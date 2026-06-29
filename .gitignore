@@ -1,0 +1,16 @@
+# Local Claude settings (personal, not shared)
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+
+# Build artifacts (the project will become a Tauri + web app)
+/target/
+node_modules/
+dist/
+build/
+
+# Logs & env
+*.log
+.env
+.env.*
