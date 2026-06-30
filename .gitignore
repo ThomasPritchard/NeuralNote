@@ -10,7 +10,18 @@ node_modules/
 dist/
 build/
 
+# Coverage + SonarQube scanner artifacts
+coverage/
+/lcov-rust.info
+.scannerwork/
+
 # Logs & env
 *.log
 .env
 .env.*
+
+# Stray pasted screenshots at the repo root (PA-033)
+/clipboard-*.png
+
+# Production-audit working artifact (never committed; deleted on remediation)
+/production-audit-report.md

@@ -1,0 +1,6 @@
+# NeuralNote Cargo workspace.
+# Members: the client-agnostic vault core, and the desktop Tauri shell that wraps it.
+# A shared target dir + single lockfile keeps the two in lockstep.
+[workspace]
+resolver = "2"
+members = ["crates/neuralnote-core", "app/desktop/src-tauri"]

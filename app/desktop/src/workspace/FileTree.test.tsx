@@ -1,0 +1,378 @@
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import userEvent from "@testing-library/user-event";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import type { TreeNode } from "../lib/types";
+
+// Mock only the api CRUD calls; keep errorMessage real so surfaced text is honest.
+vi.mock("../lib/api", async (importActual) => {
+  const actual = await importActual<typeof import("../lib/api")>();
+  return {
+    ...actual,
+    createFolder: vi.fn(),
+    createNote: vi.fn(),
+    renameEntry: vi.fn(),
+    deleteEntry: vi.fn(),
+    moveEntry: vi.fn(),
+  };
+});
+
+import * as api from "../lib/api";
+import { FileTree } from "./FileTree";
+
+const mockApi = vi.mocked(api);
+
+const fileNode = (name: string): TreeNode => ({
+  kind: "file",
+  name,
+  path: `/v/${name}`,
+  relPath: name,
+  ext: "md",
+  children: null,
+});
+
+const folderNode = (name: string, children: TreeNode[] = []): TreeNode => ({
+  kind: "folder",
+  name,
+  path: `/v/${name}`,
+  relPath: name,
+  ext: null,
+  children,
+});
+
+function setup(tree: TreeNode[], over: Partial<Parameters<typeof FileTree>[0]> = {}) {
+  const props = {
+    vaultName: "MyVault",
+    vaultPath: "/v",
+    tree,
+    activePath: null as string | null,
+    activeDirty: false,
+    refreshTree: vi.fn().mockResolvedValue(undefined),
+    onSelect: vi.fn(),
+    onDeleted: vi.fn(),
+    onRemap: vi.fn(),
+    onCloseVault: vi.fn(),
+    ...over,
+  };
+  render(<FileTree {...props} />);
+  return props;
+}
+
+/** Minimal DataTransfer stand-in for jsdom drag events. */
+const dt = () => ({ effectAllowed: "", setData: vi.fn(), getData: vi.fn() });
+
+beforeEach(() => {
+  mockApi.createFolder.mockReset();
+  mockApi.createNote.mockReset();
+  mockApi.renameEntry.mockReset();
+  mockApi.deleteEntry.mockReset();
+  mockApi.moveEntry.mockReset();
+});
+
+afterEach(() => {
+  vi.restoreAllMocks();
+});
+
+describe("FileTree — rendering", () => {
+  it("renders the vault name and an empty-state hint", () => {
+    setup([]);
+    expect(screen.getByText("MyVault")).toBeInTheDocument();
+    expect(screen.getByText(/This vault is empty/i)).toBeInTheDocument();
+  });
+
+  it("renders files and folders with the active file marked", () => {
+    setup([folderNode("Notes", [fileNode("a.md")]), fileNode("top.md")], {
+      activePath: "/v/top.md",
+    });
+    expect(screen.getByText("Notes")).toBeInTheDocument();
+    expect(screen.getByText("top.md")).toBeInTheDocument();
+    expect(screen.getByText("a.md")).toBeInTheDocument(); // folder open by default
+  });
+});
+
+describe("FileTree — create", () => {
+  it("creates a note at the vault root and selects it", async () => {
+    const node = { ...fileNode("New.md"), path: "/v/New.md" };
+    mockApi.createNote.mockResolvedValueOnce(node);
+    const p = setup([]);
+
+    await userEvent.click(screen.getByRole("button", { name: "New note" }));
+    const input = screen.getByLabelText("New note name");
+    await userEvent.type(input, "New.md{Enter}");
+
+    await waitFor(() =>
+      expect(mockApi.createNote).toHaveBeenCalledWith("/v", "New.md"),
+    );
+    expect(p.refreshTree).toHaveBeenCalled();
+    expect(p.onSelect).toHaveBeenCalledWith("/v/New.md");
+  });
+
+  it("keeps the input open and surfaces an error when creation fails", async () => {
+    mockApi.createNote.mockRejectedValueOnce({ message: "Already exists" });
+    setup([]);
+
+    await userEvent.click(screen.getByRole("button", { name: "New note" }));
+    await userEvent.type(screen.getByLabelText("New note name"), "Dup.md{Enter}");
+
+    expect(await screen.findByText("Already exists")).toBeInTheDocument();
+    expect(screen.getByLabelText("New note name")).toBeInTheDocument();
+
+    // The inline error is dismissible.
+    await userEvent.click(screen.getByRole("button", { name: "Dismiss error" }));
+    expect(screen.queryByText("Already exists")).not.toBeInTheDocument();
+  });
+
+  it("creates a folder via the vault menu", async () => {
+    mockApi.createFolder.mockResolvedValueOnce(folderNode("Sub"));
+    const p = setup([]);
+
+    await userEvent.click(screen.getByRole("button", { name: /MyVault/ }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "New folder" }));
+    await userEvent.type(screen.getByLabelText("New folder name"), "Sub{Enter}");
+
+    await waitFor(() =>
+      expect(mockApi.createFolder).toHaveBeenCalledWith("/v", "Sub"),
+    );
+    expect(p.refreshTree).toHaveBeenCalled();
+  });
+
+  it("creates a note inside a folder via its hover action", async () => {
+    mockApi.createNote.mockResolvedValueOnce({
+      ...fileNode("child.md"),
+      path: "/v/Notes/child.md",
+    });
+    const p = setup([folderNode("Notes", [fileNode("a.md")])]);
+
+    await userEvent.click(screen.getByRole("button", { name: "New note in Notes" }));
+    await userEvent.type(screen.getByLabelText("New note name"), "child.md{Enter}");
+
+    await waitFor(() =>
+      expect(mockApi.createNote).toHaveBeenCalledWith("/v/Notes", "child.md"),
+    );
+    expect(p.onSelect).toHaveBeenCalledWith("/v/Notes/child.md");
+  });
+});
+
+describe("FileTree — rename", () => {
+  it("renames a file and remaps the open note", async () => {
+    const renamed = { ...fileNode("b.md"), path: "/v/b.md" };
+    mockApi.renameEntry.mockResolvedValueOnce(renamed);
+    const p = setup([fileNode("a.md")]);
+
+    await userEvent.click(screen.getByRole("button", { name: "Rename a.md" }));
+    const input = screen.getByLabelText("Rename a.md");
+    await userEvent.clear(input);
+    await userEvent.type(input, "b.md{Enter}");
+
+    await waitFor(() =>
+      expect(mockApi.renameEntry).toHaveBeenCalledWith("/v/a.md", "b.md"),
+    );
+    expect(p.refreshTree).toHaveBeenCalled();
+    expect(p.onRemap).toHaveBeenCalledWith("/v/a.md", renamed);
+  });
+
+  it("surfaces a rename failure", async () => {
+    mockApi.renameEntry.mockRejectedValueOnce({ message: "Invalid name" });
+    setup([fileNode("a.md")]);
+
+    await userEvent.click(screen.getByRole("button", { name: "Rename a.md" }));
+    const input = screen.getByLabelText("Rename a.md");
+    await userEvent.clear(input);
+    await userEvent.type(input, "bad/name{Enter}");
+
+    expect(await screen.findByText("Invalid name")).toBeInTheDocument();
+  });
+});
+
+describe("FileTree — delete", () => {
+  it("confirms then deletes, refreshing and notifying", async () => {
+    mockApi.deleteEntry.mockResolvedValueOnce(undefined);
+    const p = setup([fileNode("a.md")]);
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete a.md" }));
+    const dialog = screen.getByRole("alertdialog");
+    expect(within(dialog).getByText(/Delete note\?/i)).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Move to trash" }));
+
+    await waitFor(() =>
+      expect(mockApi.deleteEntry).toHaveBeenCalledWith("/v/a.md"),
+    );
+    expect(p.refreshTree).toHaveBeenCalled();
+    expect(p.onDeleted).toHaveBeenCalled();
+  });
+
+  it("can cancel the delete confirmation", async () => {
+    setup([fileNode("a.md")]);
+    await userEvent.click(screen.getByRole("button", { name: "Delete a.md" }));
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(mockApi.deleteEntry).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a delete failure", async () => {
+    mockApi.deleteEntry.mockRejectedValueOnce({ message: "Permission denied" });
+    setup([folderNode("Notes", [])]);
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete Notes" }));
+    await userEvent.click(screen.getByRole("button", { name: "Move to trash" }));
+    expect(await screen.findByText("Permission denied")).toBeInTheDocument();
+  });
+
+  it("warns about lost unsaved edits when deleting the open dirty note", async () => {
+    // Round-8: every other destructive path is guarded; delete must not silently
+    // wipe unsaved edits. The confirm warns so the user can cancel and save first.
+    setup([fileNode("a.md")], { activePath: "/v/a.md", activeDirty: true });
+    await userEvent.click(screen.getByRole("button", { name: "Delete a.md" }));
+    const dialog = screen.getByRole("alertdialog");
+    expect(within(dialog).getByText(/unsaved changes that will be lost/i)).toBeInTheDocument();
+  });
+
+  it("warns when deleting a folder that contains the open dirty note", async () => {
+    setup([folderNode("Notes", [])], {
+      activePath: "/v/Notes/a.md",
+      activeDirty: true,
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Delete Notes" }));
+    expect(
+      within(screen.getByRole("alertdialog")).getByText(/unsaved changes that will be lost/i),
+    ).toBeInTheDocument();
+  });
+
+  it("shows the normal restore message when the open note is clean", async () => {
+    setup([fileNode("a.md")], { activePath: "/v/a.md", activeDirty: false });
+    await userEvent.click(screen.getByRole("button", { name: "Delete a.md" }));
+    expect(
+      within(screen.getByRole("alertdialog")).getByText(/where you can restore it/i),
+    ).toBeInTheDocument();
+  });
+});
+
+describe("FileTree — folder collapse", () => {
+  it("toggles a folder open and closed", async () => {
+    setup([folderNode("Notes", [fileNode("a.md")])]);
+    const folderBtn = screen.getByText("Notes").closest("button")!;
+    expect(screen.getByText("a.md")).toBeInTheDocument();
+    await userEvent.click(folderBtn);
+    expect(screen.queryByText("a.md")).not.toBeInTheDocument();
+    await userEvent.click(folderBtn);
+    expect(screen.getByText("a.md")).toBeInTheDocument();
+  });
+});
+
+describe("FileTree — drag and drop", () => {
+  it("moves a file into a folder on drop", async () => {
+    const moved = { ...fileNode("a.md"), path: "/v/Notes/a.md" };
+    mockApi.moveEntry.mockResolvedValueOnce(moved);
+    const p = setup([folderNode("Notes", []), fileNode("a.md")]);
+
+    const fileBtn = screen.getByText("a.md").closest("button")!;
+    const folderRow = screen.getByText("Notes").closest("div")!;
+
+    fireEvent.dragStart(fileBtn, { dataTransfer: dt() });
+    fireEvent.dragOver(folderRow, { dataTransfer: dt() });
+    fireEvent.drop(folderRow, { dataTransfer: dt() });
+
+    await waitFor(() =>
+      expect(mockApi.moveEntry).toHaveBeenCalledWith("/v/a.md", "/v/Notes"),
+    );
+    expect(p.onRemap).toHaveBeenCalledWith("/v/a.md", moved);
+  });
+
+  it("no-ops a drop onto a file (stopPropagation, never a root move)", () => {
+    setup([fileNode("a.md"), fileNode("b.md")]);
+    const a = screen.getByText("a.md").closest("button")!;
+    const bRow = screen.getByText("b.md").closest("div")!;
+
+    fireEvent.dragStart(a, { dataTransfer: dt() });
+    fireEvent.drop(bRow, { dataTransfer: dt() });
+
+    expect(mockApi.moveEntry).not.toHaveBeenCalled();
+  });
+
+  it("no-ops when dropping a root file back onto the vault root", () => {
+    setup([fileNode("a.md")]);
+    const a = screen.getByText("a.md").closest("button")!;
+    const scrollBody = a.closest(".overflow-y-auto")!;
+
+    fireEvent.dragStart(a, { dataTransfer: dt() });
+    fireEvent.drop(scrollBody, { dataTransfer: dt() });
+
+    expect(mockApi.moveEntry).not.toHaveBeenCalled();
+  });
+
+  it("moves a nested file out to the vault root via the scroll-body drop target", async () => {
+    const nestedFile: TreeNode = {
+      kind: "file",
+      name: "a.md",
+      path: "/v/Notes/a.md",
+      relPath: "Notes/a.md",
+      ext: "md",
+      children: null,
+    };
+    const moved = { ...nestedFile, path: "/v/a.md", relPath: "a.md" };
+    mockApi.moveEntry.mockResolvedValueOnce(moved);
+    setup([folderNode("Notes", [nestedFile])]);
+
+    const nested = screen.getByText("a.md").closest("button")!;
+    const scrollBody = nested.closest(".overflow-y-auto")!;
+
+    fireEvent.dragStart(nested, { dataTransfer: dt() });
+    fireEvent.drop(scrollBody, { dataTransfer: dt() });
+
+    await waitFor(() =>
+      expect(mockApi.moveEntry).toHaveBeenCalledWith("/v/Notes/a.md", "/v"),
+    );
+  });
+});
+
+describe("FileTree — TreeRow interactions", () => {
+  it("renames a folder via double-click", async () => {
+    setup([folderNode("Notes", [])]);
+    await userEvent.dblClick(screen.getByText("Notes").closest("button")!);
+    expect(screen.getByLabelText("Rename Notes")).toBeInTheDocument();
+  });
+
+  it("renames a file via double-click", async () => {
+    setup([fileNode("a.md")]);
+    await userEvent.dblClick(screen.getByText("a.md").closest("button")!);
+    expect(screen.getByLabelText("Rename a.md")).toBeInTheDocument();
+  });
+
+  it("renames a folder via its hover action", async () => {
+    setup([folderNode("Notes", [])]);
+    await userEvent.click(screen.getByRole("button", { name: "Rename Notes" }));
+    expect(screen.getByLabelText("Rename Notes")).toBeInTheDocument();
+  });
+
+  it("creates a folder inside a folder via its hover action", async () => {
+    setup([folderNode("Notes", [])]);
+    await userEvent.click(screen.getByRole("button", { name: "New folder in Notes" }));
+    expect(screen.getByLabelText("New folder name")).toBeInTheDocument();
+  });
+
+  it("supports dragging a folder and leaving a drop target", () => {
+    setup([folderNode("Src", []), folderNode("Dest", [])]);
+    const srcRow = screen.getByText("Src").closest("div")!;
+    const destRow = screen.getByText("Dest").closest("div")!;
+
+    fireEvent.dragStart(srcRow, { dataTransfer: dt() });
+    fireEvent.dragOver(destRow, { dataTransfer: dt() });
+    fireEvent.dragLeave(destRow, { dataTransfer: dt() });
+    fireEvent.dragEnd(srcRow, { dataTransfer: dt() });
+
+    // No drop occurred, so no move was attempted.
+    expect(mockApi.moveEntry).not.toHaveBeenCalled();
+  });
+});
+
+describe("FileTree — vault menu actions", () => {
+  it("refreshes the tree and closes the vault", async () => {
+    const p = setup([]);
+    await userEvent.click(screen.getByRole("button", { name: /MyVault/ }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "Refresh tree" }));
+    expect(p.refreshTree).toHaveBeenCalled();
+
+    await userEvent.click(screen.getByRole("button", { name: /MyVault/ }));
+    await userEvent.click(screen.getByRole("menuitem", { name: "Close vault" }));
+    expect(p.onCloseVault).toHaveBeenCalled();
+  });
+});

@@ -1,0 +1,255 @@
+/* ──────────────────────────────────────────────────────────────────────────
+   NeuralNote design directions — 6 token blocks, one per `[data-direction]`.
+   Every block overrides the shadcn semantic variables (background, primary,
+   sidebar-*, radius …) plus font + a couple of custom tokens. Flip the
+   data-direction attribute on a wrapper and the whole look swaps; component
+   markup is untouched. Tokens here mirror prototype/design.md.
+   ────────────────────────────────────────────────────────────────────────── */
+
+[data-direction] {
+  font-family: var(--font-sans);
+  background-color: var(--background);
+  color: var(--foreground);
+  --grid: transparent;
+}
+.nn-heading { font-family: var(--font-heading); }
+.nn-mono { font-family: var(--font-mono); }
+
+/* 1 ─ Eden · warm-dark, soft sage, spacious & calm ───────────────────────── */
+[data-direction="eden"] {
+  --background: oklch(0.18 0.008 155);
+  --foreground: oklch(0.93 0.012 150);
+  --card: oklch(0.215 0.01 155);
+  --card-foreground: oklch(0.93 0.012 150);
+  --popover: oklch(0.2 0.01 155);
+  --popover-foreground: oklch(0.93 0.012 150);
+  --primary: oklch(0.83 0.07 150);
+  --primary-foreground: oklch(0.2 0.02 150);
+  --secondary: oklch(0.26 0.012 155);
+  --secondary-foreground: oklch(0.9 0.01 150);
+  --muted: oklch(0.24 0.01 155);
+  --muted-foreground: oklch(0.66 0.015 150);
+  --accent: oklch(0.28 0.02 150);
+  --accent-foreground: oklch(0.93 0.01 150);
+  --destructive: oklch(0.62 0.2 25);
+  --border: oklch(1 0 0 / 8%);
+  --input: oklch(1 0 0 / 10%);
+  --ring: oklch(0.83 0.07 150);
+  --sidebar: oklch(0.16 0.008 155);
+  --sidebar-foreground: oklch(0.8 0.01 150);
+  --sidebar-primary: oklch(0.83 0.07 150);
+  --sidebar-primary-foreground: oklch(0.2 0.02 150);
+  --sidebar-accent: oklch(0.24 0.015 150);
+  --sidebar-accent-foreground: oklch(0.93 0.01 150);
+  --sidebar-border: oklch(1 0 0 / 6%);
+  --sidebar-ring: oklch(0.83 0.07 150);
+  --radius: 0.85rem;
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-heading: "Inter", system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, monospace;
+}
+
+/* 2 ─ Obsidian-native · dense, neutral grey, purple accent ────────────────── */
+[data-direction="obsidian"] {
+  --background: oklch(0.21 0 0);
+  --foreground: oklch(0.86 0 0);
+  --card: oklch(0.245 0 0);
+  --card-foreground: oklch(0.86 0 0);
+  --popover: oklch(0.245 0 0);
+  --popover-foreground: oklch(0.86 0 0);
+  --primary: oklch(0.62 0.18 292);
+  --primary-foreground: oklch(0.98 0 0);
+  --secondary: oklch(0.27 0 0);
+  --secondary-foreground: oklch(0.9 0 0);
+  --muted: oklch(0.26 0 0);
+  --muted-foreground: oklch(0.6 0 0);
+  --accent: oklch(0.3 0.03 292);
+  --accent-foreground: oklch(0.95 0 0);
+  --destructive: oklch(0.62 0.2 25);
+  --border: oklch(1 0 0 / 10%);
+  --input: oklch(1 0 0 / 12%);
+  --ring: oklch(0.62 0.18 292);
+  --sidebar: oklch(0.185 0 0);
+  --sidebar-foreground: oklch(0.72 0 0);
+  --sidebar-primary: oklch(0.62 0.18 292);
+  --sidebar-primary-foreground: oklch(0.98 0 0);
+  --sidebar-accent: oklch(0.28 0.03 292);
+  --sidebar-accent-foreground: oklch(0.95 0 0);
+  --sidebar-border: oklch(1 0 0 / 8%);
+  --sidebar-ring: oklch(0.62 0.18 292);
+  --radius: 0.35rem;
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-heading: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+/* 3 ─ Collective OS · warm cream paper, heavy editorial display ───────────── */
+[data-direction="collective"] {
+  --background: oklch(0.96 0.014 88);
+  --foreground: oklch(0.17 0.005 60);
+  --card: oklch(0.985 0.01 88);
+  --card-foreground: oklch(0.17 0.005 60);
+  --popover: oklch(0.985 0.01 88);
+  --popover-foreground: oklch(0.17 0.005 60);
+  --primary: oklch(0.2 0.005 60);
+  --primary-foreground: oklch(0.97 0.012 88);
+  --secondary: oklch(0.91 0.016 86);
+  --secondary-foreground: oklch(0.2 0 0);
+  --muted: oklch(0.92 0.014 86);
+  --muted-foreground: oklch(0.46 0.01 70);
+  --accent: oklch(0.88 0.025 85);
+  --accent-foreground: oklch(0.2 0 0);
+  --destructive: oklch(0.55 0.2 25);
+  --border: oklch(0.2 0.01 60 / 12%);
+  --input: oklch(0.2 0.01 60 / 14%);
+  --ring: oklch(0.2 0 0);
+  --sidebar: oklch(0.94 0.016 88);
+  --sidebar-foreground: oklch(0.3 0.01 60);
+  --sidebar-primary: oklch(0.2 0.005 60);
+  --sidebar-primary-foreground: oklch(0.97 0.012 88);
+  --sidebar-accent: oklch(0.9 0.02 86);
+  --sidebar-accent-foreground: oklch(0.2 0 0);
+  --sidebar-border: oklch(0.2 0.01 60 / 10%);
+  --sidebar-ring: oklch(0.2 0 0);
+  --radius: 1.1rem;
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-heading: "Archivo", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+/* 4 ─ Deepflow · dark indigo dashboard, data-viz chrome ───────────────────── */
+[data-direction="deepflow"] {
+  --background: oklch(0.16 0.02 282);
+  --foreground: oklch(0.93 0.01 285);
+  --card: oklch(0.2 0.025 282);
+  --card-foreground: oklch(0.93 0.01 285);
+  --popover: oklch(0.2 0.025 282);
+  --popover-foreground: oklch(0.93 0.01 285);
+  --primary: oklch(0.62 0.21 288);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.26 0.03 282);
+  --secondary-foreground: oklch(0.93 0.01 285);
+  --muted: oklch(0.24 0.025 282);
+  --muted-foreground: oklch(0.66 0.02 285);
+  --accent: oklch(0.3 0.06 288);
+  --accent-foreground: oklch(0.95 0.01 285);
+  --destructive: oklch(0.62 0.2 25);
+  --border: oklch(1 0 0 / 8%);
+  --input: oklch(1 0 0 / 10%);
+  --ring: oklch(0.62 0.21 288);
+  --sidebar: oklch(0.14 0.018 282);
+  --sidebar-foreground: oklch(0.72 0.02 285);
+  --sidebar-primary: oklch(0.62 0.21 288);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.28 0.06 288);
+  --sidebar-accent-foreground: oklch(0.95 0.01 285);
+  --sidebar-border: oklch(1 0 0 / 7%);
+  --sidebar-ring: oklch(0.62 0.21 288);
+  --radius: 0.7rem;
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-heading: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+/* ★ CHOSEN · NeuralNote · Deepflow indigo skin, Obsidian-native UX density ──── */
+[data-direction="neuralnote"] {
+  --background: oklch(0.16 0.02 282);
+  --foreground: oklch(0.93 0.01 285);
+  --card: oklch(0.2 0.025 282);
+  --card-foreground: oklch(0.93 0.01 285);
+  --popover: oklch(0.2 0.025 282);
+  --popover-foreground: oklch(0.93 0.01 285);
+  --primary: oklch(0.62 0.21 288);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.26 0.03 282);
+  --secondary-foreground: oklch(0.93 0.01 285);
+  --muted: oklch(0.24 0.025 282);
+  --muted-foreground: oklch(0.66 0.02 285);
+  --accent: oklch(0.3 0.06 288);
+  --accent-foreground: oklch(0.95 0.01 285);
+  --destructive: oklch(0.62 0.2 25);
+  --border: oklch(1 0 0 / 9%);
+  --input: oklch(1 0 0 / 11%);
+  --ring: oklch(0.62 0.21 288);
+  --sidebar: oklch(0.14 0.018 282);
+  --sidebar-foreground: oklch(0.72 0.02 285);
+  --sidebar-primary: oklch(0.62 0.21 288);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.28 0.06 288);
+  --sidebar-accent-foreground: oklch(0.95 0.01 285);
+  --sidebar-border: oklch(1 0 0 / 7%);
+  --sidebar-ring: oklch(0.62 0.21 288);
+  --radius: 0.5rem;
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-heading: "Inter", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+/* 5 ─ Linear · cool zinc command deck, crisp indigo, refined density ───────── */
+[data-direction="linear"] {
+  --background: oklch(0.155 0.004 270);
+  --foreground: oklch(0.95 0.004 270);
+  --card: oklch(0.19 0.005 270);
+  --card-foreground: oklch(0.95 0.004 270);
+  --popover: oklch(0.19 0.005 270);
+  --popover-foreground: oklch(0.95 0.004 270);
+  --primary: oklch(0.6 0.16 277);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.23 0.006 270);
+  --secondary-foreground: oklch(0.95 0.004 270);
+  --muted: oklch(0.22 0.006 270);
+  --muted-foreground: oklch(0.63 0.008 272);
+  --accent: oklch(0.26 0.012 275);
+  --accent-foreground: oklch(0.96 0.004 270);
+  --destructive: oklch(0.62 0.2 25);
+  --border: oklch(1 0 0 / 7%);
+  --input: oklch(1 0 0 / 9%);
+  --ring: oklch(0.6 0.16 277);
+  --sidebar: oklch(0.135 0.004 270);
+  --sidebar-foreground: oklch(0.68 0.008 272);
+  --sidebar-primary: oklch(0.6 0.16 277);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.24 0.012 275);
+  --sidebar-accent-foreground: oklch(0.96 0.004 270);
+  --sidebar-border: oklch(1 0 0 / 6%);
+  --sidebar-ring: oklch(0.6 0.16 277);
+  --radius: 0.5rem;
+  --font-sans: "Inter", system-ui, sans-serif;
+  --font-heading: "Inter", system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, monospace;
+}
+
+/* 6 ─ Vercel · monochrome on graph paper, sharp, mono metadata ────────────── */
+[data-direction="vercel"] {
+  --background: oklch(0.985 0 0);
+  --foreground: oklch(0.13 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.13 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.13 0 0);
+  --primary: oklch(0.13 0 0);
+  --primary-foreground: oklch(0.99 0 0);
+  --secondary: oklch(0.95 0 0);
+  --secondary-foreground: oklch(0.13 0 0);
+  --muted: oklch(0.96 0 0);
+  --muted-foreground: oklch(0.44 0 0);
+  --accent: oklch(0.94 0 0);
+  --accent-foreground: oklch(0.13 0 0);
+  --destructive: oklch(0.55 0.2 25);
+  --border: oklch(0.13 0 0 / 12%);
+  --input: oklch(0.13 0 0 / 15%);
+  --ring: oklch(0.13 0 0);
+  --sidebar: oklch(0.97 0 0);
+  --sidebar-foreground: oklch(0.3 0 0);
+  --sidebar-primary: oklch(0.13 0 0);
+  --sidebar-primary-foreground: oklch(0.99 0 0);
+  --sidebar-accent: oklch(0.93 0 0);
+  --sidebar-accent-foreground: oklch(0.13 0 0);
+  --sidebar-border: oklch(0.13 0 0 / 10%);
+  --sidebar-ring: oklch(0.13 0 0);
+  --radius: 0.25rem;
+  --grid: oklch(0.13 0 0 / 6%);
+  --font-sans: "Geist", system-ui, sans-serif;
+  --font-heading: "Geist", system-ui, sans-serif;
+  --font-mono: "Geist Mono", ui-monospace, monospace;
+}

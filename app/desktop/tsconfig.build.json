@@ -1,0 +1,5 @@
+{
+  "//": "Production build type-check: the app sources only. Tests are excluded so a test-only type quirk can never block a release build (they are type-checked by `npm run typecheck` / the IDE via tsconfig.json).",
+  "extends": "./tsconfig.json",
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx", "src/test"]
+}

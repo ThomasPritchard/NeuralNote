@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window. Vault file operations are app-defined commands and need no capability; the dialog plugin is used only from Rust. allow-destroy lets the unsaved-edit guard close the window via getCurrentWindow().destroy() after the user confirms discard (onCloseRequested is covered by core:default's event permissions).",
+  "windows": ["main"],
+  "permissions": ["core:default", "core:window:allow-destroy"]
+}

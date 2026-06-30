@@ -1,0 +1,85 @@
+# Tier-2 native end-to-end tests: drive the real NeuralNote window via
+# WebdriverIO + tauri-driver. Linux + Windows ONLY — tauri-driver has no macOS
+# WebDriver, so the Mac path is covered by the Tier-1 mockIPC suite
+# (app/desktop: `npm run test:e2e`), which runs in the unit job elsewhere.
+#
+# Mirrors the official Tauri WebDriver CI pattern:
+# https://v2.tauri.app/develop/tests/webdriver/ci
+
+name: e2e-native
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  webdriver:
+    name: WebdriverIO (${{ matrix.platform }})
+    runs-on: ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        platform: [ubuntu-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # WebKitWebDriver + the GTK/webkit build deps + a virtual display.
+      - name: Tauri + WebDriver system dependencies (Linux)
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libwebkit2gtk-4.1-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev \
+            webkit2gtk-driver \
+            xvfb
+
+      # Edge WebView2 driver (msedgedriver), put on PATH for tauri-driver.
+      - name: Install msedgedriver (Windows)
+        if: matrix.platform == 'windows-latest'
+        run: |
+          cargo install --git https://github.com/chippers/msedgedriver-tool
+          & "$HOME/.cargo/bin/msedgedriver-tool.exe"
+          "$PWD" >> $env:GITHUB_PATH
+
+      - name: Setup Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Single workspace at the repo root (crates/* + app/desktop/src-tauri).
+          workspaces: "."
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/desktop/package-lock.json
+
+      - name: Install desktop app dependencies
+        working-directory: app/desktop
+        run: npm ci
+
+      - name: Install e2e-native dependencies
+        working-directory: app/desktop/e2e-native
+        run: npm install
+
+      - name: Install tauri-driver
+        run: cargo install tauri-driver --locked
+
+      # wdio's onPrepare runs `tauri build --debug --no-bundle` before the session.
+      - name: WebdriverIO (Linux, headless via xvfb)
+        if: matrix.platform == 'ubuntu-latest'
+        working-directory: app/desktop/e2e-native
+        run: xvfb-run --auto-servernum npm test
+
+      - name: WebdriverIO (Windows)
+        if: matrix.platform == 'windows-latest'
+        working-directory: app/desktop/e2e-native
+        run: npm test
