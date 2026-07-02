@@ -73,7 +73,9 @@ the `root_of()` idiom). Errors are `CoreError` (existing kinds suffice: `io`, `n
   - resolution: wikilink target matches by case-insensitive filename (with or without `.md`),
     shortest-rel-path tiebreak (Obsidian's rule); md links resolve relative to the note's
     folder. Unresolved → skipped. Self-links and duplicate edges deduped.
-  - nodes: every markdown note in the vault (linked or not); cluster = first path segment.
+  - nodes: every markdown note in the vault (linked or not — orphans render too); cluster =
+    first path segment. Node title reuses the existing precedence rule (`note.rs::title_from`:
+    frontmatter `title` → first `# H1` → file stem), so graph, tree, and reader agree on names.
 - Tests live in the core crate's existing `#[cfg(test)] mod tests` (lib.rs), tempdir
   fixtures, failure/edge-path heavy per house style.
 
