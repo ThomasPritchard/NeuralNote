@@ -541,6 +541,7 @@ mod tests {
         fs::write(dir.path().join("n.md"), "Hello World\n").unwrap();
         let r = search::search_vault(dir.path(), "hello WORLD").unwrap();
         assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.skipped_files, 0); // every file was readable
         let m = &r.hits[0].matches[0];
         assert_eq!(m.line, 1);
         assert_eq!(slice_chars(&m.snippet, m.ranges[0]), "Hello World");
@@ -773,6 +774,73 @@ mod tests {
         let r = search::search_vault(dir.path(), "target").unwrap();
         let rels: Vec<&str> = r.hits.iter().map(|h| h.rel_path.as_str()).collect();
         assert_eq!(rels, ["open.md"]);
+        assert_eq!(r.skipped_files, 1); // a permissions failure is not "no results"
+    }
+
+    #[test]
+    fn search_clips_straddling_range_at_window_edge() {
+        // A 300-char line: the match at [0,6) pins the window to [0,200); a
+        // second match at [197,203) straddles the window edge and keeps its
+        // visible prefix [197,200); a third at [250,256) is outside and dropped.
+        let dir = tempfile::tempdir().unwrap();
+        let line = format!(
+            "needle{}needle{}needle{}",
+            "x".repeat(191),
+            "y".repeat(47),
+            "z".repeat(44)
+        );
+        fs::write(dir.path().join("n.md"), &line).unwrap();
+        let r = search::search_vault(dir.path(), "needle").unwrap();
+        let m = &r.hits[0].matches[0];
+        assert_eq!(m.ranges, vec![(0, 6), (197, 200)]);
+        assert_eq!(slice_chars(&m.snippet, m.ranges[1]), "nee");
+    }
+
+    #[test]
+    fn search_query_wider_than_window_keeps_a_visible_range() {
+        // A match wider than the snippet window still highlights its visible
+        // portion — a content match NEVER carries empty ranges.
+        let dir = tempfile::tempdir().unwrap();
+        let line = "q".repeat(250);
+        fs::write(dir.path().join("n.md"), &line).unwrap();
+        let r = search::search_vault(dir.path(), &line).unwrap();
+        let m = &r.hits[0].matches[0];
+        assert_eq!(m.snippet.chars().count(), search::SNIPPET_MAX_CHARS);
+        assert_eq!(m.ranges, vec![(0, search::SNIPPET_MAX_CHARS as u32)]);
+    }
+
+    #[test]
+    fn search_caps_very_long_queries() {
+        // A pathological query is trimmed to MAX_QUERY_CHARS server-side rather
+        // than erroring or scanning unbounded.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("n.md"), "q".repeat(256)).unwrap();
+        let r = search::search_vault(dir.path(), &"q".repeat(300)).unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert!(!r.hits[0].matches[0].ranges.is_empty());
+    }
+
+    #[test]
+    fn search_reports_all_occurrences_on_short_lines() {
+        // Regression guard for the window-bounded occurrence scan: lines at or
+        // under the snippet width keep every occurrence.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("n.md"), "ab then ab then ab\n").unwrap();
+        let r = search::search_vault(dir.path(), "ab").unwrap();
+        assert_eq!(r.hits[0].matches[0].ranges, vec![(0, 2), (8, 10), (16, 18)]);
+    }
+
+    #[test]
+    fn search_folds_greek_final_sigma() {
+        // Word-final ς folds to σ, so an uppercase query (whose Σ lowercases to
+        // σ) still matches final-sigma text. Deliberately the ONLY extra fold —
+        // no ß→ss or other multi-char equivalence tables.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("n.md"), "ο σεισμός χθες\n").unwrap();
+        let r = search::search_vault(dir.path(), "ΣΕΙΣΜΌΣ").unwrap();
+        assert_eq!(r.hits.len(), 1);
+        let m = &r.hits[0].matches[0];
+        assert_eq!(slice_chars(&m.snippet, m.ranges[0]), "σεισμός");
     }
 
     /* ──────────────────────────────  links  ────────────────────────────── */
@@ -951,6 +1019,7 @@ mod tests {
         let g = links::read_link_graph(dir.path()).unwrap();
         assert!(g.nodes.is_empty());
         assert!(g.links.is_empty());
+        assert_eq!(g.skipped_files, 0);
     }
 
     #[test]
@@ -980,7 +1049,94 @@ mod tests {
         let g = links::read_link_graph(dir.path()).unwrap();
         assert_eq!(g.nodes.len(), 2);
         assert!(g.links.is_empty());
+        assert_eq!(g.skipped_files, 1); // the aggregate signal for the UI
         let locked = g.nodes.iter().find(|n| n.id == "locked.md").unwrap();
         assert_eq!(locked.title, "locked");
+    }
+
+    #[test]
+    fn graph_resolves_extensionless_markdown_links() {
+        // Obsidian resolves `[see](two)` to a sibling `two.md` — the candidate
+        // is tried as written, then with `.md` appended.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("two.md"), "").unwrap();
+        fs::write(dir.path().join("one.md"), "[see](two)\n").unwrap();
+        let g = links::read_link_graph(dir.path()).unwrap();
+        assert_eq!(g.links.len(), 1);
+        assert!(edge(&g, "one.md", "two.md").is_some());
+    }
+
+    #[test]
+    fn graph_fence_closes_only_on_matching_char_and_length() {
+        // CommonMark: a 4-backtick fence is NOT closed by a 3-backtick line, and
+        // tilde fences mask too. Only [[b]] (outside every fence) survives.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("b.md"), "").unwrap();
+        fs::write(dir.path().join("c.md"), "").unwrap();
+        fs::write(dir.path().join("d.md"), "").unwrap();
+        fs::write(
+            dir.path().join("a.md"),
+            "[[b]]\n````\n```\n[[c]]\n````\n~~~\n[[d]]\n~~~\n",
+        )
+        .unwrap();
+        let g = links::read_link_graph(dir.path()).unwrap();
+        assert_eq!(g.links.len(), 1);
+        assert!(edge(&g, "a.md", "b.md").is_some());
+    }
+
+    #[test]
+    fn graph_inline_span_masks_across_lines() {
+        // CommonMark code spans can cross newlines: the span swallowing [[c]]
+        // opens on one line and closes on the next; [[b]] outside it resolves.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("b.md"), "").unwrap();
+        fs::write(dir.path().join("c.md"), "").unwrap();
+        fs::write(
+            dir.path().join("a.md"),
+            "start `code\n[[c]] inside` end [[b]]\n",
+        )
+        .unwrap();
+        let g = links::read_link_graph(dir.path()).unwrap();
+        assert_eq!(g.links.len(), 1);
+        assert!(edge(&g, "a.md", "b.md").is_some());
+    }
+
+    #[test]
+    fn graph_dedupes_normalized_md_targets_within_a_note() {
+        // `./two.md`, `two.md`, and the wikilink forms all land on one target —
+        // extraction-level dedupe keeps allocation O(distinct) and one edge out.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("two.md"), "").unwrap();
+        fs::write(
+            dir.path().join("one.md"),
+            "[a](./two.md) [b](two.md) [[two]] [[TWO]]\n",
+        )
+        .unwrap();
+        let g = links::read_link_graph(dir.path()).unwrap();
+        assert_eq!(g.links.len(), 1);
+    }
+
+    #[test]
+    fn graph_case_colliding_rel_paths_resolve_deterministically() {
+        // A case-sensitive filesystem can hold Target.md AND target.md, so the
+        // folded rel-path index must not be last-write-wins: exact case wins,
+        // otherwise the wikilink tiebreak (shortest, then lexicographic). Pinned
+        // at function level — the macOS test filesystem is case-insensitive, so
+        // a fixture cannot create both files on disk.
+        let mut by_rel: std::collections::HashMap<String, Vec<String>> =
+            std::collections::HashMap::new();
+        by_rel.insert(
+            "target.md".into(),
+            vec!["target.md".into(), "Target.md".into()],
+        );
+        assert_eq!(
+            links::resolve_rel("target.md", &by_rel).as_deref(),
+            Some("target.md") // exact-case match preferred
+        );
+        assert_eq!(
+            links::resolve_rel("TARGET.MD", &by_rel).as_deref(),
+            Some("Target.md") // no exact case → shortest, then lexicographic
+        );
+        assert_eq!(links::resolve_rel("missing.md", &by_rel), None);
     }
 }

@@ -1,10 +1,12 @@
 //! The note link graph — wikilinks + relative markdown links, Obsidian-style.
 //!
-//! Two passes over the note set: first build a node per markdown note (orphans
-//! included) plus the resolution indices, then extract links from each note's
-//! BODY (frontmatter stripped, code blocks/spans masked), resolve them against
-//! the full note set, and dedupe edges on the unordered pair. Unresolved targets
-//! are skipped silently — no ghost nodes.
+//! One walk over the note set builds a node per markdown note (orphans
+//! included), the resolution indices, and each note's deduplicated raw link
+//! targets — extracted from the BODY only (frontmatter stripped, code blocks
+//! and spans masked) and dropped-body-immediately so memory stays
+//! O(distinct targets), never O(vault text). Targets are then resolved against
+//! the full note set and edges deduped on the unordered pair. Unresolved
+//! targets are skipped silently — no ghost nodes.
 
 use crate::error::CoreResult;
 use crate::model::{GraphLink, GraphNode, LinkGraph};
@@ -13,6 +15,15 @@ use crate::tree::{markdown_files, read_tree};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
+/// A raw link target as written in a note, before resolution — wiki and
+/// markdown targets resolve by different rules, so the kind is kept.
+#[derive(Clone, PartialEq, Eq, Hash)]
+enum RawTarget {
+    Wiki(String),
+    /// Already normalised to a vault-relative path candidate.
+    Md(String),
+}
+
 /// Build the vault's link graph: a node per markdown note, an edge per resolved,
 /// deduplicated wikilink or relative markdown link.
 pub fn read_link_graph(root: &Path) -> CoreResult<LinkGraph> {
@@ -20,16 +31,20 @@ pub fn read_link_graph(root: &Path) -> CoreResult<LinkGraph> {
     let files = markdown_files(&tree);
 
     let mut nodes: Vec<GraphNode> = Vec::new();
-    // (rel_path, body) per note, link extraction input.
-    let mut bodies: Vec<(String, String)> = Vec::new();
+    // Per note: its deduped raw targets (order preserved → deterministic edges).
+    let mut note_targets: Vec<(String, Vec<RawTarget>)> = Vec::new();
     // Lowercased stem AND filename → rel_paths, for `[[target]]` ± `.md`.
     let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
-    // Lowercased rel_path → rel_path, for markdown-link resolution.
-    let mut by_rel: HashMap<String, String> = HashMap::new();
+    // Lowercased rel_path → rel_paths, for markdown-link resolution. A Vec —
+    // never last-write-wins — because a case-sensitive filesystem can hold
+    // `Target.md` AND `target.md` (see `resolve_rel`).
+    let mut by_rel: HashMap<String, Vec<String>> = HashMap::new();
+    let mut skipped_files: u32 = 0;
 
     for node in &files {
         // Lossy read (a Latin-1 note must not error the graph); an unreadable
-        // note keeps its node — orphan-style, links skipped — and is logged.
+        // note keeps its node — orphan-style, links skipped — and the failure
+        // is logged AND counted, never silent.
         let raw = match std::fs::read(&node.path) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) => {
@@ -37,6 +52,7 @@ pub fn read_link_graph(root: &Path) -> CoreResult<LinkGraph> {
                     "link graph: could not read {} ({e}); node kept, its links skipped",
                     node.path
                 );
+                skipped_files = skipped_files.saturating_add(1);
                 String::new()
             }
         };
@@ -58,26 +74,27 @@ pub fn read_link_graph(root: &Path) -> CoreResult<LinkGraph> {
             .entry(node.name.to_lowercase())
             .or_default()
             .push(node.rel_path.clone());
-        by_rel.insert(node.rel_path.to_lowercase(), node.rel_path.clone());
-        bodies.push((node.rel_path.clone(), body));
+        by_rel
+            .entry(node.rel_path.to_lowercase())
+            .or_default()
+            .push(node.rel_path.clone());
+        note_targets.push((
+            node.rel_path.clone(),
+            extract_targets(&node.rel_path, &body),
+        ));
+        // `raw`/`body` drop here — only the deduped targets are retained.
     }
     let all_rels: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
 
     let mut links: Vec<GraphLink> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    for (source, body) in &bodies {
-        let masked = mask_code(body);
-        let mut resolved: Vec<String> = Vec::new();
-        for target in extract_wikilinks(&masked) {
-            resolved.extend(resolve_wikilink(&target, &by_name, &all_rels));
-        }
-        for target in extract_md_links(&masked) {
-            resolved.extend(
-                normalize_md_target(source, &target)
-                    .and_then(|rel| by_rel.get(&rel.to_lowercase()).cloned()),
-            );
-        }
-        for target in resolved {
+    for (source, targets) in &note_targets {
+        for raw_target in targets {
+            let resolved = match raw_target {
+                RawTarget::Wiki(t) => resolve_wikilink(t, &by_name, &all_rels),
+                RawTarget::Md(rel) => resolve_md_rel(rel, &by_rel),
+            };
+            let Some(target) = resolved else { continue };
             if target == *source {
                 continue; // self-link
             }
@@ -98,7 +115,11 @@ pub fn read_link_graph(root: &Path) -> CoreResult<LinkGraph> {
         }
     }
 
-    Ok(LinkGraph { nodes, links })
+    Ok(LinkGraph {
+        nodes,
+        links,
+        skipped_files,
+    })
 }
 
 /// First path segment of a rel_path; `""` for root-level notes.
@@ -109,33 +130,81 @@ fn cluster_of(rel: &str) -> &str {
     }
 }
 
-/// Blank out fenced code blocks (``` fences; an unclosed fence masks to the end)
-/// and inline code spans, space-for-space, so links inside them are ignored —
-/// Obsidian behavior. Newlines are kept so nothing else shifts lines.
-fn mask_code(body: &str) -> String {
-    let mut out = String::with_capacity(body.len());
-    let mut in_fence = false;
-    for line in body.split_inclusive('\n') {
-        let is_fence = line.trim_start().starts_with("```");
-        if is_fence || in_fence {
-            for ch in line.chars() {
-                out.push(if ch == '\n' || ch == '\r' { ch } else { ' ' });
-            }
-        } else {
-            mask_inline_spans(line, &mut out);
+/// Extract a note's deduplicated raw link targets from its body. Dedupe happens
+/// DURING extraction (insertion-ordered), so a note repeating one target a
+/// million times retains O(distinct targets), never O(occurrences).
+fn extract_targets(source_rel: &str, body: &str) -> Vec<RawTarget> {
+    let masked = mask_code(body);
+    let mut seen: HashSet<RawTarget> = HashSet::new();
+    let mut out: Vec<RawTarget> = Vec::new();
+    let mut add = |t: RawTarget| {
+        if seen.insert(t.clone()) {
+            out.push(t);
         }
-        if is_fence {
-            in_fence = !in_fence;
+    };
+    extract_wikilinks(&masked, |t| add(RawTarget::Wiki(t.to_string())));
+    extract_md_links(&masked, |t| {
+        if let Some(rel) = normalize_md_target(source_rel, t) {
+            add(RawTarget::Md(rel));
+        }
+    });
+    out
+}
+
+/// Blank out fenced code blocks and inline code spans, space-for-space
+/// (newlines kept), so links inside them are ignored — Obsidian behavior.
+fn mask_code(body: &str) -> String {
+    mask_inline_spans(&mask_fences(body))
+}
+
+/// Mask fenced code blocks: a fence opens with ≥3 backticks or tildes and
+/// closes only on a run of the SAME character at least as long (CommonMark) —
+/// a 3-backtick line inside a 4-backtick fence is content, not a closer. An
+/// unclosed fence masks to the end of the body.
+fn mask_fences(body: &str) -> String {
+    let mut out = String::with_capacity(body.len());
+    let mut open: Option<(char, usize)> = None;
+    for line in body.split_inclusive('\n') {
+        let marker = fence_marker(line);
+        let masked = match (open, marker) {
+            (None, Some(m)) => {
+                open = Some(m);
+                true
+            }
+            (None, None) => false,
+            (Some((ch, len)), m) => {
+                if m.is_some_and(|(c2, l2)| c2 == ch && l2 >= len) {
+                    open = None;
+                }
+                true // opener, interior, and closer lines all mask
+            }
+        };
+        if masked {
+            blank_keeping_newlines(line, &mut out);
+        } else {
+            out.push_str(line);
         }
     }
     out
 }
 
-/// Copy `line` into `out`, blanking backtick code spans (a run of N backticks
-/// closes with the next run of exactly N — the CommonMark rule). An unmatched
-/// opener is copied literally.
-fn mask_inline_spans(line: &str, out: &mut String) {
-    let chars: Vec<char> = line.chars().collect();
+/// The leading code-fence run of a line (``` or ~~~, length ≥ 3), if any.
+fn fence_marker(line: &str) -> Option<(char, usize)> {
+    let trimmed = line.trim_start();
+    let first = trimmed.chars().next()?;
+    if first != '`' && first != '~' {
+        return None;
+    }
+    let len = trimmed.chars().take_while(|&c| c == first).count();
+    (len >= 3).then_some((first, len))
+}
+
+/// Blank inline code spans over the WHOLE body — CommonMark spans may cross
+/// newlines. A run of N backticks closes on the next run of exactly N; an
+/// unmatched opener is copied literally.
+fn mask_inline_spans(text: &str) -> String {
+    let chars: Vec<char> = text.chars().collect();
+    let mut out = String::with_capacity(text.len());
     let mut i = 0;
     while i < chars.len() {
         if chars[i] != '`' {
@@ -147,7 +216,9 @@ fn mask_inline_spans(line: &str, out: &mut String) {
         match find_closing_run(&chars, i + open_len, open_len) {
             Some(close_start) => {
                 let span_end = close_start + open_len;
-                out.extend(std::iter::repeat_n(' ', span_end - i));
+                for &c in &chars[i..span_end] {
+                    out.push(if c == '\n' || c == '\r' { c } else { ' ' });
+                }
                 i = span_end;
             }
             None => {
@@ -155,6 +226,14 @@ fn mask_inline_spans(line: &str, out: &mut String) {
                 i += open_len;
             }
         }
+    }
+    out
+}
+
+/// Push `line` as spaces, preserving newline chars so lines never shift.
+fn blank_keeping_newlines(line: &str, out: &mut String) {
+    for c in line.chars() {
+        out.push(if c == '\n' || c == '\r' { c } else { ' ' });
     }
 }
 
@@ -179,28 +258,25 @@ fn find_closing_run(chars: &[char], from: usize, n: usize) -> Option<usize> {
     None
 }
 
-/// Raw wikilink targets in `text`: `[[t]]`, `[[t|alias]]`, `[[t#heading]]`,
+/// Emit raw wikilink targets in `text`: `[[t]]`, `[[t|alias]]`, `[[t#heading]]`,
 /// `[[t#heading|alias]]`; embeds (`![[t]]`) are caught by the same scan. The
 /// target is the part before the first `#` or `|`, trimmed.
-fn extract_wikilinks(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
+fn extract_wikilinks(text: &str, mut emit: impl FnMut(&str)) {
     let mut rest = text;
     while let Some(start) = rest.find("[[") {
         let after = &rest[start + 2..];
-        let Some(end) = after.find("]]") else { break };
+        let Some(end) = after.find("]]") else { return };
         let target = after[..end].split(['#', '|']).next().unwrap_or("").trim();
         if !target.is_empty() {
-            out.push(target.to_string());
+            emit(target);
         }
         rest = &after[end + 2..];
     }
-    out
 }
 
-/// Raw `[text](target)` markdown-link targets in `text`. `[[wikilinks]]` are
-/// skipped here (the wikilink scan owns them); image links (`![…](…)`) count.
-fn extract_md_links(text: &str) -> Vec<String> {
-    let mut out = Vec::new();
+/// Emit raw `[text](target)` markdown-link targets in `text`. `[[wikilinks]]`
+/// are skipped here (the wikilink scan owns them); image links (`![…](…)`) count.
+fn extract_md_links(text: &str, mut emit: impl FnMut(&str)) {
     let mut rest = text;
     while let Some(open) = rest.find('[') {
         let after_open = &rest[open + 1..];
@@ -209,18 +285,17 @@ fn extract_md_links(text: &str) -> Vec<String> {
             continue;
         }
         let Some(close) = after_open.find(']') else {
-            break;
+            return;
         };
         let after_close = &after_open[close + 1..];
         let Some(paren) = after_close.strip_prefix('(') else {
             rest = after_close;
             continue;
         };
-        let Some(t_end) = paren.find(')') else { break };
-        out.push(paren[..t_end].to_string());
+        let Some(t_end) = paren.find(')') else { return };
+        emit(&paren[..t_end]);
         rest = &paren[t_end + 1..];
     }
-    out
 }
 
 /// Resolve a markdown-link target lexically against the source note's folder.
@@ -291,4 +366,24 @@ fn resolve_wikilink(
         .into_iter()
         .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
         .cloned()
+}
+
+/// Resolve a normalised rel-path candidate against the folded rel-path index,
+/// case-insensitively. Exact-case match wins; otherwise the same
+/// shortest-then-lexicographic tiebreak as wikilinks (a case-sensitive
+/// filesystem can hold `Target.md` AND `target.md`).
+pub(crate) fn resolve_rel(cand: &str, by_rel: &HashMap<String, Vec<String>>) -> Option<String> {
+    let list = by_rel.get(&cand.to_lowercase())?;
+    if let Some(exact) = list.iter().find(|r| r.as_str() == cand) {
+        return Some(exact.clone());
+    }
+    list.iter()
+        .min_by(|a, b| a.len().cmp(&b.len()).then_with(|| a.cmp(b)))
+        .cloned()
+}
+
+/// Markdown-link resolution: the candidate as written, else with `.md`
+/// appended (Obsidian resolves extensionless links).
+fn resolve_md_rel(cand: &str, by_rel: &HashMap<String, Vec<String>>) -> Option<String> {
+    resolve_rel(cand, by_rel).or_else(|| resolve_rel(&format!("{cand}.md"), by_rel))
 }

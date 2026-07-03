@@ -200,17 +200,17 @@ describe("file / folder operation wrappers", () => {
 
 describe("search + graph wrappers", () => {
   it("searchVault passes the query", async () => {
-    mockInvoke.mockResolvedValueOnce({ hits: [], truncated: false });
+    mockInvoke.mockResolvedValueOnce({ hits: [], truncated: false, skippedFiles: 0 });
     const out = await searchVault("neural");
     expect(mockInvoke).toHaveBeenCalledWith("search_vault", { query: "neural" });
-    expect(out).toEqual({ hits: [], truncated: false });
+    expect(out).toEqual({ hits: [], truncated: false, skippedFiles: 0 });
   });
 
   it("readLinkGraph calls read_link_graph", async () => {
-    mockInvoke.mockResolvedValueOnce({ nodes: [], links: [] });
+    mockInvoke.mockResolvedValueOnce({ nodes: [], links: [], skippedFiles: 0 });
     const out = await readLinkGraph();
     expect(mockInvoke).toHaveBeenCalledWith("read_link_graph");
-    expect(out).toEqual({ nodes: [], links: [] });
+    expect(out).toEqual({ nodes: [], links: [], skippedFiles: 0 });
   });
 });
 

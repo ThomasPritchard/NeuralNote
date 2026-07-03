@@ -1,11 +1,12 @@
 // Contract tests for the two search/graph mock-backend handlers, driven through
 // the real Tauri IPC boundary (mockIPC) and the real api.ts wrappers. The e2e
 // journeys (phases C/D) render the full <App/>; this suite pins the mirrored
-// core semantics — code-point offsets, snippet windows, caps, wikilink/md-link
-// resolution — that those journeys will build on, exactly as frozen in
-// specs/search-and-graph-view.md §Contract.
+// core semantics — code-point offsets, case folding, snippet windows, budget
+// flow, walk order, masking, and wikilink/md-link resolution — mirrored 1:1
+// from crates/neuralnote-core/src/{search,links,tree}.rs (the ground truth).
 
 import { afterEach, describe, expect, it } from "vitest";
+import { invoke } from "@tauri-apps/api/core";
 import { clearMocks } from "@tauri-apps/api/mocks";
 import { readLinkGraph, searchVault } from "../lib/api";
 import { createMockVault, VAULT_ROOT, type SeedEntry } from "./mockVault";
@@ -22,8 +23,16 @@ const seedVault = (seed: SeedEntry[]): void => {
 describe("mockVault search_vault", () => {
   it("returns an empty response for an empty or whitespace-only query", async () => {
     seedVault([{ kind: "file", relPath: "a.md", content: "hello" }]);
-    expect(await searchVault("")).toEqual({ hits: [], truncated: false });
-    expect(await searchVault("   ")).toEqual({ hits: [], truncated: false });
+    expect(await searchVault("")).toEqual({
+      hits: [],
+      truncated: false,
+      skippedFiles: 0,
+    });
+    expect(await searchVault("   ")).toEqual({
+      hits: [],
+      truncated: false,
+      skippedFiles: 0,
+    });
   });
 
   it("matches case-insensitively with 1-based lines and all ranges per line", async () => {
@@ -36,6 +45,7 @@ describe("mockVault search_vault", () => {
     ]);
     const out = await searchVault("hello");
     expect(out.truncated).toBe(false);
+    expect(out.skippedFiles).toBe(0);
     expect(out.hits).toEqual([
       {
         path: `${VAULT_ROOT}/a.md`,
@@ -122,6 +132,53 @@ describe("mockVault search_vault", () => {
     ]);
   });
 
+  it("emits hits in tree-walk order: folders first, case-insensitive by name", async () => {
+    seedVault([
+      { kind: "file", relPath: "Banana.md", content: "alpha" },
+      { kind: "file", relPath: "apple.md", content: "alpha" },
+      { kind: "file", relPath: "b-dir/note1.md", content: "alpha" },
+    ]);
+    const out = await searchVault("alpha");
+    // Core walks read_tree order (tree.rs): folders before files within each
+    // dir, each group case-insensitive by name — NOT case-sensitive relPath
+    // order (which would put Banana.md before apple.md).
+    expect(out.hits.map((h) => h.relPath)).toEqual([
+      "b-dir/note1.md",
+      "apple.md",
+      "Banana.md",
+    ]);
+  });
+
+  it("silently truncates queries at 256 code points", async () => {
+    seedVault([{ kind: "file", relPath: "big.md", content: `${"a".repeat(256)}XYZ` }]);
+    const out = await searchVault("a".repeat(300));
+    // The 300-char query is capped to 256 (MAX_QUERY_CHARS) and then matches.
+    // The 256-wide match is wider than the 200-char window, so its range is
+    // clipped to the full visible window — never dropped.
+    expect(out.hits).toHaveLength(1);
+    expect(out.hits[0].matches[0].snippet).toBe("a".repeat(200));
+    expect(out.hits[0].matches[0].ranges).toEqual([[0, 200]]);
+  });
+
+  it("folds with full Unicode lowercasing (İ expands) keeping original offsets", async () => {
+    seedVault([{ kind: "file", relPath: "notes.md", content: "xİ is" }]);
+    const out = await searchVault("i");
+    // "İ".toLowerCase() → "i" + combining dot (2 code points); the fold-origin
+    // map keeps the match anchored to the ONE original İ char.
+    expect(out.hits[0].nameMatch).toBe(false);
+    expect(out.hits[0].matches[0].ranges).toEqual([
+      [1, 2],
+      [3, 4],
+    ]);
+  });
+
+  it("normalises Greek final sigma so ΣΕΙΣΜΌΣ matches σεισμός", async () => {
+    seedVault([{ kind: "file", relPath: "quake.md", content: "σεισμός" }]);
+    const out = await searchVault("ΣΕΙΣΜΌΣ");
+    expect(out.hits).toHaveLength(1);
+    expect(out.hits[0].matches[0].ranges).toEqual([[0, 7]]);
+  });
+
   it("clips long lines to a 200-code-point window centered on the first match", async () => {
     const line = `${"x".repeat(300)}NEEDLE${"y".repeat(300)}NEEDLE`;
     seedVault([{ kind: "file", relPath: "long.md", content: line }]);
@@ -129,9 +186,23 @@ describe("mockVault search_vault", () => {
     const match = out.hits[0].matches[0];
     expect(Array.from(match.snippet).length).toBe(200);
     expect(match.snippet).toBe(`${"x".repeat(97)}NEEDLE${"y".repeat(97)}`);
-    // First occurrence rebased into the window; the second falls outside and
-    // is dropped rather than clipped to an empty/backwards range.
+    // First occurrence rebased into the window; the second falls fully outside
+    // and is dropped rather than clipped to an empty/backwards range.
     expect(match.ranges).toEqual([[97, 103]]);
+  });
+
+  it("clips (not drops) a range straddling the window edge", async () => {
+    // Window = chars [203, 403): the second NEEDLE starts at char 400, so only
+    // its first 3 chars are visible → clipped to [197, 200], kept.
+    const line = `${"x".repeat(300)}NEEDLE${"y".repeat(94)}NEEDLE${"z".repeat(100)}`;
+    seedVault([{ kind: "file", relPath: "long.md", content: line }]);
+    const out = await searchVault("needle");
+    const match = out.hits[0].matches[0];
+    expect(match.snippet).toBe(`${"x".repeat(97)}NEEDLE${"y".repeat(94)}NEE`);
+    expect(match.ranges).toEqual([
+      [97, 103],
+      [197, 200],
+    ]);
   });
 
   it("caps matches at 50 per file and flags truncation", async () => {
@@ -143,7 +214,7 @@ describe("mockVault search_vault", () => {
     expect(out.truncated).toBe(true);
   });
 
-  it("caps total matches at 200 across files in display order", async () => {
+  it("caps total matches at 200 across files in walk order", async () => {
     const content = Array(45).fill("hit").join("\n");
     seedVault(
       [1, 2, 3, 4, 5].map((n) => ({
@@ -156,6 +227,29 @@ describe("mockVault search_vault", () => {
     expect(out.truncated).toBe(true);
     expect(out.hits.map((h) => h.matches.length)).toEqual([45, 45, 45, 45, 20]);
   });
+
+  it("spends the global budget in walk order — a late name-hit keeps its hit but loses its matches", async () => {
+    const fifty = Array(50).fill("hit").join("\n");
+    seedVault([
+      { kind: "file", relPath: "a1.md", content: fifty },
+      { kind: "file", relPath: "a2.md", content: fifty },
+      { kind: "file", relPath: "a3.md", content: fifty },
+      { kind: "file", relPath: "a4.md", content: fifty },
+      { kind: "file", relPath: "zz-hit.md", content: "hit\nhit\nhit" },
+    ]);
+    const out = await searchVault("hit");
+    // Core consumes the 200 budget DURING the walk (a1–a4 exhaust it), so
+    // zz-hit.md — walked last — keeps its name hit but gets no content
+    // matches; name-first ordering then puts it at the front of the response.
+    expect(out.truncated).toBe(true);
+    expect(out.hits.map((h) => [h.relPath, h.nameMatch, h.matches.length])).toEqual([
+      ["zz-hit.md", true, 0],
+      ["a1.md", false, 50],
+      ["a2.md", false, 50],
+      ["a3.md", false, 50],
+      ["a4.md", false, 50],
+    ]);
+  });
 });
 
 describe("mockVault read_link_graph", () => {
@@ -167,6 +261,7 @@ describe("mockVault read_link_graph", () => {
       { kind: "file", relPath: "image.png", content: "" },
     ]);
     const out = await readLinkGraph();
+    expect(out.skippedFiles).toBe(0);
     expect(out.nodes).toHaveLength(3);
     expect(out.nodes).toEqual(
       expect.arrayContaining([
@@ -264,6 +359,83 @@ describe("mockVault read_link_graph", () => {
     expect(out.links).toEqual([{ source: "a.md", target: "Gamma.md", bridge: false }]);
   });
 
+  it("treats a 3-backtick line inside a 4-backtick fence as content, not a closer", async () => {
+    seedVault([
+      {
+        kind: "file",
+        relPath: "a.md",
+        content: "````\n```\n[[Beta]]\n```\n````\n[[Gamma]]",
+      },
+      { kind: "file", relPath: "Beta.md", content: "" },
+      { kind: "file", relPath: "Gamma.md", content: "" },
+    ]);
+    const out = await readLinkGraph();
+    // CommonMark: only a run of the SAME char at least as long as the opener
+    // closes a fence — [[Beta]] stays masked until the ```` closer.
+    expect(out.links).toEqual([{ source: "a.md", target: "Gamma.md", bridge: false }]);
+  });
+
+  it("does not treat mid-line backticks as a fence opener", async () => {
+    seedVault([
+      { kind: "file", relPath: "a.md", content: "see ``` marker\n[[Beta]]" },
+      { kind: "file", relPath: "Beta.md", content: "" },
+    ]);
+    const out = await readLinkGraph();
+    // Fences are line-anchored; an unmatched mid-line ``` run is literal text,
+    // so the wikilink on the next line is live.
+    expect(out.links).toEqual([{ source: "a.md", target: "Beta.md", bridge: false }]);
+  });
+
+  it("masks inline code spans that cross newlines", async () => {
+    seedVault([
+      {
+        kind: "file",
+        relPath: "a.md",
+        content: "a `x\n[[Beta]]\ny` b\n[[Gamma]]",
+      },
+      { kind: "file", relPath: "Beta.md", content: "" },
+      { kind: "file", relPath: "Gamma.md", content: "" },
+    ]);
+    const out = await readLinkGraph();
+    // CommonMark code spans may cross newlines: the single-backtick span
+    // swallows [[Beta]]; [[Gamma]] after the closer stays live.
+    expect(out.links).toEqual([{ source: "a.md", target: "Gamma.md", bridge: false }]);
+  });
+
+  it("takes md-link targets up to the first ')' (spaces included) with .md fallback", async () => {
+    seedVault([
+      { kind: "file", relPath: "a.md", content: "[x](my note.md) [g](docs/guide)" },
+      { kind: "file", relPath: "my note.md", content: "" },
+      { kind: "file", relPath: "docs/guide.md", content: "" },
+    ]);
+    const out = await readLinkGraph();
+    expect(out.links).toEqual(
+      expect.arrayContaining([
+        { source: "a.md", target: "my note.md", bridge: false },
+        { source: "a.md", target: "docs/guide.md", bridge: true },
+      ]),
+    );
+    expect(out.links).toHaveLength(2);
+  });
+
+  it("resolves case-colliding rel-paths with exact-case preference", async () => {
+    seedVault([
+      { kind: "file", relPath: "src.md", content: "[a](Target.md) [b](target.md)" },
+      { kind: "file", relPath: "Target.md", content: "" },
+      { kind: "file", relPath: "target.md", content: "" },
+    ]);
+    const out = await readLinkGraph();
+    // A case-sensitive filesystem can hold both; each link resolves to its
+    // exact-case file instead of collapsing onto one slot.
+    expect(out.links).toEqual(
+      expect.arrayContaining([
+        { source: "src.md", target: "Target.md", bridge: false },
+        { source: "src.md", target: "target.md", bridge: false },
+      ]),
+    );
+    expect(out.links).toHaveLength(2);
+  });
+
   it("breaks resolution ties by shortest relPath, then lexicographic", async () => {
     seedVault([
       { kind: "file", relPath: "src.md", content: "[[note]] [[paper]]" },
@@ -316,5 +488,15 @@ describe("mockVault read_link_graph", () => {
       ]),
     );
     expect(out.links).toHaveLength(3);
+  });
+});
+
+describe("mockVault unknown commands", () => {
+  it("rejects loudly instead of resolving undefined (silent empty success)", async () => {
+    seedVault([]);
+    await expect(invoke("bogus_cmd")).rejects.toEqual({
+      kind: "io",
+      message: "unknown command: bogus_cmd",
+    });
   });
 });

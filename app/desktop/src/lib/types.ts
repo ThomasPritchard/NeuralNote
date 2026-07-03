@@ -92,6 +92,10 @@ export interface SearchResponse {
   hits: FileHit[];
   /** True when results were clipped by the caps (50 matches/file, 200 total). */
   truncated: boolean;
+  /** Markdown files that couldn't be read and were skipped — surfaced, never
+   *  silent. Always 0 from the mock backend (its in-memory FS can't fail
+   *  per-file). */
+  skippedFiles: number;
 }
 
 // ── Link graph (read_link_graph) ─────────────────────────────────────────────
@@ -118,6 +122,10 @@ export interface GraphLink {
 export interface LinkGraph {
   nodes: GraphNode[];
   links: GraphLink[];
+  /** Markdown files that couldn't be read: the node is kept (orphan-style),
+   *  its links are skipped, and the failure is counted here — never silent.
+   *  Always 0 from the mock backend (its in-memory FS can't fail per-file). */
+  skippedFiles: number;
 }
 
 /** The shape a `CoreError` takes when it crosses the Tauri boundary. */

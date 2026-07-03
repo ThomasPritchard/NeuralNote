@@ -21,34 +21,42 @@ pub const MAX_TOTAL_MATCHES: usize = 200;
 pub const MAX_MATCHES_PER_FILE: usize = 50;
 /// Snippet window size in Unicode scalars (chars).
 pub const SNIPPET_MAX_CHARS: usize = 200;
+/// Longest query actually searched, in chars — longer input is trimmed
+/// server-side (never an error) so a pasted blob can't drive unbounded work.
+pub const MAX_QUERY_CHARS: usize = 256;
 
 /// Case-insensitively search every markdown note under `root` for `query`.
 ///
 /// The raw file text is searched, frontmatter included (Obsidian behavior).
-/// Name/title hits rank before content-only hits, each group in tree-walk order.
+/// Name/title hits rank before content-only hits, each group in tree-walk
+/// order. Queries longer than [`MAX_QUERY_CHARS`] are truncated to it.
 pub fn search_vault(root: &Path, query: &str) -> CoreResult<SearchResponse> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
         return Ok(SearchResponse {
             hits: Vec::new(),
             truncated: false,
+            skipped_files: 0,
         });
     }
-    let folded_query = fold(trimmed);
+    let capped: String = trimmed.chars().take(MAX_QUERY_CHARS).collect();
+    let folded_query = fold(&capped);
     let tree = read_tree(root)?;
 
     let mut name_hits: Vec<FileHit> = Vec::new();
     let mut content_hits: Vec<FileHit> = Vec::new();
     let mut total = 0usize;
     let mut truncated = false;
+    let mut skipped_files: u32 = 0;
 
     for node in markdown_files(&tree) {
         // Lossy read: a Latin-1 note must not error the whole search; an
-        // unreadable file is skipped loudly, never fatal.
+        // unreadable file is skipped loudly (logged AND counted), never fatal.
         let raw = match std::fs::read(&node.path) {
             Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
             Err(e) => {
                 log::warn!("search: skipping unreadable file {}: {e}", node.path);
+                skipped_files = skipped_files.saturating_add(1);
                 continue;
             }
         };
@@ -91,6 +99,7 @@ pub fn search_vault(root: &Path, query: &str) -> CoreResult<SearchResponse> {
     Ok(SearchResponse {
         hits: name_hits,
         truncated,
+        skipped_files,
     })
 }
 
@@ -100,7 +109,8 @@ pub fn search_vault(root: &Path, query: &str) -> CoreResult<SearchResponse> {
 fn scan_content(raw: &str, folded_query: &[char], budget: usize) -> (Vec<SearchMatch>, bool) {
     let mut out = Vec::new();
     for (idx, line) in raw.lines().enumerate() {
-        let Some(m) = match_line(line, idx as u32 + 1, folded_query) else {
+        let line_no = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+        let Some(m) = match_line(line, line_no, folded_query) else {
             continue;
         };
         if out.len() >= budget {
@@ -111,9 +121,17 @@ fn scan_content(raw: &str, folded_query: &[char], budget: usize) -> (Vec<SearchM
     (out, false)
 }
 
-/// Case-fold a string the same way lines are folded (per-char `to_lowercase`).
+/// Case-fold one char: `to_lowercase` plus Greek final-sigma normalisation
+/// (ς → σ), so word-final sigma matches regardless of position. Deliberately
+/// NO other multi-char equivalences (ß→ss, etc.) — hand-rolled Unicode tables
+/// are a known bug farm here; the ß limitation is documented in the spec.
+fn fold_char(ch: char) -> impl Iterator<Item = char> {
+    ch.to_lowercase().map(|c| if c == 'ς' { 'σ' } else { c })
+}
+
+/// Case-fold a string the same way lines are folded (per-char [`fold_char`]).
 fn fold(s: &str) -> Vec<char> {
-    s.chars().flat_map(char::to_lowercase).collect()
+    s.chars().flat_map(fold_char).collect()
 }
 
 /// Whether `text`, case-folded, contains the folded query.
@@ -143,7 +161,7 @@ fn fold_line(line: &str) -> FoldedLine {
     let mut char_starts = Vec::new();
     for (char_idx, (byte_idx, ch)) in line.char_indices().enumerate() {
         char_starts.push(byte_idx);
-        for lc in ch.to_lowercase() {
+        for lc in fold_char(ch) {
             folded.push(lc);
             fold_origin.push(char_idx);
         }
@@ -156,12 +174,26 @@ fn fold_line(line: &str) -> FoldedLine {
     }
 }
 
-/// All non-overlapping occurrences of `query` in `folded`, as folded-index ranges.
-fn occurrences(folded: &[char], query: &[char]) -> Vec<(usize, usize)> {
-    let mut out = Vec::new();
+/// Non-overlapping occurrences of `query` in `folded`, as folded-index ranges.
+///
+/// The scan is bounded by the snippet window: the first occurrence pins the
+/// window, and its end can never exceed `first_end + SNIPPET_MAX_CHARS` in
+/// original chars — anything starting past that is discarded by
+/// [`build_snippet`] anyway, so the scan stops there structurally (a multi-MB
+/// single-line note cannot amplify allocations).
+fn occurrences(folded: &[char], fold_origin: &[usize], query: &[char]) -> Vec<(usize, usize)> {
+    let mut out: Vec<(usize, usize)> = Vec::new();
+    let mut cutoff: Option<usize> = None; // original-char index; None until a match
     let mut i = 0;
     while i + query.len() <= folded.len() {
+        if cutoff.is_some_and(|c| fold_origin[i] >= c) {
+            break;
+        }
         if folded[i..i + query.len()] == *query {
+            if out.is_empty() {
+                let first_end = fold_origin[i + query.len() - 1] + 1;
+                cutoff = Some(first_end + SNIPPET_MAX_CHARS);
+            }
             out.push((i, i + query.len()));
             i += query.len();
         } else {
@@ -176,7 +208,7 @@ fn occurrences(folded: &[char], query: &[char]) -> Vec<(usize, usize)> {
 /// matching line; `line_no` is 1-based.
 fn match_line(line: &str, line_no: u32, folded_query: &[char]) -> Option<SearchMatch> {
     let fl = fold_line(line);
-    let occs = occurrences(&fl.folded, folded_query);
+    let occs = occurrences(&fl.folded, &fl.fold_origin, folded_query);
     if occs.is_empty() {
         return None;
     }
@@ -194,8 +226,11 @@ fn match_line(line: &str, line_no: u32, folded_query: &[char]) -> Option<SearchM
 }
 
 /// The snippet for a matched line: the whole line when short, else a
-/// [`SNIPPET_MAX_CHARS`]-wide window centered on the first match (clamped to the
-/// line), with ranges rebased to the window and out-of-window ranges dropped.
+/// [`SNIPPET_MAX_CHARS`]-wide window centered on the first match (clamped to
+/// the line). Ranges are rebased to the window; a range straddling a window
+/// edge is CLIPPED to its visible part, and only fully-outside ranges are
+/// dropped — so the first match (which the window is centered on) always
+/// yields a range, even when wider than the window itself.
 fn build_snippet(
     line: &str,
     fl: &FoldedLine,
@@ -214,8 +249,10 @@ fn build_snippet(
     let snippet = line[fl.char_starts[start]..fl.char_starts[end]].to_string();
     let ranges = occs
         .iter()
-        .filter(|&&(x, y)| x >= start && y <= end)
-        .map(|&(x, y)| ((x - start) as u32, (y - start) as u32))
+        .filter_map(|&(x, y)| {
+            let (cx, cy) = (x.max(start), y.min(end));
+            (cx < cy).then_some(((cx - start) as u32, (cy - start) as u32))
+        })
         .collect();
     (snippet, ranges)
 }

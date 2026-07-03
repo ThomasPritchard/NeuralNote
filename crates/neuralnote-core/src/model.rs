@@ -124,6 +124,9 @@ pub struct SearchResponse {
     pub hits: Vec<FileHit>,
     /// True when a match cap clipped anything (the UI shows a banner).
     pub truncated: bool,
+    /// Markdown files that could not be read and were skipped (each is also
+    /// logged). Lets the UI distinguish "no results" from "couldn't look".
+    pub skipped_files: u32,
 }
 
 /// A note in the link graph — one per markdown note, orphans included.
@@ -153,4 +156,8 @@ pub struct GraphLink {
 pub struct LinkGraph {
     pub nodes: Vec<GraphNode>,
     pub links: Vec<GraphLink>,
+    /// Markdown files that could not be read (their nodes remain, their
+    /// outgoing links are unknown; each is also logged). Lets the UI
+    /// distinguish "sparse graph" from "couldn't look".
+    pub skipped_files: u32,
 }

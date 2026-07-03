@@ -41,15 +41,21 @@ New Tauri commands, following the established recipe (core fn → `#[tauri::comm
 
 ```
 search_vault { query } -> SearchResponse
-  SearchResponse { hits: FileHit[], truncated: bool }
+  SearchResponse { hits: FileHit[], truncated: bool, skippedFiles: number }
   FileHit { path, relPath, title, nameMatch: bool, matches: Match[] }
-  Match { line: number, snippet: string, ranges: [start, end][] }  // char offsets into snippet
+  Match { line: number (1-based), snippet: string, ranges: [start, end][] }
 
 read_link_graph {} -> LinkGraph
-  LinkGraph { nodes: GraphNode[], links: GraphLink[] }
+  LinkGraph { nodes: GraphNode[], links: GraphLink[], skippedFiles: number }
   GraphNode { id: relPath, title, cluster: string }   // cluster = top-level folder ("" = root)
   GraphLink { source: id, target: id, bridge: bool }  // bridge = cross-cluster
 ```
+
+Contract notes (review round 1, 2026-07-03): `ranges` are **Unicode code-point offsets** into
+`snippet` (JS slices via `Array.from`, never `String.slice`); ranges straddling the snippet
+window are **clipped, not dropped**, and a content match always carries ≥1 range; queries cap
+at 256 chars. `skippedFiles` counts unreadable markdown files (each also `log::warn!`ed) so a
+permissions failure is distinguishable from an empty result — the UI must surface it when > 0.
 
 Both commands are `async fn` (worker pool; never hold the state Mutex across `.await` — copy
 the `root_of()` idiom). Errors are `CoreError` (existing kinds suffice: `io`, `notFound`).
@@ -66,13 +72,18 @@ the `root_of()` idiom). Errors are `CoreError` (existing kinds suffice: `io`, `n
   content-only matches.
 - **`links.rs`** — `read_link_graph(root) -> LinkGraph`. Per note, extract:
   - wikilinks: `[[target]]`, `[[target|alias]]`, `[[target#heading]]`, `[[target#heading|alias]]`
-    (target = part before `#`/`|`); embeds (`![[…]]`) count as links too.
+    (target = part before `#`/`|`); embeds (`![[…]]`) count as links too. Path-qualified
+    targets (`[[folder/note]]`) resolve by segment-aligned rel-path suffix match.
   - markdown links: `[text](target)` where target is relative and resolves inside the vault
-    (ignore `http(s):`, `mailto:`, absolute URLs); `%20`-decode.
+    (ignore `http(s):`, `mailto:`, absolute URLs); `%20`-decode; extensionless targets get a
+    `.md` fallback (Obsidian behavior).
   - **ignore links inside fenced code blocks and inline code spans** (Obsidian behavior).
+    Fences track opener char + length (CommonMark: a ````-fence only closes on ≥4 of the same
+    char); inline spans are backtick-run matched and may cross newlines.
   - resolution: wikilink target matches by case-insensitive filename (with or without `.md`),
-    shortest-rel-path tiebreak (Obsidian's rule); md links resolve relative to the note's
-    folder. Unresolved → skipped. Self-links and duplicate edges deduped.
+    shortest-rel-path tiebreak, then lexicographic (deterministic); case-colliding rel-paths
+    prefer the exact-case match. md links resolve relative to the note's folder. Unresolved →
+    skipped. Self-links and duplicate edges deduped on the unordered pair.
   - nodes: every markdown note in the vault (linked or not — orphans render too); cluster =
     first path segment. Node title reuses the existing precedence rule (`note.rs::title_from`:
     frontmatter `title` → first `# H1` → file stem), so graph, tree, and reader agree on names.
@@ -139,3 +150,10 @@ Scroll-to-match in reader/editor; live graph refresh on `vault://tree-changed`; 
 for unresolved links; inline `#tag` facets; search ranking beyond name-first; very large
 vault perf (label bands were tuned at ~40 nodes; no node cap in v1 — revisit if >2k-note
 vaults stutter); orb variant + magnet picking (prototype-only experiments).
+
+Documented v1 search limitations (review round 1): case-insensitivity is char-wise
+`to_lowercase` + final-sigma (ς→σ) — full Unicode case folding (ß↔ss) is deliberately NOT
+hand-rolled (house cautionary tale; revisit only via a vetted library). Non-UTF-8 notes are
+searched lossily (U+FFFD), so a search can miss text the reader shows — the reader flags such
+notes via `lossyText`. Fold-map memory is O(largest line) transiently; acceptable for local
+markdown, revisit in the capture phase.
