@@ -22,9 +22,11 @@ import {
   openVault,
   pickNewVaultLocation,
   pickVaultFolder,
+  readLinkGraph,
   readNote,
   readTree,
   renameEntry,
+  searchVault,
   writeNote,
 } from "./api";
 
@@ -193,6 +195,22 @@ describe("file / folder operation wrappers", () => {
       path: "/v/a.md",
       newParentPath: "/v/Sub",
     });
+  });
+});
+
+describe("search + graph wrappers", () => {
+  it("searchVault passes the query", async () => {
+    mockInvoke.mockResolvedValueOnce({ hits: [], truncated: false });
+    const out = await searchVault("neural");
+    expect(mockInvoke).toHaveBeenCalledWith("search_vault", { query: "neural" });
+    expect(out).toEqual({ hits: [], truncated: false });
+  });
+
+  it("readLinkGraph calls read_link_graph", async () => {
+    mockInvoke.mockResolvedValueOnce({ nodes: [], links: [] });
+    const out = await readLinkGraph();
+    expect(mockInvoke).toHaveBeenCalledWith("read_link_graph");
+    expect(out).toEqual({ nodes: [], links: [] });
   });
 });
 

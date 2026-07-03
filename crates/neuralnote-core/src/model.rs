@@ -87,3 +87,70 @@ pub struct RecentVault {
     /// Unix epoch milliseconds of the last open.
     pub last_opened: i64,
 }
+
+/// One matching line of a note in full-text search results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchMatch {
+    /// 1-based line number in the raw file.
+    pub line: u32,
+    /// The matching line, clipped to a window around the first match when long.
+    pub snippet: String,
+    /// Match ranges as `[start, end)` **Unicode-scalar (char) offsets into
+    /// `snippet`** (serialises to `[[s, e], …]`). The frontend slices the
+    /// snippet via `Array.from`, so both sides count code points — never bytes
+    /// or UTF-16 units.
+    pub ranges: Vec<(u32, u32)>,
+}
+
+/// One file's worth of search results.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileHit {
+    /// Absolute path on disk.
+    pub path: String,
+    pub rel_path: String,
+    pub title: String,
+    /// True when the file stem or title matched the query (ranked first).
+    pub name_match: bool,
+    /// Content matches; empty for a name-only hit.
+    pub matches: Vec<SearchMatch>,
+}
+
+/// The full result of a vault search.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SearchResponse {
+    pub hits: Vec<FileHit>,
+    /// True when a match cap clipped anything (the UI shows a banner).
+    pub truncated: bool,
+}
+
+/// A note in the link graph — one per markdown note, orphans included.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphNode {
+    /// The note's `rel_path` (stable id).
+    pub id: String,
+    pub title: String,
+    /// First path segment of `rel_path`; `""` for root-level notes.
+    pub cluster: String,
+}
+
+/// A resolved, deduplicated link between two notes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct GraphLink {
+    pub source: String,
+    pub target: String,
+    /// True when source and target live in different clusters (cross-folder).
+    pub bridge: bool,
+}
+
+/// The whole vault's wikilink/markdown-link graph.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LinkGraph {
+    pub nodes: Vec<GraphNode>,
+    pub links: Vec<GraphLink>,
+}

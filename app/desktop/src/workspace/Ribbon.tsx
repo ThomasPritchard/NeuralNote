@@ -1,7 +1,9 @@
-// The far-left icon rail (Obsidian's workspace switcher). Files is the only live
-// view in this phase; Search, Capture, and Graph are present-but-inert
-// placeholders for the next phase — kept as real, labelled, aria-disabled
-// buttons so the locked layout is honest without faking behaviour.
+// The far-left icon rail (Obsidian's workspace switcher). Files/Search swap
+// the sidebar panel and Graph view toggles the center pane — the view state
+// lives in Workspace, so this rail is a pure prop-driven control with real
+// active states. Capture and Settings remain present-but-inert placeholders
+// for later phases: real, labelled, aria-disabled buttons so the locked
+// layout is honest without faking behaviour.
 
 import {
   Brain,
@@ -16,20 +18,26 @@ import { cn } from "../lib/cn";
 
 const EASE = "ease-[cubic-bezier(0.32,0.72,0,1)]";
 
-interface RibbonItem {
-  icon: LucideIcon;
-  label: string;
-  active: boolean;
+/** Which sidebar panel is showing (Workspace-local view state). */
+export type SidebarPanel = "files" | "search";
+/** What the center pane renders (Workspace-local view state). */
+export type CenterView = "note" | "graph";
+
+interface RibbonProps {
+  sidebarPanel: SidebarPanel;
+  centerView: CenterView;
+  onShowFiles: () => void;
+  onShowSearch: () => void;
+  onToggleGraph: () => void;
 }
 
-const items: RibbonItem[] = [
-  { icon: Files, label: "Files", active: true },
-  { icon: Search, label: "Search", active: false },
-  { icon: FilePlus2, label: "Capture", active: false },
-  { icon: Network, label: "Graph view", active: false },
-];
-
-export function Ribbon() {
+export function Ribbon({
+  sidebarPanel,
+  centerView,
+  onShowFiles,
+  onShowSearch,
+  onToggleGraph,
+}: RibbonProps) {
   return (
     <nav
       aria-label="Workspace"
@@ -39,29 +47,50 @@ export function Ribbon() {
         <Brain className="size-[18px]" aria-hidden />
       </div>
 
-      {items.map(({ icon: Icon, label, active }) => (
-        <RibbonButton key={label} icon={Icon} label={label} active={active} />
-      ))}
+      <RibbonButton
+        icon={Files}
+        label="Files"
+        active={sidebarPanel === "files"}
+        onClick={onShowFiles}
+      />
+      <RibbonButton
+        icon={Search}
+        label="Search"
+        active={sidebarPanel === "search"}
+        onClick={onShowSearch}
+      />
+      <RibbonButton icon={FilePlus2} label="Capture" active={false} />
+      <RibbonButton
+        icon={Network}
+        label="Graph view"
+        active={centerView === "graph"}
+        onClick={onToggleGraph}
+      />
 
       <RibbonButton icon={Settings} label="Settings" active={false} className="mt-auto" />
     </nav>
   );
 }
 
-function RibbonButton({
-  icon: Icon,
-  label,
-  active,
-  className,
-}: RibbonItem & { className?: string }) {
-  // Only "Files" is functional this phase; the rest are honest placeholders.
-  const inert = !active;
+interface RibbonButtonProps {
+  icon: LucideIcon;
+  label: string;
+  active: boolean;
+  /** Absent for the not-yet-built placeholders (aria-disabled, no-op). */
+  onClick?: () => void;
+  className?: string;
+}
+
+function RibbonButton({ icon: Icon, label, active, onClick, className }: RibbonButtonProps) {
+  const inert = !onClick;
   return (
     <button
       type="button"
       aria-label={inert ? `${label} (coming soon)` : label}
       aria-disabled={inert || undefined}
+      aria-pressed={inert ? undefined : active}
       title={inert ? "Coming in a later phase" : label}
+      onClick={onClick}
       className={cn(
         "relative grid size-9 place-items-center rounded-lg transition-colors duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
         EASE,

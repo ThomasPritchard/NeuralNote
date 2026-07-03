@@ -1,11 +1,13 @@
-// The workspace: ribbon · file tree · reader/editor · cited-chat stub · status
-// bar. This orchestrator owns the open-note state (via useOpenNote) and the
+// The workspace: ribbon · file tree / search panel · reader/editor / graph ·
+// cited-chat stub · status bar. This orchestrator owns the open-note state
+// (via useOpenNote), the Workspace-local view state (which sidebar panel and
+// center view are showing — deliberately NOT in the vault store), and the
 // glue that keeps the reader honest when the tree mutates underneath it —
 // including a single guard that blocks losing unsaved edits when navigating
 // away, and the OS window-close / Cmd-Q path routed through that same guard.
 // Tree CRUD lives in FileTree; lifecycle errors flow from the store.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useReducer, useRef, useState } from "react";
 import { AlertTriangle, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -15,8 +17,10 @@ import { ChatStub } from "./ChatStub";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { FileTree } from "./FileTree";
 import { isPathInside, normSep, remapPath } from "./fileMeta";
+import { GraphView } from "./GraphView";
 import { NotePane } from "./NotePane";
-import { Ribbon } from "./Ribbon";
+import { Ribbon, type CenterView, type SidebarPanel } from "./Ribbon";
+import { SearchPanel } from "./SearchPanel";
 import { StatusBar } from "./StatusBar";
 import { useOpenNote } from "./useOpenNote";
 
@@ -26,6 +30,11 @@ export function Workspace() {
   const open = useOpenNote();
   // A deferred action awaiting the user's call on discarding unsaved edits.
   const [pendingDiscard, setPendingDiscard] = useState<(() => void) | null>(null);
+  // Workspace-local view state (specs/search-and-graph-view.md §View model).
+  const [sidebarPanel, setSidebarPanel] = useState<SidebarPanel>("files");
+  const [centerView, setCenterView] = useState<CenterView>("note");
+  // Bumped whenever ⌘K / the ribbon Search icon wants the search field focused.
+  const [searchFocusSignal, bumpSearchFocus] = useReducer((n: number) => n + 1, 0);
 
   // The latest open-note snapshot, readable from the stable callbacks and the OS
   // close handler below without rebuilding them (or re-registering the window
@@ -48,12 +57,45 @@ export function Workspace() {
       .catch((err) => console.error("window destroy failed:", err));
   }, []);
 
+  /** Open a note by absolute path (tree, search result, graph "Open in
+   *  reader"). The center-view switch lives INSIDE the guarded action so
+   *  cancelling the discard dialog keeps the current view. */
+  const openNoteAt = useCallback(
+    (absPath: string) =>
+      guard(() => {
+        openRef.current.open(absPath);
+        setCenterView("note");
+      }),
+    [guard],
+  );
+
+  const vaultPath = vault?.path;
+  /** GraphNode ids are vault-relative paths; join onto the vault root. The
+   *  plain join is safe — the backend canonicalizes through ensure_within,
+   *  and mockVault keys entries exactly this way. */
+  const openFromGraph = useCallback(
+    (relPath: string) => {
+      if (vaultPath) openNoteAt(`${vaultPath}/${relPath}`);
+    },
+    [openNoteAt, vaultPath],
+  );
+
   const handleSelect = useCallback(
     (path: string) => {
       if (path === openRef.current.path) return;
-      guard(() => openRef.current.open(path));
+      openNoteAt(path);
     },
-    [guard],
+    [openNoteAt],
+  );
+
+  const handleShowFiles = useCallback(() => setSidebarPanel("files"), []);
+  const handleShowSearch = useCallback(() => {
+    setSidebarPanel("search");
+    bumpSearchFocus();
+  }, []);
+  const handleToggleGraph = useCallback(
+    () => setCenterView((v) => (v === "graph" ? "note" : "graph")),
+    [],
   );
 
   const handleDeleted = useCallback((node: TreeNode) => {
@@ -120,25 +162,52 @@ export function Workspace() {
     };
   }, [closeWindow, reportError]);
 
+  // ⌘K / Ctrl+K anywhere: open the sidebar search panel and focus its field.
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setSidebarPanel("search");
+        bumpSearchFocus();
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   if (!vault) return null;
 
   return (
     <div className="flex h-full w-full flex-col bg-background text-foreground">
       <div className="flex min-h-0 flex-1">
-        <Ribbon />
-        <FileTree
-          vaultName={vault.name}
-          vaultPath={vault.path}
-          tree={tree}
-          activePath={open.path}
-          activeDirty={open.dirty}
-          refreshTree={refreshTree}
-          onSelect={handleSelect}
-          onDeleted={handleDeleted}
-          onRemap={handleRemap}
-          onCloseVault={handleCloseVault}
+        <Ribbon
+          sidebarPanel={sidebarPanel}
+          centerView={centerView}
+          onShowFiles={handleShowFiles}
+          onShowSearch={handleShowSearch}
+          onToggleGraph={handleToggleGraph}
         />
-        <NotePane open={open} onClose={() => guard(() => openRef.current.clear())} />
+        {sidebarPanel === "files" ? (
+          <FileTree
+            vaultName={vault.name}
+            vaultPath={vault.path}
+            tree={tree}
+            activePath={open.path}
+            activeDirty={open.dirty}
+            refreshTree={refreshTree}
+            onSelect={handleSelect}
+            onDeleted={handleDeleted}
+            onRemap={handleRemap}
+            onCloseVault={handleCloseVault}
+          />
+        ) : (
+          <SearchPanel focusSignal={searchFocusSignal} onOpen={openNoteAt} />
+        )}
+        {centerView === "graph" ? (
+          <GraphView onOpenNote={openFromGraph} />
+        ) : (
+          <NotePane open={open} onClose={() => guard(() => openRef.current.clear())} />
+        )}
         <ChatStub />
       </div>
 

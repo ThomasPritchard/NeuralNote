@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TreeNode } from "../lib/types";
@@ -11,6 +11,9 @@ const openState = vi.hoisted(() => ({ current: null as unknown as OpenNote }));
 const captured = vi.hoisted(() => ({
   fileTree: {} as Record<string, (...a: never[]) => void>,
   notePane: {} as Record<string, (...a: never[]) => void>,
+  ribbon: {} as Record<string, (...a: never[]) => void>,
+  searchPanel: {} as { focusSignal: number; onOpen: (absPath: string) => void },
+  graphView: {} as { onOpenNote: (relPath: string) => void },
 }));
 const win = vi.hoisted(() => {
   const state: { closeCb?: (e: { preventDefault: () => void }) => void } = {};
@@ -45,7 +48,24 @@ vi.mock("./NotePane", () => ({
   },
 }));
 vi.mock("./ChatStub", () => ({ ChatStub: () => <div data-testid="chatstub" /> }));
-vi.mock("./Ribbon", () => ({ Ribbon: () => <div data-testid="ribbon" /> }));
+vi.mock("./Ribbon", () => ({
+  Ribbon: (props: Record<string, (...a: never[]) => void>) => {
+    captured.ribbon = props;
+    return <div data-testid="ribbon" />;
+  },
+}));
+vi.mock("./SearchPanel", () => ({
+  SearchPanel: (props: { focusSignal: number; onOpen: (absPath: string) => void }) => {
+    captured.searchPanel = props;
+    return <div data-testid="searchpanel" data-focus-signal={props.focusSignal} />;
+  },
+}));
+vi.mock("./GraphView", () => ({
+  GraphView: (props: { onOpenNote: (relPath: string) => void }) => {
+    captured.graphView = props;
+    return <div data-testid="graphview" />;
+  },
+}));
 vi.mock("./StatusBar", () => ({
   StatusBar: ({ vaultName }: { vaultName: string }) => (
     <div data-testid="statusbar">{vaultName}</div>
@@ -281,6 +301,110 @@ describe("Workspace — close vault + close note", () => {
     expect(openState.current.clear).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole("button", { name: "Discard" }));
     expect(openState.current.clear).toHaveBeenCalled();
+  });
+});
+
+describe("Workspace — view state (sidebar panel + center view)", () => {
+  it("swaps the sidebar between files and search via the ribbon", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+    expect(screen.queryByTestId("searchpanel")).not.toBeInTheDocument();
+
+    act(() => captured.ribbon.onShowSearch());
+    expect(screen.getByTestId("searchpanel")).toBeInTheDocument();
+    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+
+    act(() => captured.ribbon.onShowFiles());
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+    expect(screen.queryByTestId("searchpanel")).not.toBeInTheDocument();
+  });
+
+  it("toggles the center pane between note and graph via the ribbon", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    expect(screen.getByTestId("notepane")).toBeInTheDocument();
+
+    act(() => captured.ribbon.onToggleGraph());
+    expect(screen.getByTestId("graphview")).toBeInTheDocument();
+    expect(screen.queryByTestId("notepane")).not.toBeInTheDocument();
+
+    act(() => captured.ribbon.onToggleGraph());
+    expect(screen.getByTestId("notepane")).toBeInTheDocument();
+    expect(screen.queryByTestId("graphview")).not.toBeInTheDocument();
+  });
+
+  it("⌘K / Ctrl+K opens the search panel and bumps the focus signal", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    let notPrevented = true;
+    act(() => {
+      notPrevented = fireEvent.keyDown(window, { key: "k", metaKey: true });
+    });
+    expect(notPrevented).toBe(false); // preventDefault was called
+    expect(screen.getByTestId("searchpanel")).toHaveAttribute(
+      "data-focus-signal",
+      "1",
+    );
+
+    // Repeat presses (case-insensitive, Ctrl too) keep bumping the signal.
+    act(() => {
+      fireEvent.keyDown(window, { key: "K", ctrlKey: true });
+    });
+    expect(screen.getByTestId("searchpanel")).toHaveAttribute(
+      "data-focus-signal",
+      "2",
+    );
+  });
+
+  it("ignores a plain K press without a modifier", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    act(() => {
+      fireEvent.keyDown(window, { key: "k" });
+    });
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+    expect(screen.queryByTestId("searchpanel")).not.toBeInTheDocument();
+  });
+
+  it("opens a search result through the guard and lands in note view", () => {
+    openState.current = makeOpen({ dirty: false });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    act(() => captured.ribbon.onShowSearch());
+    act(() => captured.ribbon.onToggleGraph());
+
+    act(() => captured.searchPanel.onOpen("/v/b.md"));
+    expect(openState.current.open).toHaveBeenCalledWith("/v/b.md");
+    expect(screen.getByTestId("notepane")).toBeInTheDocument();
+    expect(screen.queryByTestId("graphview")).not.toBeInTheDocument();
+  });
+
+  it("keeps the graph view when a guarded open is cancelled", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    act(() => captured.ribbon.onToggleGraph());
+
+    act(() => captured.graphView.onOpenNote("b.md"));
+    expect(screen.getByText("Discard unsaved changes?")).toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.getByTestId("graphview")).toBeInTheDocument();
+    expect(openState.current.open).not.toHaveBeenCalled();
+  });
+
+  it("joins the vault path for a confirmed graph open and returns to note view", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    act(() => captured.ribbon.onToggleGraph());
+
+    act(() => captured.graphView.onOpenNote("Notes/b.md"));
+    await userEvent.click(screen.getByRole("button", { name: "Discard" }));
+    expect(openState.current.open).toHaveBeenCalledWith("/v/Notes/b.md");
+    expect(screen.getByTestId("notepane")).toBeInTheDocument();
   });
 });
 

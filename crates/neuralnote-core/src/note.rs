@@ -172,6 +172,15 @@ pub fn write_note(
     Ok(build_doc(root, &path, content.to_string(), false))
 }
 
+/// Title + frontmatter-stripped body for already-in-hand `raw` content, using the
+/// same precedence as [`read_note`] (frontmatter `title` → first `# H1` → `stem`),
+/// so search, graph, tree, and reader all agree on a note's name.
+pub(crate) fn title_and_body(raw: &str, stem: &str) -> (String, String) {
+    let parsed = parse_frontmatter(raw);
+    let title = title_from(&parsed.frontmatter, &parsed.body, stem);
+    (title, parsed.body)
+}
+
 struct Parsed {
     frontmatter: Option<serde_json::Value>,
     frontmatter_raw: Option<String>,

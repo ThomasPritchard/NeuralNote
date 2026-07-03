@@ -115,3 +115,26 @@ pub fn node_for(root: &Path, path: &Path) -> CoreResult<TreeNode> {
 pub fn is_markdown_ext(ext: Option<&str>) -> bool {
     matches!(ext, Some("md") | Some("markdown") | Some("mdx"))
 }
+
+/// Flatten every markdown file out of a scanned tree, in tree-walk order
+/// (deterministic: folders-first, case-insensitive by name — the [`read_tree`]
+/// sort). Consumers that start from `read_tree` + this helper inherit the scan
+/// rules (hidden-dotdir skip, symlink skip, depth cap) by construction.
+pub fn markdown_files(nodes: &[TreeNode]) -> Vec<&TreeNode> {
+    let mut out = Vec::new();
+    collect_markdown(nodes, &mut out);
+    out
+}
+
+fn collect_markdown<'a>(nodes: &'a [TreeNode], out: &mut Vec<&'a TreeNode>) {
+    for node in nodes {
+        match &node.children {
+            Some(children) => collect_markdown(children, out),
+            None => {
+                if is_markdown_ext(node.ext.as_deref()) {
+                    out.push(node);
+                }
+            }
+        }
+    }
+}

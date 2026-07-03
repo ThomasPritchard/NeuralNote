@@ -4,7 +4,15 @@
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { CoreError, NoteDoc, RecentVault, TreeNode, Vault } from "./types";
+import type {
+  CoreError,
+  LinkGraph,
+  NoteDoc,
+  RecentVault,
+  SearchResponse,
+  TreeNode,
+  Vault,
+} from "./types";
 
 /** Normalise a thrown Tauri error (a serialised CoreError, or anything) to a
  *  message string the UI can show. Failures are surfaced, never swallowed. */
@@ -70,6 +78,14 @@ export const deleteEntry = (path: string) =>
 
 export const moveEntry = (path: string, newParentPath: string) =>
   invoke<TreeNode>("move_entry", { path, newParentPath });
+
+// ── Search + link graph ──────────────────────────────────────────────────────
+/** Full-text search across the vault's markdown notes (on-demand scan). */
+export const searchVault = (query: string) =>
+  invoke<SearchResponse>("search_vault", { query });
+
+/** The wikilink/markdown-link graph over every markdown note in the vault. */
+export const readLinkGraph = () => invoke<LinkGraph>("read_link_graph");
 
 // ── Events ───────────────────────────────────────────────────────────────────
 /** Subscribe to on-disk vault changes (external edits, e.g. from Obsidian).

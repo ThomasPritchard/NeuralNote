@@ -8,7 +8,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use neuralnote_core::model::{NoteDoc, RecentVault, TreeNode, Vault};
+use neuralnote_core::model::{LinkGraph, NoteDoc, RecentVault, SearchResponse, TreeNode, Vault};
 use neuralnote_core::CoreError;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -270,6 +270,19 @@ async fn write_note(
     neuralnote_core::note::write_note(&root_of(&state)?, Path::new(&path), &content, expected_hash)
 }
 
+// `search_vault`/`read_link_graph` follow the same recipe as `read_tree` above:
+// async → worker pool (a full-vault scan must not freeze the window), sync body,
+// and the state guard (inside `root_of`) never crosses an await point.
+#[tauri::command]
+async fn search_vault(state: SharedState<'_>, query: String) -> Result<SearchResponse, CoreError> {
+    neuralnote_core::search::search_vault(&root_of(&state)?, &query)
+}
+
+#[tauri::command]
+async fn read_link_graph(state: SharedState<'_>) -> Result<LinkGraph, CoreError> {
+    neuralnote_core::links::read_link_graph(&root_of(&state)?)
+}
+
 #[tauri::command]
 fn create_folder(
     state: SharedState,
@@ -339,6 +352,8 @@ pub fn run() {
             read_tree,
             read_note,
             write_note,
+            search_vault,
+            read_link_graph,
             create_folder,
             create_note,
             rename_entry,

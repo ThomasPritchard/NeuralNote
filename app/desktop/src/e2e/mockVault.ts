@@ -11,6 +11,8 @@
 //   - TreeNode / NoteDoc / Vault shapes ... src/lib/types.ts (camelCase serde)
 //   - create_note appends `.md`, rename keeps a markdown ext, folders-first sort,
 //     title = frontmatter.title → first H1 → file stem ... crates/neuralnote-core
+//   - search_vault (code-point offsets, snippet windows, caps) + read_link_graph
+//     (wikilink/md-link resolution) ... specs/search-and-graph-view.md §Contract
 //
 // Events (`vault://tree-changed`, the window `tauri://close-requested`) and the
 // window `destroy` are wired too: `mockIPC(..., { shouldMockEvents: true })`
@@ -22,8 +24,14 @@ import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type { InvokeArgs } from "@tauri-apps/api/core";
 import type {
   CoreError,
+  FileHit,
+  GraphLink,
+  GraphNode,
+  LinkGraph,
   NoteDoc,
   RecentVault,
+  SearchMatch,
+  SearchResponse,
   TreeNode,
   Vault,
 } from "../lib/types";
@@ -173,6 +181,254 @@ const titleFrom = (
   return stem;
 };
 
+// ── Search mirror (specs/search-and-graph-view.md §Contract: search_vault) ───
+// Offsets are Unicode CODE POINTS (`Array.from`), matching the Rust side's char
+// (scalar-value) offsets — never UTF-16 units.
+
+/** A markdown note handed to the search/graph mirrors. */
+interface MdFile {
+  path: string;
+  rel: string;
+  content: string;
+}
+
+const SEARCH_MAX_TOTAL = 200;
+const SEARCH_MAX_PER_FILE = 50;
+const SNIPPET_WINDOW = 200;
+
+/** Lowercase one code point, keeping it a single code point (simple case
+ *  folding). Multi-code-point expansions (e.g. İ → i̇) keep the original so
+ *  match offsets never drift out of code-point space. */
+const foldCp = (cp: string): string => {
+  const lower = cp.toLowerCase();
+  return Array.from(lower).length === 1 ? lower : cp;
+};
+
+const foldStr = (s: string): string => Array.from(s).map(foldCp).join("");
+
+/** Non-overlapping, case-folded occurrences of `needle` in a line, both in
+ *  code-point space. Returns [start, end) pairs. */
+const findRanges = (lineCps: string[], needleCps: string[]): [number, number][] => {
+  const ranges: [number, number][] = [];
+  const hay = lineCps.map(foldCp);
+  for (let i = 0; i + needleCps.length <= hay.length; ) {
+    let hit = true;
+    for (let j = 0; j < needleCps.length; j += 1) {
+      if (hay[i + j] !== needleCps[j]) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit) {
+      ranges.push([i, i + needleCps.length]);
+      i += needleCps.length;
+    } else {
+      i += 1;
+    }
+  }
+  return ranges;
+};
+
+/** Clip a long line to a SNIPPET_WINDOW-code-point window centered on the
+ *  first match, rebasing ranges into the window and dropping ones that fall
+ *  outside it. Short lines pass through whole. */
+const windowSnippet = (
+  lineCps: string[],
+  ranges: [number, number][],
+): { snippet: string; ranges: [number, number][] } => {
+  if (lineCps.length <= SNIPPET_WINDOW) {
+    return { snippet: lineCps.join(""), ranges };
+  }
+  const center = Math.floor((ranges[0][0] + ranges[0][1]) / 2);
+  const start = Math.max(
+    0,
+    Math.min(center - SNIPPET_WINDOW / 2, lineCps.length - SNIPPET_WINDOW),
+  );
+  const rebased = ranges
+    .map(([s, e]): [number, number] => [
+      Math.max(s - start, 0),
+      Math.min(e - start, SNIPPET_WINDOW),
+    ])
+    .filter(([s, e]) => s < e);
+  return {
+    snippet: lineCps.slice(start, start + SNIPPET_WINDOW).join(""),
+    ranges: rebased,
+  };
+};
+
+/** Mirror of core search: markdown-only, case-insensitive over the raw text
+ *  (frontmatter included), name/title matches ranked first, caps 50/file and
+ *  200 total with `truncated`. Name-only hits carry `matches: []`. */
+const searchFiles = (files: MdFile[], rawQuery: string): SearchResponse => {
+  const query = rawQuery.trim();
+  if (query === "") return { hits: [], truncated: false };
+  const needle = Array.from(query).map(foldCp);
+  const queryFolded = needle.join("");
+
+  let truncated = false;
+  const nameHits: FileHit[] = [];
+  const contentHits: FileHit[] = [];
+  for (const file of files) {
+    const stem = stemOf(file.path);
+    const parsed = parseFrontmatter(file.content);
+    const title = titleFrom(parsed.frontmatter, parsed.body, stem);
+    const nameMatch =
+      foldStr(stem).includes(queryFolded) || foldStr(title).includes(queryFolded);
+
+    const matches: SearchMatch[] = [];
+    const lines = file.content.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i += 1) {
+      const lineCps = Array.from(lines[i]);
+      const ranges = findRanges(lineCps, needle);
+      if (ranges.length === 0) continue;
+      if (matches.length >= SEARCH_MAX_PER_FILE) {
+        truncated = true;
+        break;
+      }
+      matches.push({ line: i + 1, ...windowSnippet(lineCps, ranges) });
+    }
+
+    if (!nameMatch && matches.length === 0) continue;
+    const hit: FileHit = { path: file.path, relPath: file.rel, title, nameMatch, matches };
+    (nameMatch ? nameHits : contentHits).push(hit);
+  }
+
+  // Apply the global cap in display order (name matches first).
+  const hits = [...nameHits, ...contentHits];
+  let budget = SEARCH_MAX_TOTAL;
+  for (const hit of hits) {
+    if (hit.matches.length > budget) {
+      hit.matches = hit.matches.slice(0, budget);
+      truncated = true;
+    }
+    budget -= hit.matches.length;
+  }
+  return { hits, truncated };
+};
+
+// ── Link-graph mirror (§Contract: read_link_graph) ───────────────────────────
+
+const FENCED_BLOCK_RE = /```[\s\S]*?(?:```|$)/g;
+const INLINE_CODE_RE = /`[^`]*`/g;
+const WIKILINK_RE = /!?\[\[([^\]]+)\]\]/g;
+const MD_LINK_RE = /\[[^\]]*\]\(([^)\s]+)\)/g;
+const URL_SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.\-]*:/;
+
+/** Top-level folder of a relPath; "" for vault-root notes. */
+const clusterOf = (rel: string): string =>
+  rel.includes("/") ? rel.slice(0, rel.indexOf("/")) : "";
+
+/** Obsidian's ambiguity rule: shortest relPath wins, then lexicographic. */
+const pickShortest = (candidates: string[]): string | null => {
+  if (candidates.length === 0) return null;
+  return [...candidates].sort(
+    (x, y) => x.length - y.length || (x < y ? -1 : x > y ? 1 : 0),
+  )[0];
+};
+
+/** Resolve a wikilink target: case-insensitive filename (with or without .md);
+ *  path-qualified targets (containing /) match by relPath suffix at a segment
+ *  boundary. */
+const resolveWikilink = (target: string, files: MdFile[]): string | null => {
+  const t = target.toLowerCase();
+  const candidates = files
+    .filter((f) => {
+      const rel = f.rel.toLowerCase();
+      if (t.includes("/")) {
+        return (
+          rel === t ||
+          rel === `${t}.md` ||
+          rel.endsWith(`/${t}`) ||
+          rel.endsWith(`/${t}.md`)
+        );
+      }
+      return basename(rel) === t || stemOf(rel) === t;
+    })
+    .map((f) => f.rel);
+  return pickShortest(candidates);
+};
+
+/** Resolve a relative markdown-link target against the note's folder, with
+ *  `../` handling. Null when it escapes the vault root or nothing matches. */
+const resolveMdLink = (
+  noteRel: string,
+  target: string,
+  files: MdFile[],
+): string | null => {
+  const segs = noteRel.split("/").slice(0, -1);
+  for (const part of target.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") {
+      if (segs.length === 0) return null; // escapes the vault root
+      segs.pop();
+    } else {
+      segs.push(part);
+    }
+  }
+  const resolved = segs.join("/").toLowerCase();
+  if (resolved === "") return null;
+  const candidates = files
+    .filter((f) => {
+      const rel = f.rel.toLowerCase();
+      return rel === resolved || rel === `${resolved}.md`;
+    })
+    .map((f) => f.rel);
+  return pickShortest(candidates);
+};
+
+/** Mirror of core link extraction: nodes for every markdown note (orphans
+ *  too); wikilinks + relative markdown links from the frontmatter-stripped
+ *  body with code fences/spans masked; self-links dropped; unordered-pair
+ *  dedupe; bridge = endpoints in different clusters. */
+const buildLinkGraph = (files: MdFile[]): LinkGraph => {
+  const nodes: GraphNode[] = [];
+  const links: GraphLink[] = [];
+  const seen = new Set<string>();
+
+  const addEdge = (source: string, target: string): void => {
+    if (source === target) return; // self-link
+    const key =
+      source < target ? `${source}\u0000${target}` : `${target}\u0000${source}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    links.push({ source, target, bridge: clusterOf(source) !== clusterOf(target) });
+  };
+
+  for (const f of files) {
+    const parsed = parseFrontmatter(f.content);
+    nodes.push({
+      id: f.rel,
+      title: titleFrom(parsed.frontmatter, parsed.body, stemOf(f.rel)),
+      cluster: clusterOf(f.rel),
+    });
+
+    // Obsidian ignores links inside fenced blocks and inline code spans.
+    const masked = parsed.body
+      .replace(FENCED_BLOCK_RE, " ")
+      .replace(INLINE_CODE_RE, " ");
+
+    for (const m of masked.matchAll(WIKILINK_RE)) {
+      const target = m[1].split(/[#|]/)[0].trim();
+      if (target === "") continue;
+      const resolved = resolveWikilink(target, files);
+      if (resolved !== null) addEdge(f.rel, resolved);
+    }
+
+    for (const m of masked.matchAll(MD_LINK_RE)) {
+      let target = m[1];
+      if (URL_SCHEME_RE.test(target) || target.startsWith("/")) continue;
+      const hash = target.indexOf("#");
+      if (hash !== -1) target = target.slice(0, hash);
+      target = target.replace(/%20/g, " ");
+      if (target === "") continue;
+      const resolved = resolveMdLink(f.rel, target, files);
+      if (resolved !== null) addEdge(f.rel, resolved);
+    }
+  }
+
+  return { nodes, links };
+};
+
 export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
   let root = VAULT_ROOT;
   const entries = new Map<string, Entry>();
@@ -274,6 +530,17 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     return e as Entry & { kind: "file" };
   };
 
+  /** Every markdown note, sorted by relPath for deterministic hit/node order. */
+  const markdownFiles = (): MdFile[] => {
+    const files: MdFile[] = [];
+    for (const [p, e] of entries) {
+      if (e.kind === "file" && isMarkdownExt(extOf(p))) {
+        files.push({ path: p, rel: relOf(p), content: e.content });
+      }
+    }
+    return files.sort((x, y) => (x.rel < y.rel ? -1 : x.rel > y.rel ? 1 : 0));
+  };
+
   // ── The IPC handler: one stateful backend for the whole journey ───────────
   const handler = (cmd: string, payload?: InvokeArgs): unknown => {
     calls.push(cmd);
@@ -354,6 +621,10 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         }
         return undefined;
       }
+      case "search_vault":
+        return searchFiles(markdownFiles(), a.query as string);
+      case "read_link_graph":
+        return buildLinkGraph(markdownFiles());
       case "move_entry": {
         const path = a.path as string;
         const newParent = a.newParentPath as string;

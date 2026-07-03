@@ -59,6 +59,67 @@ export interface RecentVault {
   lastOpened: number;
 }
 
+// ── Search (search_vault) ────────────────────────────────────────────────────
+
+/** One matching line within a file. */
+export interface SearchMatch {
+  /** 1-based line number in the file. */
+  line: number;
+  /** The matching line, clipped to a ~200-code-point window for long lines. */
+  snippet: string;
+  /** [start, end) match offsets into `snippet`, in Unicode CODE POINTS — the
+   *  Rust side counts `char`s (scalar values), not UTF-16 units. Slice with
+   *  `Array.from(snippet).slice(start, end)`, never `String.prototype.slice`
+   *  (which counts UTF-16 units and drifts past any astral char, e.g. emoji). */
+  ranges: [number, number][];
+}
+
+/** A file with search matches (by content, file name, or note title). */
+export interface FileHit {
+  /** Absolute path on disk (feeds the guarded open). */
+  path: string;
+  /** Vault-relative, `/`-joined — the stable id for the UI. */
+  relPath: string;
+  /** frontmatter `title` → first H1 → file stem (same rule as NoteDoc). */
+  title: string;
+  /** The query matched the file stem or title; such hits rank first, and a
+   *  name-only hit (no content matches) carries `matches: []`. */
+  nameMatch: boolean;
+  matches: SearchMatch[];
+}
+
+export interface SearchResponse {
+  hits: FileHit[];
+  /** True when results were clipped by the caps (50 matches/file, 200 total). */
+  truncated: boolean;
+}
+
+// ── Link graph (read_link_graph) ─────────────────────────────────────────────
+
+/** A markdown note in the vault link graph (orphans included). */
+export interface GraphNode {
+  /** Vault-relative path — the stable id shared with TreeNode.relPath. */
+  id: string;
+  /** Same precedence rule as NoteDoc.title. */
+  title: string;
+  /** Top-level folder name; "" for vault-root notes. */
+  cluster: string;
+}
+
+/** An undirected, deduped wikilink/markdown-link edge between two notes. */
+export interface GraphLink {
+  /** GraphNode ids (relPaths). */
+  source: string;
+  target: string;
+  /** True when the endpoints live in different clusters (cross-folder link). */
+  bridge: boolean;
+}
+
+export interface LinkGraph {
+  nodes: GraphNode[];
+  links: GraphLink[];
+}
+
 /** The shape a `CoreError` takes when it crosses the Tauri boundary. */
 export interface CoreError {
   kind:
