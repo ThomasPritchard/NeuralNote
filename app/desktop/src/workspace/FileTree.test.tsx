@@ -364,6 +364,97 @@ describe("FileTree — TreeRow interactions", () => {
   });
 });
 
+describe("FileTree — filename filter", () => {
+  it("renders an enabled filter input with the new labels and no ⌘K chip", () => {
+    setup([fileNode("a.md")]);
+    const input = screen.getByLabelText("Filter files by name");
+    expect(input).toBeEnabled();
+    expect(input).toHaveAttribute("placeholder", "Filter files…");
+    // ⌘K belongs to the vault-wide SearchPanel, not the sidebar filter.
+    expect(screen.queryByText("⌘K")).not.toBeInTheDocument();
+  });
+
+  it("typing narrows the tree to matching files and their ancestor folders", async () => {
+    setup([
+      folderNode("Notes", [fileNode("alpha.md"), fileNode("beta.md")]),
+      fileNode("top.md"),
+    ]);
+
+    await userEvent.type(screen.getByLabelText("Filter files by name"), "beta");
+
+    expect(screen.getByText("Notes")).toBeInTheDocument();
+    expect(screen.getByText("beta.md")).toBeInTheDocument();
+    expect(screen.queryByText("alpha.md")).not.toBeInTheDocument();
+    expect(screen.queryByText("top.md")).not.toBeInTheDocument();
+  });
+
+  it("auto-expands collapsed folders while the filter is active", async () => {
+    setup([folderNode("Notes", [fileNode("alpha.md")])]);
+    await userEvent.click(screen.getByText("Notes").closest("button")!); // collapse
+    expect(screen.queryByText("alpha.md")).not.toBeInTheDocument();
+
+    await userEvent.type(screen.getByLabelText("Filter files by name"), "alpha");
+
+    expect(screen.getByText("alpha.md")).toBeInTheDocument();
+  });
+
+  it("keeps only the filtered children of a folder whose own name matches", async () => {
+    setup([folderNode("Projects", [fileNode("alpha.md"), fileNode("project-plan.md")])]);
+
+    await userEvent.type(screen.getByLabelText("Filter files by name"), "project");
+
+    expect(screen.getByText("Projects")).toBeInTheDocument();
+    expect(screen.getByText("project-plan.md")).toBeInTheDocument();
+    expect(screen.queryByText("alpha.md")).not.toBeInTheDocument();
+  });
+
+  it("shows the ✕ clear button only while the filter is non-empty", async () => {
+    setup([fileNode("a.md")]);
+    expect(screen.queryByRole("button", { name: "Clear filter" })).not.toBeInTheDocument();
+
+    await userEvent.type(screen.getByLabelText("Filter files by name"), "a");
+
+    expect(screen.getByRole("button", { name: "Clear filter" })).toBeInTheDocument();
+  });
+
+  it("clearing via ✕ restores the full tree and the prior collapse state", async () => {
+    setup([folderNode("Notes", [fileNode("alpha.md")]), fileNode("top.md")]);
+    await userEvent.click(screen.getByText("Notes").closest("button")!); // collapse
+    await userEvent.type(screen.getByLabelText("Filter files by name"), "alpha");
+    expect(screen.getByText("alpha.md")).toBeInTheDocument();
+    expect(screen.queryByText("top.md")).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Clear filter" }));
+
+    expect(screen.getByLabelText("Filter files by name")).toHaveValue("");
+    expect(screen.getByText("top.md")).toBeInTheDocument(); // full tree back
+    expect(screen.queryByText("alpha.md")).not.toBeInTheDocument(); // Notes still collapsed
+  });
+
+  it("Escape clears the filter and restores the full tree and collapse state", async () => {
+    setup([folderNode("Notes", [fileNode("alpha.md")]), fileNode("top.md")]);
+    await userEvent.click(screen.getByText("Notes").closest("button")!); // collapse
+    const input = screen.getByLabelText("Filter files by name");
+    await userEvent.type(input, "alpha");
+    expect(screen.queryByText("top.md")).not.toBeInTheDocument();
+
+    await userEvent.type(input, "{Escape}");
+
+    expect(input).toHaveValue("");
+    expect(screen.getByText("top.md")).toBeInTheDocument();
+    expect(screen.queryByText("alpha.md")).not.toBeInTheDocument(); // Notes still collapsed
+  });
+
+  it("shows a no-match empty state distinct from the empty-vault copy", async () => {
+    setup([fileNode("a.md")]);
+
+    await userEvent.type(screen.getByLabelText("Filter files by name"), "zzz");
+
+    expect(screen.getByText('No files match "zzz"')).toBeInTheDocument();
+    expect(screen.queryByText(/This vault is empty/i)).not.toBeInTheDocument();
+  });
+});
+
 describe("FileTree — vault menu actions", () => {
   it("refreshes the tree and closes the vault", async () => {
     const p = setup([]);

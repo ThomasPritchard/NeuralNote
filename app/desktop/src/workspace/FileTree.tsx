@@ -12,6 +12,7 @@ import { cn } from "../lib/cn";
 import type { TreeNode } from "../lib/types";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { isPathInside, normSep } from "./fileMeta";
+import { filterTree } from "./filterTree";
 import {
   CreateRow,
   TreeRow,
@@ -22,6 +23,11 @@ import {
 import { VaultMenu } from "./VaultMenu";
 
 const EASE = "ease-[cubic-bezier(0.32,0.72,0,1)]";
+
+// While the filename filter is active every surviving folder renders expanded:
+// this empty set is passed as the tree's collapsed-set so the user's real
+// collapse state stays untouched and restores when the filter clears.
+const NO_COLLAPSED: Set<string> = new Set();
 
 interface FileTreeProps {
   vaultName: string;
@@ -53,6 +59,7 @@ export const FileTree = memo(function FileTree({
   onCloseVault,
 }: FileTreeProps) {
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [filter, setFilter] = useState("");
   const [creating, setCreating] = useState<CreatingState | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [dragPath, setDragPath] = useState<string | null>(null);
@@ -144,19 +151,28 @@ export const FileTree = memo(function FileTree({
   // (the workspace passes stable handlers); making row-level memo effective for
   // large vaults means useCallback-ing these handlers + useMemo-ing ctx — a
   // future optimisation, deferred as a low-value nicety.
+  const filterActive = filter.trim() !== "";
+  const visibleTree = filterActive ? filterTree(tree, filter) : tree;
+
   const ctx: TreeContext = {
     activePath,
-    collapsed,
+    // Filtering forces every surviving folder open without touching the real
+    // collapse state, so it restores intact when the filter clears.
+    collapsed: filterActive ? NO_COLLAPSED : collapsed,
     creating,
     renaming,
     dragPath,
-    toggle: (relPath) =>
+    toggle: (relPath) => {
+      // A toggle while filtering would mutate the real collapse state with no
+      // visible effect (everything renders expanded) — ignore it instead.
+      if (filterActive) return;
       setCollapsed((prev) => {
         const next = new Set(prev);
         if (next.has(relPath)) next.delete(relPath);
         else next.add(relPath);
         return next;
-      }),
+      });
+    },
     onSelect,
     onStartCreate: startCreate,
     onStartRename: startRename,
@@ -208,19 +224,35 @@ export const FileTree = memo(function FileTree({
         )}
       </header>
 
-      {/* Search — visual placeholder; vault search arrives in a later phase. */}
+      {/* Filename filter — narrows the tree as you type. Full-text vault
+          search lives in the ⌘K SearchPanel; this only matches file names. */}
       <div className="px-3 pb-2">
         <label className="flex items-center gap-2 rounded-md border border-border bg-background/40 px-2 py-1.5 text-[13px] text-muted-foreground/70">
           <Search className="size-3.5 shrink-0" aria-hidden />
           <input
-            disabled
-            aria-label="Search vault (coming soon)"
-            placeholder="Search — coming soon"
-            className="w-full bg-transparent placeholder:text-muted-foreground/60 focus:outline-none disabled:cursor-not-allowed"
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            onKeyDown={(e) => {
+              if (e.key === "Escape" && filter !== "") {
+                e.stopPropagation();
+                setFilter("");
+              }
+            }}
+            aria-label="Filter files by name"
+            placeholder="Filter files…"
+            className="w-full bg-transparent placeholder:text-muted-foreground/60 focus:outline-none"
           />
-          <kbd className="nn-mono rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
-            ⌘K
-          </kbd>
+          {filter !== "" && (
+            <button
+              type="button"
+              aria-label="Clear filter"
+              title="Clear filter"
+              onClick={() => setFilter("")}
+              className="grid size-4 shrink-0 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+            >
+              <X className="size-3.5" aria-hidden />
+            </button>
+          )}
         </label>
       </div>
 
@@ -241,13 +273,19 @@ export const FileTree = memo(function FileTree({
         }}
       >
         {creatingAtRoot && creating && <CreateRow kind={creating.kind} ctx={ctx} />}
-        {tree.length === 0 && !creatingAtRoot ? (
+        {tree.length === 0 && !creatingAtRoot && (
           <p className="px-2 py-6 text-center text-[12px] leading-relaxed text-muted-foreground/70">
             This vault is empty. Use the + above to create your first note.
           </p>
-        ) : (
-          tree.map((node) => <TreeRow key={node.relPath} node={node} ctx={ctx} />)
         )}
+        {tree.length > 0 && filterActive && visibleTree.length === 0 && (
+          <p className="px-2 py-6 text-center text-[12px] leading-relaxed text-muted-foreground/70">
+            No files match &quot;{filter}&quot;
+          </p>
+        )}
+        {visibleTree.map((node) => (
+          <TreeRow key={node.relPath} node={node} ctx={ctx} />
+        ))}
       </div>
 
       {opError && (
