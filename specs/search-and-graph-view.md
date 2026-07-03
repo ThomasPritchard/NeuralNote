@@ -152,6 +152,23 @@ no eval/WASM in the trio at these versions.
 - **Manual/live**: real 3D rendering, morph, hover/labels verified in the running app
   (`npm run tauri dev`) — jsdom cannot cover WebGL truth.
 
+## Addendum — cluster drill-down (approved 2026-07-03)
+
+The legend is interactive. **Hover** a cluster row → dim-preview (the hover-focus machinery
+lights that cluster's nodes, rest dims). **Click** → true isolation: the graph regenerates
+with only that folder's notes (frontend filter — no backend call), the force layout re-runs
+so the cluster unfolds, auto zoom-to-fit. **Sub-clusters = folder levels**: inside an
+isolated folder the legend re-keys to its sub-folders (palette reassigned) and a breadcrumb
+(`All notes / Areas / Health`) navigates back up. Bridge (pink) styling and the
+cross-folder stat recompute per level — a bridge means "crosses the current boundary".
+Isolated stats gain a muted "N links lead outside" line (links with exactly one endpoint
+inside). Notes directly in the focused folder cluster under the folder's own name (mirroring
+root files → vault name). Mechanism: `toGalaxy(graph, rootLabel, focusPath)`; GraphView owns
+the focus trail and remounts the galaxy per level (the immutable-data-per-mount contract);
+NeuralGalaxy gains optional `onClusterSelect`/`onClusterHover` props. Chosen over soft-focus
+only (clusters never unfold) and link-community detection (unnameable clusters, superseded by
+the AI phase's semantic clustering later).
+
 ## Known gaps / deferred
 
 Scroll-to-match in reader/editor; live graph refresh on `vault://tree-changed`; ghost nodes

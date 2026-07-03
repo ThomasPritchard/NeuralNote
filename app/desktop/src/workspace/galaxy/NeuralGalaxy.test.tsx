@@ -49,10 +49,10 @@ function makeProps(overrides: Partial<NeuralGalaxyProps> = {}): NeuralGalaxyProp
       ],
     },
     clusters: {
-      "": { label: "My Vault", color: "#7d6fe0" },
-      notes: { label: "notes", color: "#2f9d93" },
+      "": { label: "My Vault", color: "#7d6fe0", drillable: false },
+      notes: { label: "notes", color: "#2f9d93", drillable: true },
     },
-    stats: { notes: 3, links: 2, crossFolderLinks: 1 },
+    stats: { notes: 3, links: 2, crossFolderLinks: 1, outsideLinks: 0 },
     width: 800,
     height: 600,
     onOpenNote: vi.fn(),
@@ -63,6 +63,26 @@ function makeProps(overrides: Partial<NeuralGalaxyProps> = {}): NeuralGalaxyProp
 function clickNode(id: string) {
   const node = harness.props.graphData.nodes.find((n: any) => n.id === id);
   act(() => harness.props.onNodeClick(node));
+}
+
+// Handles normally register from makeStarNode (mocked away with the
+// renderer) — register fakes so the focus plumbing has targets.
+function registerFakes() {
+  const make = () => ({
+    update: vi.fn<(time: number) => void>(),
+    setHover: vi.fn<(on: boolean) => void>(),
+    setDimmed: vi.fn<(on: boolean) => void>(),
+  });
+  const handles = { alpha: make(), beta: make(), gamma: make() };
+  registerNode("alpha.md", handles.alpha);
+  registerNode("notes/beta.md", handles.beta);
+  registerNode("notes/gamma.md", handles.gamma);
+  return handles;
+}
+
+function hover(id: string | null) {
+  const node = id ? harness.props.graphData.nodes.find((n: any) => n.id === id) : null;
+  act(() => harness.props.onNodeHover(node));
 }
 
 beforeEach(() => {
@@ -82,7 +102,7 @@ describe("NeuralGalaxy", () => {
   it("pluralizes each stat independently", () => {
     render(
       <NeuralGalaxy
-        {...makeProps({ stats: { notes: 1, links: 1, crossFolderLinks: 0 } })}
+        {...makeProps({ stats: { notes: 1, links: 1, crossFolderLinks: 0, outsideLinks: 0 } })}
       />,
     );
     expect(screen.getByText("1 note · 1 link · 0 cross-folder links")).toBeInTheDocument();
@@ -241,26 +261,6 @@ describe("NeuralGalaxy", () => {
   });
 
   describe("hover-focus dimming", () => {
-    // Handles normally register from makeStarNode (mocked away with the
-    // renderer) — register fakes so the focus plumbing has targets.
-    function registerFakes() {
-      const make = () => ({
-        update: vi.fn<(time: number) => void>(),
-        setHover: vi.fn<(on: boolean) => void>(),
-        setDimmed: vi.fn<(on: boolean) => void>(),
-      });
-      const handles = { alpha: make(), beta: make(), gamma: make() };
-      registerNode("alpha.md", handles.alpha);
-      registerNode("notes/beta.md", handles.beta);
-      registerNode("notes/gamma.md", handles.gamma);
-      return handles;
-    }
-
-    function hover(id: string | null) {
-      const node = id ? harness.props.graphData.nodes.find((n: any) => n.id === id) : null;
-      act(() => harness.props.onNodeHover(node));
-    }
-
     it("dims everything outside the hovered node's neighbourhood", () => {
       render(<NeuralGalaxy {...makeProps()} />);
       const h = registerFakes();
@@ -354,6 +354,212 @@ describe("NeuralGalaxy", () => {
       await user.click(screen.getByRole("button", { name: "2d" }));
       expect(h.alpha.setHover).toHaveBeenLastCalledWith(false);
       expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(false);
+    });
+  });
+
+  describe("interactive legend (cluster drill-down)", () => {
+    it("renders folder cluster rows as buttons that fire onClusterSelect with the cluster key", async () => {
+      const user = userEvent.setup();
+      const onClusterSelect = vi.fn();
+      render(<NeuralGalaxy {...makeProps({ onClusterSelect })} />);
+      await user.click(screen.getByRole("button", { name: "notes" }));
+      expect(onClusterSelect).toHaveBeenCalledWith("notes");
+    });
+
+    it("renders the '' row (the current folder's own notes) as a plain non-button row", () => {
+      render(<NeuralGalaxy {...makeProps({ onClusterSelect: vi.fn() })} />);
+      expect(screen.queryByRole("button", { name: "My Vault" })).not.toBeInTheDocument();
+      expect(screen.getByText("My Vault")).toBeInTheDocument();
+    });
+
+    it("survives a legend click without onClusterSelect (prop is optional)", async () => {
+      const user = userEvent.setup();
+      render(<NeuralGalaxy {...makeProps()} />);
+      await user.click(screen.getByRole("button", { name: "notes" }));
+      expect(screen.getByText("notes")).toBeInTheDocument(); // no throw, row intact
+    });
+
+    it("shows the drill chevron only on clusters with sub-structure", () => {
+      const flat = makeProps({
+        clusters: {
+          "": { label: "My Vault", color: "#7d6fe0", drillable: false },
+          notes: { label: "notes", color: "#2f9d93", drillable: false },
+        },
+      });
+      const { unmount } = render(<NeuralGalaxy {...flat} />);
+      expect(screen.getByRole("button", { name: "notes" }).querySelector("svg")).toBeNull();
+      unmount();
+
+      render(<NeuralGalaxy {...makeProps()} />); // notes is drillable here
+      expect(screen.getByRole("button", { name: "notes" }).querySelector("svg")).not.toBeNull();
+    });
+
+    it("hovering a legend row lights the whole cluster and dims the rest; leave restores", () => {
+      render(<NeuralGalaxy {...makeProps()} />);
+      const h = registerFakes();
+
+      fireEvent.mouseEnter(screen.getByRole("button", { name: "notes" }));
+      expect(h.beta.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(true);
+
+      fireEvent.mouseLeave(screen.getByRole("button", { name: "notes" }));
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.beta.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(false);
+    });
+
+    it("previews the '' cluster from its plain row too", () => {
+      render(<NeuralGalaxy {...makeProps()} />);
+      const h = registerFakes();
+      fireEvent.mouseEnter(screen.getByText("My Vault"));
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.beta.setDimmed).toHaveBeenLastCalledWith(true);
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(true);
+      fireEvent.mouseLeave(screen.getByText("My Vault"));
+      expect(h.beta.setDimmed).toHaveBeenLastCalledWith(false);
+    });
+
+    it("fades links outside the previewed cluster — intra-cluster links stay lit, bridges out fade", () => {
+      render(<NeuralGalaxy {...makeProps()} />);
+      registerFakes();
+      const p = FORCE_PROFILES["3d"];
+      const bridgeOut = { source: "alpha.md", target: "notes/beta.md", bridge: true };
+      const intra = { source: "notes/beta.md", target: "notes/gamma.md", bridge: false };
+
+      fireEvent.mouseEnter(screen.getByRole("button", { name: "notes" }));
+      // Both endpoints inside the previewed cluster: full styling.
+      expect(harness.props.linkColor(intra)).toBe(`rgba(150,150,200,${p.linkAlpha})`);
+      // The bridge leaves the cluster: it must stop drawing the eye.
+      expect(harness.props.linkColor(bridgeOut)).toBe(BRIDGE_FADED_COLOR);
+      expect(harness.props.linkDirectionalParticles(bridgeOut)).toBe(0);
+
+      fireEvent.mouseLeave(screen.getByRole("button", { name: "notes" }));
+      expect(harness.props.linkColor(bridgeOut)).toBe("rgba(244,170,255,0.85)");
+    });
+
+    it("restores to the SELECTION's focus (not full brightness) when the legend preview ends", () => {
+      render(<NeuralGalaxy {...makeProps()} />);
+      const h = registerFakes();
+
+      clickNode("alpha.md"); // selection: {alpha, beta} lit, gamma dim
+      fireEvent.mouseEnter(screen.getByRole("button", { name: "notes" }));
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(true); // preview wins
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(false);
+
+      fireEvent.mouseLeave(screen.getByRole("button", { name: "notes" }));
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(false); // selection focus back
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(true);
+    });
+
+    it("node-hover and legend-hover share the focus channel — last event wins", () => {
+      render(<NeuralGalaxy {...makeProps()} />);
+      const h = registerFakes();
+
+      fireEvent.mouseEnter(screen.getByRole("button", { name: "notes" }));
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(true);
+
+      hover("alpha.md"); // node hover fired later: it takes the channel
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.beta.setDimmed).toHaveBeenLastCalledWith(false); // alpha's neighbour
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(true);
+    });
+
+    it("appends the outside-links stat segment only when links lead outside", () => {
+      const { unmount } = render(
+        <NeuralGalaxy
+          {...makeProps({ stats: { notes: 3, links: 2, crossFolderLinks: 1, outsideLinks: 212 } })}
+        />,
+      );
+      expect(
+        screen.getByText("3 notes · 2 links · 1 cross-folder link · 212 links lead outside"),
+      ).toBeInTheDocument();
+      unmount();
+
+      render(
+        <NeuralGalaxy
+          {...makeProps({ stats: { notes: 3, links: 2, crossFolderLinks: 1, outsideLinks: 1 } })}
+        />,
+      );
+      expect(
+        screen.getByText("3 notes · 2 links · 1 cross-folder link · 1 link leads outside"),
+      ).toBeInTheDocument();
+    });
+
+    it("renders the breadcrumb slot inside the legend card, above the cluster rows", () => {
+      render(
+        <NeuralGalaxy {...makeProps({ breadcrumb: <span data-testid="crumb">Areas</span> })} />,
+      );
+      const crumb = screen.getByTestId("crumb");
+      const legendCard = screen.getByText("Clusters").parentElement as HTMLElement;
+      expect(legendCard.contains(crumb)).toBe(true);
+      // Above the rows: the crumb precedes the first cluster row in the card.
+      const rows = screen.getByText("My Vault");
+      expect(crumb.compareDocumentPosition(rows) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it("keeps the Cross-folder legend row non-interactive", () => {
+      render(<NeuralGalaxy {...makeProps({ onClusterSelect: vi.fn() })} />);
+      expect(
+        screen.queryByRole("button", { name: /Cross-folder link/ }),
+      ).not.toBeInTheDocument();
+      expect(screen.getByText("Cross-folder link")).toBeInTheDocument();
+    });
+  });
+
+  describe("auto-framing (fires once, never fights the user's camera)", () => {
+    // The engine restarts on every morph reheat, profile swap, and drag — a
+    // stop can land seconds into the user's own zooming. Auto-fit must fire
+    // at most once per mount and die on first user wheel/pointerdown.
+    it("zoomToFits exactly once across repeated engine stops", () => {
+      render(<NeuralGalaxy {...makeProps()} />);
+      act(() => harness.props.onEngineStop());
+      act(() => harness.props.onEngineStop());
+      expect(harness.fg.zoomToFit).toHaveBeenCalledTimes(1);
+    });
+
+    it("cancels the pending auto-frame on user wheel — an engine stop no longer refits", () => {
+      const { container } = render(<NeuralGalaxy {...makeProps()} />);
+      fireEvent.wheel(container.firstChild as Element);
+      act(() => harness.props.onEngineStop());
+      expect(harness.fg.zoomToFit).not.toHaveBeenCalled();
+    });
+
+    it("cancels on pointerdown too (drag/orbit owns the camera)", () => {
+      const { container } = render(<NeuralGalaxy {...makeProps()} />);
+      fireEvent.pointerDown(container.firstChild as Element);
+      act(() => harness.props.onEngineStop());
+      expect(harness.fg.zoomToFit).not.toHaveBeenCalled();
+    });
+
+    it("keeps the user-initiated 2D-morph fit alive after the auto-frame is cancelled", async () => {
+      // Reduced motion collapses the morph tween to 0ms so its completion
+      // callback (the intentional zoomToFit) runs synchronously in jsdom.
+      vi.stubGlobal("matchMedia", () => ({ matches: true }));
+      try {
+        const user = userEvent.setup();
+        const { container } = render(<NeuralGalaxy {...makeProps()} />);
+        fireEvent.wheel(container.firstChild as Element); // kill auto-framing
+        await user.click(screen.getByRole("button", { name: "2d" }));
+        expect(harness.fg.zoomToFit).toHaveBeenCalledWith(600, 100);
+        // …and the dead auto-frame stays dead through later engine stops.
+        act(() => harness.props.onEngineStop());
+        expect(harness.fg.zoomToFit).toHaveBeenCalledTimes(1);
+      } finally {
+        vi.unstubAllGlobals();
+      }
+    });
+
+    it("resets per mount: a remount (the drill-down isolation path) auto-fits once again", () => {
+      const { container, unmount } = render(<NeuralGalaxy {...makeProps()} />);
+      fireEvent.wheel(container.firstChild as Element);
+      act(() => harness.props.onEngineStop());
+      expect(harness.fg.zoomToFit).not.toHaveBeenCalled();
+      unmount();
+
+      render(<NeuralGalaxy {...makeProps()} />); // fresh mount = fresh guard
+      act(() => harness.props.onEngineStop());
+      expect(harness.fg.zoomToFit).toHaveBeenCalledTimes(1);
     });
   });
 

@@ -6,18 +6,26 @@
 // specs/search-and-graph-view.md §Frontend): `onOpenNote` takes a GraphNode id
 // (vault-relative path) and routes "Open in reader" through Workspace's
 // guarded open.
+//
+// Cluster drill-down (spec §Addendum): this component owns the focus trail.
+// Clicking a legend cluster pushes its folder segment; the breadcrumb (slotted
+// into the galaxy's legend card) jumps back up. Each level re-transforms the
+// SAME fetched graph and remounts NeuralGalaxy via `key` — the immutable-data-
+// per-mount contract — so the force layout re-runs and the engine-stop framing
+// zooms to fit the isolated cluster.
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Loader2, RotateCw } from "lucide-react";
 import { errorMessage, readLinkGraph } from "../lib/api";
+import type { LinkGraph } from "../lib/types";
 import { useVault } from "../lib/store";
 import { NeuralGalaxy } from "./galaxy/NeuralGalaxy";
-import { toGalaxy, type GalaxyView } from "./graphTransform";
+import { toGalaxy } from "./graphTransform";
 
 type LoadState =
   | { phase: "loading" }
   | { phase: "error"; message: string }
-  | { phase: "ready"; galaxy: GalaxyView; skippedFiles: number };
+  | { phase: "ready"; graph: LinkGraph };
 
 export function GraphView({
   onOpenNote,
@@ -28,6 +36,7 @@ export function GraphView({
   const vaultName = vault?.name ?? "Vault root";
   const [state, setState] = useState<LoadState>({ phase: "loading" });
   const [size, setSize] = useState({ width: 0, height: 0 });
+  const [focusTrail, setFocusTrail] = useState<string[]>([]);
   const containerRef = useRef<HTMLElement | null>(null);
 
   // No stale-fetch token on purpose: leaving graph view (or swapping vaults)
@@ -36,21 +45,40 @@ export function GraphView({
   const load = useCallback(async () => {
     setState({ phase: "loading" });
     try {
-      const graph = await readLinkGraph();
-      setState({
-        phase: "ready",
-        galaxy: toGalaxy(graph, vaultName),
-        skippedFiles: graph.skippedFiles,
-      });
+      setState({ phase: "ready", graph: await readLinkGraph() });
     } catch (e) {
       // Never silently render an empty galaxy on failure.
       setState({ phase: "error", message: errorMessage(e) });
     }
-  }, [vaultName]);
+  }, []);
 
   useEffect(() => {
     void load();
-  }, [load]);
+  }, [load, vaultName]);
+
+  // The rendered level: the fetched graph transformed at the focus trail. A
+  // trail can go stale (a refetch dropped the folder) — fall back to root in
+  // the SAME render rather than ever showing an empty galaxy.
+  const view = useMemo(() => {
+    if (state.phase !== "ready") return null;
+    const focused = toGalaxy(state.graph, vaultName, focusTrail.join("/"));
+    if (focusTrail.length > 0 && focused.data.nodes.length === 0) {
+      return { trail: [] as string[], galaxy: toGalaxy(state.graph, vaultName) };
+    }
+    return { trail: focusTrail, galaxy: focused };
+  }, [state, vaultName, focusTrail]);
+
+  // Keep the trail state honest when the memo had to fall back (otherwise the
+  // stale trail would resurface if a later refetch restored the folder).
+  useEffect(() => {
+    if (view && view.trail !== focusTrail) setFocusTrail(view.trail);
+  }, [view, focusTrail]);
+
+  // Drill down one level. "" is the current folder's own notes — the legend
+  // renders that row inert, so this guard is belt-and-braces.
+  const drillInto = useCallback((cluster: string) => {
+    if (cluster !== "") setFocusTrail((trail) => [...trail, cluster]);
+  }, []);
 
   // Size the galaxy to this pane (the renderer needs pixel dimensions). The
   // observer fires once on observe with the current size, then on resizes.
@@ -68,6 +96,44 @@ export function GraphView({
   }, []);
 
   const sized = size.width > 0 && size.height > 0;
+  const trail = view?.trail ?? [];
+
+  // Breadcrumb for the legend card: `All notes / Areas / Health` — ancestors
+  // jump to their level, the current level is inert. Root shows no breadcrumb
+  // (the quieter option). Typography reuses the legend heading's classes.
+  const breadcrumb =
+    trail.length > 0 ? (
+      <nav
+        aria-label="Folder breadcrumb"
+        className="nn-mono text-[10px] uppercase tracking-wider text-muted-foreground"
+      >
+        <button
+          type="button"
+          onClick={() => setFocusTrail([])}
+          className="transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+        >
+          All notes
+        </button>
+        {trail.map((segment, i) => (
+          <span key={trail.slice(0, i + 1).join("/")}>
+            {" / "}
+            {i === trail.length - 1 ? (
+              <span className="text-foreground">{segment}</span>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setFocusTrail(trail.slice(0, i + 1))}
+                className="transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+              >
+                {segment}
+              </button>
+            )}
+          </span>
+        ))}
+      </nav>
+    ) : undefined;
+
+  const skippedFiles = state.phase === "ready" ? state.graph.skippedFiles : 0;
 
   return (
     <main
@@ -79,7 +145,7 @@ export function GraphView({
           dimensions, and a blank pane while the first ResizeObserver tick
           lands would read as a failure. */}
       {(state.phase === "loading" ||
-        (state.phase === "ready" && state.galaxy.data.nodes.length > 0 && !sized)) && (
+        (view && view.galaxy.data.nodes.length > 0 && !sized)) && (
         <div className="grid h-full place-items-center">
           <Loader2
             className="size-5 animate-spin text-muted-foreground motion-reduce:animate-none"
@@ -104,26 +170,32 @@ export function GraphView({
         </div>
       )}
 
-      {state.phase === "ready" && state.galaxy.data.nodes.length === 0 && (
+      {view && view.galaxy.data.nodes.length === 0 && (
         <div className="grid h-full place-items-center">
           <p className="text-[13px] leading-relaxed text-muted-foreground">No notes yet</p>
         </div>
       )}
 
-      {state.phase === "ready" && state.galaxy.data.nodes.length > 0 && sized && (
+      {view && view.galaxy.data.nodes.length > 0 && sized && (
         <>
           <NeuralGalaxy
-            data={state.galaxy.data}
-            clusters={state.galaxy.clusters}
-            stats={state.galaxy.stats}
+            // Remount per drill level: layout re-runs on the filtered payload
+            // and the engine-stop framing zooms to fit (data-per-mount
+            // contract — the sim mutates node objects in place).
+            key={trail.join("/")}
+            data={view.galaxy.data}
+            clusters={view.galaxy.clusters}
+            stats={view.galaxy.stats}
             width={size.width}
             height={size.height}
             onOpenNote={onOpenNote}
+            onClusterSelect={drillInto}
+            breadcrumb={breadcrumb}
           />
-          {state.skippedFiles > 0 && (
+          {skippedFiles > 0 && (
             // Non-blocking degradation notice, kept near the stats/top area.
             <p className="nn-mono pointer-events-none absolute left-5 top-16 text-[11px] text-muted-foreground">
-              {state.skippedFiles} file(s) couldn't be read
+              {skippedFiles} file(s) couldn't be read
             </p>
           )}
         </>

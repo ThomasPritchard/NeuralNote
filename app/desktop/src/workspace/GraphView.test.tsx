@@ -1,4 +1,4 @@
-import { act, render, screen } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LinkGraph } from "../lib/types";
@@ -166,5 +166,114 @@ describe("GraphView", () => {
     act(() => harness.props.onNodeClick(beta));
     await userEvent.click(screen.getByRole("button", { name: "Open in reader" }));
     expect(onOpenNote).toHaveBeenCalledWith("notes/beta.md");
+  });
+});
+
+// ── Cluster drill-down (spec §Addendum) ─────────────────────────────────────
+describe("GraphView cluster drill-down", () => {
+  // Two levels under notes/ so the journey can drill twice.
+  const deepGraph = (): LinkGraph => ({
+    nodes: [
+      { id: "alpha.md", title: "Alpha", cluster: "" },
+      { id: "notes/beta.md", title: "Beta", cluster: "notes" },
+      { id: "notes/daily/gamma.md", title: "Gamma", cluster: "notes" },
+      { id: "notes/daily/delta.md", title: "Delta", cluster: "notes" },
+      { id: "essays/epsilon.md", title: "Epsilon", cluster: "essays" },
+    ],
+    links: [
+      { source: "alpha.md", target: "notes/beta.md", bridge: true },
+      { source: "notes/beta.md", target: "notes/daily/gamma.md", bridge: false },
+      { source: "notes/daily/gamma.md", target: "notes/daily/delta.md", bridge: false },
+      { source: "essays/epsilon.md", target: "notes/beta.md", bridge: true },
+    ],
+    skippedFiles: 0,
+  });
+
+  const nodeIds = () => harness.props.graphData.nodes.map((n: any) => n.id).sort();
+
+  async function renderDeep() {
+    mocks.readLinkGraph.mockResolvedValue(deepGraph());
+    const view = render(<GraphView onOpenNote={vi.fn()} />);
+    fireResize(800, 600);
+    await screen.findByTestId("force-graph-3d");
+    return view;
+  }
+
+  it("drills into a clicked cluster: filtered galaxy, breadcrumb, outside-links stat", async () => {
+    await renderDeep();
+    expect(screen.queryByRole("navigation", { name: "Folder breadcrumb" })).toBeNull();
+
+    await userEvent.click(screen.getByRole("button", { name: "notes" }));
+
+    // The galaxy remounted with ONLY the folder's notes and links.
+    expect(nodeIds()).toEqual(["notes/beta.md", "notes/daily/delta.md", "notes/daily/gamma.md"]);
+    expect(harness.props.graphData.links).toHaveLength(2);
+
+    // Breadcrumb: clickable root, inert current level.
+    const crumb = screen.getByRole("navigation", { name: "Folder breadcrumb" });
+    expect(within(crumb).getByRole("button", { name: "All notes" })).toBeInTheDocument();
+    expect(within(crumb).getByText("notes")).toBeInTheDocument();
+    expect(within(crumb).queryByRole("button", { name: "notes" })).toBeNull();
+
+    // Stats recompute at this level, with the outside-links segment appended
+    // (alpha→beta and epsilon→beta each leave one foot outside the folder).
+    expect(
+      screen.getByText("3 notes · 2 links · 1 cross-folder link · 2 links lead outside"),
+    ).toBeInTheDocument();
+  });
+
+  it("drills two levels, then breadcrumb ancestors jump back up", async () => {
+    await renderDeep();
+    await userEvent.click(screen.getByRole("button", { name: "notes" }));
+    await userEvent.click(screen.getByRole("button", { name: "daily" }));
+
+    expect(nodeIds()).toEqual(["notes/daily/delta.md", "notes/daily/gamma.md"]);
+    const crumb = screen.getByRole("navigation", { name: "Folder breadcrumb" });
+    // "notes" is an ancestor now (clickable); "daily" is current (inert).
+    expect(within(crumb).queryByRole("button", { name: "daily" })).toBeNull();
+
+    await userEvent.click(within(crumb).getByRole("button", { name: "notes" }));
+    expect(nodeIds()).toEqual(["notes/beta.md", "notes/daily/delta.md", "notes/daily/gamma.md"]);
+
+    await userEvent.click(
+      within(screen.getByRole("navigation", { name: "Folder breadcrumb" })).getByRole("button", {
+        name: "All notes",
+      }),
+    );
+    expect(nodeIds()).toEqual([
+      "alpha.md",
+      "essays/epsilon.md",
+      "notes/beta.md",
+      "notes/daily/delta.md",
+      "notes/daily/gamma.md",
+    ]);
+    expect(screen.queryByRole("navigation", { name: "Folder breadcrumb" })).toBeNull();
+  });
+
+  it("resets a stale trail to root when a refetch no longer has notes under it", async () => {
+    mocks.readLinkGraph.mockResolvedValueOnce(deepGraph());
+    const { rerender } = render(<GraphView onOpenNote={vi.fn()} />);
+    fireResize(800, 600);
+    await screen.findByTestId("force-graph-3d");
+    await userEvent.click(screen.getByRole("button", { name: "notes" }));
+    expect(nodeIds()).toHaveLength(3);
+
+    // A vault-name change re-runs the fetch; the new graph lost the notes/
+    // folder entirely — the stale trail must reset, never an empty galaxy.
+    const prunedGraph: LinkGraph = {
+      nodes: [
+        { id: "alpha.md", title: "Alpha", cluster: "" },
+        { id: "essays/epsilon.md", title: "Epsilon", cluster: "essays" },
+      ],
+      links: [],
+      skippedFiles: 0,
+    };
+    mocks.readLinkGraph.mockResolvedValueOnce(prunedGraph);
+    mocks.useVault.mockReturnValue({ vault: { name: "Other Vault", path: "/v2" } });
+    rerender(<GraphView onOpenNote={vi.fn()} />);
+    await screen.findByTestId("force-graph-3d");
+
+    expect(nodeIds()).toEqual(["alpha.md", "essays/epsilon.md"]);
+    expect(screen.queryByRole("navigation", { name: "Folder breadcrumb" })).toBeNull();
   });
 });

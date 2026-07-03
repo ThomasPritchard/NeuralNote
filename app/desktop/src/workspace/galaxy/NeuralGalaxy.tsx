@@ -1,8 +1,8 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ForceGraph3D from "react-force-graph-3d";
 import * as THREE from "three";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
-import { Search, Sparkles, X } from "lucide-react";
+import { ChevronRight, Search, Sparkles, X } from "lucide-react";
 import type { GalaxyLink, GalaxyNode } from "./graph";
 import { makeStarNode } from "./starNode";
 import { applyFocus, resetRegistry, setHover, updateAll } from "./nodeRegistry";
@@ -136,12 +136,21 @@ export interface NeuralGalaxyProps {
    *  and the 2D morph mutate the node objects in place, so a refetch means a
    *  remount with a fresh payload (see galaxy/graph.ts + graphTransform). */
   data: { nodes: GalaxyNode[]; links: GalaxyLink[] };
-  /** Legend/label metadata — every node.cluster key must be present. */
-  clusters: Record<string, { label: string; color: string }>;
-  stats: { notes: number; links: number; crossFolderLinks: number };
+  /** Legend/label metadata — every node.cluster key must be present.
+   *  `drillable` marks clusters with sub-folders (they get the chevron). */
+  clusters: Record<string, { label: string; color: string; drillable: boolean }>;
+  /** `outsideLinks` > 0 only when a drill-down isolates a folder — the stats
+   *  line then appends the muted "N links lead outside" segment. */
+  stats: { notes: number; links: number; crossFolderLinks: number; outsideLinks: number };
   width: number;
   height: number;
   onOpenNote: (id: string) => void;
+  /** Legend cluster row clicked — the drill-down entry point. The "" row (the
+   *  current folder's own notes) never fires this: it renders as a plain row. */
+  onClusterSelect?: (cluster: string) => void;
+  /** Drill-trail breadcrumb, slotted at the top of the legend card. GraphView
+   *  owns the trail; this component stays agnostic of drill semantics. */
+  breadcrumb?: ReactNode;
 }
 
 export function NeuralGalaxy({
@@ -151,9 +160,28 @@ export function NeuralGalaxy({
   width,
   height,
   onOpenNote,
+  onClusterSelect,
+  breadcrumb,
 }: Readonly<NeuralGalaxyProps>) {
   const fgRef = useRef<any>(null);
+  const rootRef = useRef<HTMLDivElement | null>(null);
   const hoveredRef = useRef<Set<string>>(new Set());
+
+  // ── Auto-framing: at most ONCE per mount, never against the user ─────────
+  // The layout engine restarts on every morph reheat, profile swap, and drag,
+  // so an engine stop can land seconds into the user's own navigation — an
+  // unguarded zoomToFit there yanks the camera away mid-zoom. One guard is
+  // shared by the initial 1800ms timeout and the engine-stop handler
+  // (whichever fires first wins); the first wheel/pointerdown hands the
+  // camera to the user and kills any pending auto-frame. Deliberate fits are
+  // unaffected: changeView's 2D frame calls zoomToFit directly, and a
+  // drill-down isolation remounts with a fresh guard (auto-fits once again).
+  const framedRef = useRef(false);
+  const frameOnce = useCallback(() => {
+    if (framedRef.current) return;
+    framedRef.current = true;
+    fgRef.current?.zoomToFit(800, 110);
+  }, []);
   const reducedRef = useRef(
     globalThis.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false,
   );
@@ -197,38 +225,74 @@ export function NeuralGalaxy({
   }, [selected, adjacency, nodeById]);
 
   // ── Hover-focus state ────────────────────────────────────────────────────
-  // The lit set derives from one origin: the hovered node, else the selected
-  // node (so the panel's neighbour list matches what stays bright), else
-  // nothing. Node dims retarget GPU-side through the registry — no React work
-  // per node. The epoch bump exists ONLY for the links: a re-render hands the
+  // ONE focus channel, last event wins. Two kinds of focus feed it:
+  //  · node focus  — origin = the hovered node, else the selected node; the
+  //    lit set is the origin + its direct neighbours.
+  //  · cluster preview — hovering a legend row; NO single origin, the lit set
+  //    is the whole cluster (origin: null).
+  // Node dims retarget GPU-side through the registry — no React work per
+  // node. The epoch bump exists ONLY for the links: a re-render hands the
   // library a fresh linkColor accessor identity, which re-runs its link digest
   // (recolour in place). fg.refresh() is NOT used — it flushes the node data
   // mapper, which would rebuild every star object and snap the eased dims.
   const hoverOriginRef = useRef<string | null>(null);
   const selectedIdRef = useRef<string | null>(null);
-  const focusRef = useRef<{ origin: string; lit: Set<string> } | null>(null);
+  const previewClusterRef = useRef<string | null>(null);
+  const focusRef = useRef<{ key: string; origin: string | null; lit: Set<string> } | null>(null);
   const [, setFocusEpoch] = useState(0);
 
   const refreshFocus = useCallback(() => {
-    const origin = hoverOriginRef.current ?? selectedIdRef.current;
-    if ((focusRef.current?.origin ?? null) === origin) return;
-    focusRef.current = origin
-      ? { origin, lit: new Set([origin, ...(adjacency.get(origin) ?? []).map((nb) => nb.id)]) }
-      : null;
+    const preview = previewClusterRef.current;
+    const origin = preview === null ? (hoverOriginRef.current ?? selectedIdRef.current) : null;
+    // "cluster:"/"node:" prefixes keep the two focus kinds from colliding.
+    const key = preview !== null ? `cluster:${preview}` : origin !== null ? `node:${origin}` : null;
+    if ((focusRef.current?.key ?? null) === key) return;
+    if (key === null) {
+      focusRef.current = null;
+    } else if (preview !== null) {
+      focusRef.current = {
+        key,
+        origin: null,
+        lit: new Set(data.nodes.filter((n) => n.cluster === preview).map((n) => n.id)),
+      };
+    } else {
+      const o = origin as string;
+      focusRef.current = {
+        key,
+        origin: o,
+        lit: new Set([o, ...(adjacency.get(o) ?? []).map((nb) => nb.id)]),
+      };
+    }
     applyFocus(focusRef.current?.lit ?? null);
     setFocusEpoch((n) => n + 1);
-  }, [adjacency]);
+  }, [adjacency, data]);
 
   useEffect(() => {
     selectedIdRef.current = selected?.id ?? null;
     refreshFocus();
   }, [selected, refreshFocus]);
 
-  /** A link keeps full styling only while it touches the focus origin (the
-   *  hovered↔neighbour links themselves, not neighbour↔neighbour strays). */
+  /** Legend-row hover preview: lights the whole cluster, dims the rest.
+   *  `null` (pointer leave) falls back to the node-hover/selection focus. */
+  const previewCluster = useCallback(
+    (cluster: string | null) => {
+      previewClusterRef.current = cluster;
+      refreshFocus();
+    },
+    [refreshFocus],
+  );
+
+  /** Node focus: a link keeps full styling only while it touches the origin
+   *  (the hovered↔neighbour links themselves, not neighbour↔neighbour strays).
+   *  Cluster preview: lit while BOTH endpoints sit inside the cluster — the
+   *  preview shows the cluster's internal web, links leaving it fade. */
   const isLinkLit = useCallback((l: any) => {
     const f = focusRef.current;
-    return !f || endpointId(l.source) === f.origin || endpointId(l.target) === f.origin;
+    if (!f) return true;
+    if (f.origin !== null) {
+      return endpointId(l.source) === f.origin || endpointId(l.target) === f.origin;
+    }
+    return f.lit.has(endpointId(l.source)) && f.lit.has(endpointId(l.target));
   }, []);
 
   // Init (once): restrained bloom (only node cores glow) plus a single RAF loop
@@ -265,12 +329,24 @@ export function NeuralGalaxy({
     };
     raf = requestAnimationFrame(tick);
 
-    const framed = setTimeout(() => fg.zoomToFit(800, 110), 1800);
+    const framed = setTimeout(frameOnce, 1800);
+
+    // First wheel/pointerdown = the user owns the camera: cancel any pending
+    // auto-frame (both the timeout above and the engine-stop path).
+    const cancelAutoFrame = () => {
+      framedRef.current = true;
+      clearTimeout(framed);
+    };
+    const root = rootRef.current;
+    root?.addEventListener("wheel", cancelAutoFrame, { passive: true });
+    root?.addEventListener("pointerdown", cancelAutoFrame);
 
     return () => {
       cancelAnimationFrame(raf);
       cancelAnimationFrame(morphRaf.current);
       clearTimeout(framed);
+      root?.removeEventListener("wheel", cancelAutoFrame);
+      root?.removeEventListener("pointerdown", cancelAutoFrame);
       // StrictMode: the composer outlives this effect's dev double-invoke, so
       // the bloom pass must come off or two stacked passes wash out the render.
       fg.postProcessingComposer().removePass(bloom);
@@ -355,6 +431,7 @@ export function NeuralGalaxy({
         }
       }
       hoverOriginRef.current = node ? node.id : null;
+      previewClusterRef.current = null; // shared focus channel: last event wins
       refreshFocus();
     },
     [adjacency, refreshFocus],
@@ -457,7 +534,7 @@ export function NeuralGalaxy({
   );
 
   return (
-    <div className="relative h-full w-full overflow-hidden bg-background">
+    <div ref={rootRef} className="relative h-full w-full overflow-hidden bg-background">
       <ForceGraph3D
         ref={fgRef}
         width={width}
@@ -490,7 +567,7 @@ export function NeuralGalaxy({
         linkDirectionalParticleColor={PARTICLE_COLOR}
         onNodeClick={onNodeClick}
         onBackgroundClick={dismissSelected}
-        onEngineStop={() => fgRef.current?.zoomToFit(800, 110)}
+        onEngineStop={frameOnce}
       />
 
       {/* ── Top bar: title + view toggle + search ──────────────────────── */}
@@ -503,6 +580,14 @@ export function NeuralGalaxy({
             <div className="nn-mono text-[11px] text-muted-foreground">
               {plural(stats.notes, "note")} · {plural(stats.links, "link")} ·{" "}
               {plural(stats.crossFolderLinks, "cross-folder link")}
+              {/* Only an isolated folder has links leaving the view (0 at root). */}
+              {stats.outsideLinks > 0 && (
+                <>
+                  {" "}
+                  · {plural(stats.outsideLinks, "link")} lead
+                  {stats.outsideLinks === 1 ? "s" : ""} outside
+                </>
+              )}
             </div>
           </div>
         </div>
@@ -571,14 +656,42 @@ export function NeuralGalaxy({
       </div>
 
       {/* ── Cluster legend ─────────────────────────────────────────────── */}
+      {/* Interactive (spec §Addendum): hover a row → the whole cluster lights
+          via the shared focus channel; click a folder row → onClusterSelect
+          drills in. The "" row (this folder's own notes) is not a drill target
+          so it stays a plain row; the bridge row stays non-interactive. */}
       <div className="absolute bottom-5 left-5 flex flex-col gap-1.5 rounded-lg border border-border bg-card/80 px-4 py-3 backdrop-blur">
+        {breadcrumb}
         <div className="nn-mono mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">Clusters</div>
-        {Object.values(clusters).map((c) => (
-          <div key={c.label} className="flex items-center gap-2 text-xs text-foreground">
-            <span className="size-2.5 rounded-full" style={{ background: c.color, boxShadow: `0 0 8px ${c.color}` }} />
-            {c.label}
-          </div>
-        ))}
+        {Object.entries(clusters).map(([key, c]) =>
+          key === "" ? (
+            <div
+              key="c:"
+              onMouseEnter={() => previewCluster("")}
+              onMouseLeave={() => previewCluster(null)}
+              className="flex items-center gap-2 text-xs text-foreground"
+            >
+              <span className="size-2.5 rounded-full" style={{ background: c.color, boxShadow: `0 0 8px ${c.color}` }} />
+              {c.label}
+            </div>
+          ) : (
+            <button
+              key={`c:${key}`}
+              type="button"
+              onClick={() => onClusterSelect?.(key)}
+              onMouseEnter={() => previewCluster(key)}
+              onMouseLeave={() => previewCluster(null)}
+              className="flex items-center gap-2 text-left text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            >
+              <span className="size-2.5 rounded-full" style={{ background: c.color, boxShadow: `0 0 8px ${c.color}` }} />
+              {c.label}
+              {/* Drill affordance: this folder has sub-folders to unfold into. */}
+              {c.drillable && (
+                <ChevronRight aria-hidden className="ml-auto size-3 shrink-0 text-muted-foreground" />
+              )}
+            </button>
+          ),
+        )}
         <div className="mt-1.5 flex items-center gap-2 border-t border-border pt-1.5 text-xs text-foreground">
           <span className="h-0.5 w-4 rounded-full" style={{ background: "#f4aaff", boxShadow: "0 0 8px #f4aaff" }} />
           <span>Cross-folder link</span>

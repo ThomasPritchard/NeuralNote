@@ -15,6 +15,12 @@ const link = (source: string, target: string, bridge = false) => ({
   bridge,
 });
 
+/** Node with the backend's cluster contract applied: first path segment. */
+const vnode = (id: string) => node(id, id.includes("/") ? id.split("/")[0] : "");
+/** Link with the backend's honest bridge flag: top-level folders differ. */
+const vlink = (source: string, target: string) =>
+  link(source, target, source.split("/")[0] !== target.split("/")[0]);
+
 const graph = (
   nodes: LinkGraph["nodes"],
   links: LinkGraph["links"] = [],
@@ -30,9 +36,9 @@ describe("toGalaxy", () => {
     ]);
     const { clusters } = toGalaxy(g, "My Vault");
     expect(Object.keys(clusters)).toEqual(["", "a", "b"]);
-    expect(clusters[""]).toEqual({ label: "My Vault", color: CLUSTER_PALETTE[0] });
-    expect(clusters["a"]).toEqual({ label: "a", color: CLUSTER_PALETTE[1] });
-    expect(clusters["b"]).toEqual({ label: "b", color: CLUSTER_PALETTE[2] });
+    expect(clusters[""]).toEqual({ label: "My Vault", color: CLUSTER_PALETTE[0], drillable: false });
+    expect(clusters["a"]).toEqual({ label: "a", color: CLUSTER_PALETTE[1], drillable: false });
+    expect(clusters["b"]).toEqual({ label: "b", color: CLUSTER_PALETTE[2], drillable: false });
   });
 
   it("wraps the palette after five clusters", () => {
@@ -113,6 +119,7 @@ describe("toGalaxy", () => {
       notes: 3,
       links: 2,
       crossFolderLinks: 1,
+      outsideLinks: 0,
     });
   });
 
@@ -123,5 +130,150 @@ describe("toGalaxy", () => {
     expect(first.data.nodes[0]).not.toBe(second.data.nodes[0]);
     expect(first.data.nodes[0]).not.toBe(g.nodes[0]);
     expect(first.data).not.toBe(second.data);
+  });
+
+  it("marks a root cluster drillable only when it has sub-folders", () => {
+    const g = graph([
+      vnode("Areas/Health/diet.md"),
+      vnode("Areas/direct.md"),
+      vnode("Inbox/loose.md"),
+      vnode("root.md"),
+    ]);
+    const { clusters } = toGalaxy(g, "r");
+    expect(clusters["Areas"].drillable).toBe(true); // has Areas/Health/
+    expect(clusters["Inbox"].drillable).toBe(false); // files only
+    expect(clusters[""].drillable).toBe(false); // the current folder's own notes
+  });
+});
+
+// ── Cluster drill-down: toGalaxy(graph, rootLabel, focusPath) ──────────────
+describe("toGalaxy with a focusPath", () => {
+  // Two-level fixture: Areas has sub-folders (Health, Gym), Inbox is flat.
+  const drillGraph = () =>
+    graph(
+      [
+        vnode("Areas/overview.md"),
+        vnode("Areas/Health/diet.md"),
+        vnode("Areas/Health/sleep.md"),
+        vnode("Areas/Health/Deep/protocols.md"),
+        vnode("Areas/Gym/plan.md"),
+        vnode("AreasX/decoy.md"),
+        vnode("Inbox/loose.md"),
+        vnode("root.md"),
+      ],
+      [
+        vlink("Areas/Health/diet.md", "Areas/Health/sleep.md"),
+        vlink("Areas/Health/diet.md", "Areas/Gym/plan.md"),
+        vlink("Areas/overview.md", "Areas/Health/diet.md"),
+        vlink("Areas/Health/sleep.md", "Inbox/loose.md"),
+        vlink("root.md", "AreasX/decoy.md"),
+      ],
+    );
+
+  it("filters to nodes strictly under the focus path — segment-aligned, no false prefixes", () => {
+    const { data } = toGalaxy(drillGraph(), "r", "Areas");
+    expect(data.nodes.map((n) => n.id).sort()).toEqual([
+      "Areas/Gym/plan.md",
+      "Areas/Health/Deep/protocols.md",
+      "Areas/Health/diet.md",
+      "Areas/Health/sleep.md",
+      "Areas/overview.md",
+    ]); // AreasX/decoy.md must NOT ride in on the string prefix
+    // Only links with both endpoints inside survive.
+    expect(data.links).toHaveLength(3);
+    expect(data.links.map((l) => `${l.source}→${l.target}`).sort()).toEqual([
+      "Areas/Health/diet.md→Areas/Gym/plan.md",
+      "Areas/Health/diet.md→Areas/Health/sleep.md",
+      "Areas/overview.md→Areas/Health/diet.md",
+    ]);
+  });
+
+  it("clusters by the NEXT path segment; direct notes get '' labeled with the folder's name", () => {
+    const { data, clusters } = toGalaxy(drillGraph(), "My Vault", "Areas");
+    const byId = new Map(data.nodes.map((n) => [n.id, n]));
+    expect(byId.get("Areas/overview.md")?.cluster).toBe("");
+    expect(byId.get("Areas/Health/diet.md")?.cluster).toBe("Health");
+    expect(byId.get("Areas/Health/Deep/protocols.md")?.cluster).toBe("Health");
+    expect(byId.get("Areas/Gym/plan.md")?.cluster).toBe("Gym");
+    // "" is labeled by the focused folder's display name, not the vault root.
+    expect(clusters[""].label).toBe("Areas");
+    expect(clusters["Health"].label).toBe("Health");
+  });
+
+  it("labels '' with the LAST segment of a nested focus path", () => {
+    const { clusters } = toGalaxy(drillGraph(), "My Vault", "Areas/Health");
+    expect(clusters[""].label).toBe("Health");
+  });
+
+  it("reassigns the palette per level: '' first, then folder names in code-unit order", () => {
+    const { clusters } = toGalaxy(drillGraph(), "r", "Areas");
+    expect(Object.keys(clusters)).toEqual(["", "Gym", "Health"]);
+    expect(clusters[""].color).toBe(CLUSTER_PALETTE[0]);
+    expect(clusters["Gym"].color).toBe(CLUSTER_PALETTE[1]);
+    expect(clusters["Health"].color).toBe(CLUSTER_PALETTE[2]);
+  });
+
+  it("recomputes bridges at the current level: root output equals the backend flag", () => {
+    const g = drillGraph();
+    const { data } = toGalaxy(g, "r");
+    const backendBridge = new Map(g.links.map((l) => [`${l.source}→${l.target}`, l.bridge]));
+    for (const l of data.links) {
+      expect(l.bridge).toBe(backendBridge.get(`${l.source}→${l.target}`));
+    }
+  });
+
+  it("ignores the backend bridge flag — a bogus flag is corrected by the recompute", () => {
+    const g = graph(
+      [vnode("a/one.md"), vnode("a/two.md")],
+      [link("a/one.md", "a/two.md", true)], // backend lied: same folder
+    );
+    expect(toGalaxy(g, "r").data.links[0].bridge).toBe(false);
+  });
+
+  it("flips bridges at a deeper level: same top folder, different sub-folders", () => {
+    const { data, stats } = toGalaxy(drillGraph(), "r", "Areas");
+    const byPair = new Map(data.links.map((l) => [`${l.source}→${l.target}`, l.bridge]));
+    // Health↔Gym crosses the CURRENT boundary — a bridge here, not at root.
+    expect(byPair.get("Areas/Health/diet.md→Areas/Gym/plan.md")).toBe(true);
+    // Intra-Health stays a normal link.
+    expect(byPair.get("Areas/Health/diet.md→Areas/Health/sleep.md")).toBe(false);
+    // Direct note ("") ↔ Health crosses the boundary too.
+    expect(byPair.get("Areas/overview.md→Areas/Health/diet.md")).toBe(true);
+    expect(stats.crossFolderLinks).toBe(2);
+  });
+
+  it("counts outsideLinks: links with exactly ONE endpoint inside the filtered set", () => {
+    const { stats } = toGalaxy(drillGraph(), "r", "Areas");
+    // Areas/Health/sleep.md → Inbox/loose.md is the only one-foot-in link.
+    expect(stats.outsideLinks).toBe(1);
+    expect(stats.notes).toBe(5);
+    expect(stats.links).toBe(3);
+    // At root nothing is outside.
+    expect(toGalaxy(drillGraph(), "r").stats.outsideLinks).toBe(0);
+  });
+
+  it("flags drillability per level: sub-sub-folders drill, flat sub-folders don't", () => {
+    const { clusters } = toGalaxy(drillGraph(), "r", "Areas");
+    expect(clusters["Health"].drillable).toBe(true); // has Health/Deep/
+    expect(clusters["Gym"].drillable).toBe(false); // files only
+    expect(clusters[""].drillable).toBe(false);
+  });
+
+  it("sizes nodes by their degree WITHIN the filtered view, not the global graph", () => {
+    // sleep.md has 2 links globally but only 1 inside Areas — the isolated
+    // view's sizes must match the links it actually shows.
+    const { data } = toGalaxy(drillGraph(), "r", "Areas");
+    const sleep = data.nodes.find((n) => n.id === "Areas/Health/sleep.md");
+    expect(sleep?.val).toBe(degreeVal(1));
+    const diet = data.nodes.find((n) => n.id === "Areas/Health/diet.md");
+    expect(diet?.val).toBe(degreeVal(3));
+  });
+
+  it("returns the empty shape for a focus path with no notes under it", () => {
+    expect(toGalaxy(drillGraph(), "r", "Nope")).toEqual({
+      data: { nodes: [], links: [] },
+      clusters: {},
+      stats: { notes: 0, links: 0, crossFolderLinks: 0, outsideLinks: 0 },
+    });
   });
 });

@@ -143,6 +143,46 @@ describe("Journey 12: graph view over real link data", () => {
     expect(screen.queryByText(/couldn't be read/)).not.toBeInTheDocument();
   });
 
+  it("drills into a legend cluster and returns via the breadcrumb (spec §Addendum)", async () => {
+    const { user } = await openVault(LINKED_SEED);
+    await enterGraphView(user);
+
+    // Drill: click the "notes" cluster IN THE LEGEND (the sidebar tree also
+    // shows folder names, so scope to the legend card).
+    const legend = () => within(screen.getByText("Clusters").parentElement as HTMLElement);
+    await user.click(legend().getByRole("button", { name: "notes" }));
+
+    // The stub received ONLY the folder's notes; the intra-folder link stays,
+    // recomputed as a normal link at this level (both notes sit directly in
+    // notes/), and Gamma's inbound link now leads outside.
+    const ids = harness.props.graphData.nodes.map((n: any) => n.id).sort();
+    expect(ids).toEqual(["notes/Alpha.md", "notes/Beta.md"]);
+    expect(harness.props.graphData.links).toEqual([
+      expect.objectContaining({ source: "notes/Alpha.md", target: "notes/Beta.md", bridge: false }),
+    ]);
+    expect(
+      screen.getByText("2 notes · 1 link · 0 cross-folder links · 1 link leads outside"),
+    ).toBeInTheDocument();
+
+    // The legend re-keyed to this level: "notes" appears twice in the card —
+    // the plain "" cluster row (DIV, not a button: a second click is a no-op)
+    // and the breadcrumb's inert current level (SPAN). Neither is clickable.
+    expect(
+      legend()
+        .getAllByText("notes")
+        .map((el) => el.tagName)
+        .sort(),
+    ).toEqual(["DIV", "SPAN"]);
+    expect(legend().queryByRole("button", { name: "notes" })).toBeNull();
+    const crumb = screen.getByRole("navigation", { name: "Folder breadcrumb" });
+
+    // Breadcrumb "All notes" restores the full galaxy.
+    await user.click(within(crumb).getByRole("button", { name: "All notes" }));
+    const restored = harness.props.graphData.nodes.map((n: any) => n.id).sort();
+    expect(restored).toEqual(["essays/Gamma.md", "notes/Alpha.md", "notes/Beta.md"]);
+    expect(screen.queryByRole("navigation", { name: "Folder breadcrumb" })).toBeNull();
+  });
+
   it("opens the detail panel on node click and routes 'Open in reader' back to the note view", async () => {
     const { user } = await openVault(LINKED_SEED);
     await enterGraphView(user);
