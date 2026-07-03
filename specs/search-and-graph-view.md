@@ -1,6 +1,14 @@
 # Build plan — Search + Graph view (app phase 2a)
 
-Status: **designed, awaiting implementation** (2026-07-03). Ports the locked prototype designs
+Status: **implemented + verified** (2026-07-03). Evidence: 72 Rust tests + 338 TS tests (36
+files) green; typecheck/clippy/fmt clean; SonarQube gate GREEN (0 new violations, 93.4% new
+coverage); Rust gate green except pre-existing cargo-audit advisories (tauri→plist transitive,
+predates this feature); two adversarial review rounds (code-reviewer + silent-failure-hunter +
+cross-model Codex on the parsers) run to clean, all findings fixed; app boots clean via
+`tauri dev`. Remaining manual check: WebGL visual truth (bloom/morph/labels) — handed to Tom
+with a click-through list; jsdom cannot cover it. Coverage deviation, documented: galaxy
+renderer-bound files (nodeChrome 14%, starNode 13%, NeuralGalaxy 83%) execute only under real
+WebGL — all pure logic meets the ≥90% bar. Ports the locked prototype designs
 (search field styling, neural-galaxy graph) into the real app, backed by two new Rust core
 capabilities: vault text search and a wikilink/markdown-link graph. **Still no AI** — the AI
 phase later layers semantic search and inferred links on top of both.
