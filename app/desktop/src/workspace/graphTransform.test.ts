@@ -1,7 +1,12 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import type { LinkGraph } from "../lib/types";
 import { CLUSTER_PALETTE } from "./galaxy/graph";
-import { toGalaxy } from "./graphTransform";
+import { degreeVal, toGalaxy } from "./graphTransform";
+
+// nodeChrome (for the HUB_VAL coherence check) pulls in three-spritetext,
+// which needs a 2D canvas at construction time — jsdom lacks one.
+vi.mock("three-spritetext", () => ({ default: class {} }));
+import { HUB_VAL } from "./galaxy/nodeChrome";
 
 const node = (id: string, cluster = "", title = id) => ({ id, title, cluster });
 const link = (source: string, target: string, bridge = false) => ({
@@ -44,15 +49,33 @@ describe("toGalaxy", () => {
     for (const n of data.nodes) expect(clusters[n.cluster]).toBeDefined();
   });
 
-  it("sizes nodes by degree: floor 2.5, hub threshold at degree 6, cap 8", () => {
-    // hub has degree 6 (crosses HUB_VAL=7 in nodeChrome); near has degree 5;
-    // orphan has degree 0; mega has degree 8 (capped at 8).
+  it("sizes nodes by degree: floor 2.5, sub-linear √degree growth, cap 17", () => {
+    // Sub-linear so a degree-40 MOC dwarfs a degree-6 note without a linear
+    // blowout: val = 2.5 + 2.2·√degree, capped at 17.
+    expect(degreeVal(0)).toBe(2.5);
+    expect(degreeVal(1)).toBeCloseTo(4.7, 5);
+    expect(degreeVal(6)).toBeCloseTo(2.5 + 2.2 * Math.sqrt(6), 5);
+    expect(degreeVal(44)).toBe(17); // 2.5 + 2.2·√44 ≈ 17.09 — capped
+    expect(degreeVal(100)).toBe(17);
+    // Monotonic: more links never shrinks a node.
+    for (let d = 1; d <= 60; d++) {
+      expect(degreeVal(d)).toBeGreaterThanOrEqual(degreeVal(d - 1));
+    }
+  });
+
+  it("keeps the mapping coherent with nodeChrome's hub gate: hub text starts at degree 12", () => {
+    // "Hub" must mean genuinely top-tier. If either side is retuned, this
+    // pins where the big-label tier begins.
+    expect(degreeVal(11)).toBeLessThan(HUB_VAL);
+    expect(degreeVal(12)).toBeGreaterThanOrEqual(HUB_VAL);
+  });
+
+  it("applies the degree mapping to real nodes (orphan floor, spokes, capped mega-hub)", () => {
     const spokes = ["s1", "s2", "s3", "s4", "s5", "s6"];
-    const megaSpokes = ["m1", "m2", "m3", "m4", "m5", "m6", "m7", "m8"];
+    const megaSpokes = Array.from({ length: 44 }, (_, i) => `m${i}`);
     const g = graph(
       [
         node("hub.md"),
-        node("near.md"),
         node("orphan.md"),
         node("mega.md"),
         ...spokes.map((s) => node(`${s}.md`)),
@@ -60,15 +83,14 @@ describe("toGalaxy", () => {
       ],
       [
         ...spokes.map((s) => link("hub.md", `${s}.md`)),
-        ...spokes.slice(0, 5).map((s) => link("near.md", `${s}.md`)),
         ...megaSpokes.map((s) => link("mega.md", `${s}.md`)),
       ],
     );
     const byId = new Map(toGalaxy(g, "r").data.nodes.map((n) => [n.id, n]));
     expect(byId.get("orphan.md")?.val).toBe(2.5);
-    expect(byId.get("near.md")?.val).toBe(6.25); // degree 5 — below the hub cut
-    expect(byId.get("hub.md")?.val).toBe(7); // degree 6 — exactly HUB_VAL
-    expect(byId.get("mega.md")?.val).toBe(8); // degree 8 — capped
+    expect(byId.get("s1.md")?.val).toBe(degreeVal(1));
+    expect(byId.get("hub.md")?.val).toBe(degreeVal(6));
+    expect(byId.get("mega.md")?.val).toBe(17); // degree 44 — capped
   });
 
   it("colours nodes by their cluster and passes bridges through", () => {

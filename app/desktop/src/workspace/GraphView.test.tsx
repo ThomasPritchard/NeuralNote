@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LinkGraph } from "../lib/types";
 import { createFakeForceGraph, type FakeForceGraph } from "../test/fakeForceGraph";
 import { CLUSTER_PALETTE } from "./galaxy/graph";
+import { degreeVal } from "./graphTransform";
 import { GraphView } from "./GraphView";
 
 const mocks = vi.hoisted(() => ({
@@ -107,7 +108,7 @@ describe("GraphView", () => {
     const nodes = harness.props.graphData.nodes;
     expect(nodes[0]).toMatchObject({
       id: "alpha.md",
-      val: 3.25, // degree 1 → 2.5 + 0.75
+      val: degreeVal(1), // degree-derived size via the exported mapping seam
       color: CLUSTER_PALETTE[0],
     });
     expect(harness.props.width).toBe(800);

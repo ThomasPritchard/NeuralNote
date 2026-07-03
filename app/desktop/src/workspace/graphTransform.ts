@@ -13,11 +13,19 @@ export interface GalaxyView {
   stats: { notes: number; links: number; crossFolderLinks: number };
 }
 
-// val = 2.5 + 0.75·degree, capped: degree 6 lands exactly on the HUB_VAL=7
-// hub-label threshold in galaxy/nodeChrome.ts, so ≥6 links reads as a hub.
+// val = 2.5 + 2.2·√degree, capped at 17. Sub-linear so a well-linked note
+// grows steadily but a degree-40 MOC still dwarfs a degree-6 note (the old
+// linear cap-8 mapping squashed them to nearly the same size). Degree 12
+// crosses the HUB_VAL=10 hub-text gate in galaxy/nodeChrome.ts — pinned by
+// graphTransform.test.ts so neither side drifts alone.
 const VAL_FLOOR = 2.5;
-const VAL_PER_LINK = 0.75;
-const VAL_CAP = 8;
+const VAL_PER_SQRT_LINK = 2.2;
+const VAL_CAP = 17;
+
+/** Degree → render size. Pure seam so the galaxy's size story is testable. */
+export function degreeVal(degree: number): number {
+  return Math.min(VAL_FLOOR + VAL_PER_SQRT_LINK * Math.sqrt(degree), VAL_CAP);
+}
 
 /** Code-unit comparator matching the default `.sort()` ordering — NOT
  *  localeCompare, which is locale-dependent and would unpin the deterministic
@@ -56,7 +64,7 @@ export function toGalaxy(graph: LinkGraph, rootLabel: string): GalaxyView {
     id: n.id,
     title: n.title,
     cluster: n.cluster,
-    val: Math.min(VAL_FLOOR + VAL_PER_LINK * (degree.get(n.id) ?? 0), VAL_CAP),
+    val: degreeVal(degree.get(n.id) ?? 0),
     color: clusters[n.cluster].color,
   }));
 

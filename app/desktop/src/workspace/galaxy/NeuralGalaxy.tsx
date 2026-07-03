@@ -145,6 +145,10 @@ export function NeuralGalaxy({
   const [view, setView] = useState<ViewMode>("3d");
   const morphRaf = useRef(0);
   const savedCamRef = useRef<{ pos: THREE.Vector3; fov: number } | null>(null);
+  // The RAF tick (mount effect, [] deps) needs the LIVE viewport height for
+  // screen-space label/hit math — a ref sidesteps the stale closure.
+  const heightRef = useRef(height);
+  heightRef.current = height;
 
   // Adjacency for hover-glow and the panel's neighbour list: a node's direct
   // neighbours (with the bridge flag) in both directions. Links may be raw
@@ -194,31 +198,18 @@ export function NeuralGalaxy({
     const tick = () => {
       raf = requestAnimationFrame(tick);
       const time = reducedRef.current ? 0 : (performance.now() - start) / 1000;
-      // twinkle + hover-glow easing + proximity label fade (hover works even
-      // if reduced). fovScale normalizes label distances for the 2D lens.
-      // Label bands self-calibrate against the graph's live bounding radius
-      // (absolute constants broke the moment the layout dispersion changed):
-      // fitDist ≈ the effective distance of a whole-graph overview. 3D shows
-      // ghosts at the fitted overview and sharpens on approach; 2D stays
-      // fully labeled at its fit and fades only when pulled well back.
+      // twinkle + hover-glow easing + screen-space chrome (hover works even
+      // if reduced). Labels reveal by each star's PROJECTED radius and hit
+      // proxies keep a minimum projected size (see nodeChrome): pxPerWorld
+      // is the screen px per world unit at distance 1, so a node's apparent
+      // radius is worldR · pxPerWorld / dist. fov comes in via tan(fov/2),
+      // which keeps the 2D dolly-zoom lens (fov 20) equivalent to 3D for
+      // free; fovScale still normalizes the ultra-close label fade.
       const cam = fg.camera() as THREE.PerspectiveCamera;
-      const fovScale = Math.tan((cam.fov * Math.PI) / 360) / Math.tan((50 * Math.PI) / 360);
-      let r2max = 1;
-      for (const n of data.nodes as any[]) {
-        if (n.x == null) continue;
-        const d2 = n.x * n.x + n.y * n.y + (n.z ?? 0) * (n.z ?? 0);
-        if (d2 > r2max) r2max = d2;
-      }
-      const fitDist = Math.sqrt(r2max) / Math.tan((25 * Math.PI) / 180);
-      // Fractions calibrated against measured resting ratios: the 3D
-      // overview sits at ~1.45×fitDist (ghost labels there, crisp a couple
-      // of zoom notches in); the fitted 2D map sits at ~1.2×fitDist (fully
-      // labeled, gone by ~2× when pulled well back).
-      const band: [number, number] =
-        viewRef.current === "2d"
-          ? [1.25 * fitDist, 1.9 * fitDist]
-          : [0.95 * fitDist, 1.75 * fitDist];
-      updateAll(time, { camPos: cam.position, fovScale, band });
+      const tanHalfFov = Math.tan((cam.fov * Math.PI) / 360);
+      const fovScale = tanHalfFov / Math.tan((50 * Math.PI) / 360);
+      const pxPerWorld = heightRef.current / 2 / tanHalfFov;
+      updateAll(time, { camPos: cam.position, fovScale, pxPerWorld });
     };
     raf = requestAnimationFrame(tick);
 

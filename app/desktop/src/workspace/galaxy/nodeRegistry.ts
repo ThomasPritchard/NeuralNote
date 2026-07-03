@@ -4,13 +4,16 @@
 // materials) and registers it by id; the loop calls `updateAll(time)`, and
 // hover handlers flip `setHover` on a node + its neighbours.
 
-// Per-frame label context: camera world position, fovScale (tan(fov/2)
+// Per-frame label/chrome context: camera world position, fovScale (tan(fov/2)
 // relative to the resting lens — <1 when the dolly-zoomed 2D lens magnifies,
-// so fades track how close things LOOK), and the view's [full, gone] band.
+// so the ultra-close fade tracks how close things LOOK), and pxPerWorld
+// (screen px per world unit at distance 1 = viewportHalfHeight / tan(fov/2)),
+// from which each node derives its projected size for the screen-space label
+// reveal and the minimum hit-target scaling.
 export interface LabelCtx {
   camPos: { x: number; y: number; z: number };
   fovScale: number;
-  band: [number, number];
+  pxPerWorld: number;
 }
 
 export interface NodeHandle {

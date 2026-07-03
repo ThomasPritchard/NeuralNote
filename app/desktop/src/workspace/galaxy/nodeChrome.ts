@@ -18,6 +18,22 @@ export function hitRadius(visualR: number): number {
   return Math.max(visualR * 2, HIT_FLOOR);
 }
 
+// World units are meaningless to a fingertip: at the fitted overview a
+// 9-unit proxy projects sub-pixel. The per-frame tick scales each proxy so
+// its PROJECTED radius never drops below MIN_HIT_PX (the hover ring tracks
+// the same radius, so the revealed target stays the true click target).
+export const MIN_HIT_PX = 10;
+
+/**
+ * Scale factor for a hit proxy of world radius `hitR`, viewed from `dist`
+ * with `pxPerWorld` screen px per world unit at distance 1. Never below 1 —
+ * a close-up proxy keeps its true (world-tuned) radius.
+ */
+export function hitProxyScale(hitR: number, pxPerWorld: number, dist: number): number {
+  const projectedPx = (hitR * pxPerWorld) / Math.max(dist, 1e-6);
+  return Math.max(1, MIN_HIT_PX / projectedPx);
+}
+
 export function makeHitProxy(hitR: number): THREE.Mesh {
   // Material-invisible (not object-invisible): three.js still raycasts it.
   return new THREE.Mesh(
@@ -43,6 +59,8 @@ const RING_FRAG = /* glsl */ `
 export interface HoverRing {
   mesh: THREE.Mesh;
   setHover: (eased: number) => void;
+  /** Re-aim the annulus at a (possibly screen-space-grown) hit radius. */
+  setRadius: (worldR: number) => void;
 }
 
 // The annulus peaks at ~0.86 of the quad half-extent, so the quad is
@@ -66,14 +84,23 @@ export function makeHoverRing(hitR: number, color: string): HoverRing {
     setHover: (eased) => {
       material.uniforms.uHover.value = eased;
     },
+    setRadius: (worldR) => {
+      material.uniforms.uScale.value = worldR / 0.86;
+    },
   };
 }
 
-// Every node carries a label. Cluster hubs (val >= HUB_VAL) are visible from
-// afar; leaf labels reveal by proximity — invisible in the overview (forty
-// captions at once is noise), legible as the camera closes in. Muted
-// off-white keeps the bloom pass from haloing the text.
-export const HUB_VAL = 7;
+// Every node carries a label, and ONE fade rule governs them all: a label
+// reveals when its star's PROJECTED radius crosses LABEL_REVEAL_PX (see
+// labelOpacity). Hubs differ only in text size and — being bigger stars —
+// cross the reveal threshold earlier as you zoom; nothing is always-on, so
+// the fitted overview stays a clean field of stars. Muted off-white keeps
+// the bloom pass from haloing the text.
+//
+// HUB_VAL gates the bigger text tier. Under graphTransform's degreeVal
+// mapping (2.5 + 2.2·√degree, cap 17) it corresponds to degree ≥ 12 —
+// genuinely top-tier MOC territory, pinned by graphTransform.test.ts.
+export const HUB_VAL = 10;
 
 export function makeNodeLabel(n: { title: string; val: number }, hitR: number): SpriteText {
   const isHub = n.val >= HUB_VAL;
@@ -91,17 +118,30 @@ function smooth01(t: number): number {
   return c * c * (3 - 2 * c);
 }
 
-// Label opacity from (fov-normalized) camera distance — ONE behavior for
-// every node (hubs differ only in text size). closeFade mirrors the shader's
-// proxAtten (40→220): ultra-close, a label yields to its star instead of
-// blooming into a smear. The far band is the view's to choose: [full, gone]
-// in effective units — 3D keeps ghosts at the resting overview and sharpens
-// on approach; 2D stays fully labeled at the fitted map and fades only when
-// pulled well back beyond it.
-export type LabelBand = [full: number, gone: number];
+// Label reveal is SCREEN-SPACE: readability is about apparent size, not
+// world distance (distance bands broke at real-vault scale — every label
+// rendered at the fitted overview). A label starts fading in when its star's
+// projected radius crosses LABEL_REVEAL_PX and is fully on by LABEL_FULL_PX.
+// Projection (worldR · pxPerWorld / dist) is inherently fov-correct, so the
+// 2D dolly-zoom lens (fov 20) and the 3D view behave equivalently for free.
+//
+// Tuned headlessly at real-vault scale (~765 notes, 1400×1800 viewport): the
+// fitted 2D overview projects the biggest hubs at ~18px (zero labels needs
+// reveal > that with margin) and a wheel notch zooms ~×1.4, so hubs (~37px
+// two notches in) label first while degree-1-2 leaves (~15px there) stay
+// quiet until the camera is well into a neighbourhood (~4 notches).
+export const LABEL_REVEAL_PX = 30;
+export const LABEL_FULL_PX = 40;
 
-export function labelOpacity(dist: number, band: LabelBand): number {
-  const closeFade = smooth01((dist - 40) / 180);
-  const farFade = 1 - smooth01((dist - band[0]) / (band[1] - band[0]));
-  return (0.08 + 0.82 * closeFade) * farFade;
+/**
+ * @param screenR  the star's projected on-screen radius in px
+ * @param effDist  fov-normalized camera distance (world dist × fovScale) —
+ *                 drives only the ultra-close fade, mirroring the shader's
+ *                 proxAtten (40→220): parked on a star, its label yields
+ *                 instead of blooming into a smear.
+ */
+export function labelOpacity(screenR: number, effDist: number): number {
+  const reveal = smooth01((screenR - LABEL_REVEAL_PX) / (LABEL_FULL_PX - LABEL_REVEAL_PX));
+  const closeFade = smooth01((effDist - 40) / 180);
+  return reveal * (0.08 + 0.82 * closeFade);
 }

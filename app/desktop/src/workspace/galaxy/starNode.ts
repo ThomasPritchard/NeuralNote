@@ -1,7 +1,14 @@
 import * as THREE from "three";
 import { BILLBOARD_VERT, PROX_ATTEN, STAR_HELPERS } from "./starfield.glsl";
 import { registerNode, type NodeHandle } from "./nodeRegistry";
-import { hitRadius, labelOpacity, makeHitProxy, makeHoverRing, makeNodeLabel } from "./nodeChrome";
+import {
+  hitProxyScale,
+  hitRadius,
+  labelOpacity,
+  makeHitProxy,
+  makeHoverRing,
+  makeNodeLabel,
+} from "./nodeChrome";
 
 // Variant A — the galaxy "star" node.
 //
@@ -47,7 +54,11 @@ function seedFrom(id: string): number {
 }
 
 export function makeStarNode(n: any): THREE.Object3D {
-  const r = 4.4 * Math.cbrt(Math.max(1, n.val));
+  // √val, not ∛val: val is already sub-linear in degree (graphTransform's
+  // 2.5 + 2.2·√degree), and cbrt squashed the hub:leaf radius ratio to ~1.9×
+  // — MOCs vanished into the crowd at the fitted overview. √val gives ~2.6×
+  // (leaf ≈ 5, capped MOC ≈ 13 world units), Obsidian-style anchor nodes.
+  const r = 3.2 * Math.sqrt(Math.max(1, n.val));
   const material = new THREE.ShaderMaterial({
     uniforms: {
       uColor: { value: new THREE.Color(n.color) },
@@ -65,15 +76,20 @@ export function makeStarNode(n: any): THREE.Object3D {
   const mesh = new THREE.Mesh(new THREE.PlaneGeometry(2, 2), material);
 
   // Chrome: real-geometry hit target (the shader-billboarded quad is invisible
-  // to the raycaster), a ring that reveals it on hover, hub labels.
+  // to the raycaster), a ring that reveals it on hover, labels.
   const hitR = hitRadius(r);
+  const proxy = makeHitProxy(hitR);
   const ring = makeHoverRing(hitR, n.color);
   const group = new THREE.Group();
-  group.add(mesh, makeHitProxy(hitR), ring.mesh);
+  group.add(mesh, proxy, ring.mesh);
   const label = makeNodeLabel(n, hitR);
   group.add(label);
 
-  // Twinkle + eased hover-glow, driven once per frame by NeuralGalaxy's loop.
+  // Twinkle + eased hover-glow + screen-space chrome, driven once per frame
+  // by NeuralGalaxy's loop: the label fades by the star's projected radius,
+  // and the hit proxy (with its reveal ring) grows so it never drops below
+  // MIN_HIT_PX on screen — a distant leaf stays hoverable and its ring stays
+  // visible at the true (grown) target size.
   let hover = 0;
   let hoverTarget = 0;
   const worldPos = new THREE.Vector3();
@@ -87,7 +103,14 @@ export function makeStarNode(n: any): THREE.Object3D {
       if (labels) {
         group.getWorldPosition(worldPos);
         camVec.set(labels.camPos.x, labels.camPos.y, labels.camPos.z);
-        label.material.opacity = labelOpacity(worldPos.distanceTo(camVec) * labels.fovScale, labels.band);
+        const dist = worldPos.distanceTo(camVec);
+        label.material.opacity = labelOpacity(
+          (r * labels.pxPerWorld) / Math.max(dist, 1e-6),
+          dist * labels.fovScale,
+        );
+        const k = hitProxyScale(hitR, labels.pxPerWorld, dist);
+        proxy.scale.setScalar(k);
+        ring.setRadius(hitR * k);
       }
     },
     setHover: (on) => {
