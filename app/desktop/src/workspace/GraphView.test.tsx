@@ -1,4 +1,4 @@
-import { act, render, screen, waitForElementToBeRemoved } from "@testing-library/react";
+import { act, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { LinkGraph } from "../lib/types";
@@ -89,14 +89,17 @@ describe("GraphView", () => {
     mocks.readLinkGraph.mockResolvedValue(linkGraph());
     render(<GraphView onOpenNote={vi.fn()} />);
 
-    // Data loaded but the container is still 0×0 — no galaxy yet.
-    await waitForElementToBeRemoved(() => screen.queryByLabelText("Loading graph"));
+    // Data loaded but the container is still 0×0 — no galaxy yet, and the
+    // spinner stays up (a ready-but-unsized pane must never look blank).
+    await act(async () => {});
     expect(screen.queryByTestId("force-graph-3d")).not.toBeInTheDocument();
+    expect(screen.getByLabelText("Loading graph")).toBeInTheDocument();
 
     fireResize(800, 600);
     expect(screen.getByTestId("force-graph-3d")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Loading graph")).not.toBeInTheDocument();
     expect(
-      screen.getByText("2 notes · 1 links · 1 cross-folder links"),
+      screen.getByText("2 notes · 1 link · 1 cross-folder link"),
     ).toBeInTheDocument();
 
     // Transformed shape reached the renderer: decorated vals/colours, and the

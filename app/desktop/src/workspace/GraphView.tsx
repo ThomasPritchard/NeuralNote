@@ -30,6 +30,9 @@ export function GraphView({
   const [size, setSize] = useState({ width: 0, height: 0 });
   const containerRef = useRef<HTMLElement | null>(null);
 
+  // No stale-fetch token on purpose: leaving graph view (or swapping vaults)
+  // unmounts this component, and setState after unmount is a React 18/19
+  // no-op — there's no overlapping-fetch path to guard.
   const load = useCallback(async () => {
     setState({ phase: "loading" });
     try {
@@ -62,13 +65,19 @@ export function GraphView({
     return () => observer.disconnect();
   }, []);
 
+  const sized = size.width > 0 && size.height > 0;
+
   return (
     <main
       ref={containerRef}
       aria-label="Graph view"
       className="relative flex-1 overflow-hidden bg-background"
     >
-      {state.phase === "loading" && (
+      {/* The spinner also covers ready-but-unsized: the galaxy needs pixel
+          dimensions, and a blank pane while the first ResizeObserver tick
+          lands would read as a failure. */}
+      {(state.phase === "loading" ||
+        (state.phase === "ready" && state.galaxy.data.nodes.length > 0 && !sized)) && (
         <div className="grid h-full place-items-center">
           <Loader2
             className="size-5 animate-spin text-muted-foreground motion-reduce:animate-none"
@@ -99,18 +108,16 @@ export function GraphView({
         </div>
       )}
 
-      {state.phase === "ready" && state.galaxy.data.nodes.length > 0 && (
+      {state.phase === "ready" && state.galaxy.data.nodes.length > 0 && sized && (
         <>
-          {size.width > 0 && size.height > 0 && (
-            <NeuralGalaxy
-              data={state.galaxy.data}
-              clusters={state.galaxy.clusters}
-              stats={state.galaxy.stats}
-              width={size.width}
-              height={size.height}
-              onOpenNote={onOpenNote}
-            />
-          )}
+          <NeuralGalaxy
+            data={state.galaxy.data}
+            clusters={state.galaxy.clusters}
+            stats={state.galaxy.stats}
+            width={size.width}
+            height={size.height}
+            onOpenNote={onOpenNote}
+          />
           {state.skippedFiles > 0 && (
             // Non-blocking degradation notice, kept near the stats/top area.
             <p className="nn-mono pointer-events-none absolute left-5 top-16 text-[11px] text-muted-foreground">

@@ -72,10 +72,19 @@ beforeEach(() => {
 describe("NeuralGalaxy", () => {
   it("renders the stats line and the cluster legend with the cross-folder row", () => {
     render(<NeuralGalaxy {...makeProps()} />);
-    expect(screen.getByText("3 notes · 2 links · 1 cross-folder links")).toBeInTheDocument();
+    expect(screen.getByText("3 notes · 2 links · 1 cross-folder link")).toBeInTheDocument();
     expect(screen.getByText("My Vault")).toBeInTheDocument();
     expect(screen.getByText("notes")).toBeInTheDocument();
     expect(screen.getByText("Cross-folder link")).toBeInTheDocument();
+  });
+
+  it("pluralizes each stat independently", () => {
+    render(
+      <NeuralGalaxy
+        {...makeProps({ stats: { notes: 1, links: 1, crossFolderLinks: 0 } })}
+      />,
+    );
+    expect(screen.getByText("1 note · 1 link · 0 cross-folder links")).toBeInTheDocument();
   });
 
   it("adds a bloom pass on mount and removes the SAME pass on unmount (StrictMode safety)", () => {
@@ -120,6 +129,19 @@ describe("NeuralGalaxy", () => {
     const neighbour = screen.getByRole("button", { name: /Beta/ });
     expect(neighbour).toHaveTextContent("Cross-folder");
     expect(harness.fg.cameraPosition).toHaveBeenCalled();
+  });
+
+  it("keeps the neighbour count in step with the rendered rows when a link points at a missing node", () => {
+    const props = makeProps();
+    // A dangling link: "ghost.md" appears in the links but not in the nodes.
+    props.data.links.push({ source: "alpha.md", target: "ghost.md" });
+    render(<NeuralGalaxy {...props} />);
+    clickNode("alpha.md");
+    // Adjacency sees two neighbours, but only Beta resolves — the count must
+    // match the single rendered row, never the raw adjacency length.
+    expect(screen.getByText("1 connected note")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Beta/ })).toBeInTheDocument();
+    expect(screen.queryByText(/ghost/i)).not.toBeInTheDocument();
   });
 
   it("traverses to a neighbour from the panel", async () => {

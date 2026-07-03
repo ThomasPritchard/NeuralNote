@@ -133,7 +133,7 @@ describe("Journey 12: graph view over real link data", () => {
 
     // Stats line + legend (scoped to the legend card — the tree sidebar also
     // shows the folder names).
-    expect(screen.getByText("3 notes · 2 links · 1 cross-folder links")).toBeInTheDocument();
+    expect(screen.getByText("3 notes · 2 links · 1 cross-folder link")).toBeInTheDocument();
     const legend = within(screen.getByText("Clusters").parentElement as HTMLElement);
     expect(legend.getByText("essays")).toBeInTheDocument();
     expect(legend.getByText("notes")).toBeInTheDocument();
@@ -217,7 +217,7 @@ describe("Journey 13: graph guard and failure surfacing", () => {
     await user.click(screen.getByRole("button", { name: /Retry/ }));
 
     expect(await screen.findByTestId("force-graph-3d")).toBeInTheDocument();
-    expect(screen.getByText("3 notes · 2 links · 1 cross-folder links")).toBeInTheDocument();
+    expect(screen.getByText("3 notes · 2 links · 1 cross-folder link")).toBeInTheDocument();
     expect(screen.queryByText("graph scan failed")).not.toBeInTheDocument();
   });
 });

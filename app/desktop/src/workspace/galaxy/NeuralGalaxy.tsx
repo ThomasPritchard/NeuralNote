@@ -28,6 +28,10 @@ function easeInOut(t: number): number {
   return t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
 }
 
+function plural(n: number, noun: string): string {
+  return `${n} ${noun}${n === 1 ? "" : "s"}`;
+}
+
 export interface NeuralGalaxyProps {
   /** Pre-decorated render graph. IMMUTABLE per mount: the force simulation
    *  and the 2D morph mutate the node objects in place, so a refetch means a
@@ -77,6 +81,17 @@ export function NeuralGalaxy({
   }, [data]);
 
   const nodeById = useMemo(() => new Map(data.nodes.map((n) => [n.id, n])), [data]);
+
+  // The selected node's neighbours, resolved against nodeById up front so the
+  // panel's count and its rows can never disagree (a link id missing from the
+  // render graph is dropped from both).
+  const neighbours = useMemo(() => {
+    if (!selected) return [];
+    return (adjacency.get(selected.id) ?? []).flatMap(({ id, bridge }) => {
+      const node = nodeById.get(id);
+      return node ? [{ node, bridge }] : [];
+    });
+  }, [selected, adjacency, nodeById]);
 
   // Init (once): restrained bloom (only node cores glow) plus a single RAF loop
   // driving node twinkle and hover-glow easing. The graph is never remounted,
@@ -307,7 +322,7 @@ export function NeuralGalaxy({
         nodeThreeObject={makeStarNode}
         onNodeHover={onNodeHover}
         nodeLabel={(n: any) =>
-          `<div style="font:600 12px Inter,sans-serif;color:#fff;background:rgba(20,18,32,.92);border:1px solid rgba(255,255,255,.12);padding:5px 9px;border-radius:8px">${n.title}<span style="color:${n.color};margin-left:8px;font-weight:500">${clusters[n.cluster].label}</span></div>`
+          `<div style="font:600 12px Inter,sans-serif;color:#fff;background:rgba(20,18,32,.92);border:1px solid rgba(255,255,255,.12);padding:5px 9px;border-radius:8px">${n.title}<span style="color:${n.color};margin-left:8px;font-weight:500">${clusters[n.cluster]?.label ?? n.cluster}</span></div>`
         }
         linkColor={(l: any) => (l.bridge ? "rgba(244,170,255,0.85)" : "rgba(150,150,200,0.16)")}
         linkWidth={(l: any) => (l.bridge ? 0.8 : 0.3)}
@@ -327,7 +342,8 @@ export function NeuralGalaxy({
               <Sparkles className="size-4 text-primary" /> Neural galaxy
             </div>
             <div className="nn-mono text-[11px] text-muted-foreground">
-              {stats.notes} notes · {stats.links} links · {stats.crossFolderLinks} cross-folder links
+              {plural(stats.notes, "note")} · {plural(stats.links, "link")} ·{" "}
+              {plural(stats.crossFolderLinks, "cross-folder link")}
             </div>
           </div>
         </div>
@@ -385,7 +401,7 @@ export function NeuralGalaxy({
                     <span className="size-2 shrink-0 rounded-full" style={{ background: n.color }} />
                     <span className="truncate">{n.title}</span>
                     <span className="nn-mono ml-auto shrink-0 text-[10px] text-muted-foreground">
-                      {clusters[n.cluster].label}
+                      {clusters[n.cluster]?.label ?? n.cluster}
                     </span>
                   </button>
                 ))}
@@ -418,7 +434,7 @@ export function NeuralGalaxy({
               className="nn-mono rounded-full px-2 py-0.5 text-[10px]"
               style={{ background: `${selected.color}22`, color: selected.color }}
             >
-              {clusters[selected.cluster].label}
+              {clusters[selected.cluster]?.label ?? selected.cluster}
             </span>
             <button onClick={closeSelectedAndReturn} aria-label="Close">
               <X className="size-4 text-muted-foreground hover:text-foreground" />
@@ -426,31 +442,26 @@ export function NeuralGalaxy({
           </div>
           <h3 className="nn-heading mt-2 text-base font-semibold leading-snug text-foreground">{selected.title}</h3>
           <div className="nn-mono mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">
-            {(adjacency.get(selected.id) ?? []).length} connected note
-            {(adjacency.get(selected.id) ?? []).length === 1 ? "" : "s"}
+            {plural(neighbours.length, "connected note")}
           </div>
           <div className="mt-1.5 max-h-56 overflow-y-auto">
-            {(adjacency.get(selected.id) ?? []).map(({ id, bridge }) => {
-              const nb = nodeById.get(id) as any;
-              if (!nb) return null;
-              return (
-                <button
-                  key={id}
-                  onClick={() => onNodeClick(nb)}
-                  onMouseEnter={() => setHover(id, true)}
-                  onMouseLeave={() => setHover(id, false)}
-                  className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-foreground transition hover:bg-primary/10"
-                >
-                  <span className="size-2 shrink-0 rounded-full" style={{ background: nb.color }} />
-                  <span className="truncate">{nb.title}</span>
-                  {bridge && (
-                    <span className="nn-mono ml-auto shrink-0 text-[9px]" style={{ color: "#f4aaff" }}>
-                      Cross-folder
-                    </span>
-                  )}
-                </button>
-              );
-            })}
+            {neighbours.map(({ node: nb, bridge }) => (
+              <button
+                key={nb.id}
+                onClick={() => onNodeClick(nb)}
+                onMouseEnter={() => setHover(nb.id, true)}
+                onMouseLeave={() => setHover(nb.id, false)}
+                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-foreground transition hover:bg-primary/10"
+              >
+                <span className="size-2 shrink-0 rounded-full" style={{ background: nb.color }} />
+                <span className="truncate">{nb.title}</span>
+                {bridge && (
+                  <span className="nn-mono ml-auto shrink-0 text-[9px]" style={{ color: "#f4aaff" }}>
+                    Cross-folder
+                  </span>
+                )}
+              </button>
+            ))}
           </div>
           <button
             onClick={() => onOpenNote(selected.id)}
