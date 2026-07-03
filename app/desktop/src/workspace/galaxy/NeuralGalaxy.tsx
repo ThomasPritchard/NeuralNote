@@ -24,6 +24,88 @@ type ViewMode = "3d" | "2d";
 const MORPH_MS = 1100;
 const FOV_2D = 20; // narrow lens ≈ orthographic once the dolly-zoom lands
 
+// ── Force profiles ──────────────────────────────────────────────────────────
+// Layout physics + link visibility per view. Tuned headlessly at real-vault
+// scale (~765 notes / ~1435 links) against an "Obsidian-like" bar for the 2D
+// map: one cohesive connected web with readable sub-clusters, islands pulled
+// near the main mass, and the link web visible at overview. The 3D galaxy
+// keeps more spread but must never scatter disconnected islands to infinity.
+// Applied on init and re-applied on every 2D↔3D morph (see applyForceProfile).
+// Hand-tweak values here — everything layout-physics lives in this block.
+export interface ForceProfile {
+  /** forceManyBody repulsion (negative). More negative = airier layout. */
+  chargeStrength: number;
+  /** Repulsion range cap. Without it, disconnected components repel forever
+   *  and drift to the viewport edges; a few hundred units keeps them in orbit. */
+  chargeDistanceMax: number;
+  /** Link rest length — smaller pulls connected notes into a tighter web. */
+  linkDistance: number;
+  /** Positional gravity toward the origin (forceX/Y-style, target 0). The only
+   *  force that pulls disconnected islands/orphans back toward the mass. The
+   *  flat 2D map needs more of it than the 3D galaxy. */
+  gravityStrength: number;
+  /** Normal (same-folder) link styling. Bridges stay pink in both views. */
+  linkAlpha: number;
+  linkWidth: number;
+  /** Cross-folder bridge width — keep > linkWidth so bridges read stronger. */
+  bridgeWidth: number;
+}
+
+export const FORCE_PROFILES: Record<ViewMode, ForceProfile> = {
+  "3d": {
+    chargeStrength: -80,
+    chargeDistanceMax: 500,
+    linkDistance: 45,
+    gravityStrength: 0.04,
+    linkAlpha: 0.3,
+    linkWidth: 0.5,
+    bridgeWidth: 0.8,
+  },
+  "2d": {
+    chargeStrength: -60,
+    chargeDistanceMax: 400,
+    linkDistance: 36,
+    gravityStrength: 0.055,
+    linkAlpha: 0.42,
+    linkWidth: 0.8,
+    bridgeWidth: 1.1,
+  },
+};
+
+const BRIDGE_COLOR = "rgba(244,170,255,0.85)";
+
+/** Simulation node as d3-force-3d sees it: positions + velocities are live. */
+type SimNode = GalaxyNode & { x: number; y: number; z: number; vx: number; vy: number; vz: number };
+
+// Positional gravity toward the origin — the same math as d3's forceX(0)/
+// forceY(0) (+ forceZ in 3D), written as a tiny custom force so we don't
+// import the untyped, transitive d3-force-3d package. `d3Force(name, fn)`
+// accepts any function force with an `initialize` hook.
+function makeGravity(strength: number, withZ: boolean) {
+  let nodes: SimNode[] = [];
+  const force = (alpha: number) => {
+    const k = strength * alpha;
+    for (const n of nodes) {
+      n.vx -= n.x * k;
+      n.vy -= n.y * k;
+      if (withZ) n.vz -= (n.z ?? 0) * k;
+    }
+  };
+  force.initialize = (ns: SimNode[]) => {
+    nodes = ns;
+  };
+  return force;
+}
+
+/** Point the live simulation at a view's physics (init + every view morph).
+ *  z-gravity only exists in 3D: the 2D morph pins fz=0, so a z pull is inert. */
+function applyForceProfile(fg: any, mode: ViewMode) {
+  const p = FORCE_PROFILES[mode];
+  fg.d3Force("charge")?.strength(p.chargeStrength).distanceMax(p.chargeDistanceMax);
+  fg.d3Force("link")?.distance(p.linkDistance);
+  fg.d3Force("gravity", makeGravity(p.gravityStrength, mode === "3d"));
+}
+
 function easeInOut(t: number): number {
   return t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
 }
@@ -103,11 +185,9 @@ export function NeuralGalaxy({
     const bloom = new UnrealBloomPass(new THREE.Vector2(width, height), 0.4, 0.5, 0.45);
     fg.postProcessingComposer().addPass(bloom);
 
-    // Disperse the resting layout: stronger repulsion + longer link
-    // rest-length than the lib defaults (-60 charge, 30 distance), so
-    // clusters separate and their members breathe instead of clumping.
-    fg.d3Force("charge")?.strength(-160);
-    fg.d3Force("link")?.distance(55);
+    // Layout physics live in FORCE_PROFILES (top of file). The graph mounts
+    // in 3D; changeView re-applies the matching profile on every morph.
+    applyForceProfile(fg, "3d");
 
     const start = performance.now();
     let raf = 0;
@@ -285,6 +365,9 @@ export function NeuralGalaxy({
       if (v === viewRef.current || !fg) return;
       viewRef.current = v;
       setView(v);
+      // Swap the layout physics with the view; animateMorph's reheat below
+      // keeps the sim ticking so the new forces take hold through the tween.
+      applyForceProfile(fg, v);
       preFocusRef.current = null; // a pose saved in the other view's camera regime is wrong
       const cam = fg.camera() as THREE.PerspectiveCamera;
       const controls: any = fg.controls();
@@ -324,8 +407,14 @@ export function NeuralGalaxy({
         nodeLabel={(n: any) =>
           `<div style="font:600 12px Inter,sans-serif;color:#fff;background:rgba(20,18,32,.92);border:1px solid rgba(255,255,255,.12);padding:5px 9px;border-radius:8px">${n.title}<span style="color:${n.color};margin-left:8px;font-weight:500">${clusters[n.cluster]?.label ?? n.cluster}</span></div>`
         }
-        linkColor={(l: any) => (l.bridge ? "rgba(244,170,255,0.85)" : "rgba(150,150,200,0.16)")}
-        linkWidth={(l: any) => (l.bridge ? 0.8 : 0.3)}
+        // Link styling is view-aware (FORCE_PROFILES): the flat 2D map needs a
+        // clearly visible web at overview; the 3D galaxy stays more subdued.
+        linkColor={(l: any) =>
+          l.bridge ? BRIDGE_COLOR : `rgba(150,150,200,${FORCE_PROFILES[view].linkAlpha})`
+        }
+        linkWidth={(l: any) =>
+          l.bridge ? FORCE_PROFILES[view].bridgeWidth : FORCE_PROFILES[view].linkWidth
+        }
         linkDirectionalParticles={(l: any) => (l.bridge ? 3 : 0)}
         linkDirectionalParticleWidth={1.6}
         linkDirectionalParticleColor={() => "#f4aaff"}

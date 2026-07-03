@@ -5,11 +5,13 @@
 import * as THREE from "three";
 import { vi } from "vitest";
 
-/** A d3 force accessor as NeuralGalaxy uses it: `d3Force("charge").strength(n)`
- *  / `d3Force("link").distance(n)` — chainable, so setters return the force. */
+/** A d3 force accessor as NeuralGalaxy uses it: `d3Force("charge").strength(n)
+ *  .distanceMax(n)` / `d3Force("link").distance(n)` — chainable, so setters
+ *  return the force. */
 export interface FakeForce {
   strength: ReturnType<typeof vi.fn>;
   distance: ReturnType<typeof vi.fn>;
+  distanceMax: ReturnType<typeof vi.fn>;
 }
 
 export interface FakeForceGraph {
@@ -26,18 +28,29 @@ export interface FakeForceGraph {
   __camera: THREE.PerspectiveCamera;
   __controls: { target: THREE.Vector3; noRotate: boolean };
   __forces: Record<string, FakeForce>;
+  /** Custom force functions registered via the setter form `d3Force(name, fn)`
+   *  (e.g. NeuralGalaxy's positional gravity). */
+  __customForces: Record<string, unknown>;
 }
 
 export function createFakeForceGraph(): FakeForceGraph {
   const composer = { addPass: vi.fn(), removePass: vi.fn() };
 
   const forces: Record<string, FakeForce> = {};
-  const d3Force = vi.fn((name: string) => {
+  const customForces: Record<string, unknown> = {};
+  const d3Force = vi.fn((name: string, force?: unknown) => {
+    // Setter form: register/replace a named force (matches three-forcegraph's
+    // `d3Force(forceName, forceFn)`); the component ignores the return value.
+    if (force !== undefined) {
+      customForces[name] = force;
+      return undefined;
+    }
     if (!forces[name]) {
-      const force: Partial<FakeForce> = {};
-      force.strength = vi.fn(() => force);
-      force.distance = vi.fn(() => force);
-      forces[name] = force as FakeForce;
+      const fake: Partial<FakeForce> = {};
+      fake.strength = vi.fn(() => fake);
+      fake.distance = vi.fn(() => fake);
+      fake.distanceMax = vi.fn(() => fake);
+      forces[name] = fake as FakeForce;
     }
     return forces[name];
   });
@@ -61,5 +74,6 @@ export function createFakeForceGraph(): FakeForceGraph {
     __camera: camera,
     __controls: controls,
     __forces: forces,
+    __customForces: customForces,
   };
 }

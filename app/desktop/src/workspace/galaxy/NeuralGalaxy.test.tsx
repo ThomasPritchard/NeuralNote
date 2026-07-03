@@ -3,7 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFakeForceGraph, type FakeForceGraph } from "../../test/fakeForceGraph";
 import type { NeuralGalaxyProps } from "./NeuralGalaxy";
-import { NeuralGalaxy } from "./NeuralGalaxy";
+import { FORCE_PROFILES, NeuralGalaxy } from "./NeuralGalaxy";
 
 // The 3D renderer is mocked away: these tests drive the plain-DOM overlays
 // (top bar, search, legend, detail panel) and the imperative fg traffic.
@@ -171,6 +171,72 @@ describe("NeuralGalaxy", () => {
     clickNode("notes/beta.md");
     await user.click(screen.getByRole("button", { name: "Open in reader" }));
     expect(props.onOpenNote).toHaveBeenCalledWith("notes/beta.md");
+  });
+
+  it("applies the 3D force profile on init: capped charge, link distance, gravity", () => {
+    render(<NeuralGalaxy {...makeProps()} />);
+    const p = FORCE_PROFILES["3d"];
+    expect(harness.fg.__forces.charge.strength).toHaveBeenCalledWith(p.chargeStrength);
+    expect(harness.fg.__forces.charge.distanceMax).toHaveBeenCalledWith(p.chargeDistanceMax);
+    expect(harness.fg.__forces.link.distance).toHaveBeenCalledWith(p.linkDistance);
+    expect(typeof harness.fg.__customForces.gravity).toBe("function");
+  });
+
+  it("swaps to the 2D force profile when the view toggles (and reheats the sim)", async () => {
+    const user = userEvent.setup();
+    render(<NeuralGalaxy {...makeProps()} />);
+    await user.click(screen.getByRole("button", { name: "2d" }));
+    const p = FORCE_PROFILES["2d"];
+    expect(harness.fg.__forces.charge.strength).toHaveBeenLastCalledWith(p.chargeStrength);
+    expect(harness.fg.__forces.charge.distanceMax).toHaveBeenLastCalledWith(p.chargeDistanceMax);
+    expect(harness.fg.__forces.link.distance).toHaveBeenLastCalledWith(p.linkDistance);
+    expect(harness.fg.d3ReheatSimulation).toHaveBeenCalled();
+  });
+
+  it("3D gravity pulls nodes toward the origin on all three axes", () => {
+    render(<NeuralGalaxy {...makeProps()} />);
+    const gravity = harness.fg.__customForces.gravity as any;
+    const node = { x: 100, y: -50, z: 20, vx: 0, vy: 0, vz: 0 };
+    gravity.initialize([node]);
+    gravity(1);
+    expect(node.vx).toBeLessThan(0);
+    expect(node.vy).toBeGreaterThan(0);
+    expect(node.vz).toBeLessThan(0);
+  });
+
+  it("2D gravity pulls x/y only (z is pinned by the morph)", async () => {
+    const user = userEvent.setup();
+    render(<NeuralGalaxy {...makeProps()} />);
+    await user.click(screen.getByRole("button", { name: "2d" }));
+    const gravity = harness.fg.__customForces.gravity as any;
+    const node = { x: 100, y: -50, z: 20, vx: 0, vy: 0, vz: 0 };
+    gravity.initialize([node]);
+    gravity(1);
+    expect(node.vx).toBeLessThan(0);
+    expect(node.vy).toBeGreaterThan(0);
+    expect(node.vz).toBe(0);
+  });
+
+  it("styles links per view profile — bridges stay pink and stronger in both", async () => {
+    const user = userEvent.setup();
+    render(<NeuralGalaxy {...makeProps()} />);
+    const normal = { bridge: false };
+    const bridge = { bridge: true };
+
+    const p3 = FORCE_PROFILES["3d"];
+    expect(p3.bridgeWidth).toBeGreaterThan(p3.linkWidth);
+    expect(harness.props.linkColor(normal)).toBe(`rgba(150,150,200,${p3.linkAlpha})`);
+    expect(harness.props.linkColor(bridge)).toBe("rgba(244,170,255,0.85)");
+    expect(harness.props.linkWidth(normal)).toBe(p3.linkWidth);
+    expect(harness.props.linkWidth(bridge)).toBe(p3.bridgeWidth);
+
+    await user.click(screen.getByRole("button", { name: "2d" }));
+    const p2 = FORCE_PROFILES["2d"];
+    expect(p2.bridgeWidth).toBeGreaterThan(p2.linkWidth);
+    expect(harness.props.linkColor(normal)).toBe(`rgba(150,150,200,${p2.linkAlpha})`);
+    expect(harness.props.linkColor(bridge)).toBe("rgba(244,170,255,0.85)");
+    expect(harness.props.linkWidth(normal)).toBe(p2.linkWidth);
+    expect(harness.props.linkWidth(bridge)).toBe(p2.bridgeWidth);
   });
 
   it("marks the active view on the 3D/2D toggle and morphs the camera", async () => {
