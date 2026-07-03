@@ -5,7 +5,7 @@ import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPa
 import { Search, Sparkles, X } from "lucide-react";
 import type { GalaxyLink, GalaxyNode } from "./graph";
 import { makeStarNode } from "./starNode";
-import { resetRegistry, setHover, updateAll } from "./nodeRegistry";
+import { applyFocus, resetRegistry, setHover, updateAll } from "./nodeRegistry";
 
 // ── NeuralGalaxy ──────────────────────────────────────────────────────────
 // A 3D "neural map" of the vault: notes are nodes, wikilinks are edges,
@@ -73,6 +73,23 @@ export const FORCE_PROFILES: Record<ViewMode, ForceProfile> = {
 };
 
 const BRIDGE_COLOR = "rgba(244,170,255,0.85)";
+const PARTICLE_COLOR = () => "#f4aaff";
+
+// ── Hover-focus (Obsidian-style) ─────────────────────────────────────────
+// Hovering a node keeps it + its direct neighbours + their shared links at
+// full styling while everything else fades back, so the local cluster pops.
+// Node brightness dims GPU-side via the registry (starNode's DIM_FACTOR);
+// links fade through these accessor constants. While a node is selected and
+// nothing is hovered, the selection's neighbourhood is the lit set.
+/** Multiplier on a normal link's alpha when it falls outside the lit set. */
+export const LINK_FADE = 0.12;
+/** Faded bridge styling — a dimmed bridge must stop drawing the eye. */
+export const BRIDGE_FADED_COLOR = "rgba(244,170,255,0.08)";
+
+/** Links may hold raw id strings or (post-simulation) node object refs. */
+function endpointId(end: unknown): string {
+  return typeof end === "object" && end !== null ? (end as { id: string }).id : (end as string);
+}
 
 /** Simulation node as d3-force-3d sees it: positions + velocities are live. */
 type SimNode = GalaxyNode & { x: number; y: number; z: number; vx: number; vy: number; vz: number };
@@ -178,6 +195,41 @@ export function NeuralGalaxy({
       return node ? [{ node, bridge }] : [];
     });
   }, [selected, adjacency, nodeById]);
+
+  // ── Hover-focus state ────────────────────────────────────────────────────
+  // The lit set derives from one origin: the hovered node, else the selected
+  // node (so the panel's neighbour list matches what stays bright), else
+  // nothing. Node dims retarget GPU-side through the registry — no React work
+  // per node. The epoch bump exists ONLY for the links: a re-render hands the
+  // library a fresh linkColor accessor identity, which re-runs its link digest
+  // (recolour in place). fg.refresh() is NOT used — it flushes the node data
+  // mapper, which would rebuild every star object and snap the eased dims.
+  const hoverOriginRef = useRef<string | null>(null);
+  const selectedIdRef = useRef<string | null>(null);
+  const focusRef = useRef<{ origin: string; lit: Set<string> } | null>(null);
+  const [, setFocusEpoch] = useState(0);
+
+  const refreshFocus = useCallback(() => {
+    const origin = hoverOriginRef.current ?? selectedIdRef.current;
+    if ((focusRef.current?.origin ?? null) === origin) return;
+    focusRef.current = origin
+      ? { origin, lit: new Set([origin, ...(adjacency.get(origin) ?? []).map((nb) => nb.id)]) }
+      : null;
+    applyFocus(focusRef.current?.lit ?? null);
+    setFocusEpoch((n) => n + 1);
+  }, [adjacency]);
+
+  useEffect(() => {
+    selectedIdRef.current = selected?.id ?? null;
+    refreshFocus();
+  }, [selected, refreshFocus]);
+
+  /** A link keeps full styling only while it touches the focus origin (the
+   *  hovered↔neighbour links themselves, not neighbour↔neighbour strays). */
+  const isLinkLit = useCallback((l: any) => {
+    const f = focusRef.current;
+    return !f || endpointId(l.source) === f.origin || endpointId(l.target) === f.origin;
+  }, []);
 
   // Init (once): restrained bloom (only node cores glow) plus a single RAF loop
   // driving node twinkle and hover-glow easing. The graph is never remounted,
@@ -288,7 +340,8 @@ export function NeuralGalaxy({
     [onNodeClick],
   );
 
-  // Hover-glow: brighten the hovered node and its direct neighbours.
+  // Hover-glow + hover-focus: brighten the hovered node and its direct
+  // neighbours, and retarget the focus dim (everything else fades back).
   const onNodeHover = useCallback(
     (node: any) => {
       hoveredRef.current.forEach((id) => setHover(id, false));
@@ -301,8 +354,10 @@ export function NeuralGalaxy({
           hoveredRef.current.add(nb.id);
         }
       }
+      hoverOriginRef.current = node ? node.id : null;
+      refreshFocus();
     },
-    [adjacency],
+    [adjacency, refreshFocus],
   );
 
   // ── 2D ↔ 3D morph ────────────────────────────────────────────────────────
@@ -356,6 +411,9 @@ export function NeuralGalaxy({
       if (v === viewRef.current || !fg) return;
       viewRef.current = v;
       setView(v);
+      // The library only re-raycasts on mousemove: a hover parked under the
+      // morphing camera would keep the old neighbourhood lit — drop it.
+      onNodeHover(null);
       // Swap the layout physics with the view; animateMorph's reheat below
       // keeps the sim ticking so the new forces take hold through the tween.
       applyForceProfile(fg, v);
@@ -379,7 +437,23 @@ export function NeuralGalaxy({
         animateMorph(saved?.fov ?? cam.fov, false);
       }
     },
-    [animateMorph],
+    [animateMorph, onNodeHover],
+  );
+
+  // Stable accessor identities, on purpose: only linkColor changes identity
+  // per render, so the library's link digest recolours materials in place
+  // instead of clearing + rebuilding every link object (its `linkWidth` prop
+  // sits on the recreate-objects list; a fresh identity per render would
+  // reconstruct ~all link meshes on every hover-set change and keystroke).
+  // Width/particles still re-evaluate per digest via viewRef/focusRef.
+  const linkWidth = useCallback((l: any) => {
+    const p = FORCE_PROFILES[viewRef.current];
+    return l.bridge ? p.bridgeWidth : p.linkWidth;
+  }, []);
+
+  const linkParticles = useCallback(
+    (l: any) => (l.bridge && isLinkLit(l) ? 3 : 0),
+    [isLinkLit],
   );
 
   return (
@@ -400,15 +474,20 @@ export function NeuralGalaxy({
         }
         // Link styling is view-aware (FORCE_PROFILES): the flat 2D map needs a
         // clearly visible web at overview; the 3D galaxy stays more subdued.
-        linkColor={(l: any) =>
-          l.bridge ? BRIDGE_COLOR : `rgba(150,150,200,${FORCE_PROFILES[view].linkAlpha})`
-        }
-        linkWidth={(l: any) =>
-          l.bridge ? FORCE_PROFILES[view].bridgeWidth : FORCE_PROFILES[view].linkWidth
-        }
-        linkDirectionalParticles={(l: any) => (l.bridge ? 3 : 0)}
+        // Under an active hover-focus, links outside the lit neighbourhood
+        // fade well back (alpha only — widths keep their objects stable).
+        linkColor={(l: any) => {
+          if (!isLinkLit(l)) {
+            return l.bridge
+              ? BRIDGE_FADED_COLOR
+              : `rgba(150,150,200,${+(FORCE_PROFILES[view].linkAlpha * LINK_FADE).toFixed(3)})`;
+          }
+          return l.bridge ? BRIDGE_COLOR : `rgba(150,150,200,${FORCE_PROFILES[view].linkAlpha})`;
+        }}
+        linkWidth={linkWidth}
+        linkDirectionalParticles={linkParticles}
         linkDirectionalParticleWidth={1.6}
-        linkDirectionalParticleColor={() => "#f4aaff"}
+        linkDirectionalParticleColor={PARTICLE_COLOR}
         onNodeClick={onNodeClick}
         onBackgroundClick={dismissSelected}
         onEngineStop={() => fgRef.current?.zoomToFit(800, 110)}

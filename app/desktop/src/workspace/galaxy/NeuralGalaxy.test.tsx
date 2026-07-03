@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFakeForceGraph, type FakeForceGraph } from "../../test/fakeForceGraph";
 import type { NeuralGalaxyProps } from "./NeuralGalaxy";
-import { FORCE_PROFILES, NeuralGalaxy } from "./NeuralGalaxy";
+import { BRIDGE_FADED_COLOR, FORCE_PROFILES, LINK_FADE, NeuralGalaxy } from "./NeuralGalaxy";
+import { registerNode } from "./nodeRegistry";
 
 // The 3D renderer is mocked away: these tests drive the plain-DOM overlays
 // (top bar, search, legend, detail panel) and the imperative fg traffic.
@@ -237,6 +238,123 @@ describe("NeuralGalaxy", () => {
     expect(harness.props.linkColor(bridge)).toBe("rgba(244,170,255,0.85)");
     expect(harness.props.linkWidth(normal)).toBe(p2.linkWidth);
     expect(harness.props.linkWidth(bridge)).toBe(p2.bridgeWidth);
+  });
+
+  describe("hover-focus dimming", () => {
+    // Handles normally register from makeStarNode (mocked away with the
+    // renderer) — register fakes so the focus plumbing has targets.
+    function registerFakes() {
+      const make = () => ({
+        update: vi.fn<(time: number) => void>(),
+        setHover: vi.fn<(on: boolean) => void>(),
+        setDimmed: vi.fn<(on: boolean) => void>(),
+      });
+      const handles = { alpha: make(), beta: make(), gamma: make() };
+      registerNode("alpha.md", handles.alpha);
+      registerNode("notes/beta.md", handles.beta);
+      registerNode("notes/gamma.md", handles.gamma);
+      return handles;
+    }
+
+    function hover(id: string | null) {
+      const node = id ? harness.props.graphData.nodes.find((n: any) => n.id === id) : null;
+      act(() => harness.props.onNodeHover(node));
+    }
+
+    it("dims everything outside the hovered node's neighbourhood", () => {
+      render(<NeuralGalaxy {...makeProps()} />);
+      const h = registerFakes();
+      hover("alpha.md");
+      // alpha + its direct neighbour beta stay lit; gamma dims.
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.beta.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(true);
+    });
+
+    it("restores every node on hover-end when nothing is selected", () => {
+      render(<NeuralGalaxy {...makeProps()} />);
+      const h = registerFakes();
+      hover("alpha.md");
+      hover(null);
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.beta.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(false);
+    });
+
+    it("fades links outside the neighbourhood — only links touching the hovered node stay lit", () => {
+      render(<NeuralGalaxy {...makeProps()} />);
+      registerFakes();
+      const p = FORCE_PROFILES["3d"];
+      const bridgeLink = { source: "alpha.md", target: "notes/beta.md", bridge: true };
+      const normalLink = { source: "notes/beta.md", target: "notes/gamma.md", bridge: false };
+
+      hover("alpha.md");
+      // alpha↔beta touches the hovered node: full styling. beta↔gamma does
+      // not (even though beta is lit): faded.
+      expect(harness.props.linkColor(bridgeLink)).toBe("rgba(244,170,255,0.85)");
+      expect(harness.props.linkDirectionalParticles(bridgeLink)).toBe(3);
+      expect(harness.props.linkColor(normalLink)).toBe(
+        `rgba(150,150,200,${+(p.linkAlpha * LINK_FADE).toFixed(3)})`,
+      );
+
+      hover("notes/gamma.md");
+      // Now the bridge is outside the lit neighbourhood: it must stop drawing
+      // the eye — faded colour, particles off.
+      expect(harness.props.linkColor(bridgeLink)).toBe(BRIDGE_FADED_COLOR);
+      expect(harness.props.linkDirectionalParticles(bridgeLink)).toBe(0);
+      expect(harness.props.linkColor(normalLink)).toBe(`rgba(150,150,200,${p.linkAlpha})`);
+
+      hover(null);
+      expect(harness.props.linkColor(bridgeLink)).toBe("rgba(244,170,255,0.85)");
+      expect(harness.props.linkDirectionalParticles(bridgeLink)).toBe(3);
+      expect(harness.props.linkColor(normalLink)).toBe(`rgba(150,150,200,${p.linkAlpha})`);
+    });
+
+    it("resolves post-simulation object endpoints when matching links to the lit set", () => {
+      render(<NeuralGalaxy {...makeProps()} />);
+      registerFakes();
+      hover("alpha.md");
+      const objectLink = {
+        source: { id: "alpha.md" },
+        target: { id: "notes/beta.md" },
+        bridge: true,
+      };
+      expect(harness.props.linkColor(objectLink)).toBe("rgba(244,170,255,0.85)");
+    });
+
+    it("keeps the selection's neighbourhood lit while the panel is open; hover overrides", () => {
+      render(<NeuralGalaxy {...makeProps()} />);
+      const h = registerFakes();
+
+      clickNode("alpha.md"); // panel open: {alpha, beta} lit
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(true);
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(false);
+
+      hover("notes/gamma.md"); // hover wins while it lasts: {gamma, beta} lit
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(true);
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(false);
+
+      hover(null); // falls back to the selection's neighbourhood
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(true);
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(false);
+
+      act(() => harness.props.onBackgroundClick()); // dismiss: everything restored
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.beta.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(false);
+    });
+
+    it("clears a parked hover when the view toggles (the lib only re-raycasts on mousemove)", async () => {
+      const user = userEvent.setup();
+      render(<NeuralGalaxy {...makeProps()} />);
+      const h = registerFakes();
+      hover("alpha.md");
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(true);
+
+      await user.click(screen.getByRole("button", { name: "2d" }));
+      expect(h.alpha.setHover).toHaveBeenLastCalledWith(false);
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(false);
+    });
   });
 
   it("marks the active view on the 3D/2D toggle and morphs the camera", async () => {

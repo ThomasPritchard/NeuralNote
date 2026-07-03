@@ -22,6 +22,13 @@ const HOVER_BOOST = 1.6; // how much brighter a hovered/neighbour node burns
 const TWINKLE = 0.4; //     depth of the per-star brightness flicker (0..1)
 const TWINKLE_SPEED = 0.5;
 
+// Hover-focus dim: brightness factor for nodes OUTSIDE the hovered/selected
+// neighbourhood (Obsidian-style). Low enough that the lit cluster pops,
+// high enough that the dimmed field keeps giving spatial context. Labels
+// multiply the same factor into their screen-space fade.
+export const DIM_FACTOR = 0.18;
+const DIM_EASE = 0.1; // per-frame lerp toward the dim target (glow uses 0.12)
+
 const STAR_FRAG = /* glsl */ `
   uniform vec3 uColor;
   uniform float uTime;
@@ -92,22 +99,24 @@ export function makeStarNode(n: any): THREE.Object3D {
   // visible at the true (grown) target size.
   let hover = 0;
   let hoverTarget = 0;
+  let dim = 1;
+  let dimTarget = 1;
   const worldPos = new THREE.Vector3();
   const camVec = new THREE.Vector3();
   const handle: NodeHandle = {
     update: (time, labels) => {
       hover += (hoverTarget - hover) * 0.12;
+      dim += (dimTarget - dim) * DIM_EASE;
       material.uniforms.uTime.value = time;
-      material.uniforms.uIntensity.value = 1 + hover * HOVER_BOOST;
+      material.uniforms.uIntensity.value = (1 + hover * HOVER_BOOST) * dim;
       ring.setHover(hover);
       if (labels) {
         group.getWorldPosition(worldPos);
         camVec.set(labels.camPos.x, labels.camPos.y, labels.camPos.z);
         const dist = worldPos.distanceTo(camVec);
-        label.material.opacity = labelOpacity(
-          (r * labels.pxPerWorld) / Math.max(dist, 1e-6),
-          dist * labels.fovScale,
-        );
+        label.material.opacity =
+          labelOpacity((r * labels.pxPerWorld) / Math.max(dist, 1e-6), dist * labels.fovScale) *
+          dim;
         const k = hitProxyScale(hitR, labels.pxPerWorld, dist);
         proxy.scale.setScalar(k);
         ring.setRadius(hitR * k);
@@ -115,6 +124,9 @@ export function makeStarNode(n: any): THREE.Object3D {
     },
     setHover: (on) => {
       hoverTarget = on ? 1 : 0;
+    },
+    setDimmed: (on) => {
+      dimTarget = on ? DIM_FACTOR : 1;
     },
   };
   registerNode(n.id, handle);

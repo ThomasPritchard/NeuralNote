@@ -17,11 +17,15 @@ export interface LabelCtx {
 }
 
 export interface NodeHandle {
-  // Advance twinkle and ease the hover-glow toward its target. Called once
-  // per frame; labels fade from the LabelCtx when provided.
+  // Advance twinkle and ease the hover-glow + dim factors toward their
+  // targets. Called once per frame; labels fade from the LabelCtx when
+  // provided.
   update: (time: number, labels?: LabelCtx) => void;
   // Target the hover-glow on or off; the handle eases toward it in `update`.
   setHover: (on: boolean) => void;
+  // Target the hover-focus dim on or off (Obsidian-style: everything outside
+  // the hovered neighbourhood fades back); eased in `update` like the glow.
+  setDimmed: (on: boolean) => void;
 }
 
 const handles = new Map<string, NodeHandle>();
@@ -40,4 +44,12 @@ export function updateAll(time: number, labels?: LabelCtx): void {
 
 export function setHover(id: string, on: boolean): void {
   handles.get(id)?.setHover(on);
+}
+
+/** Retarget every node's dim for a new focus: nodes in the lit set (the
+ *  hovered/selected node + its direct neighbours) stay bright, everything
+ *  else dims. `null` clears the focus — all nodes ease back to full. Called
+ *  on discrete hover/selection changes, never per frame. */
+export function applyFocus(litIds: ReadonlySet<string> | null): void {
+  handles.forEach((h, id) => h.setDimmed(litIds !== null && !litIds.has(id)));
 }
