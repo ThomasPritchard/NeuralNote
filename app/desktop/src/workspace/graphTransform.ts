@@ -19,12 +19,20 @@ const VAL_FLOOR = 2.5;
 const VAL_PER_LINK = 0.75;
 const VAL_CAP = 8;
 
+/** Code-unit comparator matching the default `.sort()` ordering — NOT
+ *  localeCompare, which is locale-dependent and would unpin the deterministic
+ *  palette assignment below. */
+function byCodeUnit(a: string, b: string): number {
+  if (a < b) return -1;
+  return a > b ? 1 : 0;
+}
+
 /** Cluster keys sorted with the vault root ("") first, then folder names. */
 function clusterRecord(
   graph: LinkGraph,
   rootLabel: string,
 ): Record<string, { label: string; color: string }> {
-  const names = [...new Set(graph.nodes.map((n) => n.cluster))].sort();
+  const names = [...new Set(graph.nodes.map((n) => n.cluster))].sort(byCodeUnit);
   const clusters: Record<string, { label: string; color: string }> = {};
   names.forEach((name, i) => {
     clusters[name] = {

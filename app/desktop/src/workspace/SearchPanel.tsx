@@ -78,10 +78,10 @@ export function highlightSnippet(
 function MatchRow({
   match,
   onOpen,
-}: {
+}: Readonly<{
   match: SearchMatch;
   onOpen: () => void;
-}) {
+}>) {
   return (
     <li>
       <button
@@ -103,10 +103,10 @@ function MatchRow({
 function FileHitGroup({
   hit,
   onOpen,
-}: {
+}: Readonly<{
   hit: FileHit;
   onOpen: (absPath: string) => void;
-}) {
+}>) {
   return (
     <li>
       <button
@@ -137,11 +137,11 @@ function SearchResults({
   query,
   response,
   onOpen,
-}: {
+}: Readonly<{
   query: string;
   response: SearchResponse;
   onOpen: (absPath: string) => void;
-}) {
+}>) {
   return (
     <>
       {response.truncated && (
@@ -175,10 +175,10 @@ function SearchResults({
 export function SearchPanel({
   focusSignal,
   onOpen,
-}: {
+}: Readonly<{
   focusSignal: number;
   onOpen: (absPath: string) => void;
-}) {
+}>) {
   const { reportError } = useVault();
   const [query, setQuery] = useState("");
   const [state, setState] = useState<SearchState>({ kind: "idle" });
@@ -228,8 +228,8 @@ export function SearchPanel({
 
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key !== "Escape") return;
-    if (query !== "") setQuery("");
-    else e.currentTarget.blur();
+    if (query === "") e.currentTarget.blur();
+    else setQuery("");
   };
 
   let body: ReactNode;

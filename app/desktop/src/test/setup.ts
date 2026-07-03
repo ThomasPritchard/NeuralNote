@@ -12,7 +12,7 @@ afterEach(() => {
 
 // jsdom has no matchMedia. Default stub: no media query matches (i.e. no
 // reduced-motion). Tests that need `matches: true` override via vi.stubGlobal.
-Object.defineProperty(window, "matchMedia", {
+Object.defineProperty(globalThis, "matchMedia", {
   writable: true,
   value: vi.fn().mockImplementation((query: string) => ({
     matches: false,

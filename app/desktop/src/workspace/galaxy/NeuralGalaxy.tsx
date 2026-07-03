@@ -52,11 +52,11 @@ export function NeuralGalaxy({
   width,
   height,
   onOpenNote,
-}: NeuralGalaxyProps) {
+}: Readonly<NeuralGalaxyProps>) {
   const fgRef = useRef<any>(null);
   const hoveredRef = useRef<Set<string>>(new Set());
   const reducedRef = useRef(
-    window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false,
+    globalThis.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false,
   );
   const [selected, setSelected] = useState<GalaxyNode | null>(null);
   const [query, setQuery] = useState("");
@@ -422,7 +422,7 @@ export function NeuralGalaxy({
         ))}
         <div className="mt-1.5 flex items-center gap-2 border-t border-border pt-1.5 text-xs text-foreground">
           <span className="h-0.5 w-4 rounded-full" style={{ background: "#f4aaff", boxShadow: "0 0 8px #f4aaff" }} />
-          Cross-folder link
+          <span>Cross-folder link</span>
         </div>
       </div>
 

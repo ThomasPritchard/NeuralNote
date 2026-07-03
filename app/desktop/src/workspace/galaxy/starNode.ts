@@ -42,7 +42,7 @@ const STAR_FRAG = /* glsl */ `
 // Stable 0..1 phase per node id so stars don't all twinkle in lock-step.
 function seedFrom(id: string): number {
   let h = 0;
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) >>> 0;
+  for (let i = 0; i < id.length; i++) h = (h * 31 + (id.codePointAt(i) ?? 0)) >>> 0;
   return (h % 10000) / 10000;
 }
 

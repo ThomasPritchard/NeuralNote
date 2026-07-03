@@ -9,7 +9,7 @@
 //! targets are skipped silently — no ghost nodes.
 
 use crate::error::CoreResult;
-use crate::model::{GraphLink, GraphNode, LinkGraph};
+use crate::model::{GraphLink, GraphNode, LinkGraph, TreeNode};
 use crate::note::title_and_body;
 use crate::tree::{markdown_files, read_tree};
 use std::collections::{HashMap, HashSet};
@@ -29,19 +29,40 @@ enum RawTarget {
 pub fn read_link_graph(root: &Path) -> CoreResult<LinkGraph> {
     let tree = read_tree(root)?;
     let files = markdown_files(&tree);
+    let index = collect_notes(&files);
+    let links = build_links(&index);
+    Ok(LinkGraph {
+        nodes: index.nodes,
+        links,
+        skipped_files: index.skipped_files,
+    })
+}
 
+/// One walk's worth of per-file collection: the nodes, the resolution indices,
+/// and each note's deduplicated raw targets.
+struct NoteIndex {
+    nodes: Vec<GraphNode>,
+    /// Per note: its deduped raw targets (order preserved → deterministic edges).
+    note_targets: Vec<(String, Vec<RawTarget>)>,
+    /// Lowercased stem AND filename → rel_paths, for `[[target]]` ± `.md`.
+    by_name: HashMap<String, Vec<String>>,
+    /// Lowercased rel_path → rel_paths, for markdown-link resolution. A Vec —
+    /// never last-write-wins — because a case-sensitive filesystem can hold
+    /// `Target.md` AND `target.md` (see `resolve_rel`).
+    by_rel: HashMap<String, Vec<String>>,
+    skipped_files: u32,
+}
+
+/// The per-file collection step: build every note's node, index it for
+/// resolution, and extract its raw link targets.
+fn collect_notes(files: &[&TreeNode]) -> NoteIndex {
     let mut nodes: Vec<GraphNode> = Vec::new();
-    // Per note: its deduped raw targets (order preserved → deterministic edges).
     let mut note_targets: Vec<(String, Vec<RawTarget>)> = Vec::new();
-    // Lowercased stem AND filename → rel_paths, for `[[target]]` ± `.md`.
     let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
-    // Lowercased rel_path → rel_paths, for markdown-link resolution. A Vec —
-    // never last-write-wins — because a case-sensitive filesystem can hold
-    // `Target.md` AND `target.md` (see `resolve_rel`).
     let mut by_rel: HashMap<String, Vec<String>> = HashMap::new();
     let mut skipped_files: u32 = 0;
 
-    for node in &files {
+    for node in files {
         // Lossy read (a Latin-1 note must not error the graph); an unreadable
         // note keeps its node — orphan-style, links skipped — and the failure
         // is logged AND counted, never silent.
@@ -84,17 +105,40 @@ pub fn read_link_graph(root: &Path) -> CoreResult<LinkGraph> {
         ));
         // `raw`/`body` drop here — only the deduped targets are retained.
     }
-    let all_rels: Vec<String> = nodes.iter().map(|n| n.id.clone()).collect();
 
+    NoteIndex {
+        nodes,
+        note_targets,
+        by_name,
+        by_rel,
+        skipped_files,
+    }
+}
+
+/// Resolve one raw target against the collected indices — wiki and markdown
+/// targets resolve by different rules.
+fn resolve_target(
+    raw_target: &RawTarget,
+    index: &NoteIndex,
+    all_rels: &[String],
+) -> Option<String> {
+    match raw_target {
+        RawTarget::Wiki(t) => resolve_wikilink(t, &index.by_name, all_rels),
+        RawTarget::Md(rel) => resolve_md_rel(rel, &index.by_rel),
+    }
+}
+
+/// The edge-building step: resolve every note's raw targets and keep one edge
+/// per unordered pair, skipping self-links and unresolved targets.
+fn build_links(index: &NoteIndex) -> Vec<GraphLink> {
+    let all_rels: Vec<String> = index.nodes.iter().map(|n| n.id.clone()).collect();
     let mut links: Vec<GraphLink> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
-    for (source, targets) in &note_targets {
+    for (source, targets) in &index.note_targets {
         for raw_target in targets {
-            let resolved = match raw_target {
-                RawTarget::Wiki(t) => resolve_wikilink(t, &by_name, &all_rels),
-                RawTarget::Md(rel) => resolve_md_rel(rel, &by_rel),
+            let Some(target) = resolve_target(raw_target, index, &all_rels) else {
+                continue;
             };
-            let Some(target) = resolved else { continue };
             if target == *source {
                 continue; // self-link
             }
@@ -114,12 +158,7 @@ pub fn read_link_graph(root: &Path) -> CoreResult<LinkGraph> {
             });
         }
     }
-
-    Ok(LinkGraph {
-        nodes,
-        links,
-        skipped_files,
-    })
+    links
 }
 
 /// First path segment of a rel_path; `""` for root-level notes.

@@ -10,7 +10,7 @@
 //! `char_indices`, making boundary panics impossible by construction.
 
 use crate::error::CoreResult;
-use crate::model::{FileHit, SearchMatch, SearchResponse};
+use crate::model::{FileHit, SearchMatch, SearchResponse, TreeNode};
 use crate::note::title_and_body;
 use crate::tree::{markdown_files, read_tree};
 use std::path::Path;
@@ -60,38 +60,15 @@ pub fn search_vault(root: &Path, query: &str) -> CoreResult<SearchResponse> {
                 continue;
             }
         };
-        let stem = Path::new(&node.name)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| node.name.clone());
-        let (title, _body) = title_and_body(&raw, &stem);
-        // Name/title checks run for every file, even after the content budget is
-        // exhausted — a name hit costs no match budget.
-        let name_match =
-            contains_folded(&stem, &folded_query) || contains_folded(&title, &folded_query);
-
         let budget = MAX_MATCHES_PER_FILE.min(MAX_TOTAL_MATCHES - total);
-        let (matches, clipped) = if budget == 0 && truncated {
-            (Vec::new(), false) // budget gone and truncation already known — skip
-        } else {
-            scan_content(&raw, &folded_query, budget)
-        };
+        let (hit, clipped) = build_file_hit(node, &raw, &folded_query, budget, truncated);
         truncated |= clipped;
-        total += matches.len();
-
-        if name_match || !matches.is_empty() {
-            let hit = FileHit {
-                path: node.path.clone(),
-                rel_path: node.rel_path.clone(),
-                title,
-                name_match,
-                matches,
-            };
-            if name_match {
-                name_hits.push(hit);
-            } else {
-                content_hits.push(hit);
-            }
+        let Some(hit) = hit else { continue };
+        total += hit.matches.len();
+        if hit.name_match {
+            name_hits.push(hit);
+        } else {
+            content_hits.push(hit);
         }
     }
 
@@ -101,6 +78,45 @@ pub fn search_vault(root: &Path, query: &str) -> CoreResult<SearchResponse> {
         truncated,
         skipped_files,
     })
+}
+
+/// The per-file hit-building step: the name/title check (which runs for every
+/// file — a name hit costs no match budget) plus the budgeted content scan.
+/// When the budget is spent AND truncation is already known, the scan is
+/// skipped; otherwise a zero-budget scan still runs so a clipped match can
+/// raise the truncation flag. Returns the file's hit (`None` when nothing
+/// matched) and whether the scan was clipped.
+fn build_file_hit(
+    node: &TreeNode,
+    raw: &str,
+    folded_query: &[char],
+    budget: usize,
+    truncation_known: bool,
+) -> (Option<FileHit>, bool) {
+    let stem = Path::new(&node.name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| node.name.clone());
+    let (title, _body) = title_and_body(raw, &stem);
+    let name_match = contains_folded(&stem, folded_query) || contains_folded(&title, folded_query);
+
+    let (matches, clipped) = if budget == 0 && truncation_known {
+        (Vec::new(), false) // budget gone and truncation already known — skip
+    } else {
+        scan_content(raw, folded_query, budget)
+    };
+
+    if !name_match && matches.is_empty() {
+        return (None, clipped);
+    }
+    let hit = FileHit {
+        path: node.path.clone(),
+        rel_path: node.rel_path.clone(),
+        title,
+        name_match,
+        matches,
+    };
+    (Some(hit), clipped)
 }
 
 /// Scan `raw`'s lines for matches, keeping at most `budget` of them. The bool is

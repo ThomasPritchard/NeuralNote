@@ -37,7 +37,7 @@ export function Ribbon({
   onShowFiles,
   onShowSearch,
   onToggleGraph,
-}: RibbonProps) {
+}: Readonly<RibbonProps>) {
   return (
     <nav
       aria-label="Workspace"
@@ -81,7 +81,13 @@ interface RibbonButtonProps {
   className?: string;
 }
 
-function RibbonButton({ icon: Icon, label, active, onClick, className }: RibbonButtonProps) {
+function RibbonButton({
+  icon: Icon,
+  label,
+  active,
+  onClick,
+  className,
+}: Readonly<RibbonButtonProps>) {
   const inert = !onClick;
   return (
     <button

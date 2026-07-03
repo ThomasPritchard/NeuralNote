@@ -21,9 +21,9 @@ type LoadState =
 
 export function GraphView({
   onOpenNote,
-}: {
+}: Readonly<{
   onOpenNote: (relPath: string) => void;
-}) {
+}>) {
   const { vault } = useVault();
   const vaultName = vault?.name ?? "Vault root";
   const [state, setState] = useState<LoadState>({ phase: "loading" });
@@ -58,7 +58,9 @@ export function GraphView({
     const el = containerRef.current;
     if (!el) return;
     const observer = new ResizeObserver((entries) => {
-      const { width, height } = entries[entries.length - 1].contentRect;
+      const last = entries.at(-1);
+      if (!last) return; // never fires — the callback always has entries
+      const { width, height } = last.contentRect;
       setSize({ width, height });
     });
     observer.observe(el);

@@ -171,8 +171,8 @@ export function Workspace() {
         bumpSearchFocus();
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    globalThis.addEventListener("keydown", onKey);
+    return () => globalThis.removeEventListener("keydown", onKey);
   }, []);
 
   if (!vault) return null;
