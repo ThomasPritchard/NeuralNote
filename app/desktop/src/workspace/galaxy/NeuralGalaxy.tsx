@@ -75,6 +75,14 @@ export const FORCE_PROFILES: Record<ViewMode, ForceProfile> = {
 const BRIDGE_COLOR = "rgba(244,170,255,0.85)";
 const PARTICLE_COLOR = () => "#f4aaff";
 
+// For strings interpolated into nodeLabel's raw-HTML tooltip. Everything
+// else in this file renders through JSX (React escapes it).
+const escapeHtml = (s: string) =>
+  s.replace(
+    /[&<>"]/g,
+    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!,
+  );
+
 // ── Hover-focus (Obsidian-style) ─────────────────────────────────────────
 // Hovering a node keeps it + its direct neighbours + their shared links at
 // full styling while everything else fades back, so the local cluster pops.
@@ -431,7 +439,10 @@ export function NeuralGalaxy({
         }
       }
       hoverOriginRef.current = node ? node.id : null;
-      previewClusterRef.current = null; // shared focus channel: last event wins
+      // Shared focus channel: a real node hover takes over from a legend
+      // preview — but a spurious onHover(null) (the sim drifting a node out
+      // from under the last raycast position) must not wipe an active preview.
+      if (node) previewClusterRef.current = null;
       refreshFocus();
     },
     [adjacency, refreshFocus],
@@ -546,8 +557,12 @@ export function NeuralGalaxy({
         nodeVal="val"
         nodeThreeObject={makeStarNode}
         onNodeHover={onNodeHover}
+        // nodeLabel is the ONE raw-innerHTML sink (float-tooltip renders the
+        // string unescaped): titles and folder names are untrusted vault
+        // content, so both interpolations MUST go through escapeHtml. n.color
+        // is always a CLUSTER_PALETTE hex — safe by construction.
         nodeLabel={(n: any) =>
-          `<div style="font:600 12px Inter,sans-serif;color:#fff;background:rgba(20,18,32,.92);border:1px solid rgba(255,255,255,.12);padding:5px 9px;border-radius:8px">${n.title}<span style="color:${n.color};margin-left:8px;font-weight:500">${clusters[n.cluster]?.label ?? n.cluster}</span></div>`
+          `<div style="font:600 12px Inter,sans-serif;color:#fff;background:rgba(20,18,32,.92);border:1px solid rgba(255,255,255,.12);padding:5px 9px;border-radius:8px">${escapeHtml(n.title)}<span style="color:${n.color};margin-left:8px;font-weight:500">${escapeHtml(clusters[n.cluster]?.label ?? n.cluster)}</span></div>`
         }
         // Link styling is view-aware (FORCE_PROFILES): the flat 2D map needs a
         // clearly visible web at overview; the 3D galaxy stays more subdued.

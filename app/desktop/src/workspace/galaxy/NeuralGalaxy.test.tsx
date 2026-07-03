@@ -579,3 +579,45 @@ describe("NeuralGalaxy", () => {
     expect(harness.fg.d3ReheatSimulation).toHaveBeenCalled();
   });
 });
+
+describe("tooltip HTML escaping (nodeLabel is the one raw-innerHTML sink)", () => {
+  // Note titles and folder names are untrusted vault content; float-tooltip
+  // renders nodeLabel's string via innerHTML with no escaping of its own.
+  it("escapes a hostile note title", () => {
+    render(<NeuralGalaxy {...makeProps()} />);
+    const html = harness.props.nodeLabel({
+      title: '<img src=x onerror=alert(1)>',
+      cluster: "notes",
+      color: "#7d6fe0",
+    });
+    expect(html).not.toContain("<img");
+    expect(html).toContain("&lt;img src=x onerror=alert(1)&gt;");
+  });
+
+  it("escapes a hostile folder/cluster name on the fallback path", () => {
+    render(<NeuralGalaxy {...makeProps()} />);
+    const html = harness.props.nodeLabel({
+      title: "ok",
+      cluster: '<b onmouseover=x>evil</b>',
+      color: "#7d6fe0",
+    });
+    expect(html).not.toContain("<b ");
+    expect(html).toContain("&lt;b onmouseover=x&gt;evil&lt;/b&gt;");
+  });
+});
+
+describe("legend cluster preview vs raycast noise", () => {
+  it("survives a spurious onNodeHover(null) while the pointer is on the legend row", () => {
+    // The sim can drift a node out from under the last on-canvas pointer
+    // position and fire onHover(null) — that must not wipe an active preview.
+    render(<NeuralGalaxy {...makeProps()} />);
+    const h = registerFakes();
+
+    fireEvent.mouseEnter(screen.getByRole("button", { name: "notes" }));
+    expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(true);
+
+    act(() => harness.props.onNodeHover(null));
+    expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(true);
+    expect(h.beta.setDimmed).toHaveBeenLastCalledWith(false);
+  });
+});

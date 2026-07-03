@@ -74,9 +74,10 @@ export function toGalaxy(graph: LinkGraph, rootLabel: string, focusPath = ""): G
     if (!isUnder(n.id, focusPath)) continue;
     const cluster = clusterAtLevel(n.id, focusPath);
     clusterById.set(n.id, cluster);
-    // A cluster drills when any of its notes sits deeper than one level —
-    // "Areas/Health/x.md" makes "Health" drillable at focus "Areas"; the ""
-    // group (the folder's own notes) never drills.
+    // A cluster drills when any of its notes sits deeper than one level
+    // BELOW the cluster itself: at focus "Areas", "Areas/Health/x.md" only
+    // makes "Health" isolatable — "Areas/Health/Deep/x.md" is what makes
+    // "Health" drillable. The "" group (the folder's own notes) never drills.
     const deeper =
       cluster !== "" && relToFocus(n.id, focusPath).includes("/", cluster.length + 1);
     drillable.set(cluster, (drillable.get(cluster) ?? false) || deeper);
