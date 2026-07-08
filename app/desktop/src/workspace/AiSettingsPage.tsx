@@ -143,7 +143,8 @@ function CurrentProviderChip({ status }: Readonly<{ status: AiStatus | null }>) 
           className="size-1.5 rounded-full bg-primary shadow-[0_0_6px_var(--color-primary)]"
           aria-hidden
         />
-        OpenRouter
+        {/* No space intended — the flex gap separates chip parts. */}
+        {"OpenRouter"}
         <span className="nn-mono max-w-[10rem] truncate">
           {status.openrouter.model.split("/").pop()}
         </span>
@@ -158,7 +159,8 @@ function CurrentProviderChip({ status }: Readonly<{ status: AiStatus | null }>) 
             className="size-1.5 rounded-full bg-primary shadow-[0_0_6px_var(--color-primary)]"
             aria-hidden
           />
-          Local
+          {/* No space intended — the flex gap separates chip parts. */}
+          {"Local"}
           <span className="nn-mono max-w-[10rem] truncate">
             {status.local.activeModelTag}
           </span>
@@ -184,6 +186,25 @@ interface PullProgress {
   total: number | null;
   percent: number | null;
 }
+
+// State-updater factories, named at module level so the promise chains that use
+// them stay within Sonar's callback-nesting depth (S2004).
+
+/** Merge one repo's HF transparency metadata into the map. */
+const withHfMeta =
+  (repo: string, meta: HfModelMeta) =>
+  (prev: Record<string, HfModelMeta>): Record<string, HfModelMeta> => ({
+    ...prev,
+    [repo]: meta,
+  });
+
+/** Record `tag`'s pull failure, inline on the row that was downloading. */
+const withPullError =
+  (tag: string, message: string) =>
+  (prev: Record<string, string>): Record<string, string> => ({
+    ...prev,
+    [tag]: message,
+  });
 
 // ── The page ──────────────────────────────────────────────────────────────────
 
@@ -265,7 +286,7 @@ export function AiSettingsPage() {
         for (const c of list) {
           void api
             .hfModelMetadata(c.hfRepo)
-            .then(guard((meta: HfModelMeta) => setHfMeta((prev) => ({ ...prev, [c.hfRepo]: meta }))))
+            .then(guard((meta: HfModelMeta) => setHfMeta(withHfMeta(c.hfRepo, meta))))
             .catch(() => {
               // Non-fatal by contract: HF being unreachable means "no metadata",
               // never a blocked or erroring catalogue (types.ts HfModelMeta).
@@ -308,7 +329,9 @@ export function AiSettingsPage() {
     }
   };
 
-  const useOpenRouter = () => {
+  // ("activate", not a `use` prefix — these are plain event handlers, and the
+  // hook naming convention would misread them as React hooks.)
+  const activateOpenRouter = () => {
     setSwitching(true);
     setOrError(null);
     void api
@@ -340,13 +363,13 @@ export function AiSettingsPage() {
       } else if (ev.type === "error") {
         // The one terminal failure frame (including cancellation) — inline, on
         // the row that was downloading.
-        setPullErrors((prev) => ({ ...prev, [tag]: ev.message }));
+        setPullErrors(withPullError(tag, ev.message));
       } else {
         // Terminal success: the fresh model immediately becomes the provider.
         void api
           .setActiveProvider("local", tag)
           .then(refreshStatus)
-          .catch((e) => setPullErrors((prev) => ({ ...prev, [tag]: errorMessage(e) })));
+          .catch((e) => setPullErrors(withPullError(tag, errorMessage(e))));
         void refreshInstalled();
       }
     };
@@ -354,7 +377,7 @@ export function AiSettingsPage() {
       .pullLocalModel(tag, onEvent)
       // A transport-level rejection (e.g. the sidecar died mid-pull) takes the
       // same inline lane as a streamed terminal error — never silent.
-      .catch((e) => setPullErrors((prev) => ({ ...prev, [tag]: errorMessage(e) })))
+      .catch((e) => setPullErrors(withPullError(tag, errorMessage(e))))
       .finally(() => setPull(null));
   };
 
@@ -362,10 +385,10 @@ export function AiSettingsPage() {
     setCancelling(true);
     void api
       .cancelPull()
-      .catch((e) => setPullErrors((prev) => ({ ...prev, [tag]: errorMessage(e) })));
+      .catch((e) => setPullErrors(withPullError(tag, errorMessage(e))));
   };
 
-  const useLocalModel = (tag: string) => {
+  const activateLocalModel = (tag: string) => {
     setSwitching(true);
     setLocalActionError(null);
     void api
@@ -443,7 +466,7 @@ export function AiSettingsPage() {
           {!orActive && (
             <button
               type="button"
-              onClick={useOpenRouter}
+              onClick={activateOpenRouter}
               disabled={!hasKey || switching}
               className={BTN_PRIMARY}
             >
@@ -580,9 +603,9 @@ export function AiSettingsPage() {
                 const meta = hfMeta[c.hfRepo];
                 const metaBits = meta
                   ? [
-                      meta.downloads != null
-                        ? `${COMPACT.format(meta.downloads)} downloads`
-                        : null,
+                      meta.downloads == null
+                        ? null
+                        : `${COMPACT.format(meta.downloads)} downloads`,
                       meta.license,
                       meta.lastModified
                         ? (() => {
@@ -660,24 +683,27 @@ export function AiSettingsPage() {
                             {pull.completed != null && pull.total != null
                               ? `${gb(pull.completed)} / ${gb(pull.total)}`
                               : ""}
-                            {pull.percent != null
-                              ? ` · ${Math.round(pull.percent)}%`
-                              : ""}
+                            {pull.percent == null
+                              ? ""
+                              : ` · ${Math.round(pull.percent)}%`}
                           </span>
                         </div>
-                        <div
-                          role="progressbar"
+                        {/* Native progressbar; the vendor pseudo-elements
+                            reproduce the token look (muted track, primary fill
+                            with the violet glow). Percent-less frames render as
+                            0% — value never goes undefined, so no engine falls
+                            into its own indeterminate animation. */}
+                        <progress
                           aria-label={`Downloading ${c.tag}`}
-                          aria-valuemin={0}
-                          aria-valuemax={100}
-                          aria-valuenow={pull.percent ?? undefined}
-                          className="h-1.5 overflow-hidden rounded-full bg-muted"
-                        >
-                          <div
-                            className="h-full rounded-full bg-primary shadow-[0_0_8px_var(--color-primary)] transition-[width] duration-300"
-                            style={{ width: `${pull.percent ?? 0}%` }}
-                          />
-                        </div>
+                          max={100}
+                          value={pull.percent ?? 0}
+                          className={cn(
+                            "h-1.5 w-full appearance-none overflow-hidden rounded-full border-none bg-muted",
+                            "[&::-webkit-progress-bar]:rounded-full [&::-webkit-progress-bar]:bg-muted",
+                            "[&::-webkit-progress-value]:rounded-full [&::-webkit-progress-value]:bg-primary [&::-webkit-progress-value]:shadow-[0_0_8px_var(--color-primary)] [&::-webkit-progress-value]:transition-[width] [&::-webkit-progress-value]:duration-300",
+                            "[&::-moz-progress-bar]:rounded-full [&::-moz-progress-bar]:bg-primary [&::-moz-progress-bar]:shadow-[0_0_8px_var(--color-primary)]",
+                          )}
+                        />
                       </div>
                     )}
                     {pullErrors[c.tag] && (
@@ -744,7 +770,7 @@ export function AiSettingsPage() {
                     ) : (
                       <button
                         type="button"
-                        onClick={() => useLocalModel(m.tag)}
+                        onClick={() => activateLocalModel(m.tag)}
                         disabled={switching}
                         className={BTN_QUIET}
                       >

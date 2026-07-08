@@ -34,3 +34,15 @@ class ResizeObserverStub implements ResizeObserver {
   disconnect = vi.fn();
 }
 globalThis.ResizeObserver ??= ResizeObserverStub;
+
+// jsdom's <dialog> carries only the `open` property — showModal()/close() are
+// unimplemented (jsdom/jsdom#3294). Minimal polyfill so components can drive a
+// native modal dialog; top-layer/inert/focus behaviour stays a real-browser
+// concern (covered by the Tier-2 native WebDriver specs).
+HTMLDialogElement.prototype.showModal ??= function (this: HTMLDialogElement) {
+  this.setAttribute("open", "");
+};
+HTMLDialogElement.prototype.close ??= function (this: HTMLDialogElement) {
+  this.removeAttribute("open");
+  this.dispatchEvent(new Event("close"));
+};

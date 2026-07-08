@@ -1,7 +1,8 @@
 // SettingsModal: the presentational shell — open/close (Esc, backdrop, X),
-// section switching, initial-section override, focus handling. AiSettingsPage
-// is stubbed out: its data loading has its own suite, and the shell's job is
-// only to mount the right section.
+// section switching, initial-section override, focus handling (a native
+// <dialog> opened via showModal; the jsdom polyfill lives in test/setup.ts).
+// AiSettingsPage is stubbed out: its data loading has its own suite, and the
+// shell's job is only to mount the right section.
 
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -107,16 +108,15 @@ describe("SettingsModal — focus", () => {
     expect(opener).toHaveFocus();
   });
 
-  it("wraps Tab within the dialog (focus trap)", async () => {
-    const { user } = setup();
-    // Last focusable is the close X (the content column follows the nav in DOM
-    // order); Tab from it must wrap to the first nav button, not escape.
-    screen.getByRole("button", { name: "Close settings" }).focus();
-    await user.tab();
-    expect(screen.getByRole("button", { name: "General" })).toHaveFocus();
-
-    // And Shift+Tab from the first focusable wraps back to the last.
-    await user.tab({ shift: true });
-    expect(screen.getByRole("button", { name: "Close settings" })).toHaveFocus();
+  it("opens as a native modal (showModal), which traps focus in the dialog", () => {
+    // The focus trap is the browser's: showModal() puts the dialog in the top
+    // layer and makes the rest of the document inert, so Tab can only cycle
+    // the dialog's own controls. jsdom implements neither top layer nor tab
+    // order, so the test pins the mechanism that delivers the trap.
+    const showModal = vi.spyOn(HTMLDialogElement.prototype, "showModal");
+    setup();
+    expect(showModal).toHaveBeenCalledOnce();
+    expect(screen.getByRole("dialog")).toHaveAttribute("open");
+    showModal.mockRestore();
   });
 });

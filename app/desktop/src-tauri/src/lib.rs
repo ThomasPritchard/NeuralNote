@@ -690,7 +690,7 @@ async fn chat(
     on_event: tauri::ipc::Channel<neuralnote_core::ai::ChatEvent>,
 ) -> Result<(), ()> {
     use neuralnote_core::ai::{
-        read_provider_config, run_chat, ChatEvent, EventSink, Guards, KeywordRetriever, LlmMessage,
+        read_provider_config, ChatEvent, EventSink, Guards, KeywordRetriever, LlmMessage,
         ProviderKind,
     };
 
@@ -725,105 +725,155 @@ async fn chat(
 
     // Provider selection is the ONLY new decision: build the matching client, then
     // both arms converge on the SAME run_chat call (orchestration/verification is
-    // untouched). run_chat emits its own Done/Error; a returned Err (defensive) is
-    // surfaced as a final Error so a failure is never silent.
+    // untouched). The provider-independent inputs travel together as one `ChatRun`;
+    // run_chat emits its own Done/Error, and a returned Err (defensive) is surfaced
+    // as a final Error so a failure is never silent.
+    let mut run = ChatRun {
+        prompt: &prompt,
+        history: &history,
+        root: &root,
+        retriever: &retriever,
+        guards: &guards,
+        sink: &mut sink,
+    };
     match cfg.effective_provider() {
         None => {
-            sink.send(ChatEvent::Error {
+            run.sink.send(ChatEvent::Error {
                 message: "No AI provider is set up yet. Choose one in Settings.".into(),
             });
         }
-        Some(ProviderKind::OpenRouter) => {
-            let key = match ai::read_api_key() {
-                Ok(Some(k)) => k,
-                Ok(None) => {
-                    sink.send(ChatEvent::Error {
-                        message: "No API key set. Add your OpenRouter key in Settings.".into(),
-                    });
-                    return Ok(());
-                }
-                Err(e) => {
-                    sink.send(ChatEvent::Error {
-                        message: format!("Couldn't read the API key: {e}"),
-                    });
-                    return Ok(());
-                }
-            };
-            let client = ai::OpenAiChatClient::new(key);
-            if let Err(e) = run_chat(
-                &prompt, &history, &root, &cfg.model, &retriever, &client, &mut sink, &guards,
-            )
-            .await
-            {
-                sink.send(ChatEvent::Error {
-                    message: format!("Chat failed: {e}"),
+        Some(ProviderKind::OpenRouter) => chat_via_openrouter(&mut run, &cfg.model).await,
+        Some(ProviderKind::Local) => match cfg.local_model_tag {
+            Some(tag) => chat_via_local(&mut run, &app, &state, &tag).await,
+            None => {
+                run.sink.send(ChatEvent::Error {
+                    message: "No local model selected. Set up Local AI in Settings.".into(),
                 });
             }
-        }
-        Some(ProviderKind::Local) => {
-            let tag = match cfg.local_model_tag {
-                Some(tag) => tag,
-                None => {
-                    sink.send(ChatEvent::Error {
-                        message: "No local model selected. Set up Local AI in Settings.".into(),
-                    });
-                    return Ok(());
-                }
-            };
-            // Refuse a non-curated model even if the config was hand-edited to one —
-            // cited chat must run a tool-calling-capable model or not at all.
-            if !neuralnote_core::ai::is_curated_model(&tag) {
-                sink.send(ChatEvent::Error {
-                    message: format!(
-                        "\"{tag}\" isn't a supported local model. Pick one in Settings."
-                    ),
-                });
-                return Ok(());
-            }
-            let port = match local::ensure_ollama_started(&app, &state).await {
-                Ok(port) => port,
-                Err(e) => {
-                    sink.send(ChatEvent::Error {
-                        message: format!("Couldn't start Local AI: {}", ai::error_detail(e)),
-                    });
-                    return Ok(());
-                }
-            };
-            // Pre-flight the model so a deleted / never-finished model reads as a
-            // clear "reinstall in Settings", not an opaque mid-stream 404.
-            match local::list_local_models(port).await {
-                Ok(models) if models.iter().any(|m| model_installed(&m.tag, &tag)) => {}
-                Ok(_) => {
-                    sink.send(ChatEvent::Error {
-                        message: format!(
-                            "The local model \"{tag}\" isn't installed. Reinstall it in Settings."
-                        ),
-                    });
-                    return Ok(());
-                }
-                Err(e) => {
-                    sink.send(ChatEvent::Error {
-                        message: format!(
-                            "Couldn't check your installed local models: {}",
-                            ai::error_detail(e)
-                        ),
-                    });
-                    return Ok(());
-                }
-            }
-            let client = local::ollama_chat_client(port);
-            if let Err(e) = run_chat(
-                &prompt, &history, &root, &tag, &retriever, &client, &mut sink, &guards,
-            )
-            .await
-            {
-                sink.send(ChatEvent::Error {
-                    message: format!("Chat failed: {e}"),
-                });
-            }
-        }
+        },
     }
     Ok(())
+}
+
+/// The provider-independent inputs to one chat turn, bundled so each provider
+/// helper takes a short, uniform argument list (keeping both under the arg-count
+/// and cognitive-complexity bars). The sink is borrowed mutably for the whole turn.
+struct ChatRun<'a> {
+    prompt: &'a str,
+    history: &'a [neuralnote_core::ai::LlmMessage],
+    root: &'a Path,
+    retriever: &'a neuralnote_core::ai::KeywordRetriever,
+    guards: &'a neuralnote_core::ai::Guards,
+    sink: &'a mut ai::TauriChannelSink,
+}
+
+/// The OpenRouter chat arm: read the key, build the client, run the shared
+/// pipeline. Split out of `chat` so each provider's error handling stays flat;
+/// every failure lands on the sink (never silent).
+async fn chat_via_openrouter(run: &mut ChatRun<'_>, model: &str) {
+    use neuralnote_core::ai::{run_chat, ChatEvent, EventSink};
+
+    let key = match ai::read_api_key() {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            run.sink.send(ChatEvent::Error {
+                message: "No API key set. Add your OpenRouter key in Settings.".into(),
+            });
+            return;
+        }
+        Err(e) => {
+            run.sink.send(ChatEvent::Error {
+                message: format!("Couldn't read the API key: {e}"),
+            });
+            return;
+        }
+    };
+    let client = ai::OpenAiChatClient::new(key);
+    if let Err(e) = run_chat(
+        run.prompt,
+        run.history,
+        run.root,
+        model,
+        run.retriever,
+        &client,
+        run.sink,
+        run.guards,
+    )
+    .await
+    {
+        run.sink.send(ChatEvent::Error {
+            message: format!("Chat failed: {e}"),
+        });
+    }
+}
+
+/// The local (Ollama sidecar) chat arm: enforce the curated allowlist, ensure the
+/// sidecar is up, pre-flight the model, then run the shared pipeline. Split out of
+/// `chat` for the same reason; every failure is surfaced on the sink.
+async fn chat_via_local(
+    run: &mut ChatRun<'_>,
+    app: &AppHandle,
+    state: &SharedState<'_>,
+    tag: &str,
+) {
+    use neuralnote_core::ai::{run_chat, ChatEvent, EventSink};
+
+    // Refuse a non-curated model even if the config was hand-edited to one —
+    // cited chat must run a tool-calling-capable model or not at all.
+    if !neuralnote_core::ai::is_curated_model(tag) {
+        run.sink.send(ChatEvent::Error {
+            message: format!("\"{tag}\" isn't a supported local model. Pick one in Settings."),
+        });
+        return;
+    }
+    let port = match local::ensure_ollama_started(app, state).await {
+        Ok(port) => port,
+        Err(e) => {
+            run.sink.send(ChatEvent::Error {
+                message: format!("Couldn't start Local AI: {}", ai::error_detail(e)),
+            });
+            return;
+        }
+    };
+    // Pre-flight the model so a deleted / never-finished model reads as a clear
+    // "reinstall in Settings", not an opaque mid-stream 404.
+    match local::list_local_models(port).await {
+        Ok(models) if models.iter().any(|m| model_installed(&m.tag, tag)) => {}
+        Ok(_) => {
+            run.sink.send(ChatEvent::Error {
+                message: format!(
+                    "The local model \"{tag}\" isn't installed. Reinstall it in Settings."
+                ),
+            });
+            return;
+        }
+        Err(e) => {
+            run.sink.send(ChatEvent::Error {
+                message: format!(
+                    "Couldn't check your installed local models: {}",
+                    ai::error_detail(e)
+                ),
+            });
+            return;
+        }
+    }
+    let client = local::ollama_chat_client(port);
+    if let Err(e) = run_chat(
+        run.prompt,
+        run.history,
+        run.root,
+        tag,
+        run.retriever,
+        &client,
+        run.sink,
+        run.guards,
+    )
+    .await
+    {
+        run.sink.send(ChatEvent::Error {
+            message: format!("Chat failed: {e}"),
+        });
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

@@ -1,11 +1,12 @@
 // The app settings surface: a modal with a left section nav (VS Code /
-// Obsidian style) and a content pane. The overlay/backdrop/Esc idiom matches
-// ConfirmDialog; being a full dialog rather than a one-question alert, it also
-// traps Tab inside itself and hands focus back to the opener on close. The
-// dialog body is mounted fresh per open (`open ? … : null`) so section state,
-// initial focus, and the AI page's data loads all reset naturally.
+// Obsidian style) and a content pane. A native <dialog> opened with
+// showModal(): the top layer makes everything outside inert (the focus trap),
+// and focus is handed back to the opener on close. The accessible
+// backdrop-click affordance matches ConfirmDialog. The dialog body is mounted
+// fresh per open (`open ? … : null`) so section state, initial focus, and the
+// AI page's data loads all reset naturally.
 
-import { useEffect, useRef, useState, type KeyboardEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Brain,
   Info,
@@ -28,11 +29,6 @@ const SECTIONS: ReadonlyArray<{
   { id: "ai", label: "Configure the AI", icon: Sparkles },
   { id: "about", label: "About", icon: Info },
 ];
-
-/** Everything focusable inside the panel; the tabIndex=-1 backdrop and panel
- *  itself are deliberately excluded so the trap cycles real controls only. */
-const FOCUSABLE =
-  'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])';
 
 function GeneralSection() {
   return (
@@ -83,52 +79,64 @@ function SettingsDialog({
   initialSection,
 }: Readonly<{ onClose: () => void; initialSection: SettingsSection }>) {
   const [section, setSection] = useState<SettingsSection>(initialSection);
-  const panelRef = useRef<HTMLDivElement>(null);
+  const dialogRef = useRef<HTMLDialogElement>(null);
 
-  // Take focus on open; hand it back to the opener on close (best-effort — the
-  // opener may itself have unmounted, in which case focus simply stays put).
+  // Open as a native modal — showModal() puts the dialog in the top layer and
+  // makes the rest of the document inert, which is the focus trap the old
+  // hand-rolled Tab loop provided. Take focus on open; hand it back to the
+  // opener on close (best-effort — the opener may itself have unmounted, in
+  // which case focus simply stays put). The `open` guard keeps StrictMode's
+  // dev double-mount from calling showModal() on an already-open dialog.
   useEffect(() => {
     const opener = document.activeElement;
-    panelRef.current?.focus();
+    const dialog = dialogRef.current;
+    if (dialog && !dialog.open) dialog.showModal();
+    dialog?.focus();
     return () => {
+      // Leave the top layer BEFORE restoring focus: while the dialog is still
+      // modal, everything outside it is inert and opener.focus() is silently
+      // ignored (verified in real Chromium). `dialog` is closure-captured —
+      // the ref may already be nulled by the time this cleanup runs.
+      if (dialog?.open) dialog.close();
       if (opener instanceof HTMLElement && opener.isConnected) opener.focus();
     };
   }, []);
 
+  // Esc closes. An explicit document-level listener (rather than the native
+  // cancel path alone) keeps the close under React's control and observable in
+  // jsdom; its preventDefault() also stops the UA turning the same keystroke
+  // into a cancel/close pass of its own.
   useEffect(() => {
-    const onKey = (e: globalThis.KeyboardEvent) => {
+    const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
         e.preventDefault();
         onClose();
       }
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
+    globalThis.addEventListener("keydown", onKey);
+    return () => globalThis.removeEventListener("keydown", onKey);
   }, [onClose]);
 
-  /** Keep Tab cycling inside the dialog (the modal contract aria-modal claims). */
-  const trapTab = (e: KeyboardEvent<HTMLDivElement>) => {
-    if (e.key !== "Tab") return;
-    const panel = panelRef.current;
-    if (!panel) return;
-    const focusables = Array.from(panel.querySelectorAll<HTMLElement>(FOCUSABLE));
-    if (focusables.length === 0) return;
-    const first = focusables[0];
-    const last = focusables[focusables.length - 1];
-    const active = document.activeElement;
-    if (e.shiftKey && (active === first || active === panel)) {
-      e.preventDefault();
-      last.focus();
-    } else if (!e.shiftKey && active === last) {
-      e.preventDefault();
-      first.focus();
-    }
-  };
-
   return (
-    <div className="fixed inset-0 z-50 grid place-items-center bg-background/70 p-4 backdrop-blur-sm">
+    // The <dialog> is styled as the full-screen overlay itself (UA fit-content
+    // sizing, border, and Canvas colours reset), so the ::backdrop goes
+    // transparent — the overlay already dims and blurs the app behind it.
+    <dialog
+      ref={dialogRef}
+      aria-modal="true"
+      aria-labelledby="settings-title"
+      tabIndex={-1}
+      onCancel={(e) => {
+        // A UA close request that bypassed the keydown listener: keep the
+        // close under React's control — the dialog unmounts rather than being
+        // left mounted with [open] silently removed.
+        e.preventDefault();
+        onClose();
+      }}
+      className="fixed inset-0 z-50 m-0 grid h-full max-h-none w-full max-w-none place-items-center border-0 bg-background/70 p-4 text-foreground backdrop-blur-sm focus:outline-none [&::backdrop]:bg-transparent"
+    >
       {/* Same accessible click-outside affordance as ConfirmDialog: a real
-          <button> kept out of the tab order; the dialog is a sibling, so inside
+          <button> kept out of the tab order; the panel is a sibling, so inside
           clicks never reach it. */}
       <button
         type="button"
@@ -137,15 +145,7 @@ function SettingsDialog({
         onClick={onClose}
         className="fixed inset-0 cursor-default"
       />
-      <div
-        ref={panelRef}
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="settings-title"
-        tabIndex={-1}
-        onKeyDown={trapTab}
-        className="relative flex h-[min(80vh,40rem)] w-full max-w-3xl overflow-hidden rounded-xl border border-border bg-card shadow-2xl focus:outline-none"
-      >
+      <div className="relative flex h-[min(80vh,40rem)] w-full max-w-3xl overflow-hidden rounded-xl border border-border bg-card shadow-2xl">
         <nav
           aria-label="Settings sections"
           className="flex w-48 shrink-0 flex-col gap-1 border-r border-border bg-sidebar/60 p-3"
@@ -191,7 +191,7 @@ function SettingsDialog({
           </div>
         </div>
       </div>
-    </div>
+    </dialog>
   );
 }
 
