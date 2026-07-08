@@ -42,6 +42,10 @@ interface FileTreeProps {
   onDeleted: (node: TreeNode) => void;
   onRemap: (oldPath: string, newNode: TreeNode) => void;
   onCloseVault: () => void;
+  /** A native-menu request to create a note/folder at the vault root, or null.
+   *  Consumed via onCreateConsumed so it opens the inline row exactly once. */
+  pendingCreate: CreateKind | null;
+  onCreateConsumed: () => void;
 }
 
 // Memoized: the workspace re-renders on every editor keystroke, but the tree
@@ -58,6 +62,8 @@ export const FileTree = memo(function FileTree({
   onDeleted,
   onRemap,
   onCloseVault,
+  pendingCreate,
+  onCreateConsumed,
 }: FileTreeProps) {
   // Folders are open by default (empty set); the user's manual folds persist per
   // vault so they survive an app restart. Lazy-loaded once — vaultPath is stable
@@ -103,6 +109,18 @@ export const FileTree = memo(function FileTree({
         if (id === templatesReq.current) setOpError(errorMessage(e));
       });
   };
+
+  // Open the inline create row when the native menu (File → New Note/Folder)
+  // requests one at the vault root. A ref keeps startCreate current without
+  // re-running the effect every render; consuming the request clears it so a
+  // sidebar remount (files ↔ search) can't replay a stale create.
+  const startCreateRef = useRef(startCreate);
+  startCreateRef.current = startCreate;
+  useEffect(() => {
+    if (!pendingCreate) return;
+    startCreateRef.current(vaultPath, pendingCreate);
+    onCreateConsumed();
+  }, [pendingCreate, vaultPath, onCreateConsumed]);
 
   const startRename = (path: string) => {
     templatesReq.current++;

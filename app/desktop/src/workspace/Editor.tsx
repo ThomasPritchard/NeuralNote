@@ -26,8 +26,11 @@ import {
   type KeyboardEvent as ReactKeyboardEvent,
 } from "react";
 import { AlertTriangle, RotateCw, Save } from "lucide-react";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import * as api from "../lib/api";
 import { cn } from "../lib/cn";
 import type { NoteIndexEntry } from "./linkResolve";
+import { applyFormat, type FormatAction } from "./markdownFormat";
 import {
   filterWikilinkSuggestions,
   findWikilinkTrigger,
@@ -123,7 +126,6 @@ interface AutocompleteState {
 interface EditorProps {
   value: string;
   onChange: (value: string) => void;
-  onSave: () => void;
   saveError: string | null;
   /** The file changed on disk; save is blocked pending the user's choice. */
   conflict: boolean;
@@ -139,7 +141,6 @@ interface EditorProps {
 export function Editor({
   value,
   onChange,
-  onSave,
   saveError,
   conflict,
   onOverwrite,
@@ -152,16 +153,39 @@ export function Editor({
   const acRef = useRef(ac);
   acRef.current = ac;
 
+  // Format menu (Bold / Italic / Heading / Link) → transform the current
+  // selection. Only acts when this textarea is the focused element, so ⌘B in the
+  // chat or search field never rewrites the note. Writes the DOM value directly
+  // and re-fires onChange to keep the textarea uncontrolled — the same path the
+  // `[[` autocomplete uses. (⌘S save lives on the menu now, handled in Workspace.)
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "s") {
-        e.preventDefault();
-        onSave();
-      }
+    let cancelled = false;
+    let unlisten: UnlistenFn | undefined;
+    void api
+      .onMenu((e) => {
+        if (!e.action.startsWith("format-")) return;
+        const ta = textareaRef.current;
+        if (!ta || document.activeElement !== ta) return;
+        const result = applyFormat(e.action as FormatAction, {
+          value: ta.value,
+          start: ta.selectionStart ?? 0,
+          end: ta.selectionEnd ?? 0,
+        });
+        ta.value = result.value;
+        ta.setSelectionRange(result.start, result.end);
+        onChange(result.value);
+        ta.focus();
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((err) => console.error("failed to subscribe to format actions:", err));
+    return () => {
+      cancelled = true;
+      unlisten?.();
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onSave]);
+  }, [onChange]);
 
   /** Re-derive the trigger from the current caret. Cheap (string scan to the
    *  caret); the mirror measurement only runs when the trigger changes. */

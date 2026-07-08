@@ -180,15 +180,6 @@ describe("NotePane — edit mode", () => {
     expect(open.setMode).toHaveBeenCalledWith("read");
   });
 
-  it("saves from the editor's Cmd+S shortcut", () => {
-    const open = openNote({ mode: "edit", dirty: true });
-    render(<NotePane open={open} onClose={vi.fn()} />);
-    window.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "s", metaKey: true, cancelable: true }),
-    );
-    expect(open.save).toHaveBeenCalled();
-  });
-
   it("wires the editor's conflict actions to overwrite and reload", async () => {
     const open = openNote({ mode: "edit", dirty: true, conflict: true });
     render(<NotePane open={open} onClose={vi.fn()} />);

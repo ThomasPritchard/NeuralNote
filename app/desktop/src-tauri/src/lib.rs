@@ -18,6 +18,7 @@ use tauri_plugin_dialog::DialogExt;
 
 mod ai;
 mod local;
+mod menu;
 
 /// Event emitted to the frontend when the vault changes on disk (the frontend
 /// debounces and re-reads the tree). Lets external edits — e.g. from Obsidian —
@@ -31,7 +32,6 @@ struct VaultSession {
     _watcher: RecommendedWatcher,
 }
 
-#[derive(Default)]
 struct AppState {
     session: Option<VaultSession>,
     local_ai: local::LocalAiState,
@@ -44,6 +44,28 @@ struct AppState {
     // never pruned. Bounded by picks-per-session (tiny in practice), so deferred —
     // round-9 FYI. Cap or LRU-evict it if a session could realistically pick many.
     authorized: HashSet<PathBuf>,
+    /// Whether the cited-recall chat panel is shown. Owned here (not just in the
+    /// webview) because the native View-menu checkmark reflects it; the menu is
+    /// its only toggle, so this stays authoritative. Reset to shown on each vault
+    /// open so a freshly-mounted workspace and the checkmark start in agreement.
+    chat_visible: bool,
+    /// Whether a text note is currently open in edit mode. The Format menu items
+    /// only do anything when the editor is mounted (edit mode), so they're enabled
+    /// only when this is true — an enabled-but-inert Format item would be a silent
+    /// no-op. Pushed from the webview via `set_menu_editing`; reset on vault change.
+    editing: bool,
+}
+
+impl Default for AppState {
+    fn default() -> Self {
+        Self {
+            session: None,
+            local_ai: local::LocalAiState::default(),
+            authorized: HashSet::new(),
+            chat_visible: true,
+            editing: false,
+        }
+    }
 }
 
 type SharedState<'a> = State<'a, Mutex<AppState>>;
@@ -92,6 +114,16 @@ fn record_recent(app: &AppHandle, vault: &Vault) {
             }
         }
         Err(e) => log::warn!("could not resolve config dir to record recent vault: {e}"),
+    }
+}
+
+/// Rebuild the native menu after a vault open/close so "Open Recent" and the
+/// vault-only items reflect the new state. A failure only degrades the menu (the
+/// app keeps working), so it's logged rather than surfaced — but never dropped
+/// silently.
+fn refresh_menu(app: &AppHandle) {
+    if let Err(e) = menu::refresh(app) {
+        log::warn!("could not refresh the application menu: {e}");
     }
 }
 
@@ -208,12 +240,20 @@ fn open_vault(app: AppHandle, state: SharedState, path: String) -> Result<Vault,
     let vault = neuralnote_core::vault::open_vault(&requested)?;
     let root = PathBuf::from(&vault.path);
     let watcher = start_watcher(&app, &root)?;
-    // Replace only the session, preserving the authorized set for later opens.
-    lock_state(&state).session = Some(VaultSession {
-        root,
-        _watcher: watcher,
-    });
+    {
+        // Replace only the session, preserving the authorized set for later opens.
+        // Reset chat visibility so the fresh workspace and the menu checkmark agree,
+        // and clear edit-mode (no note is open yet) so Format items start disabled.
+        let mut guard = lock_state(&state);
+        guard.session = Some(VaultSession {
+            root,
+            _watcher: watcher,
+        });
+        guard.chat_visible = true;
+        guard.editing = false;
+    }
     record_recent(&app, &vault);
+    refresh_menu(&app);
     Ok(vault)
 }
 
@@ -238,17 +278,46 @@ fn create_vault(
     let vault = neuralnote_core::vault::create_vault(&parent, &name)?;
     let root = PathBuf::from(&vault.path);
     let watcher = start_watcher(&app, &root)?;
-    lock_state(&state).session = Some(VaultSession {
-        root,
-        _watcher: watcher,
-    });
+    {
+        let mut guard = lock_state(&state);
+        guard.session = Some(VaultSession {
+            root,
+            _watcher: watcher,
+        });
+        guard.chat_visible = true;
+        guard.editing = false;
+    }
     record_recent(&app, &vault);
+    refresh_menu(&app);
     Ok(vault)
 }
 
 #[tauri::command]
-fn close_vault(state: SharedState) {
-    lock_state(&state).session = None;
+fn close_vault(app: AppHandle, state: SharedState) {
+    {
+        let mut guard = lock_state(&state);
+        guard.session = None;
+        // No note is open once the vault closes; keep Format items from lingering
+        // enabled (they gate on `editing`).
+        guard.editing = false;
+    }
+    refresh_menu(&app);
+}
+
+/// Pushed from the webview whenever a text note enters or leaves edit mode. The
+/// native Format menu items only do anything while the editor is mounted, so they
+/// track this flag rather than mere vault-open — an enabled Format item that did
+/// nothing would be a silent no-op. Skips the rebuild when the flag is unchanged.
+#[tauri::command]
+fn set_menu_editing(app: AppHandle, state: SharedState, editing: bool) {
+    {
+        let mut guard = lock_state(&state);
+        if guard.editing == editing {
+            return;
+        }
+        guard.editing = editing;
+    }
+    refresh_menu(&app);
 }
 
 // `read_tree`/`read_note`/`write_note` are `async` so Tauri runs them on its
@@ -777,6 +846,15 @@ pub fn run() {
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_shell::init())
         .manage(Mutex::new(AppState::default()))
+        // Install the NeuralNote application menu, replacing Tauri's generic
+        // default. A failure here would leave the app menu-less — surface it in
+        // the log rather than dropping it silently (PA-007 discipline).
+        .setup(|app| {
+            if let Err(e) = menu::install(app.handle()) {
+                log::error!("could not install the application menu: {e}");
+            }
+            Ok(())
+        })
         .invoke_handler(tauri::generate_handler![
             list_recent_vaults,
             pick_vault_folder,
@@ -784,6 +862,7 @@ pub fn run() {
             open_vault,
             create_vault,
             close_vault,
+            set_menu_editing,
             read_tree,
             read_note,
             write_note,

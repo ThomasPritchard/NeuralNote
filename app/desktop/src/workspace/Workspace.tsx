@@ -18,6 +18,7 @@ import {
 import { AlertTriangle, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import * as api from "../lib/api";
 import { useVault } from "../lib/store";
 import type { TreeNode } from "../lib/types";
 import { ChatPane } from "./ChatPane";
@@ -31,6 +32,7 @@ import { Ribbon, type CenterView, type SidebarPanel } from "./Ribbon";
 import { SearchPanel } from "./SearchPanel";
 import { SettingsModal } from "./SettingsModal";
 import { StatusBar } from "./StatusBar";
+import type { CreateKind } from "./TreeRow";
 import { useOpenNote } from "./useOpenNote";
 
 export function Workspace() {
@@ -42,6 +44,12 @@ export function Workspace() {
   // Workspace-local view state (specs/search-and-graph-view.md §View model).
   const [sidebarPanel, setSidebarPanel] = useState<SidebarPanel>("files");
   const [centerView, setCenterView] = useState<CenterView>("note");
+  // Whether the cited-recall chat panel is shown. Menu-owned (View → Cited Recall
+  // Panel); the Rust side is the source of truth and sends the new value on toggle.
+  const [showChat, setShowChat] = useState(true);
+  // A menu-requested "new note/folder" awaiting the FileTree to open its inline
+  // create row; cleared once consumed so it can't re-fire on a sidebar remount.
+  const [pendingCreate, setPendingCreate] = useState<CreateKind | null>(null);
   // Bumped whenever ⌘K / the ribbon Search icon wants the search field focused.
   const [searchFocusSignal, bumpSearchFocus] = useReducer((n: number) => n + 1, 0);
   // Settings modal state, plus a version bumped when it closes so the chat
@@ -133,6 +141,7 @@ export function Workspace() {
     () => setCenterView((v) => (v === "graph" ? "note" : "graph")),
     [],
   );
+  const consumeCreate = useCallback(() => setPendingCreate(null), []);
 
   const handleDeleted = useCallback((node: TreeNode) => {
     // Clearing the reader if the open note (or its containing folder) was deleted.
@@ -198,18 +207,86 @@ export function Workspace() {
     };
   }, [closeWindow, reportError]);
 
-  // ⌘K / Ctrl+K anywhere: open the sidebar search panel and focus its field.
+  // Native menu → vault-scoped actions. The menu owns the accelerators now (⌘K
+  // search and ⌘S save moved off the old per-component keydown handlers), so
+  // nothing double-fires. Open Vault / Open Recent live in the store (they work
+  // before a vault is open); everything here needs the open vault. Read the
+  // latest open-note via openRef so the listener stays registered once.
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === "k") {
-        e.preventDefault();
-        setSidebarPanel("search");
-        bumpSearchFocus();
-      }
+    let cancelled = false;
+    let unlisten: UnlistenFn | undefined;
+    void api
+      .onMenu((e) => {
+        const o = openRef.current;
+        switch (e.action) {
+          case "new-note":
+            setSidebarPanel("files");
+            setPendingCreate("note");
+            break;
+          case "new-folder":
+            setSidebarPanel("files");
+            setPendingCreate("folder");
+            break;
+          case "save":
+            if (o.note && o.dirty && !o.saving) void o.save();
+            break;
+          case "toggle-mode":
+            if (o.note && !o.note.binary) {
+              o.setMode(o.mode === "edit" ? "read" : "edit");
+            }
+            break;
+          case "close-vault":
+            guard(() => void close());
+            break;
+          case "search":
+          case "view-search":
+            setSidebarPanel("search");
+            bumpSearchFocus();
+            break;
+          case "view-files":
+            setSidebarPanel("files");
+            break;
+          case "toggle-graph":
+            setCenterView((v) => (v === "graph" ? "note" : "graph"));
+            break;
+          case "toggle-chat":
+            if (typeof e.checked === "boolean") setShowChat(e.checked);
+            break;
+          default:
+            break; // open-vault / open-recent are handled in the store
+        }
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      // A failed listen leaves every vault-scoped menu item dead — Save most of
+      // all, which now lives ONLY on the menu. The store's own onMenu subscription
+      // covers just Open Vault/Recent and has already resolved by the time this
+      // one runs (it's mounted from app start), so it can't surface this for us.
+      // Surface it here so a silently-dead Save can never masquerade as working.
+      .catch((err) => {
+        console.error("failed to subscribe to menu actions:", err);
+        reportError(
+          "Menu actions are unavailable — use the on-screen controls, and save with the Save button.",
+        );
+      });
+    return () => {
+      cancelled = true;
+      unlisten?.();
     };
-    globalThis.addEventListener("keydown", onKey);
-    return () => globalThis.removeEventListener("keydown", onKey);
-  }, []);
+  }, [guard, close, reportError]);
+
+  // Keep the native Format menu honest: those items act on the editor's textarea,
+  // which is mounted only when a text note is open in edit mode. Push that fact to
+  // Rust so it enables Format only then. Best-effort — the enabled state is
+  // cosmetic, and Rust skips the rebuild when the flag is unchanged.
+  const editing = !!open.note && !open.note.binary && open.mode === "edit";
+  useEffect(() => {
+    void api
+      .setMenuEditing(editing)
+      .catch((err) => console.error("failed to sync editor state to the menu:", err));
+  }, [editing]);
 
   if (!vault) return null;
 
@@ -236,6 +313,8 @@ export function Workspace() {
             onDeleted={handleDeleted}
             onRemap={handleRemap}
             onCloseVault={handleCloseVault}
+            pendingCreate={pendingCreate}
+            onCreateConsumed={consumeCreate}
           />
         ) : (
           <SearchPanel focusSignal={searchFocusSignal} onOpen={openNoteAt} />
@@ -250,11 +329,19 @@ export function Workspace() {
             onOpenLink={openNoteRel}
           />
         )}
-        <ChatPane
-          openNoteAt={openNoteAt}
-          onOpenSettings={handleOpenSettings}
-          refreshSignal={aiStatusVersion}
-        />
+        {/* Keep ChatPane mounted and toggle it with CSS, never conditionally
+            unmount it: unmounting would discard the cited-recall transcript and
+            silently abandon an in-flight streamed answer (the Rust `chat` call
+            would run against a dead channel). Using `display:contents` lets its
+            <aside> sit in the flex row as if unwrapped; `none` drops the subtree
+            from layout while React keeps it — and its stream — alive. */}
+        <div style={{ display: showChat ? "contents" : "none" }}>
+          <ChatPane
+            openNoteAt={openNoteAt}
+            onOpenSettings={handleOpenSettings}
+            refreshSignal={aiStatusVersion}
+          />
+        </div>
       </div>
 
       <StatusBar vaultName={vault.name} tree={tree} note={open.note} />

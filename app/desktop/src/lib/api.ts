@@ -62,6 +62,14 @@ export const createVault = (parentDir: string, name: string) =>
 
 export const closeVault = () => invoke<void>("close_vault");
 
+/**
+ * Tell the native menu whether a note is open in edit mode, so it can enable the
+ * Format items only when they'd actually do something (the Editor that handles
+ * them is mounted only in edit mode). Best-effort — the enabled state is cosmetic.
+ */
+export const setMenuEditing = (editing: boolean) =>
+  invoke<void>("set_menu_editing", { editing });
+
 // ── Tree + notes ────────────────────────────────────────────────────────────
 export const readTree = () => invoke<TreeNode[]>("read_tree");
 
@@ -124,6 +132,44 @@ export const createNoteFromTemplate = (
  *  Returns an unlisten function. */
 export const onTreeChanged = (cb: () => void): Promise<UnlistenFn> =>
   listen("vault://tree-changed", () => cb());
+
+/** Every action the native menu can emit. Kept in lockstep with the Rust menu's
+ *  item ids (src-tauri/src/menu.rs `CUSTOM_ACTIONS`). Predefined items
+ *  (undo/copy/quit…) are handled natively by the OS and never reach here. */
+export type MenuAction =
+  | "new-note"
+  | "new-folder"
+  | "open-vault"
+  | "open-recent"
+  | "close-vault"
+  | "save"
+  | "search"
+  | "view-files"
+  | "view-search"
+  | "toggle-graph"
+  | "toggle-mode"
+  | "toggle-chat"
+  | "format-bold"
+  | "format-italic"
+  | "format-h1"
+  | "format-h2"
+  | "format-h3"
+  | "format-link";
+
+export interface MenuActionEvent {
+  action: MenuAction;
+  /** Set only for `open-recent` — the vault path to open. */
+  path?: string;
+  /** Set only for `toggle-chat` — the new (authoritative) visibility. */
+  checked?: boolean;
+}
+
+/** Subscribe to native-menu clicks/accelerators. One event bus for every custom
+ *  menu item; the Rust side owns the ids. Returns an unlisten function. */
+export const onMenu = (
+  cb: (event: MenuActionEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<MenuActionEvent>("menu://action", (e) => cb(e.payload));
 
 // ── AI: cited chat (chat / api_key_* commands) ───────────────────────────────
 /** Whether an API key is configured + the model that will be used. The key
