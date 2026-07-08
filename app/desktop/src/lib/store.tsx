@@ -180,6 +180,29 @@ export function VaultProvider({ children }: { children: ReactNode }) {
     };
   }, [status, refreshTree]);
 
+  // Native menu → vault lifecycle. Open Vault / Open Recent must work on the
+  // welcome screen, before any vault is open — so they live here in the always-
+  // mounted provider, not in the Workspace (which isn't mounted until a vault
+  // opens). Every other menu action is vault-only and handled in the Workspace.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: UnlistenFn | undefined;
+    void api
+      .onMenu((e) => {
+        if (e.action === "open-vault") void openExisting();
+        else if (e.action === "open-recent" && e.path) void openByPath(e.path);
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((e) => setError(errorMessage(e)));
+    return () => {
+      cancelled = true;
+      unlisten?.();
+    };
+  }, [openExisting, openByPath]);
+
   // Memoised so the context value is referentially stable across renders that
   // don't change any field — otherwise every consumer re-renders each tick (S6481).
   const value: VaultContextValue = useMemo(

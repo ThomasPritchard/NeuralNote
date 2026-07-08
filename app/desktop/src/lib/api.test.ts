@@ -20,6 +20,7 @@ import {
   listRecentVaults,
   listTemplates,
   moveEntry,
+  onMenu,
   onTreeChanged,
   openVault,
   pickNewVaultLocation,
@@ -30,6 +31,7 @@ import {
   readTree,
   renameEntry,
   searchVault,
+  setMenuEditing,
   writeNote,
 } from "./api";
 
@@ -121,6 +123,13 @@ describe("vault lifecycle wrappers", () => {
   it("closeVault calls close_vault", async () => {
     await closeVault();
     expect(mockInvoke).toHaveBeenCalledWith("close_vault");
+  });
+
+  it("setMenuEditing forwards the editing flag", async () => {
+    await setMenuEditing(true);
+    expect(mockInvoke).toHaveBeenCalledWith("set_menu_editing", { editing: true });
+    await setMenuEditing(false);
+    expect(mockInvoke).toHaveBeenCalledWith("set_menu_editing", { editing: false });
   });
 });
 
@@ -271,5 +280,26 @@ describe("onTreeChanged", () => {
     const handler = mockListen.mock.calls[0][1] as (e: unknown) => void;
     handler({ payload: "anything" });
     expect(cb).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("onMenu", () => {
+  it("subscribes to menu://action and forwards the event payload", async () => {
+    const unlisten = vi.fn();
+    mockListen.mockResolvedValueOnce(unlisten);
+    const cb = vi.fn();
+
+    const returned = await onMenu(cb);
+
+    expect(mockListen).toHaveBeenCalledWith(
+      "menu://action",
+      expect.any(Function),
+    );
+    expect(returned).toBe(unlisten);
+
+    // The wrapper unwraps the Tauri envelope and hands the payload to the callback.
+    const handler = mockListen.mock.calls.at(-1)![1] as (e: unknown) => void;
+    handler({ payload: { action: "open-recent", path: "/vaults/Brain" } });
+    expect(cb).toHaveBeenCalledWith({ action: "open-recent", path: "/vaults/Brain" });
   });
 });

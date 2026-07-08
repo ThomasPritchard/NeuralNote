@@ -4,10 +4,17 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "./Editor";
 import type { NoteIndexEntry } from "./linkResolve";
 
+// The Editor subscribes to menu://action for the Format commands; mock the event
+// bus so listen() resolves to a no-op unlisten and tests can drive the handler.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(() => Promise.resolve(() => {})),
+}));
+import { listen } from "@tauri-apps/api/event";
+const mockListen = vi.mocked(listen);
+
 interface Props {
   value?: string;
   onChange?: (v: string) => void;
-  onSave?: () => void;
   saveError?: string | null;
   conflict?: boolean;
   onOverwrite?: () => void;
@@ -19,7 +26,6 @@ function renderEditor(props: Props = {}) {
   const handlers = {
     value: "initial",
     onChange: vi.fn(),
-    onSave: vi.fn(),
     saveError: null as string | null,
     conflict: false,
     onOverwrite: vi.fn(),
@@ -28,6 +34,15 @@ function renderEditor(props: Props = {}) {
   };
   render(<Editor {...handlers} />);
   return handlers;
+}
+
+/** The menu-action handler the Editor's onMenu subscription registered (latest
+ *  mount). onMenu wraps it as `(e) => cb(e.payload)`, so drive it with a
+ *  `{ payload }` envelope. */
+function fireMenu(action: string) {
+  const call = mockListen.mock.calls.at(-1);
+  const handler = call![1] as (e: { payload: { action: string } }) => void;
+  handler({ payload: { action } });
 }
 
 beforeEach(() => {
@@ -48,31 +63,25 @@ describe("Editor — buffer", () => {
   });
 });
 
-describe("Editor — save shortcut", () => {
-  it("saves on Cmd+S and prevents the browser default", () => {
-    const h = renderEditor();
-    const ev = new KeyboardEvent("keydown", {
-      key: "s",
-      metaKey: true,
-      cancelable: true,
-    });
-    window.dispatchEvent(ev);
-    expect(h.onSave).toHaveBeenCalledTimes(1);
-    expect(ev.defaultPrevented).toBe(true);
+describe("Editor — format actions", () => {
+  it("wraps the focused selection in bold on format-bold", () => {
+    const h = renderEditor({ value: "word" });
+    const ta = screen.getByLabelText("Note source") as HTMLTextAreaElement;
+    ta.focus();
+    ta.setSelectionRange(0, 4);
+    fireMenu("format-bold");
+    expect(ta.value).toBe("**word**");
+    expect([ta.selectionStart, ta.selectionEnd]).toEqual([2, 6]);
+    expect(h.onChange).toHaveBeenLastCalledWith("**word**");
   });
 
-  it("saves on Ctrl+S (uppercase key too)", () => {
-    const h = renderEditor();
-    window.dispatchEvent(
-      new KeyboardEvent("keydown", { key: "S", ctrlKey: true, cancelable: true }),
-    );
-    expect(h.onSave).toHaveBeenCalledTimes(1);
-  });
-
-  it("ignores plain keystrokes and unmounts its listener", () => {
-    const h = renderEditor();
-    window.dispatchEvent(new KeyboardEvent("keydown", { key: "s" }));
-    expect(h.onSave).not.toHaveBeenCalled();
+  it("ignores format actions when its textarea isn't focused", () => {
+    const h = renderEditor({ value: "word" });
+    const ta = screen.getByLabelText("Note source") as HTMLTextAreaElement;
+    ta.blur();
+    fireMenu("format-bold");
+    expect(ta.value).toBe("word");
+    expect(h.onChange).not.toHaveBeenCalled();
   });
 });
 
@@ -174,11 +183,10 @@ describe("Editor — [[ autocomplete", () => {
   });
 
   it("never traps typing while closed — Enter stays a newline", async () => {
-    const h = renderEditor({ value: "", noteIndex: INDEX });
+    renderEditor({ value: "", noteIndex: INDEX });
     const ta = textarea();
     await userEvent.type(ta, "a{Enter}b");
     expect(ta.value).toBe("a\nb");
-    expect(h.onSave).not.toHaveBeenCalled();
   });
 
   it("closes once the link is closed by hand", async () => {

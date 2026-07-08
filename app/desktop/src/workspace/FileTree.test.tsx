@@ -53,6 +53,8 @@ function setup(tree: TreeNode[], over: Partial<Parameters<typeof FileTree>[0]> =
     onDeleted: vi.fn(),
     onRemap: vi.fn(),
     onCloseVault: vi.fn(),
+    pendingCreate: null,
+    onCreateConsumed: vi.fn(),
     ...over,
   };
   render(<FileTree {...props} />);
@@ -131,6 +133,8 @@ describe("FileTree — fold persistence", () => {
         onDeleted={vi.fn()}
         onRemap={vi.fn()}
         onCloseVault={vi.fn()}
+        pendingCreate={null}
+        onCreateConsumed={vi.fn()}
       />,
     );
     // Open by default → child visible. The open folder is the only expanded button.
@@ -152,6 +156,8 @@ describe("FileTree — fold persistence", () => {
         onDeleted={vi.fn()}
         onRemap={vi.fn()}
         onCloseVault={vi.fn()}
+        pendingCreate={null}
+        onCreateConsumed={vi.fn()}
       />,
     );
     expect(screen.queryByText("a.md")).not.toBeInTheDocument();

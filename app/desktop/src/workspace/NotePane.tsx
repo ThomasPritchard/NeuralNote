@@ -157,7 +157,6 @@ export function NotePane({
         <Editor
           value={open.draft}
           onChange={open.setDraft}
-          onSave={() => void open.save()}
           saveError={open.saveError}
           conflict={open.conflict}
           onOverwrite={() => void open.overwrite()}

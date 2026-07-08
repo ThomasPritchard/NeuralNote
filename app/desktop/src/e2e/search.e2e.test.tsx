@@ -10,7 +10,8 @@
 // findBy* queries, exactly as a user would wait.
 
 import { describe, it, expect } from "vitest";
-import { fireEvent, screen, within } from "@testing-library/react";
+import { act, screen, within } from "@testing-library/react";
+import { emit } from "@tauri-apps/api/event";
 import { renderApp, type RenderAppResult } from "./renderApp";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
 
@@ -65,10 +66,13 @@ describe("Journey 10: full-text vault search", () => {
     expect(screen.getByRole("list", { name: "Search results" })).toBeInTheDocument();
   });
 
-  it("opens the search panel and focuses the input on ⌘K", async () => {
+  it("opens the search panel and focuses the input via the Find menu action", async () => {
     await openVault([{ kind: "file", relPath: "Note.md", content: "body" }]);
 
-    fireEvent.keyDown(window, { key: "k", metaKey: true });
+    // ⌘K is a native-menu accelerator now; the menu emits menu://action.
+    await act(async () => {
+      await emit("menu://action", { action: "search" });
+    });
 
     const input = await screen.findByLabelText("Search vault");
     expect(input).toHaveFocus();

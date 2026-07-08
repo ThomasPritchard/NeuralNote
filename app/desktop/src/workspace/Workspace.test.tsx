@@ -1,6 +1,8 @@
-import { act, fireEvent, render, screen } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { listen } from "@tauri-apps/api/event";
+import { invoke } from "@tauri-apps/api/core";
 import type { TreeNode } from "../lib/types";
 import type { OpenNote } from "./useOpenNote";
 
@@ -30,6 +32,27 @@ const win = vi.hoisted(() => {
 
 vi.mock("../lib/store", () => ({ useVault: mockUseVault }));
 vi.mock("./useOpenNote", () => ({ useOpenNote: () => openState.current }));
+// The Workspace subscribes to menu://action; mock the event bus so listen()
+// resolves and tests can drive the registered handler directly.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(() => Promise.resolve(() => {})),
+}));
+const mockListen = vi.mocked(listen);
+// The Workspace pushes edit-mode changes to the native menu via invoke; mock the
+// command bus so those calls resolve and can be asserted.
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve()) }));
+const mockInvoke = vi.mocked(invoke);
+
+/** Invoke the latest menu://action handler the Workspace registered. */
+function fireMenu(payload: {
+  action: string;
+  path?: string;
+  checked?: boolean;
+}) {
+  const calls = mockListen.mock.calls.filter((c) => c[0] === "menu://action");
+  const handler = calls.at(-1)![1] as (e: { payload: unknown }) => void;
+  act(() => handler({ payload }));
+}
 vi.mock("@tauri-apps/api/window", () => ({
   getCurrentWindow: () => ({
     onCloseRequested: win.onCloseRequested,
@@ -128,6 +151,7 @@ function vaultCtx(over: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   mockUseVault.mockReset();
+  mockInvoke.mockClear();
   win.state.closeCb = undefined;
   win.destroy.mockClear();
   win.onCloseRequested.mockClear();
@@ -372,28 +396,138 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     expect(screen.queryByTestId("graphview")).not.toBeInTheDocument();
   });
 
-  it("⌘K / Ctrl+K opens the search panel and bumps the focus signal", () => {
+  it("the search menu action opens the search panel and bumps the focus signal", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
 
-    let notPrevented = true;
-    act(() => {
-      notPrevented = fireEvent.keyDown(window, { key: "k", metaKey: true });
-    });
-    expect(notPrevented).toBe(false); // preventDefault was called
+    // Find in Vault (⌘K) is a menu accelerator now; the action opens the panel.
+    fireMenu({ action: "search" });
     expect(screen.getByTestId("searchpanel")).toHaveAttribute(
       "data-focus-signal",
       "1",
     );
 
-    // Repeat presses (case-insensitive, Ctrl too) keep bumping the signal.
-    act(() => {
-      fireEvent.keyDown(window, { key: "K", ctrlKey: true });
-    });
+    // Each Find action keeps bumping the focus signal.
+    fireMenu({ action: "search" });
     expect(screen.getByTestId("searchpanel")).toHaveAttribute(
       "data-focus-signal",
       "2",
     );
+  });
+
+  // Menu actions the e2e journey doesn't cover (open-recent, new-note,
+  // view-search, toggle-graph and toggle-chat live in menubar.e2e). These need
+  // the open-note / store state that the mocked children make easy to assert.
+  it("the save action saves the open note when it is dirty", () => {
+    openState.current = makeOpen({
+      path: "/v/a.md",
+      note: { binary: false } as unknown as OpenNote["note"],
+      dirty: true,
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "save" });
+    expect(openState.current.save).toHaveBeenCalledTimes(1);
+  });
+
+  it("the save action is a no-op when the note is clean", () => {
+    openState.current = makeOpen({
+      path: "/v/a.md",
+      note: { binary: false } as unknown as OpenNote["note"],
+      dirty: false,
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "save" });
+    expect(openState.current.save).not.toHaveBeenCalled();
+  });
+
+  it("the toggle-mode action flips a text note between read and edit", () => {
+    openState.current = makeOpen({
+      path: "/v/a.md",
+      note: { binary: false } as unknown as OpenNote["note"],
+      mode: "read",
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "toggle-mode" });
+    expect(openState.current.setMode).toHaveBeenCalledWith("edit");
+  });
+
+  it("tells the native menu to enable Format only while editing a text note", async () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    // Read mode (no note): Format disabled.
+    openState.current = makeOpen();
+    const { rerender } = render(<Workspace />);
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("set_menu_editing", { editing: false }),
+    );
+
+    // A text note open in edit mode: Format enabled.
+    mockInvoke.mockClear();
+    openState.current = makeOpen({
+      path: "/v/a.md",
+      note: { binary: false } as unknown as OpenNote["note"],
+      mode: "edit",
+    });
+    rerender(<Workspace />);
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("set_menu_editing", { editing: true }),
+    );
+
+    // A binary attachment in edit mode has no editable text: Format stays disabled.
+    mockInvoke.mockClear();
+    openState.current = makeOpen({
+      path: "/v/img.png",
+      note: { binary: true } as unknown as OpenNote["note"],
+      mode: "edit",
+    });
+    rerender(<Workspace />);
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("set_menu_editing", { editing: false }),
+    );
+  });
+
+  it("the close-vault action closes when there are no unsaved edits", () => {
+    const ctx = vaultCtx();
+    openState.current = makeOpen({ dirty: false });
+    mockUseVault.mockReturnValue(ctx);
+    render(<Workspace />);
+
+    fireMenu({ action: "close-vault" });
+    expect(ctx.close).toHaveBeenCalled();
+  });
+
+  it("the toggle-graph action swaps the center pane to the graph and back", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    expect(screen.getByTestId("notepane")).toBeInTheDocument();
+
+    fireMenu({ action: "toggle-graph" });
+    expect(screen.getByTestId("graphview")).toBeInTheDocument();
+    expect(screen.queryByTestId("notepane")).not.toBeInTheDocument();
+
+    fireMenu({ action: "toggle-graph" });
+    expect(screen.getByTestId("notepane")).toBeInTheDocument();
+  });
+
+  it("view-files shows the files sidebar; store-handled actions are ignored here", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "search" });
+    expect(screen.getByTestId("searchpanel")).toBeInTheDocument();
+
+    fireMenu({ action: "view-files" });
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+
+    // open-vault / open-recent are the store's job — they fall through the
+    // Workspace switch as a no-op without disturbing the current view.
+    fireMenu({ action: "open-vault" });
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
   });
 
   it("ignores a plain K press without a modifier", () => {
