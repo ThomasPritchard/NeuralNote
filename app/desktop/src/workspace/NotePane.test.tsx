@@ -1,9 +1,24 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteDoc } from "../lib/types";
+
+// Read mode mounts the Reader's backlinks panel, which fetches; keep the
+// fetch pending so these pane-level tests stay deterministic (panel behaviour
+// is covered in BacklinksPanel.test.tsx).
+vi.mock("../lib/api", async (importActual) => {
+  const actual = await importActual<typeof import("../lib/api")>();
+  return { ...actual, readBacklinks: vi.fn() };
+});
+
+import * as api from "../lib/api";
 import { NotePane } from "./NotePane";
 import type { OpenNote } from "./useOpenNote";
+
+beforeEach(() => {
+  vi.mocked(api.readBacklinks).mockReset();
+  vi.mocked(api.readBacklinks).mockReturnValue(new Promise(() => {}));
+});
 
 function note(overrides: Partial<NoteDoc> = {}): NoteDoc {
   return {

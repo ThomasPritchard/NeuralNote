@@ -14,6 +14,7 @@ const captured = vi.hoisted(() => ({
   ribbon: {} as Record<string, (...a: never[]) => void>,
   searchPanel: {} as { focusSignal: number; onOpen: (absPath: string) => void },
   graphView: {} as { onOpenNote: (relPath: string) => void },
+  chatPane: {} as { openNoteAt: (absPath: string) => void },
 }));
 const win = vi.hoisted(() => {
   const state: { closeCb?: (e: { preventDefault: () => void }) => void } = {};
@@ -47,7 +48,12 @@ vi.mock("./NotePane", () => ({
     return <div data-testid="notepane" />;
   },
 }));
-vi.mock("./ChatStub", () => ({ ChatStub: () => <div data-testid="chatstub" /> }));
+vi.mock("./ChatPane", () => ({
+  ChatPane: (props: { openNoteAt: (absPath: string) => void }) => {
+    captured.chatPane = props;
+    return <div data-testid="chatpane" />;
+  },
+}));
 vi.mock("./Ribbon", () => ({
   Ribbon: (props: Record<string, (...a: never[]) => void>) => {
     captured.ribbon = props;
@@ -149,6 +155,38 @@ describe("Workspace — shell", () => {
     expect(screen.getByText("lifecycle boom")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: "Dismiss error" }));
     expect(ctx.clearError).toHaveBeenCalled();
+  });
+});
+
+describe("Workspace — note index + rel-path opener threading", () => {
+  it("builds the note index from the tree and passes it to the note pane", () => {
+    mockUseVault.mockReturnValue(vaultCtx({ tree: [node("/v/Target.md")] }));
+    render(<Workspace />);
+    expect((captured.notePane as { noteIndex?: unknown }).noteIndex).toEqual([
+      { relPath: "Target.md", stem: "target" },
+    ]);
+  });
+
+  it("opens wikilink/backlink targets via the guarded absolute-path open", async () => {
+    mockUseVault.mockReturnValue(vaultCtx({ tree: [node("/v/Target.md")] }));
+    render(<Workspace />);
+    const { onOpenLink } = captured.notePane as unknown as {
+      onOpenLink: (rel: string) => void;
+    };
+    await act(async () => onOpenLink("Target.md"));
+    expect(openState.current.open).toHaveBeenCalledWith("/v/Target.md");
+  });
+
+  it("routes a dirty wikilink navigation through the discard guard", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx({ tree: [node("/v/Target.md")] }));
+    render(<Workspace />);
+    const { onOpenLink } = captured.notePane as unknown as {
+      onOpenLink: (rel: string) => void;
+    };
+    await act(async () => onOpenLink("Target.md"));
+    expect(screen.getByText("Discard unsaved changes?")).toBeInTheDocument();
+    expect(openState.current.open).not.toHaveBeenCalled();
   });
 });
 

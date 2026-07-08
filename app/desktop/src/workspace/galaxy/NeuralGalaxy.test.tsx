@@ -366,10 +366,29 @@ describe("NeuralGalaxy", () => {
       expect(onClusterSelect).toHaveBeenCalledWith("notes");
     });
 
-    it("renders the '' row (the current folder's own notes) as a plain non-button row", () => {
-      render(<NeuralGalaxy {...makeProps({ onClusterSelect: vi.fn() })} />);
-      expect(screen.queryByRole("button", { name: "My Vault" })).not.toBeInTheDocument();
-      expect(screen.getByText("My Vault")).toBeInTheDocument();
+    it("renders the '' row (the current folder's own notes) as a preview-only row that never drills", async () => {
+      const user = userEvent.setup();
+      const onClusterSelect = vi.fn();
+      render(<NeuralGalaxy {...makeProps({ onClusterSelect })} />);
+      // A real button (keyboard focus drives the same cluster preview as
+      // hover — pinned below), but with no drill action: clicking is a no-op.
+      await user.click(screen.getByRole("button", { name: "My Vault" }));
+      expect(onClusterSelect).not.toHaveBeenCalled();
+    });
+
+    it("keyboard focus on the '' row previews its cluster exactly like hover; blur restores", () => {
+      render(<NeuralGalaxy {...makeProps()} />);
+      const h = registerFakes();
+
+      fireEvent.focus(screen.getByRole("button", { name: "My Vault" }));
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.beta.setDimmed).toHaveBeenLastCalledWith(true);
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(true);
+
+      fireEvent.blur(screen.getByRole("button", { name: "My Vault" }));
+      expect(h.alpha.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.beta.setDimmed).toHaveBeenLastCalledWith(false);
+      expect(h.gamma.setDimmed).toHaveBeenLastCalledWith(false);
     });
 
     it("survives a legend click without onClusterSelect (prop is optional)", async () => {

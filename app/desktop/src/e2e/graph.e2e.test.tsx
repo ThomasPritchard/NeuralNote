@@ -165,15 +165,20 @@ describe("Journey 12: graph view over real link data", () => {
     ).toBeInTheDocument();
 
     // The legend re-keyed to this level: "notes" appears twice in the card —
-    // the plain "" cluster row (DIV, not a button: a second click is a no-op)
-    // and the breadcrumb's inert current level (SPAN). Neither is clickable.
+    // the "" cluster row (an accessible preview-only BUTTON with no drill
+    // action) and the breadcrumb's inert current level (SPAN). Clicking the
+    // "" row must be a no-op: the drilled payload stays exactly as it is.
     expect(
       legend()
         .getAllByText("notes")
         .map((el) => el.tagName)
         .sort(),
-    ).toEqual(["DIV", "SPAN"]);
-    expect(legend().queryByRole("button", { name: "notes" })).toBeNull();
+    ).toEqual(["BUTTON", "SPAN"]);
+    await user.click(legend().getByRole("button", { name: "notes" }));
+    expect(harness.props.graphData.nodes.map((n: any) => n.id).sort()).toEqual([
+      "notes/Alpha.md",
+      "notes/Beta.md",
+    ]);
     const crumb = screen.getByRole("navigation", { name: "Folder breadcrumb" });
 
     // Breadcrumb "All notes" restores the full galaxy.

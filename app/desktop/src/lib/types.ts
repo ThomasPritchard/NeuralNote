@@ -128,6 +128,42 @@ export interface LinkGraph {
   skippedFiles: number;
 }
 
+// ── Backlinks + templates ────────────────────────────────────────────────────
+
+/** One resolved occurrence of a link pointing at the current note. */
+export interface Backlink {
+  sourceRel: string;
+  sourceTitle: string;
+  snippet: string;
+  /** 1-based line number in the source note body. */
+  line: number;
+}
+
+/** One note-title mention that does not already link the current note. */
+export interface UnlinkedMention {
+  sourceRel: string;
+  sourceTitle: string;
+  snippet: string;
+  /** 1-based line number in the source note body. */
+  line: number;
+}
+
+/** The Obsidian-style backlinks panel payload. */
+export interface Backlinks {
+  linked: Backlink[];
+  unlinked: UnlinkedMention[];
+  /** Markdown files that couldn't be read and were skipped. */
+  skippedFiles: number;
+}
+
+/** One markdown template available for note creation. */
+export interface TemplateInfo {
+  /** Vault-relative path to the template file. */
+  relPath: string;
+  /** Display name, derived from the template file stem. */
+  name: string;
+}
+
 /** The shape a `CoreError` takes when it crosses the Tauri boundary. */
 export interface CoreError {
   kind:
@@ -137,6 +173,58 @@ export interface CoreError {
     | "invalidName"
     | "conflict"
     | "io"
-    | "frontmatter";
+    | "frontmatter"
+    | "llm";
   message: string;
 }
+
+// ── AI: cited chat (chat / api_key_* commands) ───────────────────────────────
+
+/** Whether an API key is configured, and the model that will be used. The key
+ *  itself never crosses to the webview — only its presence and the model id. */
+export interface ApiKeyStatus {
+  hasKey: boolean;
+  model: string;
+}
+
+export type ChatRole = "user" | "assistant";
+
+/** One prior turn of the conversation, sent back with the next question so the
+ *  model has context. System/tool turns are assembled in the Rust core. */
+export interface ChatTurn {
+  role: ChatRole;
+  content: string;
+}
+
+/** A streamed event from a chat run — the Rust→UI contract (mirrors
+ *  crates/neuralnote-core/src/ai/events.rs; serde `type`-tagged, camelCase).
+ *  The UI renders the sequence as live steps: searching → reading → verifying →
+ *  cited answer. A run always ends with `done` (success) or `error` (a surfaced
+ *  failure), never silently. */
+export type ChatEvent =
+  | { type: "searching"; query: string }
+  | { type: "retrieved"; query: string; hitCount: number }
+  | { type: "reading"; relPath: string; startLine: number; endLine: number }
+  | { type: "thinking"; delta: string }
+  | { type: "verifying" }
+  | { type: "citationDropped"; reason: string }
+  | { type: "answer"; delta: string }
+  | {
+      type: "citation";
+      /** The evidence handle the model cited (e.g. "e1"). */
+      id: string;
+      relPath: string;
+      startLine: number;
+      endLine: number;
+      /** The verified quoted text — a verbatim substring of the source note. */
+      text: string;
+    }
+  | {
+      type: "coverage";
+      searchedTerms: string[];
+      notesRead: string[];
+      truncated: boolean;
+      skippedFiles: number;
+    }
+  | { type: "error"; message: string }
+  | { type: "done" };

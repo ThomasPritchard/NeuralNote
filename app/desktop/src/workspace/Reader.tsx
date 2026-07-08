@@ -6,16 +6,27 @@
 
 import { AlertTriangle, FileQuestion } from "lucide-react";
 import type { NoteDoc } from "../lib/types";
+import { BacklinksPanel } from "./BacklinksPanel";
 import {
   extFromPath,
   extLabel,
   iconForFile,
+  isMarkdownExt,
   isMarkdownRenderable,
   isTextLikeExt,
 } from "./fileMeta";
+import type { NoteIndexEntry } from "./linkResolve";
 import { Markdown } from "./Markdown";
 
-export function Reader({ note }: { note: NoteDoc }) {
+interface ReaderProps {
+  note: NoteDoc;
+  /** Vault note index for wikilink/internal-link resolution in the body. */
+  noteIndex?: NoteIndexEntry[];
+  /** Open another vault note by relPath (the workspace's guarded open). */
+  onOpenLink?: (relPath: string) => void;
+}
+
+export function Reader({ note, noteIndex, onOpenLink }: Readonly<ReaderProps>) {
   const ext = extFromPath(note.path);
   const TypeIcon = iconForFile(ext);
 
@@ -57,14 +68,35 @@ export function Reader({ note }: { note: NoteDoc }) {
         )}
 
         <div className="mt-7">
-          <NoteBody note={note} ext={ext} />
+          <NoteBody
+            note={note}
+            ext={ext}
+            noteIndex={noteIndex}
+            onOpenLink={onOpenLink}
+          />
         </div>
+
+        {/* Backlinks only exist for actual markdown notes — read_backlinks
+            indexes markdown files, so extensionless/binary files skip it. */}
+        {!note.binary && isMarkdownExt(ext) && (
+          <BacklinksPanel notePath={note.path} onOpenLink={onOpenLink} />
+        )}
       </div>
     </article>
   );
 }
 
-function NoteBody({ note, ext }: { note: NoteDoc; ext: string | null }) {
+function NoteBody({
+  note,
+  ext,
+  noteIndex,
+  onOpenLink,
+}: Readonly<{
+  note: NoteDoc;
+  ext: string | null;
+  noteIndex?: NoteIndexEntry[];
+  onOpenLink?: (relPath: string) => void;
+}>) {
   // Binaries first: the backend flags them and returns empty body/raw, so the
   // friendly notice (with no raw dump) is the only sensible view.
   if (note.binary) {
@@ -72,7 +104,7 @@ function NoteBody({ note, ext }: { note: NoteDoc; ext: string | null }) {
   }
   // Markdown, plus extensionless text files (README, LICENSE).
   if (isMarkdownRenderable(ext)) {
-    return <Markdown body={note.body} />;
+    return <Markdown body={note.body} noteIndex={noteIndex} onOpenLink={onOpenLink} />;
   }
   // Other text-like files fall back to their raw bytes; anything else, no dump.
   return <UnsupportedNotice ext={ext} raw={isTextLikeExt(ext) ? note.raw : null} />;
@@ -81,10 +113,10 @@ function NoteBody({ note, ext }: { note: NoteDoc; ext: string | null }) {
 function UnsupportedNotice({
   ext,
   raw,
-}: {
+}: Readonly<{
   ext: string | null;
   raw: string | null;
-}) {
+}>) {
   return (
     <div className="rounded-lg border border-border bg-card/50 p-5">
       <div className="flex items-center gap-2 text-[13px] font-medium text-foreground/90">
@@ -100,7 +132,7 @@ function UnsupportedNotice({
   );
 }
 
-function Properties({ frontmatter }: { frontmatter: Record<string, unknown> }) {
+function Properties({ frontmatter }: Readonly<{ frontmatter: Record<string, unknown> }>) {
   return (
     <dl className="mt-5 flex flex-col divide-y divide-border/70 overflow-hidden rounded-lg border border-border bg-card/50">
       {Object.entries(frontmatter).map(([key, value]) => (
@@ -117,7 +149,7 @@ function Properties({ frontmatter }: { frontmatter: Record<string, unknown> }) {
   );
 }
 
-function FrontmatterValue({ value }: { value: unknown }) {
+function FrontmatterValue({ value }: Readonly<{ value: unknown }>) {
   if (Array.isArray(value)) {
     return (
       <div className="flex flex-wrap gap-1.5">

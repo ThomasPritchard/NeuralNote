@@ -40,6 +40,17 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
   path and the key edge cases by hand. A clean diff and green tests are necessary, not
   sufficient — type-checks and unit tests verify *code* correctness, not *feature* correctness.
 
+### Code review + triage (run as a pair — they drive each other)
+- When the change gets a review pass — **required** for security-adjacent changes (§2), and the
+  norm for any non-trivial feature — run the reviewers (`pr-review-toolkit:code-reviewer` +
+  `silent-failure-hunter`) **and** `code-triage` in **gate mode** *together*. They drive each
+  other: the reviewers surface issues; `code-triage` scores whether the **changed** code clears
+  the numeric bar (**Queue 1 to pass** — a measured bar, not "looks okay"). Fix findings
+  severity-first and re-run the review↔triage loop on the *delta* until it clears Queue 1.
+- ⚠️ This pairing is **not yet baked into the `pr-review-toolkit` plugin** — until it is, invoke
+  `code-triage` explicitly as the exit gate at the end of every review cycle so the reviewers and
+  the triage gate are never run apart.
+
 ### Project invariants (the things this product refuses to break)
 - **Failures are never silent.** Capture / LLM / citation / parse / I/O errors are surfaced to
   the user explicitly, and **content is never lost or hidden** (e.g. a note that won't fully
@@ -61,9 +72,10 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
 Applies when a change touches: **a parser/validator, untrusted input (note content, frontmatter,
 imported vaults), file paths, the IPC boundary, secrets/keys, or auth.**
 
-- **Independent adversarial review is REQUIRED.** A green test suite + green Sonar is **not**
-  sign-off here. A separate reviewer must try to *break* the control — comparing what the
-  validator *thinks* it accepts against the *real* grammar/threat.
+- **Independent adversarial review is REQUIRED**, paired with the `code-triage` gate (see
+  "Code review + triage" in §1 — they run together, never apart). A green test suite + green
+  Sonar is **not** sign-off here. A separate reviewer must try to *break* the control — comparing
+  what the validator *thinks* it accepts against the *real* grammar/threat.
   - *Why this rule exists:* a YAML alias-bomb guard in this codebase passed its full unit suite
     **and** a green Sonar gate, yet adversarial review bypassed it twice (a quote mid-plain-scalar;
     hyphenated anchor names). Tests prove the cases you thought of; adversarial review finds the
@@ -102,6 +114,7 @@ Baseline (every feature)
 - [ ] Rust gate GREEN — ./scripts/rust-quality-gate.sh (all categories enforced)
 - [ ] typecheck + clippy + fmt clean
 - [ ] Ran it in the app — golden path + key edge cases by hand
+- [ ] Code review + code-triage (gate mode) run TOGETHER; review↔triage loop clears Queue 1
 - [ ] Failures surfaced, never silent; no content lost/hidden
 - [ ] Obsidian markdown+YAML compatibility preserved
 - [ ] Spec/CLAUDE.md updated; deferrals left as TODO(context) in code

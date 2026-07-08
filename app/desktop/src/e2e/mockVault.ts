@@ -23,6 +23,9 @@
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type { InvokeArgs } from "@tauri-apps/api/core";
 import type {
+  ApiKeyStatus,
+  Backlinks,
+  ChatEvent,
   CoreError,
   FileHit,
   GraphLink,
@@ -32,12 +35,17 @@ import type {
   RecentVault,
   SearchMatch,
   SearchResponse,
+  TemplateInfo,
   TreeNode,
   Vault,
 } from "../lib/types";
 
 export const VAULT_ROOT = "/vault";
 export const NEW_VAULT_PARENT = "/parent";
+
+/** The model `api_key_status` reports when a test doesn't override it — mirrors
+ *  the plan's locked default (ChatPane.DEFAULT_MODEL). */
+export const DEFAULT_CHAT_MODEL = "anthropic/claude-sonnet-4.5";
 
 /** A thrown backend error, shaped exactly as a serialised `CoreError`. */
 export interface CoreErrorLike {
@@ -46,12 +54,14 @@ export interface CoreErrorLike {
 }
 
 /** A folder, or a file with its full raw contents. */
-type Entry = { kind: "folder" } | { kind: "file"; content: string };
+type Entry =
+  | { kind: "folder" }
+  | { kind: "file"; content: string; unreadable?: boolean };
 
 /** Seed nodes use vault-relative, `/`-joined paths (the UI's stable id). */
 export type SeedEntry =
   | { kind: "folder"; relPath: string }
-  | { kind: "file"; relPath: string; content?: string };
+  | { kind: "file"; relPath: string; content?: string; unreadable?: boolean };
 
 export interface CreateMockVaultOptions {
   /** Initial tree contents. Ancestor folders are auto-created. */
@@ -62,6 +72,15 @@ export interface CreateMockVaultOptions {
   pickFolder?: string | null;
   /** What the "new vault location" folder picker returns (null = cancelled). */
   pickNewLocation?: string | null;
+  /** The AI key status `api_key_status` reports. Defaults to a key present so a
+   *  test lands straight in the chat view; pass `{ hasKey: false }` to exercise
+   *  the guided-setup state. `model` defaults to {@link DEFAULT_CHAT_MODEL}. */
+  apiKey?: { hasKey: boolean; model?: string };
+  /** The `ChatEvent` sequence the `chat` command streams to its Channel, in
+   *  order, exactly as the Rust core would (searching → … → done | error). */
+  chatScript?: ChatEvent[];
+  /** Fixed clock for template rendering. Defaults to the Rust test fixture time. */
+  now?: Date;
 }
 
 export interface MockVault {
@@ -191,6 +210,7 @@ interface MdFile {
   path: string;
   rel: string;
   content: string;
+  unreadable?: boolean;
 }
 
 const MAX_TOTAL_MATCHES = 200;
@@ -356,8 +376,13 @@ const searchFiles = (files: MdFile[], rawQuery: string): SearchResponse => {
   const contentHits: FileHit[] = [];
   let total = 0;
   let truncated = false;
+  let skippedFiles = 0;
 
   for (const file of files) {
+    if (file.unreadable) {
+      skippedFiles += 1;
+      continue;
+    }
     const stem = stemOf(file.path);
     const parsed = parseFrontmatter(file.content);
     const title = titleFrom(parsed.frontmatter, parsed.body, stem);
@@ -379,7 +404,7 @@ const searchFiles = (files: MdFile[], rawQuery: string): SearchResponse => {
       (nameMatch ? nameHits : contentHits).push(hit);
     }
   }
-  return { hits: [...nameHits, ...contentHits], truncated, skippedFiles: 0 };
+  return { hits: [...nameHits, ...contentHits], truncated, skippedFiles };
 };
 
 // ── Link-graph mirror (crates/neuralnote-core/src/links.rs, mirrored 1:1) ────
@@ -497,45 +522,57 @@ const maskCode = (body: string): string => maskInlineSpans(maskFences(body));
 /** Mirror of core `extract_wikilinks`: `[[t]]`, `[[t|alias]]`, `[[t#heading]]`,
  *  `[[t#heading|alias]]`; embeds (`![[t]]`) are caught by the same scan. The
  *  target is the part before the first `#` or `|`, trimmed. */
-const extractWikilinks = (text: string, emit: (t: string) => void): void => {
+const extractWikilinks = (text: string, emit: (t: string, offset: number) => void): void => {
+  let base = 0;
   let rest = text;
   for (;;) {
     const start = rest.indexOf("[[");
     if (start === -1) return;
-    const after = rest.slice(start + 2);
+    const open = base + start;
+    const afterStart = open + 2;
+    const after = text.slice(afterStart);
     const end = after.indexOf("]]");
     if (end === -1) return;
     const target = after.slice(0, end).split(/[#|]/)[0].trim();
-    if (target !== "") emit(target);
-    rest = after.slice(end + 2);
+    if (target !== "") emit(target, open);
+    base = afterStart + end + 2;
+    rest = text.slice(base);
   }
 };
 
 /** Mirror of core `extract_md_links`: `[text](target)` where the target is
  *  everything up to the first `)` — spaces included. `[[wikilinks]]` are
  *  skipped here (the wikilink scan owns them); image links (`![…](…)`) count. */
-const extractMdLinks = (text: string, emit: (t: string) => void): void => {
+const extractMdLinks = (text: string, emit: (t: string, offset: number) => void): void => {
+  let base = 0;
   let rest = text;
   for (;;) {
     const open = rest.indexOf("[");
     if (open === -1) return;
-    const afterOpen = rest.slice(open + 1);
+    const openAbs = base + open;
+    const afterOpenAbs = openAbs + 1;
+    const afterOpen = text.slice(afterOpenAbs);
     if (afterOpen.startsWith("[")) {
-      rest = afterOpen.slice(1);
+      base = afterOpenAbs + 1;
+      rest = text.slice(base);
       continue;
     }
     const close = afterOpen.indexOf("]");
     if (close === -1) return;
-    const afterClose = afterOpen.slice(close + 1);
+    const afterCloseAbs = afterOpenAbs + close + 1;
+    const afterClose = text.slice(afterCloseAbs);
     if (!afterClose.startsWith("(")) {
-      rest = afterClose;
+      base = afterCloseAbs;
+      rest = text.slice(base);
       continue;
     }
+    const parenAbs = afterCloseAbs + 1;
     const paren = afterClose.slice(1);
     const tEnd = paren.indexOf(")");
     if (tEnd === -1) return;
-    emit(paren.slice(0, tEnd));
-    rest = paren.slice(tEnd + 1);
+    emit(paren.slice(0, tEnd), openAbs);
+    base = parenAbs + tEnd + 1;
+    rest = text.slice(base);
   }
 };
 
@@ -609,6 +646,52 @@ const resolveRel = (cand: string, byRel: Map<string, string[]>): string | null =
 const resolveMdRel = (cand: string, byRel: Map<string, string[]>): string | null =>
   resolveRel(cand, byRel) ?? resolveRel(`${cand}.md`, byRel);
 
+interface LinkResolutionIndex {
+  byName: Map<string, string[]>;
+  byRel: Map<string, string[]>;
+  allRels: string[];
+}
+
+const pushIndex = (map: Map<string, string[]>, key: string, rel: string): void => {
+  const list = map.get(key);
+  if (list) list.push(rel);
+  else map.set(key, [rel]);
+};
+
+/** Mirror of core `LinkResolutionIndex::from_files`. */
+const buildLinkResolutionIndex = (files: MdFile[]): LinkResolutionIndex => {
+  const byName = new Map<string, string[]>();
+  const byRel = new Map<string, string[]>();
+  const allRels: string[] = [];
+  for (const file of files) {
+    const stem = stemOf(file.rel);
+    pushIndex(byName, stem.toLowerCase(), file.rel);
+    pushIndex(byName, basename(file.rel).toLowerCase(), file.rel);
+    pushIndex(byRel, file.rel.toLowerCase(), file.rel);
+    allRels.push(file.rel);
+  }
+  return { byName, byRel, allRels };
+};
+
+const resolveRawTarget = (target: RawTarget, index: LinkResolutionIndex): string | null =>
+  target.kind === "wiki"
+    ? resolveWikilink(target.value, index.byName, index.allRels)
+    : resolveMdRel(target.value, index.byRel);
+
+const emitRawTargets = (
+  sourceRel: string,
+  masked: string,
+  emit: (target: RawTarget, offset: number) => void,
+): void => {
+  extractWikilinks(masked, (target, offset) => {
+    emit({ kind: "wiki", value: target }, offset);
+  });
+  extractMdLinks(masked, (target, offset) => {
+    const rel = normalizeMdTarget(sourceRel, target);
+    if (rel !== null) emit({ kind: "md", value: rel }, offset);
+  });
+};
+
 /** Mirror of core `extract_targets`: a note's deduplicated raw targets from
  *  its masked body, insertion-ordered (dedupe DURING extraction). */
 const extractTargets = (sourceRel: string, body: string): RawTarget[] => {
@@ -622,11 +705,402 @@ const extractTargets = (sourceRel: string, body: string): RawTarget[] => {
       out.push({ kind, value });
     }
   };
-  extractWikilinks(masked, (t) => add("wiki", t));
-  extractMdLinks(masked, (t) => {
-    const rel = normalizeMdTarget(sourceRel, t);
-    if (rel !== null) add("md", rel);
+  emitRawTargets(sourceRel, masked, (target) => {
+    add(target.kind, target.value);
   });
+  return out;
+};
+
+interface RawLinkOccurrence {
+  target: RawTarget;
+  line: number;
+  snippet: string;
+}
+
+const rustLines = (text: string): string[] => {
+  if (text === "") return [];
+  const lines = text.split(/\n/);
+  if (lines.at(-1) === "") lines.pop();
+  return lines.map((line) => line.replace(/\r$/, ""));
+};
+
+const splitInclusiveLineParts = (text: string): { starts: number[]; lines: string[] } => {
+  const starts: number[] = [];
+  const lines: string[] = [];
+  const pieces = text.match(/[^\n]*\n|[^\n]+/g) ?? [];
+  let offset = 0;
+  for (const piece of pieces) {
+    starts.push(offset);
+    lines.push(piece.replace(/[\n\r]+$/g, ""));
+    offset += piece.length;
+  }
+  if (starts.length === 0) {
+    starts.push(0);
+    lines.push("");
+  }
+  return { starts, lines };
+};
+
+const clipLineAround = (line: string, first: [number, number]): string =>
+  buildSnippet(Array.from(line), [first]).snippet;
+
+const occurrenceFor = (
+  originalLines: string[],
+  starts: number[],
+  maskedLines: string[],
+  target: RawTarget,
+  offset: number,
+): RawLinkOccurrence => {
+  let idx = 0;
+  for (let i = 0; i < starts.length; i += 1) {
+    if (starts[i] <= offset) idx = i;
+    else break;
+  }
+  const line = originalLines[idx] ?? "";
+  const start = starts[idx] ?? 0;
+  const maskedLine = maskedLines[idx] ?? "";
+  const col = Array.from(maskedLine.slice(0, Math.max(0, offset - start))).length;
+  return {
+    target,
+    line: idx + 1,
+    snippet: clipLineAround(line, [col, col + 1]),
+  };
+};
+
+/** Mirror of core `extract_link_occurrences`: every raw link occurrence from a
+ *  masked body, preserving line/snippet evidence for directional backlinks. */
+const extractLinkOccurrences = (sourceRel: string, body: string): RawLinkOccurrence[] => {
+  const masked = maskCode(body);
+  const { starts, lines: maskedLines } = splitInclusiveLineParts(masked);
+  const originalLines = rustLines(body);
+  const out: RawLinkOccurrence[] = [];
+  emitRawTargets(sourceRel, masked, (target, offset) => {
+    out.push(occurrenceFor(originalLines, starts, maskedLines, target, offset));
+  });
+  return out;
+};
+
+interface NoteText {
+  title: string;
+  body: string;
+}
+
+const readNoteText = (file: MdFile, skipped: { count: number }): NoteText | null => {
+  if (file.unreadable) {
+    skipped.count += 1;
+    return null;
+  }
+  const parsed = parseFrontmatter(file.content);
+  return {
+    title: titleFrom(parsed.frontmatter, parsed.body, stemOf(file.rel)),
+    body: parsed.body,
+  };
+};
+
+const isWordChar = (ch: string): boolean => ch === "_" || /^[\p{L}\p{N}]$/u.test(ch);
+
+const hasWordBoundaries = (folded: string[], start: number, end: number): boolean => {
+  const left = start === 0 || !(isWordChar(folded[start - 1]) && isWordChar(folded[start]));
+  const right =
+    end === folded.length || !(isWordChar(folded[end - 1]) && isWordChar(folded[end]));
+  return left && right;
+};
+
+const titleMatchesInLine = (line: string, foldedTitle: string[]): [number, number][] => {
+  const fl = foldLine(Array.from(line));
+  const matches: [number, number][] = [];
+  let i = 0;
+  while (i + foldedTitle.length <= fl.folded.length) {
+    const end = i + foldedTitle.length;
+    let hit = true;
+    for (let j = 0; j < foldedTitle.length; j += 1) {
+      if (fl.folded[i + j] !== foldedTitle[j]) {
+        hit = false;
+        break;
+      }
+    }
+    if (hit && hasWordBoundaries(fl.folded, i, end)) {
+      matches.push([fl.foldOrigin[i], fl.foldOrigin[end - 1] + 1]);
+      i = end;
+    } else {
+      i += 1;
+    }
+  }
+  return matches;
+};
+
+const findTitleMentions = (body: string, title: string): [number, string][] => {
+  const foldedTitle = fold(title.trim());
+  if (foldedTitle.length === 0) return [];
+  const masked = maskCode(body);
+  const bodyLines = rustLines(body);
+  const maskedLines = rustLines(masked);
+  const mentions: [number, string][] = [];
+  for (let idx = 0; idx < bodyLines.length && idx < maskedLines.length; idx += 1) {
+    for (const match of titleMatchesInLine(maskedLines[idx], foldedTitle)) {
+      mentions.push([idx + 1, clipLineAround(bodyLines[idx], match)]);
+    }
+  }
+  return mentions;
+};
+
+const buildBacklinks = (files: MdFile[], targetRel: string): Backlinks => {
+  const target = files.find((file) => file.rel === targetRel);
+  if (!target) {
+    throw { kind: "notFound", message: targetRel } satisfies CoreErrorLike;
+  }
+
+  const skipped = { count: 0 };
+  const targetTitle = readNoteText(target, skipped)?.title ?? stemOf(target.rel);
+  const resolver = buildLinkResolutionIndex(files);
+  const linked: Backlinks["linked"] = [];
+  const unlinked: Backlinks["unlinked"] = [];
+
+  for (const file of files) {
+    if (file.rel === targetRel) continue;
+    const note = readNoteText(file, skipped);
+    if (note === null) continue;
+
+    const linkedBefore = linked.length;
+    for (const occurrence of extractLinkOccurrences(file.rel, note.body)) {
+      if (resolveRawTarget(occurrence.target, resolver) === targetRel) {
+        linked.push({
+          sourceRel: file.rel,
+          sourceTitle: note.title,
+          snippet: occurrence.snippet,
+          line: occurrence.line,
+        });
+      }
+    }
+
+    if (linked.length === linkedBefore) {
+      for (const [line, snippet] of findTitleMentions(note.body, targetTitle)) {
+        unlinked.push({
+          sourceRel: file.rel,
+          sourceTitle: note.title,
+          snippet,
+          line,
+        });
+      }
+    }
+  }
+
+  const bySourceThenLine = <T extends { sourceRel: string; line: number }>(a: T, b: T): number =>
+    a.sourceRel === b.sourceRel ? a.line - b.line : a.sourceRel < b.sourceRel ? -1 : 1;
+  linked.sort(bySourceThenLine);
+  unlinked.sort(bySourceThenLine);
+  return { linked, unlinked, skippedFiles: skipped.count };
+};
+
+// ── Template mirror (crates/neuralnote-core/src/templates.rs) ─────────────────
+
+const DEFAULT_TEMPLATE_FOLDER = "Templates";
+const DEFAULT_DATE_FORMAT = "YYYY-MM-DD";
+const DEFAULT_TIME_FORMAT = "HH:mm";
+const FALLBACK_TEMPLATE_FOLDERS = ["Templates", "_templates", "templates"];
+
+interface TemplateSettings {
+  folder: string;
+  dateFormat: string;
+  timeFormat: string;
+}
+
+const parseRelativePath = (raw: string): string | null => {
+  const normalized = raw.trim().replace(/\\/g, "/");
+  if (normalized === "" || normalized.startsWith("/")) return null;
+  const out: string[] = [];
+  for (const part of normalized.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") return null;
+    out.push(part);
+  }
+  return out.length === 0 ? null : out.join("/");
+};
+
+const two = (n: number): string => String(n).padStart(2, "0");
+
+const MONTH_LONG = [
+  "January",
+  "February",
+  "March",
+  "April",
+  "May",
+  "June",
+  "July",
+  "August",
+  "September",
+  "October",
+  "November",
+  "December",
+];
+const MONTH_SHORT = MONTH_LONG.map((name) => name.slice(0, 3));
+const WEEKDAY_LONG = [
+  "Sunday",
+  "Monday",
+  "Tuesday",
+  "Wednesday",
+  "Thursday",
+  "Friday",
+  "Saturday",
+];
+const WEEKDAY_SHORT = WEEKDAY_LONG.map((name) => name.slice(0, 3));
+
+const renderMomentToken = (rest: string, now: Date): [string, string] | null => {
+  const year = now.getFullYear();
+  const month = now.getMonth() + 1;
+  const day = now.getDate();
+  const hours = now.getHours();
+  const hour12 = hours % 12 || 12;
+  const minutes = now.getMinutes();
+  const seconds = now.getSeconds();
+  const ampm = hours < 12 ? "AM" : "PM";
+  const tokens: [string, string][] = [
+    ["YYYY", String(year)],
+    ["MMMM", MONTH_LONG[now.getMonth()]],
+    ["dddd", WEEKDAY_LONG[now.getDay()]],
+    ["MMM", MONTH_SHORT[now.getMonth()]],
+    ["ddd", WEEKDAY_SHORT[now.getDay()]],
+    ["YY", two(year % 100)],
+    ["MM", two(month)],
+    ["DD", two(day)],
+    ["HH", two(hours)],
+    ["hh", two(hour12)],
+    ["mm", two(minutes)],
+    ["ss", two(seconds)],
+    ["M", String(month)],
+    ["D", String(day)],
+    ["H", String(hours)],
+    ["h", String(hour12)],
+    ["A", ampm],
+  ];
+  for (const [token, rendered] of tokens) {
+    if (rest.startsWith(token)) return [token, rendered];
+  }
+  if (rest.startsWith("a")) return ["a", ampm.toLowerCase()];
+  return null;
+};
+
+const formatMoment = (format: string, now: Date): string => {
+  let out = "";
+  let cursor = 0;
+  while (cursor < format.length) {
+    const rest = format.slice(cursor);
+    if (rest.startsWith("[")) {
+      const closeOffset = format.slice(cursor + 1).indexOf("]");
+      if (closeOffset === -1) {
+        out += rest;
+        break;
+      }
+      const close = cursor + 1 + closeOffset;
+      out += format.slice(cursor + 1, close);
+      cursor = close + 1;
+      continue;
+    }
+    const rendered = renderMomentToken(rest, now);
+    if (rendered !== null) {
+      out += rendered[1];
+      cursor += rendered[0].length;
+      continue;
+    }
+    const [ch] = Array.from(rest);
+    out += ch;
+    cursor += ch.length;
+  }
+  return out;
+};
+
+const renderObsidian = (inner: string, title: string, now: Date, settings: TemplateSettings): string | null => {
+  const command = inner.trim();
+  if (command === "title") return title;
+  if (command === "date") return formatMoment(settings.dateFormat, now);
+  if (command === "time") return formatMoment(settings.timeFormat, now);
+  if (command.startsWith("date:")) return formatMoment(command.slice("date:".length).trim(), now);
+  if (command.startsWith("time:")) return formatMoment(command.slice("time:".length).trim(), now);
+  return null;
+};
+
+const parseQuoted = (input: string): string | null => {
+  const quote = input.charAt(0);
+  if (quote !== '"' && quote !== "'") return null;
+  if (!input.endsWith(quote) || input.length < 2) return null;
+  return input.slice(1, -1);
+};
+
+const parseOptionalFormat = (args: string): string | null =>
+  parseQuoted(args) ??
+  (() => {
+    if (!args.startsWith("[") || !args.endsWith("]")) return null;
+    return parseQuoted(args.slice(1, -1).trim());
+  })();
+
+const parseFormatCall = (command: string, name: string): string | undefined | null => {
+  if (!command.startsWith(`${name}(`) || !command.endsWith(")")) return null;
+  const args = command.slice(name.length + 1, -1).trim();
+  if (args === "") return undefined;
+  return parseOptionalFormat(args);
+};
+
+const shiftedDate = (now: Date, days: number): Date => {
+  const shifted = new Date(now.getTime());
+  shifted.setDate(shifted.getDate() + days);
+  return shifted;
+};
+
+const renderTemplater = (inner: string, title: string, now: Date): string | null => {
+  const command = inner.trim();
+  if (command === "tp.file.title") return title;
+  const nowFormat = parseFormatCall(command, "tp.date.now");
+  if (nowFormat !== null) return formatMoment(nowFormat ?? DEFAULT_DATE_FORMAT, now);
+  const tomorrowFormat = parseFormatCall(command, "tp.date.tomorrow");
+  if (tomorrowFormat !== null) {
+    return formatMoment(tomorrowFormat ?? DEFAULT_DATE_FORMAT, shiftedDate(now, 1));
+  }
+  const yesterdayFormat = parseFormatCall(command, "tp.date.yesterday");
+  if (yesterdayFormat !== null) {
+    return formatMoment(yesterdayFormat ?? DEFAULT_DATE_FORMAT, shiftedDate(now, -1));
+  }
+  const createdFormat = parseFormatCall(command, "tp.file.creation_date");
+  if (createdFormat !== null) return formatMoment(createdFormat ?? DEFAULT_DATE_FORMAT, now);
+  return null;
+};
+
+const renderTemplate = (
+  content: string,
+  title: string,
+  now: Date,
+  settings: TemplateSettings,
+): string => {
+  let out = "";
+  let cursor = 0;
+  while (cursor < content.length) {
+    const nextObsidian = content.indexOf("{{", cursor);
+    const nextTemplater = content.indexOf("<%", cursor);
+    if (nextObsidian === -1 && nextTemplater === -1) {
+      out += content.slice(cursor);
+      break;
+    }
+    const useObsidian =
+      nextObsidian !== -1 && (nextTemplater === -1 || nextObsidian <= nextTemplater);
+    const start = useObsidian ? nextObsidian : nextTemplater;
+    out += content.slice(cursor, start);
+    const openLen = 2;
+    const closeMarker = useObsidian ? "}}" : "%>";
+    const afterOpen = start + openLen;
+    const closeOffset = content.slice(afterOpen).indexOf(closeMarker);
+    if (closeOffset === -1) {
+      out += content.slice(start);
+      break;
+    }
+    const close = afterOpen + closeOffset;
+    const fullEnd = close + closeMarker.length;
+    const full = content.slice(start, fullEnd);
+    const inner = content.slice(afterOpen, close);
+    const rendered = useObsidian
+      ? renderObsidian(inner, title, now, settings)
+      : renderTemplater(inner, title, now);
+    out += rendered ?? full;
+    cursor = fullEnd;
+  }
   return out;
 };
 
@@ -643,6 +1117,7 @@ const buildLinkGraph = (files: MdFile[]): LinkGraph => {
   const byName = new Map<string, string[]>();
   // Lowercased relPath → relPaths, for markdown-link resolution.
   const byRel = new Map<string, string[]>();
+  let skippedFiles = 0;
   const push = (map: Map<string, string[]>, key: string, rel: string): void => {
     const list = map.get(key);
     if (list) list.push(rel);
@@ -651,7 +1126,10 @@ const buildLinkGraph = (files: MdFile[]): LinkGraph => {
 
   for (const f of files) {
     const stem = stemOf(f.rel);
-    const parsed = parseFrontmatter(f.content);
+    const parsed = f.unreadable
+      ? { frontmatter: null, body: "", frontmatterRaw: null, frontmatterError: null }
+      : parseFrontmatter(f.content);
+    if (f.unreadable) skippedFiles += 1;
     nodes.push({
       id: f.rel,
       title: titleFrom(parsed.frontmatter, parsed.body, stem),
@@ -660,7 +1138,7 @@ const buildLinkGraph = (files: MdFile[]): LinkGraph => {
     push(byName, stem.toLowerCase(), f.rel);
     push(byName, basename(f.rel).toLowerCase(), f.rel);
     push(byRel, f.rel.toLowerCase(), f.rel);
-    noteTargets.push([f.rel, extractTargets(f.rel, parsed.body)]);
+    noteTargets.push([f.rel, f.unreadable ? [] : extractTargets(f.rel, parsed.body)]);
   }
   const allRels = nodes.map((n) => n.id);
 
@@ -686,7 +1164,45 @@ const buildLinkGraph = (files: MdFile[]): LinkGraph => {
       });
     }
   }
-  return { nodes, links, skippedFiles: 0 };
+  return { nodes, links, skippedFiles };
+};
+
+// ── Chat Channel delivery (the `chat` command's streamed events) ─────────────
+// `api.chat` passes a `@tauri-apps/api` `Channel` as the `onEvent` invoke arg.
+// The public `invoke` hands args straight to `__TAURI_INTERNALS__.invoke`, which
+// under `mockIPC` is `cb(cmd, args)` with NO serialisation — so the handler
+// receives the LIVE Channel instance (not its `__CHANNEL__:id` string form).
+//
+// The Channel registered a callback via `transformCallback` on construction;
+// under mockIPC that's `registerCallback`, which stores the closure in
+// `window.__TAURI_INTERNALS__.callbacks` keyed by the numeric `channel.id` and
+// exposes it through `runCallback(id, data)`. The Rust side delivers each event
+// as a `{ index, message }` frame to that callback; the Channel's own ordering
+// machinery then forwards `message` to the `onmessage` handler `api.chat` set
+// (the pane's `applyEvent`). Driving it through `runCallback` — rather than
+// poking `channel.onmessage` directly — exercises that real dispatch path.
+interface TauriChannelLike {
+  id: number;
+}
+interface TauriInternalsLike {
+  runCallback?: (id: number, data: unknown) => void;
+}
+
+/** Stream a scripted `ChatEvent[]` to the invoke's Channel exactly as the Rust
+ *  core would: one in-order `{ index, message }` frame per event. Throws loudly
+ *  if the channel isn't wired to the mock IPC — a dropped stream is never silent. */
+const emitToChannel = (channel: unknown, events: ChatEvent[]): void => {
+  const id = (channel as TauriChannelLike | null)?.id;
+  const runCallback = (window as unknown as {
+    __TAURI_INTERNALS__?: TauriInternalsLike;
+  }).__TAURI_INTERNALS__?.runCallback;
+  if (typeof id !== "number" || !runCallback) {
+    throw {
+      kind: "io",
+      message: "chat channel is not wired to the mock IPC",
+    } satisfies CoreErrorLike;
+  }
+  events.forEach((message, index) => runCallback(id, { index, message }));
 };
 
 export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
@@ -699,6 +1215,15 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
   const failures = new Map<string, CoreErrorLike>();
   const calls: string[] = [];
   let destroyed = false;
+  const now = opts.now ?? new Date(2026, 0, 2, 15, 4, 5);
+
+  // AI key state (mutated by save/clear, reported by api_key_status) + the chat
+  // stream this vault replays. Both are per-test overridable via opts.
+  const keyState = {
+    hasKey: opts.apiKey?.hasKey ?? true,
+    model: opts.apiKey?.model ?? DEFAULT_CHAT_MODEL,
+  };
+  const chatScript = opts.chatScript ?? [];
 
   const relOf = (p: string): string => p.slice(root.length + 1);
 
@@ -713,11 +1238,34 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
   for (const s of opts.seed ?? []) {
     const abs = `${root}/${s.relPath}`;
     ensureAncestors(abs);
-    entries.set(abs, s.kind === "folder" ? { kind: "folder" } : { kind: "file", content: s.content ?? "" });
+    entries.set(
+      abs,
+      s.kind === "folder"
+        ? { kind: "folder" }
+        : { kind: "file", content: s.content ?? "", unreadable: s.unreadable },
+    );
   }
 
   const fail = (kind: CoreErrorLike["kind"], message: string): never => {
     throw { kind, message } satisfies CoreErrorLike;
+  };
+
+  const normalizeAbsPath = (path: string): string => {
+    const parts: string[] = [];
+    for (const part of path.split("/")) {
+      if (part === "" || part === ".") continue;
+      if (part === "..") parts.pop();
+      else parts.push(part);
+    }
+    return `/${parts.join("/")}`;
+  };
+
+  const resolveVaultPath = (path: string): string => {
+    const abs = normalizeAbsPath(path.startsWith("/") ? path : `${root}/${path}`);
+    if (abs !== root && !abs.startsWith(`${root}/`)) {
+      fail("outsideVault", path);
+    }
+    return abs;
   };
 
   // ── TreeNode serialisation (folders-first, then case-insensitive by name) ──
@@ -792,8 +1340,20 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
 
   const requireFile = (path: string): Entry & { kind: "file" } => {
     const e = entries.get(path);
-    if (!e || e.kind !== "file") fail("notFound", `${path} not found`);
-    return e as Entry & { kind: "file" };
+    if (!e) throw { kind: "notFound", message: `${path} not found` } satisfies CoreErrorLike;
+    if (e.kind !== "file") {
+      throw { kind: "notFound", message: `${path} not found` } satisfies CoreErrorLike;
+    }
+    if (e.unreadable) throw { kind: "io", message: `${path} unreadable` } satisfies CoreErrorLike;
+    return e;
+  };
+
+  const createNoteNode = (parentPath: string, name: string): TreeNode => {
+    const fileName = ensureMd(name.trim());
+    const target = `${parentPath}/${fileName}`;
+    if (entries.has(target)) fail("alreadyExists", `${fileName} already exists`);
+    entries.set(target, { kind: "file", content: "" });
+    return toNode(target);
   };
 
   /** Mirror of core `markdown_files` + `collect_markdown` (tree.rs): every
@@ -809,13 +1369,133 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         } else if (isMarkdownExt(node.ext)) {
           const entry = entries.get(node.path);
           if (entry?.kind === "file") {
-            out.push({ path: node.path, rel: node.relPath, content: entry.content });
+            out.push({
+              path: node.path,
+              rel: node.relPath,
+              content: entry.content,
+              unreadable: entry.unreadable,
+            });
           }
         }
       }
     };
     collect(childrenOf(root));
     return out;
+  };
+
+  const topLevelTemplateFolder = (): string | null => {
+    const matches: string[] = [];
+    for (const [path, entry] of entries) {
+      const name = basename(path);
+      if (
+        parentOf(path) === root &&
+        entry.kind === "folder" &&
+        FALLBACK_TEMPLATE_FOLDERS.some((wanted) => name.toLowerCase() === wanted.toLowerCase())
+      ) {
+        matches.push(name);
+      }
+    }
+    matches.sort();
+    return matches[0] ?? null;
+  };
+
+  const readObsidianTemplateConfig = (
+    settings: TemplateSettings,
+  ): string | null => {
+    const entry = entries.get(`${root}/.obsidian/templates.json`);
+    if (!entry || entry.kind !== "file" || entry.unreadable) return null;
+    try {
+      const parsed = JSON.parse(entry.content) as unknown;
+      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) return null;
+      const obj = parsed as Record<string, unknown>;
+      if (typeof obj.dateFormat === "string" && obj.dateFormat.trim() !== "") {
+        settings.dateFormat = obj.dateFormat;
+      }
+      if (typeof obj.timeFormat === "string" && obj.timeFormat.trim() !== "") {
+        settings.timeFormat = obj.timeFormat;
+      }
+      return typeof obj.folder === "string" ? parseRelativePath(obj.folder) : null;
+    } catch {
+      return null;
+    }
+  };
+
+  const inferTemplateSettings = (): TemplateSettings => {
+    const settings: TemplateSettings = {
+      folder: DEFAULT_TEMPLATE_FOLDER,
+      dateFormat: DEFAULT_DATE_FORMAT,
+      timeFormat: DEFAULT_TIME_FORMAT,
+    };
+    settings.folder =
+      readObsidianTemplateConfig(settings) ??
+      topLevelTemplateFolder() ??
+      DEFAULT_TEMPLATE_FOLDER;
+    return settings;
+  };
+
+  const existingTemplateFolder = (settings: TemplateSettings): string | null => {
+    const folder = resolveVaultPath(settings.folder);
+    return entries.get(folder)?.kind === "folder" ? folder : null;
+  };
+
+  const templateInfos = (): TemplateInfo[] => {
+    const settings = inferTemplateSettings();
+    const folder = existingTemplateFolder(settings);
+    if (folder === null) return [];
+    const out: TemplateInfo[] = [];
+    const collect = (nodes: TreeNode[]): void => {
+      for (const node of nodes) {
+        if (node.children !== null) {
+          collect(node.children);
+        } else if (isMarkdownExt(node.ext)) {
+          out.push({ relPath: node.relPath, name: stemOf(node.relPath) });
+        }
+      }
+    };
+    collect(childrenOf(folder));
+    out.sort((a, b) => {
+      const ar = a.relPath.toLowerCase();
+      const br = b.relPath.toLowerCase();
+      if (ar !== br) return ar < br ? -1 : 1;
+      return a.relPath < b.relPath ? -1 : a.relPath > b.relPath ? 1 : 0;
+    });
+    return out;
+  };
+
+  const isSameOrInside = (candidate: string, folder: string): boolean =>
+    candidate === folder || candidate.startsWith(`${folder}/`);
+
+  const resolveTemplateFile = (settings: TemplateSettings, template: string): string => {
+    const folder = existingTemplateFolder(settings);
+    if (folder === null) {
+      throw {
+        kind: "notFound",
+        message: `template folder not found: ${settings.folder}`,
+      } satisfies CoreErrorLike;
+    }
+    const rel = parseRelativePath(template);
+    if (rel === null) {
+      throw {
+        kind: "invalidName",
+        message: "template path must be vault-relative",
+      } satisfies CoreErrorLike;
+    }
+    const requested = resolveVaultPath(rel);
+    if (!isSameOrInside(requested, folder)) {
+      fail("invalidName", `template must be inside the template folder: ${relOf(folder)}`);
+    }
+    if (!isMarkdownExt(extOf(requested))) {
+      fail("invalidName", "template must be a markdown file");
+    }
+    const entry = entries.get(requested);
+    if (!entry) throw { kind: "notFound", message: `template not found: ${rel}` } satisfies CoreErrorLike;
+    if (entry.kind !== "file") {
+      throw { kind: "notFound", message: `template not found: ${rel}` } satisfies CoreErrorLike;
+    }
+    if (entry.unreadable) {
+      throw { kind: "io", message: `${requested} unreadable` } satisfies CoreErrorLike;
+    }
+    return requested;
   };
 
   // ── The IPC handler: one stateful backend for the whole journey ───────────
@@ -873,11 +1553,7 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         return toNode(target);
       }
       case "create_note": {
-        const fileName = ensureMd((a.name as string).trim());
-        const target = `${a.parentPath as string}/${fileName}`;
-        if (entries.has(target)) fail("alreadyExists", `${fileName} already exists`);
-        entries.set(target, { kind: "file", content: "" });
-        return toNode(target);
+        return createNoteNode(a.parentPath as string, a.name as string);
       }
       case "rename_entry": {
         const path = a.path as string;
@@ -902,6 +1578,47 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         return searchFiles(markdownFiles(), a.query as string);
       case "read_link_graph":
         return buildLinkGraph(markdownFiles());
+      case "read_backlinks": {
+        const path = resolveVaultPath(a.path as string);
+        return buildBacklinks(markdownFiles(), relOf(path));
+      }
+      case "list_templates":
+        return templateInfos();
+      case "create_note_from_template": {
+        const parentPath = resolveVaultPath(a.parentPath as string);
+        const name = a.name as string;
+        const template = (a.template ?? null) as string | null;
+        const settings = inferTemplateSettings();
+        const templateContent =
+          template === null
+            ? null
+            : requireFile(resolveTemplateFile(settings, template)).content;
+        const node = createNoteNode(parentPath, name);
+        if (templateContent !== null) {
+          const file = requireFile(node.path);
+          file.content = renderTemplate(templateContent, stemOf(node.name), now, settings);
+        }
+        return node;
+      }
+      // ── AI: cited chat (api_key_* + chat) ─────────────────────────────────
+      case "api_key_status":
+        return { hasKey: keyState.hasKey, model: keyState.model } satisfies ApiKeyStatus;
+      case "save_api_key": {
+        // The key itself never crosses back; only presence + model are reported.
+        keyState.hasKey = true;
+        keyState.model = (a.model as string) || keyState.model;
+        return undefined;
+      }
+      case "clear_api_key": {
+        keyState.hasKey = false;
+        return undefined;
+      }
+      case "chat": {
+        // Replay the scripted stream through the real Channel, then resolve —
+        // mirroring the Rust run that emits events and ends on `done`/`error`.
+        emitToChannel(a.onEvent, chatScript);
+        return undefined;
+      }
       case "move_entry": {
         const path = a.path as string;
         const newParent = a.newParentPath as string;

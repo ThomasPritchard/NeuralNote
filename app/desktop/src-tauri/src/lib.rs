@@ -8,11 +8,15 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
-use neuralnote_core::model::{LinkGraph, NoteDoc, RecentVault, SearchResponse, TreeNode, Vault};
+use neuralnote_core::model::{
+    Backlinks, LinkGraph, NoteDoc, RecentVault, SearchResponse, TemplateInfo, TreeNode, Vault,
+};
 use neuralnote_core::CoreError;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter, Manager, State};
 use tauri_plugin_dialog::DialogExt;
+
+mod ai;
 
 /// Event emitted to the frontend when the vault changes on disk (the frontend
 /// debounces and re-reads the tree). Lets external edits — e.g. from Obsidian —
@@ -284,6 +288,20 @@ async fn read_link_graph(state: SharedState<'_>) -> Result<LinkGraph, CoreError>
 }
 
 #[tauri::command]
+async fn read_backlinks(state: SharedState<'_>, path: String) -> Result<Backlinks, CoreError> {
+    let root = root_of(&state)?;
+    let requested = Path::new(&path);
+    let target = if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let target = neuralnote_core::paths::ensure_within(&root, &target)?;
+    let rel = neuralnote_core::paths::rel_path(&root, &target);
+    neuralnote_core::backlinks::read_backlinks(&root, &rel)
+}
+
+#[tauri::command]
 fn create_folder(
     state: SharedState,
     parent_path: String,
@@ -299,6 +317,42 @@ fn create_note(
     name: String,
 ) -> Result<TreeNode, CoreError> {
     neuralnote_core::entries::create_note(&root_of(&state)?, Path::new(&parent_path), &name)
+}
+
+#[tauri::command]
+async fn list_templates(state: SharedState<'_>) -> Result<Vec<TemplateInfo>, CoreError> {
+    neuralnote_core::templates::list_templates(&root_of(&state)?)
+}
+
+#[tauri::command]
+fn create_note_from_template(
+    state: SharedState,
+    parent_path: String,
+    name: String,
+    template: Option<String>,
+) -> Result<TreeNode, CoreError> {
+    let root = root_of(&state)?;
+    let parent = neuralnote_core::paths::ensure_within(&root, Path::new(&parent_path))?;
+    let template_rel = template
+        .map(|template| {
+            let requested = Path::new(&template);
+            let target = if requested.is_absolute() {
+                requested.to_path_buf()
+            } else {
+                root.join(requested)
+            };
+            neuralnote_core::paths::ensure_within(&root, &target)
+                .map(|target| neuralnote_core::paths::rel_path(&root, &target))
+        })
+        .transpose()?;
+
+    neuralnote_core::templates::create_note_from_template(
+        &root,
+        &parent,
+        &name,
+        template_rel.as_deref(),
+        chrono::Local::now(),
+    )
 }
 
 #[tauri::command]
@@ -322,6 +376,109 @@ fn move_entry(
         Path::new(&path),
         Path::new(&new_parent_path),
     )
+}
+
+/* ───────────────────────────  AI: cited chat  ──────────────────────────── */
+
+#[tauri::command]
+fn api_key_status(app: AppHandle) -> Result<ai::ApiKeyStatus, CoreError> {
+    ai::api_key_status(&config_dir(&app)?)
+}
+
+#[tauri::command]
+fn save_api_key(app: AppHandle, key: String, model: String) -> Result<(), CoreError> {
+    let model = model.trim();
+    let model = if model.is_empty() {
+        neuralnote_core::ai::DEFAULT_MODEL
+    } else {
+        model
+    };
+    ai::save_api_key(&config_dir(&app)?, key.trim(), model)
+}
+
+#[tauri::command]
+fn clear_api_key(app: AppHandle) -> Result<(), CoreError> {
+    ai::clear_api_key(&config_dir(&app)?)
+}
+
+/// Run one cited-chat turn. Streams `ChatEvent`s to the frontend via `on_event`;
+/// the API key is read here (Rust-side) and never crosses to the webview. Every
+/// failure (no vault, no key, transport) is surfaced as a `ChatEvent::Error` —
+/// never a panic, never silent. `async` so it runs on the worker pool, like the
+/// other long-running commands; the state guard (inside `root_of`) is dropped
+/// before the first await.
+#[tauri::command]
+async fn chat(
+    app: AppHandle,
+    state: SharedState<'_>,
+    prompt: String,
+    history: Vec<ai::ChatTurn>,
+    on_event: tauri::ipc::Channel<neuralnote_core::ai::ChatEvent>,
+) -> Result<(), ()> {
+    use neuralnote_core::ai::{
+        run_chat, ChatEvent, EventSink, Guards, KeywordRetriever, LlmMessage, DEFAULT_MODEL,
+    };
+
+    let mut sink = ai::TauriChannelSink::new(on_event);
+
+    let root = match root_of(&state) {
+        Ok(r) => r,
+        Err(e) => {
+            sink.send(ChatEvent::Error {
+                message: format!("No vault is open: {e}"),
+            });
+            return Ok(());
+        }
+    };
+
+    let key = match ai::read_api_key() {
+        Ok(Some(k)) => k,
+        Ok(None) => {
+            sink.send(ChatEvent::Error {
+                message: "No API key set. Add your OpenRouter key to start chatting.".into(),
+            });
+            return Ok(());
+        }
+        Err(e) => {
+            sink.send(ChatEvent::Error {
+                message: format!("Couldn't read the API key: {e}"),
+            });
+            return Ok(());
+        }
+    };
+    // The model is non-secret app config; if resolving/reading it fails, warn and
+    // fall back rather than blocking chat.
+    let model = match config_dir(&app).and_then(|cfg| ai::read_model(&cfg)) {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!("could not read the stored model, using the default: {e}");
+            DEFAULT_MODEL.to_string()
+        }
+    };
+
+    let history: Vec<LlmMessage> = history.into_iter().map(Into::into).collect();
+    let retriever = KeywordRetriever::new(root.clone());
+    let client = ai::OpenRouterClient::new(key);
+
+    // run_chat emits its own Done/Error; a returned Err (defensive) is surfaced as
+    // a final Error so a failure is never silent.
+    if let Err(e) = run_chat(
+        &prompt,
+        &history,
+        &root,
+        &model,
+        &retriever,
+        &client,
+        &mut sink,
+        &Guards::default(),
+    )
+    .await
+    {
+        sink.send(ChatEvent::Error {
+            message: format!("Chat failed: {e}"),
+        });
+    }
+    Ok(())
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -354,11 +511,18 @@ pub fn run() {
             write_note,
             search_vault,
             read_link_graph,
+            read_backlinks,
             create_folder,
             create_note,
+            list_templates,
+            create_note_from_template,
             rename_entry,
             delete_entry,
             move_entry,
+            api_key_status,
+            save_api_key,
+            clear_api_key,
+            chat,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

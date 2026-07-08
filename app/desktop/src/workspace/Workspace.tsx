@@ -7,17 +7,25 @@
 // away, and the OS window-close / Cmd-Q path routed through that same guard.
 // Tree CRUD lives in FileTree; lifecycle errors flow from the store.
 
-import { useCallback, useEffect, useReducer, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+} from "react";
 import { AlertTriangle, X } from "lucide-react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { useVault } from "../lib/store";
 import type { TreeNode } from "../lib/types";
-import { ChatStub } from "./ChatStub";
+import { ChatPane } from "./ChatPane";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { FileTree } from "./FileTree";
 import { isPathInside, normSep, remapPath } from "./fileMeta";
 import { GraphView } from "./GraphView";
+import { buildNoteIndex, type NoteIndexEntry } from "./linkResolve";
 import { NotePane } from "./NotePane";
 import { Ribbon, type CenterView, type SidebarPanel } from "./Ribbon";
 import { SearchPanel } from "./SearchPanel";
@@ -70,15 +78,31 @@ export function Workspace() {
   );
 
   const vaultPath = vault?.path;
-  /** GraphNode ids are vault-relative paths; join onto the vault root. The
-   *  plain join is safe — the backend canonicalizes through ensure_within,
-   *  and mockVault keys entries exactly this way. */
-  const openFromGraph = useCallback(
+  /** Open a note by vault-relative path (graph nodes, wikilinks, backlink
+   *  sources); joins onto the vault root, same as ChatPane's citation-open.
+   *  The plain join is safe — the backend canonicalizes through
+   *  ensure_within, and mockVault keys entries exactly this way. */
+  const openNoteRel = useCallback(
     (relPath: string) => {
       if (vaultPath) openNoteAt(`${vaultPath}/${relPath}`);
     },
     [openNoteAt, vaultPath],
   );
+
+  /** Wikilink/markdown-link resolution index over the loaded tree, shared by
+   *  the reader (clickable links) and editor (`[[` autocomplete). Memoized on
+   *  the tree — it only rebuilds when the vault actually rescans. */
+  const noteIndex = useMemo<NoteIndexEntry[]>(() => {
+    if (!vault) return [];
+    return buildNoteIndex({
+      kind: "folder",
+      name: vault.name,
+      path: vault.path,
+      relPath: "",
+      ext: null,
+      children: tree,
+    });
+  }, [vault, tree]);
 
   const handleSelect = useCallback(
     (path: string) => {
@@ -204,11 +228,16 @@ export function Workspace() {
           <SearchPanel focusSignal={searchFocusSignal} onOpen={openNoteAt} />
         )}
         {centerView === "graph" ? (
-          <GraphView onOpenNote={openFromGraph} />
+          <GraphView onOpenNote={openNoteRel} />
         ) : (
-          <NotePane open={open} onClose={() => guard(() => openRef.current.clear())} />
+          <NotePane
+            open={open}
+            onClose={() => guard(() => openRef.current.clear())}
+            noteIndex={noteIndex}
+            onOpenLink={openNoteRel}
+          />
         )}
-        <ChatStub />
+        <ChatPane openNoteAt={openNoteAt} />
       </div>
 
       <StatusBar vaultName={vault.name} tree={tree} note={open.note} />

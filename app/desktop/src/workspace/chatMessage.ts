@@ -1,0 +1,253 @@
+// The chat pane's view model + the pure event reducer. A chat is a list of
+// `ChatMessage`s; an assistant turn accumulates the streamed `ChatEvent`s (the
+// live search/read/verify "harness" log, the streamed answer, cited sources,
+// and a coverage footer). Keeping the fold pure and framework-free makes the
+// harness feel unit-testable without React.
+
+import type { ChatEvent, ChatTurn } from "../lib/types";
+
+/** One row in the live activity log — the visible trace of the agent working. */
+export type ActivityStep =
+  | { kind: "search"; query: string; hitCount?: number }
+  | { kind: "reading"; relPath: string; startLine: number; endLine: number }
+  | { kind: "verifying" }
+  | { kind: "dropped"; reason: string };
+
+/** A verified citation the answer leans on — the click target that opens the
+ *  cited note. Mirrors the `citation` ChatEvent minus its discriminant. */
+export interface CitationView {
+  id: string;
+  relPath: string;
+  startLine: number;
+  endLine: number;
+  text: string;
+}
+
+/** The coverage footer — how much of the vault the turn actually saw, kept
+ *  honest (partial/skipped coverage is surfaced, never hidden). */
+export interface CoverageView {
+  searchedTerms: string[];
+  notesRead: string[];
+  truncated: boolean;
+  skippedFiles: number;
+}
+
+export interface UserMessage {
+  role: "user";
+  content: string;
+}
+
+export interface AssistantMessage {
+  role: "assistant";
+  /** The live "searching / reading / verifying" trace, in order. */
+  activity: ActivityStep[];
+  /** Optional streamed reasoning tokens (rendered collapsed). */
+  thinking: string;
+  /** The streamed answer markdown, accumulated delta by delta. */
+  answer: string;
+  citations: CitationView[];
+  coverage: CoverageView | null;
+  /** A surfaced, non-fatal turn error — shown inline, never swallowed. */
+  error: string | null;
+  /** True once the run ended (a `done` or `error` event). */
+  done: boolean;
+}
+
+export type ChatMessage = UserMessage | AssistantMessage;
+
+export function userMessage(content: string): UserMessage {
+  return { role: "user", content };
+}
+
+/** A fresh assistant turn, before any event has landed. */
+export function emptyAssistant(): AssistantMessage {
+  return {
+    role: "assistant",
+    activity: [],
+    thinking: "",
+    answer: "",
+    citations: [],
+    coverage: null,
+    error: null,
+    done: false,
+  };
+}
+
+/** Fold a `retrieved` event into the matching `searching` row (→ "searching X →
+ *  N notes"). Falls back to a standalone row if no pending search matches — a
+ *  retrieval count is never dropped just because its search row went missing. */
+function withHitCount(
+  steps: ActivityStep[],
+  query: string,
+  hitCount: number,
+): ActivityStep[] {
+  for (let i = steps.length - 1; i >= 0; i--) {
+    const step = steps[i];
+    if (step.kind === "search" && step.query === query && step.hitCount === undefined) {
+      const next = steps.slice();
+      next[i] = { ...step, hitCount };
+      return next;
+    }
+  }
+  return [...steps, { kind: "search", query, hitCount }];
+}
+
+/** Immutably fold one streamed `ChatEvent` into the assistant turn's view
+ *  state. Total over the `ChatEvent` union — a new variant is a compile error
+ *  here, so the UI can never silently ignore a backend event. */
+export function reduceAssistant(
+  turn: AssistantMessage,
+  event: ChatEvent,
+): AssistantMessage {
+  switch (event.type) {
+    case "searching":
+      return { ...turn, activity: [...turn.activity, { kind: "search", query: event.query }] };
+    case "retrieved":
+      return { ...turn, activity: withHitCount(turn.activity, event.query, event.hitCount) };
+    case "reading":
+      return {
+        ...turn,
+        activity: [
+          ...turn.activity,
+          { kind: "reading", relPath: event.relPath, startLine: event.startLine, endLine: event.endLine },
+        ],
+      };
+    case "verifying":
+      return { ...turn, activity: [...turn.activity, { kind: "verifying" }] };
+    case "citationDropped":
+      return { ...turn, activity: [...turn.activity, { kind: "dropped", reason: event.reason }] };
+    case "thinking":
+      return { ...turn, thinking: turn.thinking + event.delta };
+    case "answer":
+      return { ...turn, answer: turn.answer + event.delta };
+    case "citation":
+      return {
+        ...turn,
+        citations: [
+          ...turn.citations,
+          {
+            id: event.id,
+            relPath: event.relPath,
+            startLine: event.startLine,
+            endLine: event.endLine,
+            text: event.text,
+          },
+        ],
+      };
+    case "coverage":
+      return {
+        ...turn,
+        coverage: {
+          searchedTerms: event.searchedTerms,
+          notesRead: event.notesRead,
+          truncated: event.truncated,
+          skippedFiles: event.skippedFiles,
+        },
+      };
+    case "error":
+      // A run ends on `error` too — mark it done so the working indicator
+      // clears, but keep the message visible.
+      return { ...turn, error: event.message, done: true };
+    case "done":
+      return { ...turn, done: true };
+  }
+}
+
+/** Resolve `[eN]` citation markers in an answer against the verified citations.
+ *  Citations arrive only after the answer has streamed, so while the turn is
+ *  still running the markers are left exactly as the model emitted them. Once the
+ *  turn is `done`, any `[eN]` with no matching verified citation was dropped by
+ *  the verifier or hallucinated by the model — strip it (and a leading space) so
+ *  a discredited citation is never left showing as a live reference. Citation
+ *  fidelity is the moat: a marker pointing at nothing is a broken citation. */
+export function resolveAnswerMarkers(
+  answer: string,
+  citations: CitationView[],
+  done: boolean,
+): string {
+  if (!done) return answer;
+  const verified = new Set(citations.map((c) => c.id));
+  // Case-insensitive to mirror the Rust citation extractor (which accepts `[E9]`
+  // and folds to lowercase); compare against the lowercased id the citation carries.
+  return answer.replace(/ ?\[(e\d+)\]/gi, (whole, id: string) =>
+    verified.has(id.toLowerCase()) ? whole : "",
+  );
+}
+
+/** A `reading` step with the number of times that note was read consecutively
+ *  folded in — so five back-to-back reads of one note render as one row (`×5`),
+ *  not five identical lines. Its range widens to span every folded read. */
+export type GroupedStep =
+  | { kind: "search"; query: string; hitCount?: number }
+  | { kind: "reading"; relPath: string; startLine: number; endLine: number; count: number }
+  | { kind: "verifying" }
+  | { kind: "dropped"; reason: string };
+
+/** Collapse *consecutive* reads of the same note into a single counted row. Only
+ *  consecutive runs merge, so the trace stays in execution order (a note re-read
+ *  after other steps still shows again) — the common bloat case is a burst of reads
+ *  of one note, which this flattens. Searches stay per-row: distinct queries are the
+ *  point of the "watch it search" trace. */
+export function groupActivity(activity: ActivityStep[]): GroupedStep[] {
+  const out: GroupedStep[] = [];
+  for (const step of activity) {
+    const last = out.at(-1);
+    if (step.kind === "reading" && last?.kind === "reading" && last.relPath === step.relPath) {
+      last.count += 1;
+      last.startLine = Math.min(last.startLine, step.startLine);
+      last.endLine = Math.max(last.endLine, step.endLine);
+      continue;
+    }
+    out.push(step.kind === "reading" ? { ...step, count: 1 } : step);
+  }
+  return out;
+}
+
+/** The one-line footer the collapsed trace shows once the turn is done. `notesRead`
+ *  counts *distinct* notes (provenance honesty — reading one note five times is one
+ *  source, not five), `dropped` counts discarded citations (surfaced, never hidden —
+ *  a dropped citation is the moat's honesty signal). */
+export interface ActivitySummary {
+  searches: number;
+  notesRead: number;
+  dropped: number;
+  verified: boolean;
+  totalSteps: number;
+}
+
+export function summarizeActivity(activity: ActivityStep[]): ActivitySummary {
+  let searches = 0;
+  let dropped = 0;
+  let verified = false;
+  const notes = new Set<string>();
+  for (const step of activity) {
+    switch (step.kind) {
+      case "search":
+        searches += 1;
+        break;
+      case "reading":
+        notes.add(step.relPath);
+        break;
+      case "verifying":
+        verified = true;
+        break;
+      case "dropped":
+        dropped += 1;
+        break;
+    }
+  }
+  return { searches, notesRead: notes.size, dropped, verified, totalSteps: activity.length };
+}
+
+/** The prior conversation as plain `ChatTurn`s, for the next `chat` request.
+ *  Empty assistant turns (errored / no answer) are dropped so the model isn't
+ *  handed blank context. */
+export function toHistory(messages: ChatMessage[]): ChatTurn[] {
+  return messages
+    .map((m): ChatTurn =>
+      m.role === "user"
+        ? { role: "user", content: m.content }
+        : { role: "assistant", content: m.answer },
+    )
+    .filter((turn) => turn.content.trim() !== "");
+}

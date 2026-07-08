@@ -146,7 +146,7 @@ fn fold_char(ch: char) -> impl Iterator<Item = char> {
 }
 
 /// Case-fold a string the same way lines are folded (per-char [`fold_char`]).
-fn fold(s: &str) -> Vec<char> {
+pub(crate) fn fold(s: &str) -> Vec<char> {
     s.chars().flat_map(fold_char).collect()
 }
 
@@ -160,18 +160,18 @@ fn contains_folded(text: &str, folded_query: &[char]) -> bool {
 
 /// A line's fold map: the folded text plus enough bookkeeping to map any folded
 /// match back to an original char range and to slice the original line safely.
-struct FoldedLine {
+pub(crate) struct FoldedLine {
     /// Each original char's `to_lowercase()` output, concatenated.
-    folded: Vec<char>,
+    pub(crate) folded: Vec<char>,
     /// The original CHAR index each folded char came from (pushed once per
     /// emitted folded char, so expansion like `İ` → 2 chars stays mapped).
-    fold_origin: Vec<usize>,
+    pub(crate) fold_origin: Vec<usize>,
     /// Byte offset of each original char, plus a final `line.len()` sentinel —
     /// `line[char_starts[a]..char_starts[b]]` is boundary-safe for any a ≤ b.
-    char_starts: Vec<usize>,
+    pub(crate) char_starts: Vec<usize>,
 }
 
-fn fold_line(line: &str) -> FoldedLine {
+pub(crate) fn fold_line(line: &str) -> FoldedLine {
     let mut folded = Vec::new();
     let mut fold_origin = Vec::new();
     let mut char_starts = Vec::new();
@@ -188,6 +188,29 @@ fn fold_line(line: &str) -> FoldedLine {
         fold_origin,
         char_starts,
     }
+}
+
+fn char_starts(line: &str) -> Vec<usize> {
+    let mut starts: Vec<usize> = line.char_indices().map(|(idx, _)| idx).collect();
+    starts.push(line.len());
+    starts
+}
+
+fn snippet_window(n_chars: usize, first: (usize, usize)) -> (usize, usize) {
+    if n_chars <= SNIPPET_MAX_CHARS {
+        return (0, n_chars);
+    }
+    let (a, b) = (first.0.min(n_chars), first.1.min(n_chars));
+    let start = ((a + b) / 2)
+        .saturating_sub(SNIPPET_MAX_CHARS / 2)
+        .min(n_chars - SNIPPET_MAX_CHARS);
+    (start, start + SNIPPET_MAX_CHARS)
+}
+
+pub(crate) fn clip_line_around(line: &str, first: (usize, usize)) -> String {
+    let starts = char_starts(line);
+    let (start, end) = snippet_window(starts.len() - 1, first);
+    line[starts[start]..starts[end]].to_string()
 }
 
 /// Non-overlapping occurrences of `query` in `folded`, as folded-index ranges.
@@ -257,11 +280,7 @@ fn build_snippet(
         let ranges = occs.iter().map(|&(a, b)| (a as u32, b as u32)).collect();
         return (line.to_string(), ranges);
     }
-    let (a, b) = occs[0];
-    let start = ((a + b) / 2)
-        .saturating_sub(SNIPPET_MAX_CHARS / 2)
-        .min(n_chars - SNIPPET_MAX_CHARS);
-    let end = start + SNIPPET_MAX_CHARS;
+    let (start, end) = snippet_window(n_chars, occs[0]);
     let snippet = line[fl.char_starts[start]..fl.char_starts[end]].to_string();
     let ranges = occs
         .iter()

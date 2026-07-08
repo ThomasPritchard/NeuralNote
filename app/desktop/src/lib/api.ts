@@ -2,14 +2,19 @@
 // between the React UI and the Rust backend — components never call `invoke`
 // directly, they call these. Command names + arg shapes match src-tauri/lib.rs.
 
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  ApiKeyStatus,
+  Backlinks,
+  ChatEvent,
+  ChatTurn,
   CoreError,
   LinkGraph,
   NoteDoc,
   RecentVault,
   SearchResponse,
+  TemplateInfo,
   TreeNode,
   Vault,
 } from "./types";
@@ -87,8 +92,54 @@ export const searchVault = (query: string) =>
 /** The wikilink/markdown-link graph over every markdown note in the vault. */
 export const readLinkGraph = () => invoke<LinkGraph>("read_link_graph");
 
+/** Directional backlinks and unlinked title mentions for one target note. */
+export const readBacklinks = (path: string) =>
+  invoke<Backlinks>("read_backlinks", { path });
+
+/** Markdown templates in the inferred Obsidian-compatible template folder. */
+export const listTemplates = () => invoke<TemplateInfo[]>("list_templates");
+
+/** Create a note and optionally seed it with a rendered vault template. */
+export const createNoteFromTemplate = (
+  parentPath: string,
+  name: string,
+  template: string | null,
+) =>
+  invoke<TreeNode>("create_note_from_template", {
+    parentPath,
+    name,
+    template,
+  });
+
 // ── Events ───────────────────────────────────────────────────────────────────
 /** Subscribe to on-disk vault changes (external edits, e.g. from Obsidian).
  *  Returns an unlisten function. */
 export const onTreeChanged = (cb: () => void): Promise<UnlistenFn> =>
   listen("vault://tree-changed", () => cb());
+
+// ── AI: cited chat (chat / api_key_* commands) ───────────────────────────────
+/** Whether an API key is configured + the model that will be used. The key
+ *  itself never crosses to the webview — only its presence is reported. */
+export const apiKeyStatus = () => invoke<ApiKeyStatus>("api_key_status");
+
+/** Store the OpenRouter API key (OS keychain, Rust-side) and the chosen model. */
+export const saveApiKey = (key: string, model: string) =>
+  invoke<void>("save_api_key", { key, model });
+
+/** Remove the stored API key. */
+export const clearApiKey = () => invoke<void>("clear_api_key");
+
+/** Run one cited-chat turn. `onEvent` fires for each streamed `ChatEvent`
+ *  (searching / reading / verifying / answer / citation / coverage) as it
+ *  happens; the returned promise resolves when the run ends (after its `done` or
+ *  `error` event). The API key stays Rust-side — only the prompt + prior turns
+ *  cross the boundary. */
+export const chat = (
+  prompt: string,
+  history: ChatTurn[],
+  onEvent: (event: ChatEvent) => void,
+): Promise<void> => {
+  const channel = new Channel<ChatEvent>();
+  channel.onmessage = onEvent;
+  return invoke<void>("chat", { prompt, history, onEvent: channel });
+};

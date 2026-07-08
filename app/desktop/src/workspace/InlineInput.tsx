@@ -3,7 +3,7 @@
 // It is intentionally dumb — the parent owns the async op and decides when to
 // unmount it, so an error can keep the input open with the user's text intact.
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, type RefObject } from "react";
 import { cn } from "../lib/cn";
 
 interface InlineInputProps {
@@ -14,6 +14,10 @@ interface InlineInputProps {
   /** Called with the trimmed value when the user confirms a non-empty entry. */
   onSubmit: (value: string) => void;
   onCancel: () => void;
+  /** Blur does NOT cancel while focus moves inside this container — lets a
+   *  sibling control (e.g. the create row's template picker) share the
+   *  editing session without ending it. */
+  blurWithin?: RefObject<HTMLElement | null>;
   className?: string;
 }
 
@@ -23,6 +27,7 @@ export function InlineInput({
   ariaLabel,
   onSubmit,
   onCancel,
+  blurWithin,
   className,
 }: InlineInputProps) {
   const [value, setValue] = useState(initialValue);
@@ -69,8 +74,13 @@ export function InlineInput({
           cancel();
         }
       }}
-      onBlur={() => {
-        if (!settledRef.current) cancel();
+      onBlur={(e) => {
+        if (settledRef.current) return;
+        const next = e.relatedTarget;
+        if (blurWithin?.current && next && blurWithin.current.contains(next)) {
+          return;
+        }
+        cancel();
       }}
       className={cn(
         "w-full rounded-md border border-primary/60 bg-background px-1.5 py-[3px] text-[13px] text-foreground",

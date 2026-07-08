@@ -78,6 +78,16 @@ pub struct NoteDoc {
     pub lossy_text: bool,
 }
 
+/// One markdown template available for note creation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TemplateInfo {
+    /// Vault-relative path to the template file.
+    pub rel_path: String,
+    /// Display name, derived from the template file stem.
+    pub name: String,
+}
+
 /// A recently-opened vault, for the welcome screen.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -159,5 +169,38 @@ pub struct LinkGraph {
     /// Markdown files that could not be read (their nodes remain, their
     /// outgoing links are unknown; each is also logged). Lets the UI
     /// distinguish "sparse graph" from "couldn't look".
+    pub skipped_files: u32,
+}
+
+/// One resolved occurrence of a link pointing at the current note.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Backlink {
+    pub source_rel: String,
+    pub source_title: String,
+    pub snippet: String,
+    /// 1-based line number in the source note body.
+    pub line: u32,
+}
+
+/// One note whose body mentions the current note title without linking it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UnlinkedMention {
+    pub source_rel: String,
+    pub source_title: String,
+    pub snippet: String,
+    /// 1-based line number in the source note body.
+    pub line: u32,
+}
+
+/// The Obsidian-style backlinks panel payload.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Backlinks {
+    pub linked: Vec<Backlink>,
+    pub unlinked: Vec<UnlinkedMention>,
+    /// Markdown files that could not be read and were skipped (each is also
+    /// logged). Lets the UI distinguish "no mentions" from "couldn't look".
     pub skipped_files: u32,
 }

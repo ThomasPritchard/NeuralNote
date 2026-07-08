@@ -12,16 +12,19 @@ import {
   closeVault,
   createFolder,
   createNote,
+  createNoteFromTemplate,
   createVault,
   deleteEntry,
   errorMessage,
   isConflict,
   listRecentVaults,
+  listTemplates,
   moveEntry,
   onTreeChanged,
   openVault,
   pickNewVaultLocation,
   pickVaultFolder,
+  readBacklinks,
   readLinkGraph,
   readNote,
   readTree,
@@ -211,6 +214,42 @@ describe("search + graph wrappers", () => {
     const out = await readLinkGraph();
     expect(mockInvoke).toHaveBeenCalledWith("read_link_graph");
     expect(out).toEqual({ nodes: [], links: [], skippedFiles: 0 });
+  });
+});
+
+describe("backlinks + templates wrappers", () => {
+  it("readBacklinks passes the path", async () => {
+    mockInvoke.mockResolvedValueOnce({ linked: [], unlinked: [], skippedFiles: 0 });
+    const out = await readBacklinks("/v/target.md");
+    expect(mockInvoke).toHaveBeenCalledWith("read_backlinks", { path: "/v/target.md" });
+    expect(out).toEqual({ linked: [], unlinked: [], skippedFiles: 0 });
+  });
+
+  it("listTemplates calls list_templates", async () => {
+    mockInvoke.mockResolvedValueOnce([{ relPath: "Templates/Daily.md", name: "Daily" }]);
+    const out = await listTemplates();
+    expect(mockInvoke).toHaveBeenCalledWith("list_templates");
+    expect(out).toEqual([{ relPath: "Templates/Daily.md", name: "Daily" }]);
+  });
+
+  it("createNoteFromTemplate passes parentPath, name, and template", async () => {
+    mockInvoke.mockResolvedValueOnce({ kind: "file", name: "Daily.md" });
+    await createNoteFromTemplate("/v", "Daily", "Templates/Daily.md");
+    expect(mockInvoke).toHaveBeenCalledWith("create_note_from_template", {
+      parentPath: "/v",
+      name: "Daily",
+      template: "Templates/Daily.md",
+    });
+  });
+
+  it("createNoteFromTemplate passes null when creating a blank note", async () => {
+    mockInvoke.mockResolvedValueOnce({ kind: "file", name: "Blank.md" });
+    await createNoteFromTemplate("/v", "Blank", null);
+    expect(mockInvoke).toHaveBeenCalledWith("create_note_from_template", {
+      parentPath: "/v",
+      name: "Blank",
+      template: null,
+    });
   });
 });
 

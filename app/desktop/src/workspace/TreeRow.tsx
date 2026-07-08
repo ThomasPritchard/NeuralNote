@@ -3,18 +3,19 @@
 // reveals per-node actions: new note / new folder (folders only), rename, delete.
 // Inline create/rename inputs live here; the parent FileTree owns the async ops.
 
-import { memo, useState } from "react";
+import { memo, useRef, useState } from "react";
 import {
   ChevronRight,
   Folder,
   FolderOpen,
   FolderPlus,
+  LayoutTemplate,
   Pencil,
   Plus,
   Trash2,
 } from "lucide-react";
 import { cn } from "../lib/cn";
-import type { TreeNode } from "../lib/types";
+import type { TemplateInfo, TreeNode } from "../lib/types";
 import { iconForFile, isPathInside } from "./fileMeta";
 import { InlineInput } from "./InlineInput";
 
@@ -34,6 +35,12 @@ export interface TreeContext {
   creating: CreatingState | null;
   renaming: string | null;
   dragPath: string | null;
+  /** Vault templates offered while creating a note; empty = no picker (the
+   *  plain create flow, unchanged). */
+  templates: TemplateInfo[];
+  /** relPath of the chosen template, or null for a blank note. */
+  selectedTemplate: string | null;
+  onSelectTemplate: (relPath: string | null) => void;
   toggle: (relPath: string) => void;
   onSelect: (path: string) => void;
   onStartCreate: (parentPath: string, kind: CreateKind) => void;
@@ -280,18 +287,63 @@ function FileRow({ node, ctx }: { node: TreeNode; ctx: TreeContext }) {
   );
 }
 
-/** The inline "name your new note/folder" row shown inside the target folder. */
+/** The inline "name your new note/folder" row shown inside the target folder.
+ *  When the vault has templates and a note is being created, a compact picker
+ *  appears under the name input (defaulting to "Blank note" — templates are
+ *  strictly optional and add zero friction when unused). */
 export function CreateRow({ kind, ctx }: { kind: CreateKind; ctx: TreeContext }) {
+  // Focus moving between the name input and the template picker must not end
+  // the create session — InlineInput's blur-cancel is scoped to this row.
+  const rowRef = useRef<HTMLDivElement>(null);
   const Icon = kind === "folder" ? Folder : iconForFile("md");
+  const showTemplates = kind === "note" && ctx.templates.length > 0;
+
   return (
-    <div className="flex items-center gap-1.5 py-px pl-1.5 pr-1">
-      <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-      <InlineInput
-        placeholder={kind === "folder" ? "Folder name" : "Note name"}
-        ariaLabel={kind === "folder" ? "New folder name" : "New note name"}
-        onSubmit={ctx.onSubmitCreate}
-        onCancel={ctx.onCancelEdit}
-      />
+    <div ref={rowRef} className="py-px pl-1.5 pr-1">
+      <div className="flex items-center gap-1.5">
+        <Icon className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+        <InlineInput
+          placeholder={kind === "folder" ? "Folder name" : "Note name"}
+          ariaLabel={kind === "folder" ? "New folder name" : "New note name"}
+          onSubmit={ctx.onSubmitCreate}
+          onCancel={ctx.onCancelEdit}
+          blurWithin={rowRef}
+        />
+      </div>
+      {showTemplates && (
+        <div className="mt-1 flex items-center gap-1.5 pl-5">
+          <LayoutTemplate
+            className="size-3 shrink-0 text-muted-foreground/70"
+            aria-hidden
+          />
+          <select
+            aria-label="Note template"
+            value={ctx.selectedTemplate ?? ""}
+            onChange={(e) =>
+              ctx.onSelectTemplate(e.target.value === "" ? null : e.target.value)
+            }
+            onKeyDown={(e) => {
+              if (e.key === "Enter") {
+                // Enter here means "done choosing" — hand focus back to the
+                // name input so the next Enter creates the note.
+                e.preventDefault();
+                rowRef.current?.querySelector("input")?.focus();
+              } else if (e.key === "Escape") {
+                e.preventDefault();
+                ctx.onCancelEdit();
+              }
+            }}
+            className="w-full min-w-0 cursor-pointer rounded-md border border-border bg-background px-1 py-[3px] text-[12px] text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+          >
+            <option value="">Blank note</option>
+            {ctx.templates.map((t) => (
+              <option key={t.relPath} value={t.relPath}>
+                {t.name}
+              </option>
+            ))}
+          </select>
+        </div>
+      )}
     </div>
   );
 }

@@ -26,4 +26,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 notify = "8"
 neuralnote-core = { path = "../../../crates/neuralnote-core" }
-
+# AI slice — OS keychain for the BYO API key. macOS-first; add `windows-native`
+# / `sync-secret-service` features when those desktop targets land (spec §8.4).
+keyring = { version = "3", features = ["apple-native"] }
+# Native HTTP for the OpenRouter LLM client. rustls avoids a system OpenSSL dep;
+# `stream` gives the SSE byte stream for the final-answer token stream.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
+async-trait = "0.1"
+futures-util = "0.3"
+chrono = { version = "0.4", default-features = false, features = ["clock"] }

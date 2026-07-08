@@ -11,6 +11,7 @@
 use crate::error::CoreResult;
 use crate::model::{GraphLink, GraphNode, LinkGraph, TreeNode};
 use crate::note::title_and_body;
+use crate::search;
 use crate::tree::{markdown_files, read_tree};
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -18,10 +19,62 @@ use std::path::Path;
 /// A raw link target as written in a note, before resolution — wiki and
 /// markdown targets resolve by different rules, so the kind is kept.
 #[derive(Clone, PartialEq, Eq, Hash)]
-enum RawTarget {
+pub(crate) enum RawTarget {
     Wiki(String),
     /// Already normalised to a vault-relative path candidate.
     Md(String),
+}
+
+/// One raw link occurrence from a source body, with source-line context.
+pub(crate) struct RawLinkOccurrence {
+    pub(crate) target: RawTarget,
+    pub(crate) line: u32,
+    pub(crate) snippet: String,
+}
+
+/// The case-folded note indices used by every Obsidian-style link resolver.
+pub(crate) struct LinkResolutionIndex {
+    /// Lowercased stem AND filename → rel_paths, for `[[target]]` ± `.md`.
+    by_name: HashMap<String, Vec<String>>,
+    /// Lowercased rel_path → rel_paths, for markdown-link resolution.
+    by_rel: HashMap<String, Vec<String>>,
+    all_rels: Vec<String>,
+}
+
+impl LinkResolutionIndex {
+    pub(crate) fn from_files(files: &[&TreeNode]) -> Self {
+        let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
+        let mut by_rel: HashMap<String, Vec<String>> = HashMap::new();
+        let mut all_rels: Vec<String> = Vec::new();
+        for node in files {
+            let stem = stem_of(&node.name);
+            by_name
+                .entry(stem.to_lowercase())
+                .or_default()
+                .push(node.rel_path.clone());
+            by_name
+                .entry(node.name.to_lowercase())
+                .or_default()
+                .push(node.rel_path.clone());
+            by_rel
+                .entry(node.rel_path.to_lowercase())
+                .or_default()
+                .push(node.rel_path.clone());
+            all_rels.push(node.rel_path.clone());
+        }
+        Self {
+            by_name,
+            by_rel,
+            all_rels,
+        }
+    }
+
+    pub(crate) fn resolve(&self, raw_target: &RawTarget) -> Option<String> {
+        match raw_target {
+            RawTarget::Wiki(t) => resolve_wikilink(t, &self.by_name, &self.all_rels),
+            RawTarget::Md(rel) => resolve_md_rel(rel, &self.by_rel),
+        }
+    }
 }
 
 /// Build the vault's link graph: a node per markdown note, an edge per resolved,
@@ -44,12 +97,7 @@ struct NoteIndex {
     nodes: Vec<GraphNode>,
     /// Per note: its deduped raw targets (order preserved → deterministic edges).
     note_targets: Vec<(String, Vec<RawTarget>)>,
-    /// Lowercased stem AND filename → rel_paths, for `[[target]]` ± `.md`.
-    by_name: HashMap<String, Vec<String>>,
-    /// Lowercased rel_path → rel_paths, for markdown-link resolution. A Vec —
-    /// never last-write-wins — because a case-sensitive filesystem can hold
-    /// `Target.md` AND `target.md` (see `resolve_rel`).
-    by_rel: HashMap<String, Vec<String>>,
+    resolver: LinkResolutionIndex,
     skipped_files: u32,
 }
 
@@ -58,8 +106,7 @@ struct NoteIndex {
 fn collect_notes(files: &[&TreeNode]) -> NoteIndex {
     let mut nodes: Vec<GraphNode> = Vec::new();
     let mut note_targets: Vec<(String, Vec<RawTarget>)> = Vec::new();
-    let mut by_name: HashMap<String, Vec<String>> = HashMap::new();
-    let mut by_rel: HashMap<String, Vec<String>> = HashMap::new();
+    let resolver = LinkResolutionIndex::from_files(files);
     let mut skipped_files: u32 = 0;
 
     for node in files {
@@ -77,28 +124,13 @@ fn collect_notes(files: &[&TreeNode]) -> NoteIndex {
                 String::new()
             }
         };
-        let stem = Path::new(&node.name)
-            .file_stem()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| node.name.clone());
+        let stem = stem_of(&node.name);
         let (title, body) = title_and_body(&raw, &stem);
         nodes.push(GraphNode {
             id: node.rel_path.clone(),
             title,
             cluster: cluster_of(&node.rel_path).to_string(),
         });
-        by_name
-            .entry(stem.to_lowercase())
-            .or_default()
-            .push(node.rel_path.clone());
-        by_name
-            .entry(node.name.to_lowercase())
-            .or_default()
-            .push(node.rel_path.clone());
-        by_rel
-            .entry(node.rel_path.to_lowercase())
-            .or_default()
-            .push(node.rel_path.clone());
         note_targets.push((
             node.rel_path.clone(),
             extract_targets(&node.rel_path, &body),
@@ -109,34 +141,19 @@ fn collect_notes(files: &[&TreeNode]) -> NoteIndex {
     NoteIndex {
         nodes,
         note_targets,
-        by_name,
-        by_rel,
+        resolver,
         skipped_files,
-    }
-}
-
-/// Resolve one raw target against the collected indices — wiki and markdown
-/// targets resolve by different rules.
-fn resolve_target(
-    raw_target: &RawTarget,
-    index: &NoteIndex,
-    all_rels: &[String],
-) -> Option<String> {
-    match raw_target {
-        RawTarget::Wiki(t) => resolve_wikilink(t, &index.by_name, all_rels),
-        RawTarget::Md(rel) => resolve_md_rel(rel, &index.by_rel),
     }
 }
 
 /// The edge-building step: resolve every note's raw targets and keep one edge
 /// per unordered pair, skipping self-links and unresolved targets.
 fn build_links(index: &NoteIndex) -> Vec<GraphLink> {
-    let all_rels: Vec<String> = index.nodes.iter().map(|n| n.id.clone()).collect();
     let mut links: Vec<GraphLink> = Vec::new();
     let mut seen: HashSet<(String, String)> = HashSet::new();
     for (source, targets) in &index.note_targets {
         for raw_target in targets {
-            let Some(target) = resolve_target(raw_target, index, &all_rels) else {
+            let Some(target) = index.resolver.resolve(raw_target) else {
                 continue;
             };
             if target == *source {
@@ -169,6 +186,13 @@ fn cluster_of(rel: &str) -> &str {
     }
 }
 
+pub(crate) fn stem_of(name: &str) -> String {
+    Path::new(name)
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.to_string())
+}
+
 /// Extract a note's deduplicated raw link targets from its body. Dedupe happens
 /// DURING extraction (insertion-ordered), so a note repeating one target a
 /// million times retains O(distinct targets), never O(occurrences).
@@ -181,18 +205,96 @@ fn extract_targets(source_rel: &str, body: &str) -> Vec<RawTarget> {
             out.push(t);
         }
     };
-    extract_wikilinks(&masked, |t| add(RawTarget::Wiki(t.to_string())));
-    extract_md_links(&masked, |t| {
-        if let Some(rel) = normalize_md_target(source_rel, t) {
-            add(RawTarget::Md(rel));
-        }
+    emit_raw_targets(source_rel, &masked, |target, _offset| add(target));
+    out
+}
+
+/// Extract every raw link occurrence from a body, preserving source-line
+/// evidence for directional backlinks. Resolution happens later via
+/// [`LinkResolutionIndex`] so these occurrences use the graph's exact rules.
+pub(crate) fn extract_link_occurrences(source_rel: &str, body: &str) -> Vec<RawLinkOccurrence> {
+    let masked = mask_code(body);
+    let context = LineContext::new(body, &masked);
+    let mut out = Vec::new();
+    emit_raw_targets(source_rel, &masked, |target, offset| {
+        out.push(context.occurrence(target, offset));
     });
     out
 }
 
+fn emit_raw_targets(source_rel: &str, masked: &str, mut emit: impl FnMut(RawTarget, usize)) {
+    extract_wikilinks(masked, |target, offset| {
+        emit(RawTarget::Wiki(target.to_string()), offset);
+    });
+    extract_md_links(masked, |target, offset| {
+        if let Some(rel) = normalize_md_target(source_rel, target) {
+            emit(RawTarget::Md(rel), offset);
+        }
+    });
+}
+
+struct LineContext<'a> {
+    starts: Vec<usize>,
+    masked_lines: Vec<&'a str>,
+    original_lines: Vec<&'a str>,
+}
+
+impl<'a> LineContext<'a> {
+    fn new(original: &'a str, masked: &'a str) -> Self {
+        let (starts, masked_lines) = line_parts(masked);
+        Self {
+            starts,
+            masked_lines,
+            original_lines: original.lines().collect(),
+        }
+    }
+
+    fn occurrence(&self, target: RawTarget, offset: usize) -> RawLinkOccurrence {
+        let idx = self.line_index(offset);
+        let line = self.original_lines.get(idx).copied().unwrap_or("");
+        let col = self.char_offset(idx, offset);
+        RawLinkOccurrence {
+            target,
+            line: u32::try_from(idx + 1).unwrap_or(u32::MAX),
+            snippet: search::clip_line_around(line, (col, col.saturating_add(1))),
+        }
+    }
+
+    fn line_index(&self, offset: usize) -> usize {
+        match self.starts.binary_search(&offset) {
+            Ok(idx) => idx,
+            Err(0) => 0,
+            Err(idx) => idx - 1,
+        }
+    }
+
+    fn char_offset(&self, idx: usize, offset: usize) -> usize {
+        let start = self.starts.get(idx).copied().unwrap_or(0);
+        let line = self.masked_lines.get(idx).copied().unwrap_or("");
+        let byte_len = offset.saturating_sub(start).min(line.len());
+        line[..byte_len].chars().count()
+    }
+}
+
+fn line_parts(text: &str) -> (Vec<usize>, Vec<&str>) {
+    let mut starts = Vec::new();
+    let mut lines = Vec::new();
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        starts.push(offset);
+        lines.push(line.trim_end_matches(['\n', '\r']));
+        offset += line.len();
+    }
+    if starts.is_empty() {
+        starts.push(0);
+        lines.push("");
+    }
+    (starts, lines)
+}
+
 /// Blank out fenced code blocks and inline code spans, space-for-space
 /// (newlines kept), so links inside them are ignored — Obsidian behavior.
-fn mask_code(body: &str) -> String {
+pub(crate) fn mask_code(body: &str) -> String {
     mask_inline_spans(&mask_fences(body))
 }
 
@@ -300,40 +402,52 @@ fn find_closing_run(chars: &[char], from: usize, n: usize) -> Option<usize> {
 /// Emit raw wikilink targets in `text`: `[[t]]`, `[[t|alias]]`, `[[t#heading]]`,
 /// `[[t#heading|alias]]`; embeds (`![[t]]`) are caught by the same scan. The
 /// target is the part before the first `#` or `|`, trimmed.
-fn extract_wikilinks(text: &str, mut emit: impl FnMut(&str)) {
+fn extract_wikilinks(text: &str, mut emit: impl FnMut(&str, usize)) {
+    let mut base = 0usize;
     let mut rest = text;
     while let Some(start) = rest.find("[[") {
-        let after = &rest[start + 2..];
+        let open = base + start;
+        let after_start = open + 2;
+        let after = &text[after_start..];
         let Some(end) = after.find("]]") else { return };
         let target = after[..end].split(['#', '|']).next().unwrap_or("").trim();
         if !target.is_empty() {
-            emit(target);
+            emit(target, open);
         }
-        rest = &after[end + 2..];
+        base = after_start + end + 2;
+        rest = &text[base..];
     }
 }
 
 /// Emit raw `[text](target)` markdown-link targets in `text`. `[[wikilinks]]`
 /// are skipped here (the wikilink scan owns them); image links (`![…](…)`) count.
-fn extract_md_links(text: &str, mut emit: impl FnMut(&str)) {
+fn extract_md_links(text: &str, mut emit: impl FnMut(&str, usize)) {
+    let mut base = 0usize;
     let mut rest = text;
     while let Some(open) = rest.find('[') {
-        let after_open = &rest[open + 1..];
+        let open_abs = base + open;
+        let after_open_abs = open_abs + 1;
+        let after_open = &text[after_open_abs..];
         if let Some(stripped) = after_open.strip_prefix('[') {
+            base = after_open_abs + 1;
             rest = stripped;
             continue;
         }
         let Some(close) = after_open.find(']') else {
             return;
         };
-        let after_close = &after_open[close + 1..];
+        let after_close_abs = after_open_abs + close + 1;
+        let after_close = &text[after_close_abs..];
         let Some(paren) = after_close.strip_prefix('(') else {
+            base = after_close_abs;
             rest = after_close;
             continue;
         };
+        let paren_abs = after_close_abs + 1;
         let Some(t_end) = paren.find(')') else { return };
-        emit(&paren[..t_end]);
-        rest = &paren[t_end + 1..];
+        emit(&paren[..t_end], open_abs);
+        base = paren_abs + t_end + 1;
+        rest = &text[base..];
     }
 }
 

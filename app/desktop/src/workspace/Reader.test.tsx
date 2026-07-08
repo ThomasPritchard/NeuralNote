@@ -1,7 +1,25 @@
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it } from "vitest";
+import userEvent from "@testing-library/user-event";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { NoteDoc } from "../lib/types";
+
+// The reader now mounts the backlinks panel for markdown notes; keep its
+// fetch pending by default so these rendering tests stay focused (the panel's
+// own behaviour is covered in BacklinksPanel.test.tsx).
+vi.mock("../lib/api", async (importActual) => {
+  const actual = await importActual<typeof import("../lib/api")>();
+  return { ...actual, readBacklinks: vi.fn() };
+});
+
+import * as api from "../lib/api";
 import { Reader } from "./Reader";
+
+const mockApi = vi.mocked(api);
+
+beforeEach(() => {
+  mockApi.readBacklinks.mockReset();
+  mockApi.readBacklinks.mockReturnValue(new Promise(() => {}));
+});
 
 function doc(overrides: Partial<NoteDoc> = {}): NoteDoc {
   return {
@@ -138,5 +156,48 @@ describe("Reader — frontmatter", () => {
       screen.getByText(/Frontmatter couldn't be parsed: bad indentation/i),
     ).toBeInTheDocument();
     expect(screen.getByText("still here")).toBeInTheDocument();
+  });
+});
+
+describe("Reader — backlinks panel", () => {
+  it("mounts the backlinks panel for markdown notes, fetching by note path", async () => {
+    mockApi.readBacklinks.mockResolvedValue({
+      linked: [],
+      unlinked: [],
+      skippedFiles: 0,
+    });
+    render(<Reader note={doc()} />);
+    expect(screen.getByRole("region", { name: "Backlinks" })).toBeInTheDocument();
+    expect(await screen.findByText(/No backlinks yet/)).toBeInTheDocument();
+    expect(mockApi.readBacklinks).toHaveBeenCalledExactlyOnceWith("/v/n.md");
+  });
+
+  it("skips the panel for non-markdown and binary files", () => {
+    const { rerender } = render(
+      <Reader note={doc({ path: "/v/data.json", body: "", raw: "{}" })} />,
+    );
+    expect(screen.queryByRole("region", { name: "Backlinks" })).not.toBeInTheDocument();
+
+    rerender(<Reader note={doc({ path: "/v/scan.pdf", binary: true, body: "" })} />);
+    expect(screen.queryByRole("region", { name: "Backlinks" })).not.toBeInTheDocument();
+    expect(mockApi.readBacklinks).not.toHaveBeenCalled();
+  });
+
+  it("threads wikilink clicks in the body through onOpenLink", async () => {
+    mockApi.readBacklinks.mockResolvedValue({
+      linked: [],
+      unlinked: [],
+      skippedFiles: 0,
+    });
+    const onOpenLink = vi.fn();
+    render(
+      <Reader
+        note={doc({ body: "go to [[Target]]" })}
+        noteIndex={[{ relPath: "Notes/Target.md", stem: "target" }]}
+        onOpenLink={onOpenLink}
+      />,
+    );
+    await userEvent.click(screen.getByRole("link", { name: "Target" }));
+    expect(onOpenLink).toHaveBeenCalledExactlyOnceWith("Notes/Target.md");
   });
 });

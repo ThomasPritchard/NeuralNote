@@ -4,6 +4,8 @@
 //! frontmatter), and do file/folder CRUD — all vault-scoped and safe. No
 //! dependency on Tauri or any UI, so other clients can reuse this verbatim.
 
+pub mod ai;
+pub mod backlinks;
 pub mod entries;
 pub mod error;
 pub mod links;
@@ -12,13 +14,14 @@ pub mod note;
 pub mod paths;
 pub mod recents;
 pub mod search;
+pub mod templates;
 pub mod tree;
 pub mod vault;
 
 pub use error::{CoreError, CoreResult};
 pub use model::{
-    EntryKind, FileHit, GraphLink, GraphNode, LinkGraph, NoteDoc, RecentVault, SearchMatch,
-    SearchResponse, TreeNode, Vault,
+    Backlink, Backlinks, EntryKind, FileHit, GraphLink, GraphNode, LinkGraph, NoteDoc, RecentVault,
+    SearchMatch, SearchResponse, TemplateInfo, TreeNode, UnlinkedMention, Vault,
 };
 
 #[cfg(test)]
@@ -33,6 +36,19 @@ mod tests {
         fs::write(dir.path().join("Research/note.md"), "# Hello\n\nbody").unwrap();
         fs::write(dir.path().join(".hidden.md"), "secret").unwrap();
         dir
+    }
+
+    fn fixed_template_clock() -> chrono::DateTime<chrono::Local> {
+        use chrono::TimeZone;
+
+        chrono::Local
+            .with_ymd_and_hms(2026, 1, 2, 15, 4, 5)
+            .single()
+            .unwrap()
+    }
+
+    fn template_ctx(title: &str) -> templates::TemplateContext {
+        templates::TemplateContext::new(title, fixed_template_clock())
     }
 
     #[test]
@@ -129,6 +145,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let node = entries::create_note(dir.path(), dir.path(), "ideas").unwrap();
         assert_eq!(node.name, "ideas.md");
+        assert_eq!(fs::read_to_string(dir.path().join("ideas.md")).unwrap(), "");
         assert!(entries::create_note(dir.path(), dir.path(), "ideas").is_err());
     }
 
@@ -321,6 +338,678 @@ mod tests {
         assert!(entries::rename_entry(dir.path(), Path::new(&renamed.path), "a/b").is_err());
     }
 
+    /* ───────────────────────────  templates  ───────────────────────────── */
+
+    #[test]
+    fn templates_config_folder_and_date_time_formats_are_honored() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".obsidian")).unwrap();
+        fs::create_dir_all(dir.path().join("Meta/Templates")).unwrap();
+        fs::write(
+            dir.path().join(".obsidian/templates.json"),
+            r#"{"folder":"Meta/Templates","dateFormat":"DD/MM/YYYY","timeFormat":"HH:mm:ss"}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Meta/Templates/Daily.md"),
+            "created {{date}} at {{time}}",
+        )
+        .unwrap();
+
+        let listed = templates::list_templates(dir.path()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].rel_path, "Meta/Templates/Daily.md");
+        assert_eq!(listed[0].name, "Daily");
+
+        let node = templates::create_note_from_template(
+            dir.path(),
+            dir.path(),
+            "Today",
+            Some("Meta/Templates/Daily.md"),
+            fixed_template_clock(),
+        )
+        .unwrap();
+        assert_eq!(node.name, "Today.md");
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Today.md")).unwrap(),
+            "created 02/01/2026 at 15:04:05"
+        );
+    }
+
+    #[test]
+    fn templates_fallback_to_templates_and_underscore_templates_folders() {
+        let templates_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(templates_dir.path().join("Templates")).unwrap();
+        fs::write(templates_dir.path().join("Templates/Zed.md"), "z").unwrap();
+        fs::write(templates_dir.path().join("Templates/alpha.markdown"), "a").unwrap();
+        fs::write(
+            templates_dir.path().join("Templates/not-a-template.txt"),
+            "x",
+        )
+        .unwrap();
+
+        let listed = templates::list_templates(templates_dir.path()).unwrap();
+        let rels: Vec<&str> = listed.iter().map(|t| t.rel_path.as_str()).collect();
+        assert_eq!(rels, ["Templates/alpha.markdown", "Templates/Zed.md"]);
+        assert_eq!(listed[0].name, "alpha");
+        assert_eq!(listed[1].name, "Zed");
+
+        let underscore_dir = tempfile::tempdir().unwrap();
+        fs::create_dir(underscore_dir.path().join("_templates")).unwrap();
+        fs::write(underscore_dir.path().join("_templates/Seed.md"), "seed").unwrap();
+
+        let listed = templates::list_templates(underscore_dir.path()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].rel_path, "_templates/Seed.md");
+        assert_eq!(listed[0].name, "Seed");
+    }
+
+    #[test]
+    fn no_templates_is_zero_config_and_create_from_none_stays_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(templates::list_templates(dir.path()).unwrap().is_empty());
+
+        let node = templates::create_note_from_template(
+            dir.path(),
+            dir.path(),
+            "Blank",
+            None,
+            fixed_template_clock(),
+        )
+        .unwrap();
+        assert_eq!(node.name, "Blank.md");
+        assert_eq!(fs::read_to_string(dir.path().join("Blank.md")).unwrap(), "");
+    }
+
+    #[test]
+    fn obsidian_core_variables_render_with_fixed_clock() {
+        let rendered = templates::render_template(
+            "{{title}}\n{{date}}\n{{date:MMM D, YYYY}}\n{{time}}\n{{time:H:mm:ss a}}",
+            &template_ctx("My Note"),
+        );
+
+        assert_eq!(
+            rendered,
+            "My Note\n2026-01-02\nJan 2, 2026\n15:04\n15:04:05 pm"
+        );
+    }
+
+    #[test]
+    fn templater_subset_variables_render_with_fixed_clock() {
+        let rendered = templates::render_template(
+            "<% tp.file.title %>\n\
+             <% tp.date.now(\"YYYY-MM-DD\") %>\n\
+             <% tp.date.tomorrow() %>\n\
+             <% tp.date.yesterday(\"YYYY/MM/DD\") %>\n\
+             <% tp.file.creation_date(\"HH:mm\") %>",
+            &template_ctx("Daily Plan"),
+        );
+
+        assert_eq!(
+            rendered,
+            "Daily Plan\n2026-01-02\n2026-01-03\n2026/01/01\n15:04"
+        );
+    }
+
+    #[test]
+    fn moment_literal_brackets_render_verbatim_text() {
+        assert_eq!(
+            templates::render_template("{{date:[Week] w}}", &template_ctx("Daily Plan")),
+            "Week w"
+        );
+        assert_eq!(
+            templates::render_template(
+                "{{date:YYYY [at] HH:mm}} / {{date:[A] A}}",
+                &template_ctx("Daily Plan")
+            ),
+            "2026 at 15:04 / A PM"
+        );
+    }
+
+    #[test]
+    fn create_note_from_template_writes_rendered_markdown_and_refuses_duplicates() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Templates")).unwrap();
+        fs::write(
+            dir.path().join("Templates/Project.md"),
+            "# {{title}}\nCreated <% tp.date.now(\"YYYY-MM-DD\") %>\n",
+        )
+        .unwrap();
+
+        let node = templates::create_note_from_template(
+            dir.path(),
+            dir.path(),
+            "Project Alpha",
+            Some("Templates/Project.md"),
+            fixed_template_clock(),
+        )
+        .unwrap();
+        assert_eq!(node.name, "Project Alpha.md");
+        let raw = fs::read_to_string(dir.path().join("Project Alpha.md")).unwrap();
+        assert_eq!(raw, "# Project Alpha\nCreated 2026-01-02\n");
+
+        let doc = note::read_note(dir.path(), &dir.path().join("Project Alpha.md")).unwrap();
+        assert!(!doc.binary);
+        assert!(doc.frontmatter_error.is_none());
+        assert_eq!(doc.title, "Project Alpha");
+
+        let dup = templates::create_note_from_template(
+            dir.path(),
+            dir.path(),
+            "Project Alpha",
+            Some("Templates/Project.md"),
+            fixed_template_clock(),
+        );
+        assert!(matches!(dup, Err(CoreError::AlreadyExists(_))));
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Project Alpha.md")).unwrap(),
+            raw
+        );
+    }
+
+    #[test]
+    fn create_note_from_template_enforces_name_parent_and_template_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Templates")).unwrap();
+        fs::write(dir.path().join("Templates/Safe.md"), "ok").unwrap();
+
+        assert!(matches!(
+            templates::create_note_from_template(
+                dir.path(),
+                dir.path(),
+                "bad/name",
+                None,
+                fixed_template_clock()
+            ),
+            Err(CoreError::InvalidName(_))
+        ));
+        assert!(matches!(
+            templates::create_note_from_template(
+                dir.path(),
+                outside.path(),
+                "Escaped",
+                None,
+                fixed_template_clock()
+            ),
+            Err(CoreError::OutsideVault(_)) | Err(CoreError::NotFound(_))
+        ));
+        assert!(matches!(
+            templates::create_note_from_template(
+                dir.path(),
+                dir.path(),
+                "Escaped Template",
+                Some("../outside.md"),
+                fixed_template_clock()
+            ),
+            Err(CoreError::OutsideVault(_)) | Err(CoreError::InvalidName(_))
+        ));
+        assert!(matches!(
+            templates::create_note_from_template(
+                dir.path(),
+                dir.path(),
+                "Not In Folder",
+                Some("Research/note.md"),
+                fixed_template_clock()
+            ),
+            Err(CoreError::InvalidName(_)) | Err(CoreError::NotFound(_))
+        ));
+    }
+
+    #[test]
+    fn create_note_from_template_rejects_template_paths_outside_markdown_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Templates")).unwrap();
+        fs::write(dir.path().join("Templates/Safe.md"), "ok").unwrap();
+        fs::write(dir.path().join("Templates/not-markdown.txt"), "nope").unwrap();
+        fs::create_dir(dir.path().join("SomewhereElse")).unwrap();
+        fs::write(dir.path().join("SomewhereElse/x.md"), "outside").unwrap();
+
+        for (template, note_name) in [
+            ("SomewhereElse/x.md", "Outside Folder"),
+            ("Templates/not-markdown.txt", "Not Markdown"),
+            ("/etc/passwd", "Absolute Template"),
+            ("../secret.md", "Parent Traversal"),
+            ("", "Empty Template"),
+            (".", "Current Directory"),
+        ] {
+            assert!(
+                matches!(
+                    templates::create_note_from_template(
+                        dir.path(),
+                        dir.path(),
+                        note_name,
+                        Some(template),
+                        fixed_template_clock()
+                    ),
+                    Err(CoreError::InvalidName(_))
+                ),
+                "template {template:?} must be rejected as InvalidName"
+            );
+            assert!(!dir.path().join(format!("{note_name}.md")).exists());
+        }
+    }
+
+    #[test]
+    fn create_note_from_template_with_no_template_folder_returns_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(matches!(
+            templates::create_note_from_template(
+                dir.path(),
+                dir.path(),
+                "No Template Folder",
+                Some("Templates/Missing.md"),
+                fixed_template_clock()
+            ),
+            Err(CoreError::NotFound(_))
+        ));
+        assert!(!dir.path().join("No Template Folder.md").exists());
+    }
+
+    #[test]
+    fn missing_template_file_errors_without_creating_blank_note() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Templates")).unwrap();
+
+        let err = templates::create_note_from_template(
+            dir.path(),
+            dir.path(),
+            "Should Not Exist",
+            Some("Templates/Missing.md"),
+            fixed_template_clock(),
+        );
+
+        assert!(matches!(err, Err(CoreError::NotFound(_))));
+        assert!(!dir.path().join("Should Not Exist.md").exists());
+    }
+
+    #[test]
+    fn failed_template_write_cleanup_removes_created_note() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = dir.path().join("Orphan.md");
+        fs::write(&created, "").unwrap();
+
+        templates::remove_created_note_after_template_write_failure(&created);
+
+        assert!(
+            !created.exists(),
+            "failed template writes must not leave blank notes"
+        );
+    }
+
+    #[test]
+    fn malformed_obsidian_template_config_falls_back_and_notes_still_create() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".obsidian")).unwrap();
+        fs::create_dir(dir.path().join("Templates")).unwrap();
+        fs::write(dir.path().join(".obsidian/templates.json"), "{ not json").unwrap();
+        fs::write(
+            dir.path().join("Templates/Fallback.md"),
+            "fallback {{title}}",
+        )
+        .unwrap();
+
+        let listed = templates::list_templates(dir.path()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].rel_path, "Templates/Fallback.md");
+
+        templates::create_note_from_template(
+            dir.path(),
+            dir.path(),
+            "From Bad Config",
+            Some("Templates/Fallback.md"),
+            fixed_template_clock(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("From Bad Config.md")).unwrap(),
+            "fallback From Bad Config"
+        );
+    }
+
+    #[test]
+    fn unreadable_obsidian_template_config_falls_back_to_discovered_folder() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".obsidian")).unwrap();
+        fs::create_dir(dir.path().join(".obsidian/templates.json")).unwrap();
+        fs::create_dir(dir.path().join("Templates")).unwrap();
+        fs::write(dir.path().join("Templates/Fallback.md"), "fallback").unwrap();
+
+        let listed = templates::list_templates(dir.path()).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].rel_path, "Templates/Fallback.md");
+
+        templates::create_note_from_template(
+            dir.path(),
+            dir.path(),
+            "Unreadable Config",
+            Some("Templates/Fallback.md"),
+            fixed_template_clock(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Unreadable Config.md")).unwrap(),
+            "fallback"
+        );
+    }
+
+    #[test]
+    fn invalid_obsidian_template_configs_fall_back_to_discovered_folder() {
+        for (config, note_name, expected) in [
+            ("{ not valid json", "Malformed Config", "malformed"),
+            ("[]", "Array Config", "array"),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            fs::create_dir(dir.path().join(".obsidian")).unwrap();
+            fs::create_dir(dir.path().join("Templates")).unwrap();
+            fs::write(dir.path().join(".obsidian/templates.json"), config).unwrap();
+            fs::write(dir.path().join("Templates/Fallback.md"), expected).unwrap();
+
+            let listed = templates::list_templates(dir.path()).unwrap();
+            assert_eq!(listed.len(), 1);
+            assert_eq!(listed[0].rel_path, "Templates/Fallback.md");
+
+            templates::create_note_from_template(
+                dir.path(),
+                dir.path(),
+                note_name,
+                Some("Templates/Fallback.md"),
+                fixed_template_clock(),
+            )
+            .unwrap();
+
+            assert_eq!(
+                fs::read_to_string(dir.path().join(format!("{note_name}.md"))).unwrap(),
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn empty_obsidian_template_date_and_time_formats_keep_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join(".obsidian")).unwrap();
+        fs::create_dir(dir.path().join("Templates")).unwrap();
+        fs::write(
+            dir.path().join(".obsidian/templates.json"),
+            r#"{"dateFormat":"","timeFormat":""}"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("Templates/DefaultFormats.md"),
+            "created {{date}} at {{time}}",
+        )
+        .unwrap();
+
+        templates::create_note_from_template(
+            dir.path(),
+            dir.path(),
+            "Default Formats",
+            Some("Templates/DefaultFormats.md"),
+            fixed_template_clock(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Default Formats.md")).unwrap(),
+            "created 2026-01-02 at 15:04"
+        );
+    }
+
+    #[test]
+    fn template_folder_path_that_is_a_file_is_treated_as_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Templates"), "not a directory").unwrap();
+
+        assert!(matches!(
+            templates::create_note_from_template(
+                dir.path(),
+                dir.path(),
+                "Folder Is File",
+                Some("Templates/Seed.md"),
+                fixed_template_clock()
+            ),
+            Err(CoreError::NotFound(_))
+        ));
+        assert!(!dir.path().join("Folder Is File.md").exists());
+    }
+
+    #[test]
+    fn template_discovery_skips_matching_file_names() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("templates"), "not a directory").unwrap();
+
+        assert!(templates::list_templates(dir.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn non_utf8_template_decodes_lossily_and_creates_note() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Templates")).unwrap();
+        fs::write(
+            dir.path().join("Templates/Latin1.md"),
+            b"# {{title}}\nWindows-1252-ish caf\xE9\n",
+        )
+        .unwrap();
+
+        templates::create_note_from_template(
+            dir.path(),
+            dir.path(),
+            "Lossy Template",
+            Some("Templates/Latin1.md"),
+            fixed_template_clock(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Lossy Template.md")).unwrap(),
+            "# Lossy Template\nWindows-1252-ish caf\u{fffd}\n"
+        );
+    }
+
+    #[test]
+    fn template_folder_discovery_prefers_sorted_matching_directory_names() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("templates")).unwrap();
+        fs::create_dir(dir.path().join("_templates")).unwrap();
+        fs::write(dir.path().join("templates/Lower.md"), "lower").unwrap();
+        fs::write(dir.path().join("_templates/Underscore.md"), "underscore").unwrap();
+
+        let listed = templates::list_templates(dir.path()).unwrap();
+        let rels: Vec<&str> = listed.iter().map(|t| t.rel_path.as_str()).collect();
+
+        assert_eq!(rels, ["_templates/Underscore.md"]);
+    }
+
+    #[test]
+    fn frontmatter_template_renders_to_parseable_obsidian_markdown() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Templates")).unwrap();
+        fs::write(
+            dir.path().join("Templates/Frontmatter.md"),
+            "---\n\
+             title: \"{{title}}\"\n\
+             created: \"{{date}}\"\n\
+             ---\n\
+             # <% tp.file.title %>\n\
+             Body\n",
+        )
+        .unwrap();
+
+        templates::create_note_from_template(
+            dir.path(),
+            dir.path(),
+            "Source Cited Recall",
+            Some("Templates/Frontmatter.md"),
+            fixed_template_clock(),
+        )
+        .unwrap();
+
+        let raw = fs::read_to_string(dir.path().join("Source Cited Recall.md")).unwrap();
+        assert!(raw.starts_with("---\n"));
+        assert!(raw.contains("\n---\n# Source Cited Recall"));
+
+        let doc = note::read_note(dir.path(), &dir.path().join("Source Cited Recall.md")).unwrap();
+        assert!(doc.frontmatter_error.is_none());
+        assert_eq!(
+            doc.frontmatter
+                .as_ref()
+                .and_then(|v| v.get("title"))
+                .and_then(|v| v.as_str()),
+            Some("Source Cited Recall")
+        );
+    }
+
+    #[test]
+    fn untrusted_templater_commands_are_left_verbatim() {
+        let input = [
+            "<% process.exit(1) %>",
+            "<%* app.vault.delete() %>",
+            "<% require('child_process') %>",
+            "<% tp.system.command(\"rm -rf /\") %>",
+            "<% tp.user.somefn() %>",
+        ]
+        .join("\n");
+
+        assert_eq!(
+            templates::render_template(&input, &template_ctx("Safe Note")),
+            input
+        );
+    }
+
+    #[test]
+    fn templater_marker_before_obsidian_marker_renders_first() {
+        assert_eq!(
+            templates::render_template(
+                "<% tp.file.title %> -- {{title}}",
+                &template_ctx("Marker Order")
+            ),
+            "Marker Order -- Marker Order"
+        );
+    }
+
+    #[test]
+    fn unterminated_templater_format_quote_is_left_verbatim() {
+        let input = "<% tp.date.now(\"oops) %>";
+
+        assert_eq!(templates::render_template(input, &template_ctx("T")), input);
+    }
+
+    #[test]
+    fn unclosed_moment_literal_dumps_remaining_format_verbatim() {
+        assert_eq!(
+            templates::render_template("{{date:[unclosed}}", &template_ctx("T")),
+            "[unclosed"
+        );
+    }
+
+    #[test]
+    fn unknown_and_unclosed_variables_fail_safe_verbatim_and_notes_still_create() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Templates")).unwrap();
+        let content = "{{evil}}\n{{ }}\nunclosed {{\nunclosed <%";
+        fs::write(dir.path().join("Templates/Safe.md"), content).unwrap();
+
+        assert_eq!(
+            templates::render_template(content, &template_ctx("Safe Note")),
+            content
+        );
+
+        templates::create_note_from_template(
+            dir.path(),
+            dir.path(),
+            "Safe Note",
+            Some("Templates/Safe.md"),
+            fixed_template_clock(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(dir.path().join("Safe Note.md")).unwrap(),
+            content
+        );
+    }
+
+    fn assert_template_renders_under(name: &str, input: String, max: std::time::Duration) {
+        // Completed marker pairs are the adversarial shape: after each tiny block,
+        // the old scanner searched the whole remaining tail for the absent marker.
+        // Unmatched opens break after one pass, so they do not prove linearity.
+        let started = std::time::Instant::now();
+        let rendered = templates::render_template(&input, &template_ctx("Fast"));
+        let elapsed = started.elapsed();
+
+        eprintln!("{name}: rendered {} bytes in {elapsed:?}", input.len());
+        assert_eq!(rendered, input);
+        assert!(
+            elapsed < max,
+            "{name} took {elapsed:?}; completed-pair scanning likely regressed"
+        );
+    }
+
+    #[test]
+    fn completed_obsidian_pairs_render_linearly() {
+        assert_template_renders_under(
+            "obsidian completed pairs",
+            "{{}}".repeat(200_000),
+            std::time::Duration::from_secs(2),
+        );
+    }
+
+    #[test]
+    fn completed_templater_pairs_render_linearly() {
+        assert_template_renders_under(
+            "templater completed pairs",
+            "<%%>".repeat(200_000),
+            std::time::Duration::from_secs(2),
+        );
+    }
+
+    #[test]
+    fn far_marker_mix_renders_linearly() {
+        assert_template_renders_under(
+            "far marker mix",
+            format!("{}{}", "{{}}".repeat(200_000), "<%%>"),
+            std::time::Duration::from_secs(2),
+        );
+    }
+
+    #[test]
+    fn pathological_unmatched_delimiters_render_without_hanging() {
+        let huge = "{{".repeat(50_000);
+        let started = std::time::Instant::now();
+        let rendered = templates::render_template(&huge, &template_ctx("Fast"));
+
+        assert_eq!(rendered, huge);
+        assert!(
+            started.elapsed().as_secs() < 2,
+            "template scan took too long; likely non-linear"
+        );
+    }
+
+    #[test]
+    fn rendering_never_panics_on_hostile_unicode_or_malformed_input() {
+        let cases = [
+            "",
+            "{{",
+            "<%",
+            "{{title",
+            "<% tp.date.now(\"YYYY",
+            "{{date:YYYY-😀-MM-DD}}",
+            "prefix 😀 {{title}} suffix",
+            "<% tp.date.tomorrow([\"YYYY-MM-DD\"]) %>",
+            "<% tp.file.creation_date([\"HH:mm\"]) %>",
+        ];
+
+        for case in cases {
+            let rendered =
+                std::panic::catch_unwind(|| templates::render_template(case, &template_ctx("T")));
+            assert!(rendered.is_ok(), "render panicked for {case:?}");
+        }
+    }
+
     #[test]
     fn core_error_displays_all_variants_and_from_io() {
         for e in [
@@ -331,13 +1020,21 @@ mod tests {
             CoreError::Conflict("a".into()),
             CoreError::Io("a".into()),
             CoreError::Frontmatter("a".into()),
+            CoreError::Llm("a".into()),
         ] {
             assert!(!e.to_string().is_empty());
         }
+        let not_found = std::io::Error::new(std::io::ErrorKind::NotFound, "gone");
+        assert!(matches!(CoreError::from(not_found), CoreError::NotFound(_)));
         let dup = std::io::Error::new(std::io::ErrorKind::AlreadyExists, "dup");
         assert!(matches!(CoreError::from(dup), CoreError::AlreadyExists(_)));
         let other = std::io::Error::other("boom");
         assert!(matches!(CoreError::from(other), CoreError::Io(_)));
+        // A trash-move failure maps to Io (surfaced, never swallowed).
+        let trashed = trash::Error::Unknown {
+            description: "x".into(),
+        };
+        assert!(matches!(CoreError::from(trashed), CoreError::Io(_)));
     }
 
     /// Build a "billion laughs" alias bomb: `levels` anchors, each a `fan`-wide list
@@ -1138,5 +1835,179 @@ mod tests {
             Some("Target.md") // no exact case → shortest, then lexicographic
         );
         assert_eq!(links::resolve_rel("missing.md", &by_rel), None);
+    }
+
+    /* ────────────────────────────  backlinks  ─────────────────────────── */
+
+    #[test]
+    fn backlinks_return_linked_occurrences_with_line_and_snippet() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("target.md"), "# Rust\n").unwrap();
+        fs::write(
+            dir.path().join("alpha.md"),
+            "# Alpha\n\nThis line links [[target]] now.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("beta.md"),
+            "# Beta\n\nIntro\nAnother line links [target](target.md).\n",
+        )
+        .unwrap();
+
+        let b = backlinks::read_backlinks(dir.path(), "target.md").unwrap();
+
+        assert_eq!(b.skipped_files, 0);
+        assert_eq!(b.linked.len(), 2);
+        assert_eq!(b.linked[0].source_rel, "alpha.md");
+        assert_eq!(b.linked[0].source_title, "Alpha");
+        assert_eq!(b.linked[0].line, 3);
+        assert_eq!(b.linked[0].snippet, "This line links [[target]] now.");
+        assert_eq!(b.linked[1].source_rel, "beta.md");
+        assert_eq!(b.linked[1].source_title, "Beta");
+        assert_eq!(b.linked[1].line, 4);
+        assert_eq!(
+            b.linked[1].snippet,
+            "Another line links [target](target.md)."
+        );
+        assert!(b.unlinked.is_empty());
+    }
+
+    #[test]
+    fn backlinks_resolve_wikilink_alias_heading_and_relative_md_links() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::create_dir(dir.path().join("Folder")).unwrap();
+        fs::create_dir(dir.path().join("Sources")).unwrap();
+        fs::write(dir.path().join("Folder/Target.md"), "# Target\n").unwrap();
+        fs::write(
+            dir.path().join("Sources/source.md"),
+            "[[target]]\n[[target|alias]]\n[[target#heading]]\n[md](../Folder/Target.md#part)\n",
+        )
+        .unwrap();
+
+        let b = backlinks::read_backlinks(dir.path(), "Folder/Target.md").unwrap();
+        let lines: Vec<u32> = b.linked.iter().map(|l| l.line).collect();
+
+        assert_eq!(lines, vec![1, 2, 3, 4]);
+        assert!(b.linked.iter().all(|l| l.source_rel == "Sources/source.md"));
+        assert!(b.unlinked.is_empty());
+    }
+
+    #[test]
+    fn backlinks_ignore_links_inside_code_fences_and_inline_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("target.md"), "# Rust\n").unwrap();
+        fs::write(
+            dir.path().join("source.md"),
+            "```\n[[target]]\n```\ninline `[[target]]` span\nreal [[target]]\n",
+        )
+        .unwrap();
+
+        let b = backlinks::read_backlinks(dir.path(), "target.md").unwrap();
+
+        assert_eq!(b.linked.len(), 1);
+        assert_eq!(b.linked[0].line, 5);
+        assert_eq!(b.linked[0].snippet, "real [[target]]");
+    }
+
+    #[test]
+    fn backlinks_find_unlinked_title_mentions_without_duplicate_linked_notes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("target.md"),
+            "# Rust\nRust inside the target and [[target]] must not list itself.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("plain.md"),
+            "I keep notes about rust here.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("both.md"),
+            "Rust is mentioned, and this note also links [[target]].\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("substring.md"),
+            "Trust me, this is different.\n",
+        )
+        .unwrap();
+
+        let b = backlinks::read_backlinks(dir.path(), "target.md").unwrap();
+
+        assert_eq!(b.linked.len(), 1);
+        assert_eq!(b.linked[0].source_rel, "both.md");
+        assert_eq!(b.unlinked.len(), 1);
+        assert_eq!(b.unlinked[0].source_rel, "plain.md");
+        assert_eq!(b.unlinked[0].source_title, "plain");
+        assert_eq!(b.unlinked[0].line, 1);
+        assert_eq!(b.unlinked[0].snippet, "I keep notes about rust here.");
+        assert!(!b.linked.iter().any(|l| l.source_rel == "target.md"));
+        assert!(!b.unlinked.iter().any(|m| m.source_rel == "target.md"));
+    }
+
+    #[test]
+    fn backlinks_return_every_unlinked_title_mention_per_note() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("target.md"), "# Rust\n").unwrap();
+        fs::write(
+            dir.path().join("plain.md"),
+            "Rust starts here.\nNo match here.\nAnother rust mention here.\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("linked.md"),
+            "Rust plain text is ignored because this note links [[target]].\n",
+        )
+        .unwrap();
+
+        let b = backlinks::read_backlinks(dir.path(), "target.md").unwrap();
+
+        assert_eq!(b.linked.len(), 1);
+        assert_eq!(b.linked[0].source_rel, "linked.md");
+        assert_eq!(b.unlinked.len(), 2);
+        assert!(b.unlinked.iter().all(|m| m.source_rel == "plain.md"));
+        assert_eq!(b.unlinked[0].line, 1);
+        assert_eq!(b.unlinked[0].snippet, "Rust starts here.");
+        assert_eq!(b.unlinked[1].line, 3);
+        assert_eq!(b.unlinked[1].snippet, "Another rust mention here.");
+        assert!(!b.unlinked.iter().any(|m| m.source_rel == "linked.md"));
+    }
+
+    #[test]
+    fn backlinks_do_not_match_title_mentions_inside_code() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("target.md"), "# Rust\n").unwrap();
+        fs::write(
+            dir.path().join("source.md"),
+            "```\nRust\n```\ninline `Rust` span\nplain Rust survives\n",
+        )
+        .unwrap();
+
+        let b = backlinks::read_backlinks(dir.path(), "target.md").unwrap();
+
+        assert_eq!(b.unlinked.len(), 1);
+        assert_eq!(b.unlinked[0].line, 5);
+        assert_eq!(b.unlinked[0].snippet, "plain Rust survives");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn backlinks_count_unreadable_markdown_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("target.md"), "# Rust\n").unwrap();
+        fs::write(dir.path().join("locked.md"), "[[target]]\n").unwrap();
+        fs::set_permissions(
+            dir.path().join("locked.md"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let b = backlinks::read_backlinks(dir.path(), "target.md").unwrap();
+
+        assert!(b.linked.is_empty());
+        assert!(b.unlinked.is_empty());
+        assert_eq!(b.skipped_files, 1);
     }
 }

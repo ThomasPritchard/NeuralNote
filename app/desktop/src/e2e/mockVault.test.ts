@@ -8,7 +8,14 @@
 import { afterEach, describe, expect, it } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { clearMocks } from "@tauri-apps/api/mocks";
-import { readLinkGraph, searchVault } from "../lib/api";
+import {
+  createNoteFromTemplate,
+  listTemplates,
+  readBacklinks,
+  readLinkGraph,
+  readNote,
+  searchVault,
+} from "../lib/api";
 import { createMockVault, VAULT_ROOT, type SeedEntry } from "./mockVault";
 
 afterEach(() => {
@@ -488,6 +495,135 @@ describe("mockVault read_link_graph", () => {
       ]),
     );
     expect(out.links).toHaveLength(3);
+  });
+});
+
+describe("mockVault read_backlinks", () => {
+  it("returns linked occurrences, every unlinked title mention, and skipped unreadable markdown count", async () => {
+    seedVault([
+      { kind: "file", relPath: "target.md", content: "# Rust\n" },
+      {
+        kind: "file",
+        relPath: "alpha.md",
+        content: "# Alpha\n\nSee [[target]].\nAgain [target](target.md).\n",
+      },
+      {
+        kind: "file",
+        relPath: "both.md",
+        content: "# Both\nRust is mentioned, but this note links [[target]].\n",
+      },
+      {
+        kind: "file",
+        relPath: "plain.md",
+        content:
+          "# Plain\nRust starts here. Rust also here.\nTrust is not a match.\ninline `Rust` ignored\n```\nRust ignored\n```\nRust survives.\n",
+      },
+      { kind: "file", relPath: "locked.md", content: "[[target]]\n", unreadable: true },
+    ]);
+
+    const out = await readBacklinks(`${VAULT_ROOT}/target.md`);
+
+    expect(out.skippedFiles).toBe(1);
+    expect(out.linked).toEqual([
+      {
+        sourceRel: "alpha.md",
+        sourceTitle: "Alpha",
+        line: 3,
+        snippet: "See [[target]].",
+      },
+      {
+        sourceRel: "alpha.md",
+        sourceTitle: "Alpha",
+        line: 4,
+        snippet: "Again [target](target.md).",
+      },
+      {
+        sourceRel: "both.md",
+        sourceTitle: "Both",
+        line: 2,
+        snippet: "Rust is mentioned, but this note links [[target]].",
+      },
+    ]);
+    expect(out.unlinked).toEqual([
+      {
+        sourceRel: "plain.md",
+        sourceTitle: "Plain",
+        line: 2,
+        snippet: "Rust starts here. Rust also here.",
+      },
+      {
+        sourceRel: "plain.md",
+        sourceTitle: "Plain",
+        line: 2,
+        snippet: "Rust starts here. Rust also here.",
+      },
+      {
+        sourceRel: "plain.md",
+        sourceTitle: "Plain",
+        line: 8,
+        snippet: "Rust survives.",
+      },
+    ]);
+  });
+});
+
+describe("mockVault templates", () => {
+  it("lists markdown templates from the inferred Obsidian folder", async () => {
+    seedVault([
+      {
+        kind: "file",
+        relPath: ".obsidian/templates.json",
+        content: JSON.stringify({ folder: "Meta/Templates" }),
+      },
+      { kind: "file", relPath: "Templates/Default.md", content: "wrong folder" },
+      { kind: "file", relPath: "Meta/Templates/Zed.md", content: "z" },
+      { kind: "file", relPath: "Meta/Templates/alpha.markdown", content: "a" },
+      { kind: "file", relPath: "Meta/Templates/not-template.txt", content: "x" },
+    ]);
+
+    await expect(listTemplates()).resolves.toEqual([
+      { relPath: "Meta/Templates/alpha.markdown", name: "alpha" },
+      { relPath: "Meta/Templates/Zed.md", name: "Zed" },
+    ]);
+  });
+
+  it("renders title, date, templater dates, and unknown variables verbatim", async () => {
+    createMockVault({
+      now: new Date(2026, 0, 2, 15, 4, 5),
+      seed: [
+        {
+          kind: "file",
+          relPath: ".obsidian/templates.json",
+          content: JSON.stringify({ dateFormat: "DD/MM/YYYY", timeFormat: "HH:mm:ss" }),
+        },
+        {
+          kind: "file",
+          relPath: "Templates/Daily.md",
+          content:
+            "# {{title}}\nCreated {{date}} at {{time}}\nTomorrow <% tp.date.tomorrow(\"YYYY-MM-DD\") %>\nUnknown {{evil}}\n",
+        },
+      ],
+    }).install();
+
+    const node = await createNoteFromTemplate(VAULT_ROOT, "Project Alpha", "Templates/Daily.md");
+    expect(node).toMatchObject({
+      kind: "file",
+      name: "Project Alpha.md",
+      relPath: "Project Alpha.md",
+    });
+    await expect(readNote(`${VAULT_ROOT}/Project Alpha.md`)).resolves.toMatchObject({
+      raw:
+        "# Project Alpha\nCreated 02/01/2026 at 15:04:05\nTomorrow 2026-01-03\nUnknown {{evil}}\n",
+    });
+  });
+
+  it("creates a blank note when no template is requested and no template folder exists", async () => {
+    seedVault([]);
+
+    const node = await createNoteFromTemplate(VAULT_ROOT, "Blank", null);
+
+    expect(node).toMatchObject({ kind: "file", name: "Blank.md", relPath: "Blank.md" });
+    await expect(readNote(`${VAULT_ROOT}/Blank.md`)).resolves.toMatchObject({ raw: "" });
   });
 });
 

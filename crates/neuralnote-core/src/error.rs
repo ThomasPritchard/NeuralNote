@@ -24,6 +24,9 @@ pub enum CoreError {
     Io(String),
     /// Frontmatter parse failure (surfaced, never swallowed).
     Frontmatter(String),
+    /// An LLM transport/protocol failure (network, HTTP status, bad response) from
+    /// the AI chat loop. Surfaced to the user as a `ChatEvent::Error`, never silent.
+    Llm(String),
 }
 
 impl std::fmt::Display for CoreError {
@@ -36,6 +39,7 @@ impl std::fmt::Display for CoreError {
             CoreError::Conflict(m) => write!(f, "conflict: {m}"),
             CoreError::Io(m) => write!(f, "io error: {m}"),
             CoreError::Frontmatter(m) => write!(f, "frontmatter error: {m}"),
+            CoreError::Llm(m) => write!(f, "llm error: {m}"),
         }
     }
 }

@@ -1,5 +1,6 @@
-# Local Claude settings (personal, not shared)
+# Local Claude settings (personal, not shared) + runtime lock
 .claude/settings.local.json
+.claude/scheduled_tasks.lock
 
 # macOS
 .DS_Store

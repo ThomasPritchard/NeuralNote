@@ -16,12 +16,27 @@ import {
 import { cn } from "../lib/cn";
 import { Editor } from "./Editor";
 import { extFromPath, iconForFile } from "./fileMeta";
+import type { NoteIndexEntry } from "./linkResolve";
 import { Reader } from "./Reader";
 import type { OpenNote } from "./useOpenNote";
 
 const EASE = "ease-[cubic-bezier(0.32,0.72,0,1)]";
 
-export function NotePane({ open, onClose }: { open: OpenNote; onClose: () => void }) {
+interface NotePaneProps {
+  open: OpenNote;
+  onClose: () => void;
+  /** Vault note index — wikilink resolution (reader) + `[[` autocomplete (editor). */
+  noteIndex?: NoteIndexEntry[];
+  /** Open another vault note by relPath (the workspace's guarded open). */
+  onOpenLink?: (relPath: string) => void;
+}
+
+export function NotePane({
+  open,
+  onClose,
+  noteIndex,
+  onOpenLink,
+}: Readonly<NotePaneProps>) {
   if (!open.path) {
     return (
       <main className="grid flex-1 place-items-center bg-background">
@@ -147,9 +162,10 @@ export function NotePane({ open, onClose }: { open: OpenNote; onClose: () => voi
           conflict={open.conflict}
           onOverwrite={() => void open.overwrite()}
           onReload={open.reload}
+          noteIndex={noteIndex}
         />
       ) : (
-        <Reader note={note} />
+        <Reader note={note} noteIndex={noteIndex} onOpenLink={onOpenLink} />
       )}
     </main>
   );
@@ -158,10 +174,10 @@ export function NotePane({ open, onClose }: { open: OpenNote; onClose: () => voi
 function ModeToggle({
   editing,
   onSelect,
-}: {
+}: Readonly<{
   editing: boolean;
   onSelect: (mode: "read" | "edit") => void;
-}) {
+}>) {
   return (
     // <fieldset> is the native grouping element (replaces role="group"); the
     // border-0/m-0/p-0/min-w-0 resets strip the UA fieldset chrome so the toggle
@@ -191,12 +207,12 @@ function ToggleButton({
   label,
   icon: Icon,
   onClick,
-}: {
+}: Readonly<{
   active: boolean;
   label: string;
   icon: typeof Eye;
   onClick: () => void;
-}) {
+}>) {
   return (
     <button
       type="button"

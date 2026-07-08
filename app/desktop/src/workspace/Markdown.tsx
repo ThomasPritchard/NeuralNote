@@ -1,11 +1,51 @@
 // Themed markdown rendering for the reader. react-markdown v10 removed the
 // `className` prop, so styling is done via a `components` map plus a wrapping
-// div. Links are deliberately inert (preventDefault) — opening external URLs in
-// the Tauri webview would navigate away from the app; real link-opening is a
-// later phase.
+// div.
+//
+// Links: when a `noteIndex` is provided (the reader), `[[wikilinks]]` (via
+// remarkWikilink) and vault-internal markdown links resolve against the index
+// and open in-app through `onOpenLink`; unresolved wikilinks render dimmed
+// with a dashed underline (Obsidian-style). External URLs stay inert
+// (preventDefault) — no opener plugin ships yet, and navigating the Tauri
+// webview away from the app would be worse than doing nothing. Without a
+// `noteIndex` (the chat pane) rendering is unchanged from before.
 
-import ReactMarkdown, { type Components } from "react-markdown";
+import { useMemo } from "react";
+import ReactMarkdown, {
+  defaultUrlTransform,
+  type Components,
+} from "react-markdown";
 import remarkGfm from "remark-gfm";
+import {
+  resolveMarkdownLink,
+  resolveWikilink,
+  type NoteIndexEntry,
+} from "./linkResolve";
+import { remarkWikilink, WIKILINK_SCHEME } from "./remarkWikilink";
+
+const LINK_CLASS =
+  "rounded-sm text-primary underline decoration-primary/40 underline-offset-2 transition-colors hover:decoration-primary focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary";
+
+const UNRESOLVED_CLASS =
+  "cursor-default text-muted-foreground underline decoration-dashed decoration-muted-foreground/40 underline-offset-2 transition-colors hover:decoration-muted-foreground/70";
+
+/** react-markdown's default transform strips unknown schemes; ours must let the
+ *  private `nn-wikilink:` urls through untouched while still delegating to the
+ *  default (sanitizing) transform for everything else — `javascript:`/`data:`
+ *  on normal links stay stripped. */
+function wikilinkUrlTransform(url: string): string {
+  return url.startsWith(WIKILINK_SCHEME) ? url : defaultUrlTransform(url);
+}
+
+/** mdast→hast percent-encodes link urls (e.g. spaces); undo it to recover the
+ *  raw wikilink target as written. A malformed escape falls back to the raw. */
+function decodeTarget(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
 
 const components: Components = {
   // `children` is destructured and rendered explicitly so the heading's text
@@ -39,7 +79,7 @@ const components: Components = {
       href={href}
       title={href}
       onClick={(e) => e.preventDefault()}
-      className="text-primary underline decoration-primary/40 underline-offset-2 transition-colors hover:decoration-primary"
+      className={LINK_CLASS}
       {...props}
     >
       {children}
@@ -96,11 +136,99 @@ const components: Components = {
   ),
 };
 
+/** Build the `a` renderer that resolves wikilinks + internal markdown links
+ *  against the vault's note index. Kept outside the component so the closure
+ *  is the only per-render allocation (via useMemo below). */
+function makeLinkRenderer(
+  noteIndex: NoteIndexEntry[],
+  onOpenLink: ((relPath: string) => void) | undefined,
+): Components["a"] {
+  const internal = (
+    relPath: string,
+    href: string | undefined,
+    children: React.ReactNode,
+    props: object,
+  ) => (
+    <a
+      href={href}
+      title={relPath}
+      onClick={(e) => {
+        e.preventDefault();
+        onOpenLink?.(relPath);
+      }}
+      className={LINK_CLASS}
+      {...props}
+    >
+      {children}
+    </a>
+  );
+
+  return function NoteLink({ node: _node, href, children, ...props }) {
+    if (href?.startsWith(WIKILINK_SCHEME)) {
+      const target = decodeTarget(href.slice(WIKILINK_SCHEME.length));
+      const relPath = resolveWikilink(target, noteIndex);
+      if (relPath !== null) return internal(relPath, href, children, props);
+      // Unresolved: still show the text, dimmed with a dashed underline, and
+      // say why it doesn't navigate. Not focusable — there is nothing to do.
+      return (
+        <span
+          className={UNRESOLVED_CLASS}
+          title={`No note called “${target}” yet`}
+          {...props}
+        >
+          {children}
+        </span>
+      );
+    }
+    const relPath = href === undefined ? null : resolveMarkdownLink(href, noteIndex);
+    if (relPath !== null) return internal(relPath, href, children, props);
+    // External / unresolvable: inert, exactly as before.
+    return (
+      <a
+        href={href}
+        title={href}
+        onClick={(e) => e.preventDefault()}
+        className={LINK_CLASS}
+        {...props}
+      >
+        {children}
+      </a>
+    );
+  };
+}
+
+interface MarkdownProps {
+  body: string;
+  /** Vault note index for wikilink/internal-link resolution. Omitted (chat),
+   *  links render exactly as before — inert, no wikilink parsing. */
+  noteIndex?: NoteIndexEntry[];
+  /** Open a vault note by relPath (the workspace's guarded open). */
+  onOpenLink?: (relPath: string) => void;
+}
+
 /** Render a markdown body with GitHub-flavoured markdown, themed to NeuralNote. */
-export function Markdown({ body }: { body: string }) {
+export function Markdown({ body, noteIndex, onOpenLink }: Readonly<MarkdownProps>) {
+  const linkAware = noteIndex !== undefined;
+
+  const activeComponents = useMemo<Components>(
+    () =>
+      noteIndex === undefined
+        ? components
+        : { ...components, a: makeLinkRenderer(noteIndex, onOpenLink) },
+    [noteIndex, onOpenLink],
+  );
+  const plugins = useMemo(
+    () => (linkAware ? [remarkGfm, remarkWikilink] : [remarkGfm]),
+    [linkAware],
+  );
+
   return (
     <div className="nn-markdown">
-      <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+      <ReactMarkdown
+        remarkPlugins={plugins}
+        components={activeComponents}
+        urlTransform={linkAware ? wikilinkUrlTransform : undefined}
+      >
         {body}
       </ReactMarkdown>
     </div>

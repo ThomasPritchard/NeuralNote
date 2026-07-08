@@ -170,7 +170,7 @@ export function GraphView({
         </div>
       )}
 
-      {view && view.galaxy.data.nodes.length === 0 && (
+      {view?.galaxy.data.nodes.length === 0 && (
         <div className="grid h-full place-items-center">
           <p className="text-[13px] leading-relaxed text-muted-foreground">No notes yet</p>
         </div>

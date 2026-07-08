@@ -14,6 +14,13 @@ serde_yaml_ng = "0.10"
 # faults; the host app installs the actual logger (tauri-plugin-log).
 log = "0.4"
 trash = "5"
+# Async traits for the AI orchestration seam (LlmClient / RetrievalProvider),
+# kept runtime-agnostic — the host app supplies the executor.
+async-trait = "0.1"
+# Deterministic local date/time rendering for Obsidian-compatible note templates.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Block on async trait methods in unit tests without pulling a full runtime.
+futures = "0.3"

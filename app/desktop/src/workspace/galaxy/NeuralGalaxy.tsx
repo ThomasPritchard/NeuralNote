@@ -1,4 +1,12 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  useCallback,
+  useEffect,
+  useMemo,
+  useReducer,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import ForceGraph3D from "react-force-graph-3d";
 import * as THREE from "three";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
@@ -247,32 +255,39 @@ export function NeuralGalaxy({
   const selectedIdRef = useRef<string | null>(null);
   const previewClusterRef = useRef<string | null>(null);
   const focusRef = useRef<{ key: string; origin: string | null; lit: Set<string> } | null>(null);
-  const [, setFocusEpoch] = useState(0);
+  // The canonical React force-update idiom: the counter's value is never read
+  // (dispatch just schedules the re-render the comment above explains).
+  const [, bumpFocusEpoch] = useReducer((n: number) => n + 1, 0);
 
   const refreshFocus = useCallback(() => {
     const preview = previewClusterRef.current;
     const origin = preview === null ? (hoverOriginRef.current ?? selectedIdRef.current) : null;
     // "cluster:"/"node:" prefixes keep the two focus kinds from colliding.
-    const key = preview !== null ? `cluster:${preview}` : origin !== null ? `node:${origin}` : null;
+    let key: string | null;
+    if (preview === null) {
+      key = origin === null ? null : `node:${origin}`;
+    } else {
+      key = `cluster:${preview}`;
+    }
     if ((focusRef.current?.key ?? null) === key) return;
     if (key === null) {
       focusRef.current = null;
-    } else if (preview !== null) {
-      focusRef.current = {
-        key,
-        origin: null,
-        lit: new Set(data.nodes.filter((n) => n.cluster === preview).map((n) => n.id)),
-      };
-    } else {
+    } else if (preview === null) {
       const o = origin as string;
       focusRef.current = {
         key,
         origin: o,
         lit: new Set([o, ...(adjacency.get(o) ?? []).map((nb) => nb.id)]),
       };
+    } else {
+      focusRef.current = {
+        key,
+        origin: null,
+        lit: new Set(data.nodes.filter((n) => n.cluster === preview).map((n) => n.id)),
+      };
     }
     applyFocus(focusRef.current?.lit ?? null);
-    setFocusEpoch((n) => n + 1);
+    bumpFocusEpoch();
   }, [adjacency, data]);
 
   useEffect(() => {
@@ -613,6 +628,7 @@ export function NeuralGalaxy({
             {(["3d", "2d"] as const).map((v) => (
               <button
                 key={v}
+                type="button"
                 onClick={() => changeView(v)}
                 className={`rounded-md px-2.5 py-1 uppercase transition ${
                   view === v
@@ -639,7 +655,7 @@ export function NeuralGalaxy({
                 className="w-full bg-transparent text-foreground placeholder:text-muted-foreground/70 focus:outline-none"
               />
               {query && (
-                <button onClick={() => setQuery("")} aria-label="Clear">
+                <button type="button" onClick={() => setQuery("")} aria-label="Clear">
                   <X className="size-3.5 hover:text-foreground" />
                 </button>
               )}
@@ -654,6 +670,7 @@ export function NeuralGalaxy({
                 {results.map((n) => (
                   <button
                     key={n.id}
+                    type="button"
                     onClick={() => pickResult(n)}
                     className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-foreground transition hover:bg-primary/10"
                   >
@@ -674,21 +691,26 @@ export function NeuralGalaxy({
       {/* Interactive (spec §Addendum): hover a row → the whole cluster lights
           via the shared focus channel; click a folder row → onClusterSelect
           drills in. The "" row (this folder's own notes) is not a drill target
-          so it stays a plain row; the bridge row stays non-interactive. */}
+          — it's still a native button so keyboard focus can drive the same
+          cluster preview, but it has no click action; the bridge row stays
+          non-interactive. */}
       <div className="absolute bottom-5 left-5 flex flex-col gap-1.5 rounded-lg border border-border bg-card/80 px-4 py-3 backdrop-blur">
         {breadcrumb}
         <div className="nn-mono mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">Clusters</div>
         {Object.entries(clusters).map(([key, c]) =>
           key === "" ? (
-            <div
+            <button
               key="c:"
+              type="button"
               onMouseEnter={() => previewCluster("")}
               onMouseLeave={() => previewCluster(null)}
-              className="flex items-center gap-2 text-xs text-foreground"
+              onFocus={() => previewCluster("")}
+              onBlur={() => previewCluster(null)}
+              className="flex items-center gap-2 text-left text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
             >
               <span className="size-2.5 rounded-full" style={{ background: c.color, boxShadow: `0 0 8px ${c.color}` }} />
               {c.label}
-            </div>
+            </button>
           ) : (
             <button
               key={`c:${key}`}
@@ -723,7 +745,7 @@ export function NeuralGalaxy({
             >
               {clusters[selected.cluster]?.label ?? selected.cluster}
             </span>
-            <button onClick={closeSelectedAndReturn} aria-label="Close">
+            <button type="button" onClick={closeSelectedAndReturn} aria-label="Close">
               <X className="size-4 text-muted-foreground hover:text-foreground" />
             </button>
           </div>
@@ -735,6 +757,7 @@ export function NeuralGalaxy({
             {neighbours.map(({ node: nb, bridge }) => (
               <button
                 key={nb.id}
+                type="button"
                 onClick={() => onNodeClick(nb)}
                 onMouseEnter={() => setHover(nb.id, true)}
                 onMouseLeave={() => setHover(nb.id, false)}

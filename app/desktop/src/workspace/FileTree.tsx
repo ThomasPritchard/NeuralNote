@@ -4,12 +4,12 @@
 // inline toast — never swallowed. The reader-affecting cases (open note deleted,
 // renamed, or moved) are reported up so the parent can keep the reader honest.
 
-import { memo, useState } from "react";
+import { memo, useEffect, useRef, useState } from "react";
 import { ChevronDown, FilePlus2, Search, X } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import { cn } from "../lib/cn";
-import type { TreeNode } from "../lib/types";
+import type { TemplateInfo, TreeNode } from "../lib/types";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { isPathInside, normSep } from "./fileMeta";
 import { filterTree } from "./filterTree";
@@ -20,6 +20,7 @@ import {
   type CreatingState,
   type TreeContext,
 } from "./TreeRow";
+import { loadCollapsed, saveCollapsed } from "./treeState";
 import { VaultMenu } from "./VaultMenu";
 
 const EASE = "ease-[cubic-bezier(0.32,0.72,0,1)]";
@@ -58,7 +59,10 @@ export const FileTree = memo(function FileTree({
   onRemap,
   onCloseVault,
 }: FileTreeProps) {
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  // Folders are open by default (empty set); the user's manual folds persist per
+  // vault so they survive an app restart. Lazy-loaded once — vaultPath is stable
+  // for a mount because App swaps Workspace↔Welcome on any vault change.
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => loadCollapsed(vaultPath));
   const [filter, setFilter] = useState("");
   const [creating, setCreating] = useState<CreatingState | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
@@ -66,20 +70,49 @@ export const FileTree = memo(function FileTree({
   const [opError, setOpError] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<TreeNode | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
+  // Templates offered in the note-create row (fetched when a create begins)
+  // and the picked one (null = blank note). A monotonic token guards a slow
+  // list_templates response from landing on a later create session.
+  const [templates, setTemplates] = useState<TemplateInfo[]>([]);
+  const [selectedTemplate, setSelectedTemplate] = useState<string | null>(null);
+  const templatesReq = useRef(0);
+
+  // Mirror the fold state to storage on every change. Cheap (a short array) and
+  // idempotent, so the redundant write on mount is harmless.
+  useEffect(() => {
+    saveCollapsed(vaultPath, collapsed);
+  }, [vaultPath, collapsed]);
 
   const startCreate = (parentPath: string, kind: CreateKind) => {
     setRenaming(null);
     setOpError(null);
     setCreating({ parentPath, kind });
+    setTemplates([]);
+    setSelectedTemplate(null);
+    const id = ++templatesReq.current;
+    if (kind !== "note") return;
+    // Templates are strictly optional: with none (or on failure) the create
+    // flow is byte-identical to before — a blank note, zero added friction.
+    api
+      .listTemplates()
+      .then((list) => {
+        if (id === templatesReq.current) setTemplates(list);
+      })
+      .catch((e) => {
+        // Surfaced (never silent), but it must not block creating the note.
+        if (id === templatesReq.current) setOpError(errorMessage(e));
+      });
   };
 
   const startRename = (path: string) => {
+    templatesReq.current++;
     setCreating(null);
     setOpError(null);
     setRenaming(path);
   };
 
   const cancelEdit = () => {
+    templatesReq.current++;
     setCreating(null);
     setRenaming(null);
   };
@@ -93,15 +126,21 @@ export const FileTree = memo(function FileTree({
     if (!creating) return;
     const { parentPath, kind } = creating;
     try {
-      const node =
-        kind === "folder"
-          ? await api.createFolder(parentPath, name)
-          : await api.createNote(parentPath, name);
+      let node: TreeNode;
+      if (kind === "folder") {
+        node = await api.createFolder(parentPath, name);
+      } else if (selectedTemplate === null) {
+        node = await api.createNote(parentPath, name);
+      } else {
+        node = await api.createNoteFromTemplate(parentPath, name, selectedTemplate);
+      }
+      templatesReq.current++;
       setCreating(null);
       await refreshTree();
       if (kind === "note") onSelect(node.path);
     } catch (e) {
-      // Keep the input open so the user can correct the name.
+      // Keep the input open (and the chosen template) so the user can correct
+      // the name.
       setOpError(errorMessage(e));
     }
   };
@@ -162,6 +201,9 @@ export const FileTree = memo(function FileTree({
     creating,
     renaming,
     dragPath,
+    templates,
+    selectedTemplate,
+    onSelectTemplate: setSelectedTemplate,
     toggle: (relPath) => {
       // A toggle while filtering would mutate the real collapse state with no
       // visible effect (everything renders expanded) — ignore it instead.
