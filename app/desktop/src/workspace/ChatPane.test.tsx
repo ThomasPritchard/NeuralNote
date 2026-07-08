@@ -1,14 +1,15 @@
-// ChatPane: the three connection states (guided setup / skipped-disabled /
-// live chat), the save→status→chat handoff, and the streamed ChatEvent loop —
-// activity log, streamed answer, cited sources, coverage footer, inline error,
-// and the citation click that opens the note at its computed absolute path.
-// The `chat` command is mocked to drive the passed `onEvent` callback with a
-// scripted event sequence, exactly as the real Rust backend will.
+// ChatPane: the provider-aware connection states (first-run picker / guided
+// setup / local-needs-a-model hand-off / skipped-disabled / live chat), the
+// save→status→chat handoff, and the streamed ChatEvent loop — activity log,
+// streamed answer, cited sources, coverage footer, inline error, and the
+// citation click that opens the note at its computed absolute path. The `chat`
+// command is mocked to drive the passed `onEvent` callback with a scripted
+// event sequence, exactly as the real Rust backend will.
 
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ChatEvent } from "../lib/types";
+import type { AiStatus, ChatEvent } from "../lib/types";
 
 const { reportError } = vi.hoisted(() => ({ reportError: vi.fn() }));
 
@@ -22,9 +23,8 @@ vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
   return {
     ...actual,
-    apiKeyStatus: vi.fn(),
+    aiStatus: vi.fn(),
     saveApiKey: vi.fn(),
-    clearApiKey: vi.fn(),
     chat: vi.fn(),
   };
 });
@@ -32,11 +32,28 @@ vi.mock("../lib/api", async (importActual) => {
 import * as api from "../lib/api";
 import { ChatPane } from "./ChatPane";
 
-const mockStatus = vi.mocked(api.apiKeyStatus);
+const mockAiStatus = vi.mocked(api.aiStatus);
 const mockSave = vi.mocked(api.saveApiKey);
 const mockChat = vi.mocked(api.chat);
 
 const DEFAULT_MODEL = "anthropic/claude-sonnet-4.5";
+
+// ── AiStatus builders (the three effective-provider shapes the pane branches on) ──
+const unconfigured = (): AiStatus => ({
+  activeProvider: null,
+  openrouter: { hasKey: false, model: DEFAULT_MODEL },
+  local: { activeModelTag: null },
+});
+const openRouterActive = (model = DEFAULT_MODEL): AiStatus => ({
+  activeProvider: "openRouter",
+  openrouter: { hasKey: true, model },
+  local: { activeModelTag: null },
+});
+const localActive = (tag: string | null): AiStatus => ({
+  activeProvider: "local",
+  openrouter: { hasKey: false, model: DEFAULT_MODEL },
+  local: { activeModelTag: tag },
+});
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -46,16 +63,30 @@ function deferred<T>() {
   return { promise, resolve };
 }
 
-/** Render the pane with a captured openNoteAt and a fresh user-event session. */
-function setup() {
+/** Render the pane with captured callbacks and a fresh user-event session. */
+function setup(refreshSignal = 0) {
   const openNoteAt = vi.fn();
+  const onOpenSettings = vi.fn();
   const user = userEvent.setup();
-  render(<ChatPane openNoteAt={openNoteAt} />);
-  return { openNoteAt, user };
+  const view = render(
+    <ChatPane
+      openNoteAt={openNoteAt}
+      onOpenSettings={onOpenSettings}
+      refreshSignal={refreshSignal}
+    />,
+  );
+  return { openNoteAt, onOpenSettings, user, view };
 }
 
 const composer = () => screen.getByLabelText("Ask across your vault");
 const sendButton = () => screen.getByRole("button", { name: "Send" });
+
+/** Walk the first-run picker into the guided OpenRouter key setup. */
+async function openKeySetup(user: ReturnType<typeof userEvent.setup>) {
+  await user.click(
+    await screen.findByRole("button", { name: /connect an openrouter key/i }),
+  );
+}
 
 /** Script `chat` to replay `events` through the passed onEvent, then resolve. */
 function scriptChat(events: ChatEvent[]) {
@@ -89,9 +120,9 @@ const CITED_RUN: ChatEvent[] = [
   { type: "done" },
 ];
 
-/** Land in the chat view with a stored key, then ask `prompt`. */
+/** Land in the chat view with an active OpenRouter setup, then ask `prompt`. */
 async function askInChat(prompt: string, events: ChatEvent[]) {
-  mockStatus.mockResolvedValue({ hasKey: true, model: DEFAULT_MODEL });
+  mockAiStatus.mockResolvedValue(openRouterActive());
   const ctx = setup();
   await screen.findByLabelText("Ask across your vault");
   scriptChat(events);
@@ -101,7 +132,7 @@ async function askInChat(prompt: string, events: ChatEvent[]) {
 }
 
 beforeEach(() => {
-  mockStatus.mockReset();
+  mockAiStatus.mockReset();
   mockSave.mockReset();
   mockChat.mockReset();
   reportError.mockReset();
@@ -111,12 +142,128 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
-describe("ChatPane — key setup", () => {
-  it("shows guided setup (not a chat) when no key is stored", async () => {
-    mockStatus.mockResolvedValue({ hasKey: false, model: DEFAULT_MODEL });
+describe("ChatPane — first-run provider branching", () => {
+  it("renders the provider picker when nothing is configured", async () => {
+    mockAiStatus.mockResolvedValue(unconfigured());
+    setup();
+
+    expect(
+      await screen.findByRole("button", { name: /connect an openrouter key/i }),
+    ).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /set up local ai/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /skip for now/i })).toBeInTheDocument();
+    // No composer, no key form — the fork comes first.
+    expect(screen.queryByLabelText("Ask across your vault")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("OpenRouter API key")).not.toBeInTheDocument();
+  });
+
+  it("routes 'Set up Local AI' to the settings opener", async () => {
+    mockAiStatus.mockResolvedValue(unconfigured());
+    const { onOpenSettings, user } = setup();
+
+    await user.click(await screen.findByRole("button", { name: /set up local ai/i }));
+    expect(onOpenSettings).toHaveBeenCalledOnce();
+  });
+
+  it("skips from the picker straight into the disconnected state", async () => {
+    mockAiStatus.mockResolvedValue(unconfigured());
+    const { user } = setup();
+
+    await user.click(await screen.findByRole("button", { name: /skip for now/i }));
+    expect(screen.getByText(/cited chat is off/i)).toBeInTheDocument();
+  });
+
+  it("lands in chat with the model tag when the local provider is set up", async () => {
+    mockAiStatus.mockResolvedValue(localActive("qwen2.5:7b"));
+    setup();
+
+    expect(await screen.findByLabelText("Ask across your vault")).toBeInTheDocument();
+    // The header status pill carries the local tag instead of a cloud model id.
+    expect(screen.getByText("qwen2.5:7b")).toBeInTheDocument();
+  });
+
+  it("hands off to settings when local is selected but no model is set up", async () => {
+    mockAiStatus.mockResolvedValue(localActive(null));
+    const { onOpenSettings, user } = setup();
+
+    // An honest dead-end, not a chat that would only error.
+    expect(await screen.findByText("Local AI needs a model")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Ask across your vault")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /open ai settings/i }));
+    expect(onOpenSettings).toHaveBeenCalledOnce();
+  });
+
+  it("falls back to guided setup when openRouter is active without a key", async () => {
+    mockAiStatus.mockResolvedValue({
+      activeProvider: "openRouter",
+      openrouter: { hasKey: false, model: DEFAULT_MODEL },
+      local: { activeModelTag: null },
+    });
     setup();
 
     expect(await screen.findByLabelText("OpenRouter API key")).toBeInTheDocument();
+  });
+
+  it("re-reads the status when refreshSignal bumps (settings closed)", async () => {
+    mockAiStatus.mockResolvedValueOnce(unconfigured());
+    const openNoteAt = vi.fn();
+    const onOpenSettings = vi.fn();
+    const { rerender } = render(
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={0} />,
+    );
+    await screen.findByRole("button", { name: /set up local ai/i });
+
+    // The user configured a local model in Settings; closing it bumps the signal.
+    mockAiStatus.mockResolvedValueOnce(localActive("qwen2.5:7b"));
+    rerender(
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={1} />,
+    );
+
+    expect(await screen.findByLabelText("Ask across your vault")).toBeInTheDocument();
+    expect(screen.getByText("qwen2.5:7b")).toBeInTheDocument();
+  });
+
+  it("keeps a manually-chosen view when a refresh still reports unconfigured", async () => {
+    mockAiStatus.mockResolvedValue(unconfigured());
+    const openNoteAt = vi.fn();
+    const onOpenSettings = vi.fn();
+    const user = userEvent.setup();
+    const { rerender } = render(
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={0} />,
+    );
+
+    // The user explicitly skipped; peeking at Settings without configuring
+    // anything must not bounce them back to the picker.
+    await user.click(await screen.findByRole("button", { name: /skip for now/i }));
+    rerender(
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={1} />,
+    );
+
+    await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));
+    expect(screen.getByText(/cited chat is off/i)).toBeInTheDocument();
+  });
+
+  it("falls back to the picker and surfaces the failure if the status check throws", async () => {
+    mockAiStatus.mockRejectedValue({ kind: "io", message: "config unreadable" });
+    setup();
+
+    expect(
+      await screen.findByRole("button", { name: /connect an openrouter key/i }),
+    ).toBeInTheDocument();
+    expect(reportError).toHaveBeenCalledExactlyOnceWith("config unreadable");
+  });
+});
+
+describe("ChatPane — key setup", () => {
+  it("shows guided setup (not a chat) after picking OpenRouter", async () => {
+    mockAiStatus.mockResolvedValue(unconfigured());
+    const { user } = setup();
+    await openKeySetup(user);
+
+    expect(screen.getByLabelText("OpenRouter API key")).toBeInTheDocument();
     // The model field is prefilled with the status model.
     expect(screen.getByLabelText("Model")).toHaveValue(DEFAULT_MODEL);
     // No composer while setup is showing.
@@ -124,10 +271,11 @@ describe("ChatPane — key setup", () => {
   });
 
   it("keeps Save disabled until a key is entered", async () => {
-    mockStatus.mockResolvedValue({ hasKey: false, model: DEFAULT_MODEL });
+    mockAiStatus.mockResolvedValue(unconfigured());
     const { user } = setup();
+    await openKeySetup(user);
 
-    const save = await screen.findByRole("button", { name: /save & start chatting/i });
+    const save = screen.getByRole("button", { name: /save & start chatting/i });
     expect(save).toBeDisabled();
 
     await user.type(screen.getByLabelText("OpenRouter API key"), "sk-or-abc");
@@ -135,16 +283,14 @@ describe("ChatPane — key setup", () => {
   });
 
   it("saves the key, re-checks status, and switches to the chat view", async () => {
-    mockStatus
-      .mockResolvedValueOnce({ hasKey: false, model: DEFAULT_MODEL })
-      .mockResolvedValueOnce({ hasKey: true, model: DEFAULT_MODEL });
+    mockAiStatus
+      .mockResolvedValueOnce(unconfigured())
+      .mockResolvedValueOnce(openRouterActive());
     mockSave.mockResolvedValue(undefined);
     const { user } = setup();
+    await openKeySetup(user);
 
-    await user.type(
-      await screen.findByLabelText("OpenRouter API key"),
-      "sk-or-secret",
-    );
+    await user.type(screen.getByLabelText("OpenRouter API key"), "sk-or-secret");
     await user.click(screen.getByRole("button", { name: /save & start chatting/i }));
 
     expect(mockSave).toHaveBeenCalledExactlyOnceWith("sk-or-secret", DEFAULT_MODEL);
@@ -153,13 +299,14 @@ describe("ChatPane — key setup", () => {
   });
 
   it("lets the user override the model before saving", async () => {
-    mockStatus
-      .mockResolvedValueOnce({ hasKey: false, model: DEFAULT_MODEL })
-      .mockResolvedValueOnce({ hasKey: true, model: "openai/gpt-4o" });
+    mockAiStatus
+      .mockResolvedValueOnce(unconfigured())
+      .mockResolvedValueOnce(openRouterActive("openai/gpt-4o"));
     mockSave.mockResolvedValue(undefined);
     const { user } = setup();
+    await openKeySetup(user);
 
-    await user.type(await screen.findByLabelText("OpenRouter API key"), "sk-or-x");
+    await user.type(screen.getByLabelText("OpenRouter API key"), "sk-or-x");
     const modelField = screen.getByLabelText("Model");
     await user.clear(modelField);
     await user.type(modelField, "openai/gpt-4o");
@@ -169,10 +316,11 @@ describe("ChatPane — key setup", () => {
   });
 
   it("Skip drops to a disabled state whose 'Connect a key' reopens setup", async () => {
-    mockStatus.mockResolvedValue({ hasKey: false, model: DEFAULT_MODEL });
+    mockAiStatus.mockResolvedValue(unconfigured());
     const { user } = setup();
+    await openKeySetup(user);
 
-    await user.click(await screen.findByRole("button", { name: /skip for now/i }));
+    await user.click(screen.getByRole("button", { name: /skip for now/i }));
     expect(screen.getByText(/cited chat is off/i)).toBeInTheDocument();
     expect(screen.queryByLabelText("Ask across your vault")).not.toBeInTheDocument();
 
@@ -180,20 +328,13 @@ describe("ChatPane — key setup", () => {
     expect(screen.getByLabelText("OpenRouter API key")).toBeInTheDocument();
   });
 
-  it("falls back to guided setup and surfaces the failure if the status check throws", async () => {
-    mockStatus.mockRejectedValue({ kind: "io", message: "keychain unavailable" });
-    setup();
-
-    expect(await screen.findByLabelText("OpenRouter API key")).toBeInTheDocument();
-    expect(reportError).toHaveBeenCalledExactlyOnceWith("keychain unavailable");
-  });
-
   it("keeps setup open and surfaces the error when saving the key fails", async () => {
-    mockStatus.mockResolvedValue({ hasKey: false, model: DEFAULT_MODEL });
+    mockAiStatus.mockResolvedValue(unconfigured());
     mockSave.mockRejectedValue({ kind: "io", message: "keychain write failed" });
     const { user } = setup();
+    await openKeySetup(user);
 
-    await user.type(await screen.findByLabelText("OpenRouter API key"), "sk-or-x");
+    await user.type(screen.getByLabelText("OpenRouter API key"), "sk-or-x");
     await user.click(screen.getByRole("button", { name: /save & start chatting/i }));
 
     await waitFor(() =>
@@ -207,7 +348,7 @@ describe("ChatPane — key setup", () => {
 
 describe("ChatPane — chat view", () => {
   it("shows an empty prompt-me state and a disabled Send with no input", async () => {
-    mockStatus.mockResolvedValue({ hasKey: true, model: DEFAULT_MODEL });
+    mockAiStatus.mockResolvedValue(openRouterActive());
     setup();
 
     await screen.findByLabelText("Ask across your vault");
@@ -251,7 +392,7 @@ describe("ChatPane — chat view", () => {
   });
 
   it("bounds the live window to the freshest steps while streaming, with a running tally", async () => {
-    mockStatus.mockResolvedValue({ hasKey: true, model: DEFAULT_MODEL });
+    mockAiStatus.mockResolvedValue(openRouterActive());
     const { user } = setup();
     await screen.findByLabelText("Ask across your vault");
 
@@ -391,7 +532,7 @@ describe("ChatPane — chat view", () => {
   });
 
   it("disables the composer while a run streams, then re-enables it", async () => {
-    mockStatus.mockResolvedValue({ hasKey: true, model: DEFAULT_MODEL });
+    mockAiStatus.mockResolvedValue(openRouterActive());
     const { user } = setup();
     await screen.findByLabelText("Ask across your vault");
 
@@ -413,7 +554,7 @@ describe("ChatPane — chat view", () => {
   });
 
   it("surfaces a transport rejection as a visible error, never silently", async () => {
-    mockStatus.mockResolvedValue({ hasKey: true, model: DEFAULT_MODEL });
+    mockAiStatus.mockResolvedValue(openRouterActive());
     const { user } = setup();
     await screen.findByLabelText("Ask across your vault");
 
@@ -426,7 +567,7 @@ describe("ChatPane — chat view", () => {
   });
 
   it("sends on Enter, but Shift+Enter inserts a newline instead", async () => {
-    mockStatus.mockResolvedValue({ hasKey: true, model: DEFAULT_MODEL });
+    mockAiStatus.mockResolvedValue(openRouterActive());
     const { user } = setup();
     await screen.findByLabelText("Ask across your vault");
     scriptChat([{ type: "answer", delta: "hi" }, { type: "done" }]);

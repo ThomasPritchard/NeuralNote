@@ -17,7 +17,10 @@
 pub mod events;
 pub mod evidence;
 pub mod llm;
+pub mod local;
+pub mod openai;
 pub mod orchestrator;
+pub mod provider_config;
 pub mod retrieval;
 pub mod tools;
 pub mod verify;
@@ -25,6 +28,16 @@ pub mod verify;
 pub use events::{ChatEvent, EventSink};
 pub use evidence::{EvidenceRegistry, EvidenceSpan};
 pub use llm::{Completion, LlmClient, LlmMessage, LlmRequest, Role, ToolCall};
+pub use local::hf::{parse_hf_metadata, HfModelMeta};
+pub use local::pull::{parse_pull_line, PullEvent, PullSink};
+pub use local::tags::{parse_installed_models, InstalledModel};
+pub use local::{
+    curated_candidates, is_curated_model, recommend_model, CandidateModel, HardwareSpec,
+    Recommendation, DEFAULT_LOCAL_MODEL,
+};
 pub use orchestrator::{run_chat, Guards, DEFAULT_MODEL};
+pub use provider_config::{
+    read_provider_config, write_provider_config, ProviderConfig, ProviderKind,
+};
 pub use retrieval::{KeywordRetriever, ListOutcome, NoteMeta, RetrievalProvider, SearchOutcome};
 pub use verify::CitationVerifier;

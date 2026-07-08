@@ -14,7 +14,12 @@ const captured = vi.hoisted(() => ({
   ribbon: {} as Record<string, (...a: never[]) => void>,
   searchPanel: {} as { focusSignal: number; onOpen: (absPath: string) => void },
   graphView: {} as { onOpenNote: (relPath: string) => void },
-  chatPane: {} as { openNoteAt: (absPath: string) => void },
+  chatPane: {} as {
+    openNoteAt: (absPath: string) => void;
+    onOpenSettings: () => void;
+    refreshSignal: number;
+  },
+  settingsModal: {} as { open: boolean; onClose: () => void },
 }));
 const win = vi.hoisted(() => {
   const state: { closeCb?: (e: { preventDefault: () => void }) => void } = {};
@@ -49,9 +54,19 @@ vi.mock("./NotePane", () => ({
   },
 }));
 vi.mock("./ChatPane", () => ({
-  ChatPane: (props: { openNoteAt: (absPath: string) => void }) => {
+  ChatPane: (props: {
+    openNoteAt: (absPath: string) => void;
+    onOpenSettings: () => void;
+    refreshSignal: number;
+  }) => {
     captured.chatPane = props;
-    return <div data-testid="chatpane" />;
+    return <div data-testid="chatpane" data-refresh-signal={props.refreshSignal} />;
+  },
+}));
+vi.mock("./SettingsModal", () => ({
+  SettingsModal: (props: { open: boolean; onClose: () => void }) => {
+    captured.settingsModal = props;
+    return props.open ? <div data-testid="settings-modal" /> : null;
   },
 }));
 vi.mock("./Ribbon", () => ({
@@ -443,6 +458,35 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     await userEvent.click(screen.getByRole("button", { name: "Discard" }));
     expect(openState.current.open).toHaveBeenCalledWith("/v/Notes/b.md");
     expect(screen.getByTestId("notepane")).toBeInTheDocument();
+  });
+});
+
+describe("Workspace — settings modal", () => {
+  it("opens from the ribbon cog and closes back", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    expect(screen.queryByTestId("settings-modal")).not.toBeInTheDocument();
+
+    act(() => captured.ribbon.onOpenSettings());
+    expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
+
+    act(() => captured.settingsModal.onClose());
+    expect(screen.queryByTestId("settings-modal")).not.toBeInTheDocument();
+  });
+
+  it("opens from the chat pane, and bumps its refresh signal on close", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    expect(screen.getByTestId("chatpane")).toHaveAttribute("data-refresh-signal", "0");
+
+    act(() => captured.chatPane.onOpenSettings());
+    expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
+
+    // Closing settings must poke the chat pane to re-read the AI status — a
+    // provider configured in the modal has to reach the docked pane.
+    act(() => captured.settingsModal.onClose());
+    expect(screen.queryByTestId("settings-modal")).not.toBeInTheDocument();
+    expect(screen.getByTestId("chatpane")).toHaveAttribute("data-refresh-signal", "1");
   });
 });
 

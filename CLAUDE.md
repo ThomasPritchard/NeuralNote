@@ -17,12 +17,15 @@ citation is worse than no answer.
 
 ## v1 scope (the smallest lovable cut)
 
-Desktop only, **Tauri 2**, **BYO-API-key**. The loop:
+Desktop only, **Tauri 2**. AI is **BYO-API-key (OpenRouter) _or_ a bundled local model**
+(Ollama sidecar) — the user picks a provider on first run and can reconfigure it in Settings; see
+[`specs/ai-providers-slice.md`](specs/ai-providers-slice.md). The loop:
 `capture → AI distil + infer metadata → write Obsidian-compatible markdown + full source → embed →
 cited chat`. Capture paths: links (YouTube/article), PDF, text; voice last. Headline onboarding:
 **open an existing Obsidian vault** (migration is free because the format is compatible).
 
-v1 target user: the **Obsidian refugee** (a power user who can supply an API key).
+v1 target user: the **Obsidian refugee** (a power user who supplies an API key, or runs a model
+locally).
 
 **Not in v1:** sync, mobile, managed cloud AI, PWA, billing, proactive nudges, Notion import
 (first fast-follow), tasks/canvas, open-source-release decision. See the spec for the full roadmap.

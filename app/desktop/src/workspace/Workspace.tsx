@@ -29,6 +29,7 @@ import { buildNoteIndex, type NoteIndexEntry } from "./linkResolve";
 import { NotePane } from "./NotePane";
 import { Ribbon, type CenterView, type SidebarPanel } from "./Ribbon";
 import { SearchPanel } from "./SearchPanel";
+import { SettingsModal } from "./SettingsModal";
 import { StatusBar } from "./StatusBar";
 import { useOpenNote } from "./useOpenNote";
 
@@ -43,6 +44,11 @@ export function Workspace() {
   const [centerView, setCenterView] = useState<CenterView>("note");
   // Bumped whenever ⌘K / the ribbon Search icon wants the search field focused.
   const [searchFocusSignal, bumpSearchFocus] = useReducer((n: number) => n + 1, 0);
+  // Settings modal state, plus a version bumped when it closes so the chat
+  // pane re-reads the AI status (a provider configured in Settings must reach
+  // the pane without remounting it and wiping the transcript).
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [aiStatusVersion, bumpAiStatusVersion] = useReducer((n: number) => n + 1, 0);
 
   // The latest open-note snapshot, readable from the stable callbacks and the OS
   // close handler below without rebuilding them (or re-registering the window
@@ -111,6 +117,12 @@ export function Workspace() {
     },
     [openNoteAt],
   );
+
+  const handleOpenSettings = useCallback(() => setSettingsOpen(true), []);
+  const handleCloseSettings = useCallback(() => {
+    setSettingsOpen(false);
+    bumpAiStatusVersion();
+  }, []);
 
   const handleShowFiles = useCallback(() => setSidebarPanel("files"), []);
   const handleShowSearch = useCallback(() => {
@@ -210,6 +222,7 @@ export function Workspace() {
           onShowFiles={handleShowFiles}
           onShowSearch={handleShowSearch}
           onToggleGraph={handleToggleGraph}
+          onOpenSettings={handleOpenSettings}
         />
         {sidebarPanel === "files" ? (
           <FileTree
@@ -237,7 +250,11 @@ export function Workspace() {
             onOpenLink={openNoteRel}
           />
         )}
-        <ChatPane openNoteAt={openNoteAt} />
+        <ChatPane
+          openNoteAt={openNoteAt}
+          onOpenSettings={handleOpenSettings}
+          refreshSignal={aiStatusVersion}
+        />
       </div>
 
       <StatusBar vaultName={vault.name} tree={tree} note={open.note} />
@@ -256,6 +273,8 @@ export function Workspace() {
           </button>
         </div>
       )}
+
+      <SettingsModal open={settingsOpen} onClose={handleCloseSettings} />
 
       {pendingDiscard && (
         <ConfirmDialog

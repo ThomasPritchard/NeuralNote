@@ -23,15 +23,23 @@
 import { mockIPC, mockWindows } from "@tauri-apps/api/mocks";
 import type { InvokeArgs } from "@tauri-apps/api/core";
 import type {
+  AiStatus,
   ApiKeyStatus,
   Backlinks,
+  CandidateModel,
   ChatEvent,
   CoreError,
   FileHit,
   GraphLink,
   GraphNode,
+  HardwareSpec,
+  HfModelMeta,
+  InstalledModel,
   LinkGraph,
   NoteDoc,
+  ProviderKind,
+  PullEvent,
+  Recommendation,
   RecentVault,
   SearchMatch,
   SearchResponse,
@@ -72,15 +80,37 @@ export interface CreateMockVaultOptions {
   pickFolder?: string | null;
   /** What the "new vault location" folder picker returns (null = cancelled). */
   pickNewLocation?: string | null;
-  /** The AI key status `api_key_status` reports. Defaults to a key present so a
-   *  test lands straight in the chat view; pass `{ hasKey: false }` to exercise
-   *  the guided-setup state. `model` defaults to {@link DEFAULT_CHAT_MODEL}. */
+  /** The AI key status `api_key_status`/`ai_status` report. Defaults to a key
+   *  present so a test lands straight in the chat view; pass `{ hasKey: false }`
+   *  to exercise the first-run provider picker (and, through it, guided key
+   *  setup). `model` defaults to {@link DEFAULT_CHAT_MODEL}. */
   apiKey?: { hasKey: boolean; model?: string };
   /** The `ChatEvent` sequence the `chat` command streams to its Channel, in
    *  order, exactly as the Rust core would (searching → … → done | error). */
   chatScript?: ChatEvent[];
   /** Fixed clock for template rendering. Defaults to the Rust test fixture time. */
   now?: Date;
+  // ── Local-AI provider (ai_status / detect_hardware / recommend / pull / …) ──
+  /** Explicit `active_provider` for `ai_status`. Defaults to the keyState
+   *  derivation (`effective_provider`: key → "openRouter", else null). */
+  activeProvider?: ProviderKind | null;
+  /** The local model tag `ai_status` reports as active (drives the status pill). */
+  localActiveTag?: string | null;
+  /** What `detect_hardware` returns. Defaults to a capable Apple-Silicon spec. */
+  hardware?: HardwareSpec;
+  /** What `recommend_local_model` returns. Defaults to a "supported" verdict. */
+  recommendation?: Recommendation;
+  /** The curated catalogue `local_candidates` returns. Defaults to two models. */
+  localCandidates?: CandidateModel[];
+  /** Models already installed (`list_local_models`). Defaults to none. */
+  installedModels?: InstalledModel[];
+  /** The `PullEvent` stream `pull_local_model` replays (progress → success|error).
+   *  Defaults to a short progress→success run; a successful run also marks the
+   *  model installed, exactly as Ollama would. */
+  pullScript?: PullEvent[];
+  /** HF metadata by hfRepo for `hf_model_metadata`. A repo with no entry makes the
+   *  command reject, which the UI treats as "no metadata" (non-fatal by contract). */
+  hfMeta?: Record<string, HfModelMeta>;
 }
 
 export interface MockVault {
@@ -1191,7 +1221,7 @@ interface TauriInternalsLike {
 /** Stream a scripted `ChatEvent[]` to the invoke's Channel exactly as the Rust
  *  core would: one in-order `{ index, message }` frame per event. Throws loudly
  *  if the channel isn't wired to the mock IPC — a dropped stream is never silent. */
-const emitToChannel = (channel: unknown, events: ChatEvent[]): void => {
+const emitToChannel = (channel: unknown, events: readonly unknown[]): void => {
   const id = (channel as TauriChannelLike | null)?.id;
   const runCallback = (window as unknown as {
     __TAURI_INTERNALS__?: TauriInternalsLike;
@@ -1199,11 +1229,58 @@ const emitToChannel = (channel: unknown, events: ChatEvent[]): void => {
   if (typeof id !== "number" || !runCallback) {
     throw {
       kind: "io",
-      message: "chat channel is not wired to the mock IPC",
+      message: "event channel is not wired to the mock IPC",
     } satisfies CoreErrorLike;
   }
   events.forEach((message, index) => runCallback(id, { index, message }));
 };
+
+// ── Local-AI defaults (a capable Apple-Silicon machine on the supported path) ──
+const GIB = 1024 ** 3;
+
+const DEFAULT_HARDWARE: HardwareSpec = {
+  totalRamBytes: 16 * GIB,
+  cpuCores: 8,
+  cpuBrand: "Apple M2",
+  gpuLabel: null,
+  arch: "aarch64",
+  os: "macos",
+};
+
+const DEFAULT_LOCAL_CANDIDATES: CandidateModel[] = [
+  {
+    tag: "llama3.2:3b",
+    params: "3.2B",
+    downloadBytes: 2_000_000_000,
+    minRamBytes: 6_000_000_000,
+    license: "Llama 3.2",
+    hfRepo: "meta-llama/Llama-3.2-3B-Instruct",
+  },
+  {
+    tag: "qwen2.5:7b",
+    params: "7.6B",
+    downloadBytes: 4_700_000_000,
+    minRamBytes: 10_000_000_000,
+    license: "Apache-2.0",
+    hfRepo: "Qwen/Qwen2.5-7B-Instruct",
+  },
+];
+
+const DEFAULT_RECOMMENDATION: Recommendation = {
+  status: "supported",
+  modelTag: "qwen2.5:7b",
+  params: "7.6B",
+  estRamBytes: 10_000_000_000,
+  why: "Fits comfortably in your 11 GB of usable memory.",
+};
+
+/** A short, realistic pull: manifest → half → full → success. */
+const DEFAULT_PULL_SCRIPT: PullEvent[] = [
+  { type: "progress", status: "pulling manifest", digest: null, completed: null, total: null, percent: null },
+  { type: "progress", status: "downloading", digest: "sha256:abc", completed: 2_350_000_000, total: 4_700_000_000, percent: 50 },
+  { type: "progress", status: "downloading", digest: "sha256:abc", completed: 4_700_000_000, total: 4_700_000_000, percent: 100 },
+  { type: "success" },
+];
 
 export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
   let root = VAULT_ROOT;
@@ -1224,6 +1301,18 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     model: opts.apiKey?.model ?? DEFAULT_CHAT_MODEL,
   };
   const chatScript = opts.chatScript ?? [];
+
+  // Local-AI provider state, mutated by set_active_provider / pull / delete and
+  // reported by ai_status / list_local_models. `explicitProvider` mirrors the Rust
+  // `ProviderConfig.active_provider`; `effectiveProvider` mirrors its
+  // `effective_provider()` (a key with no explicit choice reads as OpenRouter).
+  const aiState = {
+    explicitProvider: (opts.activeProvider ?? null) as ProviderKind | null,
+    localActiveTag: opts.localActiveTag ?? null,
+    installed: [...(opts.installedModels ?? [])] as InstalledModel[],
+  };
+  const effectiveProvider = (): ProviderKind | null =>
+    aiState.explicitProvider ?? (keyState.hasKey ? "openRouter" : null);
 
   const relOf = (p: string): string => p.slice(root.length + 1);
 
@@ -1603,6 +1692,66 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
       // ── AI: cited chat (api_key_* + chat) ─────────────────────────────────
       case "api_key_status":
         return { hasKey: keyState.hasKey, model: keyState.model } satisfies ApiKeyStatus;
+      case "ai_status":
+        // The effective provider mirrors the Rust `effective_provider()`: an
+        // explicit choice wins, else a stored key reads as "openRouter", else null
+        // (the first-run picker). Local state is mutated by set_active_provider.
+        return {
+          activeProvider: effectiveProvider(),
+          openrouter: { hasKey: keyState.hasKey, model: keyState.model },
+          local: { activeModelTag: aiState.localActiveTag },
+        } satisfies AiStatus;
+      case "detect_hardware":
+        return opts.hardware ?? DEFAULT_HARDWARE;
+      case "recommend_local_model":
+        return opts.recommendation ?? DEFAULT_RECOMMENDATION;
+      case "local_candidates":
+        return opts.localCandidates ?? DEFAULT_LOCAL_CANDIDATES;
+      case "list_local_models":
+        // The command starts the sidecar in the shell; here it just reports state.
+        return aiState.installed;
+      case "set_active_provider": {
+        aiState.explicitProvider = a.provider as ProviderKind;
+        if (a.localModelTag != null) aiState.localActiveTag = a.localModelTag as string;
+        return undefined;
+      }
+      case "hf_model_metadata": {
+        const repo = a.hfRepo as string;
+        const meta = (opts.hfMeta ?? {})[repo];
+        // No entry → reject, exactly as an unreachable HF would; the UI treats it
+        // as "no metadata" (non-fatal by contract).
+        if (!meta) fail("localAi", `no Hugging Face metadata for ${repo}`);
+        return meta;
+      }
+      case "delete_local_model": {
+        const tag = a.tag as string;
+        aiState.installed = aiState.installed.filter((m) => m.tag !== tag);
+        if (aiState.localActiveTag === tag) aiState.localActiveTag = null;
+        return undefined;
+      }
+      case "cancel_pull":
+        // The stream is delivered synchronously below, so there's nothing in-flight
+        // to interrupt here; a cancel is exercised via a pullScript ending in an
+        // error frame. No-op, matching the fire-and-forget command.
+        return undefined;
+      case "pull_local_model": {
+        const tag = a.tag as string;
+        const script = opts.pullScript ?? DEFAULT_PULL_SCRIPT;
+        emitToChannel(a.onEvent, script);
+        // A successful pull leaves the model installed, exactly as Ollama would, so
+        // the subsequent list_local_models / set_active_provider reflect it.
+        const succeeded = script.some((e) => (e as PullEvent).type === "success");
+        if (succeeded && !aiState.installed.some((m) => m.tag === tag)) {
+          aiState.installed.push({
+            tag,
+            sizeBytes: 4_700_000_000,
+            family: null,
+            parameterSize: null,
+            quantization: null,
+          });
+        }
+        return undefined;
+      }
       case "save_api_key": {
         // The key itself never crosses back; only presence + model are reported.
         keyState.hasKey = true;

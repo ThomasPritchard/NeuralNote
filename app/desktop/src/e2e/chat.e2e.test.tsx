@@ -7,7 +7,7 @@
 // core would (one `{ index, message }` frame per event, in order), so the pane
 // folds a genuine stream. See `mockVault.ts`'s `emitToChannel` for the mechanism.
 //
-//   1. No key            → guided setup renders (never a raw error).
+//   1. No provider       → first-run picker → guided setup (never a raw error).
 //   2. Ask → stream      → the harness trace, streamed answer, a source chip,
 //                          and the coverage footer all render.
 //   3. Citation click    → opens the cited note in the reader.
@@ -69,8 +69,13 @@ async function ask(user: ReturnType<typeof renderApp>["user"], prompt: string) {
 }
 
 describe("Journey 7: cited chat — no API key", () => {
-  it("shows guided key setup, not a raw error", async () => {
-    await openWorkspace({ apiKey: { hasKey: false } });
+  it("shows the provider picker, then guided key setup — not a raw error", async () => {
+    const { user } = await openWorkspace({ apiKey: { hasKey: false } });
+
+    // Nothing configured → the first-run provider picker, not an error.
+    await user.click(
+      await screen.findByRole("button", { name: /connect an openrouter key/i }),
+    );
 
     expect(await screen.findByText("Connect an AI key")).toBeInTheDocument();
     expect(screen.getByLabelText("OpenRouter API key")).toBeInTheDocument();

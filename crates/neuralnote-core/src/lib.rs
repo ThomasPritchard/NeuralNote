@@ -1021,6 +1021,7 @@ mod tests {
             CoreError::Io("a".into()),
             CoreError::Frontmatter("a".into()),
             CoreError::Llm("a".into()),
+            CoreError::LocalAi("a".into()),
         ] {
             assert!(!e.to_string().is_empty());
         }

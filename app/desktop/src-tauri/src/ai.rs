@@ -10,19 +10,15 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use neuralnote_core::ai::{openai, provider_config};
 use neuralnote_core::ai::{
-    ChatEvent, Completion, EventSink, LlmClient, LlmMessage, LlmRequest, Role, ToolCall,
-    DEFAULT_MODEL,
+    ChatEvent, Completion, EventSink, LlmClient, LlmMessage, LlmRequest, Role,
 };
 use neuralnote_core::CoreError;
 use serde::{Deserialize, Serialize};
 use std::{
-    fs,
-    path::{Path, PathBuf},
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Mutex, OnceLock,
-    },
+    path::Path,
+    sync::{Mutex, OnceLock},
     time::Duration,
 };
 
@@ -32,30 +28,12 @@ const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 /// Keychain identity for the secret API key.
 const KEYCHAIN_SERVICE: &str = "com.neuralnote.desktop";
 const KEY_ACCOUNT: &str = "openrouter-api-key";
-const AI_CONFIG_FILE: &str = "ai-config.json";
-static AI_CONFIG_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ApiKeyStatus {
     pub has_key: bool,
     pub model: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredAiConfig {
-    model: String,
-    key_configured: bool,
-}
-
-impl Default for StoredAiConfig {
-    fn default() -> Self {
-        Self {
-            model: DEFAULT_MODEL.to_string(),
-            key_configured: false,
-        }
-    }
 }
 
 struct CacheState {
@@ -141,63 +119,7 @@ pub fn read_api_key() -> Result<Option<String>, CoreError> {
 
 /* ─────────────────────────────  AI config  ─────────────────────────────── */
 
-fn config_file(config_dir: &Path) -> PathBuf {
-    config_dir.join(AI_CONFIG_FILE)
-}
-
-fn normalized_model(model: &str) -> String {
-    let model = model.trim();
-    if model.is_empty() {
-        DEFAULT_MODEL.to_string()
-    } else {
-        model.to_string()
-    }
-}
-
-fn normalize_config(mut config: StoredAiConfig) -> StoredAiConfig {
-    config.model = normalized_model(&config.model);
-    config
-}
-
-fn read_config_fallible(config_dir: &Path) -> Result<StoredAiConfig, CoreError> {
-    let path = config_file(config_dir);
-    let raw = match fs::read_to_string(&path) {
-        Ok(raw) => raw,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(StoredAiConfig::default());
-        }
-        Err(e) => {
-            return Err(CoreError::Io(format!(
-                "could not read AI config at {}: {e}",
-                path.display()
-            )))
-        }
-    };
-
-    match serde_json::from_str::<StoredAiConfig>(&raw) {
-        Ok(config) => Ok(normalize_config(config)),
-        Err(e) => Err(CoreError::Io(format!(
-            "could not parse AI config at {}: {e}",
-            path.display()
-        ))),
-    }
-}
-
-fn read_config_lenient(config_dir: &Path) -> StoredAiConfig {
-    match read_config_fallible(config_dir) {
-        Ok(config) => config,
-        Err(CoreError::Io(msg)) => {
-            log::warn!("{msg}");
-            StoredAiConfig::default()
-        }
-        Err(e) => {
-            log::warn!("could not read AI config: {e}");
-            StoredAiConfig::default()
-        }
-    }
-}
-
-fn error_detail(error: CoreError) -> String {
+pub(crate) fn error_detail(error: CoreError) -> String {
     match error {
         CoreError::NotFound(msg)
         | CoreError::AlreadyExists(msg)
@@ -206,56 +128,19 @@ fn error_detail(error: CoreError) -> String {
         | CoreError::Conflict(msg)
         | CoreError::Io(msg)
         | CoreError::Frontmatter(msg)
-        | CoreError::Llm(msg) => msg,
+        | CoreError::Llm(msg)
+        | CoreError::LocalAi(msg) => msg,
     }
-}
-
-fn write_config(config_dir: &Path, config: &StoredAiConfig) -> Result<(), CoreError> {
-    fs::create_dir_all(config_dir)
-        .map_err(|e| CoreError::Io(format!("could not create AI config dir: {e}")))?;
-    let config = StoredAiConfig {
-        model: normalized_model(&config.model),
-        key_configured: config.key_configured,
-    };
-    let bytes = serde_json::to_vec_pretty(&config)
-        .map_err(|e| CoreError::Io(format!("could not serialize AI config: {e}")))?;
-    let path = config_file(config_dir);
-    let file_name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| AI_CONFIG_FILE.into());
-    let parent = path.parent().ok_or_else(|| {
-        CoreError::Io(format!("AI config path has no parent: {}", path.display()))
-    })?;
-    let seq = AI_CONFIG_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(".{file_name}.{}.{seq}.nn-tmp", std::process::id()));
-    if let Err(e) = fs::write(&tmp, bytes) {
-        let _ = fs::remove_file(&tmp);
-        return Err(CoreError::Io(format!("could not write AI config: {e}")));
-    }
-    if let Err(e) = fs::rename(&tmp, &path) {
-        let _ = fs::remove_file(&tmp);
-        return Err(CoreError::Io(format!("could not replace AI config: {e}")));
-    }
-    Ok(())
 }
 
 /// What the frontend can know without touching the keychain: whether a key was
 /// configured and the model preference. The key itself is never returned.
 pub fn api_key_status(config_dir: &Path) -> Result<ApiKeyStatus, CoreError> {
-    let config = read_config_fallible(config_dir)?;
+    let config = provider_config::read_provider_config(config_dir)?;
     Ok(ApiKeyStatus {
         has_key: config.key_configured,
         model: config.model,
     })
-}
-
-/// The configured model id, falling back to the default when config is absent or
-/// unreadable. Older builds stored this non-secret value in the keychain under
-/// `openrouter-model`; that orphaned item is intentionally never read because a
-/// read can trigger a macOS Keychain prompt.
-pub fn read_model(config_dir: &Path) -> Result<String, CoreError> {
-    Ok(read_config_lenient(config_dir).model)
 }
 
 /// Store the API key in the keychain and the non-secret model preference in app
@@ -269,14 +154,20 @@ pub fn save_api_key(config_dir: &Path, key: &str, model: &str) -> Result<(), Cor
         .set_password(key)
         .map_err(|e| CoreError::Io(format!("could not store API key in the keychain: {e}")))?;
     set_api_key_cache(Some(key.to_string()));
-    write_config(
-        config_dir,
-        &StoredAiConfig {
-            model: model.to_string(),
-            key_configured: true,
-        },
-    )
-    .map_err(|e| {
+    // Mirror clear_api_key: a corrupt config must NOT be silently clobbered to
+    // default() — that would drop the user's active_provider/local_model_tag and
+    // silently flip them onto OpenRouter. The key is already safe in the keychain,
+    // so surface the config failure rather than guessing. (A *missing* file reads
+    // as Ok(default); only genuine corruption/IO errors reach this map_err.)
+    let mut config = provider_config::read_provider_config(config_dir).map_err(|e| {
+        CoreError::Io(format!(
+            "API key was stored in the keychain, but your AI settings file is unreadable and was left untouched: {}",
+            error_detail(e)
+        ))
+    })?;
+    config.model = model.to_string();
+    config.key_configured = true;
+    provider_config::write_provider_config(config_dir, &config).map_err(|e| {
         CoreError::Io(format!(
             "API key was stored in the keychain, but the AI preference file could not be updated: {}",
             error_detail(e)
@@ -298,14 +189,14 @@ pub fn clear_api_key(config_dir: &Path) -> Result<(), CoreError> {
             )))
         }
     }
-    let mut config = read_config_fallible(config_dir).map_err(|e| {
+    let mut config = provider_config::read_provider_config(config_dir).map_err(|e| {
         CoreError::Io(format!(
             "The keychain was cleared, but the AI preference file could not be updated: {}",
             error_detail(e)
         ))
     })?;
     config.key_configured = false;
-    write_config(config_dir, &config).map_err(|e| {
+    provider_config::write_provider_config(config_dir, &config).map_err(|e| {
         CoreError::Io(format!(
             "The keychain was cleared, but the AI preference file could not be updated: {}",
             error_detail(e)
@@ -385,45 +276,80 @@ impl EventSink for TauriChannelSink {
 
 /* ─────────────────────────────  LLM client  ────────────────────────────── */
 
-/// OpenRouter-backed [`LlmClient`]. Holds one reusable HTTP client and the API key;
-/// the model id travels per-request in [`LlmRequest::model`].
-pub struct OpenRouterClient {
+/// OpenAI-compatible [`LlmClient`]. Holds one reusable HTTP client and endpoint
+/// config; the model id travels per-request in [`LlmRequest::model`].
+pub struct OpenAiChatClient {
     http: reqwest::Client,
-    api_key: String,
+    url: String,
+    bearer: Option<String>,
+    title: Option<&'static str>,
 }
 
-impl OpenRouterClient {
-    pub fn new(api_key: String) -> Self {
+impl OpenAiChatClient {
+    pub fn new_with(
+        url: String,
+        bearer: Option<String>,
+        title: Option<&'static str>,
+        connect_timeout: Duration,
+        read_timeout: Duration,
+    ) -> Self {
         // Timeouts so a stalled/half-open endpoint can't hang `chat` forever with no
         // event (the "failures are never silent" contract). `connect_timeout` guards
         // connection setup; `read_timeout` is the per-read idle timeout — it aborts a
         // stream that goes quiet without capping a legitimately long one (a blanket
         // `.timeout()` would kill long streams, so it is deliberately omitted).
         let http = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(10))
-            .read_timeout(Duration::from_secs(120))
+            .connect_timeout(connect_timeout)
+            .read_timeout(read_timeout)
             .build()
             .unwrap_or_else(|e| {
                 log::warn!("failed to build the HTTP client with timeouts ({e}); using default");
                 reqwest::Client::new()
             });
-        Self { http, api_key }
+        Self {
+            http,
+            url,
+            bearer,
+            title,
+        }
+    }
+
+    pub fn new(api_key: String) -> Self {
+        Self::new_with(
+            OPENROUTER_URL.to_string(),
+            Some(api_key),
+            Some("NeuralNote"),
+            Duration::from_secs(10),
+            Duration::from_secs(120),
+        )
+    }
+
+    fn provider_label(&self) -> &'static str {
+        if self.bearer.is_none() && self.title.is_none() {
+            "Local AI"
+        } else {
+            "OpenRouter"
+        }
     }
 
     /// POST a request body to OpenRouter with auth + attribution headers. `stream`
     /// selects SSE vs a single JSON response. Returns the raw response for the
     /// caller to parse (buffered JSON or streamed SSE).
-    async fn post(&self, body: &WireRequest<'_>) -> Result<reqwest::Response, CoreError> {
-        let resp = self
-            .http
-            .post(OPENROUTER_URL)
-            .bearer_auth(&self.api_key)
+    async fn post(&self, body: &serde_json::Value) -> Result<reqwest::Response, CoreError> {
+        let provider = self.provider_label();
+        let mut req = self.http.post(&self.url);
+        if let Some(bearer) = &self.bearer {
+            req = req.bearer_auth(bearer);
+        }
+        if let Some(title) = self.title {
             // OpenRouter attribution (optional, but polite + helps rate limits).
-            .header("X-Title", "NeuralNote")
+            req = req.header("X-Title", title);
+        }
+        let resp = req
             .json(body)
             .send()
             .await
-            .map_err(|e| CoreError::Llm(format!("request to OpenRouter failed: {e}")))?;
+            .map_err(|e| CoreError::Llm(format!("request to {provider} failed: {e}")))?;
 
         if !resp.status().is_success() {
             let status = resp.status();
@@ -433,93 +359,30 @@ impl OpenRouterClient {
             // Redact the key before it can reach a user-facing error or a log: a
             // provider/proxy error body could echo the Authorization header, and a
             // leaked key is catastrophic. Defence in depth on the secret boundary.
-            let detail = redact(body.trim(), &self.api_key);
+            let key = self.bearer.as_deref().unwrap_or("");
+            let detail = openai::redact(body.trim(), key);
             let detail = detail.trim();
             return Err(CoreError::Llm(if detail.is_empty() {
-                format!("OpenRouter returned {status}")
+                format!("{provider} returned {status}")
             } else {
-                format!("OpenRouter returned {status}: {detail}")
+                format!("{provider} returned {status}: {detail}")
             }));
         }
         Ok(resp)
     }
 }
 
-/// Redact the API key from provider/proxy error text before it reaches the user or
-/// a log. OpenRouter shouldn't echo the Authorization header, but a proxy or a
-/// verbose gateway error might — and a leaked key is catastrophic.
-fn redact(text: &str, key: &str) -> String {
-    if key.is_empty() {
-        text.to_string()
-    } else {
-        text.replace(key, "***")
-    }
-}
-
-/// Process one SSE line into the sink + accumulator. `Ok(Some(answer))` means a
-/// terminal `[DONE]` was seen (stop reading); `Ok(None)` means keep reading; `Err`
-/// surfaces a mid-stream error frame. Shared by the newline loop and the EOF flush
-/// so the returned string stays byte-equal to the streamed deltas.
-fn consume_sse_line(
-    line_bytes: &[u8],
-    sink: &mut dyn EventSink,
-    full: &mut String,
-) -> Result<Option<String>, CoreError> {
-    match parse_sse_line(&String::from_utf8_lossy(line_bytes)) {
-        SseEvent::Delta(delta) => {
-            sink.send(ChatEvent::Answer {
-                delta: delta.clone(),
-            });
-            full.push_str(&delta);
-            Ok(None)
-        }
-        SseEvent::Done => Ok(Some(full.clone())),
-        SseEvent::Error(msg) => Err(CoreError::Llm(msg)),
-        SseEvent::Other => Ok(None),
-    }
-}
-
-/// Final guard on a streamed answer: an empty answer on the (no-tools) answer turn
-/// is always a failure — whether the stream ended via `[DONE]` (loop early-return)
-/// or plain EOF, a blank result must surface as an error, never be returned as a
-/// successful empty answer the UI would mark `Done`. Both return sites route here.
-fn finish_answer(full: String) -> Result<String, CoreError> {
-    if full.is_empty() {
-        Err(CoreError::Llm(
-            "the model returned an empty answer (the stream ended without content)".into(),
-        ))
-    } else {
-        Ok(full)
-    }
-}
-
 #[async_trait]
-impl LlmClient for OpenRouterClient {
+impl LlmClient for OpenAiChatClient {
     async fn complete(&self, req: &LlmRequest) -> Result<Completion, CoreError> {
-        let body = WireRequest::from_core(req, false);
+        let body = openai::to_wire_request(req, false);
         let resp = self.post(&body).await?;
-        let parsed: WireResponse = resp
+        let provider = self.provider_label();
+        let value: serde_json::Value = resp
             .json()
             .await
-            .map_err(|e| CoreError::Llm(format!("could not parse OpenRouter response: {e}")))?;
-        let msg = parsed
-            .choices
-            .into_iter()
-            .next()
-            .map(|c| c.message)
-            .ok_or_else(|| CoreError::Llm("OpenRouter returned no choices".into()))?;
-        Ok(Completion {
-            content: msg.content,
-            tool_calls: msg
-                .tool_calls
-                .into_iter()
-                .map(|t| ToolCall {
-                    id: t.id,
-                    name: t.function.name,
-                    arguments: t.function.arguments,
-                })
-                .collect(),
-        })
+            .map_err(|e| CoreError::Llm(format!("could not parse {provider} response: {e}")))?;
+        openai::parse_completion(value)
     }
 
     async fn complete_streaming(
@@ -527,7 +390,7 @@ impl LlmClient for OpenRouterClient {
         req: &LlmRequest,
         sink: &mut dyn EventSink,
     ) -> Result<String, CoreError> {
-        let body = WireRequest::from_core(req, true);
+        let body = openai::to_wire_request(req, true);
         let resp = self.post(&body).await?;
 
         // Buffer BYTES, not str: a chunk can split a multibyte char, but never the
@@ -546,8 +409,8 @@ impl LlmClient for OpenRouterClient {
 
             while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
                 let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-                if let Some(answer) = consume_sse_line(&line_bytes, sink, &mut full)? {
-                    return finish_answer(answer);
+                if let Some(answer) = openai::consume_sse_line(&line_bytes, sink, &mut full)? {
+                    return openai::finish_answer(answer);
                 }
             }
         }
@@ -555,213 +418,10 @@ impl LlmClient for OpenRouterClient {
         // last delta, or a terminal error frame, in the tail would be silently lost
         // (and a cited id in that tail would go missing, corrupting verification).
         if !buf.is_empty() {
-            consume_sse_line(&buf, sink, &mut full)?;
+            openai::consume_sse_line(&buf, sink, &mut full)?;
         }
-        finish_answer(full)
+        openai::finish_answer(full)
     }
-}
-
-/// One parsed SSE line's meaning.
-enum SseEvent {
-    /// A content chunk to stream to the UI.
-    Delta(String),
-    /// The `data: [DONE]` terminator.
-    Done,
-    /// A mid-stream OpenRouter `error` frame (HTTP was already 200) — fatal, must
-    /// surface as a `ChatEvent::Error`, never be swallowed into an empty answer.
-    Error(String),
-    /// A heartbeat comment, blank line, non-`data:` field, empty delta, or a
-    /// malformed chunk — all skipped, none fatal.
-    Other,
-}
-
-/// Parse one line of the OpenRouter SSE stream. Pure (no I/O) so it is unit-tested
-/// directly. A malformed `data:` payload is skipped, not surfaced — mid-stream JSON
-/// noise (e.g. keep-alive artifacts) must not sink an otherwise-good answer.
-fn parse_sse_line(line: &str) -> SseEvent {
-    let line = line.trim_end_matches(['\r', '\n']).trim();
-    // `:`-prefixed lines are SSE comments (OpenRouter sends `: OPENROUTER PROCESSING`).
-    if line.is_empty() || line.starts_with(':') {
-        return SseEvent::Other;
-    }
-    let Some(data) = line.strip_prefix("data:") else {
-        return SseEvent::Other;
-    };
-    let data = data.trim();
-    if data == "[DONE]" {
-        return SseEvent::Done;
-    }
-    match serde_json::from_str::<StreamChunk>(data) {
-        Ok(chunk) => {
-            // Check the error frame BEFORE the empty-delta filter: the failure frame
-            // carries an empty `delta.content`, so filtering first would drop it.
-            if let Some(err) = chunk.error {
-                let msg = err.message.unwrap_or_else(|| "unknown error".into());
-                return match err.code {
-                    Some(code) => {
-                        // Render a string code without JSON quotes (`rate_limited`,
-                        // not `"rate_limited"`); numbers/other Values use Display.
-                        let code = code
-                            .as_str()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| code.to_string());
-                        SseEvent::Error(format!("OpenRouter stream error {code}: {msg}"))
-                    }
-                    None => SseEvent::Error(format!("OpenRouter stream error: {msg}")),
-                };
-            }
-            chunk
-                .choices
-                .into_iter()
-                .next()
-                .and_then(|c| c.delta.content)
-                .filter(|s| !s.is_empty())
-                .map(SseEvent::Delta)
-                .unwrap_or(SseEvent::Other)
-        }
-        Err(_) => SseEvent::Other,
-    }
-}
-
-/* ───────────────────────────  Wire (OpenAI) shape  ─────────────────────── */
-// The core's LlmMessage serialises camelCase (the IPC/UI contract). The OpenRouter
-// wire is snake_case, so we map explicitly here rather than reuse the core's serde.
-
-#[derive(Serialize)]
-struct WireRequest<'a> {
-    model: &'a str,
-    messages: Vec<WireMessage>,
-    /// Omitted entirely when empty — that is how the orchestrator's final answer
-    /// turn (no tools) tells the model to prose, not tool-call.
-    #[serde(skip_serializing_if = "<[_]>::is_empty")]
-    tools: &'a [serde_json::Value],
-    stream: bool,
-}
-
-impl<'a> WireRequest<'a> {
-    fn from_core(req: &'a LlmRequest, stream: bool) -> Self {
-        Self {
-            model: &req.model,
-            messages: req.messages.iter().map(WireMessage::from_core).collect(),
-            tools: &req.tools,
-            stream,
-        }
-    }
-}
-
-#[derive(Serialize)]
-struct WireMessage {
-    role: &'static str,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    content: Option<String>,
-    #[serde(skip_serializing_if = "Vec::is_empty")]
-    tool_calls: Vec<WireToolCall>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    tool_call_id: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    name: Option<String>,
-}
-
-impl WireMessage {
-    fn from_core(m: &LlmMessage) -> Self {
-        Self {
-            role: role_str(m.role),
-            content: m.content.clone(),
-            tool_calls: m
-                .tool_calls
-                .iter()
-                .map(|t| WireToolCall {
-                    id: t.id.clone(),
-                    kind: "function",
-                    function: WireFn {
-                        name: t.name.clone(),
-                        arguments: t.arguments.clone(),
-                    },
-                })
-                .collect(),
-            tool_call_id: m.tool_call_id.clone(),
-            name: m.name.clone(),
-        }
-    }
-}
-
-fn role_str(role: Role) -> &'static str {
-    match role {
-        Role::System => "system",
-        Role::User => "user",
-        Role::Assistant => "assistant",
-        Role::Tool => "tool",
-    }
-}
-
-#[derive(Serialize)]
-struct WireToolCall {
-    id: String,
-    #[serde(rename = "type")]
-    kind: &'static str,
-    function: WireFn,
-}
-
-#[derive(Serialize)]
-struct WireFn {
-    name: String,
-    arguments: String,
-}
-
-// ── Response (non-streamed) ──
-#[derive(Deserialize)]
-struct WireResponse {
-    choices: Vec<WireChoice>,
-}
-#[derive(Deserialize)]
-struct WireChoice {
-    message: WireRespMessage,
-}
-#[derive(Deserialize)]
-struct WireRespMessage {
-    #[serde(default)]
-    content: Option<String>,
-    #[serde(default)]
-    tool_calls: Vec<WireRespToolCall>,
-}
-#[derive(Deserialize)]
-struct WireRespToolCall {
-    id: String,
-    function: WireRespFn,
-}
-#[derive(Deserialize)]
-struct WireRespFn {
-    name: String,
-    arguments: String,
-}
-
-// ── Response (streamed delta) ──
-#[derive(Deserialize)]
-struct StreamChunk {
-    #[serde(default)]
-    choices: Vec<StreamChoice>,
-    /// Present on a mid-stream failure frame. OpenRouter commits HTTP 200 on the
-    /// first token, so a later failure (rate-limit, out-of-credits, provider 5xx,
-    /// content filter) arrives in-band here — it MUST be surfaced, not ignored.
-    #[serde(default)]
-    error: Option<StreamError>,
-}
-#[derive(Deserialize)]
-struct StreamError {
-    #[serde(default)]
-    code: Option<serde_json::Value>,
-    #[serde(default)]
-    message: Option<String>,
-}
-#[derive(Deserialize)]
-struct StreamChoice {
-    #[serde(default)]
-    delta: StreamDelta,
-}
-#[derive(Deserialize, Default)]
-struct StreamDelta {
-    #[serde(default)]
-    content: Option<String>,
 }
 
 #[cfg(test)]
@@ -769,6 +429,9 @@ mod tests {
     use super::*;
     use keyring::credential::{Credential, CredentialApi, CredentialBuilderApi};
     use keyring::{Error as KeyringError, Result as KeyringResult};
+    use neuralnote_core::ai::provider_config::{
+        config_file, write_provider_config, ProviderConfig,
+    };
     use neuralnote_core::ai::DEFAULT_MODEL;
     use std::any::Any;
     use std::collections::HashMap;
@@ -776,45 +439,6 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex as StdMutex, OnceLock};
-
-    #[test]
-    fn sse_content_line_yields_delta() {
-        let line = r#"data: {"choices":[{"delta":{"content":"Hello"}}]}"#;
-        assert!(matches!(parse_sse_line(line), SseEvent::Delta(d) if d == "Hello"));
-    }
-
-    #[test]
-    fn sse_done_terminates() {
-        assert!(matches!(parse_sse_line("data: [DONE]"), SseEvent::Done));
-    }
-
-    #[test]
-    fn sse_heartbeat_and_blank_are_ignored() {
-        assert!(matches!(
-            parse_sse_line(": OPENROUTER PROCESSING"),
-            SseEvent::Other
-        ));
-        assert!(matches!(parse_sse_line(""), SseEvent::Other));
-    }
-
-    #[test]
-    fn sse_empty_delta_is_ignored() {
-        // The final usage chunk carries an empty content delta — not a token.
-        let line = r#"data: {"choices":[{"delta":{"content":""}}],"usage":{}}"#;
-        assert!(matches!(parse_sse_line(line), SseEvent::Other));
-    }
-
-    #[test]
-    fn sse_toolcall_only_delta_is_ignored_on_answer_stream() {
-        // A delta with no `content` field (e.g. a tool_calls fragment) is not text.
-        let line = r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#;
-        assert!(matches!(parse_sse_line(line), SseEvent::Other));
-    }
-
-    #[test]
-    fn sse_malformed_json_is_skipped_not_fatal() {
-        assert!(matches!(parse_sse_line("data: {not json"), SseEvent::Other));
-    }
 
     #[test]
     fn chat_turn_maps_roles_and_defaults_to_user() {
@@ -830,143 +454,6 @@ mod tests {
         }
         .into();
         assert_eq!(u.role, Role::User);
-    }
-
-    #[test]
-    fn wire_request_omits_empty_tools_and_maps_snake_case() {
-        let req = LlmRequest {
-            model: "anthropic/claude-sonnet-4.5".into(),
-            messages: vec![LlmMessage::user("q")],
-            tools: Vec::new(),
-        };
-        let v = serde_json::to_value(WireRequest::from_core(&req, true)).unwrap();
-        assert_eq!(v["model"], "anthropic/claude-sonnet-4.5");
-        assert_eq!(v["stream"], true);
-        assert!(
-            v.get("tools").is_none(),
-            "empty tools must be omitted (answer turn)"
-        );
-        assert_eq!(v["messages"][0]["role"], "user");
-    }
-
-    #[test]
-    fn wire_message_maps_tool_call_to_snake_case_function_shape() {
-        let m = LlmMessage::assistant_tool_calls(vec![ToolCall {
-            id: "c1".into(),
-            name: "search_notes".into(),
-            arguments: r#"{"query":"x"}"#.into(),
-        }]);
-        let v = serde_json::to_value(WireMessage::from_core(&m)).unwrap();
-        assert_eq!(v["role"], "assistant");
-        assert_eq!(v["tool_calls"][0]["id"], "c1");
-        assert_eq!(v["tool_calls"][0]["type"], "function");
-        assert_eq!(v["tool_calls"][0]["function"]["name"], "search_notes");
-    }
-
-    // A sink that records events, to exercise consume_sse_line without a network.
-    #[derive(Default)]
-    struct VecSink(Vec<ChatEvent>);
-    impl EventSink for VecSink {
-        fn send(&mut self, event: ChatEvent) {
-            self.0.push(event);
-        }
-    }
-
-    #[test]
-    fn redact_removes_the_key_everywhere_it_appears() {
-        let key = "sk-or-secret-123";
-        let body = format!("401: bad key 'Bearer {key}' (also {key})");
-        let out = redact(&body, key);
-        assert!(!out.contains(key), "the key must never survive redaction");
-        assert!(out.contains("***"));
-    }
-
-    #[test]
-    fn redact_is_a_noop_for_an_empty_key() {
-        assert_eq!(redact("some error", ""), "some error");
-    }
-
-    #[test]
-    fn sse_error_frame_surfaces_even_with_empty_delta() {
-        // The exact mid-stream shape: HTTP was 200, then a failure frame carrying an
-        // error object and an empty content delta. It must NOT be filtered to Other.
-        let line = r#"data: {"error":{"code":429,"message":"Rate limit exceeded"},"choices":[{"delta":{"content":""},"finish_reason":"error"}]}"#;
-        match parse_sse_line(line) {
-            SseEvent::Error(msg) => {
-                assert!(msg.contains("429") && msg.contains("Rate limit exceeded"));
-            }
-            _ => panic!("expected SseEvent::Error for a mid-stream error frame"),
-        }
-    }
-
-    #[test]
-    fn sse_error_frame_without_code_still_surfaces() {
-        match parse_sse_line(r#"data: {"error":{"message":"Provider disconnected"}}"#) {
-            SseEvent::Error(msg) => assert!(msg.contains("Provider disconnected")),
-            _ => panic!("expected SseEvent::Error"),
-        }
-    }
-
-    #[test]
-    fn consume_sse_line_streams_delta_and_accumulates() {
-        let mut sink = VecSink::default();
-        let mut full = String::new();
-        let stop = consume_sse_line(
-            br#"data: {"choices":[{"delta":{"content":"Hi"}}]}"#,
-            &mut sink,
-            &mut full,
-        )
-        .unwrap();
-        assert!(stop.is_none());
-        assert_eq!(full, "Hi");
-        assert_eq!(sink.0.len(), 1);
-        match &sink.0[0] {
-            ChatEvent::Answer { delta } => assert_eq!(delta.as_str(), "Hi"),
-            _ => panic!("expected an Answer event"),
-        }
-    }
-
-    #[test]
-    fn consume_sse_line_error_frame_returns_err() {
-        let mut sink = VecSink::default();
-        let mut full = String::from("partial");
-        assert!(
-            consume_sse_line(
-                br#"data: {"error":{"message":"boom"}}"#,
-                &mut sink,
-                &mut full
-            )
-            .is_err(),
-            "a mid-stream error frame must surface as Err, not be swallowed"
-        );
-    }
-
-    #[test]
-    fn consume_sse_line_done_returns_the_accumulated_answer() {
-        let mut sink = VecSink::default();
-        let mut full = String::from("done text");
-        let stop = consume_sse_line(b"data: [DONE]", &mut sink, &mut full).unwrap();
-        assert_eq!(stop.as_deref(), Some("done text"));
-    }
-
-    #[test]
-    fn finish_answer_rejects_an_empty_stream_including_the_done_path() {
-        // A `[DONE]`-terminated stream that produced zero content is still a failure —
-        // the loop's early return routes through the same guard as plain EOF, so the
-        // silent-empty-answer class can't leak through `[DONE]`.
-        assert!(finish_answer(String::new()).is_err());
-        assert_eq!(finish_answer("answer".into()).unwrap(), "answer");
-    }
-
-    #[test]
-    fn sse_error_frame_string_code_renders_without_quotes() {
-        let line = r#"data: {"error":{"code":"rate_limited","message":"slow down"}}"#;
-        match parse_sse_line(line) {
-            SseEvent::Error(msg) => {
-                assert!(msg.contains("rate_limited") && !msg.contains("\"rate_limited\""));
-            }
-            _ => panic!("expected SseEvent::Error"),
-        }
     }
 
     static TEST_ID: AtomicU64 = AtomicU64::new(0);
@@ -1119,6 +606,15 @@ mod tests {
         fs::read_to_string(config_file(config_dir)).unwrap()
     }
 
+    fn provider_config(model: &str, key_configured: bool) -> ProviderConfig {
+        ProviderConfig {
+            active_provider: None,
+            model: model.into(),
+            key_configured,
+            local_model_tag: None,
+        }
+    }
+
     #[test]
     fn api_key_status_returns_err_for_present_corrupt_config_without_touching_keychain() {
         let _guard = KEYCHAIN_TEST_LOCK
@@ -1174,14 +670,7 @@ mod tests {
             .unwrap();
         let keychain = TestKeychain::install();
         let config_dir = temp_config_dir("status-no-keychain");
-        write_config(
-            &config_dir,
-            &StoredAiConfig {
-                model: "openai/gpt-4.1".into(),
-                key_configured: true,
-            },
-        )
-        .unwrap();
+        write_provider_config(&config_dir, &provider_config("openai/gpt-4.1", true)).unwrap();
 
         let status = api_key_status(&config_dir).unwrap();
 
@@ -1253,29 +742,36 @@ mod tests {
     }
 
     #[test]
-    fn save_api_key_caches_written_key_when_config_write_fails() {
+    fn save_api_key_caches_written_key_when_config_persistence_fails() {
         let _guard = KEYCHAIN_TEST_LOCK
             .get_or_init(|| StdMutex::new(()))
             .lock()
             .unwrap();
         let keychain = TestKeychain::install();
-        let parent = temp_config_dir("save-config-write-fails");
+        let parent = temp_config_dir("save-config-persist-fails");
+        // A file where the config *dir* should be: the config step can neither read
+        // nor write it, so persistence fails after the keychain write succeeds.
         let blocked_config_dir = parent.join("not-a-dir");
-        fs::write(&blocked_config_dir, "blocks create_dir_all").unwrap();
+        fs::write(&blocked_config_dir, "blocks the config dir").unwrap();
 
         let err = save_api_key(&blocked_config_dir, "sk-or-session", "openai/gpt-4.1")
-            .expect_err("config write should fail after the keychain write succeeds");
+            .expect_err("config persistence should fail after the keychain write succeeds");
 
+        // Like clear_api_key, save refuses to clobber an unreadable config and
+        // surfaces the failure as Io — never silently, never a guessed default that
+        // would flip the user's provider.
         match err {
             CoreError::Io(msg) => {
-                assert!(msg.starts_with(
-                    "API key was stored in the keychain, but the AI preference file could not be updated: "
-                ));
-                assert!(msg.contains("could not create AI config dir"));
+                assert!(
+                    msg.starts_with(
+                        "API key was stored in the keychain, but your AI settings file is unreadable and was left untouched: "
+                    ),
+                    "unexpected message: {msg}"
+                );
             }
-            other => {
-                panic!("expected config write failure to surface as CoreError::Io, got {other:?}")
-            }
+            other => panic!(
+                "expected config persistence failure to surface as CoreError::Io, got {other:?}"
+            ),
         }
         assert_eq!(
             keychain.get(KEYCHAIN_SERVICE, KEY_ACCOUNT).as_deref(),
@@ -1291,40 +787,6 @@ mod tests {
             0,
             "the cached key should be used without an extra keychain read"
         );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn write_config_replaces_config_file_instead_of_writing_through_symlink() {
-        let config_dir = temp_config_dir("atomic-config-replace");
-        let external = config_dir.join("external-target.json");
-        fs::write(&external, "do-not-change").unwrap();
-        std::os::unix::fs::symlink(&external, config_file(&config_dir)).unwrap();
-
-        write_config(
-            &config_dir,
-            &StoredAiConfig {
-                model: "openai/gpt-4.1".into(),
-                key_configured: true,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            fs::read_to_string(&external).unwrap(),
-            "do-not-change",
-            "atomic replacement must not write through the old target path"
-        );
-        assert!(
-            !fs::symlink_metadata(config_file(&config_dir))
-                .unwrap()
-                .file_type()
-                .is_symlink(),
-            "the config path should be replaced by the new file"
-        );
-        let raw = read_config_text(&config_dir);
-        assert!(raw.contains("openai/gpt-4.1"));
-        assert!(raw.contains(r#""keyConfigured": true"#));
     }
 
     #[test]
@@ -1395,14 +857,7 @@ mod tests {
             .unwrap();
         let keychain = TestKeychain::install();
         let config_dir = temp_config_dir("cache-clear-race");
-        write_config(
-            &config_dir,
-            &StoredAiConfig {
-                model: "openai/gpt-4.1".into(),
-                key_configured: true,
-            },
-        )
-        .unwrap();
+        write_provider_config(&config_dir, &provider_config("openai/gpt-4.1", true)).unwrap();
         keychain.set(KEYCHAIN_SERVICE, KEY_ACCOUNT, "sk-or-old");
         let clear_config_dir = config_dir.clone();
         keychain.after_next_read(move || {
@@ -1416,31 +871,6 @@ mod tests {
             keychain.reads.load(Ordering::SeqCst),
             2,
             "the next read must re-check keychain instead of returning the stale cached key"
-        );
-    }
-
-    #[test]
-    fn read_model_falls_back_to_default_when_config_is_absent() {
-        let config_dir = temp_config_dir("default-model");
-
-        assert_eq!(read_model(&config_dir).unwrap(), DEFAULT_MODEL);
-    }
-
-    #[test]
-    fn read_model_falls_back_to_default_when_config_is_corrupt() {
-        let _guard = KEYCHAIN_TEST_LOCK
-            .get_or_init(|| StdMutex::new(()))
-            .lock()
-            .unwrap();
-        let keychain = TestKeychain::install();
-        let config_dir = temp_config_dir("default-model-corrupt");
-        fs::write(config_file(&config_dir), "{not json").unwrap();
-
-        assert_eq!(read_model(&config_dir).unwrap(), DEFAULT_MODEL);
-        assert_eq!(
-            keychain.reads.load(Ordering::SeqCst),
-            0,
-            "read_model must not touch the keychain while falling back"
         );
     }
 

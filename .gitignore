@@ -10,6 +10,7 @@
 node_modules/
 dist/
 build/
+app/desktop/src-tauri/binaries/ollama-*
 
 # Coverage + SonarQube scanner artifacts
 coverage/

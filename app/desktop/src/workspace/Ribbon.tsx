@@ -1,9 +1,10 @@
 // The far-left icon rail (Obsidian's workspace switcher). Files/Search swap
-// the sidebar panel and Graph view toggles the center pane — the view state
-// lives in Workspace, so this rail is a pure prop-driven control with real
-// active states. Capture and Settings remain present-but-inert placeholders
-// for later phases: real, labelled, aria-disabled buttons so the locked
-// layout is honest without faking behaviour.
+// the sidebar panel, Graph view toggles the center pane, and Settings opens
+// the settings modal — the view state lives in Workspace, so this rail is a
+// pure prop-driven control with real active states. Capture remains a
+// present-but-inert placeholder for a later phase: a real, labelled,
+// aria-disabled button so the locked layout is honest without faking
+// behaviour.
 
 import {
   Brain,
@@ -29,6 +30,7 @@ interface RibbonProps {
   onShowFiles: () => void;
   onShowSearch: () => void;
   onToggleGraph: () => void;
+  onOpenSettings: () => void;
 }
 
 export function Ribbon({
@@ -37,6 +39,7 @@ export function Ribbon({
   onShowFiles,
   onShowSearch,
   onToggleGraph,
+  onOpenSettings,
 }: Readonly<RibbonProps>) {
   return (
     <nav
@@ -67,7 +70,13 @@ export function Ribbon({
         onClick={onToggleGraph}
       />
 
-      <RibbonButton icon={Settings} label="Settings" active={false} className="mt-auto" />
+      <RibbonButton
+        icon={Settings}
+        label="Settings"
+        active={false}
+        onClick={onOpenSettings}
+        className="mt-auto"
+      />
     </nav>
   );
 }

@@ -1,9 +1,10 @@
-// The docked "Cited recall" pane — replaces ChatStub with the real cited-chat
-// UI. Three states share one shell (matching ChatStub's aesthetic): guided key
-// setup, a clearly-disabled "skipped" state, and the live chat view. The webview
-// never sees the API key; it only asks whether one exists (`apiKeyStatus`) and
-// drives the streamed `ChatEvent` loop via `chat`. Orchestration stays in Rust —
-// this pane only presents the stream and folds it with `reduceAssistant`.
+// The docked "Cited recall" pane — the real cited-chat UI. The provider-aware
+// states share one shell: the first-run picker (nothing configured), guided key
+// setup, a "local provider chosen but no model yet" hand-off into Settings, a
+// clearly-disabled "skipped" state, and the live chat view. The webview never
+// sees the API key; it asks `aiStatus` which provider is effective and drives
+// the streamed `ChatEvent` loop via `chat`. Orchestration stays in Rust — this
+// pane only presents the stream and folds it with `reduceAssistant`.
 
 import {
   useCallback,
@@ -12,11 +13,11 @@ import {
   useState,
   type KeyboardEvent,
 } from "react";
-import { Database, Loader2, Send, Sparkles } from "lucide-react";
+import { Cpu, Database, Loader2, Send, Sparkles } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import { useVault } from "../lib/store";
-import type { ChatEvent } from "../lib/types";
+import type { AiStatus, ChatEvent } from "../lib/types";
 import { ChatMessages } from "./ChatMessages";
 import {
   emptyAssistant,
@@ -27,11 +28,18 @@ import {
   type CitationView,
 } from "./chatMessage";
 import { DisconnectedPane, KeySetupPanel } from "./KeySetupPanel";
+import { ProviderPicker } from "./ProviderPicker";
 
-/** Locked default from the plan; the backend echoes it via `apiKeyStatus`. */
+/** Locked default from the plan; the backend echoes it via `aiStatus`. */
 const DEFAULT_MODEL = "anthropic/claude-sonnet-4.5";
 
-type View = "loading" | "setup" | "disconnected" | "chat";
+type View =
+  | "loading"
+  | "picker"
+  | "setup"
+  | "localSetup"
+  | "disconnected"
+  | "chat";
 
 /** Header status pill — mirrors ChatStub's "Indexing soon" chip per state. */
 function StatusPill({ view, model }: Readonly<{ view: View; model: string }>) {
@@ -55,7 +63,17 @@ function StatusPill({ view, model }: Readonly<{ view: View; model: string }>) {
 
 export function ChatPane({
   openNoteAt,
-}: Readonly<{ openNoteAt: (absPath: string) => void }>) {
+  onOpenSettings,
+  refreshSignal = 0,
+}: Readonly<{
+  openNoteAt: (absPath: string) => void;
+  /** Opens the settings modal on the AI section (local setup lives there). */
+  onOpenSettings: () => void;
+  /** Bumped by the workspace when Settings closes, so a provider configured
+   *  there (e.g. a first local model) is reflected without remounting — and
+   *  without wiping an in-progress transcript. */
+  refreshSignal?: number;
+}>) {
   const { vault, reportError } = useVault();
   const vaultPath = vault?.path;
 
@@ -70,27 +88,57 @@ export function ChatPane({
   // rebuilding the send callback on every streamed delta.
   const messagesRef = useRef(messages);
   messagesRef.current = messages;
+  // Latest view, readable from the status effect below without re-running it
+  // (and re-fetching) every time the user walks through the first-run states.
+  const viewRef = useRef(view);
+  viewRef.current = view;
 
-  // On mount, ask whether a key exists. A failed check still lands on guided
-  // setup (never a raw error) but is surfaced on the shared channel.
+  /** Land on the view a provider-aware status implies. The `model` doubles as
+   *  the status-pill label: the OpenRouter model id, or the local model tag. */
+  const applyStatus = useCallback((status: AiStatus) => {
+    if (status.activeProvider === "openRouter") {
+      setModel(status.openrouter.model || DEFAULT_MODEL);
+      // hasKey false here would be a config hole — fall back to guided setup.
+      setView(status.openrouter.hasKey ? "chat" : "setup");
+    } else if (status.activeProvider === "local") {
+      if (status.local.activeModelTag) {
+        setModel(status.local.activeModelTag);
+        setView("chat");
+      } else {
+        // "Local" chosen but nothing downloaded — an honest hand-off into
+        // Settings, never a chat that would only error.
+        setView("localSetup");
+      }
+    } else {
+      setModel(status.openrouter.model || DEFAULT_MODEL);
+      setView("picker");
+    }
+  }, []);
+
+  // On mount (and whenever Settings closes), read the effective provider. A
+  // failed check still lands on the first-run picker (never a raw error) but
+  // is surfaced on the shared channel.
   useEffect(() => {
     let cancelled = false;
     api
-      .apiKeyStatus()
+      .aiStatus()
       .then((status) => {
         if (cancelled) return;
-        setModel(status.model || DEFAULT_MODEL);
-        setView(status.hasKey ? "chat" : "setup");
+        // A later refresh that still reports "nothing configured" must not
+        // stomp a manually-chosen first-run view (guided setup / skipped);
+        // only the mount pass may land on the picker from scratch.
+        if (status.activeProvider === null && viewRef.current !== "loading") return;
+        applyStatus(status);
       })
       .catch((e) => {
         if (cancelled) return;
         reportError(errorMessage(e));
-        setView("setup");
+        if (viewRef.current === "loading") setView("picker");
       });
     return () => {
       cancelled = true;
     };
-  }, [reportError]);
+  }, [applyStatus, reportError, refreshSignal]);
 
   // Fold each streamed event into the in-flight (last) assistant turn.
   const applyEvent = useCallback((event: ChatEvent) => {
@@ -121,16 +169,16 @@ export function ChatPane({
       setSaving(true);
       try {
         await api.saveApiKey(key, chosenModel);
-        const status = await api.apiKeyStatus();
-        setModel(status.model || chosenModel);
-        setView("chat");
+        // Re-read the effective provider: a fresh key with no explicit choice
+        // reads as "openRouter", which lands the pane in the chat view.
+        applyStatus(await api.aiStatus());
       } catch (e) {
         reportError(errorMessage(e));
       } finally {
         setSaving(false);
       }
     },
-    [reportError],
+    [applyStatus, reportError],
   );
 
   const openCitation = useCallback(
@@ -170,6 +218,14 @@ export function ChatPane({
         </output>
       )}
 
+      {view === "picker" && (
+        <ProviderPicker
+          onPickOpenRouter={() => setView("setup")}
+          onPickLocal={onOpenSettings}
+          onSkip={() => setView("disconnected")}
+        />
+      )}
+
       {view === "setup" && (
         <KeySetupPanel
           model={model}
@@ -177,6 +233,28 @@ export function ChatPane({
           onSave={handleSave}
           onSkip={() => setView("disconnected")}
         />
+      )}
+
+      {view === "localSetup" && (
+        <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-8 text-center">
+          <span className="grid size-11 place-items-center rounded-xl bg-card text-muted-foreground ring-1 ring-inset ring-border">
+            <Cpu className="size-5" aria-hidden />
+          </span>
+          <p className="text-[13px] font-medium text-foreground/90">
+            Local AI needs a model
+          </p>
+          <p className="mx-auto max-w-[17rem] text-[12px] leading-relaxed text-muted-foreground">
+            Local AI is selected, but no model is set up yet. Pick one to
+            download in the AI settings.
+          </p>
+          <button
+            type="button"
+            onClick={onOpenSettings}
+            className="mt-1 rounded-lg bg-primary px-3.5 py-1.5 text-[12px] font-semibold text-primary-foreground shadow-[0_0_16px_-8px_var(--color-primary)] transition hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+          >
+            Open AI settings
+          </button>
+        </div>
       )}
 
       {view === "disconnected" && (

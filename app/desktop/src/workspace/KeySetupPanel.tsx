@@ -5,9 +5,11 @@
 import { useState } from "react";
 import { KeyRound, Sparkles } from "lucide-react";
 
-const FIELD =
+// Exported so the settings page's key form (AiSettingsPage) shares the exact
+// field idiom — two key UIs that can't drift apart.
+export const FIELD =
   "w-full rounded-lg border border-border bg-background/50 px-3 py-2 text-[13px] text-foreground placeholder:text-muted-foreground/60 transition focus:border-primary/60 focus:outline-none focus:ring-1 focus:ring-primary/30";
-const LABEL = "text-[11px] font-medium text-muted-foreground";
+export const LABEL = "text-[11px] font-medium text-muted-foreground";
 
 /** Guided API-key setup, shown inside the pane when no key is stored. */
 export function KeySetupPanel({

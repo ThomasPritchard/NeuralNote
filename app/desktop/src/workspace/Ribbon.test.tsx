@@ -12,6 +12,7 @@ function renderRibbon(over: Partial<RibbonProps> = {}) {
     onShowFiles: vi.fn(),
     onShowSearch: vi.fn(),
     onToggleGraph: vi.fn(),
+    onOpenSettings: vi.fn(),
     ...over,
   };
   render(<Ribbon {...props} />);
@@ -84,19 +85,26 @@ describe("Ribbon — callbacks", () => {
     await userEvent.click(screen.getByRole("button", { name: "Graph view" }));
     expect(props.onToggleGraph).toHaveBeenCalledTimes(1);
   });
+
+  it("fires onOpenSettings for the (now live) Settings cog", async () => {
+    const props = renderRibbon();
+    const btn = screen.getByRole("button", { name: "Settings" });
+    expect(btn).not.toHaveAttribute("aria-disabled");
+    await userEvent.click(btn);
+    expect(props.onOpenSettings).toHaveBeenCalledTimes(1);
+  });
 });
 
 describe("Ribbon — placeholders", () => {
-  it("keeps Capture and Settings as aria-disabled coming-soon buttons", async () => {
+  it("keeps Capture as an aria-disabled coming-soon button", async () => {
     const props = renderRibbon();
-    for (const label of ["Capture", "Settings"]) {
-      const btn = screen.getByRole("button", { name: `${label} (coming soon)` });
-      expect(btn).toHaveAttribute("aria-disabled", "true");
-      expect(btn).not.toHaveAttribute("aria-pressed");
-      await userEvent.click(btn);
-    }
+    const btn = screen.getByRole("button", { name: "Capture (coming soon)" });
+    expect(btn).toHaveAttribute("aria-disabled", "true");
+    expect(btn).not.toHaveAttribute("aria-pressed");
+    await userEvent.click(btn);
     expect(props.onShowFiles).not.toHaveBeenCalled();
     expect(props.onShowSearch).not.toHaveBeenCalled();
     expect(props.onToggleGraph).not.toHaveBeenCalled();
+    expect(props.onOpenSettings).not.toHaveBeenCalled();
   });
 });

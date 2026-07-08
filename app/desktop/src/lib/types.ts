@@ -174,7 +174,8 @@ export interface CoreError {
     | "conflict"
     | "io"
     | "frontmatter"
-    | "llm";
+    | "llm"
+    | "localAi";
   message: string;
 }
 
@@ -228,3 +229,107 @@ export type ChatEvent =
     }
   | { type: "error"; message: string }
   | { type: "done" };
+
+// ── AI: provider selection (local vs OpenRouter) ─────────────────────────────
+// Mirrors crates/neuralnote-core/src/ai/{provider_config,local/*}.rs — serde
+// camelCase, `status`/`type`-tagged enums. Kept in lockstep with the Rust types.
+
+/** Which AI backend serves cited chat. `"openRouter"` = BYO API key; `"local"` =
+ *  a bundled-Ollama model running on the user's machine. */
+export type ProviderKind = "openRouter" | "local";
+
+/** Provider-aware AI status (from `ai_status`). `activeProvider` is the *effective*
+ *  provider — an existing key user with no explicit choice reads as `"openRouter"`,
+ *  and `null` means nothing is set up yet (show the first-run picker). A pure config
+ *  read: it never starts the sidecar or unlocks the keychain. */
+export interface AiStatus {
+  activeProvider: ProviderKind | null;
+  openrouter: {
+    hasKey: boolean;
+    model: string;
+  };
+  local: {
+    /** The chosen local model tag, or null if none is set up. */
+    activeModelTag: string | null;
+  };
+}
+
+/** Detected host hardware (macOS-first) driving the local-model recommendation. */
+export interface HardwareSpec {
+  totalRamBytes: number;
+  cpuCores: number;
+  cpuBrand: string;
+  /** GPU label if detectable; null while GPU detection is deferred. */
+  gpuLabel: string | null;
+  /** e.g. "aarch64" / "x86_64". */
+  arch: string;
+  /** e.g. "macos" / "windows" / "linux". */
+  os: string;
+}
+
+/** One curated, tool-calling-capable local model that MAY be installed. The
+ *  allowlist is the source of truth for installability (it protects cited chat's
+ *  tool-calling); the UI enriches each with live `HfModelMeta`. */
+export interface CandidateModel {
+  /** The Ollama library tag to pull/run, e.g. "qwen2.5:7b". */
+  tag: string;
+  /** Human-readable parameter count, e.g. "7.6B". */
+  params: string;
+  downloadBytes: number;
+  minRamBytes: number;
+  license: string;
+  /** Hugging Face repo id for the transparency metadata lookup. */
+  hfRepo: string;
+}
+
+/** The recommendation verdict for this machine (from `recommend_local_model`).
+ *  `unsupported` carries the exact user-facing reason (e.g. weak specs, or a
+ *  not-yet-supported platform). */
+export type Recommendation =
+  | {
+      status: "supported";
+      modelTag: string;
+      params: string;
+      estRamBytes: number;
+      why: string;
+    }
+  | { status: "unsupported"; reason: string };
+
+/** Live Hugging Face metadata shown for transparency. Every field is nullable —
+ *  HF being unreachable is non-fatal; the caller treats a failed fetch as "no
+ *  metadata", never a hard error. */
+export interface HfModelMeta {
+  id: string;
+  downloads: number | null;
+  likes: number | null;
+  /** ISO-8601 timestamp string, or null. */
+  lastModified: string | null;
+  license: string | null;
+}
+
+/** A model already installed in the app-owned Ollama store (from
+ *  `list_local_models`). */
+export interface InstalledModel {
+  tag: string;
+  sizeBytes: number;
+  family: string | null;
+  parameterSize: string | null;
+  quantization: string | null;
+}
+
+/** A streamed event from a local-model download (mirrors
+ *  crates/neuralnote-core/src/ai/local/pull.rs; serde `type`-tagged, camelCase).
+ *  A pull always ends with exactly one terminal event — `success` or `error` —
+ *  never silently. `percent` is the download %, present once totals are known. */
+export type PullEvent =
+  | {
+      type: "progress";
+      /** Ollama's phase label, e.g. "pulling manifest", "downloading …". */
+      status: string;
+      digest: string | null;
+      completed: number | null;
+      total: number | null;
+      percent: number | null;
+    }
+  | { type: "success" }
+  | { type: "error"; message: string };

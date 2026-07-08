@@ -5,13 +5,21 @@
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  AiStatus,
   ApiKeyStatus,
   Backlinks,
+  CandidateModel,
   ChatEvent,
   ChatTurn,
   CoreError,
+  HardwareSpec,
+  HfModelMeta,
+  InstalledModel,
   LinkGraph,
   NoteDoc,
+  ProviderKind,
+  PullEvent,
+  Recommendation,
   RecentVault,
   SearchResponse,
   TemplateInfo,
@@ -143,3 +151,65 @@ export const chat = (
   channel.onmessage = onEvent;
   return invoke<void>("chat", { prompt, history, onEvent: channel });
 };
+
+// ── AI: provider selection (OpenRouter vs local Ollama) ──────────────────────
+
+/** Provider-aware AI status: which provider is active (or null when nothing is
+ *  set up yet), plus OpenRouter key/model and the chosen local model. A pure
+ *  config read — it never starts the sidecar or unlocks the keychain, so it's
+ *  cheap to poll on first-run and when opening Settings. */
+export const aiStatus = () => invoke<AiStatus>("ai_status");
+
+/** Choose the active provider (and, for local, the model tag to chat against).
+ *  Persisted to the non-secret AI config; the OpenRouter key stays in the OS
+ *  keychain, Rust-side. */
+export const setActiveProvider = (
+  provider: ProviderKind,
+  localModelTag?: string,
+) => invoke<void>("set_active_provider", { provider, localModelTag });
+
+/** Detect host hardware (RAM/CPU/arch/OS) for the local-model recommendation and
+ *  the Settings hardware readout. Infallible on the Rust side. */
+export const detectHardware = () => invoke<HardwareSpec>("detect_hardware");
+
+/** The curated, tool-calling-capable local-model catalogue — the source of truth
+ *  for what may be installed. Enrich each entry with `hfModelMetadata`. */
+export const localCandidates = () =>
+  invoke<CandidateModel[]>("local_candidates");
+
+/** Which curated model this machine should safely run, or an explicit
+ *  "unsupported" verdict (weak specs / unsupported platform). */
+export const recommendLocalModel = () =>
+  invoke<Recommendation>("recommend_local_model");
+
+/** Live Hugging Face metadata (downloads / licence / updated) for a model repo,
+ *  shown for transparency. HF being unreachable is non-fatal — the promise
+ *  rejects and the caller treats it as "no metadata", never a hard failure. */
+export const hfModelMetadata = (hfRepo: string) =>
+  invoke<HfModelMeta>("hf_model_metadata", { hfRepo });
+
+/** Models currently installed in the app-owned Ollama store. Starts the bundled
+ *  sidecar if it isn't running yet. */
+export const listLocalModels = () =>
+  invoke<InstalledModel[]>("list_local_models");
+
+/** Download a local model, streaming `PullEvent`s to `onEvent` as they happen
+ *  (progress → terminal success/error). The returned promise resolves when the
+ *  run ends. Exactly one terminal event fires, so a failure is never silent.
+ *  Starts the sidecar if needed. Cancel an in-flight pull with `cancelPull`. */
+export const pullLocalModel = (
+  tag: string,
+  onEvent: (event: PullEvent) => void,
+): Promise<void> => {
+  const channel = new Channel<PullEvent>();
+  channel.onmessage = onEvent;
+  return invoke<void>("pull_local_model", { tag, onEvent: channel });
+};
+
+/** Cancel the in-flight local-model download, if any. */
+export const cancelPull = () => invoke<void>("cancel_pull");
+
+/** Remove an installed local model (frees its disk). Starts the sidecar if
+ *  needed. */
+export const deleteLocalModel = (tag: string) =>
+  invoke<void>("delete_local_model", { tag });

@@ -27,6 +27,8 @@ pub enum CoreError {
     /// An LLM transport/protocol failure (network, HTTP status, bad response) from
     /// the AI chat loop. Surfaced to the user as a `ChatEvent::Error`, never silent.
     Llm(String),
+    /// Local-AI failures render distinctly from hosted LLM/provider failures.
+    LocalAi(String),
 }
 
 impl std::fmt::Display for CoreError {
@@ -40,6 +42,7 @@ impl std::fmt::Display for CoreError {
             CoreError::Io(m) => write!(f, "io error: {m}"),
             CoreError::Frontmatter(m) => write!(f, "frontmatter error: {m}"),
             CoreError::Llm(m) => write!(f, "llm error: {m}"),
+            CoreError::LocalAi(m) => write!(f, "local AI error: {m}"),
         }
     }
 }
@@ -63,3 +66,17 @@ impl From<trash::Error> for CoreError {
 }
 
 pub type CoreResult<T> = Result<T, CoreError>;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_ai_serializes_kind_and_displays() {
+        let error = CoreError::LocalAi("x".into());
+        let value = serde_json::to_value(&error).unwrap();
+
+        assert_eq!(value["kind"], "localAi");
+        assert!(!error.to_string().is_empty());
+    }
+}

@@ -1,7 +1,10 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "Capability for the main window. Vault file operations are app-defined commands and need no capability; the dialog plugin is used only from Rust. allow-destroy lets the unsaved-edit guard close the window via getCurrentWindow().destroy() after the user confirms discard (onCloseRequested is covered by core:default's event permissions).",
+  "description": "Capability for the main window. Vault file operations are app-defined commands and need no capability; the dialog AND shell plugins are used only from Rust (the Ollama sidecar is spawned via app.shell().sidecar() in the backend, which does not consult this capability — it gates only the JS Command API, which the webview never imports). Granting shell:allow-execute would hand a compromised webview a spawn primitive with unvalidated env (e.g. rebinding Ollama to 0.0.0.0), so it is deliberately omitted per least-privilege. allow-destroy lets the unsaved-edit guard close the window via getCurrentWindow().destroy() after the user confirms discard (onCloseRequested is covered by core:default's event permissions).",
   "windows": ["main"],
-  "permissions": ["core:default", "core:window:allow-destroy"]
+  "permissions": [
+    "core:default",
+    "core:window:allow-destroy"
+  ]
 }
