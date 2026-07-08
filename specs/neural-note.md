@@ -268,6 +268,12 @@ client-agnostic so future mobile/PWA clients reuse it rather than reimplement it
 *Not drawn: every stage has a failure edge back to the UI (Section 6). Capture, distil, embed, and
 chat each surface errors explicitly rather than failing silently.*
 
+*Also not drawn: the desktop shell installs a **native application menu** (File / Edit / Format /
+View) as the app's command surface. Custom items bridge to the webview over a `menu://action` event
+— the same Rust→UI pattern as the file-watcher's `vault://tree-changed` — while native Edit items
+act directly on the focused element. Shortcuts (⌘K search, ⌘S save, ⌘B/⌘I formatting, …) are menu
+accelerators, not ad-hoc key handlers, so the menu stays the single source of truth for commands.*
+
 **Components:**
 
 - **Ingest adapters** — one per source type, all converging on the same `raw source + metadata`
