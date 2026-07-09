@@ -25,6 +25,7 @@
   --color-accent: var(--accent);
   --color-accent-foreground: var(--accent-foreground);
   --color-destructive: var(--destructive);
+  --color-warning: var(--warning);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
@@ -42,6 +43,11 @@
   --radius-lg: var(--radius);
   --radius-xl: calc(var(--radius) * 1.4);
   --radius-2xl: calc(var(--radius) * 1.8);
+
+  /* The workspace interaction easing (the prototype's SPRING curve) — every
+     hover/state transition shares it so the panes feel identical. Use the
+     generated `ease-spring` utility. */
+  --ease-spring: cubic-bezier(0.32, 0.72, 0, 1);
 }
 
 :root {
@@ -60,6 +66,7 @@
   --accent: oklch(0.3 0.06 288);
   --accent-foreground: oklch(0.95 0.01 285);
   --destructive: oklch(0.62 0.2 25);
+  --warning: oklch(0.83 0.19 84);
   --border: oklch(1 0 0 / 9%);
   --input: oklch(1 0 0 / 11%);
   --ring: oklch(0.62 0.21 288);

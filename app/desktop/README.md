@@ -16,6 +16,11 @@ atomically.
 All filesystem logic and path safety live in `crates/neuralnote-core`; this app
 only wires it to the webview.
 
+Since the foundation shipped, two AI slices have landed: **cited chat** over your vault — ask a
+question and get an answer grounded in your notes, with each claim citing the note and line it came
+from — powered by either a **BYO OpenRouter API key** or a **bundled local Ollama model**. You pick
+the provider on first run and can change it later in **Settings**.
+
 ## Develop
 
 ```sh

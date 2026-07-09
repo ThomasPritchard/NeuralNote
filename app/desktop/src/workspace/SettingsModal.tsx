@@ -7,44 +7,23 @@
 // AI page's data loads all reset naturally.
 
 import { useEffect, useRef, useState } from "react";
-import {
-  Brain,
-  Info,
-  SlidersHorizontal,
-  Sparkles,
-  X,
-  type LucideIcon,
-} from "lucide-react";
+import { Brain, Info, Sparkles, X, type LucideIcon } from "lucide-react";
 import { cn } from "../lib/cn";
 import { AiSettingsPage } from "./AiSettingsPage";
 
-export type SettingsSection = "general" | "ai" | "about";
+export type SettingsSection = "ai" | "about";
 
+// No "General" section yet: a nav entry whose page is only "coming soon" copy
+// is a shipped placeholder (PA-017). Reintroduce the id + entry here alongside
+// the first real general setting.
 const SECTIONS: ReadonlyArray<{
   id: SettingsSection;
   label: string;
   icon: LucideIcon;
 }> = [
-  { id: "general", label: "General", icon: SlidersHorizontal },
   { id: "ai", label: "Configure the AI", icon: Sparkles },
   { id: "about", label: "About", icon: Info },
 ];
-
-function GeneralSection() {
-  return (
-    <section aria-labelledby="settings-general-heading" className="flex flex-col gap-1.5">
-      <h3
-        id="settings-general-heading"
-        className="nn-heading text-sm font-semibold text-foreground"
-      >
-        General
-      </h3>
-      <p className="text-[12px] leading-relaxed text-muted-foreground">
-        More settings coming soon.
-      </p>
-    </section>
-  );
-}
 
 function AboutSection() {
   return (
@@ -65,7 +44,7 @@ function AboutSection() {
           </p>
           <p className="max-w-[28rem] text-[12px] leading-relaxed text-muted-foreground">
             An AI-native second brain. Your notes stay plain, Obsidian-compatible
-            markdown on your disk, while the AI files, links, and recalls them —
+            markdown on your disk, while the AI answers questions across them —
             with citations back to the exact source.
           </p>
         </div>
@@ -185,7 +164,6 @@ function SettingsDialog({
             <X className="size-4" aria-hidden />
           </button>
           <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
-            {section === "general" && <GeneralSection />}
             {section === "ai" && <AiSettingsPage />}
             {section === "about" && <AboutSection />}
           </div>

@@ -5,9 +5,11 @@
 //! Hand-rolled (no `thiserror`) to keep the dependency surface minimal.
 
 use serde::Serialize;
+use ts_rs::TS;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, TS)]
 #[serde(tag = "kind", content = "message", rename_all = "camelCase")]
+#[ts(export)]
 pub enum CoreError {
     /// Target path does not exist.
     NotFound(String),

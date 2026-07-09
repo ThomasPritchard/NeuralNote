@@ -24,17 +24,53 @@ use tauri_plugin_shell::ShellExt;
 
 const OLLAMA_SIDECAR_NAME: &str = "ollama";
 const OLLAMA_MODELS_DIR: &str = "ollama-models";
+/// Bundled-resource subdir holding the ggml/Metal runtime libraries. Ollama's
+/// macOS runtime is three parts: the `ollama` orchestrator + the `llama-server`
+/// runner (both shipped as `externalBin`, so they land co-located — ollama finds
+/// the runner beside its own binary) + these libraries. The libraries can't be
+/// `externalBin` (they're `.dylib`/`.so`, not target-triple executables), so they
+/// ship as `bundle.resources` and are located at runtime via `OLLAMA_LIBRARY_PATH`
+/// (which redirects the ggml lib search — but NOT the runner-binary discovery,
+/// verified empirically, which is why `llama-server` must be the co-located sidecar).
+const OLLAMA_LIBS_DIR: &str = "ollama-libs";
 const OLLAMA_HEALTH_INTERVAL: Duration = Duration::from_millis(300);
 const OLLAMA_START_TIMEOUT: Duration = Duration::from_secs(30);
+/// Context window (tokens) for the local chat client. Ollama's built-in default is
+/// ~4096 and it **silently truncates from the front**, which would drop the grounding
+/// rules (sent first) and the earliest evidence — breaking cited recall on the Local
+/// path (PA-001). Sized well above the retrieval budget (the orchestrator caps context
+/// at 60_000 chars ≈ ~15k tokens); every curated model in the `ai::local` allowlist
+/// supports a window this large.
+const OLLAMA_NUM_CTX: u32 = 32_768;
+/// Cap on the retained sidecar stderr. The only reader is the startup diagnostic,
+/// which wants the TAIL (the most recent lines around a failure) — so we keep the
+/// last N KiB and drop older bytes, bounding what would otherwise grow for the
+/// sidecar's whole lifetime as `ollama serve` logs request/INFO lines (PA-009).
+const MAX_STDERR_BYTES: usize = 16 * 1024;
 
 pub(super) struct OllamaSidecar {
     child: CommandChild,
     port: u16,
 }
 
+/// A sidecar child that's been spawned but not yet health-checked into `sidecar`
+/// (it's still in the startup poll). The `id` lets its own starter reclaim exactly
+/// this child after the poll, so two concurrent starters never take each other's.
+struct StartingSidecar {
+    id: u64,
+    child: CommandChild,
+}
+
 #[derive(Default)]
 pub(super) struct LocalAiState {
     sidecar: Option<OllamaSidecar>,
+    /// Children spawned but not yet promoted to `sidecar` — still in the ≤30s health
+    /// poll. Parked HERE, where `shutdown_ollama` can reach them, so an app quit
+    /// mid-startup reaps the child instead of orphaning `ollama serve` (macOS doesn't
+    /// reap children on parent exit). A monotonic id per child keeps concurrent
+    /// starters from clobbering one another.
+    starting: Vec<StartingSidecar>,
+    next_start_id: u64,
     /// Cancel flag for the CURRENT (most-recent) model download. Lives on the state,
     /// not the sidecar, so a Cancel that arrives while the sidecar is still starting
     /// — before any sidecar exists — still targets the pull. Each pull installs a
@@ -50,6 +86,28 @@ impl LocalAiState {
 
     fn take_sidecar(&mut self) -> Option<OllamaSidecar> {
         self.sidecar.take()
+    }
+
+    /// Park a freshly-spawned child while it health-polls, returning the id
+    /// [`take_starting`](Self::take_starting) uses to reclaim exactly this child.
+    /// Reachable by `shutdown_ollama`, so a quit mid-startup can still reap it.
+    fn register_starting(&mut self, child: CommandChild) -> u64 {
+        let id = self.next_start_id;
+        self.next_start_id += 1;
+        self.starting.push(StartingSidecar { id, child });
+        id
+    }
+
+    /// Reclaim a starting child once its poll finishes, to promote or kill it.
+    /// `None` means `shutdown_ollama` already took (and killed) it mid-startup.
+    fn take_starting(&mut self, id: u64) -> Option<CommandChild> {
+        let pos = self.starting.iter().position(|s| s.id == id)?;
+        Some(self.starting.swap_remove(pos).child)
+    }
+
+    /// Drain every not-yet-promoted starting child so `shutdown_ollama` reaps them.
+    fn drain_starting(&mut self) -> Vec<CommandChild> {
+        self.starting.drain(..).map(|s| s.child).collect()
     }
 
     /// Install a fresh cancel token for a new download and return a clone. Dropping
@@ -143,13 +201,20 @@ pub(super) async fn ensure_ollama_started(
             return Ok(port);
         }
         log::warn!("Local AI sidecar on port {port} stopped answering; restarting it");
-        shutdown_ollama(state);
+        stop_running_sidecar(state);
     }
 
     let port = pick_loopback_port()?;
     let models_dir = ollama_models_dir(app)?;
     std::fs::create_dir_all(&models_dir)
         .map_err(|e| CoreError::Io(format!("could not create Local AI models dir: {e}")))?;
+
+    // Bundled ggml/Metal libraries, found via OLLAMA_LIBRARY_PATH (see OLLAMA_LIBS_DIR).
+    let libs_dir = app
+        .path()
+        .resource_dir()
+        .map(|dir| dir.join(OLLAMA_LIBS_DIR))
+        .map_err(|e| CoreError::LocalAi(format!("no resource dir for Local AI libraries: {e}")))?;
 
     let stderr = Arc::new(Mutex::new(String::new()));
     // Set when our spawned child exits, so the startup health-poll can tell "our
@@ -162,8 +227,9 @@ pub(super) async fn ensure_ollama_started(
         .args(["serve"])
         .env("OLLAMA_HOST", format!("127.0.0.1:{port}"))
         .env("OLLAMA_MODELS", models_dir.as_os_str())
+        .env("OLLAMA_LIBRARY_PATH", libs_dir.as_os_str())
         .spawn()
-        .map_err(|e| CoreError::LocalAi(format!("could not start Local AI sidecar: {e}")))?;
+        .map_err(|e| CoreError::LocalAi(format!("Couldn't start the Local AI sidecar: {e}")))?;
 
     let stderr_rx = Arc::clone(&stderr);
     let terminated_rx = Arc::clone(&terminated);
@@ -189,20 +255,37 @@ pub(super) async fn ensure_ollama_started(
         }
     });
 
-    // TODO(startup-orphan): the child isn't parked in AppState until it's healthy,
-    // so an app quit during this ≤30s health-poll can't be reaped by
-    // shutdown_ollama and leaves an orphaned `ollama serve` (macOS doesn't reap
-    // children on parent exit). Narrow window; the next launch picks a fresh free
-    // port so there's no clash. Fix later with a "starting" state slot shutdown
-    // can reach. (Below the review bar — deferred, not dropped.)
-    if let Err(e) = wait_for_ollama(port, &stderr, &terminated).await {
+    // Park the freshly-spawned child in the "starting" slot BEFORE the health-poll,
+    // so an app quit during the poll reaps it via shutdown_ollama. Without this the
+    // child is unreachable until it's promoted to `sidecar`, and a quit mid-startup
+    // would orphan `ollama serve` (macOS doesn't reap children on parent exit). The
+    // std Mutex guard is released at the end of this statement — never held across
+    // the `.await` below.
+    let start_id = crate::lock_state(state).local_ai.register_starting(child);
+
+    let poll_result = wait_for_ollama(port, &stderr, &terminated).await;
+
+    // Reclaim our child under a fresh short lock. It's gone only if shutdown_ollama
+    // reaped it mid-startup, in which case it has already been killed — surface that
+    // rather than claim a running sidecar.
+    let mut guard = crate::lock_state(state);
+    let Some(child) = guard.local_ai.take_starting(start_id) else {
+        return Err(CoreError::LocalAi(
+            "Local AI startup was interrupted by shutdown.".into(),
+        ));
+    };
+
+    if let Err(e) = poll_result {
+        drop(guard);
         if let Err(kill_err) = child.kill() {
             log::warn!("could not stop failed Local AI sidecar: {kill_err}");
         }
         return Err(e);
     }
 
-    let mut guard = crate::lock_state(state);
+    // Check-then-act, resolved atomically under this one lock: if a concurrent
+    // starter won the race and already parked a sidecar, kill our duplicate and
+    // reuse theirs.
     if let Some(existing_port) = guard.local_ai.running_port() {
         drop(guard);
         if let Err(e) = child.kill() {
@@ -216,19 +299,50 @@ pub(super) async fn ensure_ollama_started(
 }
 
 pub(super) fn shutdown_ollama(state: &crate::SharedState<'_>) {
-    // Cancel any in-flight download and take the sidecar out under one short lock
-    // (no `.await` held), then kill the child outside the lock.
+    // App-exit teardown. Cancel any in-flight download, then take the running sidecar
+    // AND every child still mid-startup out under one short lock (no `.await` held),
+    // and kill them all outside it. Draining the "starting" slot is what closes the
+    // quit-mid-startup orphan window: a child spawned but not yet promoted to
+    // `sidecar` is still reachable here and gets reaped, instead of surviving as an
+    // orphaned `ollama serve` (macOS doesn't reap children on parent exit).
+    let (sidecar, starting) = {
+        let mut guard = crate::lock_state(state);
+        guard.local_ai.pull_cancel.store(true, Ordering::SeqCst);
+        (
+            guard.local_ai.take_sidecar(),
+            guard.local_ai.drain_starting(),
+        )
+    };
+    kill_sidecar(sidecar);
+    for child in starting {
+        if let Err(e) = child.kill() {
+            log::warn!("could not stop starting Local AI sidecar during shutdown: {e}");
+        }
+    }
+}
+
+/// Drop a cached sidecar that stopped answering so `ensure_ollama_started` can
+/// respawn a fresh one. Unlike [`shutdown_ollama`] this leaves any concurrent
+/// starter's still-starting child alone — the app isn't exiting, so only the dead
+/// running sidecar is cleared. Same short-lock-then-kill-outside discipline.
+fn stop_running_sidecar(state: &crate::SharedState<'_>) {
     let sidecar = {
         let mut guard = crate::lock_state(state);
         guard.local_ai.pull_cancel.store(true, Ordering::SeqCst);
         guard.local_ai.take_sidecar()
     };
+    kill_sidecar(sidecar);
+}
+
+/// Kill a sidecar child taken out of the state, outside any lock. A failure to reap
+/// logs at warn — a teardown path that can't stop a child must not be silent.
+fn kill_sidecar(sidecar: Option<OllamaSidecar>) {
     let Some(sidecar) = sidecar else {
         return;
     };
     if let Err(e) = sidecar.child.kill() {
         log::warn!(
-            "could not stop Local AI sidecar on port {} during shutdown: {e}",
+            "could not stop Local AI sidecar on port {}: {e}",
             sidecar.port
         );
     }
@@ -241,6 +355,10 @@ pub(super) fn ollama_chat_client(port: u16) -> crate::ai::OpenAiChatClient {
         None,
         Duration::from_secs(10),
         Duration::from_secs(300),
+        Some(OLLAMA_NUM_CTX),
+        // Ollama's OpenAI-compatible endpoint doesn't speak the reasoning field; leave
+        // it off so the shared client never asks for something Local would ignore.
+        false,
     )
 }
 
@@ -264,7 +382,7 @@ pub(super) async fn pull_local_model(
         .json(&serde_json::json!({ "model": tag, "stream": true }))
         .send()
         .await
-        .map_err(|e| CoreError::LocalAi(format!("could not start Local AI download: {e}")))?;
+        .map_err(|e| CoreError::LocalAi(format!("Couldn't start the Local AI download: {e}")))?;
     let mut stream = ensure_response_success(resp, "Local AI download")
         .await?
         .bytes_stream();
@@ -345,9 +463,9 @@ async fn wait_for_ollama(
     let fail = |reason: &str| {
         let captured = captured_stderr(stderr);
         CoreError::LocalAi(if captured.is_empty() {
-            format!("couldn't start Local AI: {reason}")
+            format!("Couldn't start Local AI: {reason}")
         } else {
-            format!("couldn't start Local AI: {reason}; stderr: {captured}")
+            format!("Couldn't start Local AI: {reason}; stderr: {captured}")
         })
     };
 
@@ -484,6 +602,17 @@ fn append_output(output: &Arc<Mutex<String>>, bytes: &[u8]) {
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     output.push_str(&text);
+    // Keep only the last MAX_STDERR_BYTES so a long-lived sidecar can't grow this
+    // unbounded (PA-009). Drop the leading bytes, backing the cut up to a char
+    // boundary so a multibyte scalar is never split (`len()` is always a boundary,
+    // so this always terminates).
+    if output.len() > MAX_STDERR_BYTES {
+        let mut cut = output.len() - MAX_STDERR_BYTES;
+        while !output.is_char_boundary(cut) {
+            cut += 1;
+        }
+        output.drain(..cut);
+    }
 }
 
 fn captured_stderr(output: &Arc<Mutex<String>>) -> String {
@@ -492,4 +621,135 @@ fn captured_stderr(output: &Arc<Mutex<String>>) -> String {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .trim()
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn append_output_bounds_to_tail() {
+        // Simulate a long-lived sidecar streaming far more stderr than the cap: the
+        // accumulator must stay bounded and keep the TAIL (what the diagnostic reads),
+        // evicting the oldest lines (PA-009).
+        let buf = Arc::new(Mutex::new(String::new()));
+        for i in 0..5000 {
+            append_output(&buf, format!("line {i}\n").as_bytes());
+        }
+        let out = buf.lock().unwrap();
+        assert!(
+            out.len() <= MAX_STDERR_BYTES,
+            "stderr accumulator must stay bounded, was {}",
+            out.len()
+        );
+        assert!(out.contains("line 4999"), "the recent tail must be kept");
+        assert!(!out.contains("line 0\n"), "old output must be evicted");
+    }
+
+    #[test]
+    fn append_output_keeps_short_output_intact() {
+        // Below the cap, nothing is dropped — the whole diagnostic is preserved.
+        let buf = Arc::new(Mutex::new(String::new()));
+        append_output(&buf, b"short diagnostic\n");
+        assert_eq!(&*buf.lock().unwrap(), "short diagnostic\n");
+    }
+
+    /// Captures every event a pull emits, so a test can assert what reached the UI.
+    #[derive(Default)]
+    struct RecordingSink {
+        events: Vec<PullEvent>,
+    }
+
+    impl PullSink for RecordingSink {
+        fn send(&mut self, event: PullEvent) {
+            self.events.push(event);
+        }
+    }
+
+    fn handle_line(line: &str, cancel: &AtomicBool) -> (CoreResult<bool>, Vec<PullEvent>) {
+        let mut sink = RecordingSink::default();
+        let result = handle_pull_line(line.as_bytes(), &mut sink, cancel);
+        (result, sink.events)
+    }
+
+    #[test]
+    fn handle_pull_line_cancels_before_parsing() {
+        // A Cancel that landed mid-download aborts at the next line boundary, and no
+        // further progress leaks to the UI after the cancel.
+        let cancel = AtomicBool::new(true);
+        let (result, events) = handle_line(r#"{"status":"pulling manifest"}"#, &cancel);
+        assert!(
+            matches!(result, Err(CoreError::LocalAi(msg)) if msg == "Download cancelled."),
+            "a set cancel flag must abort the line",
+        );
+        assert!(events.is_empty(), "a cancelled pull emits no progress");
+    }
+
+    #[test]
+    fn handle_pull_line_forwards_progress_and_continues() {
+        // Progress is non-terminal: forwarded to the sink, poll continues (Ok(false)).
+        let cancel = AtomicBool::new(false);
+        let (result, events) = handle_line(r#"{"status":"pulling manifest"}"#, &cancel);
+        assert!(
+            matches!(result, Ok(false)),
+            "progress lines are non-terminal"
+        );
+        assert!(
+            matches!(events.as_slice(), [PullEvent::Progress { status, .. }] if status == "pulling manifest"),
+        );
+    }
+
+    #[test]
+    fn handle_pull_line_reports_success_terminally() {
+        // Success is the terminal signal, surfaced via the Result (Ok(true)), never
+        // as a sink event — the command owns emitting the one terminal PullEvent.
+        let cancel = AtomicBool::new(false);
+        let (result, events) = handle_line(r#"{"status":"success"}"#, &cancel);
+        assert!(matches!(result, Ok(true)), "success ends the stream");
+        assert!(
+            events.is_empty(),
+            "success is not forwarded through the sink"
+        );
+    }
+
+    #[test]
+    fn handle_pull_line_surfaces_inband_error() {
+        // An in-band `error` frame (HTTP already committed 200) becomes an Err so the
+        // failure is never silent.
+        let cancel = AtomicBool::new(false);
+        let (result, events) = handle_line(r#"{"error":"file does not exist"}"#, &cancel);
+        assert!(matches!(result, Err(CoreError::LocalAi(msg)) if msg == "file does not exist"),);
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn handle_pull_line_ignores_unrecognized_lines() {
+        // A frame with neither status nor error (e.g. a keep-alive) is skipped as
+        // non-terminal noise, emitting nothing.
+        let cancel = AtomicBool::new(false);
+        let (result, events) = handle_line("{}", &cancel);
+        assert!(matches!(result, Ok(false)));
+        assert!(events.is_empty());
+    }
+
+    #[test]
+    fn handle_pull_line_rejects_non_utf8() {
+        // Non-UTF-8 bytes surface as an error rather than a panic or a silent skip.
+        let cancel = AtomicBool::new(false);
+        let mut sink = RecordingSink::default();
+        let result = handle_pull_line(&[0xff, 0xfe], &mut sink, &cancel);
+        assert!(matches!(result, Err(CoreError::LocalAi(_))));
+        assert!(sink.events.is_empty());
+    }
+
+    #[test]
+    fn pick_loopback_port_reserves_a_free_port() {
+        // The function reserves an ephemeral loopback port and releases it so the
+        // sidecar can bind it: the port must be a real assignment (non-zero) and
+        // immediately bindable again.
+        let port = pick_loopback_port().expect("should reserve a loopback port");
+        assert_ne!(port, 0, "a :0 bind resolves to a real assigned port");
+        TcpListener::bind(("127.0.0.1", port))
+            .expect("the reserved port must be released for the sidecar to bind");
+    }
 }

@@ -52,7 +52,8 @@ export const VAULT_ROOT = "/vault";
 export const NEW_VAULT_PARENT = "/parent";
 
 /** The model `api_key_status` reports when a test doesn't override it — mirrors
- *  the plan's locked default (ChatPane.DEFAULT_MODEL). */
+ *  the core's locked default (`DEFAULT_MODEL`, neuralnote-core ai/orchestrator.rs).
+ *  The frontend holds no copy: it takes the id solely from the `aiStatus` echo. */
 export const DEFAULT_CHAT_MODEL = "anthropic/claude-sonnet-4.5";
 
 /** A thrown backend error, shaped exactly as a serialised `CoreError`. */
@@ -84,7 +85,7 @@ export interface CreateMockVaultOptions {
    *  present so a test lands straight in the chat view; pass `{ hasKey: false }`
    *  to exercise the first-run provider picker (and, through it, guided key
    *  setup). `model` defaults to {@link DEFAULT_CHAT_MODEL}. */
-  apiKey?: { hasKey: boolean; model?: string };
+  apiKey?: { hasKey: boolean; model?: string; reasoning?: boolean };
   /** The `ChatEvent` sequence the `chat` command streams to its Channel, in
    *  order, exactly as the Rust core would (searching → … → done | error). */
   chatScript?: ChatEvent[];
@@ -1299,6 +1300,9 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
   const keyState = {
     hasKey: opts.apiKey?.hasKey ?? true,
     model: opts.apiKey?.model ?? DEFAULT_CHAT_MODEL,
+    // Mirrors `ProviderConfig.reasoning`, whose serde default is false: reasoning
+    // tokens are billed, so they are opt-in. Mutated by set_reasoning.
+    reasoning: opts.apiKey?.reasoning ?? false,
   };
   const chatScript = opts.chatScript ?? [];
 
@@ -1313,6 +1317,20 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
   };
   const effectiveProvider = (): ProviderKind | null =>
     aiState.explicitProvider ?? (keyState.hasKey ? "openRouter" : null);
+
+  /** Mirror of the core's `build_ai_status`: the effective provider (an explicit
+   *  choice wins, else a stored key reads as "openRouter", else null — the
+   *  first-run picker), plus each provider's own state. Shared by `ai_status` and
+   *  `set_reasoning`, exactly as the Rust command pair shares the real one. */
+  const buildAiStatus = (): AiStatus => ({
+    activeProvider: effectiveProvider(),
+    openrouter: {
+      hasKey: keyState.hasKey,
+      model: keyState.model,
+      reasoning: keyState.reasoning,
+    },
+    local: { activeModelTag: aiState.localActiveTag },
+  });
 
   const relOf = (p: string): string => p.slice(root.length + 1);
 
@@ -1693,14 +1711,7 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
       case "api_key_status":
         return { hasKey: keyState.hasKey, model: keyState.model } satisfies ApiKeyStatus;
       case "ai_status":
-        // The effective provider mirrors the Rust `effective_provider()`: an
-        // explicit choice wins, else a stored key reads as "openRouter", else null
-        // (the first-run picker). Local state is mutated by set_active_provider.
-        return {
-          activeProvider: effectiveProvider(),
-          openrouter: { hasKey: keyState.hasKey, model: keyState.model },
-          local: { activeModelTag: aiState.localActiveTag },
-        } satisfies AiStatus;
+        return buildAiStatus();
       case "detect_hardware":
         return opts.hardware ?? DEFAULT_HARDWARE;
       case "recommend_local_model":
@@ -1714,6 +1725,13 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         aiState.explicitProvider = a.provider as ProviderKind;
         if (a.localModelTag != null) aiState.localActiveTag = a.localModelTag as string;
         return undefined;
+      }
+      case "set_reasoning": {
+        // Returns the persisted status, as the Rust command does — the toggle
+        // renders this rather than re-reading, so a failed re-read can never show
+        // "off" while the config says "on".
+        keyState.reasoning = a.enabled as boolean;
+        return buildAiStatus();
       }
       case "hf_model_metadata": {
         const repo = a.hfRepo as string;

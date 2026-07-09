@@ -125,9 +125,14 @@ impl ChatSession<'_> {
         history: &[LlmMessage],
         sink: &mut dyn EventSink,
     ) -> CoreResult<()> {
+        // Sanitise history in the core (strip stale `[eN]` markers, window to a char
+        // budget) so the grounding rules + evidence can't be silently front-truncated
+        // out of a local model's context window, and a stale marker can't mis-cite —
+        // regardless of which client built the history. See `prepare_history`.
+        let history = prepare_history(history);
         let mut messages = Vec::with_capacity(history.len() + 2);
         messages.push(LlmMessage::system(SYSTEM_PROMPT));
-        messages.extend_from_slice(history);
+        messages.extend(history);
         messages.push(LlmMessage::user(user_prompt));
 
         let tools = tools::tool_schemas();
@@ -171,6 +176,9 @@ impl ChatSession<'_> {
     ) -> CoreResult<bool> {
         let mut context_chars = 0usize;
         for _ in 0..self.guards.max_iterations {
+            // TODO(llm-retry): add one bounded backoff retry for idempotent
+            // tool-deciding `complete` turns on transient 429/5xx/dropped connection
+            // (not the streaming answer, PA-029).
             let completion = self.llm.complete(&self.request(messages, tools)).await?;
             if completion.tool_calls.is_empty() {
                 return Ok(false); // the model chose to answer — a clean stop
@@ -419,6 +427,87 @@ fn is_evidence_prefix(bytes: &[u8], pos: usize) -> bool {
     pos < bytes.len() && (bytes[pos] == b'e' || bytes[pos] == b'E')
 }
 
+/// Max chars of prior-conversation history carried into a chat request. History is
+/// otherwise unbounded — a long conversation resends every turn — and, combined with
+/// the tool-result budget (`Guards::max_context_chars`, 60k chars), could push a local
+/// model's prompt past its context window. Ollama then silently truncates from the
+/// FRONT, dropping the grounding rules (sent first) and the earliest evidence — which
+/// breaks cited recall, the moat. Sized conservatively so
+/// `system + history + max_context_chars + the answer` stay within the smallest
+/// supported local window (`local::OLLAMA_NUM_CTX` = 32_768 tokens) with headroom; the
+/// large-context cloud provider is unaffected in practice, and the cap also bounds
+/// per-turn token cost. Keeps the most recent turns; older ones drop (each turn
+/// re-runs retrieval and re-grounds, so dropping old context never corrupts citations).
+//
+// TODO(token-aware-context-budget): all budgets here are in CHARS with an implicit
+// ~4-chars/token assumption. A CJK/symbol-dense vault tokenises closer to ~2 chars/token,
+// so a near-max evidence turn (`max_context_chars` 60k) could still exceed a small local
+// `num_ctx` and be silently front-truncated. The robust fix is a token-aware (or
+// provider-aware) budget that counts the *assembled* prompt against the active window
+// before send — deferred because it couples to the model's RAM sizing. The English/Latin
+// common case has ample headroom after this cap (H1), so the residual is a narrow edge.
+const MAX_HISTORY_CHARS: usize = 12_000;
+
+/// Remove every `[eN]` citation marker (and a single leading space) from prior-turn
+/// text. Uses the same grammar as [`citation_at`], so it strips exactly what the
+/// verifier would parse. Evidence ids are assigned fresh per run, so a marker carried
+/// into a later turn refers to nothing in that turn's registry — and if the model
+/// echoes it, the verifier can re-validate it against an *unrelated* freshly-retrieved
+/// span, surfacing as a "verified" citation whose source text doesn't match the prose
+/// claim (the exact mis-citation the moat forbids). History is plain context for the
+/// model, so the markers add nothing; dropping them all closes the hole in the core,
+/// not just the client. UTF-8-safe: markers are ASCII, so slices land on boundaries.
+fn strip_cited_markers(text: &str) -> String {
+    let bytes = text.as_bytes();
+    let mut out = String::with_capacity(text.len());
+    let mut copied_from = 0;
+    let mut i = 0;
+    while i < bytes.len() {
+        if let Some((_, next)) = citation_at(text, bytes, i) {
+            // Copy up to the marker, dropping one preceding space so
+            // "a claim [e1]." becomes "a claim." (not "a claim .").
+            let mut end = i;
+            if end > copied_from && bytes[end - 1] == b' ' {
+                end -= 1;
+            }
+            out.push_str(&text[copied_from..end]);
+            copied_from = next;
+            i = next;
+        } else {
+            i += 1;
+        }
+    }
+    out.push_str(&text[copied_from..]);
+    out
+}
+
+/// Sanitise prior-conversation history before it re-enters a request: strip stale
+/// `[eN]` markers (see [`strip_cited_markers`]) and window to the most recent
+/// `MAX_HISTORY_CHARS` (see the const). This is the client-agnostic backstop for both
+/// guards — a thin client can drop them for payload/cost, but correctness lives here in
+/// the core so every client (and every provider) gets the same protection.
+fn prepare_history(history: &[LlmMessage]) -> Vec<LlmMessage> {
+    let mut kept: Vec<LlmMessage> = Vec::with_capacity(history.len());
+    let mut used = 0usize;
+    // Walk most-recent-first, keeping whole turns while the budget lasts; the newest
+    // turn is always kept (never send empty history just because one turn is huge).
+    for msg in history.iter().rev() {
+        let mut msg = msg.clone();
+        if let Some(content) = &msg.content {
+            let cleaned = strip_cited_markers(content);
+            let cost = cleaned.len();
+            if !kept.is_empty() && used.saturating_add(cost) > MAX_HISTORY_CHARS {
+                break;
+            }
+            used = used.saturating_add(cost);
+            msg.content = Some(cleaned);
+        }
+        kept.push(msg);
+    }
+    kept.reverse();
+    kept
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -443,6 +532,9 @@ mod tests {
         /// The number of tools the last `complete_streaming` call was handed — so a
         /// test can assert the answer turn advertises none.
         streaming_tools_len: Mutex<Option<usize>>,
+        /// Reasoning deltas streamed as `Thinking` events before the answer, so a test
+        /// can assert reasoning reaches the sink without polluting the answer string.
+        reasoning: Vec<String>,
         #[allow(clippy::type_complexity)]
         before_answer: Option<Box<dyn Fn() + Send + Sync>>,
     }
@@ -454,6 +546,7 @@ mod tests {
                 answer: answer.into(),
                 fail: false,
                 streaming_tools_len: Mutex::new(None),
+                reasoning: Vec::new(),
                 before_answer: None,
             }
         }
@@ -464,12 +557,18 @@ mod tests {
                 answer: String::new(),
                 fail: true,
                 streaming_tools_len: Mutex::new(None),
+                reasoning: Vec::new(),
                 before_answer: None,
             }
         }
 
         fn with_hook(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
             self.before_answer = Some(Box::new(f));
+            self
+        }
+
+        fn with_reasoning(mut self, deltas: &[&str]) -> Self {
+            self.reasoning = deltas.iter().map(|d| d.to_string()).collect();
             self
         }
     }
@@ -500,6 +599,13 @@ mod tests {
             *self.streaming_tools_len.lock().unwrap() = Some(req.tools.len());
             if let Some(hook) = &self.before_answer {
                 hook();
+            }
+            // Reasoning, if any, streams as Thinking before the answer — mirroring the
+            // real client, and never folded into the returned answer string.
+            for delta in &self.reasoning {
+                sink.send(ChatEvent::Thinking {
+                    delta: delta.clone(),
+                });
             }
             for chunk in self.answer.split_inclusive(' ') {
                 sink.send(ChatEvent::Answer {
@@ -794,6 +900,35 @@ mod tests {
     }
 
     #[test]
+    fn reasoning_deltas_reach_the_sink_as_thinking_events() {
+        let v = vault();
+        let mock = MockLlmClient::new(
+            vec![
+                tool_call("c1", "search_notes", r#"{"query":"components"}"#),
+                final_turn(),
+            ],
+            "Widgets snap together [e1].",
+        )
+        .with_reasoning(&["Let me ", "check the notes."]);
+        let events = run(v.path(), &mock, &Guards::default());
+
+        let thinking: Vec<&str> = events
+            .iter()
+            .filter_map(|e| match e {
+                ChatEvent::Thinking { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(thinking, vec!["Let me ", "check the notes."]);
+        // Reasoning is surfaced but never conflated with the answer: the run still
+        // ends cleanly and the answer's own citation verifies.
+        assert!(matches!(events.last(), Some(ChatEvent::Done)));
+        assert!(events
+            .iter()
+            .any(|e| matches!(e, ChatEvent::Citation { id, .. } if id == "e1")));
+    }
+
+    #[test]
     fn citing_an_unknown_evidence_id_is_dropped() {
         let v = vault();
         let mock = MockLlmClient::new(
@@ -864,6 +999,74 @@ mod tests {
             vec!["e1".to_string(), "e2".to_string()]
         );
         assert!(extract_cited_ids("no citations here").is_empty());
+    }
+
+    fn assistant_msg(content: &str) -> LlmMessage {
+        LlmMessage {
+            role: crate::ai::llm::Role::Assistant,
+            content: Some(content.to_string()),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            name: None,
+        }
+    }
+
+    #[test]
+    fn strip_cited_markers_removes_markers_and_leading_space() {
+        assert_eq!(
+            strip_cited_markers("Spacing is 8px [e1] and grids use it [e2]."),
+            "Spacing is 8px and grids use it."
+        );
+        // Case-insensitive `e`, multi-digit ids; non-markers are left untouched.
+        assert_eq!(
+            strip_cited_markers("A [E12] then [x] and [e] stay."),
+            "A then [x] and [e] stay."
+        );
+        assert_eq!(strip_cited_markers("no markers here"), "no markers here");
+    }
+
+    #[test]
+    fn prepare_history_strips_stale_markers_from_carried_turns() {
+        // SUS-1 backstop in the core: a `[eN]` carried into a later turn can't survive
+        // to re-validate against an unrelated fresh span.
+        let history = vec![
+            LlmMessage::user("what is spacing?"),
+            assistant_msg("Spacing is 8px [e1] and grids use it [e2]."),
+        ];
+        let out = prepare_history(&history);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].content.as_deref(), Some("what is spacing?"));
+        assert_eq!(
+            out[1].content.as_deref(),
+            Some("Spacing is 8px and grids use it.")
+        );
+    }
+
+    #[test]
+    fn prepare_history_windows_to_char_budget_keeping_most_recent() {
+        // H1: bound history so system + history + evidence can't overflow a local
+        // window. Each turn is ~5k chars, so only the newest that fit the 12k budget
+        // survive; the oldest drop.
+        let big = "x".repeat(5_000);
+        let history: Vec<LlmMessage> = (0..6)
+            .map(|i| assistant_msg(&format!("{i}{big}")))
+            .collect();
+        let out = prepare_history(&history);
+        assert!(
+            out.len() < history.len(),
+            "oversized history must be windowed"
+        );
+        assert!(!out.is_empty());
+        // The newest turn is always retained.
+        assert_eq!(out.last().unwrap().content, history.last().unwrap().content);
+    }
+
+    #[test]
+    fn prepare_history_keeps_newest_turn_even_when_it_exceeds_budget() {
+        // Never send empty history just because the last turn alone is huge.
+        let huge = assistant_msg(&"y".repeat(MAX_HISTORY_CHARS + 5_000));
+        let out = prepare_history(std::slice::from_ref(&huge));
+        assert_eq!(out.len(), 1);
     }
 
     #[test]

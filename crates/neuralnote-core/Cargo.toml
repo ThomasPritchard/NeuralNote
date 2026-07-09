@@ -19,6 +19,12 @@ trash = "5"
 async-trait = "0.1"
 # Deterministic local date/time rendering for Obsidian-compatible note templates.
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
+# Generates the TypeScript mirror of the domain/AI contract types (the
+# `app/desktop/src/lib/bindings/` files) from these Rust types during `cargo test`,
+# so the frontend can never silently drift out of lockstep with serde's wire shape.
+# serde-compat (a default feature) makes ts-rs read the existing `#[serde(...)]`
+# attributes, so the emitted TS matches the exact JSON serde produces.
+ts-rs = "12.0.1"
 
 [dev-dependencies]
 tempfile = "3"

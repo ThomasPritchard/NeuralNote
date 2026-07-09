@@ -1,8 +1,8 @@
 // The far-left icon rail (Obsidian's workspace switcher). Files/Search swap
-// the sidebar panel, Graph view toggles the center pane, and Settings opens
-// the settings modal — the view state lives in Workspace, so this rail is a
-// pure prop-driven control with real active states. Capture remains a
-// present-but-inert placeholder for a later phase: a real, labelled,
+// the sidebar panel and Graph view toggles the center pane — the view state
+// lives in Workspace, so this rail is a pure prop-driven control with real
+// active states. Settings is window-scoped and lives in the titlebar. Capture
+// remains a present-but-inert placeholder for a later phase: a real, labelled,
 // aria-disabled button so the locked layout is honest without faking
 // behaviour.
 
@@ -12,12 +12,9 @@ import {
   Files,
   Network,
   Search,
-  Settings,
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "../lib/cn";
-
-const EASE = "ease-[cubic-bezier(0.32,0.72,0,1)]";
 
 /** Which sidebar panel is showing (Workspace-local view state). */
 export type SidebarPanel = "files" | "search";
@@ -30,7 +27,6 @@ interface RibbonProps {
   onShowFiles: () => void;
   onShowSearch: () => void;
   onToggleGraph: () => void;
-  onOpenSettings: () => void;
 }
 
 export function Ribbon({
@@ -39,7 +35,6 @@ export function Ribbon({
   onShowFiles,
   onShowSearch,
   onToggleGraph,
-  onOpenSettings,
 }: Readonly<RibbonProps>) {
   return (
     <nav
@@ -69,14 +64,6 @@ export function Ribbon({
         active={centerView === "graph"}
         onClick={onToggleGraph}
       />
-
-      <RibbonButton
-        icon={Settings}
-        label="Settings"
-        active={false}
-        onClick={onOpenSettings}
-        className="mt-auto"
-      />
     </nav>
   );
 }
@@ -87,7 +74,6 @@ interface RibbonButtonProps {
   active: boolean;
   /** Absent for the not-yet-built placeholders (aria-disabled, no-op). */
   onClick?: () => void;
-  className?: string;
 }
 
 function RibbonButton({
@@ -95,7 +81,6 @@ function RibbonButton({
   label,
   active,
   onClick,
-  className,
 }: Readonly<RibbonButtonProps>) {
   const inert = !onClick;
   return (
@@ -108,11 +93,9 @@ function RibbonButton({
       onClick={onClick}
       className={cn(
         "relative grid size-9 place-items-center rounded-lg transition-colors duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
-        EASE,
-        active
+        "ease-spring",        active
           ? "bg-sidebar-accent text-foreground"
           : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground",
-        className,
       )}
     >
       {active && (

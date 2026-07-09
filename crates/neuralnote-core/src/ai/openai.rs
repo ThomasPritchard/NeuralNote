@@ -39,6 +39,26 @@ pub fn consume_sse_line(
             full.push_str(&delta);
             Ok(None)
         }
+        SseEvent::Reasoning(delta) => {
+            // Streamed to the UI like an Answer delta, but deliberately NOT pushed to
+            // `full`: the returned string must stay byte-equal to the Answer deltas
+            // (the orchestrator verifies citations against it), and reasoning is not an
+            // answer. This also keeps `finish_answer`'s empty-answer guard honest — a
+            // stream that only reasons leaves `full` empty and still surfaces as Err.
+            sink.send(ChatEvent::Thinking { delta });
+            Ok(None)
+        }
+        SseEvent::ReasoningAndDelta { reasoning, delta } => {
+            // Reasoning first: it precedes the answer token within the frame. Only the
+            // answer content reaches `full`, keeping the returned string byte-equal to
+            // the Answer deltas the orchestrator verifies citations against.
+            sink.send(ChatEvent::Thinking { delta: reasoning });
+            sink.send(ChatEvent::Answer {
+                delta: delta.clone(),
+            });
+            full.push_str(&delta);
+            Ok(None)
+        }
         SseEvent::Done => Ok(Some(full.clone())),
         SseEvent::Error(msg) => Err(CoreError::Llm(msg)),
         SseEvent::Other => Ok(None),
@@ -59,9 +79,30 @@ pub fn finish_answer(full: String) -> CoreResult<String> {
     }
 }
 
-pub fn to_wire_request(req: &LlmRequest, stream: bool) -> serde_json::Value {
-    serde_json::to_value(WireRequest::from_core(req, stream))
-        .expect("wire request serialises to JSON")
+/// Sane output ceiling for the streamed answer turn; tool-deciding turns stay uncapped so long tool-call JSON is never truncated.
+// TODO(answer-truncation-signal): if the model hits this ceiling the provider sends
+// `finish_reason: "length"` before `[DONE]`; parse it in the SSE stream and surface a
+// "answer truncated at the length limit" notice so a capped answer is never shown as a
+// complete one. Moat-safe today (a cut-off `[eN]` marker simply goes uncited, never
+// mis-cited), so this is UX polish, not a correctness fix.
+pub const ANSWER_MAX_TOKENS: u32 = 4096;
+
+/// Build the OpenAI-compatible request body. `num_ctx` is set only by the local
+/// (Ollama) client, where it becomes `options.num_ctx`; OpenRouter passes `None`.
+/// `reasoning` asks the provider to stream reasoning tokens — set only by the
+/// OpenRouter client, which speaks it, and only when the user has opted in; the
+/// local (Ollama) endpoint would ignore or reject the field.
+pub fn to_wire_request(
+    req: &LlmRequest,
+    stream: bool,
+    num_ctx: Option<u32>,
+    max_tokens: Option<u32>,
+    reasoning: bool,
+) -> serde_json::Value {
+    serde_json::to_value(WireRequest::from_core(
+        req, stream, num_ctx, max_tokens, reasoning,
+    ))
+    .expect("wire request serialises to JSON")
 }
 
 pub fn parse_completion(value: serde_json::Value) -> CoreResult<Completion> {
@@ -91,6 +132,15 @@ pub fn parse_completion(value: serde_json::Value) -> CoreResult<Completion> {
 pub enum SseEvent {
     /// A content chunk to stream to the UI.
     Delta(String),
+    /// A model reasoning-token chunk to surface as a live "thinking" step. Streamed
+    /// like [`SseEvent::Delta`] but NEVER folded into the returned answer — reasoning
+    /// is not an answer delta (see [`consume_sse_line`]).
+    Reasoning(String),
+    /// One frame carrying reasoning AND answer content. The wire does not promise the
+    /// two arrive in separate frames, so this case must be represented rather than
+    /// short-circuited: dropping the content would silently lose an answer token — and
+    /// with it, possibly a leading `[eN]` citation marker.
+    ReasoningAndDelta { reasoning: String, delta: String },
     /// The `data: [DONE]` terminator.
     Done,
     /// A mid-stream OpenRouter `error` frame (HTTP was already 200) — fatal, must
@@ -136,22 +186,73 @@ pub fn parse_sse_line(line: &str) -> SseEvent {
                     None => SseEvent::Error(format!("OpenRouter stream error: {msg}")),
                 };
             }
-            chunk
-                .choices
-                .into_iter()
-                .next()
-                .and_then(|c| c.delta.content)
-                .filter(|s| !s.is_empty())
-                .map(SseEvent::Delta)
-                .unwrap_or(SseEvent::Other)
+            let Some(delta) = chunk.choices.into_iter().next().map(|c| c.delta) else {
+                return SseEvent::Other;
+            };
+            // Read reasoning BEFORE the empty-content filter — the same reason the error
+            // frame is read first. A reasoning-only chunk carries an empty `delta.content`,
+            // so filtering first would silently drop every reasoning token, the exact
+            // mechanism that nearly ate the error frame.
+            //
+            // Both are read from the same frame and matched exhaustively rather than
+            // short-circuiting on reasoning: a frame may carry both, and returning early
+            // on reasoning would drop the answer token beside it.
+            let reasoning = extract_reasoning(&delta);
+            let content = delta.content.filter(|s| !s.is_empty());
+            match (reasoning, content) {
+                (Some(reasoning), Some(delta)) => SseEvent::ReasoningAndDelta { reasoning, delta },
+                (Some(reasoning), None) => SseEvent::Reasoning(reasoning),
+                (None, Some(delta)) => SseEvent::Delta(delta),
+                (None, None) => SseEvent::Other,
+            }
         }
         Err(_) => SseEvent::Other,
     }
 }
 
+/// Pull streamed reasoning text from a delta, if any. Prefers the documented
+/// structured `reasoning_details` array, concatenating consecutive `reasoning.text`
+/// entries; `reasoning.summary` / `reasoning.encrypted` entries carry no display text
+/// and are skipped. Falls back to a plain-string `reasoning` field — not documented as
+/// deprecated, and some providers still emit it instead of the array. Returns `None`
+/// when there is no reasoning text to surface (so the caller falls through to content).
+fn extract_reasoning(delta: &StreamDelta) -> Option<String> {
+    let text: String = delta
+        .reasoning_details
+        .iter()
+        .filter(|d| d.kind.as_deref() == Some("reasoning.text"))
+        .filter_map(|d| d.text.as_deref())
+        .collect();
+    if !text.is_empty() {
+        return Some(text);
+    }
+    delta.reasoning.clone().filter(|s| !s.is_empty())
+}
+
 /* ───────────────────────────  Wire (OpenAI) shape  ─────────────────────── */
 // The core's LlmMessage serialises camelCase (the IPC/UI contract). The OpenRouter
 // wire is snake_case, so we map explicitly here rather than reuse the core's serde.
+
+/// OpenRouter's unified reasoning request object. We only ever enable it — no
+/// `effort` / `max_tokens` knobs (YAGNI); its presence is what tells OpenRouter to
+/// stream reasoning tokens as `delta.reasoning_details`. Omitted entirely for
+/// providers that don't speak it (Ollama's OpenAI-compatible endpoint).
+#[derive(Serialize)]
+struct ReasoningRequest {
+    enabled: bool,
+}
+
+/// Ollama request options. OpenRouter has a large context and its own defaults, so
+/// only the local (Ollama) client sets this.
+#[derive(Serialize)]
+struct WireOptions {
+    /// Context window in tokens. Ollama otherwise falls back to a ~4096 default and
+    /// **silently truncates from the front** — dropping the grounding rules (sent
+    /// first) and earliest evidence, which breaks cited recall on the Local path.
+    /// Sized to fit the retrieval budget (`orchestrator::max_context_chars`) with
+    /// headroom; all curated models support it (see `ai::local` allowlist).
+    num_ctx: u32,
+}
 
 #[derive(Serialize)]
 struct WireRequest<'a> {
@@ -162,15 +263,35 @@ struct WireRequest<'a> {
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     tools: &'a [serde_json::Value],
     stream: bool,
+    /// Set only for the local (Ollama) provider to size its context window; omitted
+    /// for OpenRouter.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    options: Option<WireOptions>,
+    /// Optional output cap for streamed answer turns; omitted for tool-deciding turns.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_tokens: Option<u32>,
+    /// Set only by the OpenRouter client to request streamed reasoning tokens; omitted
+    /// for the local (Ollama) provider, which doesn't speak it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<ReasoningRequest>,
 }
 
 impl<'a> WireRequest<'a> {
-    fn from_core(req: &'a LlmRequest, stream: bool) -> Self {
+    fn from_core(
+        req: &'a LlmRequest,
+        stream: bool,
+        num_ctx: Option<u32>,
+        max_tokens: Option<u32>,
+        reasoning: bool,
+    ) -> Self {
         Self {
             model: &req.model,
             messages: req.messages.iter().map(WireMessage::from_core).collect(),
             tools: &req.tools,
             stream,
+            options: num_ctx.map(|num_ctx| WireOptions { num_ctx }),
+            max_tokens,
+            reasoning: reasoning.then_some(ReasoningRequest { enabled: true }),
         }
     }
 }
@@ -288,6 +409,28 @@ struct StreamChoice {
 struct StreamDelta {
     #[serde(default)]
     content: Option<String>,
+    /// OpenRouter's unified streamed reasoning: an array of typed entries. Only
+    /// `reasoning.text` entries carry display text; the rest (summary/encrypted) are
+    /// skipped by [`extract_reasoning`]. Absent for providers that don't reason.
+    #[serde(default)]
+    reasoning_details: Vec<ReasoningDetail>,
+    /// Secondary shape: a plain-string reasoning delta. Not documented as deprecated,
+    /// and some providers still emit `delta.reasoning` instead of the structured
+    /// `reasoning_details` array — so both are supported, the array preferred.
+    #[serde(default)]
+    reasoning: Option<String>,
+}
+
+/// One entry in `delta.reasoning_details`. Only `type` and `text` are read; the other
+/// documented fields (`summary`, `data`, `signature`, `id`, `format`, `index`) are
+/// ignored — serde skips unknown fields, so an encrypted/summary entry parses without
+/// error and simply yields no display text.
+#[derive(Deserialize)]
+struct ReasoningDetail {
+    #[serde(rename = "type", default)]
+    kind: Option<String>,
+    #[serde(default)]
+    text: Option<String>,
 }
 
 #[cfg(test)]
@@ -340,7 +483,7 @@ mod tests {
             messages: vec![LlmMessage::user("q")],
             tools: Vec::new(),
         };
-        let v = to_wire_request(&req, true);
+        let v = to_wire_request(&req, true, None, None, false);
         assert_eq!(v["model"], "anthropic/claude-sonnet-4.5");
         assert_eq!(v["stream"], true);
         assert!(
@@ -348,6 +491,61 @@ mod tests {
             "empty tools must be omitted (answer turn)"
         );
         assert_eq!(v["messages"][0]["role"], "user");
+        assert!(
+            v.get("options").is_none(),
+            "no options when num_ctx is None (OpenRouter)"
+        );
+        assert!(v.get("max_tokens").is_none());
+        assert!(
+            v.get("reasoning").is_none(),
+            "reasoning must be omitted when not requested"
+        );
+    }
+
+    #[test]
+    fn wire_request_sets_num_ctx_only_when_provided() {
+        let req = LlmRequest {
+            model: "qwen2.5:7b".into(),
+            messages: vec![LlmMessage::user("q")],
+            tools: Vec::new(),
+        };
+        // Local (Ollama) path: options.num_ctx present so Ollama sizes its window
+        // instead of front-truncating the grounding rules + evidence.
+        let local = to_wire_request(&req, false, Some(32768), None, false);
+        assert_eq!(local["options"]["num_ctx"], 32768);
+        // OpenRouter path: no options object at all.
+        let cloud = to_wire_request(&req, false, None, None, false);
+        assert!(cloud.get("options").is_none());
+    }
+
+    #[test]
+    fn wire_request_sets_max_tokens_only_when_provided() {
+        let req = LlmRequest {
+            model: "anthropic/claude-sonnet-4.5".into(),
+            messages: vec![LlmMessage::user("q")],
+            tools: Vec::new(),
+        };
+        let capped = to_wire_request(&req, true, None, Some(ANSWER_MAX_TOKENS), false);
+        assert_eq!(capped["max_tokens"], 4096);
+        let uncapped = to_wire_request(&req, true, None, None, false);
+        assert!(uncapped.get("max_tokens").is_none());
+    }
+
+    #[test]
+    fn wire_request_emits_reasoning_object_only_when_requested() {
+        let req = LlmRequest {
+            model: "anthropic/claude-sonnet-4.5".into(),
+            messages: vec![LlmMessage::user("q")],
+            tools: Vec::new(),
+        };
+        // OpenRouter answer turn: the unified reasoning object asks for streamed
+        // reasoning tokens.
+        let on = to_wire_request(&req, true, None, Some(ANSWER_MAX_TOKENS), true);
+        assert_eq!(on["reasoning"]["enabled"], true);
+        // Any turn that doesn't request it (all tool turns, and the whole Local path)
+        // must omit the field entirely — Ollama would ignore or reject it.
+        let off = to_wire_request(&req, true, None, Some(ANSWER_MAX_TOKENS), false);
+        assert!(off.get("reasoning").is_none());
     }
 
     #[test]
@@ -468,5 +666,161 @@ mod tests {
             }
             _ => panic!("expected SseEvent::Error"),
         }
+    }
+
+    #[test]
+    fn sse_reasoning_details_text_yields_reasoning_despite_empty_content() {
+        // A reasoning-only chunk: structured `reasoning_details` text AND an empty
+        // `delta.content`. It must NOT be filtered to Other — reasoning is parsed
+        // before the empty-delta filter (the exact trap the ordering guards against).
+        let line = r#"data: {"choices":[{"delta":{"content":"","reasoning_details":[{"type":"reasoning.text","text":"Let me think"}]}}]}"#;
+        match parse_sse_line(line) {
+            SseEvent::Reasoning(text) => assert_eq!(text, "Let me think"),
+            _ => panic!("expected SseEvent::Reasoning for a reasoning-only chunk"),
+        }
+    }
+
+    #[test]
+    fn sse_reasoning_details_concatenates_consecutive_text_entries() {
+        // Consecutive `reasoning.text` entries in one delta are concatenated.
+        let line = r#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"one "},{"type":"reasoning.text","text":"two"}]}}]}"#;
+        match parse_sse_line(line) {
+            SseEvent::Reasoning(text) => assert_eq!(text, "one two"),
+            _ => panic!("expected concatenated reasoning text"),
+        }
+    }
+
+    #[test]
+    fn sse_plain_string_reasoning_yields_reasoning() {
+        // The secondary shape: a plain-string `delta.reasoning` (no structured array).
+        let line = r#"data: {"choices":[{"delta":{"reasoning":"pondering"}}]}"#;
+        match parse_sse_line(line) {
+            SseEvent::Reasoning(text) => assert_eq!(text, "pondering"),
+            _ => panic!("expected SseEvent::Reasoning for a plain-string reasoning delta"),
+        }
+    }
+
+    #[test]
+    fn sse_reasoning_summary_and_encrypted_produce_no_text() {
+        // Non-text reasoning entries must not crash and must not emit garbage text:
+        // with no `reasoning.text` and no content, the chunk is simply Other.
+        let line = r#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.summary","summary":"gist"},{"type":"reasoning.encrypted","data":"AbC123"}]}}]}"#;
+        assert!(
+            matches!(parse_sse_line(line), SseEvent::Other),
+            "summary/encrypted entries carry no display text"
+        );
+    }
+
+    #[test]
+    fn sse_error_frame_with_reasoning_still_surfaces_as_error() {
+        // Ordering regression guard: a frame carrying BOTH an error object and
+        // reasoning must surface as Error — the error check precedes the reasoning
+        // check, exactly as it precedes the content filter.
+        let line = r#"data: {"error":{"code":429,"message":"Rate limit exceeded"},"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"thinking"}]}}]}"#;
+        match parse_sse_line(line) {
+            SseEvent::Error(msg) => {
+                assert!(msg.contains("429") && msg.contains("Rate limit exceeded"));
+            }
+            _ => panic!("expected SseEvent::Error to win over reasoning in a failure frame"),
+        }
+    }
+
+    #[test]
+    fn consume_sse_line_reasoning_emits_thinking_without_accumulating() {
+        // Reasoning streams to the sink as Thinking, but never enters `full` — so the
+        // returned answer stays byte-equal to the Answer deltas.
+        let mut sink = VecSink::default();
+        let mut full = String::new();
+        let stop = consume_sse_line(
+            br#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"hmm"}]}}]}"#,
+            &mut sink,
+            &mut full,
+        )
+        .unwrap();
+        assert!(stop.is_none());
+        assert!(
+            full.is_empty(),
+            "reasoning must not accumulate into the answer"
+        );
+        match sink.0.as_slice() {
+            [ChatEvent::Thinking { delta }] => assert_eq!(delta, "hmm"),
+            other => panic!("expected a single Thinking event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_frame_carrying_reasoning_and_content_keeps_both() {
+        // The wire does not promise reasoning and content arrive in separate frames.
+        // A frame carrying both must surface both — dropping the content would lose an
+        // answer token, and with it any citation marker riding on it.
+        let mut sink = VecSink::default();
+        let mut full = String::new();
+        let stop = consume_sse_line(
+            br#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"so"}],"content":"[e1] Plants"}}]}"#,
+            &mut sink,
+            &mut full,
+        )
+        .unwrap();
+        assert!(stop.is_none());
+        assert_eq!(full, "[e1] Plants", "the answer token must not be dropped");
+        match sink.0.as_slice() {
+            [ChatEvent::Thinking { delta: thinking }, ChatEvent::Answer { delta: answer }] => {
+                assert_eq!(thinking, "so");
+                assert_eq!(answer, "[e1] Plants");
+            }
+            other => panic!("expected Thinking then Answer, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_plain_string_reasoning_frame_with_content_keeps_both() {
+        // Same guarantee for the legacy plain-string `reasoning` shape.
+        let mut sink = VecSink::default();
+        let mut full = String::new();
+        consume_sse_line(
+            br#"data: {"choices":[{"delta":{"reasoning":"weighing","content":"Sugar."}}]}"#,
+            &mut sink,
+            &mut full,
+        )
+        .unwrap();
+        assert_eq!(full, "Sugar.");
+        assert_eq!(sink.0.len(), 2, "both a Thinking and an Answer event");
+    }
+
+    #[test]
+    fn reasoning_only_stream_then_done_still_fails_the_empty_answer_guard() {
+        // A stream that reasons at length and then produces no answer is still a
+        // failure: reasoning never satisfies finish_answer's empty-answer guard.
+        let mut sink = VecSink::default();
+        let mut full = String::new();
+        for text in ["Let me ", "think about ", "this"] {
+            let line = format!(
+                r#"data: {{"choices":[{{"delta":{{"reasoning_details":[{{"type":"reasoning.text","text":"{text}"}}]}}}}]}}"#
+            );
+            let stop = consume_sse_line(line.as_bytes(), &mut sink, &mut full).unwrap();
+            assert!(stop.is_none());
+        }
+        let stop = consume_sse_line(b"data: [DONE]", &mut sink, &mut full).unwrap();
+        assert_eq!(
+            stop.as_deref(),
+            Some(""),
+            "a reason-only stream carries no answer"
+        );
+        assert!(
+            finish_answer(stop.unwrap()).is_err(),
+            "reasoning-only must still surface as an empty-answer failure"
+        );
+        assert_eq!(
+            count_thinking(&sink.0),
+            3,
+            "every reasoning chunk should have reached the sink as Thinking"
+        );
+    }
+
+    fn count_thinking(events: &[ChatEvent]) -> usize {
+        events
+            .iter()
+            .filter(|e| matches!(e, ChatEvent::Thinking { .. }))
+            .count()
     }
 }

@@ -48,14 +48,22 @@ npm --prefix app/desktop run typecheck     # tsc --noEmit
 npm --prefix app/desktop run test:run      # Vitest (unit + component), one-shot
 npm --prefix app/desktop run test:e2e      # Vitest e2e (src/e2e, jsdom + mocked IPC)
 npm --prefix app/desktop run coverage      # Vitest with coverage → writes the TS lcov
+npm --prefix app/desktop run gen:bindings  # regenerate src/lib/bindings/ from the Rust ts-rs types
+npm --prefix app/desktop run check:bindings # regenerate + git-diff: fails if the committed bindings are stale
 ```
 
 `test` (no `:run`) is watch mode — use `test:run` in CI/verification.
 
+The frontend type mirror in `app/desktop/src/lib/bindings/` is **generated** from the
+Rust types by the `ts-rs` crate during `cargo test` (the façade `src/lib/types.ts`
+re-exports it). It is committed; edit the Rust type, not the `.ts`. `check:bindings`
+(also run by the gate) fails the build if the committed output drifts from the Rust
+source, so a Rust↔TS mismatch can never reach a user silently.
+
 ## Quality gates
 
 ```bash
-bash scripts/rust-quality-gate.sh          # clippy -D warnings + rustfmt --check + llvm-cov ≥90% (neuralnote-core) + cargo-audit
+bash scripts/rust-quality-gate.sh          # clippy -D warnings + rustfmt --check + ts-rs bindings drift + llvm-cov ≥90% (neuralnote-core) + cargo-audit
 ```
 
 **Known, pre-existing gate note — don't misread it as your regression.**

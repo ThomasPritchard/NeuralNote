@@ -5,9 +5,11 @@
 
 use crate::error::{CoreError, CoreResult};
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct InstalledModel {
     pub tag: String,
     pub size_bytes: u64,

@@ -155,6 +155,37 @@ describe("GraphView", () => {
     expect(screen.getByTestId("force-graph-3d")).toBeInTheDocument();
   });
 
+  it("caps a huge root graph at 500 nodes with a truncation notice; drilling under the cap clears it (PA-006)", async () => {
+    // 505 flat notes in big/ plus a drillable small/ folder — over the cap at
+    // root, comfortably under it once drilled.
+    const nodes = Array.from({ length: 505 }, (_, i) => ({
+      id: `big/note-${String(i).padStart(3, "0")}.md`,
+      title: `Note ${i}`,
+      cluster: "big",
+    }));
+    nodes.push(
+      { id: "small/sub/x.md", title: "X", cluster: "small" },
+      { id: "small/sub/y.md", title: "Y", cluster: "small" },
+      { id: "small/z.md", title: "Z", cluster: "small" },
+    );
+    mocks.readLinkGraph.mockResolvedValue(linkGraph({ nodes, links: [] }));
+    render(<GraphView onOpenNote={vi.fn()} />);
+    fireResize(800, 600);
+    await screen.findByTestId("force-graph-3d");
+
+    // Only the cap reaches the 3D sim, and the partial view says so.
+    expect(harness.props.graphData.nodes).toHaveLength(500);
+    expect(
+      screen.getByText(/Showing the 500 most-linked of 508 notes/),
+    ).toBeInTheDocument();
+
+    // The capped-out folder stays in the legend; drilling re-derives the level
+    // under the cap, so the notice disappears with the truncation.
+    await userEvent.click(screen.getByRole("button", { name: "small" }));
+    expect(harness.props.graphData.nodes).toHaveLength(3);
+    expect(screen.queryByText(/most-linked of/)).not.toBeInTheDocument();
+  });
+
   it("routes 'Open in reader' through onOpenNote with the node's relPath", async () => {
     mocks.readLinkGraph.mockResolvedValue(linkGraph());
     const onOpenNote = vi.fn();

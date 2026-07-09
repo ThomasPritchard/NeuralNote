@@ -138,6 +138,19 @@ describe("Journey 8: local AI — reconfigure from the Settings cog", () => {
     await user.click(screen.getByRole("button", { name: "Settings" }));
     const dialog = await screen.findByRole("dialog");
 
+    // The already-installed model is never offered for re-download: once the
+    // installed scan resolves, its catalogue row carries the Installed chip
+    // and no Download button.
+    const catalogue = await within(dialog).findByRole("list", {
+      name: "Model catalogue",
+    });
+    const catRow = within(catalogue).getByText("llama3.2:3b").closest("li");
+    expect(catRow).not.toBeNull();
+    expect(await within(catRow!).findByText("Installed")).toBeInTheDocument();
+    expect(
+      within(catRow!).queryByRole("button", { name: /download/i }),
+    ).not.toBeInTheDocument();
+
     // The installed local model offers "Use this model"; switch to it.
     const installed = await within(dialog).findByRole("list", {
       name: "Installed on this machine",

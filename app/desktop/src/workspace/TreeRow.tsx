@@ -1,7 +1,9 @@
-// One node in the vault tree, rendered recursively. Folders collapse/expand and
-// act as drop targets; files select into the reader. Hover (or keyboard focus)
-// reveals per-node actions: new note / new folder (folders only), rename, delete.
-// Inline create/rename inputs live here; the parent FileTree owns the async ops.
+// One node in the vault tree, rendered as a single flat row — FileTree flattens
+// the visible tree (flattenTree.ts) and windows it, so rows never recurse into
+// children here (PA-005). Folders collapse/expand and act as drop targets;
+// files select into the reader. Hover (or keyboard focus) reveals per-node
+// actions: new note / new folder (folders only), rename, delete. Inline
+// create/rename inputs live here; the parent FileTree owns the async ops.
 
 import { memo, useRef, useState } from "react";
 import {
@@ -18,8 +20,6 @@ import { cn } from "../lib/cn";
 import type { TemplateInfo, TreeNode } from "../lib/types";
 import { iconForFile, isPathInside } from "./fileMeta";
 import { InlineInput } from "./InlineInput";
-
-const EASE = "ease-[cubic-bezier(0.32,0.72,0,1)]";
 
 export type CreateKind = "note" | "folder";
 
@@ -94,6 +94,7 @@ export const TreeRow = memo(function TreeRow({
 function FolderRow({ node, ctx }: { node: TreeNode; ctx: TreeContext }) {
   const [dropActive, setDropActive] = useState(false);
   const creatingHere = ctx.creating?.parentPath === node.path;
+  // Mirrors flattenTree's open rule — the chevron and the row list must agree.
   const isOpen = creatingHere || !ctx.collapsed.has(node.relPath);
   // A folder cannot be dropped into itself or one of its descendants.
   const canDrop =
@@ -102,120 +103,104 @@ function FolderRow({ node, ctx }: { node: TreeNode; ctx: TreeContext }) {
     !isPathInside(node.path, ctx.dragPath);
 
   return (
-    <div>
-      {/* role="treeitem" reflects the row's place in the tree; tabIndex={-1}
-          meets the focusability requirement for an element with drag handlers
-          without adding a tab stop (the toggle button inside is the keyboard
-          control). aria-selected is required for treeitem (S6807); a folder is
-          never the active selection (only files are), so it is always false. */}
-      <div
-        role="treeitem"
-        aria-selected={false}
-        tabIndex={-1}
+    // role="treeitem" reflects the row's place in the tree; tabIndex={-1}
+    // meets the focusability requirement for an element with drag handlers
+    // without adding a tab stop (the toggle button inside is the keyboard
+    // control). aria-selected is required for treeitem (S6807); a folder is
+    // never the active selection (only files are), so it is always false.
+    <div
+      role="treeitem"
+      aria-selected={false}
+      tabIndex={-1}
+      className={cn(
+        "group relative flex items-center rounded-md transition-colors",
+        "ease-spring",        dropActive && canDrop && "bg-primary/15 ring-1 ring-inset ring-primary/40",
+      )}
+      draggable
+      onDragStart={(e) => {
+        e.dataTransfer.effectAllowed = "move";
+        e.dataTransfer.setData("text/plain", node.path);
+        ctx.onDragStart(node.path);
+      }}
+      onDragEnd={ctx.onDragEnd}
+      onDragOver={(e) => {
+        if (!canDrop) return;
+        e.preventDefault();
+        setDropActive(true);
+      }}
+      onDragLeave={() => setDropActive(false)}
+      onDrop={(e) => {
+        e.preventDefault();
+        e.stopPropagation();
+        setDropActive(false);
+        if (canDrop) ctx.onDrop(node.path);
+      }}
+    >
+      <button
+        type="button"
+        onClick={() => ctx.toggle(node.relPath)}
+        onDoubleClick={() => ctx.onStartRename(node.path)}
+        aria-expanded={isOpen}
         className={cn(
-          "group relative flex items-center rounded-md transition-colors",
-          EASE,
-          dropActive && canDrop && "bg-primary/15 ring-1 ring-inset ring-primary/40",
-        )}
-        draggable
-        onDragStart={(e) => {
-          e.dataTransfer.effectAllowed = "move";
-          e.dataTransfer.setData("text/plain", node.path);
-          ctx.onDragStart(node.path);
-        }}
-        onDragEnd={ctx.onDragEnd}
-        onDragOver={(e) => {
-          if (!canDrop) return;
-          e.preventDefault();
-          setDropActive(true);
-        }}
-        onDragLeave={() => setDropActive(false)}
-        onDrop={(e) => {
-          e.preventDefault();
-          e.stopPropagation();
-          setDropActive(false);
-          if (canDrop) ctx.onDrop(node.path);
-        }}
+          "flex min-w-0 flex-1 items-center gap-1 rounded-md px-1 py-1 text-left text-[13px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
+          "ease-spring",        )}
       >
+        <ChevronRight
+          className={cn(
+            "size-3 shrink-0 opacity-60 transition-transform duration-200",
+            "ease-spring",            isOpen && "rotate-90",
+          )}
+          aria-hidden
+        />
+        {isOpen ? (
+          <FolderOpen className="size-3.5 shrink-0 text-primary/80" aria-hidden />
+        ) : (
+          <Folder className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
+        )}
+        <span className="truncate">{node.name}</span>
+        <span className="nn-mono ml-auto pr-1 text-[10px] text-muted-foreground/60">
+          {node.children?.length ?? 0}
+        </span>
+      </button>
+
+      <div className={ACTIONS_WRAP}>
         <button
           type="button"
-          onClick={() => ctx.toggle(node.relPath)}
-          onDoubleClick={() => ctx.onStartRename(node.path)}
-          aria-expanded={isOpen}
-          className={cn(
-            "flex min-w-0 flex-1 items-center gap-1 rounded-md px-1 py-1 text-left text-[13px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
-            EASE,
-          )}
+          aria-label={`New note in ${node.name}`}
+          title="New note"
+          onClick={() => ctx.onStartCreate(node.path, "note")}
+          className={ACTION_BTN}
         >
-          <ChevronRight
-            className={cn(
-              "size-3 shrink-0 opacity-60 transition-transform duration-200",
-              EASE,
-              isOpen && "rotate-90",
-            )}
-            aria-hidden
-          />
-          {isOpen ? (
-            <FolderOpen className="size-3.5 shrink-0 text-primary/80" aria-hidden />
-          ) : (
-            <Folder className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
-          )}
-          <span className="truncate">{node.name}</span>
-          <span className="nn-mono ml-auto pr-1 text-[10px] text-muted-foreground/60">
-            {node.children?.length ?? 0}
-          </span>
+          <Plus className="size-3.5" aria-hidden />
         </button>
-
-        <div className={ACTIONS_WRAP}>
-          <button
-            type="button"
-            aria-label={`New note in ${node.name}`}
-            title="New note"
-            onClick={() => ctx.onStartCreate(node.path, "note")}
-            className={ACTION_BTN}
-          >
-            <Plus className="size-3.5" aria-hidden />
-          </button>
-          <button
-            type="button"
-            aria-label={`New folder in ${node.name}`}
-            title="New folder"
-            onClick={() => ctx.onStartCreate(node.path, "folder")}
-            className={ACTION_BTN}
-          >
-            <FolderPlus className="size-3.5" aria-hidden />
-          </button>
-          <button
-            type="button"
-            aria-label={`Rename ${node.name}`}
-            title="Rename"
-            onClick={() => ctx.onStartRename(node.path)}
-            className={ACTION_BTN}
-          >
-            <Pencil className="size-3.5" aria-hidden />
-          </button>
-          <button
-            type="button"
-            aria-label={`Delete ${node.name}`}
-            title="Delete"
-            onClick={() => ctx.onDelete(node)}
-            className={cn(ACTION_BTN, "hover:text-destructive")}
-          >
-            <Trash2 className="size-3.5" aria-hidden />
-          </button>
-        </div>
+        <button
+          type="button"
+          aria-label={`New folder in ${node.name}`}
+          title="New folder"
+          onClick={() => ctx.onStartCreate(node.path, "folder")}
+          className={ACTION_BTN}
+        >
+          <FolderPlus className="size-3.5" aria-hidden />
+        </button>
+        <button
+          type="button"
+          aria-label={`Rename ${node.name}`}
+          title="Rename"
+          onClick={() => ctx.onStartRename(node.path)}
+          className={ACTION_BTN}
+        >
+          <Pencil className="size-3.5" aria-hidden />
+        </button>
+        <button
+          type="button"
+          aria-label={`Delete ${node.name}`}
+          title="Delete"
+          onClick={() => ctx.onDelete(node)}
+          className={cn(ACTION_BTN, "hover:text-destructive")}
+        >
+          <Trash2 className="size-3.5" aria-hidden />
+        </button>
       </div>
-
-      {isOpen && (
-        <div className="ml-[7px] border-l border-border/60 pl-2">
-          {creatingHere && ctx.creating && (
-            <CreateRow kind={ctx.creating.kind} ctx={ctx} />
-          )}
-          {node.children?.map((child) => (
-            <TreeRow key={child.relPath} node={child} ctx={ctx} />
-          ))}
-        </div>
-      )}
     </div>
   );
 }
@@ -250,8 +235,7 @@ function FileRow({ node, ctx }: { node: TreeNode; ctx: TreeContext }) {
         aria-current={active || undefined}
         className={cn(
           "flex min-w-0 flex-1 items-center gap-1.5 rounded-md py-[5px] pl-1.5 pr-2 text-left text-[13px] transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
-          EASE,
-          active
+          "ease-spring",          active
             ? "bg-primary/12 text-foreground ring-1 ring-inset ring-primary/25"
             : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
         )}

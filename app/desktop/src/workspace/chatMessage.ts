@@ -239,15 +239,38 @@ export function summarizeActivity(activity: ActivityStep[]): ActivitySummary {
   return { searches, notesRead: notes.size, dropped, verified, totalSteps: activity.length };
 }
 
+/** Strip every `[eN]` citation marker from a prior answer before it re-enters a
+ *  later turn's context. Evidence ids are assigned fresh per run (the Rust registry
+ *  starts empty each `run_chat`), so a marker carried forward refers to nothing in
+ *  the new turn's registry — and if the model echoes it, the verifier can validate it
+ *  against an *unrelated* freshly-retrieved span, surfacing as a "verified" citation
+ *  whose source text doesn't match the prose claim (SUS-1 — the exact failure the moat
+ *  forbids). History is plain conversational context, so the markers add nothing;
+ *  dropping all of them (verified or not) closes the hole at the source. */
+export function stripCitationMarkers(answer: string): string {
+  return answer.replace(/ ?\[e\d+\]/gi, "");
+}
+
+/** Cap on how many prior turns are resent as context. Without it, every `chat`
+ *  request carries the entire transcript, so per-turn token cost grows linearly with
+ *  conversation length and a long chat eventually trips the provider's context limit
+ *  (PA-003). We keep the most recent turns and drop older ones — recency is what the
+ *  next answer usually needs. (The core separately caps tool-result content within a
+ *  run via `max_context_chars`; this bounds the conversation history.) */
+const MAX_HISTORY_TURNS = 20;
+
 /** The prior conversation as plain `ChatTurn`s, for the next `chat` request.
  *  Empty assistant turns (errored / no answer) are dropped so the model isn't
- *  handed blank context. */
+ *  handed blank context; `[eN]` markers are stripped so stale ids can't re-enter a
+ *  later run and mis-cite (see `stripCitationMarkers`); and the history is windowed
+ *  to the last `MAX_HISTORY_TURNS` so per-turn cost stays bounded (see above). */
 export function toHistory(messages: ChatMessage[]): ChatTurn[] {
   return messages
     .map((m): ChatTurn =>
       m.role === "user"
         ? { role: "user", content: m.content }
-        : { role: "assistant", content: m.answer },
+        : { role: "assistant", content: stripCitationMarkers(m.answer) },
     )
-    .filter((turn) => turn.content.trim() !== "");
+    .filter((turn) => turn.content.trim() !== "")
+    .slice(-MAX_HISTORY_TURNS);
 }

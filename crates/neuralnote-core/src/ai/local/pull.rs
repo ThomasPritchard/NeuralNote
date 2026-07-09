@@ -4,13 +4,15 @@
 //! in-band `error` fields must surface distinctly while malformed noise is skipped.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
+#[ts(export)]
 pub enum PullEvent {
     Progress {
         status: String,

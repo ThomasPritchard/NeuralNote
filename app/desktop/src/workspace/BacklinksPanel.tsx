@@ -22,8 +22,6 @@ import { errorMessage } from "../lib/api";
 import { cn } from "../lib/cn";
 import type { Backlink, Backlinks, UnlinkedMention } from "../lib/types";
 
-const EASE = "ease-[cubic-bezier(0.32,0.72,0,1)]";
-
 type PanelState =
   | { kind: "loading" }
   | { kind: "loaded"; backlinks: Backlinks }
@@ -174,14 +172,12 @@ function MentionSection({
         onClick={() => setOpen((o) => !o)}
         className={cn(
           "flex w-full items-center gap-1.5 rounded-md px-2.5 py-1.5 text-left text-[13px] font-medium text-foreground/90 transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
-          EASE,
-        )}
+          "ease-spring",        )}
       >
         <ChevronRight
           className={cn(
             "size-3 shrink-0 text-muted-foreground transition-transform duration-200",
-            EASE,
-            open && "rotate-90",
+            "ease-spring",            open && "rotate-90",
           )}
           aria-hidden
         />
@@ -229,8 +225,7 @@ function MentionRow({
         title={`Open ${entry.sourceRel}`}
         className={cn(
           "flex w-full flex-col gap-0.5 rounded-md px-2.5 py-1.5 text-left transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
-          EASE,
-        )}
+          "ease-spring",        )}
       >
         <span className="flex w-full items-baseline gap-2">
           <span className="min-w-0 truncate text-[13px] font-medium text-foreground/90">

@@ -41,17 +41,17 @@ const DEFAULT_MODEL = "anthropic/claude-sonnet-4.5";
 // ── AiStatus builders (the three effective-provider shapes the pane branches on) ──
 const unconfigured = (): AiStatus => ({
   activeProvider: null,
-  openrouter: { hasKey: false, model: DEFAULT_MODEL },
+  openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false },
   local: { activeModelTag: null },
 });
 const openRouterActive = (model = DEFAULT_MODEL): AiStatus => ({
   activeProvider: "openRouter",
-  openrouter: { hasKey: true, model },
+  openrouter: { hasKey: true, model, reasoning: false },
   local: { activeModelTag: null },
 });
 const localActive = (tag: string | null): AiStatus => ({
   activeProvider: "local",
-  openrouter: { hasKey: false, model: DEFAULT_MODEL },
+  openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false },
   local: { activeModelTag: tag },
 });
 
@@ -199,7 +199,7 @@ describe("ChatPane — first-run provider branching", () => {
   it("falls back to guided setup when openRouter is active without a key", async () => {
     mockAiStatus.mockResolvedValue({
       activeProvider: "openRouter",
-      openrouter: { hasKey: false, model: DEFAULT_MODEL },
+      openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false },
       local: { activeModelTag: null },
     });
     setup();
@@ -270,6 +270,21 @@ describe("ChatPane — key setup", () => {
     expect(screen.queryByLabelText("Ask across your vault")).not.toBeInTheDocument();
   });
 
+  it("prefills the setup model solely from the status echo — no frontend default (PA-013)", async () => {
+    // A distinctive echoed default proves the id flows from `aiStatus` (the
+    // Rust core owns the locked default), never from a frontend constant that
+    // could silently disagree after a core bump.
+    mockAiStatus.mockResolvedValue({
+      activeProvider: null,
+      openrouter: { hasKey: false, model: "acme/echoed-default", reasoning: false },
+      local: { activeModelTag: null },
+    });
+    const { user } = setup();
+    await openKeySetup(user);
+
+    expect(screen.getByLabelText("Model")).toHaveValue("acme/echoed-default");
+  });
+
   it("keeps Save disabled until a key is entered", async () => {
     mockAiStatus.mockResolvedValue(unconfigured());
     const { user } = setup();
@@ -315,17 +330,36 @@ describe("ChatPane — key setup", () => {
     expect(mockSave).toHaveBeenCalledExactlyOnceWith("sk-or-x", "openai/gpt-4o");
   });
 
-  it("Skip drops to a disabled state whose 'Connect a key' reopens setup", async () => {
+  it("Skip drops to a disabled state whose 'Connect a model' returns to the provider picker (PA-011)", async () => {
     mockAiStatus.mockResolvedValue(unconfigured());
     const { user } = setup();
     await openKeySetup(user);
 
     await user.click(screen.getByRole("button", { name: /skip for now/i }));
     expect(screen.getByText(/cited chat is off/i)).toBeInTheDocument();
+    // Provider-neutral copy: the skipped state must not read single-provider.
+    expect(screen.getByText(/an OpenRouter key or Local AI/i)).toBeInTheDocument();
     expect(screen.queryByLabelText("Ask across your vault")).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: /connect a key/i }));
-    expect(screen.getByLabelText("OpenRouter API key")).toBeInTheDocument();
+    // The CTA lands on the PICKER (both providers), never the key form alone.
+    await user.click(screen.getByRole("button", { name: /connect a model/i }));
+    expect(
+      screen.getByRole("button", { name: /connect an openrouter key/i }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /set up local ai/i })).toBeInTheDocument();
+    expect(screen.queryByLabelText("OpenRouter API key")).not.toBeInTheDocument();
+  });
+
+  it("keeps Local AI reachable from the chat pane after a skip (PA-011)", async () => {
+    mockAiStatus.mockResolvedValue(unconfigured());
+    const { onOpenSettings, user } = setup();
+
+    // Skip straight from the first-run picker — the previously dead-ended path.
+    await user.click(await screen.findByRole("button", { name: /skip for now/i }));
+    await user.click(screen.getByRole("button", { name: /connect a model/i }));
+    await user.click(screen.getByRole("button", { name: /set up local ai/i }));
+
+    expect(onOpenSettings).toHaveBeenCalledOnce();
   });
 
   it("keeps setup open and surfaces the error when saving the key fails", async () => {
@@ -354,6 +388,15 @@ describe("ChatPane — chat view", () => {
     await screen.findByLabelText("Ask across your vault");
     expect(screen.getByText(/ask anything across your vault/i)).toBeInTheDocument();
     expect(sendButton()).toBeDisabled();
+  });
+
+  it("labels the header status pill with the echoed OpenRouter model (PA-013)", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive("acme/echoed-default"));
+    setup();
+
+    await screen.findByLabelText("Ask across your vault");
+    // The pill shows the id's tail segment, straight from the status echo.
+    expect(screen.getByText("echoed-default")).toBeInTheDocument();
   });
 
   it("collapses a finished cited run to a summary line that expands to the full trace", async () => {

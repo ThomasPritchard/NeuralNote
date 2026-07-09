@@ -51,7 +51,7 @@ function ActionCard({
       onClick={onClick}
       className={cn(
         "flex flex-col items-center gap-2 rounded-xl px-4 py-5 text-sm font-medium",
-        "transition duration-200 ease-[cubic-bezier(0.32,0.72,0,1)]",
+        "transition duration-200 ease-spring",
         "hover:-translate-y-0.5 active:translate-y-0",
         "motion-reduce:transition-none motion-reduce:hover:translate-y-0",
         "focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background",

@@ -13,6 +13,7 @@ use crate::error::CoreResult;
 use crate::model::{FileHit, SearchMatch, SearchResponse, TreeNode};
 use crate::note::title_and_body;
 use crate::tree::{markdown_files, read_tree};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// Total content matches returned per search (the UI shows a truncation banner).
@@ -31,13 +32,44 @@ pub const MAX_QUERY_CHARS: usize = 256;
 /// Name/title hits rank before content-only hits, each group in tree-walk
 /// order. Queries longer than [`MAX_QUERY_CHARS`] are truncated to it.
 pub fn search_vault(root: &Path, query: &str) -> CoreResult<SearchResponse> {
+    Ok(search_vault_inner(root, query, false)?.0)
+}
+
+/// Like [`search_vault`], but also returns the raw text of every file that
+/// produced a content match, keyed by its absolute path (the same string as
+/// [`FileHit::path`]). A caller that builds evidence spans (AI retrieval) reuses
+/// this content instead of reading each hit a second time — one read per file per
+/// search, not two (PA-007). The map holds only files with quotable matches (a
+/// name-only hit has no line to cite), and the text is byte-identical to what
+/// [`crate::note::read_note`] would load, so the reused content hashes to the same
+/// `content_hash` the citation verifier expects.
+pub(crate) fn search_vault_with_content(
+    root: &Path,
+    query: &str,
+) -> CoreResult<(SearchResponse, HashMap<String, String>)> {
+    search_vault_inner(root, query, true)
+}
+
+/// The shared search body. When `retain_content` is set, the raw text of each
+/// content-hit file is kept and returned alongside the response (see
+/// [`search_vault_with_content`]); otherwise the returned map is empty and the
+/// content is dropped as soon as its hit is built (the public [`search_vault`]
+/// path, byte-for-byte unchanged).
+fn search_vault_inner(
+    root: &Path,
+    query: &str,
+    retain_content: bool,
+) -> CoreResult<(SearchResponse, HashMap<String, String>)> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
-        return Ok(SearchResponse {
-            hits: Vec::new(),
-            truncated: false,
-            skipped_files: 0,
-        });
+        return Ok((
+            SearchResponse {
+                hits: Vec::new(),
+                truncated: false,
+                skipped_files: 0,
+            },
+            HashMap::new(),
+        ));
     }
     let capped: String = trimmed.chars().take(MAX_QUERY_CHARS).collect();
     let folded_query = fold(&capped);
@@ -45,6 +77,7 @@ pub fn search_vault(root: &Path, query: &str) -> CoreResult<SearchResponse> {
 
     let mut name_hits: Vec<FileHit> = Vec::new();
     let mut content_hits: Vec<FileHit> = Vec::new();
+    let mut content_by_path: HashMap<String, String> = HashMap::new();
     let mut total = 0usize;
     let mut truncated = false;
     let mut skipped_files: u32 = 0;
@@ -65,6 +98,11 @@ pub fn search_vault(root: &Path, query: &str) -> CoreResult<SearchResponse> {
         truncated |= clipped;
         let Some(hit) = hit else { continue };
         total += hit.matches.len();
+        // Retain the content only for a hit with quotable lines — a name-only hit
+        // carries no match to build a span from, so its content is never needed.
+        if retain_content && !hit.matches.is_empty() {
+            content_by_path.insert(node.path.clone(), raw);
+        }
         if hit.name_match {
             name_hits.push(hit);
         } else {
@@ -73,11 +111,14 @@ pub fn search_vault(root: &Path, query: &str) -> CoreResult<SearchResponse> {
     }
 
     name_hits.append(&mut content_hits);
-    Ok(SearchResponse {
-        hits: name_hits,
-        truncated,
-        skipped_files,
-    })
+    Ok((
+        SearchResponse {
+            hits: name_hits,
+            truncated,
+            skipped_files,
+        },
+        content_by_path,
+    ))
 }
 
 /// The per-file hit-building step: the name/title check (which runs for every

@@ -11,7 +11,7 @@ import ForceGraph3D from "react-force-graph-3d";
 import * as THREE from "three";
 import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
 import { ChevronRight, Search, Sparkles, X } from "lucide-react";
-import type { GalaxyLink, GalaxyNode } from "./graph";
+import { CLUSTER_PALETTE, type GalaxyLink, type GalaxyNode } from "./graph";
 import { makeStarNode } from "./starNode";
 import { applyFocus, resetRegistry, setHover, updateAll } from "./nodeRegistry";
 
@@ -80,16 +80,31 @@ export const FORCE_PROFILES: Record<ViewMode, ForceProfile> = {
   },
 };
 
+// The bridge (cross-folder link) pink. Kept as literals, not var(--…):
+// three.js / force-graph materials can't resolve CSS custom properties. All
+// derivations share the one hue — #f4aaff = rgb(244,170,255).
+const BRIDGE_PINK = "#f4aaff";
 const BRIDGE_COLOR = "rgba(244,170,255,0.85)";
-const PARTICLE_COLOR = () => "#f4aaff";
+const PARTICLE_COLOR = () => BRIDGE_PINK;
 
 // For strings interpolated into nodeLabel's raw-HTML tooltip. Everything
-// else in this file renders through JSX (React escapes it).
+// else in this file renders through JSX (React escapes it). Single quotes are
+// escaped too, so an escaped value stays inert even if a refactor moves it
+// into a single-quoted attribute position.
 const escapeHtml = (s: string) =>
   s.replace(
-    /[&<>"]/g,
-    (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]!,
+    /[&<>"']/g,
+    (c) =>
+      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!,
   );
+
+// The tooltip also interpolates a colour into a style attribute. Today it is
+// always a CLUSTER_PALETTE hex (assigned by cluster index, never note data),
+// but the sink is raw HTML — pin it to a strict hex form so a future
+// data-driven colour can never become a style/attribute injection. Anything
+// off-form falls back to the first palette colour.
+const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
+const safeHex = (color: string) => (HEX_COLOR.test(color) ? color : CLUSTER_PALETTE[0]);
 
 // ── Hover-focus (Obsidian-style) ─────────────────────────────────────────
 // Hovering a node keeps it + its direct neighbours + their shared links at
@@ -574,10 +589,10 @@ export function NeuralGalaxy({
         onNodeHover={onNodeHover}
         // nodeLabel is the ONE raw-innerHTML sink (float-tooltip renders the
         // string unescaped): titles and folder names are untrusted vault
-        // content, so both interpolations MUST go through escapeHtml. n.color
-        // is always a CLUSTER_PALETTE hex — safe by construction.
+        // content, so both text interpolations MUST go through escapeHtml, and
+        // the colour MUST go through safeHex (strict hex, palette fallback).
         nodeLabel={(n: any) =>
-          `<div style="font:600 12px Inter,sans-serif;color:#fff;background:rgba(20,18,32,.92);border:1px solid rgba(255,255,255,.12);padding:5px 9px;border-radius:8px">${escapeHtml(n.title)}<span style="color:${n.color};margin-left:8px;font-weight:500">${escapeHtml(clusters[n.cluster]?.label ?? n.cluster)}</span></div>`
+          `<div style="font:600 12px Inter,sans-serif;color:#fff;background:rgba(20,18,32,.92);border:1px solid rgba(255,255,255,.12);padding:5px 9px;border-radius:8px">${escapeHtml(n.title)}<span style="color:${safeHex(n.color)};margin-left:8px;font-weight:500">${escapeHtml(clusters[n.cluster]?.label ?? n.cluster)}</span></div>`
         }
         // Link styling is view-aware (FORCE_PROFILES): the flat 2D map needs a
         // clearly visible web at overview; the 3D galaxy stays more subdued.
@@ -730,7 +745,7 @@ export function NeuralGalaxy({
           ),
         )}
         <div className="mt-1.5 flex items-center gap-2 border-t border-border pt-1.5 text-xs text-foreground">
-          <span className="h-0.5 w-4 rounded-full" style={{ background: "#f4aaff", boxShadow: "0 0 8px #f4aaff" }} />
+          <span className="h-0.5 w-4 rounded-full" style={{ background: BRIDGE_PINK, boxShadow: `0 0 8px ${BRIDGE_PINK}` }} />
           <span>Cross-folder link</span>
         </div>
       </div>
@@ -766,7 +781,7 @@ export function NeuralGalaxy({
                 <span className="size-2 shrink-0 rounded-full" style={{ background: nb.color }} />
                 <span className="truncate">{nb.title}</span>
                 {bridge && (
-                  <span className="nn-mono ml-auto shrink-0 text-[9px]" style={{ color: "#f4aaff" }}>
+                  <span className="nn-mono ml-auto shrink-0 text-[9px]" style={{ color: BRIDGE_PINK }}>
                     Cross-folder
                   </span>
                 )}

@@ -15,6 +15,12 @@ runs retrieval over it. Chat answers questions the user never wrote down, citing
 timestamp. Every decision protects retrieval quality and **citation fidelity** first. A wrong
 citation is worse than no answer.
 
+> **Built vs vision:** the capture → distil → timestamp loop above isn't built yet. Today chat
+> retrieves over the vault markdown you already have and cites the **note and line**, not a chunk or
+> timestamp. What's actually defensible right now is the *combination* the spec defines — local-vault
+> ownership, the zero-setup loop, and citation fidelity earned in execution, not capture itself. See
+> [`specs/neural-note.md`](specs/neural-note.md) lines 4-5 (status) and 49-72 (the moat, reframed).
+
 ## v1 scope (the smallest lovable cut)
 
 Desktop only, **Tauri 2**. AI is **BYO-API-key (OpenRouter) _or_ a bundled local model**
@@ -35,7 +41,12 @@ locally).
 - **Data format is sacred:** markdown + YAML frontmatter, Obsidian-vault-compatible. Don't break
   compatibility — it's both the ownership promise and the free Obsidian-migration path.
 - **Shared Rust core, thin client shell.** Keep product logic in the client-agnostic core so future
-  mobile/PWA clients reuse it.
+  mobile/PWA clients reuse it. The shell's Tauri commands live in `app/desktop/src-tauri/src/commands/`
+  (`vault.rs` and `ai.rs`); each one delegates rather than re-implements.
+- **The TS types are generated, not written.** `app/desktop/src/lib/bindings/` is emitted from the
+  Rust types by `ts-rs` during `cargo test`. Never hand-edit it. `lib/types.ts` is a thin façade that
+  re-exports it plus the few types with no Rust counterpart. `rust-quality-gate.sh` fails on stale
+  bindings; regenerate with `npm --prefix app/desktop run gen:bindings`.
 - **Verify stack specifics against current docs** (Context7) before locking versions or libraries —
   don't assert them from memory.
 - **Failures are never silent** — surface capture/LLM/citation failures explicitly. See the spec's

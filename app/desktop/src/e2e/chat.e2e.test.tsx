@@ -53,6 +53,37 @@ const successScript: ChatEvent[] = [
   { type: "done" },
 ];
 
+// The same run, with reasoning tokens. OpenRouter streams these as `thinking`
+// deltas interleaved before the answer. They must fold into their own disclosure
+// and never into the answer body: the answer is the text citations are verified
+// against, so contaminating it would corrupt provenance.
+const reasoningScript: ChatEvent[] = [
+  { type: "searching", query: "photosynthesis" },
+  { type: "retrieved", query: "photosynthesis", hitCount: 3 },
+  { type: "reading", relPath: NOTE_REL, startLine: 12, endLine: 18 },
+  { type: "thinking", delta: "The note names chloroplasts, " },
+  { type: "thinking", delta: "so the answer should too." },
+  { type: "verifying" },
+  { type: "answer", delta: "Plants turn sunlight " },
+  { type: "answer", delta: "into sugar." },
+  {
+    type: "citation",
+    id: "e1",
+    relPath: NOTE_REL,
+    startLine: 12,
+    endLine: 14,
+    text: "converted into chemical energy",
+  },
+  {
+    type: "coverage",
+    searchedTerms: ["photosynthesis"],
+    notesRead: [NOTE_REL],
+    truncated: false,
+    skippedFiles: 0,
+  },
+  { type: "done" },
+];
+
 /** Render the app and open the recent vault, resolving once the ChatPane has
  *  mounted (it only exists inside an open vault). */
 async function openWorkspace(opts: CreateMockVaultOptions = {}) {
@@ -124,6 +155,37 @@ describe("Journey 7: cited chat — streamed run", () => {
     ).toBeInTheDocument();
     // The provenance count lives in the summary line now (asserted above), not a
     // second, independently-computed coverage line that could disagree with it.
+  });
+
+  it("folds reasoning into its own disclosure and never into the cited answer", async () => {
+    const { user } = await openWorkspace({
+      seed: [{ kind: "file", relPath: NOTE_REL, content: NOTE_BODY }],
+      chatScript: reasoningScript,
+    });
+
+    await ask(user, "How does photosynthesis work?");
+
+    // The answer is exactly what the `answer` deltas carried. If reasoning ever
+    // leaked into it, the cited text would no longer match the verified span.
+    const answer = await screen.findByText(/Plants turn sunlight into sugar\./);
+    expect(answer.textContent).not.toMatch(/chloroplasts/i);
+
+    // Reasoning is inspectable but collapsed — it is provenance, not the answer.
+    const reasoning = screen.getByText("Reasoning").closest("details")!;
+    expect(reasoning).not.toHaveAttribute("open");
+
+    await user.click(within(reasoning).getByText("Reasoning"));
+    expect(
+      within(reasoning).getByText(
+        /The note names chloroplasts, so the answer should too\./,
+      ),
+    ).toBeInTheDocument();
+
+    // The run still completed normally: the citation survived alongside it.
+    const sources = screen.getByRole("list", { name: "Cited sources" });
+    expect(
+      within(sources).getByRole("button", { name: /Photosynthesis\.md:12/ }),
+    ).toBeInTheDocument();
   });
 
   it("opens the cited note in the reader when its source chip is clicked", async () => {

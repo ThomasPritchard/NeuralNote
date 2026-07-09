@@ -11,14 +11,25 @@
 // on the wire for other consumers); at root the derivation matches them by
 // construction, which graphTransform.test.ts pins.
 
-import type { LinkGraph } from "../lib/types";
+import type { GraphLink, GraphNode, LinkGraph } from "../lib/types";
 import { CLUSTER_PALETTE, type GalaxyLink, type GalaxyNode } from "./galaxy/graph";
 
 export interface GalaxyView {
   data: { nodes: GalaxyNode[]; links: GalaxyLink[] };
   clusters: Record<string, { label: string; color: string; drillable: boolean }>;
   stats: { notes: number; links: number; crossFolderLinks: number; outsideLinks: number };
+  /** Non-null when the node cap trimmed this level: `shown` of `total` notes
+   *  are rendered (the most-linked ones). The view surfaces this honestly —
+   *  a silently partial galaxy would misread as the whole vault. */
+  truncation: { shown: number; total: number } | null;
 }
+
+/** Hard ceiling on nodes handed to the 3D force sim per level (PA-006). The
+ *  uncapped root view of a several-thousand-note vault is slow to stabilise
+ *  and can stutter the whole window; above the cap we keep the most-linked
+ *  nodes (the vault's structure) and say so. Drill-down re-derives per level,
+ *  so folder views regain their full contents once under the cap. */
+export const GALAXY_NODE_CAP = 500;
 
 // val = 2.5 + 2.2·√degree, capped at 17. Sub-linear so a well-linked note
 // grows steadily but a degree-40 MOC still dwarfs a degree-6 note (the old
@@ -66,31 +77,50 @@ function currentFolderLabel(rootLabel: string, focusPath: string): string {
   return focusPath === "" ? rootLabel : focusPath.slice(focusPath.lastIndexOf("/") + 1);
 }
 
-export function toGalaxy(graph: LinkGraph, rootLabel: string, focusPath = ""): GalaxyView {
-  // ── Filter to the focused folder + derive this level's cluster per node ──
+/** Filter to notes under `focusPath` and, per surviving note, derive this
+ *  level's cluster. A cluster drills when any of its notes sits deeper than one
+ *  level BELOW the cluster itself: at focus "Areas", "Areas/Health/x.md" only
+ *  makes "Health" isolatable — "Areas/Health/Deep/x.md" is what makes "Health"
+ *  drillable. The "" group (the folder's own notes) never drills. */
+function deriveClusters(
+  nodes: GraphNode[],
+  focusPath: string,
+): { clusterById: Map<string, string>; drillable: Map<string, boolean> } {
   const clusterById = new Map<string, string>();
   const drillable = new Map<string, boolean>();
-  for (const n of graph.nodes) {
+  for (const n of nodes) {
     if (!isUnder(n.id, focusPath)) continue;
     const cluster = clusterAtLevel(n.id, focusPath);
     clusterById.set(n.id, cluster);
-    // A cluster drills when any of its notes sits deeper than one level
-    // BELOW the cluster itself: at focus "Areas", "Areas/Health/x.md" only
-    // makes "Health" isolatable — "Areas/Health/Deep/x.md" is what makes
-    // "Health" drillable. The "" group (the folder's own notes) never drills.
     const deeper =
       cluster !== "" && relToFocus(n.id, focusPath).includes("/", cluster.length + 1);
     drillable.set(cluster, (drillable.get(cluster) ?? false) || deeper);
   }
+  return { clusterById, drillable };
+}
 
-  const innerLinks = graph.links.filter(
+/** Split the graph's links against the focused set: `innerLinks` have both
+ *  endpoints inside; `outsideLinks` counts those with exactly one foot in. */
+function partitionLinks(
+  links: GraphLink[],
+  clusterById: Map<string, string>,
+): { innerLinks: GraphLink[]; outsideLinks: number } {
+  const innerLinks = links.filter(
     (l) => clusterById.has(l.source) && clusterById.has(l.target),
   );
-  const outsideLinks = graph.links.filter(
+  const outsideLinks = links.filter(
     (l) => clusterById.has(l.source) !== clusterById.has(l.target),
   ).length;
+  return { innerLinks, outsideLinks };
+}
 
-  // ── Palette reassigns per level: "" first, then folders in code-unit order.
+/** Assign each cluster a palette colour, reassigned per level: "" first, then
+ *  folder names in code-unit order (deterministic so colours never flicker). */
+function assignPalette(
+  drillable: Map<string, boolean>,
+  rootLabel: string,
+  focusPath: string,
+): GalaxyView["clusters"] {
   const names = [...drillable.keys()].sort(byCodeUnit);
   const clusters: GalaxyView["clusters"] = {};
   names.forEach((name, i) => {
@@ -100,42 +130,118 @@ export function toGalaxy(graph: LinkGraph, rootLabel: string, focusPath = ""): G
       drillable: drillable.get(name) ?? false,
     };
   });
+  return clusters;
+}
 
-  // ── Degree within the view: node sizes match the links actually shown.
+/** Count each node's degree (endpoints touched) across a set of links. */
+function computeDegree(links: GraphLink[]): Map<string, number> {
   const degree = new Map<string, number>();
-  for (const l of innerLinks) {
+  for (const l of links) {
     degree.set(l.source, (degree.get(l.source) ?? 0) + 1);
     degree.set(l.target, (degree.get(l.target) ?? 0) + 1);
   }
+  return degree;
+}
 
-  const nodes: GalaxyNode[] = graph.nodes
-    .filter((n) => clusterById.has(n.id))
+/** Node cap (PA-006): above `maxNodes`, keep the most-linked nodes and drop
+ *  links to the cut ones. Deterministic: degree desc, then id code-unit asc, so
+ *  equal-degree ties never flicker between renders. `shownIds` is null when
+ *  nothing was trimmed; the clusters record is left UNCUT by design so the
+ *  legend keeps every folder navigable and drilling re-derives that level. */
+function applyNodeCap(
+  clusterById: Map<string, string>,
+  degree: Map<string, number>,
+  innerLinks: GraphLink[],
+  maxNodes: number,
+): { shownIds: Set<string> | null; shownLinks: GraphLink[]; total: number } {
+  const total = clusterById.size;
+  const shownIds =
+    total > maxNodes
+      ? new Set(
+          [...clusterById.keys()]
+            .sort((a, b) => (degree.get(b) ?? 0) - (degree.get(a) ?? 0) || byCodeUnit(a, b))
+            .slice(0, maxNodes),
+        )
+      : null;
+  const shownLinks = shownIds
+    ? innerLinks.filter((l) => shownIds.has(l.source) && shownIds.has(l.target))
+    : innerLinks;
+  return { shownIds, shownLinks, total };
+}
+
+/** Decorate each shown node with its cluster, palette colour, and degree-based
+ *  size (`degreeVal` over `shownDegree`, i.e. the links actually rendered). */
+function buildNodes(
+  nodes: GraphNode[],
+  clusterById: Map<string, string>,
+  shownIds: Set<string> | null,
+  shownDegree: Map<string, number>,
+  clusters: GalaxyView["clusters"],
+): GalaxyNode[] {
+  return nodes
+    .filter((n) => clusterById.has(n.id) && (shownIds === null || shownIds.has(n.id)))
     .map((n) => {
       const cluster = clusterById.get(n.id) as string;
       return {
         id: n.id,
         title: n.title,
         cluster,
-        val: degreeVal(degree.get(n.id) ?? 0),
+        val: degreeVal(shownDegree.get(n.id) ?? 0),
         color: clusters[cluster].color,
       };
     });
+}
 
-  // Bridge = crosses the current level's cluster boundary (backend flag ignored).
-  const links: GalaxyLink[] = innerLinks.map((l) => ({
+/** Map shown links to render edges, flagging bridges that cross the CURRENT
+ *  level's cluster boundary (the backend's bridge flag is ignored — see head). */
+function buildLinks(shownLinks: GraphLink[], clusterById: Map<string, string>): GalaxyLink[] {
+  return shownLinks.map((l) => ({
     source: l.source,
     target: l.target,
     bridge: clusterById.get(l.source) !== clusterById.get(l.target),
   }));
+}
+
+/** Roll up the view's counts. `outsideLinks` keeps focus-boundary semantics on
+ *  purpose (links leaving the FOLDER, not links to capped-out nodes — the
+ *  truncation notice carries the cap story). */
+function buildGalaxyStats(
+  nodes: GalaxyNode[],
+  links: GalaxyLink[],
+  outsideLinks: number,
+): GalaxyView["stats"] {
+  return {
+    notes: nodes.length,
+    links: links.length,
+    crossFolderLinks: links.filter((l) => l.bridge).length,
+    outsideLinks,
+  };
+}
+
+export function toGalaxy(
+  graph: LinkGraph,
+  rootLabel: string,
+  focusPath = "",
+  maxNodes = GALAXY_NODE_CAP,
+): GalaxyView {
+  const { clusterById, drillable } = deriveClusters(graph.nodes, focusPath);
+  const { innerLinks, outsideLinks } = partitionLinks(graph.links, clusterById);
+  const clusters = assignPalette(drillable, rootLabel, focusPath);
+
+  // Degree ranks the cap pre-cap, over the level's full link structure; a
+  // capped view then re-derives it over the surviving links so node sizes match
+  // the links actually shown. Uncapped, the first map is reused unchanged.
+  const degree = computeDegree(innerLinks);
+  const { shownIds, shownLinks, total } = applyNodeCap(clusterById, degree, innerLinks, maxNodes);
+  const shownDegree = shownIds ? computeDegree(shownLinks) : degree;
+
+  const nodes = buildNodes(graph.nodes, clusterById, shownIds, shownDegree, clusters);
+  const links = buildLinks(shownLinks, clusterById);
 
   return {
     data: { nodes, links },
     clusters,
-    stats: {
-      notes: nodes.length,
-      links: links.length,
-      crossFolderLinks: links.filter((l) => l.bridge).length,
-      outsideLinks,
-    },
+    stats: buildGalaxyStats(nodes, links, outsideLinks),
+    truncation: shownIds ? { shown: nodes.length, total } : null,
   };
 }

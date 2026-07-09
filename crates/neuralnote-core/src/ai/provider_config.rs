@@ -9,12 +9,14 @@ use crate::error::{CoreError, CoreResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use ts_rs::TS;
 
 const AI_CONFIG_FILE: &str = "ai-config.json";
 static AI_CONFIG_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub enum ProviderKind {
     OpenRouter,
     Local,
@@ -29,6 +31,13 @@ pub struct ProviderConfig {
     pub key_configured: bool,
     #[serde(default)]
     pub local_model_tag: Option<String>,
+    /// Whether to request OpenRouter's (billed) reasoning tokens on the answer turn.
+    /// `#[serde(default)]` is load-bearing: an existing `ai-config.json` written
+    /// before this field existed reads back as `bool::default()` = `false`, so old
+    /// installs migrate to "off" for free. OpenRouter-only — the Local (Ollama) path
+    /// has no reasoning concept and always sends `false`.
+    #[serde(default)]
+    pub reasoning: bool,
 }
 
 impl Default for ProviderConfig {
@@ -38,6 +47,7 @@ impl Default for ProviderConfig {
             model: DEFAULT_MODEL.to_string(),
             key_configured: false,
             local_model_tag: None,
+            reasoning: false,
         }
     }
 }
@@ -138,6 +148,7 @@ mod tests {
             model: DEFAULT_MODEL.to_string(),
             key_configured: false,
             local_model_tag: None,
+            reasoning: false,
         }
     }
 
@@ -149,6 +160,7 @@ mod tests {
             model: " openai/gpt-4.1 ".into(),
             key_configured: true,
             local_model_tag: Some("qwen2.5:7b".into()),
+            reasoning: true,
         };
 
         write_provider_config(dir.path(), &config).unwrap();
@@ -192,6 +204,7 @@ mod tests {
                 model: "openai/gpt-4.1".into(),
                 key_configured: true,
                 local_model_tag: None,
+                reasoning: false,
             },
         )
         .unwrap();
@@ -222,6 +235,7 @@ mod tests {
                 model: "  ".into(),
                 key_configured: false,
                 local_model_tag: None,
+                reasoning: false,
             },
         )
         .unwrap();
@@ -237,6 +251,7 @@ mod tests {
                 model: " openai/gpt-4.1 ".into(),
                 key_configured: false,
                 local_model_tag: None,
+                reasoning: false,
             },
         )
         .unwrap();
@@ -272,6 +287,7 @@ mod tests {
             model: DEFAULT_MODEL.to_string(),
             key_configured: false,
             local_model_tag: None,
+            reasoning: false,
         };
 
         write_provider_config(dir.path(), &config).unwrap();
@@ -289,6 +305,7 @@ mod tests {
             model: DEFAULT_MODEL.to_string(),
             key_configured: false,
             local_model_tag: Some("qwen2.5:7b".into()),
+            reasoning: false,
         };
 
         write_provider_config(dir.path(), &config).unwrap();
@@ -335,11 +352,44 @@ mod tests {
             model: "openai/gpt-4.1".into(),
             key_configured: true,
             local_model_tag: Some("qwen2.5:7b".into()),
+            reasoning: true,
         })
         .unwrap();
 
         assert!(value.get("activeProvider").is_some());
         assert!(value.get("keyConfigured").is_some());
         assert!(value.get("localModelTag").is_some());
+        assert_eq!(value.get("reasoning"), Some(&serde_json::json!(true)));
+    }
+
+    #[test]
+    fn reasoning_defaults_to_false_when_absent_from_file() {
+        // The migration guarantee: an `ai-config.json` written before the reasoning
+        // field existed must read back as `false` (billed tokens stay off), never fail
+        // to parse. `#[serde(default)]` is what makes this true.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_file(dir.path()),
+            r#"{"model":"openai/gpt-4.1","keyConfigured":true}"#,
+        )
+        .unwrap();
+
+        assert!(!read_provider_config(dir.path()).unwrap().reasoning);
+    }
+
+    #[test]
+    fn reasoning_flag_round_trips_true_then_false() {
+        // The exact persistence `set_reasoning` performs: flip the flag on, then back
+        // off, and confirm each state survives a write/read cycle.
+        let dir = tempfile::tempdir().unwrap();
+
+        let mut cfg = read_provider_config(dir.path()).unwrap();
+        cfg.reasoning = true;
+        write_provider_config(dir.path(), &cfg).unwrap();
+        assert!(read_provider_config(dir.path()).unwrap().reasoning);
+
+        cfg.reasoning = false;
+        write_provider_config(dir.path(), &cfg).unwrap();
+        assert!(!read_provider_config(dir.path()).unwrap().reasoning);
     }
 }

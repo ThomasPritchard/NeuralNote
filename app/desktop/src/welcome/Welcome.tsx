@@ -68,6 +68,11 @@ export function Welcome() {
 
   return (
     <div className="relative flex h-full flex-col items-center justify-center overflow-hidden px-6 py-12">
+      {/* With the overlay titlebar there is no chrome on this screen, so this
+          strip keeps the window draggable where the native traffic lights sit.
+          data-tauri-drag-region is a plain DOM attribute — no Tauri API. All
+          interactive content is centred well below the 40px band. */}
+      <div data-tauri-drag-region aria-hidden className="absolute inset-x-0 top-0 z-20 h-10" />
       <AuroraGlow />
 
       <main className="relative z-10 flex w-full max-w-md flex-col items-center gap-7 text-center">

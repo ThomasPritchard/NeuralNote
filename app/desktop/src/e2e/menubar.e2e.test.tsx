@@ -59,10 +59,25 @@ describe("Native menu → app actions", () => {
     // in-flight answer survive) — visibility, not DOM presence, is what changes.
     expect(screen.getByText("Cited recall")).toBeVisible();
 
-    await fireMenu("toggle-chat", { checked: false });
+    // The webview owns visibility now, so each action is a bare flip (no `checked`
+    // payload); the menu item just requests a toggle.
+    await fireMenu("toggle-chat");
     expect(screen.getByText("Cited recall")).not.toBeVisible();
 
-    await fireMenu("toggle-chat", { checked: true });
+    await fireMenu("toggle-chat");
     expect(screen.getByText("Cited recall")).toBeVisible();
+  });
+
+  it("Toggle Sidebar hides and re-shows the file-tree sidebar", async () => {
+    await openVault();
+    expect(screen.getByLabelText("Filter files by name")).toBeInTheDocument();
+
+    // Collapsing the sidebar unmounts it (unlike the chat panel above) — the file
+    // tree's only in-memory state is folder folds, which persist to localStorage.
+    await fireMenu("toggle-sidebar");
+    expect(screen.queryByLabelText("Filter files by name")).not.toBeInTheDocument();
+
+    await fireMenu("toggle-sidebar");
+    expect(screen.getByLabelText("Filter files by name")).toBeInTheDocument();
   });
 });

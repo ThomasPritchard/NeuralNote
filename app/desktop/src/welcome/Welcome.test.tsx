@@ -62,6 +62,19 @@ describe("Welcome — default state", () => {
   });
 });
 
+describe("Welcome — window chrome", () => {
+  it("exposes a titlebar drag region with no content of its own", () => {
+    // With the overlay titlebar this screen has no chrome, so the drag strip
+    // is what keeps the window movable from the welcome state.
+    mockUseVault.mockReturnValue(ctx());
+    const { container } = render(<Welcome />);
+    const strip = container.querySelector("[data-tauri-drag-region]");
+    expect(strip).not.toBeNull();
+    expect(strip).toHaveAttribute("aria-hidden");
+    expect(strip?.childElementCount).toBe(0);
+  });
+});
+
 describe("Welcome — error channel", () => {
   it("renders a dismissible error alert", async () => {
     const value = ctx({ error: "Not a vault" });

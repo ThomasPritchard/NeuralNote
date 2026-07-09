@@ -274,6 +274,76 @@ describe("toGalaxy with a focusPath", () => {
       data: { nodes: [], links: [] },
       clusters: {},
       stats: { notes: 0, links: 0, crossFolderLinks: 0, outsideLinks: 0 },
+      truncation: null,
     });
+  });
+});
+
+// ── Node cap (PA-006): the first (root) render must never hand the 3D force
+// sim an unbounded vault — above the cap only the most-linked nodes render,
+// and the view is told so via `truncation`. ────────────────────────────────
+describe("toGalaxy node cap", () => {
+  it("reports no truncation while at or under the cap", () => {
+    const g = graph([node("a.md"), node("b.md")], [link("a.md", "b.md")]);
+    expect(toGalaxy(g, "r").truncation).toBeNull();
+    // Exactly at the cap is still the full view.
+    expect(toGalaxy(g, "r", "", 2).truncation).toBeNull();
+  });
+
+  it("keeps the top-N nodes by degree and reports shown/total", () => {
+    // hub links to three spokes; two isolates carry no links at all.
+    const g = graph(
+      [node("hub.md"), node("s1.md"), node("s2.md"), node("s3.md"), node("iso1.md"), node("iso2.md")],
+      [link("hub.md", "s1.md"), link("hub.md", "s2.md"), link("hub.md", "s3.md")],
+    );
+    const view = toGalaxy(g, "r", "", 4);
+    expect(view.data.nodes.map((n) => n.id).sort()).toEqual([
+      "hub.md",
+      "s1.md",
+      "s2.md",
+      "s3.md",
+    ]);
+    expect(view.data.links).toHaveLength(3);
+    expect(view.truncation).toEqual({ shown: 4, total: 6 });
+    expect(view.stats.notes).toBe(4);
+    expect(view.stats.links).toBe(3);
+  });
+
+  it("breaks degree ties deterministically by id (code-unit order)", () => {
+    const g = graph([node("c.md"), node("a.md"), node("b.md")]);
+    const view = toGalaxy(g, "r", "", 2);
+    expect(view.data.nodes.map((n) => n.id).sort()).toEqual(["a.md", "b.md"]);
+  });
+
+  it("drops links to capped-out nodes and re-derives vals from the shown links", () => {
+    // hub: degree 3 (s1, s2, s3); s1–s2 link raises those two above s3.
+    const g = graph(
+      [node("hub.md"), node("s1.md"), node("s2.md"), node("s3.md")],
+      [
+        link("hub.md", "s1.md"),
+        link("hub.md", "s2.md"),
+        link("hub.md", "s3.md"),
+        link("s1.md", "s2.md"),
+      ],
+    );
+    const view = toGalaxy(g, "r", "", 3);
+    expect(view.data.nodes.map((n) => n.id).sort()).toEqual(["hub.md", "s1.md", "s2.md"]);
+    // hub–s3 vanished with s3; sizes match the links actually shown.
+    expect(view.data.links).toHaveLength(3);
+    const hub = view.data.nodes.find((n) => n.id === "hub.md");
+    expect(hub?.val).toBe(degreeVal(2));
+    expect(view.truncation).toEqual({ shown: 3, total: 4 });
+  });
+
+  it("keeps the FULL clusters record so every folder stays navigable", () => {
+    // Cap cuts all of y/'s notes (degree 0) — its legend entry must survive,
+    // since drilling re-derives that level uncapped-then-capped.
+    const g = graph(
+      [node("x/one.md", "x"), node("x/two.md", "x"), node("y/three.md", "y")],
+      [link("x/one.md", "x/two.md")],
+    );
+    const view = toGalaxy(g, "r", "", 2);
+    expect(view.data.nodes.map((n) => n.id).sort()).toEqual(["x/one.md", "x/two.md"]);
+    expect(Object.keys(view.clusters)).toContain("y");
   });
 });

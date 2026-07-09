@@ -9,15 +9,22 @@
 use crate::ai::evidence::EvidenceSpan;
 use crate::error::CoreResult;
 use crate::model::{FileHit, TreeNode};
-use crate::note::read_note;
-use crate::search::search_vault;
+use crate::note::{content_hash, read_note};
+use crate::search::search_vault_with_content;
 use crate::tree::{markdown_files, read_tree};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 /// Default byte cap for a single evidence span's `text` (keeps tool results and the
 /// model's context bounded). Callers may lower it per read.
 const DEFAULT_SPAN_MAX_BYTES: usize = 2000;
+
+/// Cap on the notes returned — and READ — by one `list_notes` call. Bounds both the
+/// per-note disk reads and the size of the tool-result payload the model ingests, so
+/// a large migrated vault can't drive a full-vault read plus a multi-thousand-entry
+/// JSON blob into the context on a single listing (PA-002).
+const MAX_LIST_NOTES: usize = 200;
 
 /// Lightweight note metadata for the model's `list_notes` tool — never content.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,13 +44,22 @@ pub struct FolderMeta {
     pub note_count: u32,
 }
 
-/// The result of listing notes: the metadata plus how many notes could not be read.
-/// Surfacing `skipped` keeps discovery honest — the model is told the listing was
-/// partial, so it never assumes a note is absent when it was merely unreadable.
+/// The result of listing notes: the metadata plus the coverage signals that keep
+/// discovery honest. `skipped` says how many in-scope notes could not be read;
+/// `truncated`/`total` say the listing was capped (mirroring `search_notes`), so the
+/// model is never misled into thinking it saw the whole vault when it saw only the
+/// first [`MAX_LIST_NOTES`].
 #[derive(Debug, Clone, Default)]
 pub struct ListOutcome {
     pub notes: Vec<NoteMeta>,
+    /// In-scope notes that could not be read (each also logged), so the model never
+    /// assumes a note is absent when it was merely unreadable.
     pub skipped: u32,
+    /// The cap clipped the listing — more in-scope notes exist than were returned.
+    pub truncated: bool,
+    /// Total in-scope notes discovered (the honest denominator), including any past
+    /// the cap that were counted but not read.
+    pub total: u32,
 }
 
 /// The result of a retrieval search: the evidence spans plus the coverage signals
@@ -113,14 +129,20 @@ impl KeywordRetriever {
         Self { root }
     }
 
-    /// Build single-line evidence spans for each content hit, reading each note once.
-    /// Returns `(spans, cap_clipped, skipped_readback)`: whether `max_results` clipped
-    /// the spans, and how many hits failed the read-back (a note that matched the scan
-    /// but could not be re-read — a delete/permission race — is skipped loudly, never
-    /// silently dropped from the coverage count).
+    /// Build single-line evidence spans for each content hit, REUSING the raw text
+    /// `search_vault` already loaded (`content_by_path`, keyed by [`FileHit::path`])
+    /// rather than re-reading each hit — so a matched file is read once per search,
+    /// not twice (PA-007). Returns `(spans, cap_clipped, skipped_readback)`: whether
+    /// `max_results` clipped the spans, and how many hits had no retained content (a
+    /// delete/permission race between the scan and now, or a hit from outside the
+    /// search path) — skipped loudly, never silently dropped from the coverage count.
+    ///
+    /// The reused text is byte-identical to what `read_note` would load, so the
+    /// `content_hash` computed here matches the one the citation verifier recomputes.
     fn collect_spans(
         &self,
         hits: &[FileHit],
+        content_by_path: &HashMap<String, String>,
         max_results: usize,
     ) -> (Vec<EvidenceSpan>, bool, u32) {
         let mut spans = Vec::new();
@@ -131,18 +153,19 @@ impl KeywordRetriever {
             if hit.matches.is_empty() {
                 continue; // a name-only hit has no line to quote
             }
-            // One read per hit for its content_hash + raw; each match becomes a
-            // single-line span (cheap, precise — the model reads wider windows via
-            // read_note_span when it wants context).
-            let doc = match read_note(&self.root, Path::new(&hit.path)) {
-                Ok(d) => d,
-                Err(e) => {
-                    log::warn!("search_notes: skipping unreadable note {}: {e}", hit.path);
-                    skipped_readback = skipped_readback.saturating_add(1);
-                    continue;
-                }
+            // Reuse the content the search already read — no second disk read. A hit
+            // whose content wasn't retained is a genuine skip (counted, logged), the
+            // same honesty the old read-back-failure branch gave.
+            let Some(raw) = content_by_path.get(&hit.path) else {
+                log::warn!(
+                    "search_notes: no retained content for hit {}; skipping",
+                    hit.path
+                );
+                skipped_readback = skipped_readback.saturating_add(1);
+                continue;
             };
-            let lines: Vec<&str> = doc.raw.split_inclusive('\n').collect();
+            let hash = content_hash(raw);
+            let lines: Vec<&str> = raw.split_inclusive('\n').collect();
             for m in &hit.matches {
                 if spans.len() >= max_results {
                     cap_clipped = true; // the model's own result cap clipped evidence
@@ -153,7 +176,7 @@ impl KeywordRetriever {
                 spans.push(EvidenceSpan {
                     id: String::new(),
                     rel_path: hit.rel_path.clone(),
-                    content_hash: doc.content_hash.clone(),
+                    content_hash: hash.clone(),
                     start_line: start,
                     end_line: end,
                     text,
@@ -170,10 +193,23 @@ impl RetrievalProvider for KeywordRetriever {
         let tree = read_tree(&self.root)?;
         let mut notes = Vec::new();
         let mut skipped = 0u32;
+        let mut total = 0u32;
+        let mut read_count = 0usize;
+        let mut truncated = false;
         for node in markdown_files(&tree) {
             if !in_scope(&node.rel_path, folder) {
                 continue; // outside the requested folder
             }
+            // Count every in-scope note (cheap, in-memory) for the honest `total`,
+            // but READ at most MAX_LIST_NOTES of them — bounding disk I/O and the
+            // payload the model ingests (PA-002). Past the cap we keep counting and
+            // flag `truncated`, never silently claiming the listing was complete.
+            total = total.saturating_add(1);
+            if read_count >= MAX_LIST_NOTES {
+                truncated = true;
+                continue;
+            }
+            read_count += 1;
             // read_note yields the canonical title (frontmatter → H1 → stem). One
             // unreadable note must not sink the whole listing — skip it loudly AND
             // count it, so the model knows the listing is partial.
@@ -188,7 +224,12 @@ impl RetrievalProvider for KeywordRetriever {
                 }
             }
         }
-        Ok(ListOutcome { notes, skipped })
+        Ok(ListOutcome {
+            notes,
+            skipped,
+            truncated,
+            total,
+        })
     }
 
     fn list_folders(&self) -> CoreResult<Vec<FolderMeta>> {
@@ -204,7 +245,12 @@ impl RetrievalProvider for KeywordRetriever {
         max_results: usize,
         folder: Option<&str>,
     ) -> CoreResult<SearchOutcome> {
-        let resp = search_vault(&self.root, query)?;
+        // TODO(search-per-run-cache): each of the 3–8 searches per chat turn still
+        // re-scans the whole vault from disk here; a run-scoped path→content cache
+        // across searches within one run_chat is the remaining win, but it needs
+        // state threaded through RetrievalProvider — deferred (PA-007). This call
+        // eliminates only the *double*-read of each hit (search + a second read_note).
+        let (resp, content_by_path) = search_vault_with_content(&self.root, query)?;
         // Scope to the folder BEFORE the result cap, so a folder's own matches are
         // never lost to whole-vault hits that merely ranked ahead of them.
         let hits: Vec<FileHit> = resp
@@ -212,7 +258,8 @@ impl RetrievalProvider for KeywordRetriever {
             .into_iter()
             .filter(|h| in_scope(&h.rel_path, folder))
             .collect();
-        let (spans, cap_clipped, skipped_readback) = self.collect_spans(&hits, max_results);
+        let (spans, cap_clipped, skipped_readback) =
+            self.collect_spans(&hits, &content_by_path, max_results);
         Ok(SearchOutcome {
             spans,
             // GENUINE coverage gap only — the vault search's own global cap. A routine
@@ -404,16 +451,35 @@ mod tests {
         let out = r.list_notes(None).unwrap();
         assert_eq!(out.notes.len(), 1);
         assert_eq!(out.skipped, 0);
+        assert_eq!(out.total, 1); // one note, no cap hit
+        assert!(!out.truncated);
         assert_eq!(out.notes[0].rel_path, "Research/widgets.md");
         assert_eq!(out.notes[0].title, "Widgets"); // first H1
     }
 
     #[test]
+    fn list_notes_caps_at_max_and_flags_truncated_with_total() {
+        // A vault larger than the cap must return at most MAX_LIST_NOTES entries
+        // (bounding disk reads + payload), flag `truncated`, and report the true
+        // `total` as the honest denominator (PA-002).
+        let dir = tempfile::tempdir().unwrap();
+        let over = MAX_LIST_NOTES + 5;
+        for i in 0..over {
+            fs::write(dir.path().join(format!("note_{i:04}.md")), "# n\n").unwrap();
+        }
+        let r = KeywordRetriever::new(dir.path());
+        let out = r.list_notes(None).unwrap();
+        assert_eq!(out.notes.len(), MAX_LIST_NOTES, "listing is capped to K");
+        assert!(out.truncated, "the cap clipped the listing");
+        assert_eq!(out.total, over as u32, "total is the honest denominator");
+    }
+
+    #[test]
     fn search_read_back_failure_is_counted_as_skipped() {
-        // A hit whose note fails the read-back (here: a delete/permission race modelled
-        // by a FileHit pointing at a note that no longer exists) must be counted in
-        // skipped_files, not silently dropped. Drives collect_spans directly because
-        // the race window inside search_notes can't be hit with real files in one call.
+        // A hit with NO retained content (a delete/permission race between the scan
+        // and now, modelled by an empty content map) must be counted in skipped_files,
+        // not silently dropped. Since collect_spans reuses already-loaded content
+        // (PA-007), "couldn't read it back" now means "not in the content map".
         let v = vault();
         let r = KeywordRetriever::new(v.path());
         let ghost = FileHit {
@@ -431,12 +497,44 @@ mod tests {
                 ranges: vec![(0, 1)],
             }],
         };
-        let (spans, _clipped, skipped) = r.collect_spans(&[ghost], 8);
+        let empty = HashMap::new();
+        let (spans, _clipped, skipped) = r.collect_spans(&[ghost], &empty, 8);
         assert!(spans.is_empty());
         assert_eq!(
             skipped, 1,
-            "a read-back failure must increment skipped_files"
+            "a hit with no retained content must increment skipped_files"
         );
+    }
+
+    #[test]
+    fn collect_spans_reuses_provided_content_without_re_reading() {
+        // PA-007: collect_spans builds spans from the content search_vault already
+        // loaded and NEVER touches disk. The hit points at a path that does not
+        // exist — a re-read (the old double-read) would fail and skip; instead it
+        // uses the provided content and produces a span whose content_hash matches
+        // content_hash of that exact content (the verifier's invariant).
+        let v = vault();
+        let r = KeywordRetriever::new(v.path());
+        let content = "line one\nquotable target line\n".to_string();
+        let hit = FileHit {
+            path: "/nonexistent/ghost.md".into(),
+            rel_path: "ghost.md".into(),
+            title: "ghost".into(),
+            name_match: false,
+            matches: vec![SearchMatch {
+                line: 2,
+                snippet: "target".into(),
+                ranges: vec![(0, 6)],
+            }],
+        };
+        let mut map = HashMap::new();
+        map.insert("/nonexistent/ghost.md".to_string(), content.clone());
+        let (spans, clipped, skipped) = r.collect_spans(&[hit], &map, 8);
+        assert_eq!(skipped, 0, "content was provided, nothing to skip");
+        assert!(!clipped);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].text, "quotable target line");
+        assert_eq!(spans[0].content_hash, crate::note::content_hash(&content));
     }
 
     #[test]

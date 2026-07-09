@@ -14,7 +14,12 @@ static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 /// Stable content fingerprint for optimistic-concurrency conflict detection.
 /// `DefaultHasher::new()` uses fixed keys, so the digest is stable across runs.
 /// Returned as a decimal string to survive the JS number-precision boundary.
-fn content_hash(content: &str) -> String {
+///
+/// `pub(crate)` so AI retrieval can hash content it already loaded (via
+/// `search_vault`) without re-reading the file — the single source of truth for
+/// the algorithm, so a reused-content span carries the exact same `content_hash`
+/// the citation verifier expects (PA-007).
+pub(crate) fn content_hash(content: &str) -> String {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     content.hash(&mut h);
     h.finish().to_string()

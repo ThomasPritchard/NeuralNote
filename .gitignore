@@ -11,10 +11,14 @@ node_modules/
 dist/
 build/
 app/desktop/src-tauri/binaries/ollama-*
+app/desktop/src-tauri/binaries/llama-server-*
+app/desktop/src-tauri/ollama-libs/
 
 # Coverage + SonarQube scanner artifacts
 coverage/
-/lcov-rust.info
+# Unanchored so it ignores the generated report anywhere (the root one Sonar reads,
+# and a stray app/lcov-rust.info that a root-anchored `/lcov-rust.info` let slip in).
+lcov-rust.info
 .scannerwork/
 
 # Logs & env

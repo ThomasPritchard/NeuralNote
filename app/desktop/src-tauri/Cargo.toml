@@ -40,3 +40,7 @@ sysinfo = "0.39"
 # Async sleep for the Ollama sidecar health-poll (tokio is already in the tree via
 # tauri/reqwest; we only need its timer here).
 tokio = { version = "1", features = ["time"] }
+# Emits the TypeScript mirror of the shell-owned command types (AiStatus and the
+# per-provider status structs) into `app/desktop/src/lib/bindings/` during
+# `cargo test`, matching the generation the core crate does for the domain types.
+ts-rs = "12.0.1"

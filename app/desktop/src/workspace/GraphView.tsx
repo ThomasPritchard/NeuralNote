@@ -192,11 +192,23 @@ export function GraphView({
             onClusterSelect={drillInto}
             breadcrumb={breadcrumb}
           />
-          {skippedFiles > 0 && (
-            // Non-blocking degradation notice, kept near the stats/top area.
-            <p className="nn-mono pointer-events-none absolute left-5 top-16 text-[11px] text-muted-foreground">
-              {skippedFiles} file(s) couldn't be read
-            </p>
+          {(view.galaxy.truncation !== null || skippedFiles > 0) && (
+            // Non-blocking degradation notices, kept near the stats/top area.
+            <div className="pointer-events-none absolute left-5 top-16 flex flex-col gap-1">
+              {view.galaxy.truncation !== null && (
+                // The node cap trimmed this level (PA-006) — never let a
+                // partial galaxy pass silently as the whole vault.
+                <p className="nn-mono text-[11px] text-muted-foreground">
+                  Showing the {view.galaxy.truncation.shown} most-linked of{" "}
+                  {view.galaxy.truncation.total} notes — open a cluster to see more
+                </p>
+              )}
+              {skippedFiles > 0 && (
+                <p className="nn-mono text-[11px] text-muted-foreground">
+                  {skippedFiles} file(s) couldn't be read
+                </p>
+              )}
+            </div>
           )}
         </>
       )}

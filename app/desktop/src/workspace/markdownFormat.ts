@@ -41,13 +41,24 @@ export function toggleWrap(sel: Selection, token: string): FormatResult {
   const { value, start, end } = sel;
   const len = token.length;
   const selected = value.slice(start, end);
+  const marker = token[0]; // both `*` (italic) and `**` (bold) are runs of `*`
 
-  // Outer unwrap — tokens immediately flank the selection (covers empty caret).
-  if (
-    start >= len &&
-    value.slice(start - len, start) === token &&
-    value.slice(end, end + len) === token
-  ) {
+  // Length of the marker run immediately flanking the selection on each side.
+  let leftRun = 0;
+  while (start - leftRun - 1 >= 0 && value[start - leftRun - 1] === marker) leftRun += 1;
+  let rightRun = 0;
+  while (end + rightRun < value.length && value[end + rightRun] === marker) rightRun += 1;
+
+  // Outer unwrap — the emphasis of *this* width is already applied by the flanking
+  // runs, so toggle it off by removing `len` markers per side (covers the empty
+  // caret too). A `*` run encodes italic when its length is odd (1, 3, …) and bold
+  // when it is ≥ 2. So italicising a word inside `**bold**` (run 2 — bold, no italic)
+  // correctly *adds* a layer → `***bold***` (falls through to wrap), while italicising
+  // inside `***bold***` (run 3 — bold + italic) removes just the italic → `**bold**`.
+  const italicApplied = leftRun % 2 === 1 && rightRun % 2 === 1;
+  const boldApplied = leftRun >= 2 && rightRun >= 2;
+  const alreadyApplied = len === 1 ? italicApplied : boldApplied;
+  if (leftRun >= len && rightRun >= len && alreadyApplied) {
     return {
       value: value.slice(0, start - len) + selected + value.slice(end + len),
       start: start - len,

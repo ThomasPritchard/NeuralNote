@@ -63,52 +63,43 @@ function openNote(overrides: Partial<OpenNote> = {}): OpenNote {
 
 describe("NotePane — non-loaded states", () => {
   it("shows the empty prompt when nothing is open", () => {
-    render(<NotePane open={openNote({ path: null, note: null })} onClose={vi.fn()} />);
+    render(<NotePane open={openNote({ path: null, note: null })} />);
     expect(screen.getByText(/Select a note from the sidebar/i)).toBeInTheDocument();
   });
 
   it("shows a spinner while loading", () => {
-    render(<NotePane open={openNote({ loading: true })} onClose={vi.fn()} />);
+    render(<NotePane open={openNote({ loading: true })} />);
     expect(screen.getByLabelText("Loading note")).toBeInTheDocument();
   });
 
   it("shows the read error with a retry that reloads", async () => {
     const open = openNote({ error: "boom", note: null });
-    render(<NotePane open={open} onClose={vi.fn()} />);
+    render(<NotePane open={open} />);
     expect(screen.getByText("boom")).toBeInTheDocument();
     await userEvent.click(screen.getByRole("button", { name: /Retry/i }));
     expect(open.reload).toHaveBeenCalled();
   });
 
   it("shows a generic message when there is no note and no explicit error", () => {
-    render(<NotePane open={openNote({ error: null, note: null })} onClose={vi.fn()} />);
+    render(<NotePane open={openNote({ error: null, note: null })} />);
     expect(screen.getByText(/couldn't be opened/i)).toBeInTheDocument();
   });
 });
 
 describe("NotePane — loaded read mode", () => {
   it("renders the reader, breadcrumb and no save button", () => {
-    render(<NotePane open={openNote()} onClose={vi.fn()} />);
+    render(<NotePane open={openNote()} />);
     expect(screen.getByText("folder/n.md")).toBeInTheDocument();
     expect(screen.getAllByText("My Note").length).toBeGreaterThan(0);
     expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
   });
 
-  it("shows the dirty dot when there are unsaved edits", () => {
-    render(<NotePane open={openNote({ dirty: true })} onClose={vi.fn()} />);
-    expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
-  });
-
-  it("closes via the tab close button", async () => {
-    const onClose = vi.fn();
-    render(<NotePane open={openNote()} onClose={onClose} />);
-    await userEvent.click(screen.getByRole("button", { name: "Close note" }));
-    expect(onClose).toHaveBeenCalled();
-  });
+  // The tab (title, dirty dot, close) lives in the window titlebar now —
+  // its tests live in TitleBar.test.tsx.
 
   it("switches to edit mode via the toggle", async () => {
     const open = openNote();
-    render(<NotePane open={open} onClose={vi.fn()} />);
+    render(<NotePane open={open} />);
     await userEvent.click(screen.getByRole("button", { name: /Edit/i }));
     expect(open.setMode).toHaveBeenCalledWith("edit");
   });
@@ -119,7 +110,6 @@ describe("NotePane — loaded read mode", () => {
     render(
       <NotePane
         open={openNote({ mode: "edit", note: note({ binary: true, body: "", raw: "" }) })}
-        onClose={vi.fn()}
       />,
     );
     expect(screen.queryByRole("button", { name: /Edit/i })).not.toBeInTheDocument();
@@ -129,17 +119,14 @@ describe("NotePane — loaded read mode", () => {
 
   it("shows the non-UTF-8 encoding notice in read mode", () => {
     render(
-      <NotePane open={openNote({ note: note({ lossyText: true }) })} onClose={vi.fn()} />,
+      <NotePane open={openNote({ note: note({ lossyText: true }) })} />,
     );
     expect(screen.getByText(/isn't valid UTF-8/i)).toBeInTheDocument();
   });
 
   it("still shows the encoding notice in edit mode (where saving bakes it in)", () => {
     render(
-      <NotePane
-        open={openNote({ mode: "edit", note: note({ lossyText: true }) })}
-        onClose={vi.fn()}
-      />,
+      <NotePane open={openNote({ mode: "edit", note: note({ lossyText: true }) })} />,
     );
     // The warning must be visible exactly where the destructive save is triggered.
     expect(screen.getByText(/isn't valid UTF-8/i)).toBeInTheDocument();
@@ -149,14 +136,14 @@ describe("NotePane — loaded read mode", () => {
 
 describe("NotePane — edit mode", () => {
   it("renders the editor and a disabled save when clean", () => {
-    render(<NotePane open={openNote({ mode: "edit", dirty: false })} onClose={vi.fn()} />);
+    render(<NotePane open={openNote({ mode: "edit", dirty: false })} />);
     expect(screen.getByLabelText("Note source")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
   });
 
   it("enables save when dirty and triggers it", async () => {
     const open = openNote({ mode: "edit", dirty: true });
-    render(<NotePane open={open} onClose={vi.fn()} />);
+    render(<NotePane open={open} />);
     const save = screen.getByRole("button", { name: "Save" });
     expect(save).toBeEnabled();
     await userEvent.click(save);
@@ -164,25 +151,20 @@ describe("NotePane — edit mode", () => {
   });
 
   it("shows the saving state", () => {
-    render(
-      <NotePane
-        open={openNote({ mode: "edit", dirty: true, saving: true })}
-        onClose={vi.fn()}
-      />,
-    );
+    render(<NotePane open={openNote({ mode: "edit", dirty: true, saving: true })} />);
     expect(screen.getByText("Saving…")).toBeInTheDocument();
   });
 
   it("can switch back to read mode", async () => {
     const open = openNote({ mode: "edit" });
-    render(<NotePane open={open} onClose={vi.fn()} />);
+    render(<NotePane open={open} />);
     await userEvent.click(screen.getByRole("button", { name: /Read/i }));
     expect(open.setMode).toHaveBeenCalledWith("read");
   });
 
   it("wires the editor's conflict actions to overwrite and reload", async () => {
     const open = openNote({ mode: "edit", dirty: true, conflict: true });
-    render(<NotePane open={open} onClose={vi.fn()} />);
+    render(<NotePane open={open} />);
     await userEvent.click(screen.getByRole("button", { name: /Overwrite/i }));
     expect(open.overwrite).toHaveBeenCalled();
     await userEvent.click(screen.getByRole("button", { name: /Reload/i }));

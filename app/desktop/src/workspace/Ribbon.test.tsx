@@ -12,7 +12,6 @@ function renderRibbon(over: Partial<RibbonProps> = {}) {
     onShowFiles: vi.fn(),
     onShowSearch: vi.fn(),
     onToggleGraph: vi.fn(),
-    onOpenSettings: vi.fn(),
     ...over,
   };
   render(<Ribbon {...props} />);
@@ -86,12 +85,9 @@ describe("Ribbon — callbacks", () => {
     expect(props.onToggleGraph).toHaveBeenCalledTimes(1);
   });
 
-  it("fires onOpenSettings for the (now live) Settings cog", async () => {
-    const props = renderRibbon();
-    const btn = screen.getByRole("button", { name: "Settings" });
-    expect(btn).not.toHaveAttribute("aria-disabled");
-    await userEvent.click(btn);
-    expect(props.onOpenSettings).toHaveBeenCalledTimes(1);
+  it("has no Settings button — Settings lives in the titlebar", () => {
+    renderRibbon();
+    expect(screen.queryByRole("button", { name: /Settings/ })).not.toBeInTheDocument();
   });
 });
 
@@ -105,6 +101,5 @@ describe("Ribbon — placeholders", () => {
     expect(props.onShowFiles).not.toHaveBeenCalled();
     expect(props.onShowSearch).not.toHaveBeenCalled();
     expect(props.onToggleGraph).not.toHaveBeenCalled();
-    expect(props.onOpenSettings).not.toHaveBeenCalled();
   });
 });

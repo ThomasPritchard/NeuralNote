@@ -6,16 +6,18 @@
 //! the sequence as live steps: search → read → verify → cited answer.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// One event in a chat run's stream. Emitted in causal order; a run ends with
 /// either [`ChatEvent::Done`] (success) or [`ChatEvent::Error`] (surfaced failure)
 /// — never silently.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
     rename_all_fields = "camelCase"
 )]
+#[ts(export)]
 pub enum ChatEvent {
     /// A search is about to run for `query` (the live "searching…" cue).
     Searching { query: String },

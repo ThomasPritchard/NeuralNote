@@ -33,9 +33,8 @@ describe("SettingsModal — shell", () => {
     expect(dialog).toHaveAttribute("aria-modal", "true");
     // Default section is Configure the AI — the reason the modal exists in v1.
     expect(screen.getByTestId("ai-settings-page")).toBeInTheDocument();
-    // The section nav lists all three sections.
+    // The section nav lists both shipped sections.
     const nav = screen.getByRole("navigation", { name: "Settings sections" });
-    expect(nav).toContainElement(screen.getByRole("button", { name: "General" }));
     expect(nav).toContainElement(
       screen.getByRole("button", { name: "Configure the AI" }),
     );
@@ -45,21 +44,36 @@ describe("SettingsModal — shell", () => {
   it("switches sections from the left nav", async () => {
     const { user } = setup();
 
-    await user.click(screen.getByRole("button", { name: "General" }));
-    expect(screen.getByText(/more settings coming soon/i)).toBeInTheDocument();
-    expect(screen.queryByTestId("ai-settings-page")).not.toBeInTheDocument();
-
     await user.click(screen.getByRole("button", { name: "About" }));
     expect(screen.getByText("NeuralNote")).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-settings-page")).not.toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Configure the AI" }));
     expect(screen.getByTestId("ai-settings-page")).toBeInTheDocument();
+  });
+
+  it("ships no empty General section — no nav entry, no placeholder copy (PA-017)", () => {
+    setup();
+    // A live nav item whose page says only "coming soon" is a shipped
+    // placeholder; General stays hidden until it has a real setting.
+    expect(screen.queryByRole("button", { name: "General" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/coming soon/i)).not.toBeInTheDocument();
   });
 
   it("honours an explicit initial section", () => {
     setup({ initialSection: "about" });
     expect(screen.getByText("NeuralNote")).toBeInTheDocument();
     expect(screen.queryByTestId("ai-settings-page")).not.toBeInTheDocument();
+  });
+
+  it("describes only shipped capabilities in the About copy (PA-004)", () => {
+    setup({ initialSection: "about" });
+    // v1 ships cited recall; AI filing/linking/distillation does not. The
+    // self-description must not claim unbuilt features.
+    expect(
+      screen.getByText(/the AI answers questions across them/i),
+    ).toBeInTheDocument();
+    expect(screen.queryByText(/files, links/i)).not.toBeInTheDocument();
   });
 
   it("closes on Escape", async () => {

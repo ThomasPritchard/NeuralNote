@@ -10,6 +10,7 @@ import {
   groupActivity,
   reduceAssistant,
   resolveAnswerMarkers,
+  stripCitationMarkers,
   summarizeActivity,
   toHistory,
   userMessage,
@@ -141,6 +142,46 @@ describe("toHistory", () => {
       { role: "assistant", content: "It's spacing." },
       { role: "user", content: "and recall?" },
     ]);
+  });
+
+  it("windows history to the most recent turns so it can't grow unbounded (PA-003)", () => {
+    // 60 non-empty turns in → only the last 20 come out, and they're the newest.
+    const messages: ChatMessage[] = Array.from({ length: 30 }, (_, i) => [
+      userMessage(`q${i}`),
+      { ...emptyAssistant(), answer: `a${i}`, done: true } as ChatMessage,
+    ]).flat();
+    const history = toHistory(messages);
+    expect(history).toHaveLength(20);
+    // The window keeps the tail: last entry is the final assistant answer.
+    expect(history.at(-1)).toEqual({ role: "assistant", content: "a29" });
+    expect(history[0]).toEqual({ role: "user", content: "q20" });
+  });
+
+  it("strips [eN] markers from assistant answers so stale ids can't re-enter (SUS-1)", () => {
+    // Evidence ids reset per run, so a turn-1 marker means nothing in turn 2 — and
+    // could collide with an unrelated new span. History must carry the prose, not the ids.
+    const messages: ChatMessage[] = [
+      userMessage("q"),
+      { ...emptyAssistant(), answer: "Spacing is 8px [e1] and grids use it [e2].", done: true },
+    ];
+    expect(toHistory(messages)).toEqual([
+      { role: "user", content: "q" },
+      { role: "assistant", content: "Spacing is 8px and grids use it." },
+    ]);
+  });
+});
+
+describe("stripCitationMarkers", () => {
+  it("removes every [eN] marker (verified or not) with its leading space", () => {
+    expect(stripCitationMarkers("A [e1] and B [e9].")).toBe("A and B.");
+  });
+
+  it("matches uppercase markers, mirroring the Rust extractor's case-folding", () => {
+    expect(stripCitationMarkers("A [E1] then [e2]!")).toBe("A then!");
+  });
+
+  it("leaves marker-free text untouched", () => {
+    expect(stripCitationMarkers("No citations here.")).toBe("No citations here.");
   });
 });
 

@@ -3,16 +3,19 @@
 // re-syncs via the store's refreshTree(). Every op failure is surfaced in an
 // inline toast — never swallowed. The reader-affecting cases (open note deleted,
 // renamed, or moved) are reported up so the parent can keep the reader honest.
+// Large vaults render through a virtualized flat row list (flattenTree.ts +
+// @tanstack/react-virtual) so only the visible window mounts (PA-005).
 
 import { memo, useEffect, useRef, useState } from "react";
-import { ChevronDown, FilePlus2, Search, X } from "lucide-react";
+import { useVirtualizer } from "@tanstack/react-virtual";
+import { FilePlus2, Search, X } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
-import { cn } from "../lib/cn";
 import type { TemplateInfo, TreeNode } from "../lib/types";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { isPathInside, normSep } from "./fileMeta";
 import { filterTree } from "./filterTree";
+import { flattenTree, rowKey, type FlatRow } from "./flattenTree";
 import {
   CreateRow,
   TreeRow,
@@ -21,9 +24,34 @@ import {
   type TreeContext,
 } from "./TreeRow";
 import { loadCollapsed, saveCollapsed } from "./treeState";
-import { VaultMenu } from "./VaultMenu";
 
-const EASE = "ease-[cubic-bezier(0.32,0.72,0,1)]";
+// ── Virtualization (PA-005) ────────────────────────────────────────────────
+// The headline v1 user opens an existing Obsidian vault of thousands of notes
+// with folders open by default — mounting every row wrecks first paint and
+// scroll. Above this row count the tree body windows via
+// @tanstack/react-virtual; below it, rows render plainly (identical DOM to
+// the pre-virtualized tree, zero overhead for small vaults).
+const VIRTUALIZE_MIN_ROWS = 100;
+/** Estimated row height (px) before dynamic measurement lands — a file row is
+ *  ~26px (13px text + 5px vertical padding each side). */
+const ROW_ESTIMATE = 26;
+
+/** One flattened row: the node (or inline create input) wrapped in one
+ *  indent-guide layer per ancestor level. Stacked flush rows join their
+ *  `border-l` hairlines into the same continuous guide lines the old
+ *  recursive nesting drew. */
+function FlatTreeRow({ row, ctx }: Readonly<{ row: FlatRow; ctx: TreeContext }>) {
+  let content =
+    row.kind === "create" ? (
+      <CreateRow kind={row.createKind} ctx={ctx} />
+    ) : (
+      <TreeRow node={row.node} ctx={ctx} />
+    );
+  for (let i = 0; i < row.depth; i++) {
+    content = <div className="ml-[7px] border-l border-border/60 pl-2">{content}</div>;
+  }
+  return content;
+}
 
 // While the filename filter is active every surviving folder renders expanded:
 // this empty set is passed as the tree's collapsed-set so the user's real
@@ -31,7 +59,6 @@ const EASE = "ease-[cubic-bezier(0.32,0.72,0,1)]";
 const NO_COLLAPSED: Set<string> = new Set();
 
 interface FileTreeProps {
-  vaultName: string;
   vaultPath: string;
   tree: TreeNode[];
   activePath: string | null;
@@ -41,7 +68,6 @@ interface FileTreeProps {
   onSelect: (path: string) => void;
   onDeleted: (node: TreeNode) => void;
   onRemap: (oldPath: string, newNode: TreeNode) => void;
-  onCloseVault: () => void;
   /** A native-menu request to create a note/folder at the vault root, or null.
    *  Consumed via onCreateConsumed so it opens the inline row exactly once. */
   pendingCreate: CreateKind | null;
@@ -52,7 +78,6 @@ interface FileTreeProps {
 // only needs to re-render when its inputs actually change. Workspace passes
 // referentially stable handlers (useCallback) so this skips the keystroke churn.
 export const FileTree = memo(function FileTree({
-  vaultName,
   vaultPath,
   tree,
   activePath,
@@ -61,7 +86,6 @@ export const FileTree = memo(function FileTree({
   onSelect,
   onDeleted,
   onRemap,
-  onCloseVault,
   pendingCreate,
   onCreateConsumed,
 }: FileTreeProps) {
@@ -75,7 +99,6 @@ export const FileTree = memo(function FileTree({
   const [dragPath, setDragPath] = useState<string | null>(null);
   const [opError, setOpError] = useState<string | null>(null);
   const [pendingDelete, setPendingDelete] = useState<TreeNode | null>(null);
-  const [menuOpen, setMenuOpen] = useState(false);
   // Templates offered in the note-create row (fetched when a create begins)
   // and the picked one (null = blank note). A monotonic token guards a slow
   // list_templates response from landing on a later create session.
@@ -205,11 +228,34 @@ export const FileTree = memo(function FileTree({
 
   // TODO(PA-010): `ctx` is rebuilt every render, so React.memo(TreeRow) never
   // bites. The per-keystroke win already comes from React.memo(FileTree) above
-  // (the workspace passes stable handlers); making row-level memo effective for
-  // large vaults means useCallback-ing these handlers + useMemo-ing ctx — a
-  // future optimisation, deferred as a low-value nicety.
+  // (the workspace passes stable handlers), and virtualization now bounds how
+  // many rows mount at all; making row-level memo effective means
+  // useCallback-ing these handlers + useMemo-ing ctx — a future optimisation,
+  // deferred as a low-value nicety.
   const filterActive = filter.trim() !== "";
   const visibleTree = filterActive ? filterTree(tree, filter) : tree;
+
+  // The flat, ordered list of rows actually visible (open folders only, plus
+  // the transient create row) — the model the windowed body renders from.
+  const flatRows = flattenTree(
+    visibleTree,
+    filterActive ? NO_COLLAPSED : collapsed,
+    creating,
+    vaultPath,
+  );
+  const virtualize = flatRows.length > VIRTUALIZE_MIN_ROWS;
+
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const rowVirtualizer = useVirtualizer({
+    count: flatRows.length,
+    getScrollElement: () => scrollRef.current,
+    estimateSize: () => ROW_ESTIMATE,
+    overscan: 10,
+    // Below the threshold the plain branch renders every row itself; disabling
+    // also detaches the scroll/resize observers so small vaults pay nothing.
+    enabled: virtualize,
+    getItemKey: (index) => rowKey(flatRows[index]),
+  });
 
   const ctx: TreeContext = {
     activePath,
@@ -249,45 +295,14 @@ export const FileTree = memo(function FileTree({
 
   return (
     <aside className="flex w-60 shrink-0 flex-col border-r border-border bg-sidebar">
-      <header className="relative flex items-center justify-between px-3 pb-1.5 pt-3">
-        <button
-          type="button"
-          onClick={() => setMenuOpen((o) => !o)}
-          aria-haspopup="menu"
-          aria-expanded={menuOpen}
-          className={cn(
-            "flex min-w-0 items-center gap-1 rounded text-[13px] font-semibold text-sidebar-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
-            EASE,
-          )}
-        >
-          <span className="truncate">{vaultName}</span>
-          <ChevronDown className="size-3.5 shrink-0 opacity-60" aria-hidden />
-        </button>
-        <button
-          type="button"
-          aria-label="New note"
-          title="New note"
-          onClick={() => startCreate(vaultPath, "note")}
-          className="grid size-6 shrink-0 place-items-center rounded text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
-        >
-          <FilePlus2 className="size-4" aria-hidden />
-        </button>
-
-        {menuOpen && (
-          <VaultMenu
-            onClose={() => setMenuOpen(false)}
-            onNewNote={() => startCreate(vaultPath, "note")}
-            onNewFolder={() => startCreate(vaultPath, "folder")}
-            onRefresh={() => void refreshTree()}
-            onCloseVault={onCloseVault}
-          />
-        )}
-      </header>
-
-      {/* Filename filter — narrows the tree as you type. Full-text vault
-          search lives in the ⌘K SearchPanel; this only matches file names. */}
-      <div className="px-3 pb-2">
-        <label className="flex items-center gap-2 rounded-md border border-border bg-background/40 px-2 py-1.5 text-[13px] text-muted-foreground/70">
+      {/* Panel top row — filename filter + root note create, mirroring the
+          SearchPanel's field-first opening. The vault switcher and its menu
+          moved to the window titlebar; root note creation stays here because
+          it's a file-explorer affordance, not window chrome. Full-text vault
+          search lives in the ⌘K SearchPanel; this filter only matches file
+          names. */}
+      <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
+        <label className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background/40 px-2 py-1.5 text-[13px] text-muted-foreground/70">
           <Search className="size-3.5 shrink-0" aria-hidden />
           <input
             value={filter}
@@ -314,6 +329,15 @@ export const FileTree = memo(function FileTree({
             </button>
           )}
         </label>
+        <button
+          type="button"
+          aria-label="New note"
+          title="New note"
+          onClick={() => startCreate(vaultPath, "note")}
+          className="grid size-6 shrink-0 place-items-center rounded text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+        >
+          <FilePlus2 className="size-4" aria-hidden />
+        </button>
       </div>
 
       {/* Tree — the scroll body is also the drop target for "move to vault root".
@@ -321,6 +345,7 @@ export const FileTree = memo(function FileTree({
           focusability requirement for an element carrying drag handlers without
           adding a tab stop (keyboard operation is via the row buttons inside). */}
       <div
+        ref={scrollRef}
         role="tree"
         tabIndex={-1}
         className="flex-1 overflow-y-auto px-1.5 pb-2"
@@ -332,7 +357,6 @@ export const FileTree = memo(function FileTree({
           void moveTo(vaultPath);
         }}
       >
-        {creatingAtRoot && creating && <CreateRow kind={creating.kind} ctx={ctx} />}
         {tree.length === 0 && !creatingAtRoot && (
           <p className="px-2 py-6 text-center text-[12px] leading-relaxed text-muted-foreground/70">
             This vault is empty. Use the + above to create your first note.
@@ -343,9 +367,27 @@ export const FileTree = memo(function FileTree({
             No files match &quot;{filter}&quot;
           </p>
         )}
-        {visibleTree.map((node) => (
-          <TreeRow key={node.relPath} node={node} ctx={ctx} />
-        ))}
+        {virtualize ? (
+          // Windowed body: a spacer at the full list height, with only the
+          // visible slice mounted, absolutely placed at its offset. Rows
+          // measure themselves (measureElement) so the taller create row and
+          // any future variable-height rows stay correctly stacked.
+          <div className="relative w-full" style={{ height: rowVirtualizer.getTotalSize() }}>
+            {rowVirtualizer.getVirtualItems().map((item) => (
+              <div
+                key={item.key}
+                ref={rowVirtualizer.measureElement}
+                data-index={item.index}
+                className="absolute left-0 top-0 w-full"
+                style={{ transform: `translateY(${item.start}px)` }}
+              >
+                <FlatTreeRow row={flatRows[item.index]} ctx={ctx} />
+              </div>
+            ))}
+          </div>
+        ) : (
+          flatRows.map((row) => <FlatTreeRow key={rowKey(row)} row={row} ctx={ctx} />)
+        )}
       </div>
 
       {opError && (

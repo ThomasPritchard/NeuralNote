@@ -5,11 +5,13 @@
 //! here without updating that file.
 
 use serde::{Deserialize, Serialize};
+use ts_rs::TS;
 
 /// An opened vault — just a folder on disk, by design. Any folder is a valid
 /// vault (that is what makes "open your existing Obsidian vault" zero-migration).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct Vault {
     /// Display name (the folder's final path component).
     pub name: String,
@@ -18,16 +20,18 @@ pub struct Vault {
 }
 
 /// Whether a tree node is a folder or a file.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "lowercase")]
+#[ts(export)]
 pub enum EntryKind {
     Folder,
     File,
 }
 
 /// A node in the vault file tree. Folders carry `children`; files carry `ext`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct TreeNode {
     pub kind: EntryKind,
     /// Final path component (file or folder name).
@@ -45,14 +49,21 @@ pub struct TreeNode {
 
 /// A note opened in the reader/editor: parsed frontmatter + markdown body, with
 /// the full raw file always retained so nothing is ever lost or hidden.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct NoteDoc {
     pub path: String,
     pub rel_path: String,
     /// Best-effort title: frontmatter `title`, else first H1, else file stem.
     pub title: String,
     /// Parsed YAML frontmatter as JSON, or `None` if absent/unparseable.
+    /// `serde_json::Value` has no single TS shape; the frontend has always modelled
+    /// a parsed frontmatter block as a string-keyed record, so pin that here rather
+    /// than let ts-rs emit `any` (which `strict` + the no-`any` rule forbid). The
+    /// `| null` is written explicitly because `#[ts(type)]` overrides the whole
+    /// field type, including the `| null` that `Option` would otherwise add.
+    #[ts(type = "Record<string, unknown> | null")]
     pub frontmatter: Option<serde_json::Value>,
     /// The raw frontmatter block (between the `---` fences), if present.
     pub frontmatter_raw: Option<String>,
@@ -79,8 +90,9 @@ pub struct NoteDoc {
 }
 
 /// One markdown template available for note creation.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct TemplateInfo {
     /// Vault-relative path to the template file.
     pub rel_path: String,
@@ -89,8 +101,9 @@ pub struct TemplateInfo {
 }
 
 /// A recently-opened vault, for the welcome screen.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct RecentVault {
     pub name: String,
     pub path: String,
@@ -99,8 +112,9 @@ pub struct RecentVault {
 }
 
 /// One matching line of a note in full-text search results.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct SearchMatch {
     /// 1-based line number in the raw file.
     pub line: u32,
@@ -114,8 +128,9 @@ pub struct SearchMatch {
 }
 
 /// One file's worth of search results.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct FileHit {
     /// Absolute path on disk.
     pub path: String,
@@ -128,8 +143,9 @@ pub struct FileHit {
 }
 
 /// The full result of a vault search.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct SearchResponse {
     pub hits: Vec<FileHit>,
     /// True when a match cap clipped anything (the UI shows a banner).
@@ -140,8 +156,9 @@ pub struct SearchResponse {
 }
 
 /// A note in the link graph — one per markdown note, orphans included.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct GraphNode {
     /// The note's `rel_path` (stable id).
     pub id: String,
@@ -151,8 +168,9 @@ pub struct GraphNode {
 }
 
 /// A resolved, deduplicated link between two notes.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct GraphLink {
     pub source: String,
     pub target: String,
@@ -161,8 +179,9 @@ pub struct GraphLink {
 }
 
 /// The whole vault's wikilink/markdown-link graph.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct LinkGraph {
     pub nodes: Vec<GraphNode>,
     pub links: Vec<GraphLink>,
@@ -173,8 +192,9 @@ pub struct LinkGraph {
 }
 
 /// One resolved occurrence of a link pointing at the current note.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct Backlink {
     pub source_rel: String,
     pub source_title: String,
@@ -184,8 +204,9 @@ pub struct Backlink {
 }
 
 /// One note whose body mentions the current note title without linking it.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct UnlinkedMention {
     pub source_rel: String,
     pub source_title: String,
@@ -195,8 +216,9 @@ pub struct UnlinkedMention {
 }
 
 /// The Obsidian-style backlinks panel payload.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct Backlinks {
     pub linked: Vec<Backlink>,
     pub unlinked: Vec<UnlinkedMention>,

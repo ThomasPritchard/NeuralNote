@@ -3,6 +3,7 @@ import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
+import { MENU_ACTION } from "../lib/bindings/events";
 import type { TreeNode } from "../lib/types";
 import type { OpenNote } from "./useOpenNote";
 
@@ -14,6 +15,21 @@ const captured = vi.hoisted(() => ({
   fileTree: {} as Record<string, (...a: never[]) => void>,
   notePane: {} as Record<string, (...a: never[]) => void>,
   ribbon: {} as Record<string, (...a: never[]) => void>,
+  titlebar: {} as {
+    vaultName: string;
+    sidebarOpen: boolean;
+    onToggleSidebar: () => void;
+    chatOpen: boolean;
+    onToggleChat: () => void;
+    onOpenSettings: () => void;
+    note: unknown;
+    noteDirty: boolean;
+    onCloseNote: () => void;
+    onNewNote: () => void;
+    onNewFolder: () => void;
+    onRefresh: () => void;
+    onCloseVault: () => void;
+  },
   searchPanel: {} as { focusSignal: number; onOpen: (absPath: string) => void },
   graphView: {} as { onOpenNote: (relPath: string) => void },
   chatPane: {} as {
@@ -37,7 +53,7 @@ const win = vi.hoisted(() => {
 
 vi.mock("../lib/store", () => ({ useVault: mockUseVault }));
 vi.mock("./useOpenNote", () => ({ useOpenNote: () => openState.current }));
-// The Workspace subscribes to menu://action; mock the event bus so listen()
+// The Workspace subscribes to MENU_ACTION; mock the event bus so listen()
 // resolves and tests can drive the registered handler directly.
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(() => Promise.resolve(() => {})),
@@ -48,13 +64,12 @@ const mockListen = vi.mocked(listen);
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn(() => Promise.resolve()) }));
 const mockInvoke = vi.mocked(invoke);
 
-/** Invoke the latest menu://action handler the Workspace registered. */
+/** Invoke the latest MENU_ACTION handler the Workspace registered. */
 function fireMenu(payload: {
   action: string;
   path?: string;
-  checked?: boolean;
 }) {
-  const calls = mockListen.mock.calls.filter((c) => c[0] === "menu://action");
+  const calls = mockListen.mock.calls.filter((c) => c[0] === MENU_ACTION);
   const handler = calls.at(-1)![1] as (e: { payload: unknown }) => void;
   act(() => handler({ payload }));
 }
@@ -96,6 +111,12 @@ vi.mock("./Ribbon", () => ({
   Ribbon: (props: Record<string, (...a: never[]) => void>) => {
     captured.ribbon = props;
     return <div data-testid="ribbon" />;
+  },
+}));
+vi.mock("./TitleBar", () => ({
+  TitleBar: (props: Record<string, unknown>) => {
+    captured.titlebar = props as typeof captured.titlebar;
+    return <div data-testid="titlebar" />;
   },
 }));
 vi.mock("./SearchPanel", () => ({
@@ -348,7 +369,7 @@ describe("Workspace — close vault + close note", () => {
     openState.current = makeOpen({ dirty: false });
     mockUseVault.mockReturnValue(ctx);
     render(<Workspace />);
-    await act(async () => captured.fileTree.onCloseVault());
+    await act(async () => captured.titlebar.onCloseVault());
     expect(ctx.close).toHaveBeenCalled();
   });
 
@@ -357,24 +378,24 @@ describe("Workspace — close vault + close note", () => {
     openState.current = makeOpen({ dirty: true });
     mockUseVault.mockReturnValue(ctx);
     render(<Workspace />);
-    await act(async () => captured.fileTree.onCloseVault());
+    await act(async () => captured.titlebar.onCloseVault());
     await userEvent.click(screen.getByRole("button", { name: "Discard" }));
     expect(ctx.close).toHaveBeenCalled();
   });
 
-  it("clears the note pane directly when clean", async () => {
+  it("clears the note directly from the titlebar tab when clean", async () => {
     openState.current = makeOpen({ dirty: false });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
-    await act(async () => captured.notePane.onClose());
+    await act(async () => captured.titlebar.onCloseNote());
     expect(openState.current.clear).toHaveBeenCalled();
   });
 
-  it("guards clearing the note pane when dirty", async () => {
+  it("guards clearing the note from the titlebar tab when dirty", async () => {
     openState.current = makeOpen({ dirty: true });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
-    await act(async () => captured.notePane.onClose());
+    await act(async () => captured.titlebar.onCloseNote());
     expect(openState.current.clear).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole("button", { name: "Discard" }));
     expect(openState.current.clear).toHaveBeenCalled();
@@ -596,12 +617,13 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
 });
 
 describe("Workspace — settings modal", () => {
-  it("opens from the ribbon cog and closes back", () => {
+  it("opens from the titlebar cog and closes back", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
     expect(screen.queryByTestId("settings-modal")).not.toBeInTheDocument();
 
-    act(() => captured.ribbon.onOpenSettings());
+    // Settings moved off the ribbon onto the titlebar in the overlay-titlebar cut.
+    act(() => captured.titlebar.onOpenSettings());
     expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
 
     act(() => captured.settingsModal.onClose());
@@ -621,6 +643,149 @@ describe("Workspace — settings modal", () => {
     act(() => captured.settingsModal.onClose());
     expect(screen.queryByTestId("settings-modal")).not.toBeInTheDocument();
     expect(screen.getByTestId("chatpane")).toHaveAttribute("data-refresh-signal", "1");
+  });
+});
+
+describe("Workspace — titlebar + sidebar", () => {
+  it("passes the vault name and open-note state through to the titlebar", () => {
+    openState.current = makeOpen({
+      note: { title: "A" } as unknown as OpenNote["note"],
+      dirty: true,
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    expect(captured.titlebar.vaultName).toBe("MyVault");
+    expect(captured.titlebar.sidebarOpen).toBe(true);
+    expect(captured.titlebar.chatOpen).toBe(true);
+    expect(captured.titlebar.noteDirty).toBe(true);
+  });
+
+  it("collapses the sidebar (unmounting the file tree) via the titlebar toggle", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+
+    act(() => captured.titlebar.onToggleSidebar());
+    expect(captured.titlebar.sidebarOpen).toBe(false);
+    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+
+    act(() => captured.titlebar.onToggleSidebar());
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+  });
+
+  it("toggles the sidebar off and back on from the menu", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+
+    fireMenu({ action: "toggle-sidebar" });
+    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+
+    fireMenu({ action: "toggle-sidebar" });
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+  });
+
+  // Regression: selecting a panel while the sidebar is collapsed used to swap
+  // `sidebarPanel` behind a hidden sidebar — the click did nothing visible.
+  // Every "show me this panel" caller must force the sidebar open.
+  it("re-opens a collapsed sidebar when the ribbon's Files icon is clicked", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    act(() => captured.titlebar.onToggleSidebar());
+    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+
+    act(() => captured.ribbon.onShowFiles());
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+    expect(captured.titlebar.sidebarOpen).toBe(true);
+  });
+
+  it("re-opens a collapsed sidebar when the ribbon's Search icon is clicked", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    act(() => captured.titlebar.onToggleSidebar());
+    expect(screen.queryByTestId("searchpanel")).not.toBeInTheDocument();
+
+    act(() => captured.ribbon.onShowSearch());
+    expect(screen.getByTestId("searchpanel")).toBeInTheDocument();
+    expect(captured.titlebar.sidebarOpen).toBe(true);
+  });
+
+  it("flips chat visibility from the titlebar toggle", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    expect(captured.titlebar.chatOpen).toBe(true);
+
+    act(() => captured.titlebar.onToggleChat());
+    expect(captured.titlebar.chatOpen).toBe(false);
+  });
+
+  it("syncs titlebar chat visibility changes to the native menu checkmark", async () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("set_chat_visible", { visible: true }),
+    );
+
+    mockInvoke.mockClear();
+    act(() => captured.titlebar.onToggleChat());
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("set_chat_visible", { visible: false }),
+    );
+  });
+
+  it("flips chat visibility on a bare toggle-chat menu action", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    expect(captured.titlebar.chatOpen).toBe(true);
+
+    // The CheckMenuItem no longer carries a `checked` payload — a bare action
+    // just requests a flip, and the webview owns the resulting value.
+    fireMenu({ action: "toggle-chat" });
+    expect(captured.titlebar.chatOpen).toBe(false);
+  });
+
+  it("re-opens a collapsed sidebar when New Note fires from the menu", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "toggle-sidebar" });
+    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+
+    // Menu-driven New Note must force the sidebar back open onto Files, else its
+    // inline create row (the only place a create can happen) never appears.
+    fireMenu({ action: "new-note" });
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+    expect(
+      (captured.fileTree as unknown as { pendingCreate: string }).pendingCreate,
+    ).toBe("note");
+  });
+
+  it("re-opens a collapsed sidebar when New Note fires from the titlebar", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    act(() => captured.titlebar.onToggleSidebar());
+    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+
+    act(() => captured.titlebar.onNewNote());
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+    expect(
+      (captured.fileTree as unknown as { pendingCreate: string }).pendingCreate,
+    ).toBe("note");
+  });
+
+  it("re-opens a collapsed sidebar when New Folder fires from the titlebar", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    act(() => captured.titlebar.onToggleSidebar());
+    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+
+    act(() => captured.titlebar.onNewFolder());
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+    expect(
+      (captured.fileTree as unknown as { pendingCreate: string }).pendingCreate,
+    ).toBe("folder");
   });
 });
 

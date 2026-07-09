@@ -1,7 +1,7 @@
-// The main column: a single-note tab bar, a toolbar (breadcrumb · read/edit
-// toggle · save), and the reader or editor beneath. Owns the empty / loading /
-// error presentation for the active note. State lives in the useOpenNote hook
-// passed down from Workspace.
+// The main column: a toolbar (breadcrumb · read/edit toggle · save) with the
+// reader or editor beneath. Owns the empty / loading / error presentation for
+// the active note. State lives in the useOpenNote hook passed down from
+// Workspace; the active-note tab itself lives in the window titlebar.
 
 import {
   AlertTriangle,
@@ -11,31 +11,29 @@ import {
   Pencil,
   RotateCw,
   Save,
-  X,
 } from "lucide-react";
 import { cn } from "../lib/cn";
 import { Editor } from "./Editor";
-import { extFromPath, iconForFile } from "./fileMeta";
 import type { NoteIndexEntry } from "./linkResolve";
 import { Reader } from "./Reader";
 import type { OpenNote } from "./useOpenNote";
 
-const EASE = "ease-[cubic-bezier(0.32,0.72,0,1)]";
-
 interface NotePaneProps {
   open: OpenNote;
-  onClose: () => void;
   /** Vault note index — wikilink resolution (reader) + `[[` autocomplete (editor). */
   noteIndex?: NoteIndexEntry[];
   /** Open another vault note by relPath (the workspace's guarded open). */
   onOpenLink?: (relPath: string) => void;
+  /** Surface a degraded-capability message (the store's reportError) —
+   *  threaded through to the editor's menu subscription. */
+  reportError?: (message: string) => void;
 }
 
 export function NotePane({
   open,
-  onClose,
   noteIndex,
   onOpenLink,
+  reportError,
 }: Readonly<NotePaneProps>) {
   if (!open.path) {
     return (
@@ -81,7 +79,6 @@ export function NotePane({
   }
 
   const note = open.note;
-  const TabIcon = iconForFile(extFromPath(note.path));
   // Binary attachments (non-UTF-8) have no editable text body — never enter edit
   // mode for them (the editor would be blank and a save would fail with a cryptic
   // UTF-8 error). Force read mode and hide the edit/save controls below.
@@ -89,26 +86,8 @@ export function NotePane({
 
   return (
     <main className="flex min-w-0 flex-1 flex-col bg-background">
-      {/* Tab bar — single tab for v1. */}
-      <div className="flex h-9 shrink-0 items-stretch border-b border-border bg-sidebar">
-        <div className="group flex max-w-64 items-center gap-1.5 border-r border-t-2 border-t-primary border-border bg-background px-3 text-[13px] text-foreground">
-          <TabIcon className="size-3.5 shrink-0 text-primary" aria-hidden />
-          <span className="truncate">{note.title}</span>
-          {open.dirty && (
-            <span className="size-1.5 shrink-0 rounded-full bg-primary" aria-label="Unsaved changes" />
-          )}
-          <button
-            type="button"
-            aria-label="Close note"
-            onClick={onClose}
-            className="ml-1 grid size-4 shrink-0 place-items-center rounded text-muted-foreground opacity-60 transition hover:bg-muted hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
-          >
-            <X className="size-3.5" aria-hidden />
-          </button>
-        </div>
-      </div>
-
-      {/* Toolbar — breadcrumb + view controls. */}
+      {/* Toolbar — breadcrumb + view controls. Its border-b separates it from
+          the note body; the hairline above is the titlebar's own border-b. */}
       <div className="flex h-9 shrink-0 items-center justify-between gap-3 border-b border-border px-5 text-[12px] text-muted-foreground">
         <div className="nn-mono min-w-0 truncate" title={note.relPath}>
           {note.relPath}
@@ -143,7 +122,7 @@ export function NotePane({
       {/* Encoding warning — pane-level so it shows in BOTH read and edit mode.
           It matters most in edit mode, where a save would bake the `�` in. */}
       {note.lossyText && (
-        <div className="flex shrink-0 items-start gap-2 border-b border-amber-500/30 bg-amber-500/10 px-5 py-2 text-[12px] text-amber-700 dark:text-amber-400">
+        <div className="flex shrink-0 items-start gap-2 border-b border-warning/30 bg-warning/10 px-5 py-2 text-[12px] text-warning">
           <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
           <span className="leading-snug">
             This note isn&apos;t valid UTF-8, so some characters couldn&apos;t be read
@@ -162,6 +141,7 @@ export function NotePane({
           onOverwrite={() => void open.overwrite()}
           onReload={open.reload}
           noteIndex={noteIndex}
+          reportError={reportError}
         />
       ) : (
         <Reader note={note} noteIndex={noteIndex} onOpenLink={onOpenLink} />
@@ -219,8 +199,7 @@ function ToggleButton({
       aria-pressed={active}
       className={cn(
         "inline-flex items-center gap-1.5 rounded px-2 py-1 text-[12px] font-medium transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
-        EASE,
-        active
+        "ease-spring",        active
           ? "bg-background text-foreground shadow-sm"
           : "text-muted-foreground hover:text-foreground",
       )}

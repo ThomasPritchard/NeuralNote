@@ -123,7 +123,9 @@ fn search_notes_schema() -> Value {
                 "query": { "type": "string", "description": "The keyword query." },
                 "max_results": {
                     "type": "integer",
-                    "description": "Maximum evidence spans to return (default 8).",
+                    // Interpolated from the constant so the schema can't drift from the
+                    // real default again (it previously still said "default 8").
+                    "description": format!("Maximum evidence spans to return (default {DEFAULT_SEARCH_RESULTS})."),
                     "minimum": 1,
                     "maximum": MAX_SEARCH_RESULTS
                 },
@@ -208,8 +210,17 @@ fn dispatch_list(args_json: &str, provider: &dyn RetrievalProvider) -> ToolResul
         .map(|n| json!({ "title": n.title, "rel_path": n.rel_path }))
         .collect();
     ToolResult {
-        // `skipped` tells the model discovery was partial — never a silent omission.
-        content: json!({ "notes": listed, "skipped": outcome.skipped }).to_string(),
+        // `skipped` tells the model discovery was partial; `truncated`/`total` tell it
+        // the listing was capped to the first K of `total` in-scope notes — mirroring
+        // search_notes' honesty so the model never assumes it saw the whole vault
+        // (PA-002). Never a silent omission.
+        content: json!({
+            "notes": listed,
+            "skipped": outcome.skipped,
+            "truncated": outcome.truncated,
+            "total": outcome.total,
+        })
+        .to_string(),
         outcome: ToolOutcome::Listed,
     }
 }
@@ -353,7 +364,7 @@ fn span_json(id: &str, span: &crate::ai::evidence::EvidenceSpan) -> Value {
 mod tests {
     use super::*;
     use crate::ai::evidence::EvidenceSpan;
-    use crate::ai::retrieval::{FolderMeta, ListOutcome, SearchOutcome};
+    use crate::ai::retrieval::{FolderMeta, ListOutcome, NoteMeta, SearchOutcome};
     use crate::error::{CoreError, CoreResult};
     use std::fs;
 
@@ -387,6 +398,43 @@ mod tests {
                 capped: false,
                 skipped_files: 0,
             })
+        }
+        fn read_note_span(
+            &self,
+            _r: &str,
+            _s: u32,
+            _e: u32,
+            _b: usize,
+        ) -> CoreResult<EvidenceSpan> {
+            Err(CoreError::NotFound("unused".into()))
+        }
+    }
+
+    /// A fake provider whose `list_notes` returns a CAPPED outcome — to prove
+    /// dispatch_list surfaces `truncated`/`total` to the model (PA-002).
+    struct TruncatedListProvider;
+    impl RetrievalProvider for TruncatedListProvider {
+        fn list_notes(&self, _folder: Option<&str>) -> CoreResult<ListOutcome> {
+            Ok(ListOutcome {
+                notes: vec![NoteMeta {
+                    title: "A".into(),
+                    rel_path: "a.md".into(),
+                }],
+                skipped: 0,
+                truncated: true,
+                total: 500,
+            })
+        }
+        fn list_folders(&self) -> CoreResult<Vec<FolderMeta>> {
+            Ok(Vec::new())
+        }
+        fn search_notes(
+            &self,
+            _query: &str,
+            _max: usize,
+            _folder: Option<&str>,
+        ) -> CoreResult<SearchOutcome> {
+            Ok(SearchOutcome::default())
         }
         fn read_note_span(
             &self,
@@ -583,6 +631,17 @@ mod tests {
         let res = dispatch(TOOL_LIST_NOTES, "{}", &r, &mut reg);
         let v: Value = serde_json::from_str(&res.content).unwrap();
         assert_eq!(v["skipped"], 0); // honest discovery footer, even when nothing skipped
+    }
+
+    #[test]
+    fn dispatch_list_surfaces_truncated_and_total() {
+        // A capped listing must tell the model it saw only the first K of `total`
+        // notes — the same honesty search_notes gives (PA-002).
+        let mut reg = EvidenceRegistry::new();
+        let res = dispatch(TOOL_LIST_NOTES, "{}", &TruncatedListProvider, &mut reg);
+        let v: Value = serde_json::from_str(&res.content).unwrap();
+        assert_eq!(v["truncated"], true);
+        assert_eq!(v["total"], 500);
     }
 
     #[test]

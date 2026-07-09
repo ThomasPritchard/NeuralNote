@@ -18,10 +18,9 @@ use tauri::menu::{
 };
 use tauri::{AppHandle, Emitter, Manager, Wry};
 
+use crate::event_names::MENU_ACTION;
 use crate::{config_dir, lock_state, AppState};
 
-/// The single event carrying every custom menu action to the frontend.
-const MENU_ACTION: &str = "menu://action";
 /// Recent-vault item ids are `open-recent:<absolute path>`; the path is decoded
 /// back out in [`parse_menu_id`] and sent to the frontend to open.
 const RECENT_PREFIX: &str = "open-recent:";
@@ -41,6 +40,7 @@ const CUSTOM_ACTIONS: &[&str] = &[
     "toggle-graph",
     "toggle-mode",
     "toggle-chat",
+    "toggle-sidebar",
     "format-bold",
     "format-italic",
     "format-h1",
@@ -49,16 +49,14 @@ const CUSTOM_ACTIONS: &[&str] = &[
     "format-link",
 ];
 
-/// Payload for [`MENU_ACTION`]. `path` is set only for Open Recent; `checked`
-/// only for the chat-visibility toggle. Both are omitted from the JSON otherwise
-/// so the frontend sees a clean `{ action }` for the common case.
+/// Payload for [`MENU_ACTION`]. `path` is set only for Open Recent; it's omitted
+/// from the JSON otherwise so the frontend sees a clean `{ action }` for the
+/// common case.
 #[derive(Clone, Serialize)]
 struct MenuActionPayload {
     action: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     path: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    checked: Option<bool>,
 }
 
 impl MenuActionPayload {
@@ -66,7 +64,6 @@ impl MenuActionPayload {
         Self {
             action: action.to_string(),
             path: None,
-            checked: None,
         }
     }
 }
@@ -83,7 +80,6 @@ fn parse_menu_id(id: &str) -> Option<MenuActionPayload> {
         return Some(MenuActionPayload {
             action: "open-recent".to_string(),
             path: Some(path.to_string()),
-            checked: None,
         });
     }
     CUSTOM_ACTIONS
@@ -291,12 +287,24 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         vault_open,
         Some("CmdOrCtrl+E"),
     )?;
-    // The chat panel's visibility is menu-owned (no competing in-app control), so
-    // a Rust CheckMenuItem is a safe source of truth for its checkmark.
+    // The webview owns the chat panel's visibility now (a titlebar button competes
+    // with the menu, so the menu is no longer its only toggle). This CheckMenuItem
+    // no longer flips any state — it only paints its checkmark from `chat_visible`,
+    // a copy the webview pushes back via `set_chat_visible`.
     let toggle_chat = CheckMenuItemBuilder::with_id("toggle-chat", "Cited Recall Panel")
         .checked(chat_visible)
         .enabled(vault_open)
         .build(app)?;
+    // Plain MenuItem, not a CheckMenuItem: the sidebar's visibility lives entirely
+    // in the webview and carries no menu checkmark, so there is no state to keep in
+    // sync here — the menu just emits the toggle and the webview owns the rest.
+    let toggle_sidebar = MenuItem::with_id(
+        app,
+        "toggle-sidebar",
+        "Toggle Sidebar",
+        vault_open,
+        Some("CmdOrCtrl+\\"),
+    )?;
     let view_menu = SubmenuBuilder::new(app, "View")
         .item(&view_files)
         .item(&view_search)
@@ -304,6 +312,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&toggle_graph)
         .item(&toggle_mode)
         .separator()
+        .item(&toggle_sidebar)
         .item(&toggle_chat)
         .separator()
         .item(&PredefinedMenuItem::fullscreen(app, None)?)
@@ -337,17 +346,9 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
 pub fn install(app: &AppHandle) -> tauri::Result<()> {
     app.set_menu(build_menu(app)?)?;
     app.on_menu_event(|app, event| {
-        let Some(mut payload) = parse_menu_id(event.id().0.as_str()) else {
+        let Some(payload) = parse_menu_id(event.id().0.as_str()) else {
             return;
         };
-        // The chat toggle owns its own checkmark: flip the stored visibility,
-        // rebuild so the mark reflects it, and hand the frontend the new value.
-        if payload.action == "toggle-chat" {
-            payload.checked = Some(toggle_chat_visible(app));
-            if let Err(e) = refresh(app) {
-                log::warn!("could not refresh menu after chat toggle: {e}");
-            }
-        }
         if let Err(e) = app.emit(MENU_ACTION, &payload) {
             log::warn!("could not emit menu action '{}': {e}", payload.action);
         }
@@ -362,14 +363,6 @@ pub fn refresh(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
-/// Flip the stored chat-panel visibility, returning the new value.
-fn toggle_chat_visible(app: &AppHandle) -> bool {
-    let state = app.state::<Mutex<AppState>>();
-    let mut guard = lock_state(&state);
-    guard.chat_visible = !guard.chat_visible;
-    guard.chat_visible
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,7 +373,6 @@ mod tests {
             let payload = parse_menu_id(action).expect("known action parses");
             assert_eq!(payload.action, *action);
             assert!(payload.path.is_none());
-            assert!(payload.checked.is_none());
         }
     }
 
@@ -389,7 +381,6 @@ mod tests {
         let payload = parse_menu_id("open-recent:/Users/me/My Vault").expect("recent parses");
         assert_eq!(payload.action, "open-recent");
         assert_eq!(payload.path.as_deref(), Some("/Users/me/My Vault"));
-        assert!(payload.checked.is_none());
     }
 
     #[test]

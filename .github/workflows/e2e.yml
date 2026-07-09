@@ -14,6 +14,11 @@ on:
   pull_request:
   workflow_dispatch:
 
+# Least privilege: this workflow only builds and drives the app; it needs no write
+# scopes. A fork PR's token is read-only anyway, but declaring it makes that explicit.
+permissions:
+  contents: read
+
 jobs:
   webdriver:
     name: WebdriverIO (${{ matrix.platform }})
@@ -42,7 +47,7 @@ jobs:
       - name: Install msedgedriver (Windows)
         if: matrix.platform == 'windows-latest'
         run: |
-          cargo install --git https://github.com/chippers/msedgedriver-tool
+          cargo install --git https://github.com/chippers/msedgedriver-tool --rev 8c4b34f51b45f5cf08013366d703de464ab871d1
           & "$HOME/.cargo/bin/msedgedriver-tool.exe"
           "$PWD" >> $env:GITHUB_PATH
 
@@ -68,7 +73,7 @@ jobs:
 
       - name: Install e2e-native dependencies
         working-directory: app/desktop/e2e-native
-        run: npm install
+        run: npm ci
 
       - name: Install tauri-driver
         run: cargo install tauri-driver --locked

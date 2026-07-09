@@ -16,8 +16,10 @@ import {
 import { Cpu, Database, Loader2, Send, Sparkles } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
+import { cn } from "../lib/cn";
 import { useVault } from "../lib/store";
 import type { AiStatus, ChatEvent } from "../lib/types";
+import { BTN_PRIMARY } from "./buttonStyles";
 import { ChatMessages } from "./ChatMessages";
 import {
   emptyAssistant,
@@ -30,9 +32,6 @@ import {
 import { DisconnectedPane, KeySetupPanel } from "./KeySetupPanel";
 import { ProviderPicker } from "./ProviderPicker";
 
-/** Locked default from the plan; the backend echoes it via `aiStatus`. */
-const DEFAULT_MODEL = "anthropic/claude-sonnet-4.5";
-
 type View =
   | "loading"
   | "picker"
@@ -41,7 +40,8 @@ type View =
   | "disconnected"
   | "chat";
 
-/** Header status pill — mirrors ChatStub's "Indexing soon" chip per state. */
+/** Header status pill: the connected model id while chatting, "Not connected"
+ *  after a skip; hidden during the transient first-run states. */
 function StatusPill({ view, model }: Readonly<{ view: View; model: string }>) {
   if (view === "chat") {
     return (
@@ -78,7 +78,12 @@ export function ChatPane({
   const vaultPath = vault?.path;
 
   const [view, setView] = useState<View>("loading");
-  const [model, setModel] = useState(DEFAULT_MODEL);
+  // Empty until `aiStatus` echoes the effective model — the Rust core owns the
+  // locked default, so the frontend never duplicates the model id. Nothing
+  // shows it before then: the pill renders only in chat/disconnected, and the
+  // one path into setup that skips `applyStatus` (a failed status check) leaves
+  // the prefill blank — the core normalizes an empty model back to its default.
+  const [model, setModel] = useState("");
   const [saving, setSaving] = useState(false);
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
@@ -97,7 +102,7 @@ export function ChatPane({
    *  the status-pill label: the OpenRouter model id, or the local model tag. */
   const applyStatus = useCallback((status: AiStatus) => {
     if (status.activeProvider === "openRouter") {
-      setModel(status.openrouter.model || DEFAULT_MODEL);
+      setModel(status.openrouter.model);
       // hasKey false here would be a config hole — fall back to guided setup.
       setView(status.openrouter.hasKey ? "chat" : "setup");
     } else if (status.activeProvider === "local") {
@@ -110,7 +115,7 @@ export function ChatPane({
         setView("localSetup");
       }
     } else {
-      setModel(status.openrouter.model || DEFAULT_MODEL);
+      setModel(status.openrouter.model);
       setView("picker");
     }
   }, []);
@@ -206,7 +211,7 @@ export function ChatPane({
           <StatusPill view={view} model={model} />
         </div>
         <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
-          Ask questions across everything you&apos;ve captured. Every claim is
+          Ask questions across everything in your vault. Every claim is
           citation-checked against its source.
         </p>
       </header>
@@ -250,7 +255,7 @@ export function ChatPane({
           <button
             type="button"
             onClick={onOpenSettings}
-            className="mt-1 rounded-lg bg-primary px-3.5 py-1.5 text-[12px] font-semibold text-primary-foreground shadow-[0_0_16px_-8px_var(--color-primary)] transition hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+            className={cn(BTN_PRIMARY, "mt-1 px-3.5")}
           >
             Open AI settings
           </button>
@@ -258,7 +263,11 @@ export function ChatPane({
       )}
 
       {view === "disconnected" && (
-        <DisconnectedPane onConnect={() => setView("setup")} />
+        // Back to the provider PICKER, not the OpenRouter form — both shipped
+        // providers (key or Local AI) must stay reachable after a skip. The
+        // refresh guard above never lands here on its own ("picker" only
+        // applies from a loading mount), so this can't loop.
+        <DisconnectedPane onConnect={() => setView("picker")} />
       )}
 
       {view === "chat" && (
@@ -300,7 +309,9 @@ export function ChatPane({
                 onClick={send}
                 disabled={busy || input.trim() === ""}
                 aria-label="Send"
-                className="grid size-9 shrink-0 place-items-center rounded-lg bg-primary text-primary-foreground shadow-[0_0_16px_-8px_var(--color-primary)] transition hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 disabled:cursor-not-allowed disabled:bg-muted disabled:text-muted-foreground disabled:shadow-none"
+                // The primary button in icon-only form: p-0 clears the text
+                // padding; the type-scale classes are inert on an svg child.
+                className={cn(BTN_PRIMARY, "grid size-9 shrink-0 place-items-center p-0")}
               >
                 {busy ? (
                   <Loader2 className="size-4 animate-spin motion-reduce:animate-none" aria-hidden />

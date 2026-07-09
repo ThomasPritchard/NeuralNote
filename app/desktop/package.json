@@ -12,11 +12,14 @@
     "test:run": "vitest run",
     "test:e2e": "vitest run src/e2e",
     "coverage": "vitest run --coverage",
+    "gen:bindings": "cargo test --manifest-path ../../Cargo.toml --workspace export",
+    "check:bindings": "npm run gen:bindings && git -C ../.. add --intent-to-add -- app/desktop/src/lib/bindings && git -C ../.. diff --exit-code -- app/desktop/src/lib/bindings",
     "tauri": "tauri"
   },
   "dependencies": {
     "@fontsource-variable/inter": "^5.2.8",
     "@fontsource-variable/jetbrains-mono": "^5.2.8",
+    "@tanstack/react-virtual": "^3.14.5",
     "@tauri-apps/api": "^2",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
@@ -44,7 +47,7 @@
     "@vitest/coverage-v8": "^4.1.9",
     "jsdom": "^29.1.1",
     "tailwindcss": "^4.3.2",
-    "typescript": "~5.8.3",
+    "typescript": "7.0.2",
     "vite": "^7.0.4",
     "vitest": "^4.1.9"
   }

@@ -32,6 +32,7 @@ import { Ribbon, type CenterView, type SidebarPanel } from "./Ribbon";
 import { SearchPanel } from "./SearchPanel";
 import { SettingsModal } from "./SettingsModal";
 import { StatusBar } from "./StatusBar";
+import { TitleBar } from "./TitleBar";
 import type { CreateKind } from "./TreeRow";
 import { useOpenNote } from "./useOpenNote";
 
@@ -44,8 +45,13 @@ export function Workspace() {
   // Workspace-local view state (specs/search-and-graph-view.md §View model).
   const [sidebarPanel, setSidebarPanel] = useState<SidebarPanel>("files");
   const [centerView, setCenterView] = useState<CenterView>("note");
-  // Whether the cited-recall chat panel is shown. Menu-owned (View → Cited Recall
-  // Panel); the Rust side is the source of truth and sends the new value on toggle.
+  // React owns sidebar visibility outright: the native "Toggle Sidebar" menu item
+  // is a plain MenuItem with no checkmark, so there's no state-sync obligation back
+  // to Rust (unlike the chat toggle's CheckMenuItem, synced via setChatVisible).
+  const [sidebarOpen, setSidebarOpen] = useState(true);
+  // Whether the cited-recall chat panel is shown. The webview owns this state now;
+  // an effect below pushes each change to Rust, which keeps a copy only to paint the
+  // View-menu checkmark (mirrors the editing → setMenuEditing pattern).
   const [showChat, setShowChat] = useState(true);
   // A menu-requested "new note/folder" awaiting the FileTree to open its inline
   // create row; cleared once consumed so it can't re-fire on a sidebar remount.
@@ -132,8 +138,15 @@ export function Workspace() {
     bumpAiStatusVersion();
   }, []);
 
-  const handleShowFiles = useCallback(() => setSidebarPanel("files"), []);
+  /** Show a sidebar panel. Both force the sidebar open: selecting a panel that
+   *  stays hidden is a silent no-op, and every caller — the ribbon icons, the
+   *  View menu, ⌘K — means "show me this", not "pre-select it for later". */
+  const handleShowFiles = useCallback(() => {
+    setSidebarOpen(true);
+    setSidebarPanel("files");
+  }, []);
   const handleShowSearch = useCallback(() => {
+    setSidebarOpen(true);
     setSidebarPanel("search");
     bumpSearchFocus();
   }, []);
@@ -142,6 +155,16 @@ export function Workspace() {
     [],
   );
   const consumeCreate = useCallback(() => setPendingCreate(null), []);
+
+  /** Arm an inline create in the FileTree: force the sidebar open on the Files
+   *  panel — its create row lives ONLY there, so a collapsed or Search sidebar
+   *  would swallow the action — then set pendingCreate. Shared by the New
+   *  Note/Folder menu items and the titlebar vault menu (four call sites). */
+  const startCreate = useCallback((kind: CreateKind) => {
+    setSidebarOpen(true);
+    setSidebarPanel("files");
+    setPendingCreate(kind);
+  }, []);
 
   const handleDeleted = useCallback((node: TreeNode) => {
     // Clearing the reader if the open note (or its containing folder) was deleted.
@@ -219,13 +242,14 @@ export function Workspace() {
       .onMenu((e) => {
         const o = openRef.current;
         switch (e.action) {
+          // New Note/Folder + the view-switch actions all force the sidebar open
+          // (via startCreate / handleShow*): their effect is invisible while it's
+          // collapsed, so a menu-driven create/search would otherwise silently no-op.
           case "new-note":
-            setSidebarPanel("files");
-            setPendingCreate("note");
+            startCreate("note");
             break;
           case "new-folder":
-            setSidebarPanel("files");
-            setPendingCreate("folder");
+            startCreate("folder");
             break;
           case "save":
             if (o.note && o.dirty && !o.saving) void o.save();
@@ -240,17 +264,21 @@ export function Workspace() {
             break;
           case "search":
           case "view-search":
-            setSidebarPanel("search");
-            bumpSearchFocus();
+            handleShowSearch();
             break;
           case "view-files":
-            setSidebarPanel("files");
+            handleShowFiles();
             break;
           case "toggle-graph":
             setCenterView((v) => (v === "graph" ? "note" : "graph"));
             break;
           case "toggle-chat":
-            if (typeof e.checked === "boolean") setShowChat(e.checked);
+            // The webview owns showChat; the CheckMenuItem just requests a flip
+            // (no `checked` payload). The effect below pushes the new value to Rust.
+            setShowChat((v) => !v);
+            break;
+          case "toggle-sidebar":
+            setSidebarOpen((v) => !v);
             break;
           default:
             break; // open-vault / open-recent are handled in the store
@@ -275,7 +303,7 @@ export function Workspace() {
       cancelled = true;
       unlisten?.();
     };
-  }, [guard, close, reportError]);
+  }, [guard, close, reportError, startCreate, handleShowFiles, handleShowSearch]);
 
   // Keep the native Format menu honest: those items act on the editor's textarea,
   // which is mounted only when a text note is open in edit mode. Push that fact to
@@ -288,10 +316,32 @@ export function Workspace() {
       .catch((err) => console.error("failed to sync editor state to the menu:", err));
   }, [editing]);
 
+  // The webview owns showChat; push each change to Rust so the View-menu checkmark
+  // stays in agreement (mirrors the editing effect above). Best-effort — cosmetic.
+  useEffect(() => {
+    void api.setChatVisible(showChat).catch((err) =>
+      console.error("failed to sync chat visibility to the menu:", err));
+  }, [showChat]);
+
   if (!vault) return null;
 
   return (
     <div className="flex h-full w-full flex-col bg-background text-foreground">
+      <TitleBar
+        vaultName={vault.name}
+        sidebarOpen={sidebarOpen}
+        onToggleSidebar={() => setSidebarOpen((v) => !v)}
+        chatOpen={showChat}
+        onToggleChat={() => setShowChat((v) => !v)}
+        onOpenSettings={handleOpenSettings}
+        note={open.note}
+        noteDirty={open.dirty}
+        onCloseNote={() => guard(() => openRef.current.clear())}
+        onNewNote={() => startCreate("note")}
+        onNewFolder={() => startCreate("folder")}
+        onRefresh={() => void refreshTree()}
+        onCloseVault={handleCloseVault}
+      />
       <div className="flex min-h-0 flex-1">
         <Ribbon
           sidebarPanel={sidebarPanel}
@@ -299,34 +349,37 @@ export function Workspace() {
           onShowFiles={handleShowFiles}
           onShowSearch={handleShowSearch}
           onToggleGraph={handleToggleGraph}
-          onOpenSettings={handleOpenSettings}
         />
-        {sidebarPanel === "files" ? (
-          <FileTree
-            vaultName={vault.name}
-            vaultPath={vault.path}
-            tree={tree}
-            activePath={open.path}
-            activeDirty={open.dirty}
-            refreshTree={refreshTree}
-            onSelect={handleSelect}
-            onDeleted={handleDeleted}
-            onRemap={handleRemap}
-            onCloseVault={handleCloseVault}
-            pendingCreate={pendingCreate}
-            onCreateConsumed={consumeCreate}
-          />
-        ) : (
-          <SearchPanel focusSignal={searchFocusSignal} onOpen={openNoteAt} />
-        )}
+        {/* Collapse the sidebar by UNMOUNTING it (not display:none): FileTree
+            already unmounts on the Files↔Search swap, and its folder folds
+            persist to localStorage, so there's no live in-memory state to lose.
+            Contrast ChatPane below, which is deliberately kept mounted because it
+            owns a live streamed IPC Channel that unmounting would kill. */}
+        {sidebarOpen &&
+          (sidebarPanel === "files" ? (
+            <FileTree
+              vaultPath={vault.path}
+              tree={tree}
+              activePath={open.path}
+              activeDirty={open.dirty}
+              refreshTree={refreshTree}
+              onSelect={handleSelect}
+              onDeleted={handleDeleted}
+              onRemap={handleRemap}
+              pendingCreate={pendingCreate}
+              onCreateConsumed={consumeCreate}
+            />
+          ) : (
+            <SearchPanel focusSignal={searchFocusSignal} onOpen={openNoteAt} />
+          ))}
         {centerView === "graph" ? (
           <GraphView onOpenNote={openNoteRel} />
         ) : (
           <NotePane
             open={open}
-            onClose={() => guard(() => openRef.current.clear())}
             noteIndex={noteIndex}
             onOpenLink={openNoteRel}
+            reportError={reportError}
           />
         )}
         {/* Keep ChatPane mounted and toggle it with CSS, never conditionally

@@ -24,6 +24,7 @@ vi.mock("../lib/api", async (importActual) => {
     aiStatus: vi.fn(),
     setActiveProvider: vi.fn(),
     saveApiKey: vi.fn(),
+    setReasoning: vi.fn(),
     detectHardware: vi.fn(),
     localCandidates: vi.fn(),
     recommendLocalModel: vi.fn(),
@@ -41,6 +42,7 @@ import { AiSettingsPage } from "./AiSettingsPage";
 const mockAiStatus = vi.mocked(api.aiStatus);
 const mockSetActive = vi.mocked(api.setActiveProvider);
 const mockSaveKey = vi.mocked(api.saveApiKey);
+const mockSetReasoning = vi.mocked(api.setReasoning);
 const mockHardware = vi.mocked(api.detectHardware);
 const mockCandidates = vi.mocked(api.localCandidates);
 const mockRecommend = vi.mocked(api.recommendLocalModel);
@@ -56,17 +58,17 @@ const GIB = 1024 ** 3;
 
 const UNCONFIGURED: AiStatus = {
   activeProvider: null,
-  openrouter: { hasKey: false, model: "anthropic/claude-sonnet-4.5" },
+  openrouter: { hasKey: false, model: "anthropic/claude-sonnet-4.5", reasoning: false },
   local: { activeModelTag: null },
 };
 const OR_ACTIVE: AiStatus = {
   activeProvider: "openRouter",
-  openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5" },
+  openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5", reasoning: false },
   local: { activeModelTag: null },
 };
 const LOCAL_ACTIVE: AiStatus = {
   activeProvider: "local",
-  openrouter: { hasKey: false, model: "anthropic/claude-sonnet-4.5" },
+  openrouter: { hasKey: false, model: "anthropic/claude-sonnet-4.5", reasoning: false },
   local: { activeModelTag: "qwen2.5:7b" },
 };
 
@@ -145,6 +147,8 @@ function mockDefaults() {
   mockInstalled.mockResolvedValue([]);
   mockSetActive.mockResolvedValue(undefined);
   mockSaveKey.mockResolvedValue(undefined);
+  // `set_reasoning` returns the freshly persisted status, like the Rust command.
+  mockSetReasoning.mockResolvedValue(UNCONFIGURED);
   mockCancel.mockResolvedValue(undefined);
   mockDelete.mockResolvedValue(undefined);
 }
@@ -376,6 +380,64 @@ describe("AiSettingsPage — download", () => {
   });
 });
 
+describe("AiSettingsPage — the catalogue never offers Download while installed-state is unknown", () => {
+  it("shows a checking affordance — not Download — until the scan resolves", async () => {
+    const scan = deferred<InstalledModel[]>();
+    mockInstalled.mockReturnValue(scan.promise);
+    setup();
+
+    const row = await findCatalogueRow("qwen2.5:7b");
+    // The scan hasn't answered yet: offering Download here would re-download
+    // a model the user may already have (the observed bug).
+    expect(screen.queryAllByRole("button", { name: /download/i })).toHaveLength(0);
+    expect(within(row).getByText("Checking…")).toBeInTheDocument();
+    // Nor can the row claim Installed — that isn't known yet either.
+    expect(within(row).queryByText("Installed")).not.toBeInTheDocument();
+
+    await act(async () => {
+      scan.resolve([INSTALLED_QWEN]);
+      await scan.promise;
+    });
+
+    // Resolved: the installed model reads Installed with no Download, and the
+    // genuinely-absent model gets its Download back.
+    expect(await within(row).findByText("Installed")).toBeInTheDocument();
+    expect(
+      within(row).queryByRole("button", { name: /download/i }),
+    ).not.toBeInTheDocument();
+    const otherRow = await findCatalogueRow("llama3.1:8b");
+    expect(within(otherRow).getByRole("button", { name: /download/i })).toBeEnabled();
+    expect(screen.queryByText("Checking…")).not.toBeInTheDocument();
+  });
+
+  it("fails safe when the scan errors: Download held until Retry recovers", async () => {
+    mockInstalled
+      .mockRejectedValueOnce({ kind: "localAi", message: "sidecar failed to start" })
+      .mockResolvedValue([INSTALLED_QWEN]);
+    const { user } = setup();
+
+    // The failure is surfaced (never silent) …
+    expect(await screen.findByText("sidecar failed to start")).toBeInTheDocument();
+    // … and no row offers an actionable Download while installed-state is
+    // unverifiable — the button stays, disabled, so the layout doesn't jump.
+    const row = await findCatalogueRow("qwen2.5:7b");
+    expect(within(row).getByRole("button", { name: /download/i })).toBeDisabled();
+    expect(within(row).queryByText("Installed")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: /retry/i }));
+
+    // Recovery: the error clears, the installed model reads Installed, and
+    // only the genuinely-absent model offers an enabled Download.
+    expect(await within(row).findByText("Installed")).toBeInTheDocument();
+    expect(screen.queryByText("sidecar failed to start")).not.toBeInTheDocument();
+    expect(
+      within(row).queryByRole("button", { name: /download/i }),
+    ).not.toBeInTheDocument();
+    const otherRow = await findCatalogueRow("llama3.1:8b");
+    expect(within(otherRow).getByRole("button", { name: /download/i })).toBeEnabled();
+  });
+});
+
 describe("AiSettingsPage — installed models", () => {
   it("lists installed models with disk size and lets one become active", async () => {
     mockAiStatus
@@ -476,7 +538,7 @@ describe("AiSettingsPage — OpenRouter", () => {
 
   it("switches to OpenRouter when a key exists", async () => {
     mockAiStatus
-      .mockResolvedValueOnce({ ...LOCAL_ACTIVE, openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5" } })
+      .mockResolvedValueOnce({ ...LOCAL_ACTIVE, openrouter: { ...OR_ACTIVE.openrouter } })
       .mockResolvedValue(OR_ACTIVE);
     const { user } = setup();
 
@@ -487,12 +549,88 @@ describe("AiSettingsPage — OpenRouter", () => {
   it("surfaces a failed provider switch inline", async () => {
     mockAiStatus.mockResolvedValue({
       ...UNCONFIGURED,
-      openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5" },
+      openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5", reasoning: false },
     });
     mockSetActive.mockRejectedValue({ kind: "io", message: "config write failed" });
     const { user } = setup();
 
     await user.click(await screen.findByRole("button", { name: "Use OpenRouter" }));
     expect(await screen.findByText("config write failed")).toBeInTheDocument();
+  });
+});
+
+describe("AiSettingsPage — OpenRouter reasoning toggle", () => {
+  const REASONING_TOGGLE = { name: /show model reasoning/i };
+  /** OR_ACTIVE with the reasoning opt-in persisted. */
+  const OR_REASONING_ON: AiStatus = {
+    ...OR_ACTIVE,
+    openrouter: { ...OR_ACTIVE.openrouter, reasoning: true },
+  };
+
+  it("offers no reasoning toggle when no key is connected", async () => {
+    setup(); // UNCONFIGURED default: hasKey false
+    // Settle on the card's no-key affordance before asserting absence.
+    expect(await screen.findByRole("button", { name: "Connect a key…" })).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", REASONING_TOGGLE)).not.toBeInTheDocument();
+  });
+
+  it("reflects the persisted reasoning state: off unchecked, on checked", async () => {
+    mockAiStatus.mockResolvedValue(OR_ACTIVE); // reasoning: false
+    const first = render(<AiSettingsPage />);
+    expect(await screen.findByRole("checkbox", REASONING_TOGGLE)).not.toBeChecked();
+    first.unmount();
+
+    mockAiStatus.mockResolvedValue(OR_REASONING_ON);
+    render(<AiSettingsPage />);
+    expect(await screen.findByRole("checkbox", REASONING_TOGGLE)).toBeChecked();
+  });
+
+  it("opts in with one set_reasoning call and renders the status it returns", async () => {
+    mockAiStatus.mockResolvedValue(OR_ACTIVE); // initial load: reasoning off
+    mockSetReasoning.mockResolvedValue(OR_REASONING_ON); // the write's own echo
+    const { user } = setup();
+
+    await user.click(await screen.findByRole("checkbox", REASONING_TOGGLE));
+
+    expect(mockSetReasoning).toHaveBeenCalledExactlyOnceWith(true);
+    // The status the *write* returned — not a follow-up read — checks the box.
+    await waitFor(() =>
+      expect(screen.getByRole("checkbox", REASONING_TOGGLE)).toBeChecked(),
+    );
+  });
+
+  // Regression: reasoning tokens are billed, so a toggle that reads "off" while
+  // the config says "on" bills the user without consent. The old code re-read
+  // `ai_status` after the write; because `refreshStatus` swallows its own error,
+  // a read that failed after the write landed left the box unticked and silent.
+  // Rendering the status the write returned removes that window entirely.
+  it("shows the opt-in even when a subsequent status read would fail", async () => {
+    mockAiStatus
+      .mockResolvedValueOnce(OR_ACTIVE) // initial load succeeds: reasoning off
+      .mockRejectedValue({ kind: "io", message: "config unreadable" }); // every later read fails
+    mockSetReasoning.mockResolvedValue(OR_REASONING_ON); // but the write persisted
+    const { user } = setup();
+
+    await user.click(await screen.findByRole("checkbox", REASONING_TOGGLE));
+
+    // The box tells the truth about what is persisted, and is never contradicted
+    // by a stale read.
+    await waitFor(() =>
+      expect(screen.getByRole("checkbox", REASONING_TOGGLE)).toBeChecked(),
+    );
+    // No misleading inline error against the toggle: the write did succeed.
+    expect(screen.queryByText("config unreadable")).not.toBeInTheDocument();
+  });
+
+  it("surfaces a rejected reasoning write inline and stays unchecked", async () => {
+    mockAiStatus.mockResolvedValue(OR_ACTIVE);
+    mockSetReasoning.mockRejectedValue({ kind: "io", message: "reasoning write failed" });
+    const { user } = setup();
+
+    await user.click(await screen.findByRole("checkbox", REASONING_TOGGLE));
+
+    expect(await screen.findByText("reasoning write failed")).toBeInTheDocument();
+    // Nothing was persisted, so the control never shows the opt-in.
+    expect(screen.getByRole("checkbox", REASONING_TOGGLE)).not.toBeChecked();
   });
 });

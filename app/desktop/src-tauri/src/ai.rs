@@ -6,7 +6,7 @@
 //! time and NEVER returned to the webview), the **OpenRouter HTTP client**
 //! (`reqwest`, OpenAI-compatible) implementing [`LlmClient`], and a
 //! [`TauriChannelSink`] that forwards [`ChatEvent`]s to the frontend over a Tauri
-//! channel. The four `#[tauri::command]`s that expose this are in `lib.rs`.
+//! channel. The `#[tauri::command]`s that expose this are in `commands/ai.rs`.
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
@@ -21,6 +21,7 @@ use std::{
     sync::{Mutex, OnceLock},
     time::Duration,
 };
+use ts_rs::TS;
 
 /// OpenRouter's OpenAI-compatible chat-completions endpoint.
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
@@ -29,8 +30,9 @@ const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
 const KEYCHAIN_SERVICE: &str = "com.neuralnote.desktop";
 const KEY_ACCOUNT: &str = "openrouter-api-key";
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
+#[ts(export)]
 pub struct ApiKeyStatus {
     pub has_key: bool,
     pub model: String,
@@ -166,6 +168,9 @@ pub fn save_api_key(config_dir: &Path, key: &str, model: &str) -> Result<(), Cor
         ))
     })?;
     config.model = model.to_string();
+    // TODO(key-configured-derive): derive key_configured from keychain presence on
+    // read (single source of truth), not a persisted flag; closes the crash window
+    // between keychain write and config write (PA-023).
     config.key_configured = true;
     provider_config::write_provider_config(config_dir, &config).map_err(|e| {
         CoreError::Io(format!(
@@ -283,6 +288,17 @@ pub struct OpenAiChatClient {
     url: String,
     bearer: Option<String>,
     title: Option<&'static str>,
+    /// Ollama context window (tokens); `None` for OpenRouter. Set for Local so
+    /// Ollama doesn't fall back to ~4096 and silently truncate the grounding rules
+    /// + earliest evidence — protecting cited recall on the Local path (PA-001).
+    num_ctx: Option<u32>,
+    /// Whether to request streamed reasoning tokens on the answer turn. Set on the
+    /// OpenRouter path only, and even there only when the user opts in (the tokens are
+    /// billed); always `false` for Ollama, whose OpenAI-compatible endpoint doesn't
+    /// speak it. Provider capability lives here at the construction seam, not as a
+    /// branch in the shared streaming loop — so a non-reasoning provider still
+    /// substitutes cleanly (it just never emits a `Thinking` event).
+    reasoning: bool,
 }
 
 impl OpenAiChatClient {
@@ -292,6 +308,8 @@ impl OpenAiChatClient {
         title: Option<&'static str>,
         connect_timeout: Duration,
         read_timeout: Duration,
+        num_ctx: Option<u32>,
+        reasoning: bool,
     ) -> Self {
         // Timeouts so a stalled/half-open endpoint can't hang `chat` forever with no
         // event (the "failures are never silent" contract). `connect_timeout` guards
@@ -311,16 +329,34 @@ impl OpenAiChatClient {
             url,
             bearer,
             title,
+            num_ctx,
+            reasoning,
         }
     }
 
-    pub fn new(api_key: String) -> Self {
+    pub fn new(api_key: String, reasoning: bool) -> Self {
         Self::new_with(
             OPENROUTER_URL.to_string(),
             Some(api_key),
             Some("NeuralNote"),
             Duration::from_secs(10),
             Duration::from_secs(120),
+            None,      // OpenRouter sizes its own (large) context window.
+            reasoning, // Billed reasoning tokens — on only when the user opts in.
+        )
+    }
+
+    /// The answer-turn wire body: streamed, output-capped, and carrying the reasoning
+    /// request only when this client has it enabled. Split out of `complete_streaming`
+    /// so a test can inspect exactly what the client would send, without a live
+    /// endpoint.
+    fn answer_wire_body(&self, req: &LlmRequest) -> serde_json::Value {
+        openai::to_wire_request(
+            req,
+            true,
+            self.num_ctx,
+            Some(openai::ANSWER_MAX_TOKENS),
+            self.reasoning,
         )
     }
 
@@ -375,7 +411,15 @@ impl OpenAiChatClient {
 #[async_trait]
 impl LlmClient for OpenAiChatClient {
     async fn complete(&self, req: &LlmRequest) -> Result<Completion, CoreError> {
-        let body = openai::to_wire_request(req, false);
+        // No reasoning on tool-deciding turns: they aren't streamed and their content
+        // is parsed for tool_calls, so reasoning tokens here would be invisible cost.
+        let body = openai::to_wire_request(
+            req,
+            /* stream */ false,
+            self.num_ctx,
+            /* max_tokens */ None,
+            /* reasoning */ false,
+        );
         let resp = self.post(&body).await?;
         let provider = self.provider_label();
         let value: serde_json::Value = resp
@@ -390,7 +434,10 @@ impl LlmClient for OpenAiChatClient {
         req: &LlmRequest,
         sink: &mut dyn EventSink,
     ) -> Result<String, CoreError> {
-        let body = openai::to_wire_request(req, true);
+        // The answer turn carries the output ceiling; tool-deciding turns do not. It
+        // also carries the reasoning request (OpenRouter only, when opted in) — this is
+        // the one turn whose reasoning tokens surface as live `Thinking` events.
+        let body = self.answer_wire_body(req);
         let resp = self.post(&body).await?;
 
         // Buffer BYTES, not str: a chunk can split a multibyte char, but never the
@@ -612,7 +659,29 @@ mod tests {
             model: model.into(),
             key_configured,
             local_model_tag: None,
+            reasoning: false,
         }
+    }
+
+    #[test]
+    fn openai_client_requests_reasoning_only_when_enabled() {
+        // The answer turn is the one that can carry OpenRouter's billed reasoning
+        // request. `new(key, false)` must omit it entirely; `new(key, true)` must ask
+        // for it — proving the opt-in flag threads through to the wire body.
+        let req = LlmRequest {
+            model: "anthropic/claude-sonnet-4.5".into(),
+            messages: vec![LlmMessage::user("q")],
+            tools: Vec::new(),
+        };
+
+        let off = OpenAiChatClient::new("sk-test".into(), false).answer_wire_body(&req);
+        assert!(
+            off.get("reasoning").is_none(),
+            "reasoning must be omitted when the user hasn't opted in"
+        );
+
+        let on = OpenAiChatClient::new("sk-test".into(), true).answer_wire_body(&req);
+        assert_eq!(on["reasoning"]["enabled"], true);
     }
 
     #[test]

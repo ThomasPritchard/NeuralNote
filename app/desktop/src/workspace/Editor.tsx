@@ -38,8 +38,6 @@ import {
   type WikilinkSuggestion,
 } from "./wikilinkAutocomplete";
 
-const EASE = "ease-[cubic-bezier(0.32,0.72,0,1)]";
-
 /** Popup metrics used for clamping (w-72 / max-h-56 + hint row). */
 const POPUP_WIDTH = 288;
 const POPUP_MAX_HEIGHT = 252;
@@ -136,6 +134,9 @@ interface EditorProps {
   /** Vault note index feeding the `[[` autocomplete. Omitted, the editor
    *  behaves exactly as before (no popup). */
   noteIndex?: NoteIndexEntry[];
+  /** Surface a degraded-capability message to the user (the store's
+   *  reportError, threaded down from Workspace). */
+  reportError?: (message: string) => void;
 }
 
 export function Editor({
@@ -146,6 +147,7 @@ export function Editor({
   onOverwrite,
   onReload,
   noteIndex,
+  reportError,
 }: Readonly<EditorProps>) {
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const [ac, setAc] = useState<AutocompleteState | null>(null);
@@ -180,12 +182,20 @@ export function Editor({
         if (cancelled) fn();
         else unlisten = fn;
       })
-      .catch((err) => console.error("failed to subscribe to format actions:", err));
+      // A failed listen leaves every Format menu item silently dead — surface
+      // it to the user (not just the console), naming what still works
+      // (mirrors Workspace's own onMenu failure handling).
+      .catch((err) => {
+        console.error("failed to subscribe to format actions:", err);
+        reportError?.(
+          "Format menu actions are unavailable — type Markdown syntax (like **bold**) directly in the editor instead.",
+        );
+      });
     return () => {
       cancelled = true;
       unlisten?.();
     };
-  }, [onChange]);
+  }, [onChange, reportError]);
 
   /** Re-derive the trigger from the current caret. Cheap (string scan to the
    *  caret); the mirror measurement only runs when the trigger changes. */
@@ -278,7 +288,7 @@ export function Editor({
       {conflict && (
         <div
           role="alert"
-          className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-amber-500/30 bg-amber-500/10 px-6 py-2.5 text-[12px] text-amber-300"
+          className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-warning/30 bg-warning/10 px-6 py-2.5 text-[12px] text-warning"
         >
           <span className="flex items-center gap-2">
             <AlertTriangle className="size-3.5 shrink-0" aria-hidden />
@@ -295,7 +305,7 @@ export function Editor({
             <button
               type="button"
               onClick={onOverwrite}
-              className="inline-flex items-center gap-1.5 rounded-md bg-amber-500/90 px-2.5 py-1 font-medium text-black transition-colors hover:bg-amber-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-amber-400"
+              className="inline-flex items-center gap-1.5 rounded-md bg-warning/90 px-2.5 py-1 font-medium text-black transition-colors hover:bg-warning focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-warning"
             >
               <Save className="size-3.5" aria-hidden /> Overwrite
             </button>
@@ -371,8 +381,7 @@ export function Editor({
                 onMouseEnter={() => setActiveIndex(i)}
                 className={cn(
                   "flex cursor-pointer items-baseline gap-2 rounded-md px-2 py-1.5 text-[13px] transition-colors",
-                  EASE,
-                  i === active
+                  "ease-spring",                  i === active
                     ? "bg-accent text-accent-foreground"
                     : "text-foreground/90",
                 )}

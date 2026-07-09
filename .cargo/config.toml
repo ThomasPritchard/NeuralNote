@@ -1,0 +1,18 @@
+# Shared Cargo config for the NeuralNote workspace.
+#
+# `TS_RS_EXPORT_DIR` is the single output directory every `#[ts(export)]` type in
+# either crate writes its generated `.ts` mirror to during `cargo test`. Both the
+# client-agnostic core and the desktop shell target the SAME frontend bindings dir,
+# so a domain type and a shell command type land side by side for the façade
+# (`app/desktop/src/lib/types.ts`) to re-export. `relative = true` resolves the path
+# against this file's workspace root, so it works from any crate and in CI.
+#
+# `TS_RS_LARGE_INT = number` overrides ts-rs's default `bigint` mapping for 64-bit
+# integers (`u64`/`i64`). These cross to the webview as JSON numbers over Tauri IPC
+# and arrive as JS `number` (JSON.parse never yields `bigint`), so `number` is the
+# serde-faithful type — and every value here (byte sizes, epoch millis) sits far
+# below 2^53, so nothing loses precision. This keeps the generated types matching
+# what the frontend actually receives, per "serde wins".
+[env]
+TS_RS_EXPORT_DIR = { value = "app/desktop/src/lib/bindings", relative = true }
+TS_RS_LARGE_INT = "number"

@@ -26,7 +26,7 @@ export function RecentList({ recents, onOpen }: RecentListProps) {
                 type="button"
                 onClick={() => onOpen(recent.path)}
                 aria-label={`Open ${recent.name}`}
-                className="group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors duration-200 ease-[cubic-bezier(0.32,0.72,0,1)] hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-primary motion-reduce:transition-none"
+                className="group flex w-full items-center gap-3 rounded-lg px-3 py-2 text-left transition-colors duration-200 ease-spring hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-primary motion-reduce:transition-none"
               >
                 <FolderOpen
                   className="size-4 shrink-0 text-muted-foreground group-hover:text-foreground"

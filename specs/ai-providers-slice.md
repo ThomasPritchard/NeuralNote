@@ -30,11 +30,20 @@ settings surface**:
   different base URL" — reusing the Slice-1 seam — and its **library model tags ship tool-calling
   templates**. Cited chat's citations depend on reliable tool-calling; arbitrary HF GGUF pulls get
   a generic template **without** tool support and silently break the moat.
-- **Recommendation = hybrid.** A **curated allowlist** of tool-calling-capable Ollama tags
-  (`llama3.1/3.2`, `qwen2.5`, several sizes) is the **source of truth** for what may be installed;
-  the UI *also* shows live Hugging Face metadata (downloads / licence / updated) for transparency.
-- **macOS-first.** Hardware sizing targets Apple-Silicon unified memory (70% usable, conservative);
-  other platforms return "not supported on this platform yet" rather than mis-sizing.
+- **Recommendation = newest-first, spec-balanced.** A **curated allowlist** of current,
+  tool-calling-capable Ollama tags (`qwen3.5` 4b/9b/27b as the primary ladder, `granite4.1`
+  3b/8b/30b as the efficiency-per-GB alternative — both 2026, both Apache-2.0, both smoke-tested to
+  emit well-formed tool calls) is the **source of truth** for what may be installed. RAM is the hard
+  gate; among models that fit, the recommender prefers the **newest generation, then the largest
+  size** — a current-gen model at the biggest size the machine can run, falling back to a
+  smaller/older one only when nothing newer fits. The allowlist's smallest entry sets the quality
+  floor (too-weak machines are told so honestly). The UI *also* shows live Hugging Face metadata
+  (downloads / licence / updated) for transparency. Keep the list current: newer generations get a
+  higher `generation` rank, added only after a tool-calling smoke test.
+- **macOS-first.** Hardware sizing targets Apple-Silicon unified memory (70% usable, conservative)
+  but generalises to any machine — it scales to reported RAM, sizes conservatively so a pick runs
+  *well* not barely, and reports a detection failure (RAM reads 0) distinctly from weak specs.
+  Non-macOS platforms return "not supported on this platform yet" rather than mis-sizing.
 - **Settings = modal + left-sidebar nav** (VS Code / Obsidian idiom).
 
 ## 3. Architecture — provider selection is the only new decision

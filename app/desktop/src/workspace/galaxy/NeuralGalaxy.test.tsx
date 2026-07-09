@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createFakeForceGraph, type FakeForceGraph } from "../../test/fakeForceGraph";
 import type { NeuralGalaxyProps } from "./NeuralGalaxy";
 import { BRIDGE_FADED_COLOR, FORCE_PROFILES, LINK_FADE, NeuralGalaxy } from "./NeuralGalaxy";
+import { CLUSTER_PALETTE } from "./graph";
 import { registerNode } from "./nodeRegistry";
 
 // The 3D renderer is mocked away: these tests drive the plain-DOM overlays
@@ -622,6 +623,36 @@ describe("tooltip HTML escaping (nodeLabel is the one raw-innerHTML sink)", () =
     });
     expect(html).not.toContain("<b ");
     expect(html).toContain("&lt;b onmouseover=x&gt;evil&lt;/b&gt;");
+  });
+
+  it("escapes single quotes so escaped text stays inert in attribute position (PA-025)", () => {
+    render(<NeuralGalaxy {...makeProps()} />);
+    const html = harness.props.nodeLabel({
+      title: "Rock 'n' roll' onmouseover='alert(1)",
+      cluster: "notes",
+      color: "#7d6fe0",
+    });
+    // The template itself uses no single quotes, so none may survive at all.
+    expect(html).not.toContain("'");
+    expect(html).toContain("Rock &#39;n&#39; roll&#39; onmouseover=&#39;alert(1)");
+  });
+
+  it("pins the tooltip colour to a strict hex — off-form values fall back to the palette (PA-025)", () => {
+    render(<NeuralGalaxy {...makeProps()} />);
+    const html = harness.props.nodeLabel({
+      title: "ok",
+      cluster: "notes",
+      color: 'red;background:url(x)" onmouseover="alert(1)',
+    });
+    expect(html).toContain(`color:${CLUSTER_PALETTE[0]}`);
+    expect(html).not.toContain("onmouseover");
+    expect(html).not.toContain("url(x)");
+  });
+
+  it("passes a legitimate palette hex through unchanged", () => {
+    render(<NeuralGalaxy {...makeProps()} />);
+    const html = harness.props.nodeLabel({ title: "ok", cluster: "notes", color: "#2f9d93" });
+    expect(html).toContain("color:#2f9d93");
   });
 });
 

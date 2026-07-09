@@ -39,6 +39,33 @@ describe("toggleWrap", () => {
     expect(r.value).toBe("***bold***");
   });
 
+  it("does not unwrap italic from a word selected inside bold", () => {
+    const r = toggleWrap(sel("**bold**", 2, 6), "*");
+    expect(r.value).toBe("***bold***");
+    expect([r.start, r.end]).toEqual([3, 7]);
+    expect(r.value.slice(r.start, r.end)).toBe("bold");
+  });
+
+  it("removes only the italic layer from a word inside ***bold+italic***", () => {
+    // A `*` run of 3 = bold + italic, so toggling italic drops one `*` per side
+    // (→ `**bold**`), not a fourth (`****bold****`). Covers the PA-021 guard's edge.
+    const r = toggleWrap(sel("***bold***", 3, 7), "*");
+    expect(r.value).toBe("**bold**");
+    expect(r.value.slice(r.start, r.end)).toBe("bold");
+  });
+
+  it("removes only the bold layer from a word inside ***bold+italic***", () => {
+    const r = toggleWrap(sel("***bold***", 3, 7), "**");
+    expect(r.value).toBe("*bold*");
+    expect(r.value.slice(r.start, r.end)).toBe("bold");
+  });
+
+  it("unwraps italic from a word flanked by single stars", () => {
+    const r = toggleWrap(sel("*word*", 1, 5), "*");
+    expect(r.value).toBe("word");
+    expect(r.value.slice(r.start, r.end)).toBe("word");
+  });
+
   it("inserts an empty pair at a bare caret with the caret between them", () => {
     const r = toggleWrap(sel("ab", 1), "**");
     expect(r.value).toBe("a****b");

@@ -1,7 +1,8 @@
-import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TreeNode } from "../lib/types";
+import type { CreateKind } from "./TreeRow";
 
 // Mock only the api CRUD calls; keep errorMessage real so surfaced text is honest.
 vi.mock("../lib/api", async (importActual) => {
@@ -43,7 +44,6 @@ const folderNode = (name: string, children: TreeNode[] = []): TreeNode => ({
 
 function setup(tree: TreeNode[], over: Partial<Parameters<typeof FileTree>[0]> = {}) {
   const props = {
-    vaultName: "MyVault",
     vaultPath: "/v",
     tree,
     activePath: null as string | null,
@@ -52,8 +52,7 @@ function setup(tree: TreeNode[], over: Partial<Parameters<typeof FileTree>[0]> =
     onSelect: vi.fn(),
     onDeleted: vi.fn(),
     onRemap: vi.fn(),
-    onCloseVault: vi.fn(),
-    pendingCreate: null,
+    pendingCreate: null as CreateKind | null,
     onCreateConsumed: vi.fn(),
     ...over,
   };
@@ -100,9 +99,8 @@ afterEach(() => {
 });
 
 describe("FileTree — rendering", () => {
-  it("renders the vault name and an empty-state hint", () => {
+  it("renders an empty-state hint for an empty vault", () => {
     setup([]);
-    expect(screen.getByText("MyVault")).toBeInTheDocument();
     expect(screen.getByText(/This vault is empty/i)).toBeInTheDocument();
   });
 
@@ -123,7 +121,6 @@ describe("FileTree — fold persistence", () => {
 
     const first = render(
       <FileTree
-        vaultName="MyVault"
         vaultPath="/v"
         tree={tree}
         activePath={null}
@@ -132,7 +129,6 @@ describe("FileTree — fold persistence", () => {
         onSelect={vi.fn()}
         onDeleted={vi.fn()}
         onRemap={vi.fn()}
-        onCloseVault={vi.fn()}
         pendingCreate={null}
         onCreateConsumed={vi.fn()}
       />,
@@ -146,7 +142,6 @@ describe("FileTree — fold persistence", () => {
     // A fresh mount of the same vault hydrates the fold from storage.
     render(
       <FileTree
-        vaultName="MyVault"
         vaultPath="/v"
         tree={tree}
         activePath={null}
@@ -155,7 +150,6 @@ describe("FileTree — fold persistence", () => {
         onSelect={vi.fn()}
         onDeleted={vi.fn()}
         onRemap={vi.fn()}
-        onCloseVault={vi.fn()}
         pendingCreate={null}
         onCreateConsumed={vi.fn()}
       />,
@@ -196,12 +190,12 @@ describe("FileTree — create", () => {
     expect(screen.queryByText("Already exists")).not.toBeInTheDocument();
   });
 
-  it("creates a folder via the vault menu", async () => {
+  it("creates a folder at the vault root from a pending create request", async () => {
+    // The vault menu moved to the titlebar; root creates reach FileTree
+    // through the pendingCreate prop, which opens the inline row directly.
     mockApi.createFolder.mockResolvedValueOnce(folderNode("Sub"));
-    const p = setup([]);
+    const p = setup([], { pendingCreate: "folder" });
 
-    await userEvent.click(screen.getByRole("button", { name: /MyVault/ }));
-    await userEvent.click(screen.getByRole("menuitem", { name: "New folder" }));
     await userEvent.type(screen.getByLabelText("New folder name"), "Sub{Enter}");
 
     await waitFor(() =>
@@ -314,10 +308,8 @@ describe("FileTree — template picker", () => {
     expect(screen.getByLabelText("Note template")).toHaveValue("Templates/Daily.md");
   });
 
-  it("does not fetch templates for folder creation", async () => {
-    setup([]);
-    await userEvent.click(screen.getByRole("button", { name: /MyVault/ }));
-    await userEvent.click(screen.getByRole("menuitem", { name: "New folder" }));
+  it("does not fetch templates for folder creation", () => {
+    setup([], { pendingCreate: "folder" });
     expect(screen.getByLabelText("New folder name")).toBeInTheDocument();
     expect(mockApi.listTemplates).not.toHaveBeenCalled();
   });
@@ -626,15 +618,92 @@ describe("FileTree — filename filter", () => {
   });
 });
 
-describe("FileTree — vault menu actions", () => {
-  it("refreshes the tree and closes the vault", async () => {
-    const p = setup([]);
-    await userEvent.click(screen.getByRole("button", { name: /MyVault/ }));
-    await userEvent.click(screen.getByRole("menuitem", { name: "Refresh tree" }));
-    expect(p.refreshTree).toHaveBeenCalled();
+describe("FileTree — virtualization (PA-005)", () => {
+  // Above VIRTUALIZE_MIN_ROWS the tree body windows via @tanstack/react-virtual.
+  // The virtualizer measures via offsetHeight (jsdom: always 0), so give the
+  // scroll container a real viewport and every row a fixed height — the lib
+  // reads the container synchronously on mount, making the window math
+  // deterministic without ResizeObserver ever firing.
+  const VIEWPORT = 600;
+  const ROW = 26;
 
-    await userEvent.click(screen.getByRole("button", { name: /MyVault/ }));
-    await userEvent.click(screen.getByRole("menuitem", { name: "Close vault" }));
-    expect(p.onCloseVault).toHaveBeenCalled();
+  function stubLayout() {
+    vi.spyOn(HTMLElement.prototype, "offsetHeight", "get").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      return this.getAttribute("role") === "tree" ? VIEWPORT : ROW;
+    });
+    vi.spyOn(HTMLElement.prototype, "offsetWidth", "get").mockReturnValue(240);
+  }
+
+  const bigTree = (n = 300) =>
+    Array.from({ length: n }, (_, i) => fileNode(`note-${String(i).padStart(3, "0")}.md`));
+
+  it("mounts only the visible window of a large tree, not every row", () => {
+    stubLayout();
+    setup(bigTree());
+
+    expect(screen.getByText("note-000.md")).toBeInTheDocument();
+    // The far end of the list is NOT in the DOM — that's the windowing.
+    expect(screen.queryByText("note-299.md")).not.toBeInTheDocument();
+    const mounted = screen.getAllByRole("treeitem").length;
+    expect(mounted).toBeLessThan(100);
+    expect(mounted).toBeGreaterThan(VIEWPORT / ROW - 1); // the viewport is filled
+  });
+
+  it("mounts late rows (and drops early ones) when scrolled to the bottom", () => {
+    stubLayout();
+    setup(bigTree());
+    const scroller = screen.getByRole("tree");
+
+    scroller.scrollTop = 300 * ROW - VIEWPORT;
+    fireEvent.scroll(scroller);
+
+    expect(screen.getByText("note-299.md")).toBeInTheDocument();
+    expect(screen.queryByText("note-000.md")).not.toBeInTheDocument();
+  });
+
+  it("keeps selection and collapse working through the virtualized body", async () => {
+    stubLayout();
+    const p = setup([folderNode("Notes", [fileNode("inside.md")]), ...bigTree()]);
+
+    // Select a mounted file row.
+    await userEvent.click(screen.getByText("note-000.md").closest("button")!);
+    expect(p.onSelect).toHaveBeenCalledWith("/v/note-000.md");
+
+    // Collapse the folder: its child leaves the flat list entirely.
+    expect(screen.getByText("inside.md")).toBeInTheDocument();
+    await userEvent.click(screen.getByText("Notes").closest("button")!);
+    expect(screen.queryByText("inside.md")).not.toBeInTheDocument();
+  });
+
+  it("renders small trees without windowing (every row mounted)", () => {
+    // No layout stubs at all: with jsdom's 0-height viewport a virtualized
+    // body would mount almost nothing — every row being present proves the
+    // sub-threshold tree takes the plain, unwindowed path.
+    setup([folderNode("Notes", [fileNode("a.md")]), fileNode("top.md")]);
+    expect(screen.getByText("a.md")).toBeInTheDocument();
+    expect(screen.getByText("top.md")).toBeInTheDocument();
+  });
+});
+
+describe("FileTree — pending create requests", () => {
+  // Root-level creates arrive from window chrome (the native File menu and the
+  // titlebar's vault menu) via the pendingCreate prop; FileTree opens the
+  // inline row and consumes the request exactly once.
+  it("opens the root folder-create row and consumes the request", () => {
+    const p = setup([], { pendingCreate: "folder" });
+    expect(screen.getByLabelText("New folder name")).toBeInTheDocument();
+    expect(p.onCreateConsumed).toHaveBeenCalledTimes(1);
+  });
+
+  it("opens the root note-create row and consumes the request", async () => {
+    const p = setup([], { pendingCreate: "note" });
+    expect(screen.getByLabelText("New note name")).toBeInTheDocument();
+    expect(p.onCreateConsumed).toHaveBeenCalledTimes(1);
+    // A note create kicks off the optional template fetch — flush its (empty)
+    // resolution so the state update lands inside the test.
+    await act(async () => {});
+    expect(screen.queryByLabelText("Note template")).not.toBeInTheDocument();
   });
 });

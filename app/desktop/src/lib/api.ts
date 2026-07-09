@@ -4,6 +4,10 @@
 
 import { Channel, invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+// Event names are generated from the Rust `event_names.rs` constants (same
+// `cargo test` step as the type bindings), so the string is defined in exactly one
+// place and can't drift between the emit (Rust) and the listen (here).
+import { MENU_ACTION, TREE_CHANGED } from "./bindings/events";
 import type {
   AiStatus,
   ApiKeyStatus,
@@ -70,6 +74,14 @@ export const closeVault = () => invoke<void>("close_vault");
 export const setMenuEditing = (editing: boolean) =>
   invoke<void>("set_menu_editing", { editing });
 
+/**
+ * Tell the native menu whether the cited-recall chat panel is shown, so it can
+ * paint the View-menu checkmark. The webview owns this state; this call only keeps
+ * the menu's checkmark in agreement. Best-effort — the checkmark is cosmetic.
+ */
+export const setChatVisible = (visible: boolean) =>
+  invoke<void>("set_chat_visible", { visible });
+
 // ── Tree + notes ────────────────────────────────────────────────────────────
 export const readTree = () => invoke<TreeNode[]>("read_tree");
 
@@ -131,11 +143,21 @@ export const createNoteFromTemplate = (
 /** Subscribe to on-disk vault changes (external edits, e.g. from Obsidian).
  *  Returns an unlisten function. */
 export const onTreeChanged = (cb: () => void): Promise<UnlistenFn> =>
-  listen("vault://tree-changed", () => cb());
+  listen(TREE_CHANGED, () => cb());
 
 /** Every action the native menu can emit. Kept in lockstep with the Rust menu's
- *  item ids (src-tauri/src/menu.rs `CUSTOM_ACTIONS`). Predefined items
- *  (undo/copy/quit…) are handled natively by the OS and never reach here. */
+ *  item ids (src-tauri/src/menu.rs `CUSTOM_ACTIONS`) except `open-recent`, which
+ *  is in this union but deliberately not that list: Rust synthesizes it from the
+ *  `open-recent:` prefix in `parse_menu_id`. Reconciling the lists naively is a
+ *  trap — adding `open-recent` to `CUSTOM_ACTIONS` is inert, and deleting it here
+ *  breaks Open Recent. Predefined items (undo/copy/quit…) are handled natively by
+ *  the OS and never reach here. */
+// TODO(menu-action-bindings): parity with Rust's `CUSTOM_ACTIONS` is
+// hand-maintained and unenforced while sibling event names are generated
+// (`event_names.rs` -> `bindings/events.ts`, gated by `rust-quality-gate.sh`).
+// Deferred until that generator can emit the action vocabulary too; a Rust-only
+// action falls through `switch (e.action)`'s `default: break` as a dead, silent
+// no-op menu item.
 export type MenuAction =
   | "new-note"
   | "new-folder"
@@ -149,6 +171,7 @@ export type MenuAction =
   | "toggle-graph"
   | "toggle-mode"
   | "toggle-chat"
+  | "toggle-sidebar"
   | "format-bold"
   | "format-italic"
   | "format-h1"
@@ -160,8 +183,6 @@ export interface MenuActionEvent {
   action: MenuAction;
   /** Set only for `open-recent` — the vault path to open. */
   path?: string;
-  /** Set only for `toggle-chat` — the new (authoritative) visibility. */
-  checked?: boolean;
 }
 
 /** Subscribe to native-menu clicks/accelerators. One event bus for every custom
@@ -169,7 +190,7 @@ export interface MenuActionEvent {
 export const onMenu = (
   cb: (event: MenuActionEvent) => void,
 ): Promise<UnlistenFn> =>
-  listen<MenuActionEvent>("menu://action", (e) => cb(e.payload));
+  listen<MenuActionEvent>(MENU_ACTION, (e) => cb(e.payload));
 
 // ── AI: cited chat (chat / api_key_* commands) ───────────────────────────────
 /** Whether an API key is configured + the model that will be used. The key
@@ -213,6 +234,14 @@ export const setActiveProvider = (
   provider: ProviderKind,
   localModelTag?: string,
 ) => invoke<void>("set_active_provider", { provider, localModelTag });
+
+/** Opt into (or out of) OpenRouter's billed reasoning tokens on the answer turn.
+ *  Persisted to the non-secret AI config; OpenRouter-only (the local path never
+ *  requests reasoning). Returns the freshly persisted status — render that, rather
+ *  than following up with `aiStatus()`: a read that failed after the write landed
+ *  would show "off" while the config says "on", billing the user silently. */
+export const setReasoning = (enabled: boolean) =>
+  invoke<AiStatus>("set_reasoning", { enabled });
 
 /** Detect host hardware (RAM/CPU/arch/OS) for the local-model recommendation and
  *  the Settings hardware readout. Infallible on the Rust side. */

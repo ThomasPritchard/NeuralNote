@@ -4,6 +4,8 @@
 
 import { useState } from "react";
 import { KeyRound, Sparkles } from "lucide-react";
+import { cn } from "../lib/cn";
+import { BTN_PRIMARY, GLOW_PRIMARY } from "./buttonStyles";
 
 // Exported so the settings page's key form (AiSettingsPage) shares the exact
 // field idiom — two key UIs that can't drift apart.
@@ -88,7 +90,7 @@ export function KeySetupPanel({
         <button
           type="submit"
           disabled={!canSave}
-          className="mt-1 grid place-items-center rounded-lg bg-primary px-3 py-2 text-[13px] font-semibold text-primary-foreground shadow-[0_0_18px_-6px_var(--color-primary)] transition hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none"
+          className={`mt-1 grid place-items-center rounded-lg bg-primary px-3 py-2 text-[13px] font-semibold text-primary-foreground ${GLOW_PRIMARY} transition hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none`}
         >
           {saving ? "Saving…" : "Save & start chatting"}
         </button>
@@ -115,15 +117,15 @@ export function DisconnectedPane({ onConnect }: Readonly<{ onConnect: () => void
       </span>
       <p className="text-[13px] font-medium text-foreground/90">Cited chat is off</p>
       <p className="mx-auto max-w-[17rem] text-[12px] leading-relaxed text-muted-foreground">
-        Connect an OpenRouter key to ask questions across your vault and get
-        answers grounded in the exact source.
+        Connect a model — an OpenRouter key or Local AI — to ask questions
+        across your vault and get answers grounded in the exact source.
       </p>
       <button
         type="button"
         onClick={onConnect}
-        className="mt-1 rounded-lg bg-primary px-3.5 py-1.5 text-[12px] font-semibold text-primary-foreground shadow-[0_0_16px_-8px_var(--color-primary)] transition hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40"
+        className={cn(BTN_PRIMARY, "mt-1 px-3.5")}
       >
-        Connect a key
+        Connect a model
       </button>
     </div>
   );

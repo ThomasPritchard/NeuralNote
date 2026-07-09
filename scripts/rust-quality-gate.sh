@@ -42,6 +42,24 @@ else
   redx "rustfmt: needs formatting — run 'cargo fmt --all'"
 fi
 
+section "Contract drift — ts-rs bindings match the Rust source"
+# The `#[ts(export)]` types + event-name constants regenerate `app/desktop/src/lib/
+# bindings/` during `cargo test`. Re-run just those export tests and fail if the
+# committed output changed — a stale mirror must break the build here, never a user
+# with a silent Rust↔TS type mismatch. `--intent-to-add` makes `git diff` also catch
+# a brand-new (as-yet-untracked) binding file for a newly added type.
+if cargo test --workspace export >/dev/null 2>&1; then
+  git add --intent-to-add -- app/desktop/src/lib/bindings >/dev/null 2>&1 || true
+  if git diff --quiet -- app/desktop/src/lib/bindings; then
+    pass "generated bindings are current (no drift)"
+  else
+    redx "bindings are STALE — run 'npm --prefix app/desktop run gen:bindings' and commit app/desktop/src/lib/bindings/"
+    git --no-pager diff --stat -- app/desktop/src/lib/bindings | head
+  fi
+else
+  redx "ts-rs export tests failed to run — bindings could not be regenerated"
+fi
+
 section "Reliability + Coverage — cargo-llvm-cov (tests, fail-under ${COVERAGE_MIN}% lines)"
 if cargo llvm-cov -p neuralnote-core --fail-under-lines "$COVERAGE_MIN" \
      --lcov --output-path lcov-rust.info; then
