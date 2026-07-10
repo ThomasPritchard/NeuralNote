@@ -44,3 +44,9 @@ tokio = { version = "1", features = ["time"] }
 # per-provider status structs) into `app/desktop/src/lib/bindings/` during
 # `cargo test`, matching the generation the core crate does for the domain types.
 ts-rs = "12.0.1"
+
+[dev-dependencies]
+# Behavioural-eval integration test (tests/behavioural_eval.rs): a temp fixture
+# vault, an async runtime for the real HTTP clients, and its own Ollama reachability probe.
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

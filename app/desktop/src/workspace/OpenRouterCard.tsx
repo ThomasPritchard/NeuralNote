@@ -6,10 +6,12 @@ import { useId, useState } from "react";
 import { Check, KeyRound } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
+import { cn } from "../lib/cn";
 import type { AiStatus } from "../lib/types";
 import { BTN_PRIMARY, BTN_QUIET } from "./buttonStyles";
 import { FIELD, LABEL } from "./KeySetupPanel";
 import { InlineError, ProviderCard } from "./ProviderCard";
+import { reasoningCapability } from "./reasoningSupport";
 
 interface OpenRouterCardProps {
   status: AiStatus | null;
@@ -51,6 +53,17 @@ export function OpenRouterCard({
   // the status its own write returned, so the control never shows an un-persisted
   // state, and a rejected write leaves it untouched.
   const reasoning = status?.openrouter.reasoning ?? false;
+  // The probed capability — shared with the chat pane's chip (one derivation,
+  // one copy). Only a verified "unsupported" disables; "unknown" fails open.
+  //
+  // `reasoningSupported` describes the *effective* provider's model, so it may
+  // be the local model's verdict. Only trust it here when OpenRouter is the
+  // effective provider; otherwise fail open (`unknown`), or a local model's
+  // "unsupported" would falsely disable — and mislabel — the OpenRouter toggle.
+  const capability = reasoningCapability(
+    orActive ? (status?.reasoningSupported ?? "unknown") : "unknown",
+    status?.openrouter.model ?? "",
+  );
 
   const openKeyForm = () => {
     setKeyError(null);
@@ -142,22 +155,31 @@ export function OpenRouterCard({
 
       {hasKey && (
         <div className="flex flex-col gap-1">
-          <label className="flex w-fit cursor-pointer items-center gap-2 text-[12px] text-foreground/90">
+          <label
+            title={capability.reason ?? undefined}
+            className={cn(
+              "flex w-fit items-center gap-2 text-[12px] text-foreground/90",
+              capability.disabled ? "cursor-not-allowed" : "cursor-pointer",
+            )}
+          >
             <input
               type="checkbox"
               checked={reasoning}
               onChange={() => void toggleReasoning()}
-              disabled={savingReasoning}
+              disabled={savingReasoning || capability.disabled}
               aria-describedby={reasoningHintId}
               className="size-3.5 shrink-0 accent-primary disabled:cursor-not-allowed disabled:opacity-50"
             />
             <span>Show model reasoning</span>
           </label>
+          {/* The hint slot is already aria-associated, so when the probe
+              verified the model can't reason it carries the "why" — visible
+              and announced — instead of a billing note for a moot toggle. */}
           <p
             id={reasoningHintId}
             className="pl-5.5 text-[11px] leading-snug text-muted-foreground"
           >
-            Reasoning tokens are billed by OpenRouter.
+            {capability.reason ?? "Reasoning tokens are billed by OpenRouter."}
           </p>
           {reasoningError && <InlineError>{reasoningError}</InlineError>}
         </div>

@@ -10,10 +10,17 @@ import {
   FileText,
   Loader2,
   Search,
+  SearchX,
   ShieldCheck,
 } from "lucide-react";
 import { Markdown } from "./Markdown";
-import { groupActivity, resolveAnswerMarkers, summarizeActivity } from "./chatMessage";
+import {
+  groupActivity,
+  resolveAnswerMarkers,
+  showsNothingFoundCard,
+  showsReasoningBackstop,
+  summarizeActivity,
+} from "./chatMessage";
 import type {
   ActivityStep,
   ActivitySummary,
@@ -364,6 +371,60 @@ function Reasoning({ text }: Readonly<{ text: string }>) {
   );
 }
 
+// The backstop for wrong capability metadata: reasoning was requested for this
+// turn (pinned at its start) but no thinking tokens arrived. Rendered in the
+// exact slot the `Reasoning` disclosure would have occupied, so the eye finds
+// an explanation where it expected the trace. Same calm register as the
+// "Partial coverage" notice — capability metadata can be wrong, so this is a
+// fallback, not an error — and styled as the disclosure's quiet box.
+function ReasoningBackstop() {
+  return (
+    <p className="rounded-lg border border-border/60 bg-background/30 px-2.5 py-1.5 text-[11px] leading-snug text-muted-foreground">
+      Reasoning was on, but the model didn't return any for this answer.
+    </p>
+  );
+}
+
+// The empty-retrieval on-ramp: the turn searched the vault and nothing
+// survived verification. Lists what was searched (auditable, like the trace)
+// and is strictly honest about what this build can do — add a note, nothing
+// more. It must NOT offer to distil a link or ingest a source: no capture
+// pipeline ships until Slice 5, and promising an unbuilt capability is
+// fabrication, this product's worst failure mode.
+function NothingFoundCard({ terms }: Readonly<{ terms: string[] }>) {
+  // Identity + occurrence keys: the term list is fixed once coverage lands,
+  // but a backend could legally repeat a term.
+  const seen = new Map<string, number>();
+  const keyed = terms.map((term) => {
+    const n = seen.get(term) ?? 0;
+    seen.set(term, n + 1);
+    return { term, key: `${term}#${n}` };
+  });
+  return (
+    <div className="flex flex-col gap-2 rounded-lg border border-border/60 bg-background/30 px-3 py-2.5">
+      <p className="flex items-center gap-1.5 text-[11px] font-medium text-foreground/80">
+        <SearchX className="size-3.5 shrink-0 text-muted-foreground/70" aria-hidden />
+        Nothing in your vault covers this
+      </p>
+      <ul aria-label="Searched terms" className="flex flex-wrap gap-1">
+        {keyed.map(({ term, key }) => (
+          <li
+            key={key}
+            className="nn-mono rounded-full bg-muted/40 px-2 py-0.5 text-[10px] text-muted-foreground ring-1 ring-inset ring-border"
+          >
+            {term}
+          </li>
+        ))}
+      </ul>
+      <p className="text-[11px] leading-snug text-muted-foreground">
+        Answers only come from your notes. Research this and add a note, then
+        ask again.
+      </p>
+      {/* TODO(slice-5): wire a capture CTA here once the skills bank lands. */}
+    </div>
+  );
+}
+
 function SourceChip({
   citation,
   onOpen,
@@ -459,6 +520,10 @@ function AssistantTurn({
         errored={turn.error !== null}
       />
       <Reasoning text={turn.thinking} />
+      {/* Mutually exclusive with the disclosure by construction: the backstop
+          selector requires `thinking` to be blank, which is exactly when
+          `Reasoning` renders nothing — so this fills that empty slot. */}
+      {showsReasoningBackstop(turn) && <ReasoningBackstop />}
       {answer.trim() !== "" && (
         // The answer is the payload — full-contrast, tightened to the pane's
         // narrow measure, with outer block margins collapsed so it sits flush.
@@ -468,6 +533,9 @@ function AssistantTurn({
         >
           <Markdown body={answer} />
         </div>
+      )}
+      {showsNothingFoundCard(turn) && turn.coverage && (
+        <NothingFoundCard terms={turn.coverage.searchedTerms} />
       )}
       <Sources citations={turn.citations} onOpen={onOpenCitation} />
       {turn.coverage && <CoverageFooter coverage={turn.coverage} />}

@@ -2,8 +2,8 @@
 
 export type OpenRouterStatus = { hasKey: boolean, model: string, 
 /**
- * Whether the user has opted into OpenRouter's billed reasoning tokens. Lives on
- * the OpenRouter status, not the top-level `AiStatus`, because reasoning is an
- * OpenRouter-only capability — the Local (Ollama) path has no such concept.
+ * Whether the user has opted into reasoning tokens. This remains on the existing
+ * OpenRouter status DTO for compatibility, while both providers use the same
+ * persisted opt-in.
  */
 reasoning: boolean, };

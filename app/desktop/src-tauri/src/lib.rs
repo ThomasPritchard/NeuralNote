@@ -20,6 +20,12 @@ mod event_names;
 mod local;
 mod menu;
 
+// Re-exported solely for the network-gated behavioural eval integration test
+// (tests/behavioural_eval.rs), which drives the REAL provider clients through
+// run_chat outside the Tauri command plumbing. Not part of the app's own API.
+pub use ai::OpenAiChatClient;
+pub use local::ollama_chat_client;
+
 /// The currently-open vault, if any. The watcher is held here so it stays alive
 /// for the session and is dropped (stopping the watch) on close. It is `Option`
 /// because watcher init is non-fatal — `None` when it failed, so the vault still
@@ -166,6 +172,7 @@ pub fn run() {
             commands::ai::ai_status,
             commands::ai::set_active_provider,
             commands::ai::set_reasoning,
+            commands::ai::refresh_reasoning_support,
             commands::ai::detect_hardware,
             commands::ai::local_candidates,
             commands::ai::recommend_local_model,

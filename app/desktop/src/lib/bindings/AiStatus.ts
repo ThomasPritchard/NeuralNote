@@ -2,6 +2,7 @@
 import type { LocalStatus } from "./LocalStatus";
 import type { OpenRouterStatus } from "./OpenRouterStatus";
 import type { ProviderKind } from "./ProviderKind";
+import type { ReasoningSupport } from "./ReasoningSupport";
 
 /**
  * Provider-aware AI status for the settings UI and the chat pane's first-run
@@ -10,4 +11,4 @@ import type { ProviderKind } from "./ProviderKind";
  * yet. This is a pure config read — it never starts the sidecar or touches the
  * keychain, so the UI can poll it cheaply.
  */
-export type AiStatus = { activeProvider: ProviderKind | null, openrouter: OpenRouterStatus, local: LocalStatus, };
+export type AiStatus = { activeProvider: ProviderKind | null, reasoningSupported: ReasoningSupport, openrouter: OpenRouterStatus, local: LocalStatus, };

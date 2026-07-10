@@ -66,18 +66,29 @@ source, so a Rust↔TS mismatch can never reach a user silently.
 bash scripts/rust-quality-gate.sh          # clippy -D warnings + rustfmt --check + ts-rs bindings drift + llvm-cov ≥90% (neuralnote-core) + cargo-audit
 ```
 
-**Known, pre-existing gate note — don't misread it as your regression.**
-`cargo-audit` reports advisories that live entirely in **Tauri-transitive** deps,
-not app code:
+The gate prints **GREEN (all categories enforced)** on a clean tree. If it doesn't,
+that's a real finding — treat it as yours until you've proved otherwise.
 
-- `plist → quick-xml` (RUSTSEC-2026-0194/0195), and `atk`/`gdk` (GTK3 bindings,
-  unused on macOS).
-
-Before treating any advisory as caused by your change, prove provenance:
+**On `cargo-audit` advisories.** They are usually Tauri-transitive rather than app
+code, and it's tempting to shrug them off as "inherited, not mine". Don't. Prove
+provenance *and then try to fix it* — a transitive advisory is often a lockfile bump
+away, and a permanently-red security gate teaches everyone to ignore it.
 
 ```bash
-cargo tree -i <crate> -e normal            # e.g. cargo tree -i quick-xml  → shows it comes via tauri
+cargo tree -i <crate> -e normal            # where does it come from?
+cargo update --dry-run -p <parent>         # would a bump of the parent carry it forward?
 ```
+
+Worked example (2026-07-10): `quick-xml 0.39.4` (RUSTSEC-2026-0194/0195, fix
+`>=0.41.0`) arrived via `plist → tauri`. It looked unfixable — 0.39→0.41 is a
+breaking bump under Cargo's 0.x rules, so we can't force it. But `plist 1.10.0` had
+already done it upstream. `cargo update -p plist` moved both, four lines of
+`Cargo.lock`, no manifest change, all tests green, and `cargo audit` went to exit 0.
+The gate had been red for months for want of one command.
+
+`cargo audit` fails only on **vulnerabilities**. The ~17 remaining `unmaintained` /
+`unsound` warnings (gtk-rs GTK3 bindings, unused on macOS) do not fail it and need no
+ignore-list.
 
 Coverage in the gate is scoped to `neuralnote-core` (the shell's network/keychain
 paths aren't unit-coverable — they're exercised by integration + the manual run).

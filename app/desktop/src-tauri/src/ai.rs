@@ -12,7 +12,8 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use neuralnote_core::ai::{openai, provider_config};
 use neuralnote_core::ai::{
-    ChatEvent, Completion, EventSink, LlmClient, LlmMessage, LlmRequest, Role,
+    openrouter_reasoning_support, ChatEvent, Completion, EventSink, LlmClient, LlmMessage,
+    LlmRequest, ReasoningSupport, Role,
 };
 use neuralnote_core::CoreError;
 use serde::{Deserialize, Serialize};
@@ -25,6 +26,8 @@ use ts_rs::TS;
 
 /// OpenRouter's OpenAI-compatible chat-completions endpoint.
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+/// OpenRouter's public model catalogue (no key, no auth header).
+const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 
 /// Keychain identity for the secret API key.
 const KEYCHAIN_SERVICE: &str = "com.neuralnote.desktop";
@@ -279,6 +282,30 @@ impl EventSink for TauriChannelSink {
     }
 }
 
+/// Probe whether `model` supports reasoning via OpenRouter's public models
+/// endpoint. No API key is attached: the endpoint needs none, and the key must
+/// never leave the keychain boundary. Any failure returns `Unknown` (fail open).
+pub async fn probe_openrouter_reasoning(model: &str) -> ReasoningSupport {
+    let Ok(client) = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(8))
+        .build()
+    else {
+        return ReasoningSupport::Unknown;
+    };
+    let Ok(response) = client.get(OPENROUTER_MODELS_URL).send().await else {
+        return ReasoningSupport::Unknown;
+    };
+    if !response.status().is_success() {
+        return ReasoningSupport::Unknown;
+    }
+    let Ok(body) = response.text().await else {
+        return ReasoningSupport::Unknown;
+    };
+
+    openrouter_reasoning_support(&body, model)
+}
+
 /* ─────────────────────────────  LLM client  ────────────────────────────── */
 
 /// OpenAI-compatible [`LlmClient`]. Holds one reusable HTTP client and endpoint
@@ -292,12 +319,9 @@ pub struct OpenAiChatClient {
     /// Ollama doesn't fall back to ~4096 and silently truncate the grounding rules
     /// + earliest evidence — protecting cited recall on the Local path (PA-001).
     num_ctx: Option<u32>,
-    /// Whether to request streamed reasoning tokens on the answer turn. Set on the
-    /// OpenRouter path only, and even there only when the user opts in (the tokens are
-    /// billed); always `false` for Ollama, whose OpenAI-compatible endpoint doesn't
-    /// speak it. Provider capability lives here at the construction seam, not as a
-    /// branch in the shared streaming loop — so a non-reasoning provider still
-    /// substitutes cleanly (it just never emits a `Thinking` event).
+    /// Whether to request streamed reasoning tokens on the answer turn. The caller
+    /// combines the user's opt-in with the selected model's capability before client
+    /// construction, for both OpenRouter and Ollama.
     reasoning: bool,
 }
 
@@ -660,6 +684,8 @@ mod tests {
             key_configured,
             local_model_tag: None,
             reasoning: false,
+            reasoning_support: None,
+            reasoning_probed_model: None,
         }
     }
 

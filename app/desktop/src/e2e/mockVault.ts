@@ -39,6 +39,7 @@ import type {
   NoteDoc,
   ProviderKind,
   PullEvent,
+  ReasoningSupport,
   Recommendation,
   RecentVault,
   SearchMatch,
@@ -84,8 +85,21 @@ export interface CreateMockVaultOptions {
   /** The AI key status `api_key_status`/`ai_status` report. Defaults to a key
    *  present so a test lands straight in the chat view; pass `{ hasKey: false }`
    *  to exercise the first-run provider picker (and, through it, guided key
-   *  setup). `model` defaults to {@link DEFAULT_CHAT_MODEL}. */
-  apiKey?: { hasKey: boolean; model?: string; reasoning?: boolean };
+   *  setup). `model` defaults to {@link DEFAULT_CHAT_MODEL};
+   *  `reasoningSupported` defaults to `"unknown"` (never probed → fail open). */
+  apiKey?: {
+    hasKey: boolean;
+    model?: string;
+    reasoning?: boolean;
+    reasoningSupported?: ReasoningSupport;
+    /** The verdict the `refresh_reasoning_support` probe *discovers and
+     *  persists* when it runs, mirroring the real command (probe → persist →
+     *  return). When set, the mount-time probe overwrites `reasoningSupported`
+     *  with this — so a test can seed an initial `"unknown"` (chip fails open)
+     *  and prove the probe is what drives it to `"unsupported"`. Left unset,
+     *  the probe is a pure echo of the seeded verdict. */
+    probedSupport?: ReasoningSupport;
+  };
   /** The `ChatEvent` sequence the `chat` command streams to its Channel, in
    *  order, exactly as the Rust core would (searching → … → done | error). */
   chatScript?: ChatEvent[];
@@ -1303,7 +1317,13 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     // Mirrors `ProviderConfig.reasoning`, whose serde default is false: reasoning
     // tokens are billed, so they are opt-in. Mutated by set_reasoning.
     reasoning: opts.apiKey?.reasoning ?? false,
+    // Mirrors `ProviderConfig.cached_reasoning_support()`, which is "unknown"
+    // until a model is probed — and "unknown" keeps the toggle enabled, so an
+    // unprobed fixture fails open exactly as the real config does.
+    reasoningSupported: opts.apiKey?.reasoningSupported ?? "unknown",
   };
+  // The verdict the mount-time probe persists when it runs (see the option doc).
+  const probedSupport = opts.apiKey?.probedSupport;
   const chatScript = opts.chatScript ?? [];
 
   // Local-AI provider state, mutated by set_active_provider / pull / delete and
@@ -1324,6 +1344,7 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
    *  `set_reasoning`, exactly as the Rust command pair shares the real one. */
   const buildAiStatus = (): AiStatus => ({
     activeProvider: effectiveProvider(),
+    reasoningSupported: keyState.reasoningSupported,
     openrouter: {
       hasKey: keyState.hasKey,
       model: keyState.model,
@@ -1733,6 +1754,15 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         keyState.reasoning = a.enabled as boolean;
         return buildAiStatus();
       }
+      case "refresh_reasoning_support":
+        // The capability probe. The real command probes the selected model over
+        // the network, PERSISTS the verdict, and returns the freshly persisted
+        // status. Mirror that write: when `probedSupport` is set, the probe
+        // overwrites the cached verdict (so a test can start at "unknown" and
+        // observe the flip); otherwise it echoes the seeded verdict. Drive the
+        // fail-open path with `backend.setFailure("refresh_reasoning_support", …)`.
+        if (probedSupport !== undefined) keyState.reasoningSupported = probedSupport;
+        return buildAiStatus();
       case "hf_model_metadata": {
         const repo = a.hfRepo as string;
         const meta = (opts.hfMeta ?? {})[repo];

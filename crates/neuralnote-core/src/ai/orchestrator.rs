@@ -45,24 +45,33 @@ impl Default for Guards {
     }
 }
 
-const SYSTEM_PROMPT: &str =
-    "You are NeuralNote's research assistant. You answer questions strictly from the \
-user's own notes, using the tools provided to search and read them.\n\n\
-Rules you must follow:\n\
-- Answer ONLY from evidence you retrieved with the tools. Never use outside \
-knowledge and never guess.\n\
-- Before answering, issue 3 to 8 varied searches: try synonyms, tags, note titles, \
-and the user's own wording. Keyword search is literal, so rephrase generously.\n\
-- The vault is organised into folders. Call `list_folders` to see them (each with its \
-note count). When the user asks about a specific folder — e.g. \"what's in my Recipes \
-folder\" or \"search my Work notes\" — pass that folder's path as the `folder` argument \
-to `search_notes` or `list_notes` to scope to it and its subfolders; omit `folder` to \
-cover the whole vault.\n\
-- Cite every claim with the evidence id in square brackets, e.g. [e1] or [e2]. \
-Cite ids only — never a file path, and never a quote you did not retrieve.\n\
-- If the notes do not contain the answer, say so plainly. Do not invent a citation \
-or an answer.\n\
-- Keep the answer concise and grounded in the cited evidence.";
+const SYSTEM_PROMPT: &str = r#"You are NeuralNote's assistant. You help the user think with, and about, their own notes.
+
+Choose a mode for each message.
+
+CONVERSE — answer directly, call no tools:
+- greetings, thanks, small talk
+- questions about you, your abilities, or something you just said
+- follow-ups that need only your own previous answer
+
+RESEARCH — you MUST search before answering:
+- any question about facts, or about anything in the user's notes or material
+- Issue 3 to 8 varied searches: try synonyms, tags, note titles, and the user's own
+  wording. Keyword search is literal, so rephrase generously.
+- The vault is organised into folders. Call `list_folders` to see them (each with its
+  note count). When the user asks about a specific folder — e.g. "what's in my Recipes
+  folder" — pass that folder's path as the `folder` argument to `search_notes` or
+  `list_notes` to scope to it and its subfolders; omit `folder` to cover the whole vault.
+- Cite every claim with the evidence id in square brackets, e.g. [e1] or [e2]. Cite ids
+  only — never a file path, and never a quote you did not retrieve.
+
+These hold in both modes:
+- Never answer a factual question from your own knowledge. Your knowledge is for
+  conversation, not for facts.
+- If your searches find nothing relevant, say so plainly: name what you searched for,
+  and invite the user to add a note on the topic so you can answer it next time. Never
+  invent a citation or an answer.
+- Keep answers concise and grounded in the cited evidence."#;
 
 /// Run one chat turn end-to-end, streaming [`ChatEvent`]s to `sink`.
 ///
@@ -118,6 +127,20 @@ struct CoverageAcc {
     skipped_files: u32,
 }
 
+struct ThinkingCounter<'a> {
+    inner: &'a mut dyn EventSink,
+    count: usize,
+}
+
+impl EventSink for ThinkingCounter<'_> {
+    fn send(&mut self, event: ChatEvent) {
+        if matches!(&event, ChatEvent::Thinking { .. }) {
+            self.count += 1;
+        }
+        self.inner.send(event);
+    }
+}
+
 impl ChatSession<'_> {
     async fn drive(
         &self,
@@ -150,7 +173,36 @@ impl ChatSession<'_> {
         // cost of keeping tool-parsing non-streamed while the answer streams live.
         // No tools are advertised on this turn: it is unambiguously an answer, so the
         // model can't emit a tool call that streaming would silently swallow.
-        let answer = self.stream_final_answer(&messages, sink).await?;
+        let (answer, thinking_count) = {
+            let mut counting_sink = ThinkingCounter {
+                inner: sink,
+                count: 0,
+            };
+            let answer = self
+                .stream_final_answer(&messages, &mut counting_sink)
+                .await?;
+            (answer, counting_sink.count)
+        };
+
+        if answer.trim().is_empty() {
+            let message = if thinking_count > 0 {
+                "the model returned only reasoning and no answer — try again or switch model"
+            } else {
+                "the model returned an empty answer"
+            };
+            // Don't let the empty-answer return drop the truncation/skip signal — a
+            // tripped guard is often WHY the answer came back empty. emit_coverage
+            // otherwise runs only on the success path below; surface it here too, but
+            // only when it carries that signal, so a plain searched-but-empty turn
+            // stays a bare Error (whitespace_only_answer_after_search_emits_error_and_stops).
+            if guard_tripped || coverage.truncated || coverage.skipped_files > 0 {
+                emit_coverage(coverage, guard_tripped, sink);
+            }
+            sink.send(ChatEvent::Error {
+                message: message.to_string(),
+            });
+            return Ok(());
+        }
 
         self.emit_citations(&answer, &registry, sink);
         emit_coverage(coverage, guard_tripped, sink);
@@ -358,13 +410,29 @@ fn push_skipped_tool_result(messages: &mut Vec<LlmMessage>, call: &ToolCall) {
 }
 
 fn emit_coverage(coverage: CoverageAcc, guard_tripped: bool, sink: &mut dyn EventSink) {
+    let truncated = coverage.truncated || guard_tripped;
+
+    // A conversational turn searched and read nothing, so an empty footer would be a
+    // lie of precision — say nothing instead. But suppress only when the footer would
+    // carry *no* information: a run can trip a guard (or skip files) having called
+    // only `list_notes`/`list_folders`, which populate neither vector, and dropping
+    // the footer there would hide the truncation. Partial coverage is visible, never
+    // hidden (see `ChatEvent::Coverage`).
+    if coverage.searched_terms.is_empty()
+        && coverage.notes_read.is_empty()
+        && !truncated
+        && coverage.skipped_files == 0
+    {
+        return;
+    }
+
     sink.send(ChatEvent::Coverage {
         searched_terms: coverage.searched_terms,
         notes_read: coverage.notes_read,
         // "Partial coverage" = the sweep was genuinely cut short: a loop guard
         // stopped it, OR the vault search hit its own global cap (`coverage.truncated`
         // now carries only that, not a routine per-search `max_results` clip).
-        truncated: coverage.truncated || guard_tripped,
+        truncated,
         skipped_files: coverage.skipped_files,
     });
 }
@@ -520,6 +588,82 @@ mod tests {
     use std::collections::VecDeque;
     use std::fs;
     use std::sync::Mutex;
+
+    #[test]
+    fn system_prompt_defines_converse_and_research_modes() {
+        assert!(SYSTEM_PROMPT.contains("CONVERSE"));
+        assert!(SYSTEM_PROMPT.contains("RESEARCH"));
+    }
+
+    #[test]
+    fn system_prompt_scopes_the_search_mandate_to_research_mode() {
+        let research = SYSTEM_PROMPT.find("RESEARCH").expect("RESEARCH mode");
+        let search_mandate = SYSTEM_PROMPT
+            .find("Issue 3 to 8 varied searches")
+            .expect("research search mandate");
+
+        assert!(search_mandate > research);
+    }
+
+    #[test]
+    fn system_prompt_does_not_promise_unavailable_capture_skills() {
+        let prompt = SYSTEM_PROMPT.to_lowercase();
+
+        assert!(!prompt.contains("youtube"));
+        assert!(!prompt.contains("distil"));
+        assert!(!prompt.contains("pdf"));
+    }
+
+    #[test]
+    fn coverage_is_suppressed_on_a_conversational_turn() {
+        // "hello" searches nothing and reads nothing. An empty footer is a lie of
+        // precision, so emit no footer at all.
+        let mut sink = VecSink::default();
+        emit_coverage(CoverageAcc::default(), false, &mut sink);
+        assert!(sink.events.is_empty());
+    }
+
+    #[test]
+    fn coverage_still_reports_a_tripped_guard_with_no_searches() {
+        // `list_notes` / `list_folders` yield `ToolOutcome::Listed`, populating neither
+        // `searched_terms` nor `notes_read` — yet they can still trip `max_iterations`
+        // or `max_context_chars`. Suppressing the footer there would hide the
+        // truncation, and "partial coverage is visible, never hidden" (events.rs).
+        let mut sink = VecSink::default();
+        emit_coverage(CoverageAcc::default(), true, &mut sink);
+        assert!(
+            matches!(
+                sink.events.as_slice(),
+                [ChatEvent::Coverage {
+                    truncated: true,
+                    ..
+                }]
+            ),
+            "a cut-short run must surface its truncation, got {:?}",
+            sink.events
+        );
+    }
+
+    #[test]
+    fn coverage_still_reports_skipped_files_with_no_searches() {
+        let coverage = CoverageAcc {
+            skipped_files: 3,
+            ..CoverageAcc::default()
+        };
+        let mut sink = VecSink::default();
+        emit_coverage(coverage, false, &mut sink);
+        assert!(
+            matches!(
+                sink.events.as_slice(),
+                [ChatEvent::Coverage {
+                    skipped_files: 3,
+                    ..
+                }]
+            ),
+            "skipped files must never be silently dropped, got {:?}",
+            sink.events
+        );
+    }
 
     /// A scripted, network-free [`LlmClient`]. `completions` are popped by each
     /// `complete` turn; `answer` is streamed by `complete_streaming`. An optional
@@ -683,6 +827,125 @@ mod tests {
         events.iter().filter(|e| pred(e)).count()
     }
 
+    // ── §7 behavioural eval — plumbing tier ─────────────────────────────────
+    // The five spec-§7 cases run against the scripted MockLlmClient. Because the
+    // SCRIPT (not the model) decides whether a tool call fires, this tier proves
+    // PLUMBING only: the orchestrator injects no mandatory retrieval before the
+    // model's first turn (a no-tool script yields zero Searching), a zero-search
+    // turn emits no Coverage, and search/citation counts flow through intact. It
+    // CANNOT prove the model chooses to search — that is the network-gated
+    // real-model tier in app/desktop/src-tauri/tests/behavioural_eval.rs.
+    //
+    // The zero-search-but-still-emit-Coverage guardrail (a list-only run tripping a
+    // guard or skipping files) is already proven by
+    // coverage_still_reports_a_tripped_guard_with_no_searches and
+    // coverage_still_reports_skipped_files_with_no_searches — not duplicated here.
+    #[test]
+    fn eval_plumbs_the_five_section_7_cases_through_the_mock() {
+        struct EvalCase {
+            label: &'static str,
+            script: Vec<Completion>,
+            answer: &'static str,
+            search_bounds: std::ops::RangeInclusive<usize>,
+            citation_bounds: std::ops::RangeInclusive<usize>,
+            coverage_bounds: std::ops::RangeInclusive<usize>,
+        }
+
+        let cases = [
+            EvalCase {
+                label: "Case 1 Greeting",
+                script: vec![final_turn()],
+                answer: "Hey! What would you like to explore?",
+                search_bounds: 0..=0,
+                citation_bounds: 0..=0,
+                coverage_bounds: 0..=0,
+            },
+            EvalCase {
+                label: "Case 2 Meta",
+                script: vec![final_turn()],
+                answer: "I can help you think with and search your notes.",
+                search_bounds: 0..=0,
+                citation_bounds: 0..=0,
+                coverage_bounds: 0..=0,
+            },
+            EvalCase {
+                label: "Case 3 Factual-in-vault",
+                script: vec![
+                    tool_call("c1", "search_notes", r#"{"query":"components"}"#),
+                    tool_call(
+                        "c2",
+                        "read_note_span",
+                        r#"{"rel_path":"Research/widgets.md","start_line":1,"end_line":2}"#,
+                    ),
+                    final_turn(),
+                ],
+                answer: "Widgets are small components. [e1]",
+                search_bounds: 1..=usize::MAX,
+                citation_bounds: 1..=usize::MAX,
+                coverage_bounds: 1..=usize::MAX,
+            },
+            EvalCase {
+                label: "Case 4 Factual-not-in-vault",
+                script: vec![
+                    tool_call("c1", "search_notes", r#"{"query":"components"}"#),
+                    final_turn(),
+                ],
+                answer:
+                    "Nothing in your notes covers this yet — add a note and I'll answer next time.",
+                search_bounds: 1..=usize::MAX,
+                citation_bounds: 0..=0,
+                coverage_bounds: 1..=usize::MAX,
+            },
+            EvalCase {
+                label: "Case 5 Follow-up",
+                script: vec![final_turn()],
+                answer: "Widgets are small parts.",
+                search_bounds: 0..=0,
+                citation_bounds: 0..=0,
+                coverage_bounds: 0..=0,
+            },
+        ];
+
+        for EvalCase {
+            label,
+            script,
+            answer,
+            search_bounds,
+            citation_bounds,
+            coverage_bounds,
+        } in cases
+        {
+            let v = vault();
+            let mock = MockLlmClient::new(script, answer);
+            let events = run(v.path(), &mock, &Guards::default());
+
+            let searches = count(&events, |event| {
+                matches!(event, ChatEvent::Searching { .. })
+            });
+            let citations = count(&events, |event| matches!(event, ChatEvent::Citation { .. }));
+            let coverage = count(&events, |event| matches!(event, ChatEvent::Coverage { .. }));
+
+            assert!(
+                search_bounds.contains(&searches),
+                "{label}: expected Searching count in {search_bounds:?}, got {searches}"
+            );
+            assert!(
+                citation_bounds.contains(&citations),
+                "{label}: expected Citation count in {citation_bounds:?}, got {citations}"
+            );
+            assert!(
+                coverage_bounds.contains(&coverage),
+                "{label}: expected Coverage count in {coverage_bounds:?}, got {coverage}"
+            );
+
+            let last = events.last();
+            assert!(
+                matches!(last, Some(ChatEvent::Done)),
+                "{label}: last event must be Done, got {last:?}"
+            );
+        }
+    }
+
     #[test]
     fn happy_path_searches_reads_and_emits_a_verified_citation() {
         let v = vault();
@@ -784,12 +1047,11 @@ mod tests {
             count(&events, |e| matches!(e, ChatEvent::Searching { .. })),
             0
         );
-        let coverage_empty = events.iter().any(|e| {
-            matches!(e,
-            ChatEvent::Coverage { searched_terms, notes_read, .. }
-            if searched_terms.is_empty() && notes_read.is_empty())
-        });
-        assert!(coverage_empty);
+        assert_eq!(
+            count(&events, |e| matches!(e, ChatEvent::Coverage { .. })),
+            0,
+            "a turn with no searches must not emit a coverage footer"
+        );
         assert!(matches!(events.last(), Some(ChatEvent::Done)));
     }
 
@@ -850,6 +1112,48 @@ mod tests {
             )),
             "an iteration-capped sweep must report truncated coverage"
         );
+    }
+
+    #[test]
+    fn guard_tripped_empty_answer_still_reports_truncated_coverage() {
+        let v = vault();
+        // The model keeps issuing tool calls (max_iterations caps it → partial
+        // coverage) and THEN streams an empty final answer — often a symptom of the
+        // cut-short sweep. The truncation footer must survive the empty-answer error
+        // path, never dropped (the "never drop truncation" invariant, one layer up
+        // from emit_coverage).
+        let mock = MockLlmClient::new(
+            vec![
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+                tool_call("c2", "search_notes", r#"{"query":"components"}"#),
+                tool_call("c3", "search_notes", r#"{"query":"snap"}"#),
+            ],
+            "",
+        );
+        let guards = Guards {
+            max_iterations: 2,
+            ..Guards::default()
+        };
+        let events = run(v.path(), &mock, &guards);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::Coverage {
+                    truncated: true,
+                    ..
+                }
+            )),
+            "a guard-tripped empty answer must still surface its truncation, got {:?}",
+            events
+        );
+        assert_eq!(
+            count(&events, |e| matches!(e, ChatEvent::Error { .. })),
+            1,
+            "the empty-answer error still fires — the footer complements it"
+        );
+        // The error is terminal: no Done.
+        assert_eq!(count(&events, |e| matches!(e, ChatEvent::Done)), 0);
     }
 
     #[test]
@@ -926,6 +1230,45 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, ChatEvent::Citation { id, .. } if id == "e1")));
+    }
+
+    #[test]
+    fn whitespace_only_answer_after_search_emits_error_and_stops() {
+        let v = vault();
+        let mock = MockLlmClient::new(
+            vec![
+                tool_call("c1", "search_notes", r#"{"query":"components"}"#),
+                final_turn(),
+            ],
+            "   ",
+        );
+        let events = run(v.path(), &mock, &Guards::default());
+
+        assert_eq!(count(&events, |e| matches!(e, ChatEvent::Error { .. })), 1);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ChatEvent::Error { message } if message == "the model returned an empty answer"
+        )));
+        assert_eq!(
+            count(&events, |e| matches!(e, ChatEvent::Coverage { .. })),
+            0
+        );
+        assert_eq!(count(&events, |e| matches!(e, ChatEvent::Done)), 0);
+    }
+
+    #[test]
+    fn reasoning_only_answer_emits_reasoning_aware_error_and_stops() {
+        let v = vault();
+        let mock = MockLlmClient::new(vec![final_turn()], "")
+            .with_reasoning(&["all the answer ", "went into reasoning"]);
+        let events = run(v.path(), &mock, &Guards::default());
+
+        assert_eq!(count(&events, |e| matches!(e, ChatEvent::Error { .. })), 1);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ChatEvent::Error { message } if message.contains("reasoning")
+        )));
+        assert_eq!(count(&events, |e| matches!(e, ChatEvent::Done)), 0);
     }
 
     #[test]

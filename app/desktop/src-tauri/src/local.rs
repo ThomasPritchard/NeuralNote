@@ -8,8 +8,8 @@
 
 use futures_util::StreamExt;
 use neuralnote_core::ai::{
-    parse_hf_metadata, parse_installed_models, parse_pull_line, HardwareSpec, HfModelMeta,
-    InstalledModel, PullEvent, PullSink,
+    ollama_reasoning_support, parse_hf_metadata, parse_installed_models, parse_pull_line,
+    HardwareSpec, HfModelMeta, InstalledModel, PullEvent, PullSink, ReasoningSupport,
 };
 use neuralnote_core::{CoreError, CoreResult};
 use std::net::TcpListener;
@@ -348,7 +348,10 @@ fn kill_sidecar(sidecar: Option<OllamaSidecar>) {
     }
 }
 
-pub(super) fn ollama_chat_client(port: u16) -> crate::ai::OpenAiChatClient {
+/// Build the local chat client with the effective reasoning flag. Ollama's
+/// OpenAI-compatible endpoint maps thinking onto `reasoning`, so a capable local
+/// model can stream thinking when the user opts in.
+pub fn ollama_chat_client(port: u16, reasoning: bool) -> crate::ai::OpenAiChatClient {
     crate::ai::OpenAiChatClient::new_with(
         format!("http://127.0.0.1:{port}/v1/chat/completions"),
         None,
@@ -356,10 +359,32 @@ pub(super) fn ollama_chat_client(port: u16) -> crate::ai::OpenAiChatClient {
         Duration::from_secs(10),
         Duration::from_secs(300),
         Some(OLLAMA_NUM_CTX),
-        // Ollama's OpenAI-compatible endpoint doesn't speak the reasoning field; leave
-        // it off so the shared client never asks for something Local would ignore.
-        false,
+        reasoning,
     )
+}
+
+/// Probe an installed model's thinking capability through the loopback sidecar.
+/// Any transport, status, body, or parse failure returns `Unknown` (fail open).
+pub(super) async fn probe_ollama_reasoning(port: u16, tag: &str) -> ReasoningSupport {
+    let Ok(client) = management_client() else {
+        return ReasoningSupport::Unknown;
+    };
+    let Ok(response) = client
+        .post(api_url(port, "/api/show"))
+        .json(&serde_json::json!({ "model": tag }))
+        .send()
+        .await
+    else {
+        return ReasoningSupport::Unknown;
+    };
+    if !response.status().is_success() {
+        return ReasoningSupport::Unknown;
+    }
+    let Ok(body) = response.text().await else {
+        return ReasoningSupport::Unknown;
+    };
+
+    ollama_reasoning_support(&body)
 }
 
 pub(super) async fn list_local_models(port: u16) -> CoreResult<Vec<InstalledModel>> {

@@ -38,6 +38,7 @@ export type { ChatEvent } from "./bindings/ChatEvent";
 export type { ProviderKind } from "./bindings/ProviderKind";
 export type { AiStatus } from "./bindings/AiStatus";
 export type { OpenRouterStatus } from "./bindings/OpenRouterStatus";
+export type { ReasoningSupport } from "./bindings/ReasoningSupport";
 export type { LocalStatus } from "./bindings/LocalStatus";
 export type { HardwareSpec } from "./bindings/HardwareSpec";
 export type { CandidateModel } from "./bindings/CandidateModel";

@@ -14,6 +14,7 @@
 //! slots in as just another [`RetrievalProvider`] returning the same
 //! [`EvidenceSpan`] shape, with no change to the chat layer.
 
+pub mod capabilities;
 pub mod events;
 pub mod evidence;
 pub mod llm;
@@ -25,6 +26,11 @@ pub mod retrieval;
 pub mod tools;
 pub mod verify;
 
+pub use capabilities::{
+    effective_reasoning, ollama_reasoning_support, openrouter_reasoning_support,
+    parse_ollama_capabilities, parse_openrouter_models, supports_reasoning, supports_thinking,
+    ModelCapabilities, ReasoningSupport,
+};
 pub use events::{ChatEvent, EventSink};
 pub use evidence::{EvidenceRegistry, EvidenceSpan};
 pub use llm::{Completion, LlmClient, LlmMessage, LlmRequest, Role, ToolCall};

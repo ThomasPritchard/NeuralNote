@@ -243,6 +243,15 @@ export const setActiveProvider = (
 export const setReasoning = (enabled: boolean) =>
   invoke<AiStatus>("set_reasoning", { enabled });
 
+/** Probe the selected model over the network or loopback for reasoning support.
+ *  This is async I/O, not a cheap config read like `aiStatus()`, so never call it
+ *  on every render. Returns the freshly persisted status — render it directly
+ *  rather than following up with `aiStatus()`. An un-probed or failed model stays
+ *  "unknown", keeping the toggle enabled (fail open); failure never reports
+ *  "unsupported". */
+export const refreshReasoningSupport = () =>
+  invoke<AiStatus>("refresh_reasoning_support");
+
 /** Detect host hardware (RAM/CPU/arch/OS) for the local-model recommendation and
  *  the Settings hardware readout. Infallible on the Rust side. */
 export const detectHardware = () => invoke<HardwareSpec>("detect_hardware");

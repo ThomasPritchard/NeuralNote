@@ -41,6 +41,9 @@ export interface AssistantMessage {
   role: "assistant";
   /** The live "searching / reading / verifying" trace, in order. */
   activity: ActivityStep[];
+  /** Pinned at turn creation because reasoning can be toggled off mid-stream;
+   *  the finished turn stays self-describing against the opt-in it ran under. */
+  reasoningRequested: boolean;
   /** Optional streamed reasoning tokens (rendered collapsed). */
   thinking: string;
   /** The streamed answer markdown, accumulated delta by delta. */
@@ -60,10 +63,11 @@ export function userMessage(content: string): UserMessage {
 }
 
 /** A fresh assistant turn, before any event has landed. */
-export function emptyAssistant(): AssistantMessage {
+export function emptyAssistant(reasoningRequested = false): AssistantMessage {
   return {
     role: "assistant",
     activity: [],
+    reasoningRequested,
     thinking: "",
     answer: "",
     citations: [],
@@ -71,6 +75,42 @@ export function emptyAssistant(): AssistantMessage {
     error: null,
     done: false,
   };
+}
+
+/** Reasoning was requested but the model streamed no thinking tokens. */
+export function showsReasoningBackstop(turn: AssistantMessage): boolean {
+  // A failed run has a bigger problem to report; stacking this notice would
+  // bury the real one.
+  //
+  // `trim()` rather than `=== ""` so this agrees with the `Reasoning`
+  // disclosure, which hides itself on whitespace. A lone "\n" delta would
+  // otherwise render no trace *and* suppress the notice explaining why.
+  return (
+    turn.done &&
+    turn.reasoningRequested &&
+    turn.thinking.trim() === "" &&
+    turn.error === null
+  );
+}
+
+/** The turn searched the vault and genuinely found nothing to cite.
+ *
+ *  Zero surviving citations does not mean the vault held nothing — it can also
+ *  mean a note was read and the model answered without an [eN] marker, or the
+ *  verifier dropped the quote. In either of those the vault *did* cover it, so
+ *  "nothing covers this" would be a false claim about the user's own notes. The
+ *  card fires only when the turn read nothing (`notesRead` empty) and dropped
+ *  nothing; otherwise the footer and the model's own answer carry the account. */
+export function showsNothingFoundCard(turn: AssistantMessage): boolean {
+  return (
+    turn.done &&
+    turn.error === null &&
+    turn.coverage !== null &&
+    turn.coverage.searchedTerms.length > 0 &&
+    turn.coverage.notesRead.length === 0 &&
+    turn.citations.length === 0 &&
+    !turn.activity.some((step) => step.kind === "dropped")
+  );
 }
 
 /** Fold a `retrieved` event into the matching `searching` row (→ "searching X →

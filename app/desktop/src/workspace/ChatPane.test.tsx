@@ -9,7 +9,7 @@
 import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AiStatus, ChatEvent } from "../lib/types";
+import type { AiStatus, ChatEvent, ReasoningSupport } from "../lib/types";
 
 const { reportError } = vi.hoisted(() => ({ reportError: vi.fn() }));
 
@@ -26,6 +26,8 @@ vi.mock("../lib/api", async (importActual) => {
     aiStatus: vi.fn(),
     saveApiKey: vi.fn(),
     chat: vi.fn(),
+    setReasoning: vi.fn(),
+    refreshReasoningSupport: vi.fn(),
   };
 });
 
@@ -35,22 +37,32 @@ import { ChatPane } from "./ChatPane";
 const mockAiStatus = vi.mocked(api.aiStatus);
 const mockSave = vi.mocked(api.saveApiKey);
 const mockChat = vi.mocked(api.chat);
+const mockSetReasoning = vi.mocked(api.setReasoning);
+const mockRefreshSupport = vi.mocked(api.refreshReasoningSupport);
 
 const DEFAULT_MODEL = "anthropic/claude-sonnet-4.5";
 
 // ── AiStatus builders (the three effective-provider shapes the pane branches on) ──
+// `reasoningSupported` defaults to "unknown": no model has been probed, and
+// "unknown" is the fail-open verdict that leaves the reasoning toggle enabled.
 const unconfigured = (): AiStatus => ({
   activeProvider: null,
+  reasoningSupported: "unknown",
   openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false },
   local: { activeModelTag: null },
 });
-const openRouterActive = (model = DEFAULT_MODEL): AiStatus => ({
+const openRouterActive = (
+  model = DEFAULT_MODEL,
+  opts: { reasoning?: boolean; reasoningSupported?: ReasoningSupport } = {},
+): AiStatus => ({
   activeProvider: "openRouter",
-  openrouter: { hasKey: true, model, reasoning: false },
+  reasoningSupported: opts.reasoningSupported ?? "unknown",
+  openrouter: { hasKey: true, model, reasoning: opts.reasoning ?? false },
   local: { activeModelTag: null },
 });
 const localActive = (tag: string | null): AiStatus => ({
   activeProvider: "local",
+  reasoningSupported: "unknown",
   openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false },
   local: { activeModelTag: tag },
 });
@@ -121,8 +133,12 @@ const CITED_RUN: ChatEvent[] = [
 ];
 
 /** Land in the chat view with an active OpenRouter setup, then ask `prompt`. */
-async function askInChat(prompt: string, events: ChatEvent[]) {
-  mockAiStatus.mockResolvedValue(openRouterActive());
+async function askInChat(
+  prompt: string,
+  events: ChatEvent[],
+  status: AiStatus = openRouterActive(),
+) {
+  mockAiStatus.mockResolvedValue(status);
   const ctx = setup();
   await screen.findByLabelText("Ask across your vault");
   scriptChat(events);
@@ -135,7 +151,12 @@ beforeEach(() => {
   mockAiStatus.mockReset();
   mockSave.mockReset();
   mockChat.mockReset();
+  mockSetReasoning.mockReset();
+  mockRefreshSupport.mockReset();
   reportError.mockReset();
+  // The capability probe is network I/O with its own tests below; by default it
+  // stays in-flight so every other test renders pure mount-status state.
+  mockRefreshSupport.mockImplementation(() => new Promise<AiStatus>(() => {}));
 });
 
 afterEach(() => {
@@ -199,6 +220,7 @@ describe("ChatPane — first-run provider branching", () => {
   it("falls back to guided setup when openRouter is active without a key", async () => {
     mockAiStatus.mockResolvedValue({
       activeProvider: "openRouter",
+      reasoningSupported: "unknown",
       openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false },
       local: { activeModelTag: null },
     });
@@ -276,6 +298,7 @@ describe("ChatPane — key setup", () => {
     // could silently disagree after a core bump.
     mockAiStatus.mockResolvedValue({
       activeProvider: null,
+      reasoningSupported: "unknown",
       openrouter: { hasKey: false, model: "acme/echoed-default", reasoning: false },
       local: { activeModelTag: null },
     });
@@ -658,7 +681,290 @@ describe("ChatPane — chat view", () => {
       { type: "done" },
     ]);
 
-    expect(screen.getByText("Reasoning")).toBeInTheDocument();
+    expect(screen.getByText("Reasoning", { selector: "summary" })).toBeInTheDocument();
     expect(screen.getByText("weighing the evidence")).toBeInTheDocument();
+  });
+});
+
+describe("ChatPane — composer reasoning toggle", () => {
+  const chip = () => screen.getByRole("button", { name: "Show model reasoning" });
+  const findChip = () => screen.findByRole("button", { name: "Show model reasoning" });
+
+  it("renders the persisted opt-in from the status echo and probes support once", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive(DEFAULT_MODEL, { reasoning: true }));
+    // The probe echoes "unknown" — the fail-open verdict keeps the chip enabled.
+    mockRefreshSupport.mockResolvedValue(
+      openRouterActive(DEFAULT_MODEL, { reasoning: true }),
+    );
+    setup();
+
+    const toggle = await findChip();
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(toggle).toBeEnabled();
+    await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(1));
+  });
+
+  it("marks the toggle inert and shows the why — visibly — when the probe verified no support", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive("acme/no-thoughts"));
+    mockRefreshSupport.mockResolvedValue(
+      openRouterActive("acme/no-thoughts", { reasoningSupported: "unsupported" }),
+    );
+    setup();
+
+    const toggle = await findChip();
+    // aria-disabled, NOT native disabled: the explanatory state must stay
+    // reachable (see the focusability test below).
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "true"));
+    expect(toggle).not.toBeDisabled();
+    // The why names the model and is not hover-only: a plain visible line in
+    // the composer strip, doubling as the chip's accessible description.
+    expect(
+      screen.getByText("acme/no-thoughts can't return reasoning."),
+    ).toBeVisible();
+    expect(toggle).toHaveAccessibleDescription(
+      "acme/no-thoughts can't return reasoning.",
+    );
+  });
+
+  it("keeps the unsupported toggle focusable, and its click is a guarded no-op", async () => {
+    // The regression this pins: native `disabled` made the chip unfocusable,
+    // so no keyboard or screen-reader user could ever reach the explanation.
+    mockAiStatus.mockResolvedValue(openRouterActive("acme/no-thoughts"));
+    mockRefreshSupport.mockResolvedValue(
+      openRouterActive("acme/no-thoughts", { reasoningSupported: "unsupported" }),
+    );
+    const { user } = setup();
+
+    const toggle = await findChip();
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "true"));
+
+    // Reachable by keyboard — focusing it exposes the described why.
+    act(() => toggle.focus());
+    expect(toggle).toHaveFocus();
+    expect(toggle).toHaveAccessibleDescription(
+      "acme/no-thoughts can't return reasoning.",
+    );
+
+    // Focusable means the DOM won't block activation: the handler must.
+    await user.click(toggle);
+    await user.keyboard("{Enter}");
+    expect(mockSetReasoning).not.toHaveBeenCalled();
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+  });
+
+  it("fails open when the probe rejects: chip enabled, chat usable, failure surfaced", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    mockRefreshSupport.mockRejectedValue({
+      kind: "llm",
+      message: "models endpoint unreachable",
+    });
+    setup();
+
+    const toggle = await findChip();
+    await waitFor(() =>
+      expect(reportError).toHaveBeenCalledWith("models endpoint unreachable"),
+    );
+    // Never punish the user for our uncertainty: "unknown" keeps the toggle
+    // enabled and the chat view is not blocked.
+    expect(toggle).toBeEnabled();
+    expect(toggle).not.toHaveAttribute("aria-disabled");
+    expect(composer()).toBeEnabled();
+  });
+
+  it("re-probes when the selected model changes, not on a same-model refresh", async () => {
+    mockAiStatus
+      .mockResolvedValueOnce(openRouterActive("acme/one"))
+      .mockResolvedValueOnce(openRouterActive("acme/one")) // same model: no new probe
+      .mockResolvedValueOnce(openRouterActive("acme/two")); // model changed: re-probe
+    const openNoteAt = vi.fn();
+    const onOpenSettings = vi.fn();
+    const { rerender } = render(
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={0} />,
+    );
+    await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(1));
+
+    rerender(
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={1} />,
+    );
+    await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));
+    expect(mockRefreshSupport).toHaveBeenCalledTimes(1);
+
+    rerender(
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={2} />,
+    );
+    await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(2));
+  });
+
+  it("opts in with one set_reasoning call and renders the status the write returned", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    mockSetReasoning.mockResolvedValue(
+      openRouterActive(DEFAULT_MODEL, { reasoning: true }),
+    );
+    const { user } = setup();
+
+    await user.click(await findChip());
+
+    expect(mockSetReasoning).toHaveBeenCalledExactlyOnceWith(true);
+    await waitFor(() => expect(chip()).toHaveAttribute("aria-pressed", "true"));
+    // Rendered from the write's own echo — never a follow-up aiStatus read
+    // whose failure could show "off" while the config bills "on".
+    expect(mockAiStatus).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a rejected reasoning write inline and stays off", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    mockSetReasoning.mockRejectedValue({
+      kind: "io",
+      message: "could not write your AI settings",
+    });
+    const { user } = setup();
+
+    await user.click(await findChip());
+
+    // Never silent: a toggle that quietly failed to persist would misbill.
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "could not write your AI settings",
+    );
+    expect(chip()).toHaveAttribute("aria-pressed", "false");
+  });
+});
+
+describe("ChatPane — reasoning backstop notice", () => {
+  const BACKSTOP = /Reasoning was on, but the model didn't return any/;
+
+  it("shows one quiet notice when reasoning was on but no thinking arrived", async () => {
+    await askInChat(
+      "q",
+      [{ type: "answer", delta: "an answer" }, { type: "done" }],
+      openRouterActive(DEFAULT_MODEL, { reasoning: true }),
+    );
+
+    expect(screen.getByText(BACKSTOP)).toBeInTheDocument();
+    // It fills the slot the Reasoning disclosure would have taken — never both.
+    expect(document.querySelector("details")).toBeNull();
+  });
+
+  it("shows no notice when reasoning was off", async () => {
+    await askInChat("q", [{ type: "answer", delta: "an answer" }, { type: "done" }]);
+
+    expect(screen.queryByText(BACKSTOP)).not.toBeInTheDocument();
+  });
+
+  it("shows no notice when thinking actually arrived", async () => {
+    await askInChat(
+      "q",
+      [
+        { type: "thinking", delta: "weighing" },
+        { type: "answer", delta: "an answer" },
+        { type: "done" },
+      ],
+      openRouterActive(DEFAULT_MODEL, { reasoning: true }),
+    );
+
+    expect(screen.queryByText(BACKSTOP)).not.toBeInTheDocument();
+    expect(screen.getByText("Reasoning", { selector: "summary" })).toBeInTheDocument();
+  });
+
+  it("shows no notice on an unsupported model, which the app never asked", async () => {
+    // Reasoning is persisted on, but the model is verified unsupported, so the
+    // backend sends no reasoning by design. Blaming the model for returning none
+    // would be a false notice — and the toggle is disabled, so the user couldn't
+    // clear the opt-in to silence it. The turn pins the *effective* flag (false).
+    await askInChat(
+      "q",
+      [{ type: "answer", delta: "an answer" }, { type: "done" }],
+      openRouterActive("acme/no-thoughts", {
+        reasoning: true,
+        reasoningSupported: "unsupported",
+      }),
+    );
+
+    expect(screen.queryByText(BACKSTOP)).not.toBeInTheDocument();
+  });
+
+  it("judges the turn against the opt-in it started under, not a mid-stream flip", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive(DEFAULT_MODEL, { reasoning: true }));
+    const { user } = setup();
+    await screen.findByLabelText("Ask across your vault");
+
+    const gate = deferred<void>();
+    let emit!: (ev: ChatEvent) => void;
+    mockChat.mockImplementation((_p, _h, onEvent) => {
+      emit = onEvent;
+      return gate.promise; // stays in-flight while the user flips the toggle
+    });
+    await user.type(composer(), "q");
+    await user.click(sendButton());
+
+    // Mid-stream the user opts back OUT — persisted and rendered immediately…
+    mockSetReasoning.mockResolvedValue(openRouterActive());
+    await user.click(screen.getByRole("button", { name: "Show model reasoning" }));
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: "Show model reasoning" }),
+      ).toHaveAttribute("aria-pressed", "false"),
+    );
+
+    // …but the in-flight turn finishes with zero thinking and is judged against
+    // the opt-in pinned at its start: the notice still explains the absence.
+    await act(async () => {
+      emit({ type: "answer", delta: "an answer" });
+      emit({ type: "done" });
+      gate.resolve();
+      await gate.promise;
+    });
+    expect(screen.getByText(BACKSTOP)).toBeInTheDocument();
+  });
+});
+
+describe("ChatPane — the nothing-found card", () => {
+  const CARD_TITLE = "Nothing in your vault covers this";
+
+  it("lists the searched terms when the turn searched and nothing survived", async () => {
+    await askInChat("anything on quokkas?", [
+      { type: "searching", query: "quokka" },
+      { type: "retrieved", query: "quokka", hitCount: 0 },
+      { type: "answer", delta: "Your notes don't mention quokkas." },
+      {
+        type: "coverage",
+        searchedTerms: ["quokka", "marsupial"],
+        notesRead: [],
+        truncated: false,
+        skippedFiles: 0,
+      },
+      { type: "done" },
+    ]);
+
+    const title = screen.getByText(CARD_TITLE);
+    const terms = screen.getByRole("list", { name: "Searched terms" });
+    expect(within(terms).getByText("quokka")).toBeInTheDocument();
+    expect(within(terms).getByText("marsupial")).toBeInTheDocument();
+    // Honest guidance only — and NO capture CTA of any kind: nothing that
+    // could promise distillation/ingestion before Slice 5 makes it true.
+    expect(screen.getByText(/research this and add a note/i)).toBeInTheDocument();
+    expect(within(title.closest("div")!).queryAllByRole("button")).toHaveLength(0);
+  });
+
+  it("shows no card when a citation survived", async () => {
+    await askInChat("q", CITED_RUN);
+
+    expect(screen.queryByText(CARD_TITLE)).not.toBeInTheDocument();
+  });
+
+  it("shows no card when the run errored — the error box speaks alone", async () => {
+    await askInChat("q", [
+      { type: "searching", query: "x" },
+      {
+        type: "coverage",
+        searchedTerms: ["x"],
+        notesRead: [],
+        truncated: false,
+        skippedFiles: 0,
+      },
+      { type: "error", message: "rate limited" },
+    ]);
+
+    expect(screen.getByText("rate limited")).toBeInTheDocument();
+    expect(screen.queryByText(CARD_TITLE)).not.toBeInTheDocument();
   });
 });

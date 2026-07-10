@@ -56,18 +56,23 @@ const GIB = 1024 ** 3;
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
 
+// `reasoningSupported: "unknown"` — nothing has been probed, and "unknown" is the
+// fail-open verdict that leaves the reasoning toggle enabled.
 const UNCONFIGURED: AiStatus = {
   activeProvider: null,
+  reasoningSupported: "unknown",
   openrouter: { hasKey: false, model: "anthropic/claude-sonnet-4.5", reasoning: false },
   local: { activeModelTag: null },
 };
 const OR_ACTIVE: AiStatus = {
   activeProvider: "openRouter",
+  reasoningSupported: "unknown",
   openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5", reasoning: false },
   local: { activeModelTag: null },
 };
 const LOCAL_ACTIVE: AiStatus = {
   activeProvider: "local",
+  reasoningSupported: "unknown",
   openrouter: { hasKey: false, model: "anthropic/claude-sonnet-4.5", reasoning: false },
   local: { activeModelTag: "qwen2.5:7b" },
 };
@@ -632,5 +637,60 @@ describe("AiSettingsPage — OpenRouter reasoning toggle", () => {
     expect(await screen.findByText("reasoning write failed")).toBeInTheDocument();
     // Nothing was persisted, so the control never shows the opt-in.
     expect(screen.getByRole("checkbox", REASONING_TOGGLE)).not.toBeChecked();
+  });
+
+  it("disables the toggle and names the model when the probe verified no support", async () => {
+    mockAiStatus.mockResolvedValue({
+      ...OR_ACTIVE,
+      reasoningSupported: "unsupported",
+    });
+    setup();
+
+    const toggle = await screen.findByRole("checkbox", REASONING_TOGGLE);
+    expect(toggle).toBeDisabled();
+    // Disabled but never a mystery: the hint slot (already aria-associated)
+    // carries the why, naming the selected model — visible AND announced.
+    expect(toggle).toHaveAccessibleDescription(
+      "anthropic/claude-sonnet-4.5 can't return reasoning.",
+    );
+    expect(
+      screen.getByText("anthropic/claude-sonnet-4.5 can't return reasoning."),
+    ).toBeInTheDocument();
+    // No billing note for a toggle that can't spend anything.
+    expect(
+      screen.queryByText("Reasoning tokens are billed by OpenRouter."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("does not disable the OpenRouter toggle from a LOCAL model's verdict", async () => {
+    // reasoningSupported is keyed to the *effective* provider's model — when Local
+    // is active it describes the local tag, not the OpenRouter model. This card must
+    // not pair that verdict with `openrouter.model`: doing so declares a
+    // reasoning-capable OpenRouter model "can't return reasoning" (a fabrication) and
+    // disables a billed control the local model has nothing to do with.
+    mockAiStatus.mockResolvedValue({
+      activeProvider: "local",
+      reasoningSupported: "unsupported", // the LOCAL model's verdict
+      openrouter: { hasKey: true, model: "openai/gpt-4.1", reasoning: false },
+      local: { activeModelTag: "qwen3.5:9b" },
+    });
+    setup();
+
+    const toggle = await screen.findByRole("checkbox", REASONING_TOGGLE);
+    expect(toggle).not.toBeDisabled();
+    expect(
+      screen.queryByText("openai/gpt-4.1 can't return reasoning."),
+    ).not.toBeInTheDocument();
+  });
+
+  it("keeps the toggle enabled on an unprobed model — unknown fails open", async () => {
+    mockAiStatus.mockResolvedValue(OR_ACTIVE); // reasoningSupported: "unknown"
+    setup();
+
+    const toggle = await screen.findByRole("checkbox", REASONING_TOGGLE);
+    expect(toggle).toBeEnabled();
+    expect(
+      screen.getByText("Reasoning tokens are billed by OpenRouter."),
+    ).toBeInTheDocument();
   });
 });

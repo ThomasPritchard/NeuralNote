@@ -8,7 +8,7 @@
 
 use std::path::Path;
 
-use neuralnote_core::CoreError;
+use neuralnote_core::{ai::ReasoningSupport, CoreError};
 use tauri::AppHandle;
 use ts_rs::TS;
 
@@ -45,6 +45,7 @@ pub(crate) fn clear_api_key(app: AppHandle) -> Result<(), CoreError> {
 #[ts(export)]
 pub(crate) struct AiStatus {
     active_provider: Option<neuralnote_core::ai::ProviderKind>,
+    reasoning_supported: neuralnote_core::ai::ReasoningSupport,
     openrouter: OpenRouterStatus,
     local: LocalStatus,
 }
@@ -55,9 +56,9 @@ pub(crate) struct AiStatus {
 pub(crate) struct OpenRouterStatus {
     has_key: bool,
     model: String,
-    /// Whether the user has opted into OpenRouter's billed reasoning tokens. Lives on
-    /// the OpenRouter status, not the top-level `AiStatus`, because reasoning is an
-    /// OpenRouter-only capability — the Local (Ollama) path has no such concept.
+    /// Whether the user has opted into reasoning tokens. This remains on the existing
+    /// OpenRouter status DTO for compatibility, while both providers use the same
+    /// persisted opt-in.
     reasoning: bool,
 }
 
@@ -80,8 +81,10 @@ pub(crate) fn ai_status(app: AppHandle) -> Result<AiStatus, CoreError> {
 /// that `reasoning` surfaces on the OpenRouter status — is unit-testable without an
 /// `AppHandle`.
 fn build_ai_status(cfg: neuralnote_core::ai::ProviderConfig) -> AiStatus {
+    let reasoning_supported = cfg.cached_reasoning_support();
     AiStatus {
         active_provider: cfg.effective_provider(),
+        reasoning_supported,
         openrouter: OpenRouterStatus {
             has_key: cfg.key_configured,
             model: cfg.model,
@@ -120,9 +123,9 @@ pub(crate) fn set_active_provider(
     neuralnote_core::ai::write_provider_config(&dir, &cfg)
 }
 
-/// Opt into (or out of) OpenRouter's billed reasoning tokens on the answer turn.
-/// Persisted to the non-secret AI config; read back by `chat` to build the OpenRouter
-/// client. OpenRouter-only — the Local path never sends a reasoning request regardless.
+/// Opt into (or out of) reasoning tokens on the answer turn. Persisted to the
+/// non-secret AI config; `chat` combines it with the selected model's cached or
+/// freshly-probed capability before building the provider client.
 ///
 /// Returns the freshly persisted `AiStatus` (as `write_note` returns the saved
 /// `NoteDoc`). The caller must render *this*, never a follow-up `ai_status` read: a
@@ -136,6 +139,78 @@ pub(crate) fn set_reasoning(app: AppHandle, enabled: bool) -> Result<AiStatus, C
     cfg.reasoning = enabled;
     neuralnote_core::ai::write_provider_config(&dir, &cfg)?;
     Ok(build_ai_status(cfg))
+}
+
+/// Probe the effective provider's selected model for reasoning/thinking support,
+/// cache the verdict against that model, and return the freshly-persisted status.
+/// Every probe failure is cached as `Unknown`, never `Unsupported` (fail open).
+#[tauri::command]
+pub(crate) async fn refresh_reasoning_support(
+    app: AppHandle,
+    state: SharedState<'_>,
+) -> Result<AiStatus, CoreError> {
+    let dir = config_dir(&app)?;
+    let cfg = neuralnote_core::ai::read_provider_config(&dir)?;
+
+    match probed_verdict(&app, &state, &cfg).await {
+        Some((support, model)) => persist_reasoning_verdict(&dir, support, model),
+        None => Ok(build_ai_status(cfg)),
+    }
+}
+
+// TODO(config-write-serialization): the ai-config.json writers do read-modify-write
+// without a shared lock. `persist_reasoning_verdict` already narrows the blast radius —
+// it re-reads fresh and overwrites only the two capability fields, so the multi-second
+// probe window can't clobber a concurrent `set_reasoning` / `set_active_provider` /
+// `save_api_key`. What remains is the sub-ms gap between each writer's own read and write:
+// two writers landing in that window still lose one update. Acceptable while config writes
+// are rare and user-driven (you can't realistically race yourself across two settings
+// controls). Fix trigger: any writer that fires without direct user action (a background
+// re-probe, a sync loop) — then serialize all writers behind one async mutex.
+
+/// Persist a freshly-probed reasoning verdict without clobbering config that the
+/// probe's multi-second window let another writer change. The probe can run for
+/// seconds (OpenRouter ~8s, an Ollama cold-start ~30s); during it a concurrent
+/// `set_reasoning` / `set_active_provider` / `save_api_key` may land. Re-read fresh
+/// and overwrite ONLY the two capability fields, so those writes survive. Returns the
+/// persisted status so the caller renders exactly what reached disk.
+fn persist_reasoning_verdict(
+    dir: &Path,
+    support: ReasoningSupport,
+    probed_model: String,
+) -> Result<AiStatus, CoreError> {
+    let mut cfg = neuralnote_core::ai::read_provider_config(dir)?;
+    cfg.reasoning_support = Some(support);
+    cfg.reasoning_probed_model = Some(probed_model);
+    neuralnote_core::ai::write_provider_config(dir, &cfg)?;
+    Ok(build_ai_status(cfg))
+}
+
+async fn probed_verdict(
+    app: &AppHandle,
+    state: &SharedState<'_>,
+    cfg: &neuralnote_core::ai::ProviderConfig,
+) -> Option<(ReasoningSupport, String)> {
+    match cfg.effective_provider()? {
+        neuralnote_core::ai::ProviderKind::OpenRouter => Some((
+            ai::probe_openrouter_reasoning(&cfg.model).await,
+            cfg.model.clone(),
+        )),
+        neuralnote_core::ai::ProviderKind::Local => {
+            let tag = cfg.local_model_tag.clone()?;
+            let support = match local::ensure_ollama_started(app, state).await {
+                Ok(port) => local::probe_ollama_reasoning(port, &tag).await,
+                Err(e) => {
+                    log::warn!(
+                        "reasoning probe: local sidecar unavailable: {}",
+                        ai::error_detail(e)
+                    );
+                    ReasoningSupport::Unknown
+                }
+            };
+            Some((support, tag))
+        }
+    }
 }
 
 /// Detected host hardware (macOS-first; infallible — unknown fields read as
@@ -332,16 +407,23 @@ pub(crate) async fn chat(
             });
         }
         Some(ProviderKind::OpenRouter) => {
-            chat_via_openrouter(&mut run, &cfg.model, cfg.reasoning).await
+            let effective = neuralnote_core::ai::effective_reasoning(
+                cfg.reasoning,
+                cfg.cached_reasoning_support(),
+            );
+            chat_via_openrouter(&mut run, &cfg.model, effective).await
         }
-        Some(ProviderKind::Local) => match cfg.local_model_tag {
-            Some(tag) => chat_via_local(&mut run, &app, &state, &tag).await,
-            None => {
-                run.sink.send(ChatEvent::Error {
-                    message: "No local model selected. Set up Local AI in Settings.".into(),
-                });
+        Some(ProviderKind::Local) => {
+            let reasoning_opt_in = cfg.reasoning;
+            match cfg.local_model_tag {
+                Some(tag) => chat_via_local(&mut run, &app, &state, &tag, reasoning_opt_in).await,
+                None => {
+                    run.sink.send(ChatEvent::Error {
+                        message: "No local model selected. Set up Local AI in Settings.".into(),
+                    });
+                }
             }
-        },
+        }
     }
     Ok(())
 }
@@ -360,8 +442,8 @@ struct ChatRun<'a> {
 
 /// The OpenRouter chat arm: read the key, build the client, run the shared
 /// pipeline. Split out of `chat` so each provider's error handling stays flat;
-/// every failure lands on the sink (never silent). `reasoning` is the user's opt-in
-/// for billed reasoning tokens, read from the persisted config by the caller.
+/// every failure lands on the sink (never silent). `reasoning` is the effective
+/// cached-capability-aware flag computed by the caller.
 async fn chat_via_openrouter(run: &mut ChatRun<'_>, model: &str, reasoning: bool) {
     use neuralnote_core::ai::{run_chat, ChatEvent, EventSink};
 
@@ -407,6 +489,7 @@ async fn chat_via_local(
     app: &AppHandle,
     state: &SharedState<'_>,
     tag: &str,
+    reasoning_opt_in: bool,
 ) {
     use neuralnote_core::ai::{run_chat, ChatEvent, EventSink};
 
@@ -452,7 +535,9 @@ async fn chat_via_local(
             return;
         }
     }
-    let client = local::ollama_chat_client(port);
+    let support = local::probe_ollama_reasoning(port, tag).await;
+    let effective = neuralnote_core::ai::effective_reasoning(reasoning_opt_in, support);
+    let client = local::ollama_chat_client(port, effective);
     if let Err(e) = run_chat(
         run.prompt,
         run.history,
@@ -474,7 +559,52 @@ async fn chat_via_local(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use neuralnote_core::ai::ProviderConfig;
+    use neuralnote_core::ai::{
+        read_provider_config, write_provider_config, ProviderConfig, ProviderKind, ReasoningSupport,
+    };
+
+    #[test]
+    fn persist_reasoning_verdict_preserves_a_concurrent_write() {
+        // Reproduces the probe-window race: refresh_reasoning_support reads config,
+        // then awaits a multi-second probe (OpenRouter ~8s, an Ollama cold-start ~30s).
+        // During that await a concurrent writer — set_reasoning here, plus a model
+        // switch — persists new values. Persisting the verdict must NOT revert them:
+        // only the two capability fields are ours to write.
+        let dir = tempfile::tempdir().unwrap();
+        let concurrent = ProviderConfig {
+            active_provider: Some(ProviderKind::OpenRouter),
+            model: "user/switched-to-this".into(),
+            key_configured: true,
+            reasoning: false, // the user toggled reasoning OFF mid-probe
+            ..Default::default()
+        };
+        write_provider_config(dir.path(), &concurrent).unwrap();
+
+        // The fix drops the pre-await snapshot from the write path entirely: the verdict
+        // is persisted by re-reading the CURRENT config, so the concurrent write survives.
+        let status =
+            persist_reasoning_verdict(dir.path(), ReasoningSupport::Supported, "old/model".into())
+                .unwrap();
+
+        let persisted = read_provider_config(dir.path()).unwrap();
+        // The two capability fields are updated…
+        assert_eq!(
+            persisted.reasoning_support,
+            Some(ReasoningSupport::Supported)
+        );
+        assert_eq!(
+            persisted.reasoning_probed_model.as_deref(),
+            Some("old/model")
+        );
+        // …but every other field reflects the concurrent write, not the stale snapshot.
+        assert!(
+            !persisted.reasoning,
+            "a concurrent opt-out must survive the probe"
+        );
+        assert_eq!(persisted.model, "user/switched-to-this");
+        assert!(!status.openrouter.reasoning);
+        assert_eq!(status.openrouter.model, "user/switched-to-this");
+    }
 
     #[test]
     fn ai_status_surfaces_reasoning_flag_on_openrouter() {
@@ -494,5 +624,26 @@ mod tests {
             ..Default::default()
         });
         assert!(!off.openrouter.reasoning);
+    }
+
+    #[test]
+    fn ai_status_validates_reasoning_cache_against_selected_model() {
+        let valid = build_ai_status(ProviderConfig {
+            model: "openai/gpt-4.1".into(),
+            key_configured: true,
+            reasoning_support: Some(ReasoningSupport::Supported),
+            reasoning_probed_model: Some("openai/gpt-4.1".into()),
+            ..Default::default()
+        });
+        assert_eq!(valid.reasoning_supported, ReasoningSupport::Supported);
+
+        let stale = build_ai_status(ProviderConfig {
+            model: "new/model".into(),
+            key_configured: true,
+            reasoning_support: Some(ReasoningSupport::Unsupported),
+            reasoning_probed_model: Some("old/model".into()),
+            ..Default::default()
+        });
+        assert_eq!(stale.reasoning_supported, ReasoningSupport::Unknown);
     }
 }
