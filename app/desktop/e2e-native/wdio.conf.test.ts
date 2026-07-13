@@ -15,6 +15,11 @@ test("uses the workspace Cargo target for the native application", () => {
   };
 
   assert.equal(
+    "browserName" in capability,
+    false,
+    "tauri-driver rejects browserName because it is not part of its advertised capabilities",
+  );
+  assert.equal(
     capability["tauri:options"].application,
     path.resolve(here, "..", "..", "..", "target", "debug", `desktop${process.platform === "win32" ? ".exe" : ""}`),
   );

@@ -114,6 +114,10 @@ pub(crate) enum CheckedUnlink {
 struct LeafSnapshot {
     content: String,
     stat: libc::stat,
+    // Keep the inode alive for the whole decision. On Linux an unlinked inode can
+    // otherwise be recycled immediately, allowing a replacement to appear to
+    // have the same dev/inode identity as the file we originally inspected.
+    _file: File,
 }
 
 enum SnapshotLeaf {
@@ -632,7 +636,11 @@ impl StableDirectory {
         let stat = fstat_fd(file.as_raw_fd()).map_err(|error| {
             CoreError::Io(format!("could not re-check undo leaf '{leaf}': {error}"))
         })?;
-        Ok(SnapshotLeaf::Regular(LeafSnapshot { content, stat }))
+        Ok(SnapshotLeaf::Regular(LeafSnapshot {
+            content,
+            stat,
+            _file: file,
+        }))
     }
 }
 

@@ -59,8 +59,8 @@ export const config: WebdriverIO.Config = {
   capabilities: [
     {
       maxInstances: 1,
-      // `wry` is the Tauri webview engine name tauri-driver expects.
-      browserName: "wry",
+      // tauri-driver matches this vendor capability directly. Advertising a
+      // browserName makes session negotiation fail before the app can start.
       "tauri:options": { application },
     } as WebdriverIO.Capabilities,
   ],

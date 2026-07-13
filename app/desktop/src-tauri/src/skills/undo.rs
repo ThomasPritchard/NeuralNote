@@ -1,7 +1,10 @@
 //! Bounded, vault-scoped, content-safe Undo for files created by one skill run.
 
+#[cfg(unix)]
 use super::note_writer::{CheckedUnlink, ReadLeaf, StableDirectory};
-use neuralnote_core::ai::{note_content_hash, UndoCheck, UndoLedger};
+use neuralnote_core::ai::UndoLedger;
+#[cfg(unix)]
+use neuralnote_core::ai::{note_content_hash, UndoCheck};
 use neuralnote_core::{CoreError, CoreResult};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
@@ -141,6 +144,7 @@ pub(crate) fn next_chat_run_id() -> String {
 /// Apply one ledger as a best-effort report. Each entry is validated independently,
 /// so an edited or missing note never hides successful deletions of its unchanged
 /// siblings; the command decides whether the report is terminal or retryable.
+#[cfg(unix)]
 pub(crate) fn undo_ledger(root: &Path, ledger: &UndoLedger) -> UndoReport {
     let canonical_root = match root.canonicalize() {
         Ok(root) => root,
@@ -169,6 +173,25 @@ pub(crate) fn undo_ledger(root: &Path, ledger: &UndoLedger) -> UndoReport {
     }
 }
 
+/// Windows does not yet have the descriptor-confined filesystem capability used
+/// by Undo. Preserve every file and report the unavailable boundary explicitly.
+#[cfg(not(unix))]
+pub(crate) fn undo_ledger(_root: &Path, ledger: &UndoLedger) -> UndoReport {
+    UndoReport {
+        files: ledger
+            .entries()
+            .iter()
+            .map(|entry| {
+                failed(
+                    &entry.rel_path,
+                    "secure skill Undo is not supported on this platform".into(),
+                )
+            })
+            .collect(),
+    }
+}
+
+#[cfg(unix)]
 fn undo_entry(canonical_root: &Path, ledger: &UndoLedger, rel_path: &str) -> UndoFileResult {
     let (parent_rel, leaf) = match validate_undo_rel_path(rel_path) {
         Ok(parts) => parts,
@@ -226,6 +249,7 @@ fn undo_entry(canonical_root: &Path, ledger: &UndoLedger, rel_path: &str) -> Und
     }
 }
 
+#[cfg(unix)]
 fn undo_unlink_result(rel_path: &str, result: CheckedUnlink) -> UndoFileResult {
     match result {
         CheckedUnlink::Deleted => UndoFileResult::new(rel_path, UndoFileStatus::Deleted, None),
@@ -249,6 +273,7 @@ fn undo_unlink_result(rel_path: &str, result: CheckedUnlink) -> UndoFileResult {
 }
 
 // TODO(vault-rel-path): unify validate_note_path (write_policy.rs) and validate_undo_rel_path (skills/undo.rs) behind a core VaultRelPath newtype.
+#[cfg(unix)]
 fn validate_undo_rel_path(rel_path: &str) -> CoreResult<(PathBuf, String)> {
     if rel_path.trim().is_empty()
         || rel_path.starts_with(['/', '\\'])
@@ -283,6 +308,7 @@ fn validate_undo_rel_path(rel_path: &str) -> CoreResult<(PathBuf, String)> {
     Ok((parent, leaf))
 }
 
+#[cfg(unix)]
 fn has_windows_drive_prefix(path: &str) -> bool {
     let bytes = path.as_bytes();
     bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
@@ -292,6 +318,7 @@ fn failed(rel_path: &str, message: String) -> UndoFileResult {
     UndoFileResult::new(rel_path, UndoFileStatus::Failed, Some(message))
 }
 
+#[cfg(unix)]
 fn edited(rel_path: &str, message: &str) -> UndoFileResult {
     UndoFileResult::new(
         rel_path,
@@ -300,6 +327,7 @@ fn edited(rel_path: &str, message: &str) -> UndoFileResult {
     )
 }
 
+#[cfg(unix)]
 fn missing(rel_path: &str, message: &str) -> UndoFileResult {
     UndoFileResult::new(
         rel_path,
@@ -308,7 +336,7 @@ fn missing(rel_path: &str, message: &str) -> UndoFileResult {
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
     use crate::skills::FsNoteWriteBackend;

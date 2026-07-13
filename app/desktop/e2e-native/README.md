@@ -52,7 +52,7 @@ xvfb-run npm test       # Linux (headless display)
 | File | Purpose |
 | --- | --- |
 | `wdio-build.ts` | Cross-platform, no-shell Tauri build invocation and explicit build-result validation. |
-| `wdio.conf.ts` | WebdriverIO config: `browserName: "wry"` + `tauri:options.application` pointing at the debug binary; spawns/stops `tauri-driver`; builds the app in `onPrepare`. |
+| `wdio.conf.ts` | WebdriverIO config: `tauri:options.application` pointing at the debug binary; spawns/stops `tauri-driver`; builds the app in `onPrepare`. |
 | `tauri.e2e.conf.json` | Build overlay that removes the Ollama sidecars and resources; the smoke test does not exercise local AI. |
 | `specs/smoke.spec.ts` | Smoke test: the window boots and the welcome brand heading + vault entry points are visible. |
 
