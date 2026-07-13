@@ -1,4 +1,10 @@
-# NeuralNote
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="assets/brand/neuralnote-lockup-dark-bg.png">
+    <source media="(prefers-color-scheme: light)" srcset="assets/brand/neuralnote-lockup-light-bg.png">
+    <img src="assets/brand/neuralnote-lockup-light-bg.png" alt="NeuralNote" width="480">
+  </picture>
+</p>
 
 [![CI](https://github.com/ThomasPritchard/NeuralNote/actions/workflows/ci.yml/badge.svg)](https://github.com/ThomasPritchard/NeuralNote/actions/workflows/ci.yml)
 [![Native E2E](https://github.com/ThomasPritchard/NeuralNote/actions/workflows/e2e.yml/badge.svg)](https://github.com/ThomasPritchard/NeuralNote/actions/workflows/e2e.yml)
