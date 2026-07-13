@@ -21,7 +21,8 @@ import type {
   PullEvent,
   Recommendation,
 } from "../lib/types";
-import { BTN_PRIMARY, BTN_QUIET } from "./buttonStyles";
+import { buttonVariants } from "@/components/ui/button";
+import { Progress } from "@/components/ui/progress";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { LABEL } from "./KeySetupPanel";
 import { ActiveBadge, InlineError, LoadingRow, ProviderCard } from "./ProviderCard";
@@ -293,7 +294,7 @@ export function LocalAiCard({
           type="button"
           onClick={() => cancelPull(c.tag)}
           disabled={cancelling}
-          className={BTN_QUIET}
+          className={buttonVariants({ tone: "quiet", size: "sm" })}
         >
           {cancelling ? "Cancelling…" : "Cancel"}
         </button>
@@ -319,7 +320,9 @@ export function LocalAiCard({
         disabled={pull !== null || installedScan.status === "error"}
         className={cn(
           "flex items-center gap-1.5",
-          c.tag === recommendedTag ? BTN_PRIMARY : BTN_QUIET,
+          c.tag === recommendedTag
+            ? buttonVariants({ tone: "primary", size: "sm" })
+            : buttonVariants({ tone: "quiet", size: "sm" }),
         )}
       >
         <Download className="size-3.5" aria-hidden />
@@ -447,21 +450,9 @@ export function LocalAiCard({
                               : ` · ${Math.round(pull.percent)}%`}
                           </span>
                         </div>
-                        {/* Native progressbar; the vendor pseudo-elements
-                            reproduce the token look (muted track, primary fill
-                            with the violet glow). Percent-less frames render as
-                            0% — value never goes undefined, so no engine falls
-                            into its own indeterminate animation. */}
-                        <progress
+                        <Progress
                           aria-label={`Downloading ${c.tag}`}
-                          max={100}
                           value={pull.percent ?? 0}
-                          className={cn(
-                            "h-1.5 w-full appearance-none overflow-hidden rounded-full border-none bg-muted",
-                            "[&::-webkit-progress-bar]:rounded-full [&::-webkit-progress-bar]:bg-muted",
-                            "[&::-webkit-progress-value]:rounded-full [&::-webkit-progress-value]:bg-primary [&::-webkit-progress-value]:shadow-[0_0_8px_var(--color-primary)] [&::-webkit-progress-value]:transition-[width] [&::-webkit-progress-value]:duration-300",
-                            "[&::-moz-progress-bar]:rounded-full [&::-moz-progress-bar]:bg-primary [&::-moz-progress-bar]:shadow-[0_0_8px_var(--color-primary)]",
-                          )}
                         />
                       </div>
                     )}
@@ -489,7 +480,7 @@ export function LocalAiCard({
               <button
                 type="button"
                 onClick={() => void refreshInstalled()}
-                className={cn("flex items-center gap-1.5", BTN_QUIET)}
+                className={buttonVariants({ tone: "quiet", size: "sm" })}
               >
                 <RefreshCw className="size-3.5" aria-hidden />
                 Retry
@@ -531,7 +522,7 @@ export function LocalAiCard({
                         type="button"
                         onClick={() => activateLocalModel(m.tag)}
                         disabled={switching}
-                        className={BTN_QUIET}
+                        className={buttonVariants({ tone: "quiet", size: "sm" })}
                       >
                         Use this model
                       </button>

@@ -8,10 +8,13 @@ import type { ChatEvent } from "../lib/types";
 import {
   emptyAssistant,
   groupActivity,
+  isPartialSkillRun,
   reduceAssistant,
   resolveAnswerMarkers,
+  showsNothingFoundCard,
   stripCitationMarkers,
   summarizeActivity,
+  modelReportedProvenance,
   toHistory,
   userMessage,
   type ActivityStep,
@@ -20,10 +23,201 @@ import {
   type CitationView,
 } from "./chatMessage";
 
+describe("skill report context", () => {
+  it("extracts distinct caption and Whisper provenance in first-seen order", () => {
+    const turn = {
+      ...emptyAssistant(),
+      skillSteps: [
+        "Video 1 of 3 landed with captions:en-auto.",
+        "Video 2 of 3 landed with whisper:small.en; captions:en-auto was already used.",
+      ],
+      answer: "Transcript provenance: whisper:small.en",
+    };
+
+    expect(modelReportedProvenance(turn)).toEqual([
+      "captions:en-auto",
+      "whisper:small.en",
+    ]);
+  });
+
+  it("marks a settled skill run partial only when output survived a stop", () => {
+    const partial = {
+      ...emptyAssistant(),
+      done: true,
+      skillActivations: [{ id: "youtube-distil", name: "YouTube distil" }],
+      writtenNotes: [{ relPath: "Literature/One.md", kind: "literature" as const }],
+      skillSteps: ["Cancelled after video 1 of 4."],
+    };
+    expect(isPartialSkillRun(partial)).toBe(true);
+    expect(isPartialSkillRun({ ...partial, writtenNotes: [] })).toBe(false);
+    expect(isPartialSkillRun({ ...partial, done: false })).toBe(false);
+  });
+});
+
 /** Fold a whole event script over a fresh assistant turn. */
 function run(events: ChatEvent[]): AssistantMessage {
   return events.reduce(reduceAssistant, emptyAssistant());
 }
+
+describe("emptyAssistant", () => {
+  it("defaults reasoning to not requested", () => {
+    expect(emptyAssistant().reasoningRequested).toBe(false);
+  });
+
+  it("pins a requested reasoning opt-in onto the turn", () => {
+    expect(emptyAssistant(true).reasoningRequested).toBe(true);
+  });
+
+  it("starts every skill-bank accumulator empty", () => {
+    const turn = emptyAssistant();
+    expect(turn.skillActivations).toEqual([]);
+    expect(turn.skillSteps).toEqual([]);
+    expect(turn.pendingElicitation).toBeNull();
+    expect(turn.writtenNotes).toEqual([]);
+  });
+});
+
+describe("reduceAssistant — skills bank", () => {
+  it("accumulates skill activations and progress steps in arrival order", () => {
+    const turn = run([
+      { type: "skillActivated", id: "first", name: "First skill" },
+      { type: "skillStep", message: "Fetching source" },
+      { type: "skillActivated", id: "second", name: "Second skill" },
+      { type: "skillStep", message: "Writing notes" },
+    ]);
+
+    expect(turn.skillActivations).toEqual([
+      { id: "first", name: "First skill" },
+      { id: "second", name: "Second skill" },
+    ]);
+    expect(turn.skillSteps).toEqual(["Fetching source", "Writing notes"]);
+  });
+
+  it("stores the latest elicitation as the pending prompt", () => {
+    const first = {
+      type: "elicit" as const,
+      id: "prompt-1",
+      question: "Continue?",
+      options: [
+        {
+          id: "yes",
+          label: "Yes",
+          description: "Proceed",
+          imageDataUri: null,
+        },
+      ],
+      multiSelect: false,
+    };
+    const second = {
+      type: "elicit" as const,
+      id: "prompt-2",
+      question: "Choose notes",
+      options: [
+        {
+          id: "a",
+          label: "Note A",
+          description: null,
+          imageDataUri: "data:image/png;base64,abc",
+        },
+      ],
+      multiSelect: true,
+    };
+
+    const turn = run([first, second]);
+
+    expect(turn.pendingElicitation).toEqual({
+      id: "prompt-2",
+      question: "Choose notes",
+      options: second.options,
+      multiSelect: true,
+    });
+  });
+
+  it("accumulates written notes with their actual paths and kinds", () => {
+    const turn = run([
+      { type: "noteWritten", relPath: "Literature/Name.md", kind: "literature" },
+      { type: "noteWritten", relPath: "Atomic/Idea.md", kind: "atomic" },
+    ]);
+
+    expect(turn.writtenNotes).toEqual([
+      { relPath: "Literature/Name.md", kind: "literature" },
+      { relPath: "Atomic/Idea.md", kind: "atomic" },
+    ]);
+  });
+});
+
+describe("showsNothingFoundCard", () => {
+  // A genuine miss: the search surfaced nothing worth reading, so the turn read
+  // no note and cited none. `notesRead` is empty — that is what makes "nothing
+  // covers this" a true statement rather than a contradiction of the footer.
+  const searchedCoverage = {
+    searchedTerms: ["active recall"],
+    notesRead: [],
+    truncated: false,
+    skippedFiles: 0,
+  };
+  const finishedMiss: AssistantMessage = {
+    ...emptyAssistant(),
+    coverage: searchedCoverage,
+    done: true,
+  };
+
+  it("shows when a finished search read and cited nothing", () => {
+    expect(showsNothingFoundCard(finishedMiss)).toBe(true);
+  });
+
+  it("stays hidden when a note was read but not cited", () => {
+    // The model read a relevant note and answered in prose without an [eN]
+    // marker (a hedge, or a weak model paraphrasing). Zero citations, but the
+    // vault plainly *did* cover it — the footer names the note. Claiming
+    // "nothing covers this" here is a false statement about the user's notes;
+    // the answer and the footer carry the account instead.
+    const coverage = { ...searchedCoverage, notesRead: ["Learning.md"] };
+    expect(showsNothingFoundCard({ ...finishedMiss, coverage })).toBe(false);
+  });
+
+  it("stays hidden while the turn is running", () => {
+    expect(showsNothingFoundCard({ ...finishedMiss, done: false })).toBe(false);
+  });
+
+  it("stays hidden when the turn failed", () => {
+    expect(showsNothingFoundCard({ ...finishedMiss, error: "search failed" })).toBe(false);
+  });
+
+  it("stays hidden without coverage", () => {
+    expect(showsNothingFoundCard({ ...finishedMiss, coverage: null })).toBe(false);
+  });
+
+  it("stays hidden when the turn searched no terms", () => {
+    const coverage = { ...searchedCoverage, searchedTerms: [] };
+    expect(showsNothingFoundCard({ ...finishedMiss, coverage })).toBe(false);
+  });
+
+  it("stays hidden when every citation was dropped in verification", () => {
+    // Zero surviving citations has two very different causes. The vault may
+    // genuinely hold nothing — or it held the note and the verifier rejected
+    // the quote (`a_citation_whose_note_changed_mid_answer_is_dropped`).
+    // Telling the user "nothing covers this" in the second case is a false
+    // statement about their own notes. The dropped rows in the activity trace
+    // are the honest account; the card must stand down.
+    const turn: AssistantMessage = {
+      ...finishedMiss,
+      activity: [{ kind: "dropped", reason: "quote not found in source" }],
+    };
+    expect(showsNothingFoundCard(turn)).toBe(false);
+  });
+
+  it("stays hidden when at least one citation survived", () => {
+    const citation: CitationView = {
+      id: "e1",
+      relPath: "Learning.md",
+      startLine: 3,
+      endLine: 7,
+      text: "Active recall improves retention.",
+    };
+    expect(showsNothingFoundCard({ ...finishedMiss, citations: [citation] })).toBe(false);
+  });
+});
 
 describe("reduceAssistant — activity log", () => {
   it("appends a search row, then merges the retrieved count into it", () => {
@@ -107,6 +301,19 @@ describe("reduceAssistant — citations, coverage, terminal events", () => {
       truncated: true,
       skippedFiles: 1,
     });
+  });
+
+  it("retains a truncated listing-only coverage footer without showing nothing found", () => {
+    const footer = {
+      searchedTerms: [],
+      notesRead: [],
+      truncated: true,
+      skippedFiles: 0,
+    };
+    const turn = run([{ type: "coverage", ...footer }, { type: "done" }]);
+    expect(turn.coverage).not.toBeNull();
+    expect(turn.coverage).toEqual(footer);
+    expect(showsNothingFoundCard(turn)).toBe(false);
   });
 
   it("marks the turn done on `done`", () => {

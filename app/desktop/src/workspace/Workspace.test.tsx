@@ -660,6 +660,14 @@ describe("Workspace — titlebar + sidebar", () => {
     expect(captured.titlebar.noteDirty).toBe(true);
   });
 
+  it("keeps both secondary panes mounted in the compact workspace", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const panes = screen.getByTestId("workspace-panes");
+    expect(panes).toContainElement(screen.getByTestId("filetree"));
+    expect(panes).toContainElement(screen.getByTestId("chatpane"));
+  });
+
   it("collapses the sidebar (unmounting the file tree) via the titlebar toggle", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);

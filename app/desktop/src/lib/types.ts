@@ -33,11 +33,24 @@ export type { CoreError } from "./bindings/CoreError";
 // ── Generated: AI cited chat (events.rs + desktop ai.rs) ──────────────────────
 export type { ApiKeyStatus } from "./bindings/ApiKeyStatus";
 export type { ChatEvent } from "./bindings/ChatEvent";
+export type { Elicitation } from "./bindings/Elicitation";
+export type { ElicitOption } from "./bindings/ElicitOption";
+export type { NoteKind } from "./bindings/NoteKind";
+export type { UndoReport } from "./bindings/UndoReport";
+export type { UndoFileResult } from "./bindings/UndoFileResult";
+export type { UndoFileStatus } from "./bindings/UndoFileStatus";
+
+// ── Generated: AI built-in skills (skills.rs) ───────────────────────────────
+export type { Requirement } from "./bindings/Requirement";
+export type { RequirementStatus } from "./bindings/RequirementStatus";
+export type { SkillRequirement } from "./bindings/SkillRequirement";
+export type { SkillListing } from "./bindings/SkillListing";
 
 // ── Generated: AI provider selection (provider_config.rs + ai/local/*.rs) ─────
 export type { ProviderKind } from "./bindings/ProviderKind";
 export type { AiStatus } from "./bindings/AiStatus";
 export type { OpenRouterStatus } from "./bindings/OpenRouterStatus";
+export type { ReasoningSupport } from "./bindings/ReasoningSupport";
 export type { LocalStatus } from "./bindings/LocalStatus";
 export type { HardwareSpec } from "./bindings/HardwareSpec";
 export type { CandidateModel } from "./bindings/CandidateModel";

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import type { NoteIndexEntry } from "./linkResolve";
@@ -62,6 +62,24 @@ describe("Markdown", () => {
     // preventDefault means the click is swallowed; just assert it does not throw.
     await userEvent.click(link);
     expect(link).toBeInTheDocument();
+  });
+
+  it("does not render the old blockquote side stripe", () => {
+    render(<Markdown body="> a quote" />);
+    expect(screen.getByText("a quote").closest("blockquote")?.className).not.toContain(
+      "border-l",
+    );
+  });
+
+  it("replaces rejected and failed images with an accessible fallback", () => {
+    const { rerender } = render(<Markdown body="![unsafe](javascript:alert(1))" />);
+    expect(screen.queryByRole("img", { name: "unsafe" })).not.toBeInTheDocument();
+    expect(screen.getByText("Image unavailable: unsafe")).toBeInTheDocument();
+
+    rerender(<Markdown body="![diagram](https://example.com/diagram.png)" />);
+    fireEvent.error(screen.getByRole("img", { name: "diagram" }));
+    expect(screen.queryByRole("img", { name: "diagram" })).not.toBeInTheDocument();
+    expect(screen.getByText("Image unavailable: diagram")).toBeInTheDocument();
   });
 
   it("renders [[wikilinks]] as literal text when no note index is provided (chat)", () => {

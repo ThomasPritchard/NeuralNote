@@ -9,16 +9,33 @@
 
 use crate::ai::events::{ChatEvent, EventSink};
 use crate::ai::evidence::EvidenceRegistry;
-use crate::ai::llm::{LlmClient, LlmMessage, LlmRequest, ToolCall};
+use crate::ai::llm::{LlmClient, LlmMessage, LlmRequest, Role, ToolCall, UserPrompt};
 use crate::ai::retrieval::RetrievalProvider;
+use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
 use crate::ai::tools::{self, dispatch, ToolOutcome};
 use crate::ai::verify::CitationVerifier;
+use crate::ai::write_policy::{NoteWriteBackend, UndoLedger, WriteSession};
+use crate::ai::youtube::{
+    CaptureCancellation, ExtractorUpdateSession, YoutubeIo, YoutubeToolSession,
+    UNAVAILABLE_YOUTUBE_IO,
+};
+use crate::capture::{PricingInput, UnavailableVaultProfileIo, VaultProfileIo};
 use crate::error::CoreResult;
 use std::path::Path;
+
+const MAX_PLAYLIST_TURNS_PER_ITEM: usize = 8;
 
 /// The default OpenRouter model — BYO-key, OpenAI-compatible, user-editable in the
 /// shell. Kept here as the client-agnostic default the host can override.
 pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.5";
+
+/// Marker substring the frontend keys activation-failure rendering on.
+/// TS mirror: app/desktop/src/workspace/ChatMessages.tsx `ACTIVATION_FAILURE_MARK`.
+/// A wording change is a two-site edit; the tripwire is
+/// `disabled_fixture_preload_surfaces_a_recoverable_error_without_activation`
+/// in `tests/skill_orchestrator.rs`, which asserts the emitted `SkillStep`
+/// message contains this constant.
+pub const SKILL_ACTIVATION_FAILURE_MARK: &str = "could not be activated";
 
 /// Loop guards — cost- and runaway-protection (spec §4). Defaults suit a single
 /// own-vault user; the host may tune them.
@@ -45,24 +62,120 @@ impl Default for Guards {
     }
 }
 
-const SYSTEM_PROMPT: &str =
-    "You are NeuralNote's research assistant. You answer questions strictly from the \
-user's own notes, using the tools provided to search and read them.\n\n\
-Rules you must follow:\n\
-- Answer ONLY from evidence you retrieved with the tools. Never use outside \
-knowledge and never guess.\n\
-- Before answering, issue 3 to 8 varied searches: try synonyms, tags, note titles, \
-and the user's own wording. Keyword search is literal, so rephrase generously.\n\
-- The vault is organised into folders. Call `list_folders` to see them (each with its \
-note count). When the user asks about a specific folder — e.g. \"what's in my Recipes \
-folder\" or \"search my Work notes\" — pass that folder's path as the `folder` argument \
-to `search_notes` or `list_notes` to scope to it and its subfolders; omit `folder` to \
-cover the whole vault.\n\
-- Cite every claim with the evidence id in square brackets, e.g. [e1] or [e2]. \
-Cite ids only — never a file path, and never a quote you did not retrieve.\n\
-- If the notes do not contain the answer, say so plainly. Do not invent a citation \
-or an answer.\n\
-- Keep the answer concise and grounded in the cited evidence.";
+const SYSTEM_PROMPT: &str = r#"You are NeuralNote's assistant. You help the user think with, and about, their own notes.
+
+Choose a mode for each message.
+
+CONVERSE — answer directly, call no tools:
+- greetings, thanks, small talk
+- questions about you, your abilities, or something you just said
+- follow-ups that need only your own previous answer
+
+RESEARCH — you MUST search before answering:
+- any question about facts, or about anything in the user's notes or material
+- Issue 3 to 8 varied searches: try synonyms, tags, note titles, and the user's own
+  wording. Keyword search is literal, so rephrase generously.
+- The vault is organised into folders. Call `list_folders` to see them (each with its
+  note count). When the user asks about a specific folder — e.g. "what's in my Recipes
+  folder" — pass that folder's path as the `folder` argument to `search_notes` or
+  `list_notes` to scope to it and its subfolders; omit `folder` to cover the whole vault.
+- Cite every claim with the evidence id in square brackets, e.g. [e1] or [e2]. Cite ids
+  only — never a file path, and never a quote you did not retrieve.
+
+These hold in both modes:
+- Never answer a factual question from your own knowledge. Your knowledge is for
+  conversation, not for facts.
+- If your searches find nothing relevant, say so plainly: name what you searched for,
+  and invite the user to add a note on the topic so you can answer it next time. Never
+  invent a citation or an answer.
+- Keep answers concise and grounded in the cited evidence."#;
+
+/// Shell-supplied seams and pure skill policy for one chat run.
+pub struct SkillServices<'a> {
+    registry: &'a SkillRegistry,
+    environment: &'a SkillEnvironment,
+    user_prompt: &'a dyn UserPrompt,
+    note_writer: &'a dyn NoteWriteBackend,
+    work_items: usize,
+    youtube_io: &'a dyn YoutubeIo,
+    youtube_requirements: &'a dyn crate::ai::youtube::YoutubeRequirementInstaller,
+    vault_profile_io: &'a dyn VaultProfileIo,
+    capture_cancellation: CaptureCancellation,
+    pricing: Option<&'a PricingInput>,
+    extractor_updates: ExtractorUpdateSession,
+}
+
+static UNAVAILABLE_VAULT_PROFILE_IO: UnavailableVaultProfileIo = UnavailableVaultProfileIo;
+
+impl<'a> SkillServices<'a> {
+    pub fn new(
+        registry: &'a SkillRegistry,
+        environment: &'a SkillEnvironment,
+        user_prompt: &'a dyn UserPrompt,
+        note_writer: &'a dyn NoteWriteBackend,
+        work_items: usize,
+    ) -> Self {
+        Self {
+            registry,
+            environment,
+            user_prompt,
+            note_writer,
+            work_items,
+            youtube_io: &UNAVAILABLE_YOUTUBE_IO,
+            youtube_requirements: &crate::ai::youtube::UNAVAILABLE_YOUTUBE_REQUIREMENT_INSTALLER,
+            vault_profile_io: &UNAVAILABLE_VAULT_PROFILE_IO,
+            capture_cancellation: CaptureCancellation::default(),
+            pricing: None,
+            // Non-host callers get an isolated allowance; the desktop shell overrides
+            // this with its app-session-owned update state through the builder below.
+            extractor_updates: ExtractorUpdateSession::default(),
+        }
+    }
+
+    pub fn with_youtube_io(mut self, youtube_io: &'a dyn YoutubeIo) -> Self {
+        self.youtube_io = youtube_io;
+        self
+    }
+
+    pub fn with_youtube_requirements(
+        mut self,
+        installer: &'a dyn crate::ai::youtube::YoutubeRequirementInstaller,
+    ) -> Self {
+        self.youtube_requirements = installer;
+        self
+    }
+
+    pub fn with_vault_profile_io(mut self, profile_io: &'a dyn VaultProfileIo) -> Self {
+        self.vault_profile_io = profile_io;
+        self
+    }
+
+    pub fn with_capture_cancellation(mut self, cancellation: CaptureCancellation) -> Self {
+        self.capture_cancellation = cancellation;
+        self
+    }
+
+    pub fn with_pricing(mut self, pricing: &'a PricingInput) -> Self {
+        self.pricing = Some(pricing);
+        self
+    }
+
+    /// Override the current per-run default with update state retained by a host.
+    pub fn with_extractor_update_session(mut self, updates: ExtractorUpdateSession) -> Self {
+        self.extractor_updates = updates;
+        self
+    }
+}
+
+fn system_prompt(registry: &SkillRegistry) -> String {
+    let catalogue = registry.catalogue();
+    let catalogue = if catalogue.is_empty() {
+        "(none)"
+    } else {
+        &catalogue
+    };
+    format!("{SYSTEM_PROMPT}\n\nAVAILABLE SKILLS\n{catalogue}")
+}
 
 /// Run one chat turn end-to-end, streaming [`ChatEvent`]s to `sink`.
 ///
@@ -75,29 +188,44 @@ or an answer.\n\
 // shell supplies, so grouping them into a struct would only obscure the call site.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_chat(
-    user_prompt: &str,
+    user_input: &str,
     history: &[LlmMessage],
+    active_skills: Vec<String>,
     root: &Path,
     model: &str,
     provider: &dyn RetrievalProvider,
     llm: &dyn LlmClient,
+    skill_services: &SkillServices<'_>,
     sink: &mut dyn EventSink,
     guards: &Guards,
-) -> CoreResult<()> {
+) -> CoreResult<UndoLedger> {
     let session = ChatSession {
         root,
         model,
         provider,
         llm,
+        skill_services,
         guards,
     };
-    if let Err(e) = session.drive(user_prompt, history, sink).await {
+    let mut writes = match WriteSession::new(skill_services.work_items) {
+        Ok(writes) => writes,
+        Err(error) => {
+            sink.send(ChatEvent::Error {
+                message: error.to_string(),
+            });
+            return Ok(UndoLedger::default());
+        }
+    };
+    if let Err(e) = session
+        .drive(user_input, history, &active_skills, &mut writes, sink)
+        .await
+    {
         // Surface the failure explicitly and stop — never a panic, never silent.
         sink.send(ChatEvent::Error {
             message: e.to_string(),
         });
     }
-    Ok(())
+    Ok(writes.into_ledger())
 }
 
 /// The collaborators for one run, bundled so the loop's helpers stay small.
@@ -106,6 +234,7 @@ struct ChatSession<'a> {
     model: &'a str,
     provider: &'a dyn RetrievalProvider,
     llm: &'a dyn LlmClient,
+    skill_services: &'a SkillServices<'a>,
     guards: &'a Guards,
 }
 
@@ -118,11 +247,69 @@ struct CoverageAcc {
     skipped_files: u32,
 }
 
+struct ThinkingCounter<'a> {
+    inner: &'a mut dyn EventSink,
+    count: usize,
+}
+
+#[derive(Default)]
+struct PlaylistLoopState {
+    context_chars: usize,
+    announced_item: Option<usize>,
+    summary_emitted: bool,
+}
+
+impl PlaylistLoopState {
+    fn sync(
+        &mut self,
+        messages: &mut Vec<LlmMessage>,
+        youtube_session: &mut YoutubeToolSession,
+        sink: &mut dyn EventSink,
+    ) {
+        sync_playlist_control(
+            messages,
+            youtube_session,
+            sink,
+            &mut self.context_chars,
+            &mut self.announced_item,
+            &mut self.summary_emitted,
+        );
+    }
+}
+
+enum LoopControl {
+    Proceed,
+    Continue,
+    Return(bool),
+}
+
+enum EvidenceCollection {
+    Answer { guard_tripped: bool },
+    CompleteTurn,
+}
+
+#[derive(Default)]
+struct ToolBatchControl {
+    budget_hit: bool,
+    complete_turn: bool,
+}
+
+impl EventSink for ThinkingCounter<'_> {
+    fn send(&mut self, event: ChatEvent) {
+        if matches!(&event, ChatEvent::Thinking { .. }) {
+            self.count += 1;
+        }
+        self.inner.send(event);
+    }
+}
+
 impl ChatSession<'_> {
     async fn drive(
         &self,
-        user_prompt: &str,
+        user_input: &str,
         history: &[LlmMessage],
+        preloaded_skills: &[String],
+        writes: &mut WriteSession,
         sink: &mut dyn EventSink,
     ) -> CoreResult<()> {
         // Sanitise history in the core (strip stale `[eN]` markers, window to a char
@@ -130,17 +317,75 @@ impl ChatSession<'_> {
         // out of a local model's context window, and a stale marker can't mis-cite —
         // regardless of which client built the history. See `prepare_history`.
         let history = prepare_history(history);
-        let mut messages = Vec::with_capacity(history.len() + 2);
-        messages.push(LlmMessage::system(SYSTEM_PROMPT));
+        let mut messages = Vec::with_capacity(history.len() + preloaded_skills.len() + 2);
+        messages.push(LlmMessage::system(system_prompt(
+            self.skill_services.registry,
+        )));
+        let mut active_skills = ActiveSkills::new(self.guards.max_iterations);
+        for id in preloaded_skills {
+            let activation = match active_skills.activate(
+                id,
+                self.skill_services.registry,
+                self.skill_services.environment,
+            ) {
+                Ok(activation) => activation,
+                Err(error) => {
+                    sink.send(ChatEvent::SkillStep {
+                        message: format!(
+                            "Skill '{id}' {SKILL_ACTIVATION_FAILURE_MARK}: {error} — continuing without it"
+                        ),
+                    });
+                    // A preload has no genuine tool-call id. Preserve protocol order
+                    // with system context carrying the same recoverable JSON error a
+                    // rejected `use_skill` call would return, then continue ungranted.
+                    messages.push(LlmMessage::system(format!(
+                        "A preloaded skill could not be activated; continue without it.\n{}",
+                        serde_json::json!({ "error": error })
+                    )));
+                    continue;
+                }
+            };
+            if activation.newly_activated {
+                sink.send(ChatEvent::SkillActivated {
+                    id: activation.manifest.id.clone(),
+                    name: activation.manifest.name.clone(),
+                });
+                // Preloads have no genuine tool-call id, so instructions enter as a
+                // system turn. Synthesising assistant/tool messages would violate
+                // the chat protocol; activation policy and grants remain shared.
+                messages.push(LlmMessage::system(format!(
+                    "Activated skill `{}`:\n\n{}",
+                    activation.manifest.id, activation.manifest.instructions
+                )));
+            }
+        }
         messages.extend(history);
-        messages.push(LlmMessage::user(user_prompt));
+        messages.push(LlmMessage::user(user_input));
 
-        let tools = tools::tool_schemas();
         let mut registry = EvidenceRegistry::new();
         let mut coverage = CoverageAcc::default();
-        let guard_tripped = self
-            .collect_evidence(&mut messages, &tools, &mut registry, &mut coverage, sink)
+        let mut youtube_session = YoutubeToolSession::new_with_update_session(
+            self.skill_services.capture_cancellation.clone(),
+            self.skill_services.extractor_updates.clone(),
+        );
+        let collection = self
+            .collect_evidence(
+                &mut messages,
+                &mut active_skills,
+                writes,
+                &mut youtube_session,
+                &mut registry,
+                &mut coverage,
+                sink,
+            )
             .await?;
+        let guard_tripped = match collection {
+            EvidenceCollection::Answer { guard_tripped } => guard_tripped,
+            EvidenceCollection::CompleteTurn => {
+                sink.send(ChatEvent::Done);
+                return Ok(());
+            }
+        };
 
         // Verify + answer phase. Verifying is the UI cue that the answer is being
         // grounded; the actual citation checks run once we have the streamed text.
@@ -150,7 +395,36 @@ impl ChatSession<'_> {
         // cost of keeping tool-parsing non-streamed while the answer streams live.
         // No tools are advertised on this turn: it is unambiguously an answer, so the
         // model can't emit a tool call that streaming would silently swallow.
-        let answer = self.stream_final_answer(&messages, sink).await?;
+        let (answer, thinking_count) = {
+            let mut counting_sink = ThinkingCounter {
+                inner: sink,
+                count: 0,
+            };
+            let answer = self
+                .stream_final_answer(&messages, &mut counting_sink)
+                .await?;
+            (answer, counting_sink.count)
+        };
+
+        if answer.trim().is_empty() {
+            let message = if thinking_count > 0 {
+                "the model returned only reasoning and no answer — try again or switch model"
+            } else {
+                "the model returned an empty answer"
+            };
+            // Don't let the empty-answer return drop the truncation/skip signal — a
+            // tripped guard is often WHY the answer came back empty. emit_coverage
+            // otherwise runs only on the success path below; surface it here too, but
+            // only when it carries that signal, so a plain searched-but-empty turn
+            // stays a bare Error (whitespace_only_answer_after_search_emits_error_and_stops).
+            if guard_tripped || coverage.truncated || coverage.skipped_files > 0 {
+                emit_coverage(coverage, guard_tripped, sink);
+            }
+            sink.send(ChatEvent::Error {
+                message: message.to_string(),
+            });
+            return Ok(());
+        }
 
         self.emit_citations(&answer, &registry, sink);
         emit_coverage(coverage, guard_tripped, sink);
@@ -166,22 +440,52 @@ impl ChatSession<'_> {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn collect_evidence(
         &self,
         messages: &mut Vec<LlmMessage>,
-        tools: &[serde_json::Value],
+        active_skills: &mut ActiveSkills,
+        writes: &mut WriteSession,
+        youtube_session: &mut YoutubeToolSession,
         registry: &mut EvidenceRegistry,
         coverage: &mut CoverageAcc,
         sink: &mut dyn EventSink,
-    ) -> CoreResult<bool> {
-        let mut context_chars = 0usize;
-        for _ in 0..self.guards.max_iterations {
+    ) -> CoreResult<EvidenceCollection> {
+        let mut consumed = 0usize;
+        let mut playlist = PlaylistLoopState::default();
+        loop {
+            match playlist_preflight(messages, youtube_session, sink, &mut playlist) {
+                LoopControl::Proceed => {}
+                LoopControl::Continue => continue,
+                LoopControl::Return(guard_tripped) => {
+                    return Ok(EvidenceCollection::Answer { guard_tripped });
+                }
+            }
+            if iteration_guard_reached(youtube_session, active_skills, consumed) {
+                // Out of turns while the previous turn still issued tool calls — the
+                // model was mid-work, so coverage is partial, not complete.
+                return Ok(EvidenceCollection::Answer {
+                    guard_tripped: true,
+                });
+            }
+            let tools = tools::tool_schemas(&active_skills.authorized_tools());
+            // Freeze authorization for the whole model turn. If one parallel batch
+            // calls `use_skill` then `write_note`, the write was not advertised in
+            // this request and cannot consume the newly granted capability early.
+            let authorized_tools = tools::advertised_tool_names(&tools);
             // TODO(llm-retry): add one bounded backoff retry for idempotent
             // tool-deciding `complete` turns on transient 429/5xx/dropped connection
             // (not the streaming answer, PA-029).
-            let completion = self.llm.complete(&self.request(messages, tools)).await?;
+            let completion = self.llm.complete(&self.request(messages, &tools)).await?;
+            consumed += 1;
             if completion.tool_calls.is_empty() {
-                return Ok(false); // the model chose to answer — a clean stop
+                match handle_empty_tool_turn(messages, youtube_session, sink, &mut playlist) {
+                    LoopControl::Continue => continue,
+                    LoopControl::Return(guard_tripped) => {
+                        return Ok(EvidenceCollection::Answer { guard_tripped });
+                    }
+                    LoopControl::Proceed => unreachable!("empty tool turn always resolves"),
+                }
             }
 
             // The protocol requires the assistant's tool-call turn before its results,
@@ -189,70 +493,148 @@ impl ChatSession<'_> {
             messages.push(LlmMessage::assistant_tool_calls(
                 completion.tool_calls.clone(),
             ));
-            if self.handle_tool_calls(
-                &completion.tool_calls,
-                messages,
-                registry,
-                coverage,
-                sink,
-                &mut context_chars,
-            ) {
-                return Ok(true); // evidence / context budget spent
+            let control = self
+                .handle_tool_calls(
+                    &completion.tool_calls,
+                    messages,
+                    active_skills,
+                    writes,
+                    youtube_session,
+                    &authorized_tools,
+                    registry,
+                    coverage,
+                    sink,
+                    &mut playlist.context_chars,
+                )
+                .await;
+            playlist.sync(messages, youtube_session, sink);
+            if let Some(outcome) = collection_after_tool_batch(&control, youtube_session) {
+                return Ok(outcome);
             }
         }
-
-        // Out of turns while the previous turn still issued tool calls — the model
-        // was mid-search, so coverage is partial, not complete.
-        Ok(true)
     }
 
-    fn handle_tool_calls(
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_tool_calls(
         &self,
         calls: &[ToolCall],
         messages: &mut Vec<LlmMessage>,
+        active_skills: &mut ActiveSkills,
+        writes: &mut WriteSession,
+        youtube_session: &mut YoutubeToolSession,
+        authorized_tools: &std::collections::BTreeSet<String>,
         registry: &mut EvidenceRegistry,
         coverage: &mut CoverageAcc,
         sink: &mut dyn EventSink,
         context_chars: &mut usize,
-    ) -> bool {
-        let mut budget_hit = false;
+    ) -> ToolBatchControl {
+        let mut control = ToolBatchControl::default();
+        let mut playlist_cancelled = false;
+        let batch_playlist_item = youtube_session
+            .playlist_current()
+            .map(|(index, _, _)| index);
+        let mut playlist_batch_closed = false;
         for call in calls {
-            if budget_hit {
+            if playlist_batch_closed {
+                push_stale_playlist_tool_result(messages, call);
+                continue;
+            }
+            if !playlist_cancelled
+                && youtube_session.playlist_is_active()
+                && youtube_session.cancellation().is_cancelled()
+            {
+                youtube_session.cancel_playlist_remaining();
+                playlist_cancelled = true;
+            }
+            if playlist_cancelled {
+                push_cancelled_tool_result(messages, call);
+                continue;
+            }
+            if control.budget_hit {
                 push_skipped_tool_result(messages, call);
                 continue;
             }
-            self.push_tool_result(messages, call, registry, coverage, sink, context_chars);
+            control.complete_turn |= self
+                .push_tool_result(
+                    messages,
+                    call,
+                    active_skills,
+                    writes,
+                    youtube_session,
+                    authorized_tools,
+                    registry,
+                    coverage,
+                    sink,
+                    context_chars,
+                )
+                .await
+                == tools::ToolControl::CompleteTurn;
+            let current_playlist_item = youtube_session
+                .playlist_current()
+                .map(|(index, _, _)| index);
+            playlist_batch_closed = current_playlist_item != batch_playlist_item
+                || (batch_playlist_item.is_some()
+                    && call.name == tools::TOOL_SELECT_PLAYLIST_VIDEOS);
             // Check the caps INSIDE the per-call loop: one turn issuing many
             // search calls (each up to MAX_SEARCH_RESULTS spans) must not blow
             // past the caps before the guard fires — that is the token-cost spike
             // the guard exists to prevent (a BYO-key user pays for it).
-            if self.evidence_budget_spent(registry, *context_chars) {
-                budget_hit = true;
+            if self.evidence_budget_spent(registry, *context_chars, active_skills) {
+                control.budget_hit = true;
             }
         }
-        budget_hit
+        control
     }
 
-    fn push_tool_result(
+    #[allow(clippy::too_many_arguments)]
+    async fn push_tool_result(
         &self,
         messages: &mut Vec<LlmMessage>,
         call: &ToolCall,
+        active_skills: &mut ActiveSkills,
+        writes: &mut WriteSession,
+        youtube_session: &mut YoutubeToolSession,
+        authorized_tools: &std::collections::BTreeSet<String>,
         registry: &mut EvidenceRegistry,
         coverage: &mut CoverageAcc,
         sink: &mut dyn EventSink,
         context_chars: &mut usize,
-    ) {
-        let result = self.handle_tool_call(call, registry, coverage, sink);
+    ) -> tools::ToolControl {
+        let result = self
+            .handle_tool_call(
+                call,
+                active_skills,
+                writes,
+                youtube_session,
+                authorized_tools,
+                registry,
+                coverage,
+                sink,
+            )
+            .await;
+        if result.outcome == ToolOutcome::Rejected
+            && youtube_session.playlist_is_active()
+            && call.name != tools::TOOL_SELECT_PLAYLIST_VIDEOS
+        {
+            youtube_session.fail_playlist_item(format!("tool '{}' was rejected", call.name));
+        }
         *context_chars += result.content.len();
         messages.push(LlmMessage::tool_result(
             &call.id,
             &call.name,
             result.content,
         ));
+        result.control
     }
 
-    fn evidence_budget_spent(&self, registry: &EvidenceRegistry, context_chars: usize) -> bool {
-        registry.len() >= self.guards.max_spans || context_chars >= self.guards.max_context_chars
+    fn evidence_budget_spent(
+        &self,
+        registry: &EvidenceRegistry,
+        context_chars: usize,
+        active_skills: &ActiveSkills,
+    ) -> bool {
+        registry.len() >= self.guards.max_spans
+            || context_chars >= active_skills.max_context_chars(self.guards.max_context_chars)
     }
 
     async fn stream_final_answer(
@@ -267,9 +649,14 @@ impl ChatSession<'_> {
 
     /// Dispatch one tool call, emitting the live step events and folding its result
     /// into the coverage accumulator.
-    fn handle_tool_call(
+    #[allow(clippy::too_many_arguments)]
+    async fn handle_tool_call(
         &self,
         call: &ToolCall,
+        active_skills: &mut ActiveSkills,
+        writes: &mut WriteSession,
+        youtube_session: &mut YoutubeToolSession,
+        authorized_tools: &std::collections::BTreeSet<String>,
         registry: &mut EvidenceRegistry,
         coverage: &mut CoverageAcc,
         sink: &mut dyn EventSink,
@@ -280,7 +667,34 @@ impl ChatSession<'_> {
                 sink.send(ChatEvent::Searching { query });
             }
         }
-        let result = dispatch(&call.name, &call.arguments, self.provider, registry);
+        let result = {
+            let mut context = tools::ToolContext::new(
+                self.root,
+                self.skill_services.registry,
+                self.skill_services.environment,
+                active_skills,
+                self.skill_services.note_writer,
+                writes,
+                sink,
+                authorized_tools,
+            )
+            .with_youtube(self.skill_services.youtube_io, youtube_session)
+            .with_youtube_requirements(self.skill_services.youtube_requirements)
+            .with_vault_profile_io(self.skill_services.vault_profile_io);
+            if let Some(pricing) = self.skill_services.pricing {
+                context = context.with_pricing(pricing);
+            }
+            dispatch(
+                &call.id,
+                &call.name,
+                &call.arguments,
+                self.provider,
+                registry,
+                self.skill_services.user_prompt,
+                &mut context,
+            )
+            .await
+        };
         match &result.outcome {
             ToolOutcome::Searched {
                 query,
@@ -316,7 +730,7 @@ impl ChatSession<'_> {
             }
             // Metadata listing needs no event; a rejected call's error is in the tool
             // result the model reads.
-            ToolOutcome::Listed | ToolOutcome::Rejected => {}
+            ToolOutcome::Listed | ToolOutcome::Action | ToolOutcome::Rejected => {}
         }
         result
     }
@@ -346,6 +760,171 @@ impl ChatSession<'_> {
     }
 }
 
+fn iteration_guard_reached(
+    youtube_session: &YoutubeToolSession,
+    active_skills: &ActiveSkills,
+    consumed: usize,
+) -> bool {
+    !youtube_session.playlist_is_active()
+        && !youtube_session.playlist_is_finished()
+        && consumed >= active_skills.max_iterations(consumed)
+}
+
+fn collection_after_tool_batch(
+    control: &ToolBatchControl,
+    youtube_session: &YoutubeToolSession,
+) -> Option<EvidenceCollection> {
+    if control.complete_turn {
+        return Some(EvidenceCollection::CompleteTurn);
+    }
+    if youtube_session.playlist_is_finished() {
+        return Some(EvidenceCollection::Answer {
+            guard_tripped: false,
+        });
+    }
+    // An evidence/context budget ends only an ordinary run. An active playlist
+    // owns its separate bounded per-item control loop.
+    if control.budget_hit && !youtube_session.playlist_is_active() {
+        return Some(EvidenceCollection::Answer {
+            guard_tripped: true,
+        });
+    }
+    None
+}
+
+fn playlist_preflight(
+    messages: &mut Vec<LlmMessage>,
+    youtube_session: &mut YoutubeToolSession,
+    sink: &mut dyn EventSink,
+    state: &mut PlaylistLoopState,
+) -> LoopControl {
+    if !youtube_session.playlist_is_active() {
+        return LoopControl::Proceed;
+    }
+    if youtube_session.cancellation().is_cancelled() {
+        youtube_session.cancel_playlist_remaining();
+        state.sync(messages, youtube_session, sink);
+        return LoopControl::Return(true);
+    }
+    let over_turn_limit = youtube_session
+        .record_playlist_turn()
+        .is_some_and(|turns| turns > MAX_PLAYLIST_TURNS_PER_ITEM);
+    if !over_turn_limit {
+        return LoopControl::Proceed;
+    }
+    youtube_session.fail_playlist_item(format!(
+        "exceeded the bounded {MAX_PLAYLIST_TURNS_PER_ITEM}-turn work-item allowance"
+    ));
+    state.sync(messages, youtube_session, sink);
+    if youtube_session.playlist_is_finished() {
+        LoopControl::Return(false)
+    } else {
+        LoopControl::Continue
+    }
+}
+
+fn handle_empty_tool_turn(
+    messages: &mut Vec<LlmMessage>,
+    youtube_session: &mut YoutubeToolSession,
+    sink: &mut dyn EventSink,
+    state: &mut PlaylistLoopState,
+) -> LoopControl {
+    if !youtube_session.playlist_is_active() {
+        return LoopControl::Return(false);
+    }
+    youtube_session.fail_playlist_item(
+        "model stopped before both literature and transcript notes were written",
+    );
+    state.sync(messages, youtube_session, sink);
+    if youtube_session.playlist_is_finished() {
+        LoopControl::Return(false)
+    } else {
+        LoopControl::Continue
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sync_playlist_control(
+    messages: &mut Vec<LlmMessage>,
+    youtube_session: &mut YoutubeToolSession,
+    sink: &mut dyn EventSink,
+    context_chars: &mut usize,
+    announced_item: &mut Option<usize>,
+    summary_emitted: &mut bool,
+) {
+    let outcomes = youtube_session.take_unreported_playlist_outcomes();
+    if !outcomes.is_empty() {
+        compact_completed_playlist_context(messages, context_chars);
+        for outcome in outcomes {
+            let message = match outcome {
+                crate::ai::youtube::PlaylistItemOutcome::Succeeded { video_id } => {
+                    format!("Playlist video {video_id} succeeded")
+                }
+                crate::ai::youtube::PlaylistItemOutcome::Failed { video_id, reason } => {
+                    format!("Playlist video {video_id} failed: {reason}")
+                }
+                crate::ai::youtube::PlaylistItemOutcome::Cancelled { video_id } => {
+                    format!("Playlist video {video_id} cancelled")
+                }
+            };
+            sink.send(ChatEvent::SkillStep { message });
+        }
+    }
+
+    if youtube_session.playlist_is_finished() {
+        if !*summary_emitted {
+            messages.push(LlmMessage::system(format!(
+                "PLAYLIST EXECUTION SUMMARY\n{}",
+                youtube_session.playlist_summary().unwrap_or_default()
+            )));
+            *summary_emitted = true;
+        }
+        return;
+    }
+
+    if let Some((index, total, video_id)) = youtube_session.playlist_current() {
+        if *announced_item != Some(index) {
+            messages.push(LlmMessage::system(format!(
+                "Implementation control: process playlist video {}/{} with id '{}'. Use write_note work_item {}. Do not move to another video until both its literature and transcript notes have been written; failures are recorded explicitly by the host.",
+                index + 1,
+                total,
+                video_id,
+                index
+            )));
+            *announced_item = Some(index);
+        }
+    }
+}
+
+fn compact_completed_playlist_context(messages: &mut [LlmMessage], context_chars: &mut usize) {
+    for message in messages.iter_mut() {
+        if message.role == Role::Assistant {
+            for call in &mut message.tool_calls {
+                if call.arguments.len() > 512 {
+                    call.arguments = r#"{"context_evicted":"completed playlist work item"}"#.into();
+                }
+            }
+        }
+        if message.role == Role::Tool
+            && message
+                .content
+                .as_ref()
+                .is_some_and(|content| content.len() > 512)
+        {
+            message.content = Some(
+                r#"{"context_evicted":"completed playlist work item; report-card events and Undo ledger preserved"}"#
+                    .into(),
+            );
+        }
+    }
+    *context_chars = messages
+        .iter()
+        .filter(|message| message.role == Role::Tool)
+        .filter_map(|message| message.content.as_ref())
+        .map(String::len)
+        .sum();
+}
+
 fn push_skipped_tool_result(messages: &mut Vec<LlmMessage>, call: &ToolCall) {
     // Over budget already this turn: don't dispatch further, but the protocol
     // still needs a result for every declared call, so the model is told the call
@@ -357,14 +936,46 @@ fn push_skipped_tool_result(messages: &mut Vec<LlmMessage>, call: &ToolCall) {
     ));
 }
 
+fn push_cancelled_tool_result(messages: &mut Vec<LlmMessage>, call: &ToolCall) {
+    messages.push(LlmMessage::tool_result(
+        &call.id,
+        &call.name,
+        r#"{"error":{"kind":"capture_cancelled","message":"skipped: playlist capture was cancelled before this call"}}"#,
+    ));
+}
+
+fn push_stale_playlist_tool_result(messages: &mut Vec<LlmMessage>, call: &ToolCall) {
+    messages.push(LlmMessage::tool_result(
+        &call.id,
+        &call.name,
+        r#"{"error":{"kind":"stale_playlist_batch","message":"skipped: the playlist work item for this assistant batch has already resolved"}}"#,
+    ));
+}
+
 fn emit_coverage(coverage: CoverageAcc, guard_tripped: bool, sink: &mut dyn EventSink) {
+    let truncated = coverage.truncated || guard_tripped;
+
+    // A conversational turn searched and read nothing, so an empty footer would be a
+    // lie of precision — say nothing instead. But suppress only when the footer would
+    // carry *no* information: a run can trip a guard (or skip files) having called
+    // only `list_notes`/`list_folders`, which populate neither vector, and dropping
+    // the footer there would hide the truncation. Partial coverage is visible, never
+    // hidden (see `ChatEvent::Coverage`).
+    if coverage.searched_terms.is_empty()
+        && coverage.notes_read.is_empty()
+        && !truncated
+        && coverage.skipped_files == 0
+    {
+        return;
+    }
+
     sink.send(ChatEvent::Coverage {
         searched_terms: coverage.searched_terms,
         notes_read: coverage.notes_read,
         // "Partial coverage" = the sweep was genuinely cut short: a loop guard
         // stopped it, OR the vault search hit its own global cap (`coverage.truncated`
         // now carries only that, not a routine per-search `max_results` clip).
-        truncated: coverage.truncated || guard_tripped,
+        truncated,
         skipped_files: coverage.skipped_files,
     });
 }
@@ -429,11 +1040,12 @@ fn is_evidence_prefix(bytes: &[u8], pos: usize) -> bool {
 
 /// Max chars of prior-conversation history carried into a chat request. History is
 /// otherwise unbounded — a long conversation resends every turn — and, combined with
-/// the tool-result budget (`Guards::max_context_chars`, 60k chars), could push a local
-/// model's prompt past its context window. Ollama then silently truncates from the
+/// the base tool-result budget (`Guards::max_context_chars`, 60k chars; a bounded
+/// source-heavy skill may raise it), could push a local model's prompt past its
+/// context window. Ollama then silently truncates from the
 /// FRONT, dropping the grounding rules (sent first) and the earliest evidence — which
 /// breaks cited recall, the moat. Sized conservatively so
-/// `system + history + max_context_chars + the answer` stay within the smallest
+/// `system + history + the active tool-result ceiling + the answer` stay within the smallest
 /// supported local window (`local::OLLAMA_NUM_CTX` = 32_768 tokens) with headroom; the
 /// large-context cloud provider is unaffected in practice, and the cap also bounds
 /// per-turn token cost. Keeps the most recent turns; older ones drop (each turn
@@ -441,7 +1053,7 @@ fn is_evidence_prefix(bytes: &[u8], pos: usize) -> bool {
 //
 // TODO(token-aware-context-budget): all budgets here are in CHARS with an implicit
 // ~4-chars/token assumption. A CJK/symbol-dense vault tokenises closer to ~2 chars/token,
-// so a near-max evidence turn (`max_context_chars` 60k) could still exceed a small local
+// so a near-max source-heavy turn (currently up to 96k) could still exceed a small local
 // `num_ctx` and be silently front-truncated. The robust fix is a token-aware (or
 // provider-aware) budget that counts the *assembled* prompt against the active window
 // before send — deferred because it couples to the model's RAM sizing. The English/Latin
@@ -512,14 +1124,102 @@ fn prepare_history(history: &[LlmMessage]) -> Vec<LlmMessage> {
 mod tests {
     use super::*;
     use crate::ai::events::VecSink;
-    use crate::ai::llm::Completion;
+    use crate::ai::llm::{Completion, NoUserPrompt};
+    use crate::ai::local::HardwareSpec;
     use crate::ai::retrieval::KeywordRetriever;
+    use crate::ai::skills::{SkillEnvironment, SkillRegistry};
+    use crate::ai::write_policy::UnavailableNoteWriter;
+    use crate::ai::{
+        CaptionPayload, CaptionRequest, CaptureCancellation, Elicitation, MetadataPayload,
+        NotePathState, NoteWriteBackend, NoteWriteParent, OpenedNoteParent, PlaylistPayload,
+        ThumbnailPayload, VideoId, YoutubeIo, YoutubeUrl, YOUTUBE_DISTIL_SKILL_ID,
+    };
+    use crate::capture::{CaptureError, PricingInput};
     use crate::error::CoreError;
     use async_trait::async_trait;
     use futures::executor::block_on;
-    use std::collections::VecDeque;
+    use std::collections::{BTreeSet, VecDeque};
     use std::fs;
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+    use std::path::PathBuf;
     use std::sync::Mutex;
+
+    #[test]
+    fn system_prompt_defines_converse_and_research_modes() {
+        assert!(SYSTEM_PROMPT.contains("CONVERSE"));
+        assert!(SYSTEM_PROMPT.contains("RESEARCH"));
+    }
+
+    #[test]
+    fn system_prompt_scopes_the_search_mandate_to_research_mode() {
+        let research = SYSTEM_PROMPT.find("RESEARCH").expect("RESEARCH mode");
+        let search_mandate = SYSTEM_PROMPT
+            .find("Issue 3 to 8 varied searches")
+            .expect("research search mandate");
+
+        assert!(search_mandate > research);
+    }
+
+    #[test]
+    fn system_prompt_does_not_promise_unavailable_capture_skills() {
+        let prompt = SYSTEM_PROMPT.to_lowercase();
+
+        assert!(!prompt.contains("youtube"));
+        assert!(!prompt.contains("distil"));
+        assert!(!prompt.contains("pdf"));
+    }
+
+    #[test]
+    fn coverage_is_suppressed_on_a_conversational_turn() {
+        // "hello" searches nothing and reads nothing. An empty footer is a lie of
+        // precision, so emit no footer at all.
+        let mut sink = VecSink::default();
+        emit_coverage(CoverageAcc::default(), false, &mut sink);
+        assert!(sink.events.is_empty());
+    }
+
+    #[test]
+    fn coverage_still_reports_a_tripped_guard_with_no_searches() {
+        // `list_notes` / `list_folders` yield `ToolOutcome::Listed`, populating neither
+        // `searched_terms` nor `notes_read` — yet they can still trip `max_iterations`
+        // or `max_context_chars`. Suppressing the footer there would hide the
+        // truncation, and "partial coverage is visible, never hidden" (events.rs).
+        let mut sink = VecSink::default();
+        emit_coverage(CoverageAcc::default(), true, &mut sink);
+        assert!(
+            matches!(
+                sink.events.as_slice(),
+                [ChatEvent::Coverage {
+                    truncated: true,
+                    ..
+                }]
+            ),
+            "a cut-short run must surface its truncation, got {:?}",
+            sink.events
+        );
+    }
+
+    #[test]
+    fn coverage_still_reports_skipped_files_with_no_searches() {
+        let coverage = CoverageAcc {
+            skipped_files: 3,
+            ..CoverageAcc::default()
+        };
+        let mut sink = VecSink::default();
+        emit_coverage(coverage, false, &mut sink);
+        assert!(
+            matches!(
+                sink.events.as_slice(),
+                [ChatEvent::Coverage {
+                    skipped_files: 3,
+                    ..
+                }]
+            ),
+            "skipped files must never be silently dropped, got {:?}",
+            sink.events
+        );
+    }
 
     /// A scripted, network-free [`LlmClient`]. `completions` are popped by each
     /// `complete` turn; `answer` is streamed by `complete_streaming`. An optional
@@ -537,6 +1237,9 @@ mod tests {
         reasoning: Vec<String>,
         #[allow(clippy::type_complexity)]
         before_answer: Option<Box<dyn Fn() + Send + Sync>>,
+        max_request_chars: std::sync::atomic::AtomicUsize,
+        completion_requests: Mutex<Vec<Vec<LlmMessage>>>,
+        streaming_messages: Mutex<Vec<LlmMessage>>,
     }
 
     impl MockLlmClient {
@@ -548,6 +1251,9 @@ mod tests {
                 streaming_tools_len: Mutex::new(None),
                 reasoning: Vec::new(),
                 before_answer: None,
+                max_request_chars: std::sync::atomic::AtomicUsize::new(0),
+                completion_requests: Mutex::new(Vec::new()),
+                streaming_messages: Mutex::new(Vec::new()),
             }
         }
 
@@ -559,6 +1265,9 @@ mod tests {
                 streaming_tools_len: Mutex::new(None),
                 reasoning: Vec::new(),
                 before_answer: None,
+                max_request_chars: std::sync::atomic::AtomicUsize::new(0),
+                completion_requests: Mutex::new(Vec::new()),
+                streaming_messages: Mutex::new(Vec::new()),
             }
         }
 
@@ -571,11 +1280,31 @@ mod tests {
             self.reasoning = deltas.iter().map(|d| d.to_string()).collect();
             self
         }
+
+        fn max_request_chars(&self) -> usize {
+            self.max_request_chars
+                .load(std::sync::atomic::Ordering::SeqCst)
+        }
+
+        fn completion_requests(&self) -> Vec<Vec<LlmMessage>> {
+            self.completion_requests.lock().unwrap().clone()
+        }
+
+        fn streaming_messages(&self) -> Vec<LlmMessage> {
+            self.streaming_messages.lock().unwrap().clone()
+        }
     }
 
     #[async_trait]
     impl LlmClient for MockLlmClient {
-        async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+        async fn complete(&self, req: &LlmRequest) -> CoreResult<Completion> {
+            let request_chars = serde_json::to_string(&req.messages).unwrap().len();
+            self.max_request_chars
+                .fetch_max(request_chars, std::sync::atomic::Ordering::SeqCst);
+            self.completion_requests
+                .lock()
+                .unwrap()
+                .push(req.messages.clone());
             if self.fail {
                 return Err(CoreError::Llm("mock transport failure: boom".into()));
             }
@@ -597,6 +1326,7 @@ mod tests {
             sink: &mut dyn EventSink,
         ) -> CoreResult<String> {
             *self.streaming_tools_len.lock().unwrap() = Some(req.tools.len());
+            *self.streaming_messages.lock().unwrap() = req.messages.clone();
             if let Some(hook) = &self.before_answer {
                 hook();
             }
@@ -662,16 +1392,867 @@ mod tests {
         dir
     }
 
+    struct PlaylistPrompt(Mutex<VecDeque<Option<Vec<String>>>>);
+
+    #[async_trait]
+    impl UserPrompt for PlaylistPrompt {
+        async fn ask(&self, _elicitation: Elicitation) -> CoreResult<Option<Vec<String>>> {
+            Ok(self.0.lock().unwrap().pop_front().flatten())
+        }
+    }
+
+    struct PlaylistIo(usize);
+
+    #[async_trait]
+    impl YoutubeIo for PlaylistIo {
+        async fn inspect_metadata(
+            &self,
+            _url: &YoutubeUrl,
+        ) -> Result<MetadataPayload, CaptureError> {
+            Err(CaptureError::MetadataUnavailable(
+                "unused in this script".into(),
+            ))
+        }
+
+        async fn fetch_caption_vtt(
+            &self,
+            _request: &CaptionRequest,
+        ) -> Result<CaptionPayload, CaptureError> {
+            Err(CaptureError::CaptionsAbsent("unused in this script".into()))
+        }
+
+        async fn enumerate_playlist(
+            &self,
+            _url: &YoutubeUrl,
+        ) -> Result<PlaylistPayload, CaptureError> {
+            let entries = (0..self.0)
+                .map(|index| {
+                    serde_json::json!({
+                        "id": format!("V{index:010}"),
+                        "title": format!("Realistic lecture {index}"),
+                        "duration": 3600,
+                    })
+                })
+                .collect::<Vec<_>>();
+            Ok(PlaylistPayload {
+                json: serde_json::to_vec(&serde_json::json!({
+                    "_type": "playlist",
+                    "id": "PL-orchestrator_21",
+                    "title": "Twenty-one lectures",
+                    "entries": entries,
+                }))
+                .unwrap(),
+            })
+        }
+
+        async fn fetch_thumbnail(
+            &self,
+            _video_id: &VideoId,
+        ) -> Result<ThumbnailPayload, CaptureError> {
+            Err(CaptureError::ThumbnailRejected(
+                "fixture has no image".into(),
+            ))
+        }
+
+        async fn transcribe_audio(
+            &self,
+            _url: &YoutubeUrl,
+            _model: &str,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<CaptionPayload, CaptureError> {
+            Err(CaptureError::TranscriptionFailed(
+                "unused in this script".into(),
+            ))
+        }
+
+        async fn update_extractor(&self) -> Result<(), CaptureError> {
+            Err(CaptureError::ExtractorStale("unused in this script".into()))
+        }
+    }
+
+    #[derive(Default)]
+    struct GuardedPlaylistIo {
+        enumerations: std::sync::atomic::AtomicUsize,
+        capture_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl YoutubeIo for GuardedPlaylistIo {
+        async fn inspect_metadata(
+            &self,
+            _url: &YoutubeUrl,
+        ) -> Result<MetadataPayload, CaptureError> {
+            self.capture_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(CaptureError::MetadataUnavailable(
+                "host capture should not be reached".into(),
+            ))
+        }
+
+        async fn fetch_caption_vtt(
+            &self,
+            _request: &CaptionRequest,
+        ) -> Result<CaptionPayload, CaptureError> {
+            self.capture_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(CaptureError::CaptionsAbsent(
+                "host capture should not be reached".into(),
+            ))
+        }
+
+        async fn enumerate_playlist(
+            &self,
+            _url: &YoutubeUrl,
+        ) -> Result<PlaylistPayload, CaptureError> {
+            self.enumerations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(PlaylistPayload {
+                json: serde_json::to_vec(&serde_json::json!({
+                    "_type": "playlist",
+                    "id": "PL-guarded_2",
+                    "title": "Guarded playlist",
+                    "entries": [
+                        {"id":"V0000000000","title":"First","duration":60},
+                        {"id":"V0000000001","title":"Second","duration":60}
+                    ],
+                }))
+                .unwrap(),
+            })
+        }
+
+        async fn fetch_thumbnail(
+            &self,
+            _video_id: &VideoId,
+        ) -> Result<ThumbnailPayload, CaptureError> {
+            Err(CaptureError::ThumbnailRejected(
+                "fixture has no image".into(),
+            ))
+        }
+
+        async fn transcribe_audio(
+            &self,
+            _url: &YoutubeUrl,
+            _model: &str,
+            _cancellation: &CaptureCancellation,
+        ) -> Result<CaptionPayload, CaptureError> {
+            self.capture_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Err(CaptureError::TranscriptionFailed(
+                "host capture should not be reached".into(),
+            ))
+        }
+
+        async fn update_extractor(&self) -> Result<(), CaptureError> {
+            Ok(())
+        }
+    }
+
+    struct FsParent(PathBuf);
+
+    impl NoteWriteParent for FsParent {
+        fn probe(&self, leaf: &str) -> CoreResult<NotePathState> {
+            match fs::symlink_metadata(self.0.join(leaf)) {
+                Ok(metadata) if metadata.file_type().is_file() => Ok(NotePathState::RegularFile {
+                    actual_name: leaf.to_string(),
+                }),
+                Ok(_) => Ok(NotePathState::Other),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(NotePathState::Missing)
+                }
+                Err(error) => Err(CoreError::Io(error.to_string())),
+            }
+        }
+
+        fn create_new_all_or_nothing(&self, leaf: &str, content: &str) -> CoreResult<()> {
+            let mut file = OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(self.0.join(leaf))
+                .map_err(|error| CoreError::Io(error.to_string()))?;
+            file.write_all(content.as_bytes())
+                .map_err(|error| CoreError::Io(error.to_string()))
+        }
+    }
+
+    struct FsWriter;
+
+    impl NoteWriteBackend for FsWriter {
+        fn canonicalize(&self, path: &Path) -> CoreResult<PathBuf> {
+            fs::canonicalize(path).map_err(|error| CoreError::Io(error.to_string()))
+        }
+
+        fn open_parent(
+            &self,
+            canonical_root: &Path,
+            canonical_parent: &Path,
+        ) -> CoreResult<OpenedNoteParent> {
+            let opened = fs::canonicalize(canonical_parent)
+                .map_err(|error| CoreError::Io(error.to_string()))?;
+            if !opened.starts_with(canonical_root) {
+                return Err(CoreError::OutsideVault(opened.display().to_string()));
+            }
+            Ok(OpenedNoteParent::new(
+                opened.clone(),
+                Box::new(FsParent(opened)),
+            ))
+        }
+    }
+
+    struct CancellingParent {
+        path: PathBuf,
+        cancellation: CaptureCancellation,
+    }
+
+    impl NoteWriteParent for CancellingParent {
+        fn probe(&self, leaf: &str) -> CoreResult<NotePathState> {
+            FsParent(self.path.clone()).probe(leaf)
+        }
+
+        fn create_new_all_or_nothing(&self, leaf: &str, content: &str) -> CoreResult<()> {
+            FsParent(self.path.clone()).create_new_all_or_nothing(leaf, content)?;
+            self.cancellation.cancel();
+            Ok(())
+        }
+    }
+
+    struct CancellingWriter(CaptureCancellation);
+
+    impl NoteWriteBackend for CancellingWriter {
+        fn canonicalize(&self, path: &Path) -> CoreResult<PathBuf> {
+            FsWriter.canonicalize(path)
+        }
+
+        fn open_parent(
+            &self,
+            canonical_root: &Path,
+            canonical_parent: &Path,
+        ) -> CoreResult<OpenedNoteParent> {
+            let opened = fs::canonicalize(canonical_parent)
+                .map_err(|error| CoreError::Io(error.to_string()))?;
+            if !opened.starts_with(canonical_root) {
+                return Err(CoreError::OutsideVault(opened.display().to_string()));
+            }
+            Ok(OpenedNoteParent::new(
+                opened.clone(),
+                Box::new(CancellingParent {
+                    path: opened,
+                    cancellation: self.0.clone(),
+                }),
+            ))
+        }
+    }
+
+    fn realistic_transcript(video_id: &str) -> String {
+        let cues = (0..120)
+            .map(|cue| {
+                format!(
+                    "[00:{:02}:{:02}](https://youtu.be/{video_id}?t={}) Lecture sentence {cue} explains a concrete idea with enough detail for distillation.",
+                    cue / 60,
+                    cue % 60,
+                    cue
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        format!("---\nnn:\n  source:\n    youtubeId: {video_id}\n---\n\n{cues}\n")
+    }
+
+    fn youtube_test_environment() -> SkillEnvironment {
+        SkillEnvironment {
+            hardware: HardwareSpec {
+                total_ram_bytes: 8 * 1024 * 1024 * 1024,
+                cpu_cores: 8,
+                cpu_brand: "test".into(),
+                gpu_label: None,
+                arch: "aarch64".into(),
+                os: "macos".into(),
+                free_disk_bytes: 2_000_000_000,
+            },
+            app_data_bin_dir: PathBuf::from("/app-data/bin"),
+            available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
+        }
+    }
+
+    #[test]
+    fn playlist_orchestrator_processes_21_transcripts_with_bounded_context_and_full_partial_ledger()
+    {
+        let vault = tempfile::tempdir().unwrap();
+        let selected = (0..21)
+            .map(|index| format!("V{index:010}"))
+            .collect::<Vec<_>>();
+        let prompt = PlaylistPrompt(Mutex::new(VecDeque::from([
+            Some(selected.clone()),
+            Some(vec!["continue".into()]),
+        ])));
+        let mut script = vec![tool_call(
+            "select",
+            "select_playlist_videos",
+            r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-orchestrator_21"}"#,
+        )];
+        for (work_item, video_id) in selected.iter().enumerate() {
+            let transcript = realistic_transcript(video_id);
+            script.push(Completion {
+                content: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: format!("literature-{work_item}"),
+                        name: "write_note".into(),
+                        arguments: serde_json::json!({
+                            "rel_path": format!("literature-{work_item}.md"),
+                            "content": format!("# Lecture {work_item}\n\nDistilled from {video_id}."),
+                            "kind": "literature",
+                            "work_item": work_item,
+                        })
+                        .to_string(),
+                    },
+                    ToolCall {
+                        id: format!("transcript-{work_item}"),
+                        name: "write_note".into(),
+                        arguments: serde_json::json!({
+                            "rel_path": format!("transcript-{work_item}.md"),
+                            "content": transcript,
+                            "kind": "transcript",
+                            "work_item": work_item,
+                        })
+                        .to_string(),
+                    },
+                ],
+            });
+        }
+        let llm = MockLlmClient::new(script, "Playlist complete.");
+        let retriever = KeywordRetriever::new(vault.path());
+        let skills = SkillRegistry::built_in(&[]).unwrap();
+        let environment = SkillEnvironment {
+            hardware: HardwareSpec {
+                total_ram_bytes: 8 * 1024 * 1024 * 1024,
+                cpu_cores: 8,
+                cpu_brand: "test".into(),
+                gpu_label: None,
+                arch: "aarch64".into(),
+                os: "macos".into(),
+                free_disk_bytes: 2_000_000_000,
+            },
+            app_data_bin_dir: PathBuf::from("/app-data/bin"),
+            available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
+        };
+        let pricing = PricingInput::Local;
+        let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+            .with_youtube_io(&PlaylistIo(21))
+            .with_pricing(&pricing);
+        let mut sink = VecSink::default();
+        let ledger = block_on(run_chat(
+            "Distil this playlist",
+            &[],
+            vec![YOUTUBE_DISTIL_SKILL_ID.into()],
+            vault.path(),
+            "test-model",
+            &retriever,
+            &llm,
+            &services,
+            &mut sink,
+            &Guards::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            ledger.entries().len(),
+            42,
+            "every item keeps both Undo entries"
+        );
+        assert_eq!(
+            count(&sink.events, |event| matches!(
+                event,
+                ChatEvent::NoteWritten { .. }
+            )),
+            42,
+            "context eviction must not discard partial report-card events"
+        );
+        for video_id in selected {
+            assert!(sink.events.iter().any(|event| {
+                matches!(event, ChatEvent::SkillStep { message } if message.contains(&video_id) && message.contains("succeeded"))
+            }), "missing explicit outcome for {video_id}");
+        }
+        assert!(
+            llm.max_request_chars() < 120_000,
+            "completed transcript context was not evicted: {} chars",
+            llm.max_request_chars()
+        );
+        let streaming_messages = llm.streaming_messages();
+        let work_item_turns = streaming_messages
+            .iter()
+            .filter(|message| message.role == Role::Assistant)
+            .filter_map(|message| {
+                let ids = message
+                    .tool_calls
+                    .iter()
+                    .map(|call| call.id.clone())
+                    .collect::<Vec<_>>();
+                ids.iter()
+                    .any(|id| id.starts_with("literature-"))
+                    .then_some(ids)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(work_item_turns.len(), 21);
+        for (index, ids) in work_item_turns.iter().enumerate() {
+            assert_eq!(
+                ids,
+                &vec![format!("literature-{index}"), format!("transcript-{index}"),],
+                "work item {index} must finish both required writes before the next item"
+            );
+        }
+        let final_context = streaming_messages
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(final_context.contains("PLAYLIST EXECUTION SUMMARY"));
+        assert!(final_context.contains("V0000000000: succeeded"));
+        assert!(final_context.contains("V0000000020: succeeded"));
+        assert_eq!(llm.completion_requests().len(), 22);
+    }
+
+    #[test]
+    fn playlist_cancellation_inside_a_batched_turn_skips_later_calls_and_keeps_partial_ledger() {
+        let vault = tempfile::tempdir().unwrap();
+        let selected = vec!["V0000000000".to_string(), "V0000000001".to_string()];
+        let prompt = PlaylistPrompt(Mutex::new(VecDeque::from([Some(selected)])));
+        let batch = Completion {
+            content: None,
+            tool_calls: (0..2)
+                .flat_map(|work_item| {
+                    ["literature", "transcript"].map(move |kind| ToolCall {
+                        id: format!("{kind}-{work_item}"),
+                        name: "write_note".into(),
+                        arguments: serde_json::json!({
+                            "rel_path": format!("{kind}-{work_item}.md"),
+                            "content": format!("# {kind} {work_item}"),
+                            "kind": kind,
+                            "work_item": work_item,
+                        })
+                        .to_string(),
+                    })
+                })
+                .collect(),
+        };
+        let llm = MockLlmClient::new(
+            vec![
+                tool_call(
+                    "select",
+                    "select_playlist_videos",
+                    r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-orchestrator_2"}"#,
+                ),
+                batch,
+            ],
+            "Cancelled with partial results.",
+        );
+        let retriever = KeywordRetriever::new(vault.path());
+        let skills = SkillRegistry::built_in(&[]).unwrap();
+        let environment = SkillEnvironment {
+            hardware: HardwareSpec {
+                total_ram_bytes: 8 * 1024 * 1024 * 1024,
+                cpu_cores: 8,
+                cpu_brand: "test".into(),
+                gpu_label: None,
+                arch: "aarch64".into(),
+                os: "macos".into(),
+                free_disk_bytes: 2_000_000_000,
+            },
+            app_data_bin_dir: PathBuf::from("/app-data/bin"),
+            available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
+        };
+        let cancellation = CaptureCancellation::default();
+        let writer = CancellingWriter(cancellation.clone());
+        let services = SkillServices::new(&skills, &environment, &prompt, &writer, 1)
+            .with_youtube_io(&PlaylistIo(2))
+            .with_capture_cancellation(cancellation);
+        let mut sink = VecSink::default();
+        let ledger = block_on(run_chat(
+            "Distil this playlist",
+            &[],
+            vec![YOUTUBE_DISTIL_SKILL_ID.into()],
+            vault.path(),
+            "test-model",
+            &retriever,
+            &llm,
+            &services,
+            &mut sink,
+            &Guards::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(ledger.entries().len(), 1);
+        assert_eq!(
+            count(&sink.events, |event| matches!(
+                event,
+                ChatEvent::NoteWritten { .. }
+            )),
+            1
+        );
+        assert!(vault.path().join("literature-0.md").exists());
+        assert!(!vault.path().join("transcript-0.md").exists());
+        assert!(!vault.path().join("literature-1.md").exists());
+        assert!(!vault.path().join("transcript-1.md").exists());
+        for video_id in ["V0000000000", "V0000000001"] {
+            assert!(sink.events.iter().any(|event| {
+                matches!(event, ChatEvent::SkillStep { message } if message.contains(video_id) && message.contains("cancelled"))
+            }));
+        }
+        let final_context = llm
+            .streaming_messages()
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(final_context.matches("capture_cancelled").count(), 3);
+    }
+
+    #[test]
+    fn rejected_playlist_batch_cannot_cascade_into_the_next_work_item() {
+        let vault = tempfile::tempdir().unwrap();
+        let selected = vec!["V0000000000".to_string(), "V0000000001".to_string()];
+        let prompt = PlaylistPrompt(Mutex::new(VecDeque::from([Some(selected)])));
+        let stale_old_item_write = |kind: &str| ToolCall {
+            id: format!("stale-{kind}"),
+            name: "write_note".into(),
+            arguments: serde_json::json!({
+                "rel_path": format!("stale-{kind}.md"),
+                "content": "must never be written",
+                "kind": kind,
+                "work_item": 0,
+            })
+            .to_string(),
+        };
+        let hostile_batch = Completion {
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "reject-item-0".into(),
+                    name: "write_note".into(),
+                    arguments: serde_json::json!({
+                        "rel_path": "../escape.md",
+                        "content": "reject this",
+                        "kind": "literature",
+                        "work_item": 0,
+                    })
+                    .to_string(),
+                },
+                stale_old_item_write("literature"),
+                stale_old_item_write("transcript"),
+            ],
+        };
+        let next_item = Completion {
+            content: None,
+            tool_calls: ["literature", "transcript"]
+                .into_iter()
+                .map(|kind| ToolCall {
+                    id: format!("next-{kind}"),
+                    name: "write_note".into(),
+                    arguments: serde_json::json!({
+                        "rel_path": format!("next-{kind}.md"),
+                        "content": format!("# Next {kind}"),
+                        "kind": kind,
+                        "work_item": 1,
+                    })
+                    .to_string(),
+                })
+                .collect(),
+        };
+        let llm = MockLlmClient::new(
+            vec![
+                tool_call(
+                    "select",
+                    "select_playlist_videos",
+                    r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-orchestrator_2"}"#,
+                ),
+                hostile_batch,
+                next_item,
+            ],
+            "Partial playlist complete.",
+        );
+        let retriever = KeywordRetriever::new(vault.path());
+        let skills = SkillRegistry::built_in(&[]).unwrap();
+        let environment = SkillEnvironment {
+            hardware: HardwareSpec {
+                total_ram_bytes: 8 * 1024 * 1024 * 1024,
+                cpu_cores: 8,
+                cpu_brand: "test".into(),
+                gpu_label: None,
+                arch: "aarch64".into(),
+                os: "macos".into(),
+                free_disk_bytes: 2_000_000_000,
+            },
+            app_data_bin_dir: PathBuf::from("/app-data/bin"),
+            available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
+        };
+        let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+            .with_youtube_io(&PlaylistIo(2));
+        let mut sink = VecSink::default();
+        let ledger = block_on(run_chat(
+            "Distil this playlist",
+            &[],
+            vec![YOUTUBE_DISTIL_SKILL_ID.into()],
+            vault.path(),
+            "test-model",
+            &retriever,
+            &llm,
+            &services,
+            &mut sink,
+            &Guards::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(ledger.entries().len(), 2);
+        assert!(!vault.path().join("stale-literature.md").exists());
+        assert!(!vault.path().join("stale-transcript.md").exists());
+        assert!(vault.path().join("next-literature.md").exists());
+        assert!(vault.path().join("next-transcript.md").exists());
+        let steps = sink
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::SkillStep { message } => Some(message.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            steps
+                .iter()
+                .filter(|message| message.contains("V0000000000 failed"))
+                .count(),
+            1
+        );
+        assert!(steps
+            .iter()
+            .any(|message| message.contains("V0000000001 succeeded")));
+        assert!(!steps
+            .iter()
+            .any(|message| message.contains("V0000000001 failed")));
+        let final_context = llm
+            .streaming_messages()
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(final_context.matches("stale_playlist_batch").count(), 2);
+    }
+
+    #[test]
+    fn playlist_capture_rejects_cross_video_and_unselected_urls_before_host_io() {
+        let vault = tempfile::tempdir().unwrap();
+        let prompt = PlaylistPrompt(Mutex::new(VecDeque::from([Some(vec![
+            "V0000000000".into(),
+            "V0000000001".into(),
+        ])])));
+        let hostile_batch = Completion {
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "prefetch-next".into(),
+                    name: "fetch_video_info".into(),
+                    arguments: r#"{"url":"https://youtu.be/V0000000001"}"#.into(),
+                },
+                ToolCall {
+                    id: "arbitrary-unselected".into(),
+                    name: "fetch_captions".into(),
+                    arguments: r#"{"url":"https://youtu.be/jNQXAC9IVRw","lang":"en"}"#.into(),
+                },
+            ],
+        };
+        let next_item = Completion {
+            content: None,
+            tool_calls: ["literature", "transcript"]
+                .into_iter()
+                .map(|kind| ToolCall {
+                    id: format!("item-1-{kind}"),
+                    name: "write_note".into(),
+                    arguments: serde_json::json!({
+                        "rel_path": format!("item-1-{kind}.md"),
+                        "content": format!("# Item 1 {kind}"),
+                        "kind": kind,
+                        "work_item": 1,
+                    })
+                    .to_string(),
+                })
+                .collect(),
+        };
+        let llm = MockLlmClient::new(
+            vec![
+                tool_call(
+                    "select",
+                    "select_playlist_videos",
+                    r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-guarded_2"}"#,
+                ),
+                hostile_batch,
+                next_item,
+            ],
+            "Partial playlist complete.",
+        );
+        let io = GuardedPlaylistIo::default();
+        let retriever = KeywordRetriever::new(vault.path());
+        let skills = SkillRegistry::built_in(&[]).unwrap();
+        let environment = youtube_test_environment();
+        let services =
+            SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1).with_youtube_io(&io);
+        let mut sink = VecSink::default();
+        let ledger = block_on(run_chat(
+            "Distil this playlist",
+            &[],
+            vec![YOUTUBE_DISTIL_SKILL_ID.into()],
+            vault.path(),
+            "test-model",
+            &retriever,
+            &llm,
+            &services,
+            &mut sink,
+            &Guards::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(
+            io.capture_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0
+        );
+        assert_eq!(ledger.entries().len(), 2);
+        assert!(vault.path().join("item-1-literature.md").exists());
+        assert!(vault.path().join("item-1-transcript.md").exists());
+        assert!(sink.events.iter().any(|event| {
+            matches!(event, ChatEvent::SkillStep { message } if message.contains("V0000000000 failed"))
+        }));
+        assert!(sink.events.iter().any(|event| {
+            matches!(event, ChatEvent::SkillStep { message } if message.contains("V0000000001 succeeded"))
+        }));
+        let final_context = llm
+            .streaming_messages()
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(final_context.matches("stale_playlist_batch").count(), 1);
+    }
+
+    #[test]
+    fn nested_playlist_batch_is_stale_without_replacing_or_advancing_the_original_run() {
+        let vault = tempfile::tempdir().unwrap();
+        let prompt = PlaylistPrompt(Mutex::new(VecDeque::from([Some(vec![
+            "V0000000000".into(),
+            "V0000000001".into(),
+        ])])));
+        let nested_batch = Completion {
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "nested-select".into(),
+                    name: "select_playlist_videos".into(),
+                    arguments: r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-replacement"}"#.into(),
+                },
+                ToolCall {
+                    id: "stale-after-nested".into(),
+                    name: "write_note".into(),
+                    arguments: r#"{"rel_path":"must-not-exist.md","content":"stale","kind":"literature","work_item":0}"#.into(),
+                },
+            ],
+        };
+        let write_turn = |work_item: usize| Completion {
+            content: None,
+            tool_calls: ["literature", "transcript"]
+                .into_iter()
+                .map(|kind| ToolCall {
+                    id: format!("item-{work_item}-{kind}"),
+                    name: "write_note".into(),
+                    arguments: serde_json::json!({
+                        "rel_path": format!("item-{work_item}-{kind}.md"),
+                        "content": format!("# Item {work_item} {kind}"),
+                        "kind": kind,
+                        "work_item": work_item,
+                    })
+                    .to_string(),
+                })
+                .collect(),
+        };
+        let llm = MockLlmClient::new(
+            vec![
+                tool_call(
+                    "select",
+                    "select_playlist_videos",
+                    r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-guarded_2"}"#,
+                ),
+                nested_batch,
+                write_turn(0),
+                write_turn(1),
+            ],
+            "Playlist complete.",
+        );
+        let io = GuardedPlaylistIo::default();
+        let retriever = KeywordRetriever::new(vault.path());
+        let skills = SkillRegistry::built_in(&[]).unwrap();
+        let environment = youtube_test_environment();
+        let services =
+            SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1).with_youtube_io(&io);
+        let mut sink = VecSink::default();
+        let ledger = block_on(run_chat(
+            "Distil this playlist",
+            &[],
+            vec![YOUTUBE_DISTIL_SKILL_ID.into()],
+            vault.path(),
+            "test-model",
+            &retriever,
+            &llm,
+            &services,
+            &mut sink,
+            &Guards::default(),
+        ))
+        .unwrap();
+
+        assert_eq!(io.enumerations.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(ledger.entries().len(), 4);
+        assert!(!vault.path().join("must-not-exist.md").exists());
+        assert!(!sink.events.iter().any(|event| {
+            matches!(event, ChatEvent::SkillStep { message } if message.contains("failed"))
+        }));
+        let final_context = llm
+            .streaming_messages()
+            .iter()
+            .filter_map(|message| message.content.as_deref())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(final_context.matches("stale_playlist_batch").count(), 1);
+        assert!(final_context.contains("V0000000000: succeeded"));
+        assert!(final_context.contains("V0000000001: succeeded"));
+    }
+
     fn run(root: &Path, mock: &MockLlmClient, guards: &Guards) -> Vec<ChatEvent> {
         let retriever = KeywordRetriever::new(root);
+        let skills = SkillRegistry::built_in(&[]).unwrap();
+        let environment = SkillEnvironment {
+            hardware: HardwareSpec {
+                total_ram_bytes: 1,
+                cpu_cores: 1,
+                cpu_brand: "test".into(),
+                gpu_label: None,
+                arch: "aarch64".into(),
+                os: "macos".into(),
+                free_disk_bytes: 1,
+            },
+            app_data_bin_dir: std::path::PathBuf::from("/app-data/bin"),
+            available_binaries: BTreeSet::new(),
+        };
+        let services = SkillServices::new(
+            &skills,
+            &environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        );
         let mut sink = VecSink::default();
         block_on(run_chat(
             "how do widgets work?",
             &[],
+            Vec::new(),
             root,
             "test-model",
             &retriever,
             mock,
+            &services,
             &mut sink,
             guards,
         ))
@@ -679,8 +2260,218 @@ mod tests {
         sink.events
     }
 
+    #[test]
+    fn terminal_skill_recovery_finishes_every_parallel_tool_result_before_stopping() {
+        let vault = tempfile::tempdir().unwrap();
+        let provider = KeywordRetriever::new(vault.path());
+        let skills = SkillRegistry::built_in(&[]).unwrap();
+        let environment = SkillEnvironment {
+            hardware: HardwareSpec {
+                total_ram_bytes: 16_000_000_000,
+                cpu_cores: 8,
+                cpu_brand: "test".into(),
+                gpu_label: None,
+                arch: "aarch64".into(),
+                os: "macos".into(),
+                free_disk_bytes: 10_000_000_000,
+            },
+            app_data_bin_dir: PathBuf::from("/app-data/bin"),
+            available_binaries: BTreeSet::new(),
+        };
+        let calls = vec![
+            ToolCall {
+                id: "missing-ytdlp".into(),
+                name: tools::TOOL_USE_SKILL.into(),
+                arguments: format!(r#"{{"id":"{YOUTUBE_DISTIL_SKILL_ID}"}}"#),
+            },
+            ToolCall {
+                id: "sibling-skill".into(),
+                name: tools::TOOL_USE_SKILL.into(),
+                arguments: format!(r#"{{"id":"{}"}}"#, crate::ai::FIXTURE_SKILL_ID),
+            },
+        ];
+        let llm = MockLlmClient::new(
+            vec![Completion {
+                content: None,
+                tool_calls: calls.clone(),
+            }],
+            "must not stream",
+        );
+        let services = SkillServices::new(
+            &skills,
+            &environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        );
+        let guards = Guards::default();
+        let session = ChatSession {
+            root: vault.path(),
+            model: "test-model",
+            provider: &provider,
+            llm: &llm,
+            skill_services: &services,
+            guards: &guards,
+        };
+        let mut messages = vec![LlmMessage::system("system"), LlmMessage::user("capture")];
+        let mut active_skills = ActiveSkills::new(guards.max_iterations);
+        let mut writes = WriteSession::new(1).unwrap();
+        let mut youtube_session = YoutubeToolSession::new_with_update_session(
+            services.capture_cancellation.clone(),
+            services.extractor_updates.clone(),
+        );
+        let mut registry = EvidenceRegistry::new();
+        let mut coverage = CoverageAcc::default();
+        let mut sink = VecSink::default();
+
+        let outcome = block_on(session.collect_evidence(
+            &mut messages,
+            &mut active_skills,
+            &mut writes,
+            &mut youtube_session,
+            &mut registry,
+            &mut coverage,
+            &mut sink,
+        ))
+        .unwrap();
+
+        assert!(matches!(outcome, EvidenceCollection::CompleteTurn));
+        assert_eq!(llm.completion_requests().len(), 1);
+        assert!(llm.streaming_messages().is_empty());
+        assert!(!sink
+            .events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Verifying | ChatEvent::Answer { .. })));
+        let result_ids = messages
+            .iter()
+            .filter(|message| message.role == Role::Tool)
+            .filter_map(|message| message.tool_call_id.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(result_ids, ["missing-ytdlp", "sibling-skill"]);
+        assert!(active_skills.contains(crate::ai::FIXTURE_SKILL_ID));
+    }
+
     fn count(events: &[ChatEvent], pred: impl Fn(&ChatEvent) -> bool) -> usize {
         events.iter().filter(|e| pred(e)).count()
+    }
+
+    // ── §7 behavioural eval — plumbing tier ─────────────────────────────────
+    // The five spec-§7 cases run against the scripted MockLlmClient. Because the
+    // SCRIPT (not the model) decides whether a tool call fires, this tier proves
+    // PLUMBING only: the orchestrator injects no mandatory retrieval before the
+    // model's first turn (a no-tool script yields zero Searching), a zero-search
+    // turn emits no Coverage, and search/citation counts flow through intact. It
+    // CANNOT prove the model chooses to search — that is the network-gated
+    // real-model tier in app/desktop/src-tauri/tests/behavioural_eval.rs.
+    //
+    // The zero-search-but-still-emit-Coverage guardrail (a list-only run tripping a
+    // guard or skipping files) is already proven by
+    // coverage_still_reports_a_tripped_guard_with_no_searches and
+    // coverage_still_reports_skipped_files_with_no_searches — not duplicated here.
+    #[test]
+    fn eval_plumbs_the_five_section_7_cases_through_the_mock() {
+        struct EvalCase {
+            label: &'static str,
+            script: Vec<Completion>,
+            answer: &'static str,
+            search_bounds: std::ops::RangeInclusive<usize>,
+            citation_bounds: std::ops::RangeInclusive<usize>,
+            coverage_bounds: std::ops::RangeInclusive<usize>,
+        }
+
+        let cases = [
+            EvalCase {
+                label: "Case 1 Greeting",
+                script: vec![final_turn()],
+                answer: "Hey! What would you like to explore?",
+                search_bounds: 0..=0,
+                citation_bounds: 0..=0,
+                coverage_bounds: 0..=0,
+            },
+            EvalCase {
+                label: "Case 2 Meta",
+                script: vec![final_turn()],
+                answer: "I can help you think with and search your notes.",
+                search_bounds: 0..=0,
+                citation_bounds: 0..=0,
+                coverage_bounds: 0..=0,
+            },
+            EvalCase {
+                label: "Case 3 Factual-in-vault",
+                script: vec![
+                    tool_call("c1", "search_notes", r#"{"query":"components"}"#),
+                    tool_call(
+                        "c2",
+                        "read_note_span",
+                        r#"{"rel_path":"Research/widgets.md","start_line":1,"end_line":2}"#,
+                    ),
+                    final_turn(),
+                ],
+                answer: "Widgets are small components. [e1]",
+                search_bounds: 1..=usize::MAX,
+                citation_bounds: 1..=usize::MAX,
+                coverage_bounds: 1..=usize::MAX,
+            },
+            EvalCase {
+                label: "Case 4 Factual-not-in-vault",
+                script: vec![
+                    tool_call("c1", "search_notes", r#"{"query":"components"}"#),
+                    final_turn(),
+                ],
+                answer:
+                    "Nothing in your notes covers this yet — add a note and I'll answer next time.",
+                search_bounds: 1..=usize::MAX,
+                citation_bounds: 0..=0,
+                coverage_bounds: 1..=usize::MAX,
+            },
+            EvalCase {
+                label: "Case 5 Follow-up",
+                script: vec![final_turn()],
+                answer: "Widgets are small parts.",
+                search_bounds: 0..=0,
+                citation_bounds: 0..=0,
+                coverage_bounds: 0..=0,
+            },
+        ];
+
+        for EvalCase {
+            label,
+            script,
+            answer,
+            search_bounds,
+            citation_bounds,
+            coverage_bounds,
+        } in cases
+        {
+            let v = vault();
+            let mock = MockLlmClient::new(script, answer);
+            let events = run(v.path(), &mock, &Guards::default());
+
+            let searches = count(&events, |event| {
+                matches!(event, ChatEvent::Searching { .. })
+            });
+            let citations = count(&events, |event| matches!(event, ChatEvent::Citation { .. }));
+            let coverage = count(&events, |event| matches!(event, ChatEvent::Coverage { .. }));
+
+            assert!(
+                search_bounds.contains(&searches),
+                "{label}: expected Searching count in {search_bounds:?}, got {searches}"
+            );
+            assert!(
+                citation_bounds.contains(&citations),
+                "{label}: expected Citation count in {citation_bounds:?}, got {citations}"
+            );
+            assert!(
+                coverage_bounds.contains(&coverage),
+                "{label}: expected Coverage count in {coverage_bounds:?}, got {coverage}"
+            );
+
+            let last = events.last();
+            assert!(
+                matches!(last, Some(ChatEvent::Done)),
+                "{label}: last event must be Done, got {last:?}"
+            );
+        }
     }
 
     #[test]
@@ -784,12 +2575,11 @@ mod tests {
             count(&events, |e| matches!(e, ChatEvent::Searching { .. })),
             0
         );
-        let coverage_empty = events.iter().any(|e| {
-            matches!(e,
-            ChatEvent::Coverage { searched_terms, notes_read, .. }
-            if searched_terms.is_empty() && notes_read.is_empty())
-        });
-        assert!(coverage_empty);
+        assert_eq!(
+            count(&events, |e| matches!(e, ChatEvent::Coverage { .. })),
+            0,
+            "a turn with no searches must not emit a coverage footer"
+        );
         assert!(matches!(events.last(), Some(ChatEvent::Done)));
     }
 
@@ -850,6 +2640,48 @@ mod tests {
             )),
             "an iteration-capped sweep must report truncated coverage"
         );
+    }
+
+    #[test]
+    fn guard_tripped_empty_answer_still_reports_truncated_coverage() {
+        let v = vault();
+        // The model keeps issuing tool calls (max_iterations caps it → partial
+        // coverage) and THEN streams an empty final answer — often a symptom of the
+        // cut-short sweep. The truncation footer must survive the empty-answer error
+        // path, never dropped (the "never drop truncation" invariant, one layer up
+        // from emit_coverage).
+        let mock = MockLlmClient::new(
+            vec![
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+                tool_call("c2", "search_notes", r#"{"query":"components"}"#),
+                tool_call("c3", "search_notes", r#"{"query":"snap"}"#),
+            ],
+            "",
+        );
+        let guards = Guards {
+            max_iterations: 2,
+            ..Guards::default()
+        };
+        let events = run(v.path(), &mock, &guards);
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::Coverage {
+                    truncated: true,
+                    ..
+                }
+            )),
+            "a guard-tripped empty answer must still surface its truncation, got {:?}",
+            events
+        );
+        assert_eq!(
+            count(&events, |e| matches!(e, ChatEvent::Error { .. })),
+            1,
+            "the empty-answer error still fires — the footer complements it"
+        );
+        // The error is terminal: no Done.
+        assert_eq!(count(&events, |e| matches!(e, ChatEvent::Done)), 0);
     }
 
     #[test]
@@ -926,6 +2758,45 @@ mod tests {
         assert!(events
             .iter()
             .any(|e| matches!(e, ChatEvent::Citation { id, .. } if id == "e1")));
+    }
+
+    #[test]
+    fn whitespace_only_answer_after_search_emits_error_and_stops() {
+        let v = vault();
+        let mock = MockLlmClient::new(
+            vec![
+                tool_call("c1", "search_notes", r#"{"query":"components"}"#),
+                final_turn(),
+            ],
+            "   ",
+        );
+        let events = run(v.path(), &mock, &Guards::default());
+
+        assert_eq!(count(&events, |e| matches!(e, ChatEvent::Error { .. })), 1);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ChatEvent::Error { message } if message == "the model returned an empty answer"
+        )));
+        assert_eq!(
+            count(&events, |e| matches!(e, ChatEvent::Coverage { .. })),
+            0
+        );
+        assert_eq!(count(&events, |e| matches!(e, ChatEvent::Done)), 0);
+    }
+
+    #[test]
+    fn reasoning_only_answer_emits_reasoning_aware_error_and_stops() {
+        let v = vault();
+        let mock = MockLlmClient::new(vec![final_turn()], "")
+            .with_reasoning(&["all the answer ", "went into reasoning"]);
+        let events = run(v.path(), &mock, &Guards::default());
+
+        assert_eq!(count(&events, |e| matches!(e, ChatEvent::Error { .. })), 1);
+        assert!(events.iter().any(|e| matches!(
+            e,
+            ChatEvent::Error { message } if message.contains("reasoning")
+        )));
+        assert_eq!(count(&events, |e| matches!(e, ChatEvent::Done)), 0);
     }
 
     #[test]

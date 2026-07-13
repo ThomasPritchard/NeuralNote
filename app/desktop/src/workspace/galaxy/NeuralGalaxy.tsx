@@ -162,6 +162,9 @@ function plural(n: number, noun: string): string {
   return `${n} ${noun}${n === 1 ? "" : "s"}`;
 }
 
+/** Shared with GraphView so notices clear the stacked compact toolbar. */
+export const GALAXY_COMPACT_TOOLBAR_WIDTH = 760;
+
 export interface NeuralGalaxyProps {
   /** Pre-decorated render graph. IMMUTABLE per mount: the force simulation
    *  and the 2D morph mutate the node objects in place, so a refetch means a
@@ -194,6 +197,7 @@ export function NeuralGalaxy({
   onClusterSelect,
   breadcrumb,
 }: Readonly<NeuralGalaxyProps>) {
+  const compactToolbar = width < GALAXY_COMPACT_TOOLBAR_WIDTH;
   const fgRef = useRef<any>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const hoveredRef = useRef<Set<string>>(new Set());
@@ -616,8 +620,18 @@ export function NeuralGalaxy({
       />
 
       {/* ── Top bar: title + view toggle + search ──────────────────────── */}
-      <div className="pointer-events-none absolute inset-x-0 top-0 flex items-start justify-between p-5">
-        <div className="pointer-events-auto flex items-center gap-3">
+      <div
+        data-testid="galaxy-toolbar"
+        data-layout={compactToolbar ? "compact" : "wide"}
+        className={`pointer-events-none absolute inset-x-0 top-0 flex p-5 ${
+          compactToolbar ? "flex-col gap-3" : "items-start justify-between"
+        }`}
+      >
+        <div
+          className={`pointer-events-auto flex items-center ${
+            compactToolbar ? "w-full gap-2" : "gap-3"
+          }`}
+        >
           <div>
             <div className="nn-heading flex items-center gap-2 text-lg font-semibold text-foreground">
               <Sparkles className="size-4 text-primary" /> Neural galaxy
@@ -639,11 +653,13 @@ export function NeuralGalaxy({
 
         <div className="pointer-events-auto flex items-center gap-3">
           {/* 2D map ↔ 3D galaxy morph */}
-          <div className="flex items-center gap-1 rounded-lg border border-border bg-card/80 p-1 text-xs backdrop-blur">
+          <fieldset className="m-0 flex min-w-0 items-center gap-1 rounded-lg border border-border bg-card/80 p-1 text-xs backdrop-blur">
+            <legend className="sr-only">Graph dimension</legend>
             {(["3d", "2d"] as const).map((v) => (
               <button
                 key={v}
                 type="button"
+                aria-pressed={view === v}
                 onClick={() => changeView(v)}
                 className={`rounded-md px-2.5 py-1 uppercase transition ${
                   view === v
@@ -654,12 +670,14 @@ export function NeuralGalaxy({
                 {v}
               </button>
             ))}
-          </div>
+          </fieldset>
 
-          <div className="relative w-72">
+          <div className={`relative ${compactToolbar ? "min-w-0 flex-1" : "w-72"}`}>
             <label className="flex items-center gap-2 rounded-lg border border-border bg-card/80 px-3 py-2 text-sm text-muted-foreground backdrop-blur focus-within:border-primary/60">
               <Search className="size-4 shrink-0" />
               <input
+                type="search"
+                aria-label="Search the galaxy"
                 value={query}
                 onChange={(e) => setQuery(e.target.value)}
                 onKeyDown={(e) => {

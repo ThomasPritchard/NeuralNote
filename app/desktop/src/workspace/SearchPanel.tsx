@@ -273,7 +273,7 @@ export function SearchPanel({
   return (
     <aside
       aria-label="Search"
-      className="flex w-60 shrink-0 flex-col border-r border-border bg-sidebar"
+      className="nn-sidebar flex shrink-0 flex-col border-r border-border bg-sidebar"
     >
       {/* Field — faithful port of the prototype's search row. */}
       <div className="px-3 pb-2 pt-3">

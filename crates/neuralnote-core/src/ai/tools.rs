@@ -1,24 +1,44 @@
 //! The tools exposed to the model, and the dispatcher that runs them.
 //!
-//! Three tools, all whole-vault (folder/note scoping is deferred): `list_notes`
-//! (metadata only), `search_notes` (→ evidence spans), and `read_note_span`
-//! (a bounded read). Schemas are OpenAI-compatible `serde_json::Value`s. Tool
-//! argument property names are `snake_case` — these are LLM-facing, not the
-//! frontend camelCase contract.
+//! Four read-only vault tools plus `use_skill` are always available. Active skills
+//! progressively grant their declared action tools. Schemas are OpenAI-compatible
+//! `serde_json::Value`s; tool argument property names are `snake_case` because this
+//! is the model-facing contract, not the frontend camelCase contract.
 //!
 //! [`dispatch`] is total: a bad tool name or malformed arguments become an error
 //! *tool result* the model reads and recovers from, never a hard failure — an
 //! agentic loop must tolerate the model asking for something impossible.
 
+use crate::ai::events::EventSink;
 use crate::ai::evidence::EvidenceRegistry;
+use crate::ai::llm::UserPrompt;
 use crate::ai::retrieval::RetrievalProvider;
+use crate::ai::skill_tools;
+use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
+use crate::ai::write_policy::{NoteWriteBackend, WriteSession};
+use crate::ai::youtube::{YoutubeIo, YoutubeToolSession, UNAVAILABLE_YOUTUBE_IO};
+use crate::ai::youtube_tools;
+use crate::capture::{PricingInput, UnavailableVaultProfileIo, VaultProfileIo};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
+use std::path::Path;
 
 pub const TOOL_LIST_NOTES: &str = "list_notes";
 pub const TOOL_LIST_FOLDERS: &str = "list_folders";
 pub const TOOL_SEARCH_NOTES: &str = "search_notes";
 pub const TOOL_READ_NOTE_SPAN: &str = "read_note_span";
+pub const TOOL_USE_SKILL: &str = "use_skill";
+pub const TOOL_SKILL_STEP: &str = "skill_step";
+pub const TOOL_ASK_USER: &str = "ask_user";
+pub const TOOL_WRITE_NOTE: &str = "write_note";
+pub const TOOL_FETCH_VIDEO_INFO: &str = "fetch_video_info";
+pub const TOOL_FETCH_CAPTIONS: &str = "fetch_captions";
+pub const TOOL_TRANSCRIBE_AUDIO: &str = "transcribe_audio";
+pub const TOOL_SELECT_PLAYLIST_VIDEOS: &str = "select_playlist_videos";
+pub const TOOL_RESOLVE_DISTIL_ROUTE: &str = "resolve_distil_route";
+
+static UNAVAILABLE_VAULT_PROFILE_IO: UnavailableVaultProfileIo = UnavailableVaultProfileIo;
 
 // Evidence spans returned when the model doesn't specify `max_results`. A common
 // term matches far more than this, so a search often clips — but that is `capped`
@@ -51,9 +71,21 @@ pub enum ToolOutcome {
         start_line: u32,
         end_line: u32,
     },
+    /// A skill action completed and emitted its own structured event if needed.
+    Action,
     /// The call was rejected (bad name/args/path). The detail is in the content the
     /// model reads; the orchestrator emits no event for it.
     Rejected,
+}
+
+/// Internal orchestration control carried alongside a normal tool result.
+/// `CompleteTurn` still requires the caller to append the result message before
+/// ending the run, preserving one result for every tool call.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum ToolControl {
+    #[default]
+    Continue,
+    CompleteTurn,
 }
 
 /// The outcome of one tool call: the JSON string for the `role:"tool"` message, and
@@ -62,19 +94,118 @@ pub enum ToolOutcome {
 pub struct ToolResult {
     pub content: String,
     pub outcome: ToolOutcome,
+    pub(super) control: ToolControl,
+}
+
+/// Mutable per-run collaborators required by skill tools. Retrieval and
+/// `UserPrompt` stay explicit dispatch parameters to preserve their existing seams.
+pub struct ToolContext<'a> {
+    pub(super) vault_root: &'a Path,
+    pub(super) skills: &'a SkillRegistry,
+    pub(super) environment: &'a SkillEnvironment,
+    pub(super) active_skills: &'a mut ActiveSkills,
+    pub(super) note_writer: &'a dyn NoteWriteBackend,
+    pub(super) writes: &'a mut WriteSession,
+    pub(super) sink: &'a mut dyn EventSink,
+    pub(super) youtube_io: &'a dyn YoutubeIo,
+    pub(super) youtube_requirements: &'a dyn crate::ai::youtube::YoutubeRequirementInstaller,
+    pub(super) youtube_session: Option<&'a mut YoutubeToolSession>,
+    pub(super) vault_profile_io: &'a dyn VaultProfileIo,
+    pub(super) pricing: Option<&'a PricingInput>,
+    authorized_tools: &'a BTreeSet<String>,
+}
+
+impl<'a> ToolContext<'a> {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        vault_root: &'a Path,
+        skills: &'a SkillRegistry,
+        environment: &'a SkillEnvironment,
+        active_skills: &'a mut ActiveSkills,
+        note_writer: &'a dyn NoteWriteBackend,
+        writes: &'a mut WriteSession,
+        sink: &'a mut dyn EventSink,
+        authorized_tools: &'a BTreeSet<String>,
+    ) -> Self {
+        Self {
+            vault_root,
+            skills,
+            environment,
+            active_skills,
+            note_writer,
+            writes,
+            sink,
+            youtube_io: &UNAVAILABLE_YOUTUBE_IO,
+            youtube_requirements: &crate::ai::youtube::UNAVAILABLE_YOUTUBE_REQUIREMENT_INSTALLER,
+            youtube_session: None,
+            vault_profile_io: &UNAVAILABLE_VAULT_PROFILE_IO,
+            pricing: None,
+            authorized_tools,
+        }
+    }
+
+    /// Opt into the host YouTube seam for this run. Existing clients keep the
+    /// explicit unavailable implementation until Phase 5 shell wiring lands.
+    pub fn with_youtube(
+        mut self,
+        youtube_io: &'a dyn YoutubeIo,
+        youtube_session: &'a mut YoutubeToolSession,
+    ) -> Self {
+        self.youtube_io = youtube_io;
+        self.youtube_session = Some(youtube_session);
+        self
+    }
+
+    pub fn with_youtube_requirements(
+        mut self,
+        installer: &'a dyn crate::ai::youtube::YoutubeRequirementInstaller,
+    ) -> Self {
+        self.youtube_requirements = installer;
+        self
+    }
+
+    pub fn with_vault_profile_io(mut self, profile_io: &'a dyn VaultProfileIo) -> Self {
+        self.vault_profile_io = profile_io;
+        self
+    }
+
+    pub fn with_pricing(mut self, pricing: &'a PricingInput) -> Self {
+        self.pricing = Some(pricing);
+        self
+    }
 }
 
 /// The tool schemas to advertise to the model (OpenAI `tools` array shape).
-pub fn tool_schemas() -> Vec<Value> {
-    vec![
+pub fn tool_schemas(active_skill_tools: &BTreeSet<String>) -> Vec<Value> {
+    let mut schemas = vec![
         list_notes_schema(),
         list_folders_schema(),
         search_notes_schema(),
         read_note_span_schema(),
-    ]
+        skill_tools::use_skill_schema(),
+    ];
+    for (name, schema) in skill_tools::active_schemas() {
+        if active_skill_tools.contains(name) {
+            schemas.push(schema);
+        }
+    }
+    for (name, schema) in crate::ai::youtube_tool_schemas::active_schemas() {
+        if active_skill_tools.contains(name) {
+            schemas.push(schema);
+        }
+    }
+    schemas
 }
 
-fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
+/// Names represented by an advertised schema snapshot.
+pub fn advertised_tool_names(schemas: &[Value]) -> BTreeSet<String> {
+    schemas
+        .iter()
+        .filter_map(|schema| schema["function"]["name"].as_str().map(str::to_string))
+        .collect()
+}
+
+pub(super) fn function_tool(name: &str, description: &str, parameters: Value) -> Value {
     json!({
         "type": "function",
         "function": { "name": name, "description": description, "parameters": parameters }
@@ -161,25 +292,102 @@ fn read_note_span_schema() -> Value {
 
 /// Run the named tool. Spans it produces are registered (assigning citable ids) so
 /// the ids appear in the model-facing JSON and the verifier can find them later.
-pub fn dispatch(
+pub async fn dispatch(
+    call_id: &str,
     name: &str,
     args_json: &str,
     provider: &dyn RetrievalProvider,
     registry: &mut EvidenceRegistry,
+    user_prompt: &dyn UserPrompt,
+    context: &mut ToolContext<'_>,
 ) -> ToolResult {
+    if !known_tool(name) {
+        return reject(format!("unknown tool '{name}'"));
+    }
+    if !context.authorized_tools.contains(name) {
+        return reject(format!(
+            "tool '{name}' is not active; activate a skill that grants it first"
+        ));
+    }
     match name {
         TOOL_LIST_NOTES => dispatch_list(args_json, provider),
         TOOL_LIST_FOLDERS => dispatch_folders(provider),
         TOOL_SEARCH_NOTES => dispatch_search(args_json, provider, registry),
         TOOL_READ_NOTE_SPAN => dispatch_read(args_json, provider, registry),
+        TOOL_USE_SKILL => skill_tools::dispatch_use_skill(args_json, context),
+        TOOL_SKILL_STEP => skill_tools::dispatch_skill_step(args_json, context),
+        TOOL_ASK_USER => {
+            skill_tools::dispatch_ask_user(call_id, args_json, user_prompt, context).await
+        }
+        TOOL_WRITE_NOTE => skill_tools::dispatch_write_note(args_json, context),
+        TOOL_FETCH_VIDEO_INFO => youtube_tools::dispatch_fetch_video_info(args_json, context).await,
+        TOOL_FETCH_CAPTIONS => youtube_tools::dispatch_fetch_captions(args_json, context).await,
+        TOOL_TRANSCRIBE_AUDIO => {
+            youtube_tools::dispatch_transcribe_audio(call_id, args_json, user_prompt, context).await
+        }
+        TOOL_SELECT_PLAYLIST_VIDEOS => {
+            crate::ai::youtube_selection::dispatch_select_playlist_videos(
+                call_id,
+                args_json,
+                user_prompt,
+                context,
+            )
+            .await
+        }
+        TOOL_RESOLVE_DISTIL_ROUTE => {
+            crate::ai::youtube_route::dispatch_resolve_distil_route(
+                call_id,
+                args_json,
+                provider,
+                user_prompt,
+                context,
+            )
+            .await
+        }
         other => reject(format!("unknown tool '{other}'")),
     }
 }
 
-fn reject(message: String) -> ToolResult {
+fn known_tool(name: &str) -> bool {
+    matches!(
+        name,
+        TOOL_LIST_NOTES
+            | TOOL_LIST_FOLDERS
+            | TOOL_SEARCH_NOTES
+            | TOOL_READ_NOTE_SPAN
+            | TOOL_USE_SKILL
+            | TOOL_SKILL_STEP
+            | TOOL_ASK_USER
+            | TOOL_WRITE_NOTE
+            | TOOL_FETCH_VIDEO_INFO
+            | TOOL_FETCH_CAPTIONS
+            | TOOL_TRANSCRIBE_AUDIO
+            | TOOL_SELECT_PLAYLIST_VIDEOS
+            | TOOL_RESOLVE_DISTIL_ROUTE
+    )
+}
+
+pub(super) fn reject(message: String) -> ToolResult {
+    rejected_with_control(message, ToolControl::Continue)
+}
+
+pub(super) fn reject_and_complete(message: String) -> ToolResult {
+    rejected_with_control(message, ToolControl::CompleteTurn)
+}
+
+fn rejected_with_control(message: String, control: ToolControl) -> ToolResult {
     ToolResult {
         content: json!({ "error": message }).to_string(),
         outcome: ToolOutcome::Rejected,
+        control,
+    }
+}
+
+pub(super) fn action(content: String) -> ToolResult {
+    ToolResult {
+        content,
+        outcome: ToolOutcome::Action,
+        control: ToolControl::Continue,
     }
 }
 
@@ -222,6 +430,7 @@ fn dispatch_list(args_json: &str, provider: &dyn RetrievalProvider) -> ToolResul
         })
         .to_string(),
         outcome: ToolOutcome::Listed,
+        control: ToolControl::Continue,
     }
 }
 
@@ -237,6 +446,7 @@ fn dispatch_folders(provider: &dyn RetrievalProvider) -> ToolResult {
     ToolResult {
         content: json!({ "folders": listed }).to_string(),
         outcome: ToolOutcome::Listed,
+        control: ToolControl::Continue,
     }
 }
 
@@ -305,6 +515,7 @@ fn dispatch_search(
             skipped_files: outcome.skipped_files,
             notes_read,
         },
+        control: ToolControl::Continue,
     }
 }
 
@@ -347,6 +558,7 @@ fn dispatch_read(
             start_line,
             end_line,
         },
+        control: ToolControl::Continue,
     }
 }
 
@@ -363,10 +575,18 @@ fn span_json(id: &str, span: &crate::ai::evidence::EvidenceSpan) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::events::VecSink;
     use crate::ai::evidence::EvidenceSpan;
+    use crate::ai::llm::NoUserPrompt;
+    use crate::ai::local::HardwareSpec;
     use crate::ai::retrieval::{FolderMeta, ListOutcome, NoteMeta, SearchOutcome};
+    use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
+    use crate::ai::write_policy::{UnavailableNoteWriter, WriteSession};
     use crate::error::{CoreError, CoreResult};
+    use futures::executor::block_on;
+    use std::collections::BTreeSet;
     use std::fs;
+    use std::path::PathBuf;
 
     /// A fake provider that returns the SAME span twice — to prove dispatch_search
     /// dedupes the evidence list when the registry collapses them to one id.
@@ -473,9 +693,55 @@ mod tests {
         (dir, r)
     }
 
+    fn dispatch_base(
+        name: &str,
+        args_json: &str,
+        provider: &dyn RetrievalProvider,
+        registry: &mut EvidenceRegistry,
+    ) -> ToolResult {
+        let skills = SkillRegistry::built_in(&[]).unwrap();
+        let environment = SkillEnvironment {
+            hardware: HardwareSpec {
+                total_ram_bytes: 1,
+                cpu_cores: 1,
+                cpu_brand: "test".into(),
+                gpu_label: None,
+                arch: "aarch64".into(),
+                os: "macos".into(),
+                free_disk_bytes: 1,
+            },
+            app_data_bin_dir: PathBuf::from("/app-data/bin"),
+            available_binaries: BTreeSet::new(),
+        };
+        let mut active = ActiveSkills::new(8);
+        let mut writes = WriteSession::new(1).unwrap();
+        let mut sink = VecSink::default();
+        let schemas = tool_schemas(&active.authorized_tools());
+        let allowed = advertised_tool_names(&schemas);
+        let mut context = ToolContext::new(
+            Path::new("."),
+            &skills,
+            &environment,
+            &mut active,
+            &UnavailableNoteWriter,
+            &mut writes,
+            &mut sink,
+            &allowed,
+        );
+        block_on(dispatch(
+            "test-call",
+            name,
+            args_json,
+            provider,
+            registry,
+            &NoUserPrompt,
+            &mut context,
+        ))
+    }
+
     #[test]
-    fn advertises_the_four_tools() {
-        let names: Vec<String> = tool_schemas()
+    fn advertises_the_base_tools() {
+        let names: Vec<String> = tool_schemas(&BTreeSet::new())
             .iter()
             .map(|t| t["function"]["name"].as_str().unwrap().to_string())
             .collect();
@@ -485,7 +751,8 @@ mod tests {
                 TOOL_LIST_NOTES,
                 TOOL_LIST_FOLDERS,
                 TOOL_SEARCH_NOTES,
-                TOOL_READ_NOTE_SPAN
+                TOOL_READ_NOTE_SPAN,
+                TOOL_USE_SKILL,
             ]
         );
     }
@@ -494,7 +761,7 @@ mod tests {
     fn dispatch_folders_lists_folders_with_counts() {
         let (_d, r) = folder_retriever();
         let mut reg = EvidenceRegistry::new();
-        let res = dispatch(TOOL_LIST_FOLDERS, "{}", &r, &mut reg);
+        let res = dispatch_base(TOOL_LIST_FOLDERS, "{}", &r, &mut reg);
         assert_eq!(res.outcome, ToolOutcome::Listed);
         let v: Value = serde_json::from_str(&res.content).unwrap();
         assert_eq!(v["folders"][0]["rel_path"], "Recipes");
@@ -507,7 +774,7 @@ mod tests {
         let (_d, r) = folder_retriever();
         let mut reg = EvidenceRegistry::new();
         // "simmer" matches both notes; scoping to Recipes returns only the Recipes hit.
-        let res = dispatch(
+        let res = dispatch_base(
             TOOL_SEARCH_NOTES,
             r#"{"query":"simmer","folder":"Recipes"}"#,
             &r,
@@ -525,7 +792,7 @@ mod tests {
     fn dispatch_list_scopes_to_folder() {
         let (_d, r) = folder_retriever();
         let mut reg = EvidenceRegistry::new();
-        let res = dispatch(TOOL_LIST_NOTES, r#"{"folder":"Recipes"}"#, &r, &mut reg);
+        let res = dispatch_base(TOOL_LIST_NOTES, r#"{"folder":"Recipes"}"#, &r, &mut reg);
         let v: Value = serde_json::from_str(&res.content).unwrap();
         let notes = v["notes"].as_array().unwrap();
         assert_eq!(notes.len(), 1);
@@ -536,7 +803,7 @@ mod tests {
     fn dispatch_search_registers_spans_and_returns_ids() {
         let (_d, r) = retriever();
         let mut reg = EvidenceRegistry::new();
-        let res = dispatch(TOOL_SEARCH_NOTES, r#"{"query":"alpha"}"#, &r, &mut reg);
+        let res = dispatch_base(TOOL_SEARCH_NOTES, r#"{"query":"alpha"}"#, &r, &mut reg);
         assert!(matches!(
             res.outcome,
             ToolOutcome::Searched { hit_count: 1, .. }
@@ -551,7 +818,7 @@ mod tests {
     fn dispatch_read_registers_a_span() {
         let (_d, r) = retriever();
         let mut reg = EvidenceRegistry::new();
-        let res = dispatch(
+        let res = dispatch_base(
             TOOL_READ_NOTE_SPAN,
             r#"{"rel_path":"n.md","start_line":3,"end_line":4}"#,
             &r,
@@ -575,7 +842,7 @@ mod tests {
     fn dispatch_list_returns_metadata() {
         let (_d, r) = retriever();
         let mut reg = EvidenceRegistry::new();
-        let res = dispatch(TOOL_LIST_NOTES, "{}", &r, &mut reg);
+        let res = dispatch_base(TOOL_LIST_NOTES, "{}", &r, &mut reg);
         assert_eq!(res.outcome, ToolOutcome::Listed);
         let v: Value = serde_json::from_str(&res.content).unwrap();
         assert_eq!(v["notes"][0]["rel_path"], "n.md");
@@ -586,7 +853,7 @@ mod tests {
     fn dispatch_rejects_unknown_tool() {
         let (_d, r) = retriever();
         let mut reg = EvidenceRegistry::new();
-        let res = dispatch("nope", "{}", &r, &mut reg);
+        let res = dispatch_base("nope", "{}", &r, &mut reg);
         assert_eq!(res.outcome, ToolOutcome::Rejected);
         let v: Value = serde_json::from_str(&res.content).unwrap();
         assert!(v["error"].as_str().unwrap().contains("unknown tool"));
@@ -597,7 +864,7 @@ mod tests {
         let (_d, r) = retriever();
         let mut reg = EvidenceRegistry::new();
         // Missing the required `query` field.
-        let res = dispatch(TOOL_SEARCH_NOTES, r#"{"max_results":3}"#, &r, &mut reg);
+        let res = dispatch_base(TOOL_SEARCH_NOTES, r#"{"max_results":3}"#, &r, &mut reg);
         assert_eq!(res.outcome, ToolOutcome::Rejected);
         assert!(serde_json::from_str::<Value>(&res.content).unwrap()["error"].is_string());
     }
@@ -605,7 +872,7 @@ mod tests {
     #[test]
     fn dispatch_search_dedupes_duplicate_spans_by_id() {
         let mut reg = EvidenceRegistry::new();
-        let res = dispatch(
+        let res = dispatch_base(
             TOOL_SEARCH_NOTES,
             r#"{"query":"x"}"#,
             &DupProvider,
@@ -628,7 +895,7 @@ mod tests {
     fn dispatch_list_surfaces_skipped_count() {
         let (_d, r) = retriever();
         let mut reg = EvidenceRegistry::new();
-        let res = dispatch(TOOL_LIST_NOTES, "{}", &r, &mut reg);
+        let res = dispatch_base(TOOL_LIST_NOTES, "{}", &r, &mut reg);
         let v: Value = serde_json::from_str(&res.content).unwrap();
         assert_eq!(v["skipped"], 0); // honest discovery footer, even when nothing skipped
     }
@@ -638,7 +905,7 @@ mod tests {
         // A capped listing must tell the model it saw only the first K of `total`
         // notes — the same honesty search_notes gives (PA-002).
         let mut reg = EvidenceRegistry::new();
-        let res = dispatch(TOOL_LIST_NOTES, "{}", &TruncatedListProvider, &mut reg);
+        let res = dispatch_base(TOOL_LIST_NOTES, "{}", &TruncatedListProvider, &mut reg);
         let v: Value = serde_json::from_str(&res.content).unwrap();
         assert_eq!(v["truncated"], true);
         assert_eq!(v["total"], 500);
@@ -649,7 +916,7 @@ mod tests {
         let (_d, r) = retriever();
         let mut reg = EvidenceRegistry::new();
         // 9999 is clamped to MAX_SEARCH_RESULTS; the call still succeeds.
-        let res = dispatch(
+        let res = dispatch_base(
             TOOL_SEARCH_NOTES,
             r#"{"query":"alpha","max_results":9999}"#,
             &r,

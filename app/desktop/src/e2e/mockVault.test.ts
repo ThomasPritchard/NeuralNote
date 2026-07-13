@@ -9,13 +9,16 @@ import { afterEach, describe, expect, it } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { clearMocks } from "@tauri-apps/api/mocks";
 import {
+  cancelRequirementDownload,
   createNoteFromTemplate,
+  downloadRequirement,
   listTemplates,
   readBacklinks,
   readLinkGraph,
   readNote,
   searchVault,
 } from "../lib/api";
+import type { PullEvent } from "../lib/types";
 import { createMockVault, VAULT_ROOT, type SeedEntry } from "./mockVault";
 
 afterEach(() => {
@@ -624,6 +627,49 @@ describe("mockVault templates", () => {
 
     expect(node).toMatchObject({ kind: "file", name: "Blank.md", relPath: "Blank.md" });
     await expect(readNote(`${VAULT_ROOT}/Blank.md`)).resolves.toMatchObject({ raw: "" });
+  });
+});
+
+describe("mockVault requirement downloads", () => {
+  it("keeps the first download as cancel owner when a concurrent start is rejected", async () => {
+    createMockVault({
+      requirementDownloadScript: [
+        {
+          type: "progress",
+          status: "downloading",
+          digest: null,
+          completed: null,
+          total: null,
+          percent: null,
+        },
+        { type: "success" },
+      ],
+    }).install();
+    const firstEvents: PullEvent[] = [];
+    const secondEvents: PullEvent[] = [];
+
+    const first = downloadRequirement("yt-dlp", (event) => firstEvents.push(event));
+    const second = downloadRequirement("yt-dlp", (event) => secondEvents.push(event));
+    await cancelRequirementDownload();
+    await Promise.all([first, second]);
+
+    expect(secondEvents).toEqual([
+      {
+        type: "error",
+        message: "a skill requirement download is already in progress",
+      },
+    ]);
+    expect(firstEvents).toEqual([
+      {
+        type: "progress",
+        status: "downloading",
+        digest: null,
+        completed: null,
+        total: null,
+        percent: null,
+      },
+      { type: "error", message: "Download cancelled." },
+    ]);
   });
 });
 

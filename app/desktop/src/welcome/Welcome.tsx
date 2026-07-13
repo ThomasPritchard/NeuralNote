@@ -67,7 +67,7 @@ export function Welcome() {
   }
 
   return (
-    <div className="relative flex h-full flex-col items-center justify-center overflow-hidden px-6 py-12">
+    <div className="nn-welcome relative flex h-full flex-col items-center justify-center overflow-y-auto bg-background px-6 py-12">
       {/* With the overlay titlebar there is no chrome on this screen, so this
           strip keeps the window draggable where the native traffic lights sit.
           data-tauri-drag-region is a plain DOM attribute — no Tauri API. All
@@ -75,7 +75,7 @@ export function Welcome() {
       <div data-tauri-drag-region aria-hidden className="absolute inset-x-0 top-0 z-20 h-10" />
       <AuroraGlow />
 
-      <main className="relative z-10 flex w-full max-w-md flex-col items-center gap-7 text-center">
+      <main id="nn-main-content" tabIndex={-1} className="nn-welcome-card relative z-10 flex w-full max-w-lg shrink-0 flex-col items-center gap-8 rounded-2xl border border-border bg-card/55 px-10 py-10 text-center shadow-2xl outline-none">
         <BrandHeader />
 
         {error && <ErrorAlert message={error} onDismiss={clearError} />}
@@ -120,7 +120,7 @@ interface ErrorAlertProps {
 }
 
 /** Dismissible inline alert for the store's single error channel. */
-function ErrorAlert({ message, onDismiss }: ErrorAlertProps) {
+function ErrorAlert({ message, onDismiss }: Readonly<ErrorAlertProps>) {
   return (
     <div
       role="alert"

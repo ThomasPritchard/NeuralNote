@@ -12,11 +12,14 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use neuralnote_core::ai::{openai, provider_config};
 use neuralnote_core::ai::{
-    ChatEvent, Completion, EventSink, LlmClient, LlmMessage, LlmRequest, Role,
+    openrouter_reasoning_support, parse_openrouter_input_pricing, ChatEvent, Completion, EventSink,
+    LlmClient, LlmMessage, LlmRequest, ReasoningSupport, Role,
 };
+use neuralnote_core::capture::ModelPricing;
 use neuralnote_core::CoreError;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::BTreeMap,
     path::Path,
     sync::{Mutex, OnceLock},
     time::Duration,
@@ -25,6 +28,8 @@ use ts_rs::TS;
 
 /// OpenRouter's OpenAI-compatible chat-completions endpoint.
 const OPENROUTER_URL: &str = "https://openrouter.ai/api/v1/chat/completions";
+/// OpenRouter's public model catalogue (no key, no auth header).
+const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 
 /// Keychain identity for the secret API key.
 const KEYCHAIN_SERVICE: &str = "com.neuralnote.desktop";
@@ -44,6 +49,7 @@ struct CacheState {
 }
 
 static API_KEY_CACHE: OnceLock<Mutex<CacheState>> = OnceLock::new();
+static OPENROUTER_PRICING_CACHE: OnceLock<Mutex<BTreeMap<String, ModelPricing>>> = OnceLock::new();
 
 /* ─────────────────────────────  Keychain  ──────────────────────────────── */
 
@@ -252,13 +258,21 @@ impl From<ChatTurn> for LlmMessage {
 pub struct TauriChannelSink {
     channel: tauri::ipc::Channel<ChatEvent>,
     closed: bool,
+    close_signal: std::sync::Arc<ChatRunCloseSignal>,
 }
 
 impl TauriChannelSink {
-    pub fn new(channel: tauri::ipc::Channel<ChatEvent>) -> Self {
+    /// Attach the lifecycle signal observed by the provider turn, shell prompt,
+    /// and note writer. A failed delivery then cancels every layer instead of
+    /// letting a dead webview retain work or write into an unmounted vault.
+    pub(crate) fn with_close_signal(
+        channel: tauri::ipc::Channel<ChatEvent>,
+        close_signal: std::sync::Arc<ChatRunCloseSignal>,
+    ) -> Self {
         Self {
             channel,
             closed: false,
+            close_signal,
         }
     }
 }
@@ -269,14 +283,101 @@ impl EventSink for TauriChannelSink {
             return;
         }
         if let Err(e) = self.channel.send(event) {
-            // TODO(chat-cancellation): the core's EventSink is infallible, so we
-            // can't abort run_chat from here — a closed channel still lets the
-            // current run finish (bounded by the guards) before it stops. A future
-            // cancellation token checked in the loop would end token spend sooner.
+            // EventSink cannot return this failure to core, so close the retained
+            // run signal instead. RunLlmClient races each transport await against
+            // it; prompt waits observe it separately, and the note backend checks it
+            // around synchronous writes. Core is left to unwind and return its Undo
+            // ledger rather than having the whole run future dropped.
             log::warn!("chat event channel closed; dropping further events: {e}");
             self.closed = true;
+            self.close_signal.close();
         }
     }
+}
+
+/// One chat invocation's observable event-channel/workspace lifecycle. `watch`
+/// retains the closed value, so a provider, prompt, or writer that checks after
+/// teardown still fails immediately; there is no lost-notification window.
+pub(crate) struct ChatRunCloseSignal {
+    sender: tokio::sync::watch::Sender<bool>,
+}
+
+impl Default for ChatRunCloseSignal {
+    fn default() -> Self {
+        let (sender, _receiver) = tokio::sync::watch::channel(false);
+        Self { sender }
+    }
+}
+
+impl ChatRunCloseSignal {
+    pub(crate) fn close(&self) {
+        self.sender.send_replace(true);
+    }
+
+    pub(crate) fn is_closed(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    pub(crate) async fn wait_closed(&self) {
+        let mut receiver = self.sender.subscribe();
+        if *receiver.borrow() {
+            return;
+        }
+        while receiver.changed().await.is_ok() {
+            if *receiver.borrow() {
+                return;
+            }
+        }
+    }
+}
+
+/// Probe whether `model` supports reasoning via OpenRouter's public models
+/// endpoint. No API key is attached: the endpoint needs none, and the key must
+/// never leave the keychain boundary. Any failure returns `Unknown` (fail open).
+pub async fn probe_openrouter_reasoning(model: &str) -> ReasoningSupport {
+    let Ok(client) = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(8))
+        .build()
+    else {
+        return ReasoningSupport::Unknown;
+    };
+    let Ok(response) = openrouter_models_request(&client).send().await else {
+        return ReasoningSupport::Unknown;
+    };
+    if !response.status().is_success() {
+        return ReasoningSupport::Unknown;
+    }
+    let Ok(body) = response.text().await else {
+        return ReasoningSupport::Unknown;
+    };
+
+    cache_openrouter_pricing(&body, model);
+    openrouter_reasoning_support(&body, model)
+}
+
+fn openrouter_models_request(client: &reqwest::Client) -> reqwest::RequestBuilder {
+    client.get(OPENROUTER_MODELS_URL)
+}
+
+fn cache_openrouter_pricing(models_json: &str, model: &str) {
+    let Ok(pricing) = parse_openrouter_input_pricing(models_json, model) else {
+        return;
+    };
+    OPENROUTER_PRICING_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(model.to_string(), pricing);
+}
+
+pub fn cached_openrouter_pricing(model: &str) -> Option<ModelPricing> {
+    OPENROUTER_PRICING_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(model)
+        .cloned()
 }
 
 /* ─────────────────────────────  LLM client  ────────────────────────────── */
@@ -292,12 +393,9 @@ pub struct OpenAiChatClient {
     /// Ollama doesn't fall back to ~4096 and silently truncate the grounding rules
     /// + earliest evidence — protecting cited recall on the Local path (PA-001).
     num_ctx: Option<u32>,
-    /// Whether to request streamed reasoning tokens on the answer turn. Set on the
-    /// OpenRouter path only, and even there only when the user opts in (the tokens are
-    /// billed); always `false` for Ollama, whose OpenAI-compatible endpoint doesn't
-    /// speak it. Provider capability lives here at the construction seam, not as a
-    /// branch in the shared streaming loop — so a non-reasoning provider still
-    /// substitutes cleanly (it just never emits a `Thinking` event).
+    /// Whether to request streamed reasoning tokens on the answer turn. The caller
+    /// combines the user's opt-in with the selected model's capability before client
+    /// construction, for both OpenRouter and Ollama.
     reasoning: bool,
 }
 
@@ -660,6 +758,9 @@ mod tests {
             key_configured,
             local_model_tag: None,
             reasoning: false,
+            reasoning_support: None,
+            reasoning_probed_model: None,
+            disabled_skills: Vec::new(),
         }
     }
 
@@ -682,6 +783,41 @@ mod tests {
 
         let on = OpenAiChatClient::new("sk-test".into(), true).answer_wire_body(&req);
         assert_eq!(on["reasoning"]["enabled"], true);
+    }
+
+    #[test]
+    fn public_openrouter_models_request_never_carries_authorization() {
+        let client = reqwest::Client::new();
+        let request = openrouter_models_request(&client).build().unwrap();
+
+        assert!(!request
+            .headers()
+            .contains_key(reqwest::header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn pricing_cache_is_optional_for_ordinary_chat_and_accepts_validated_catalogue_data() {
+        let model = format!("test/model-{}", TEST_ID.fetch_add(1, Ordering::SeqCst));
+        assert_eq!(cached_openrouter_pricing(&model), None);
+
+        cache_openrouter_pricing(
+            &serde_json::json!({
+                "data": [{
+                    "id": model,
+                    "pricing": { "prompt": "0.000003" }
+                }]
+            })
+            .to_string(),
+            &model,
+        );
+
+        assert_eq!(
+            cached_openrouter_pricing(&model),
+            Some(ModelPricing {
+                model,
+                input_usd_per_token: 0.000003,
+            })
+        );
     }
 
     #[test]

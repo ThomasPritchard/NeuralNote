@@ -326,7 +326,7 @@ export function Workspace() {
   if (!vault) return null;
 
   return (
-    <div className="flex h-full w-full flex-col bg-background text-foreground">
+    <div className="nn-app-shell flex h-full w-full flex-col bg-background text-foreground">
       <TitleBar
         vaultName={vault.name}
         sidebarOpen={sidebarOpen}
@@ -342,7 +342,12 @@ export function Workspace() {
         onRefresh={() => void refreshTree()}
         onCloseVault={handleCloseVault}
       />
-      <div className="flex min-h-0 flex-1">
+      <div
+        id="nn-main-content"
+        tabIndex={-1}
+        data-testid="workspace-panes"
+        className="nn-workspace-panes flex min-h-0 flex-1 overflow-hidden outline-none"
+      >
         <Ribbon
           sidebarPanel={sidebarPanel}
           centerView={centerView}
@@ -388,7 +393,7 @@ export function Workspace() {
             would run against a dead channel). Using `display:contents` lets its
             <aside> sit in the flex row as if unwrapped; `none` drops the subtree
             from layout while React keeps it — and its stream — alive. */}
-        <div style={{ display: showChat ? "contents" : "none" }}>
+        <div className="nn-chat-slot" data-visible={showChat} hidden={!showChat}>
           <ChatPane
             openNoteAt={openNoteAt}
             onOpenSettings={handleOpenSettings}

@@ -35,6 +35,13 @@ pub struct HardwareSpec {
     pub gpu_label: Option<String>,
     pub arch: String,
     pub os: String,
+    // Free bytes in the app-data filesystem. Zero may mean the probe failed, the
+    // value came from a pre-Slice-4 payload, or the volume is genuinely full.
+    #[serde(default)]
+    // Keep pre-Slice-4 TypeScript fixtures source-compatible too. Rust always
+    // serialises the numeric field; clients that omit it mean the same unknown 0.
+    #[ts(optional = nullable)]
+    pub free_disk_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, TS)]
@@ -250,6 +257,7 @@ mod tests {
             gpu_label: Some("Apple GPU".into()),
             arch: "aarch64".into(),
             os: os.into(),
+            free_disk_bytes: gib(100),
         }
     }
 
@@ -481,6 +489,7 @@ mod tests {
 
         let spec = serde_json::to_value(spec(8, "macos")).unwrap();
         assert!(spec.get("totalRamBytes").is_some());
+        assert!(spec.get("freeDiskBytes").is_some());
 
         let candidate = serde_json::to_value(&curated_candidates()[0]).unwrap();
         assert!(candidate.get("minRamBytes").is_some());
@@ -489,5 +498,20 @@ mod tests {
         // Recommender-internal fields stay out of the JS contract.
         assert!(candidate.get("paramsB").is_none());
         assert!(candidate.get("generation").is_none());
+    }
+
+    #[test]
+    fn old_hardware_json_defaults_unknown_free_disk_to_zero() {
+        let old = serde_json::json!({
+            "totalRamBytes": 16_000_000_000_u64,
+            "cpuCores": 8,
+            "cpuBrand": "Apple M-series",
+            "gpuLabel": null,
+            "arch": "aarch64",
+            "os": "macos"
+        });
+
+        let parsed: HardwareSpec = serde_json::from_value(old).unwrap();
+        assert_eq!(parsed.free_disk_bytes, 0);
     }
 }

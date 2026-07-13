@@ -1,4 +1,4 @@
-// The 40px integrated titlebar (macOS overlay style). The webview extends
+// The integrated titlebar (macOS overlay style). The webview extends
 // under the native traffic lights, so this bar draws the window chrome around
 // them: a 78px spacer clears the lights, then sidebar toggle + vault switcher
 // (left), the single active-note tab (centre), and chat + settings (right).
@@ -9,10 +9,8 @@
 // the drag layer and move the window. Native traffic-light clicks are OS-handled;
 // the 78px spacer is padding on the left cluster, so it does not fall through.
 //
-// Pure presentation, prop-driven. The one piece of local state is whether the
-// vault menu is open (mirrors FileTree's `menuOpen`).
+// Pure presentation, prop-driven. Radix owns the vault menu's interaction state.
 
-import { useState } from "react";
 import {
   ChevronDown,
   PanelLeft,
@@ -21,7 +19,7 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { cn } from "../lib/cn";
+import { IconButton } from "@/components/ui/icon-button";
 import type { NoteDoc } from "../lib/types";
 import { extFromPath, iconForFile } from "./fileMeta";
 import { VaultMenu } from "./VaultMenu";
@@ -63,10 +61,12 @@ export function TitleBar({
   onRefresh,
   onCloseVault,
 }: Readonly<TitleBarProps>) {
-  const [menuOpen, setMenuOpen] = useState(false);
-
   return (
-    <header className="relative flex h-10 shrink-0 items-center border-b border-border bg-sidebar">
+    <header
+      className="nn-titlebar relative grid h-(--titlebar-height) shrink-0 items-center border-b border-border bg-titlebar"
+      data-sidebar-open={sidebarOpen}
+      data-chat-open={chatOpen}
+    >
       {/* Drag layer — behind the z-10 clusters. If a button click ever moves
           the window instead of firing, this layering is what broke. */}
       <div data-tauri-drag-region aria-hidden className="absolute inset-0" />
@@ -82,42 +82,31 @@ export function TitleBar({
 
         {/* `relative` anchor for VaultMenu (the FileTree header idiom);
             self-stretch makes `top-full` the bar's bottom edge. */}
-        <div className="relative flex min-w-0 items-center self-stretch">
-          <button
-            type="button"
-            onClick={() => setMenuOpen((o) => !o)}
-            aria-haspopup="menu"
-            aria-expanded={menuOpen}
-            title="Vault actions"
-            className={cn(
-              "flex min-w-0 max-w-48 items-center gap-1 rounded-md px-1.5 py-1 text-[13px] font-semibold text-sidebar-foreground",
-              "transition-colors duration-300 ease-spring hover:bg-sidebar-accent/60 hover:text-foreground",
-              "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
-            )}
-          >
-            <span className="truncate">{vaultName}</span>
-            <ChevronDown className="size-3.5 shrink-0 opacity-60" aria-hidden />
-          </button>
-
-          {menuOpen && (
-            <VaultMenu
-              onClose={() => setMenuOpen(false)}
-              onNewNote={onNewNote}
-              onNewFolder={onNewFolder}
-              onRefresh={onRefresh}
-              onCloseVault={onCloseVault}
-            />
-          )}
-        </div>
+        <VaultMenu
+          trigger={
+            <button
+              type="button"
+              title="Vault actions"
+              className="flex min-w-0 max-w-48 items-center gap-1 rounded-md px-1.5 py-1 text-[13px] font-semibold text-sidebar-foreground transition-colors duration-150 ease-spring hover:bg-surface-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+            >
+              <span className="truncate">{vaultName}</span>
+              <ChevronDown className="size-3.5 shrink-0 opacity-60" aria-hidden />
+            </button>
+          }
+          onNewNote={onNewNote}
+          onNewFolder={onNewFolder}
+          onRefresh={onRefresh}
+          onCloseVault={onCloseVault}
+        />
       </div>
 
       {/* Centre: the single active-note tab (nothing when no note is open). */}
-      <div className="relative z-10 mx-auto min-w-0 px-2">
+      <div className="relative z-10 min-w-0 justify-self-start px-3">
         {note && <NoteTab note={note} dirty={noteDirty} onClose={onCloseNote} />}
       </div>
 
       {/* Right: cited-recall chat toggle, then settings. */}
-      <div className="relative z-10 flex shrink-0 items-center gap-1 pr-3">
+      <div className="relative z-10 flex shrink-0 items-center justify-end gap-1 pr-3">
         <TitleBarButton
           icon={Sparkles}
           label="Toggle chat panel"
@@ -148,14 +137,14 @@ function NoteTab({
           aria-label="Unsaved changes"
         />
       )}
-      <button
-        type="button"
+      <IconButton
         aria-label="Close note"
+        label="Close note"
         onClick={onClose}
-        className="ml-1 grid size-4 shrink-0 place-items-center rounded text-muted-foreground opacity-60 transition hover:bg-muted hover:opacity-100 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+        className="ml-1 size-6 opacity-60 hover:opacity-100"
       >
         <X className="size-3.5" aria-hidden />
-      </button>
+      </IconButton>
     </div>
   );
 }
@@ -176,21 +165,13 @@ function TitleBarButton({
   onClick,
 }: Readonly<TitleBarButtonProps>) {
   return (
-    <button
-      type="button"
-      aria-label={label}
-      aria-pressed={pressed}
-      title={label}
+    <IconButton
+      label={label}
+      pressed={pressed}
       onClick={onClick}
-      className={cn(
-        "grid size-7 shrink-0 place-items-center rounded-md transition-colors duration-300 ease-spring",
-        "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
-        pressed
-          ? "bg-sidebar-accent text-foreground"
-          : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground",
-      )}
+      className="size-8"
     >
       <Icon className="size-4" aria-hidden />
-    </button>
+    </IconButton>
   );
 }

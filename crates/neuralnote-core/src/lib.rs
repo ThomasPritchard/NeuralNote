@@ -6,6 +6,7 @@
 
 pub mod ai;
 pub mod backlinks;
+pub mod capture;
 pub mod entries;
 pub mod error;
 pub mod links;

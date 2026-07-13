@@ -1,8 +1,8 @@
 // SettingsModal: the presentational shell — open/close (Esc, backdrop, X),
 // section switching, initial-section override, focus handling (a native
 // <dialog> opened via showModal; the jsdom polyfill lives in test/setup.ts).
-// AiSettingsPage is stubbed out: its data loading has its own suite, and the
-// shell's job is only to mount the right section.
+// AiSettingsPage and SkillsSettingsPage are stubbed out: their data loading
+// has its own suites, and the shell's job is only to mount the right section.
 
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -10,6 +10,10 @@ import { describe, expect, it, vi } from "vitest";
 
 vi.mock("./AiSettingsPage", () => ({
   AiSettingsPage: () => <div data-testid="ai-settings-page" />,
+}));
+
+vi.mock("./SkillsSettingsPage", () => ({
+  SkillsSettingsPage: () => <div data-testid="skills-settings-page" />,
 }));
 
 import { SettingsModal } from "./SettingsModal";
@@ -33,11 +37,12 @@ describe("SettingsModal — shell", () => {
     expect(dialog).toHaveAttribute("aria-modal", "true");
     // Default section is Configure the AI — the reason the modal exists in v1.
     expect(screen.getByTestId("ai-settings-page")).toBeInTheDocument();
-    // The section nav lists both shipped sections.
+    // The section nav lists every shipped section.
     const nav = screen.getByRole("navigation", { name: "Settings sections" });
     expect(nav).toContainElement(
       screen.getByRole("button", { name: "Configure the AI" }),
     );
+    expect(nav).toContainElement(screen.getByRole("button", { name: "Skills" }));
     expect(nav).toContainElement(screen.getByRole("button", { name: "About" }));
   });
 
@@ -48,8 +53,13 @@ describe("SettingsModal — shell", () => {
     expect(screen.getByText("NeuralNote")).toBeInTheDocument();
     expect(screen.queryByTestId("ai-settings-page")).not.toBeInTheDocument();
 
+    await user.click(screen.getByRole("button", { name: "Skills" }));
+    expect(screen.getByTestId("skills-settings-page")).toBeInTheDocument();
+    expect(screen.queryByTestId("ai-settings-page")).not.toBeInTheDocument();
+
     await user.click(screen.getByRole("button", { name: "Configure the AI" }));
     expect(screen.getByTestId("ai-settings-page")).toBeInTheDocument();
+    expect(screen.queryByTestId("skills-settings-page")).not.toBeInTheDocument();
   });
 
   it("ships no empty General section — no nav entry, no placeholder copy (PA-017)", () => {
@@ -103,7 +113,7 @@ describe("SettingsModal — focus", () => {
     );
     const opener = screen.getByRole("button", { name: "opener" });
     await user.click(opener);
-    expect(opener).toHaveFocus();
+    await vi.waitFor(() => expect(opener).toHaveFocus());
 
     rerender(
       <>
@@ -119,18 +129,14 @@ describe("SettingsModal — focus", () => {
         <SettingsModal open={false} onClose={onClose} />
       </>,
     );
-    expect(opener).toHaveFocus();
+    await vi.waitFor(() => expect(opener).toHaveFocus());
   });
 
-  it("opens as a native modal (showModal), which traps focus in the dialog", () => {
-    // The focus trap is the browser's: showModal() puts the dialog in the top
-    // layer and makes the rest of the document inert, so Tab can only cycle
-    // the dialog's own controls. jsdom implements neither top layer nor tab
-    // order, so the test pins the mechanism that delivers the trap.
-    const showModal = vi.spyOn(HTMLDialogElement.prototype, "showModal");
-    setup();
-    expect(showModal).toHaveBeenCalledOnce();
-    expect(screen.getByRole("dialog")).toHaveAttribute("open");
-    showModal.mockRestore();
+  it("keeps keyboard focus inside the modal", async () => {
+    const { user } = setup();
+    const dialog = screen.getByRole("dialog");
+    expect(dialog).toHaveFocus();
+    await user.tab({ shift: true });
+    expect(dialog).toContainElement(document.activeElement as HTMLElement);
   });
 });

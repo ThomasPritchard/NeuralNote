@@ -171,7 +171,9 @@ describe("Journey 7: cited chat — streamed run", () => {
     expect(answer.textContent).not.toMatch(/chloroplasts/i);
 
     // Reasoning is inspectable but collapsed — it is provenance, not the answer.
-    const reasoning = screen.getByText("Reasoning").closest("details")!;
+    // (Scoped to the disclosure's <summary>: the composer's reasoning chip also
+    // carries the visible word "Reasoning".)
+    const reasoning = screen.getByText("Reasoning", { selector: "summary" }).closest("details")!;
     expect(reasoning).not.toHaveAttribute("open");
 
     await user.click(within(reasoning).getByText("Reasoning"));

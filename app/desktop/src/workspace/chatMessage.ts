@@ -4,7 +4,7 @@
 // and a coverage footer). Keeping the fold pure and framework-free makes the
 // harness feel unit-testable without React.
 
-import type { ChatEvent, ChatTurn } from "../lib/types";
+import type { ChatEvent, ChatTurn, ElicitOption, NoteKind } from "../lib/types";
 
 /** One row in the live activity log — the visible trace of the agent working. */
 export type ActivityStep =
@@ -32,6 +32,13 @@ export interface CoverageView {
   skippedFiles: number;
 }
 
+export interface PendingElicitation {
+  id: string;
+  question: string;
+  options: ElicitOption[];
+  multiSelect: boolean;
+}
+
 export interface UserMessage {
   role: "user";
   content: string;
@@ -39,8 +46,15 @@ export interface UserMessage {
 
 export interface AssistantMessage {
   role: "assistant";
+  skillActivations: Array<{ id: string; name: string }>;
+  skillSteps: string[];
+  pendingElicitation: PendingElicitation | null;
+  writtenNotes: Array<{ relPath: string; kind: NoteKind }>;
   /** The live "searching / reading / verifying" trace, in order. */
   activity: ActivityStep[];
+  /** Pinned at turn creation because reasoning can be toggled off mid-stream;
+   *  the finished turn stays self-describing against the opt-in it ran under. */
+  reasoningRequested: boolean;
   /** Optional streamed reasoning tokens (rendered collapsed). */
   thinking: string;
   /** The streamed answer markdown, accumulated delta by delta. */
@@ -60,10 +74,15 @@ export function userMessage(content: string): UserMessage {
 }
 
 /** A fresh assistant turn, before any event has landed. */
-export function emptyAssistant(): AssistantMessage {
+export function emptyAssistant(reasoningRequested = false): AssistantMessage {
   return {
     role: "assistant",
+    skillActivations: [],
+    skillSteps: [],
+    pendingElicitation: null,
+    writtenNotes: [],
     activity: [],
+    reasoningRequested,
     thinking: "",
     answer: "",
     citations: [],
@@ -71,6 +90,51 @@ export function emptyAssistant(): AssistantMessage {
     error: null,
     done: false,
   };
+}
+
+/** Model-reported transcript source labels surfaced during a skill run.
+ *  These are presentation hints, not verified source metadata. Keep first-seen
+ *  order so a playlist's model narrative remains readable. */
+export function modelReportedProvenance(turn: AssistantMessage): string[] {
+  const narrative = [...turn.skillSteps, turn.answer, turn.error ?? ""].join("\n");
+  const labels = narrative.match(
+    /\b(?:captions:[A-Za-z0-9_-]+|whisper:[A-Za-z0-9_./:-]*[A-Za-z0-9_-])/g,
+  );
+  return [...new Set(labels ?? [])];
+}
+
+/** Infer a possible partial run from model-authored narrative. NoteWritten is
+ *  authoritative for the file ledger; this status itself is not verified. */
+export function isPartialSkillRun(turn: AssistantMessage): boolean {
+  if (
+    !turn.done ||
+    turn.skillActivations.length === 0 ||
+    turn.writtenNotes.length === 0
+  ) {
+    return false;
+  }
+  const narrative = [...turn.skillSteps, turn.answer, turn.error ?? ""].join("\n");
+  return /\b(?:cancelled|canceled|stopped(?:\s+early)?|partial)\b/i.test(narrative);
+}
+
+/** The turn searched the vault and genuinely found nothing to cite.
+ *
+ *  Zero surviving citations does not mean the vault held nothing — it can also
+ *  mean a note was read and the model answered without an [eN] marker, or the
+ *  verifier dropped the quote. In either of those the vault *did* cover it, so
+ *  "nothing covers this" would be a false claim about the user's own notes. The
+ *  card fires only when the turn read nothing (`notesRead` empty) and dropped
+ *  nothing; otherwise the footer and the model's own answer carry the account. */
+export function showsNothingFoundCard(turn: AssistantMessage): boolean {
+  return (
+    turn.done &&
+    turn.error === null &&
+    turn.coverage !== null &&
+    turn.coverage.searchedTerms.length > 0 &&
+    turn.coverage.notesRead.length === 0 &&
+    turn.citations.length === 0 &&
+    !turn.activity.some((step) => step.kind === "dropped")
+  );
 }
 
 /** Fold a `retrieved` event into the matching `searching` row (→ "searching X →
@@ -100,6 +164,34 @@ export function reduceAssistant(
   event: ChatEvent,
 ): AssistantMessage {
   switch (event.type) {
+    case "skillActivated":
+      return {
+        ...turn,
+        skillActivations: [
+          ...turn.skillActivations,
+          { id: event.id, name: event.name },
+        ],
+      };
+    case "skillStep":
+      return { ...turn, skillSteps: [...turn.skillSteps, event.message] };
+    case "elicit":
+      return {
+        ...turn,
+        pendingElicitation: {
+          id: event.id,
+          question: event.question,
+          options: event.options,
+          multiSelect: event.multiSelect,
+        },
+      };
+    case "noteWritten":
+      return {
+        ...turn,
+        writtenNotes: [
+          ...turn.writtenNotes,
+          { relPath: event.relPath, kind: event.kind },
+        ],
+      };
     case "searching":
       return { ...turn, activity: [...turn.activity, { kind: "search", query: event.query }] };
     case "retrieved":

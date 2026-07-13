@@ -16,7 +16,7 @@ use tauri::{AppHandle, Emitter};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::event_names::TREE_CHANGED;
-use crate::{config_dir, lock_state, menu, root_of, SharedState, VaultSession};
+use crate::{config_dir, lock_state, menu, root_of, AppState, SharedState, VaultSession};
 
 /// Canonical form for authorization comparisons, falling back to the path as
 /// given if it can't be resolved (e.g. just deleted). Without this, the PA-004
@@ -48,6 +48,13 @@ fn refresh_menu(app: &AppHandle) {
     if let Err(e) = menu::refresh(app) {
         log::warn!("could not refresh the application menu: {e}");
     }
+}
+
+/// End every chat tied to the workspace that is about to unmount. Closing or
+/// replacing a vault removes the only UI capable of answering its elicitations;
+/// retained run signals also stop a not-yet-parked question from racing teardown.
+fn cancel_active_chat_runs(state: &mut AppState) {
+    state.pending_elicitations.cancel_all_runs();
 }
 
 /// Whether `path` is already a known recent vault — a trusted root, since recents
@@ -193,6 +200,7 @@ pub(crate) fn open_vault(
         // that follows is a no-op, not a spurious menu rebuild. Clear edit-mode (no
         // note is open yet) so Format items start disabled.
         let mut guard = lock_state(&state);
+        cancel_active_chat_runs(&mut guard);
         guard.session = Some(VaultSession {
             root,
             _watcher: watcher,
@@ -232,6 +240,7 @@ pub(crate) fn create_vault(
         // the workspace remounts, so the webview's own chat-visibility copy resets
         // to `true` in agreement with this one, and no note is open yet.
         let mut guard = lock_state(&state);
+        cancel_active_chat_runs(&mut guard);
         guard.session = Some(VaultSession {
             root,
             _watcher: watcher,
@@ -248,6 +257,7 @@ pub(crate) fn create_vault(
 pub(crate) fn close_vault(app: AppHandle, state: SharedState) {
     {
         let mut guard = lock_state(&state);
+        cancel_active_chat_runs(&mut guard);
         guard.session = None;
         // No note is open once the vault closes; keep Format items from lingering
         // enabled (they gate on `editing`).

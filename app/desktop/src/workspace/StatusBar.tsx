@@ -29,7 +29,7 @@ export const StatusBar = memo(function StatusBar({
   );
 
   return (
-    <footer className="nn-mono flex h-6 shrink-0 items-center justify-between border-t border-border bg-sidebar px-3 text-[11px] text-muted-foreground">
+    <footer className="nn-mono flex h-(--statusbar-height) shrink-0 items-center justify-between border-t border-border bg-titlebar px-3 text-[11px] text-muted-foreground">
       <div className="flex min-w-0 items-center gap-3">
         <span className="truncate text-foreground/70">{vaultName}</span>
         {words !== null && (
@@ -39,7 +39,7 @@ export const StatusBar = memo(function StatusBar({
           </>
         )}
       </div>
-      <div className="flex shrink-0 items-center gap-3">
+      <div className="nn-status-secondary flex shrink-0 items-center gap-3">
         <span>
           {notes} {notes === 1 ? "note" : "notes"}
         </span>
@@ -49,7 +49,7 @@ export const StatusBar = memo(function StatusBar({
         </span>
         <span className="opacity-40">·</span>
         <span className="flex items-center gap-1.5 text-foreground/70">
-          <span className="size-1.5 rounded-full bg-primary" aria-hidden />
+          <span className="size-1.5 rounded-full bg-healthy" aria-hidden />
           <span>In sync with disk</span>
         </span>
       </div>

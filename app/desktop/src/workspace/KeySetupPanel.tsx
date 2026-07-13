@@ -4,8 +4,7 @@
 
 import { useState } from "react";
 import { KeyRound, Sparkles } from "lucide-react";
-import { cn } from "../lib/cn";
-import { BTN_PRIMARY, GLOW_PRIMARY } from "./buttonStyles";
+import { buttonVariants } from "@/components/ui/button";
 
 // Exported so the settings page's key form (AiSettingsPage) shares the exact
 // field idiom — two key UIs that can't drift apart.
@@ -36,7 +35,7 @@ export function KeySetupPanel({
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto px-6 py-8">
       <div className="flex flex-col items-center gap-2.5 text-center">
-        <span className="grid size-11 place-items-center rounded-xl bg-primary/10 text-primary shadow-[0_0_24px_-8px_var(--color-primary)] ring-1 ring-inset ring-primary/20">
+        <span className="grid size-11 place-items-center rounded-xl bg-primary/10 text-primary ring-1 ring-inset ring-primary/20">
           <KeyRound className="size-5" aria-hidden />
         </span>
         <p className="text-[14px] font-medium text-foreground/90">Connect an AI key</p>
@@ -90,7 +89,7 @@ export function KeySetupPanel({
         <button
           type="submit"
           disabled={!canSave}
-          className={`mt-1 grid place-items-center rounded-lg bg-primary px-3 py-2 text-[13px] font-semibold text-primary-foreground ${GLOW_PRIMARY} transition hover:bg-primary/90 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary/40 disabled:cursor-not-allowed disabled:opacity-50 disabled:shadow-none`}
+          className={buttonVariants({ tone: "primary", size: "lg", className: "mt-1 w-full" })}
         >
           {saving ? "Saving…" : "Save & start chatting"}
         </button>
@@ -123,7 +122,7 @@ export function DisconnectedPane({ onConnect }: Readonly<{ onConnect: () => void
       <button
         type="button"
         onClick={onConnect}
-        className={cn(BTN_PRIMARY, "mt-1 px-3.5")}
+        className={buttonVariants({ tone: "primary", size: "sm", className: "mt-1 px-3.5" })}
       >
         Connect a model
       </button>

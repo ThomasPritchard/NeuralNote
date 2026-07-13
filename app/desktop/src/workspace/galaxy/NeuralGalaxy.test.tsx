@@ -100,6 +100,16 @@ describe("NeuralGalaxy", () => {
     expect(screen.getByText("Cross-folder link")).toBeInTheDocument();
   });
 
+  it("compacts the toolbar at the narrow native pane width and labels galaxy search", () => {
+    render(<NeuralGalaxy {...makeProps({ width: 700 })} />);
+
+    expect(screen.getByTestId("galaxy-toolbar")).toHaveAttribute(
+      "data-layout",
+      "compact",
+    );
+    expect(screen.getByRole("searchbox", { name: "Search the galaxy" })).toBeInTheDocument();
+  });
+
   it("pluralizes each stat independently", () => {
     render(
       <NeuralGalaxy
@@ -586,14 +596,17 @@ describe("NeuralGalaxy", () => {
   it("marks the active view on the 3D/2D toggle and morphs the camera", async () => {
     const user = userEvent.setup();
     render(<NeuralGalaxy {...makeProps()} />);
+    const dimensionGroup = screen.getByRole("group", { name: "Graph dimension" });
+    expect(dimensionGroup.tagName).toBe("FIELDSET");
+    expect(dimensionGroup).not.toHaveAttribute("role");
     const btn2d = screen.getByRole("button", { name: "2d" });
     const btn3d = screen.getByRole("button", { name: "3d" });
-    expect(btn3d.className).toContain("bg-primary");
-    expect(btn2d.className).not.toContain("bg-primary");
+    expect(btn3d).toHaveAttribute("aria-pressed", "true");
+    expect(btn2d).toHaveAttribute("aria-pressed", "false");
 
     await user.click(btn2d);
-    expect(btn2d.className).toContain("bg-primary");
-    expect(btn3d.className).not.toContain("bg-primary");
+    expect(btn2d).toHaveAttribute("aria-pressed", "true");
+    expect(btn3d).toHaveAttribute("aria-pressed", "false");
     expect(harness.fg.__controls.noRotate).toBe(true);
     expect(harness.fg.cameraPosition).toHaveBeenCalled();
     expect(harness.fg.d3ReheatSimulation).toHaveBeenCalled();

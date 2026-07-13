@@ -4,7 +4,7 @@
 //! only non-secret routing/model preferences so every client can share the same
 //! migration and tolerant-read behaviour.
 
-use crate::ai::DEFAULT_MODEL;
+use crate::ai::{capabilities::ReasoningSupport, DEFAULT_MODEL};
 use crate::error::{CoreError, CoreResult};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -31,13 +31,38 @@ pub struct ProviderConfig {
     pub key_configured: bool,
     #[serde(default)]
     pub local_model_tag: Option<String>,
-    /// Whether to request OpenRouter's (billed) reasoning tokens on the answer turn.
+    /// Whether to request reasoning tokens on the answer turn.
     /// `#[serde(default)]` is load-bearing: an existing `ai-config.json` written
     /// before this field existed reads back as `bool::default()` = `false`, so old
-    /// installs migrate to "off" for free. OpenRouter-only — the Local (Ollama) path
-    /// has no reasoning concept and always sends `false`.
+    /// installs migrate to "off" for free.
     #[serde(default)]
     pub reasoning: bool,
+    /// Cached reasoning/thinking verdict for the selected model. `None` = never probed.
+    // TODO(reasoning-cache-newtype): this field and `reasoning_probed_model` are only ever
+    // meaningful together — a verdict without the model it was probed against is unusable, and
+    // vice versa. `cached_reasoning_support` enforces that pairing at the one read site today,
+    // but the two independent `Option`s let the illegal half-set states be constructed. Fold
+    // them into a single `Option<ProbedReasoning { model, support }>` to make the invariant
+    // unrepresentable. Deferred, not done now: it changes the persisted ai-config.json shape,
+    // so it wants a serde migration (flatten or a versioned read) — worth doing before the
+    // format has real users, but out of scope for this slice.
+    #[serde(default)]
+    pub reasoning_support: Option<ReasoningSupport>,
+    /// Which model string the cached verdict belongs to. The cache is valid ONLY when this
+    /// equals the currently selected model; a mismatch (e.g. after a model upgrade) means the
+    /// verdict is stale and must be re-probed. This is what stops a stale `Unsupported` from
+    /// outliving a model change. See [`Self::reasoning_support`] for a planned newtype fold.
+    #[serde(default)]
+    pub reasoning_probed_model: Option<String>,
+    /// Stable skill ids the user disabled. An explicit empty list enables every
+    /// built-in skill; missing legacy state applies only the compiled-in defaults.
+    /// Existing skills remain enabled, while incomplete new skills can ship off.
+    #[serde(default = "default_disabled_skills")]
+    pub disabled_skills: Vec<String>,
+}
+
+fn default_disabled_skills() -> Vec<String> {
+    Vec::new()
 }
 
 impl Default for ProviderConfig {
@@ -48,6 +73,9 @@ impl Default for ProviderConfig {
             key_configured: false,
             local_model_tag: None,
             reasoning: false,
+            reasoning_support: None,
+            reasoning_probed_model: None,
+            disabled_skills: default_disabled_skills(),
         }
     }
 }
@@ -61,6 +89,29 @@ impl ProviderConfig {
             Some(ProviderKind::OpenRouter)
         } else {
             None
+        }
+    }
+
+    /// The model string of the effective provider: OpenRouter uses `model`, Local
+    /// uses `local_model_tag`, and no provider has no selected model.
+    pub fn selected_model(&self) -> Option<&str> {
+        match self.effective_provider()? {
+            ProviderKind::OpenRouter => Some(&self.model),
+            ProviderKind::Local => self.local_model_tag.as_deref(),
+        }
+    }
+
+    /// The cached reasoning verdict if it is still valid for the current selected
+    /// model; otherwise `Unknown` (never probed, or stale after a model change).
+    /// Fail-open by construction.
+    pub fn cached_reasoning_support(&self) -> ReasoningSupport {
+        match (
+            self.selected_model(),
+            self.reasoning_probed_model.as_deref(),
+            self.reasoning_support,
+        ) {
+            (Some(current), Some(probed), Some(support)) if current == probed => support,
+            _ => ReasoningSupport::Unknown,
         }
     }
 }
@@ -138,18 +189,12 @@ pub fn write_provider_config(config_dir: &Path, config: &ProviderConfig) -> Core
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::DEFAULT_MODEL;
+    use crate::ai::{ReasoningSupport, DEFAULT_MODEL, FIXTURE_SKILL_ID};
     use crate::CoreError;
     use std::fs;
 
     fn default_config() -> ProviderConfig {
-        ProviderConfig {
-            active_provider: None,
-            model: DEFAULT_MODEL.to_string(),
-            key_configured: false,
-            local_model_tag: None,
-            reasoning: false,
-        }
+        ProviderConfig::default()
     }
 
     #[test]
@@ -161,6 +206,9 @@ mod tests {
             key_configured: true,
             local_model_tag: Some("qwen2.5:7b".into()),
             reasoning: true,
+            reasoning_support: Some(ReasoningSupport::Supported),
+            reasoning_probed_model: Some("qwen2.5:7b".into()),
+            disabled_skills: vec![FIXTURE_SKILL_ID.into()],
         };
 
         write_provider_config(dir.path(), &config).unwrap();
@@ -205,6 +253,9 @@ mod tests {
                 key_configured: true,
                 local_model_tag: None,
                 reasoning: false,
+                reasoning_support: None,
+                reasoning_probed_model: None,
+                disabled_skills: Vec::new(),
             },
         )
         .unwrap();
@@ -225,6 +276,11 @@ mod tests {
     }
 
     #[test]
+    fn new_install_enables_every_built_in_skill() {
+        assert!(ProviderConfig::default().disabled_skills.is_empty());
+    }
+
+    #[test]
     fn write_then_read_normalizes_model() {
         let dir = tempfile::tempdir().unwrap();
 
@@ -236,6 +292,9 @@ mod tests {
                 key_configured: false,
                 local_model_tag: None,
                 reasoning: false,
+                reasoning_support: None,
+                reasoning_probed_model: None,
+                disabled_skills: Vec::new(),
             },
         )
         .unwrap();
@@ -252,6 +311,9 @@ mod tests {
                 key_configured: false,
                 local_model_tag: None,
                 reasoning: false,
+                reasoning_support: None,
+                reasoning_probed_model: None,
+                disabled_skills: Vec::new(),
             },
         )
         .unwrap();
@@ -276,7 +338,38 @@ mod tests {
         assert_eq!(config.model, "openai/gpt-4.1");
         assert!(config.key_configured);
         assert_eq!(config.local_model_tag, None);
+        assert_eq!(config.reasoning_support, None);
+        assert_eq!(config.reasoning_probed_model, None);
+        assert!(config.disabled_skills.is_empty());
+        assert_eq!(config.disabled_skills, default_config().disabled_skills);
         assert_eq!(config.effective_provider(), Some(ProviderKind::OpenRouter));
+    }
+
+    #[test]
+    fn disabled_skills_round_trip_preserves_explicit_disabled_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = default_config();
+        config.disabled_skills = vec![FIXTURE_SKILL_ID.into()];
+
+        write_provider_config(dir.path(), &config).unwrap();
+        assert_eq!(
+            read_provider_config(dir.path()).unwrap().disabled_skills,
+            [FIXTURE_SKILL_ID]
+        );
+    }
+
+    #[test]
+    fn explicit_empty_disabled_skills_remains_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_file(dir.path()),
+            r#"{"model":"openai/gpt-4.1","keyConfigured":true,"disabledSkills":[]}"#,
+        )
+        .unwrap();
+        assert!(read_provider_config(dir.path())
+            .unwrap()
+            .disabled_skills
+            .is_empty());
     }
 
     #[test]
@@ -288,6 +381,9 @@ mod tests {
             key_configured: false,
             local_model_tag: None,
             reasoning: false,
+            reasoning_support: None,
+            reasoning_probed_model: None,
+            disabled_skills: Vec::new(),
         };
 
         write_provider_config(dir.path(), &config).unwrap();
@@ -306,6 +402,9 @@ mod tests {
             key_configured: false,
             local_model_tag: Some("qwen2.5:7b".into()),
             reasoning: false,
+            reasoning_support: None,
+            reasoning_probed_model: None,
+            disabled_skills: Vec::new(),
         };
 
         write_provider_config(dir.path(), &config).unwrap();
@@ -341,6 +440,88 @@ mod tests {
     }
 
     #[test]
+    fn selected_model_uses_openrouter_model_for_key_configured_install() {
+        let config = ProviderConfig {
+            model: "openai/gpt-4.1".into(),
+            key_configured: true,
+            ..default_config()
+        };
+
+        assert_eq!(config.selected_model(), Some("openai/gpt-4.1"));
+    }
+
+    #[test]
+    fn selected_model_uses_local_model_tag_for_local_provider() {
+        let config = ProviderConfig {
+            active_provider: Some(ProviderKind::Local),
+            local_model_tag: Some("qwen2.5:7b".into()),
+            ..default_config()
+        };
+
+        assert_eq!(config.selected_model(), Some("qwen2.5:7b"));
+    }
+
+    #[test]
+    fn selected_model_is_none_without_effective_provider() {
+        assert_eq!(default_config().selected_model(), None);
+    }
+
+    #[test]
+    fn cached_reasoning_support_returns_valid_model_verdict() {
+        let config = ProviderConfig {
+            model: "openai/gpt-4.1".into(),
+            key_configured: true,
+            reasoning_support: Some(ReasoningSupport::Supported),
+            reasoning_probed_model: Some("openai/gpt-4.1".into()),
+            ..default_config()
+        };
+
+        assert_eq!(
+            config.cached_reasoning_support(),
+            ReasoningSupport::Supported
+        );
+    }
+
+    #[test]
+    fn cached_reasoning_support_is_unknown_after_model_change() {
+        let config = ProviderConfig {
+            model: "new/model".into(),
+            key_configured: true,
+            reasoning_support: Some(ReasoningSupport::Unsupported),
+            reasoning_probed_model: Some("old/model".into()),
+            ..default_config()
+        };
+
+        assert_eq!(config.cached_reasoning_support(), ReasoningSupport::Unknown);
+    }
+
+    #[test]
+    fn cached_reasoning_support_is_unknown_without_verdict() {
+        let config = ProviderConfig {
+            model: "openai/gpt-4.1".into(),
+            key_configured: true,
+            reasoning_support: None,
+            reasoning_probed_model: Some("openai/gpt-4.1".into()),
+            ..default_config()
+        };
+
+        assert_eq!(config.cached_reasoning_support(), ReasoningSupport::Unknown);
+    }
+
+    #[test]
+    fn cached_reasoning_support_is_unknown_without_probed_model() {
+        let config = ProviderConfig {
+            model: "openai/gpt-4.1".into(),
+            key_configured: true,
+            reasoning_support: Some(ReasoningSupport::Supported),
+            reasoning_probed_model: None,
+            ..default_config()
+        };
+
+        assert_eq!(config.cached_reasoning_support(), ReasoningSupport::Unknown);
+    }
+
+    #[test]
     fn serde_uses_camel_case_names() {
         assert_eq!(
             serde_json::to_value(ProviderKind::OpenRouter).unwrap(),
@@ -353,6 +534,9 @@ mod tests {
             key_configured: true,
             local_model_tag: Some("qwen2.5:7b".into()),
             reasoning: true,
+            reasoning_support: Some(ReasoningSupport::Supported),
+            reasoning_probed_model: Some("qwen2.5:7b".into()),
+            disabled_skills: vec![FIXTURE_SKILL_ID.into()],
         })
         .unwrap();
 
@@ -360,6 +544,18 @@ mod tests {
         assert!(value.get("keyConfigured").is_some());
         assert!(value.get("localModelTag").is_some());
         assert_eq!(value.get("reasoning"), Some(&serde_json::json!(true)));
+        assert_eq!(
+            value.get("reasoningSupport"),
+            Some(&serde_json::json!("supported"))
+        );
+        assert_eq!(
+            value.get("reasoningProbedModel"),
+            Some(&serde_json::json!("qwen2.5:7b"))
+        );
+        assert_eq!(
+            value.get("disabledSkills"),
+            Some(&serde_json::json!([FIXTURE_SKILL_ID]))
+        );
     }
 
     #[test]
