@@ -2,7 +2,6 @@ import type { ReactNode } from "react";
 import {
   ArrowDown,
   ArrowRight,
-  Brain,
   Check,
   Download,
   FilePlus2,
@@ -13,7 +12,8 @@ import {
   Quote,
   Sparkles,
 } from "lucide-react";
-import { finalCta, hero, loop, nav, pillars, privacy, why, wordmark } from "./content";
+import { BrandLockup } from "./BrandLockup";
+import { finalCta, hero, loop, nav, pillars, privacy, why } from "./content";
 
 /* ──────────────────────────────────────────────────────────────────────────
    LandingGradient — the "Gradient hero" direction.
@@ -131,11 +131,8 @@ function TopNav() {
         aria-label="Primary"
         className="mx-auto flex w-full max-w-6xl items-center justify-between gap-4 rounded-full border border-border bg-background/55 px-3 py-2.5 pl-4 shadow-[0_18px_50px_-24px_oklch(from_var(--primary)_l_c_h_/_0.55)] backdrop-blur-xl"
       >
-        <a href="#content" className="flex items-center gap-2.5">
-          <span className="grid size-8 place-items-center rounded-xl bg-gradient-to-br from-primary to-primary/55 text-primary-foreground shadow-[inset_0_1px_0_0_oklch(1_0_0_/_0.25)]">
-            <Brain className="size-[18px]" aria-hidden />
-          </span>
-          <span className="nn-heading text-[15px] font-semibold tracking-tight">{wordmark}</span>
+        <a href="#content" aria-label="NeuralNote">
+          <BrandLockup size="md" />
         </a>
 
         <div className="hidden items-center gap-1 md:flex">
@@ -523,11 +520,8 @@ function SiteFooter() {
     <footer className="border-t border-border px-6 py-12">
       <div className="mx-auto flex w-full max-w-6xl flex-col items-start justify-between gap-8 sm:flex-row sm:items-center">
         <div className="flex items-center gap-2.5">
-          <span className="grid size-8 place-items-center rounded-xl bg-gradient-to-br from-primary to-primary/55 text-primary-foreground">
-            <Brain className="size-[18px]" aria-hidden />
-          </span>
+          <BrandLockup size="md" />
           <div>
-            <p className="nn-heading text-[15px] font-semibold tracking-tight">{wordmark}</p>
             <p className="nn-mono text-[11px] text-muted-foreground">Free · local-first · bring your own key</p>
           </div>
         </div>

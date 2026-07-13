@@ -78,4 +78,3 @@ export const finalCta = {
 };
 
 export const nav = ["How it works", "Cited recall", "Own your data", "Download"];
-export const wordmark = "NeuralNote";

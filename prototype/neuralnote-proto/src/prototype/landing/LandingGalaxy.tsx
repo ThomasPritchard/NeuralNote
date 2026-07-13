@@ -12,7 +12,8 @@ import {
   Sparkles,
 } from "lucide-react";
 import GalaxyHero from "./GalaxyHero";
-import { finalCta, hero, loop, nav, pillars, privacy, why, wordmark } from "./content";
+import { BrandLockup } from "./BrandLockup";
+import { finalCta, hero, loop, nav, pillars, privacy, why } from "./content";
 
 /* ─────────────────────────────────────────────────────────────────────────
    Galaxy hero — premium, "expensive agency" marketing page for NeuralNote.
@@ -184,11 +185,8 @@ export default function LandingGalaxy() {
           aria-label="Primary"
           className="flex items-center justify-between gap-4 rounded-full border border-white/10 bg-background/55 py-2 pl-3 pr-2 shadow-[0_8px_40px_-12px_rgba(0,0,0,0.7)] ring-1 ring-white/[0.04] backdrop-blur-2xl"
         >
-          <a href="#main" className="flex items-center gap-2.5 pl-1.5">
-            <span className="grid size-7 place-items-center rounded-lg bg-gradient-to-br from-primary to-primary/55 text-primary-foreground shadow-[0_0_18px_-4px_var(--color-primary),inset_0_1px_0_0_rgb(255_255_255/0.25)]">
-              <Sparkles className="size-3.5" aria-hidden />
-            </span>
-            <span className="nn-heading text-[15px] font-semibold tracking-tight">{wordmark}</span>
+          <a href="#main" className="pl-1.5" aria-label="NeuralNote">
+            <BrandLockup />
           </a>
 
           <div className="hidden items-center gap-1 md:flex">
@@ -464,11 +462,8 @@ export default function LandingGalaxy() {
         {/* ── Footer ─────────────────────────────────────────────────────── */}
         <footer className="relative border-t border-white/10 px-6 py-12">
           <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-6 sm:flex-row">
-            <a href="#main" className="flex items-center gap-2.5">
-              <span className="grid size-7 place-items-center rounded-lg bg-gradient-to-br from-primary to-primary/55 text-primary-foreground shadow-[0_0_18px_-4px_var(--color-primary)]">
-                <Sparkles className="size-3.5" aria-hidden />
-              </span>
-              <span className="nn-heading text-[15px] font-semibold tracking-tight">{wordmark}</span>
+            <a href="#main" aria-label="NeuralNote">
+              <BrandLockup />
             </a>
             <p className="nn-mono text-[11px] uppercase tracking-[0.16em] text-muted-foreground/70">
               macOS · Windows · Linux — free, local-first, BYO key

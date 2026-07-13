@@ -180,9 +180,15 @@
   --sidebar-border: oklch(1 0 0 / 7%);
   --sidebar-ring: oklch(0.62 0.21 288);
   --radius: 0.5rem;
-  --font-sans: "Inter", system-ui, sans-serif;
-  --font-heading: "Inter", system-ui, sans-serif;
+  --font-sans: "Geist Variable", "Helvetica Neue", system-ui, sans-serif;
+  --font-heading: "Geist Variable", "Helvetica Neue", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, monospace;
+}
+
+[data-direction="neuralnote"] .nn-heading {
+  font-optical-sizing: auto;
+  font-weight: 500;
+  letter-spacing: -0.025em;
 }
 
 /* 5 ─ Linear · cool zinc command deck, crisp indigo, refined density ───────── */

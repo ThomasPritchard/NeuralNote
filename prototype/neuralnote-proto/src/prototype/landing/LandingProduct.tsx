@@ -11,7 +11,6 @@
 
 import {
   ArrowRight,
-  Brain,
   Check,
   Clock,
   Database,
@@ -33,6 +32,7 @@ import {
   Video,
 } from "lucide-react";
 import type { ComponentType } from "react";
+import { BrandLockup, BrandMark, brandName } from "./BrandLockup";
 import {
   finalCta,
   hero,
@@ -41,7 +41,6 @@ import {
   pillars,
   privacy,
   why,
-  wordmark,
 } from "./content";
 
 const loopIcon: ComponentType<{ className?: string }>[] = [FilePlus2, Sparkles, Quote];
@@ -73,17 +72,6 @@ export default function LandingProduct() {
 
 /* ─────────────────────────────────  Nav  ───────────────────────────────── */
 
-function Wordmark({ className = "" }: { className?: string }) {
-  return (
-    <span className={`flex items-center gap-2.5 ${className}`}>
-      <span className="grid size-7 place-items-center rounded-md bg-primary text-primary-foreground shadow-[0_0_18px_-4px_var(--color-primary),inset_0_1px_0_0_rgb(255_255_255/0.25)]">
-        <Brain className="size-[17px]" aria-hidden />
-      </span>
-      <span className="nn-heading text-[15px] font-semibold tracking-tight">{wordmark}</span>
-    </span>
-  );
-}
-
 function TopNav() {
   const links = nav.filter((n) => n !== "Download");
   const anchors: Record<string, string> = {
@@ -94,8 +82,8 @@ function TopNav() {
   return (
     <header className="sticky top-0 z-40 border-b border-border/70 bg-background/80 backdrop-blur-xl">
       <nav className="mx-auto flex h-16 max-w-6xl items-center justify-between px-6">
-        <a href="#top" aria-label={wordmark}>
-          <Wordmark />
+        <a href="#top" aria-label={brandName}>
+          <BrandLockup />
         </a>
 
         <ul className="hidden items-center gap-1 md:flex">
@@ -226,7 +214,7 @@ function ProductWindow() {
             ⌘K
           </kbd>
         </div>
-        <Sparkles className="size-4 text-primary/80" aria-hidden />
+        <BrandMark variant="app-icon" className="size-6" />
       </div>
 
       {/* 3-pane workspace */}
@@ -736,7 +724,7 @@ function Footer() {
   return (
     <footer className="border-t border-border/60 px-6 py-12">
       <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 sm:flex-row">
-        <Wordmark />
+        <BrandLockup />
         <p className="nn-mono text-[12px] text-muted-foreground/70">
           Local-first · Obsidian-compatible · bring your own key
         </p>
