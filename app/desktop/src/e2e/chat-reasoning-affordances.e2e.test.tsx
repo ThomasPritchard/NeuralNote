@@ -9,8 +9,8 @@
 // Three properties, each a way the pane could mislead the user:
 //   1. On a model verified to lack reasoning, the chip is inert AND says why —
 //      visibly, not on hover — so the user is never left with a dead control.
-//   2. When reasoning was asked for and none came back, the pane says so once,
-//      rather than silently omitting a trace the user paid attention for.
+//   2. When reasoning was asked for and none came back, the pane stays quiet;
+//      an empty implementation detail is not useful conversation content.
 //   3. When a search genuinely finds nothing, the pane says "nothing covers
 //      this" — and (asserted in the unit suite) never when a note WAS read.
 
@@ -66,7 +66,7 @@ describe("Journey 10: chat-pane reasoning affordances", () => {
     expect(chip).toHaveAccessibleDescription(/can't return reasoning/i);
   });
 
-  it("shows the one-time backstop notice when reasoning was on but none arrived", async () => {
+  it("stays quiet when reasoning was on but none arrived", async () => {
     const noThinking: ChatEvent[] = [
       { type: "answer", delta: "A plain answer, no reasoning." },
       { type: "done" },
@@ -83,8 +83,7 @@ describe("Journey 10: chat-pane reasoning affordances", () => {
 
     await ask(user, "anything");
 
-    expect(await screen.findByText(BACKSTOP)).toBeInTheDocument();
-    // The notice takes the slot the reasoning disclosure would have — never both.
+    expect(screen.queryByText(BACKSTOP)).not.toBeInTheDocument();
     expect(document.querySelector("details")).toBeNull();
   });
 

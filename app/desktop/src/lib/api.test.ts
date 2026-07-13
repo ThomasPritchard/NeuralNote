@@ -3,26 +3,40 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 // Mock the Tauri boundary so the typed wrappers can be driven in jsdom (which has
 // no Tauri runtime). Every wrapper funnels through `invoke`; `onTreeChanged` uses
 // `listen`. We assert each wrapper calls the right command with the right args.
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+vi.mock("@tauri-apps/api/core", () => ({
+  Channel: class<T> {
+    onmessage?: (message: T) => void;
+  },
+  invoke: vi.fn(),
+}));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import type { Constructable, Procedure } from "@vitest/spy";
 import {
+  answerElicitation,
+  cancelChatRun,
+  cancelRequirementDownload,
+  chat,
   closeVault,
   createFolder,
   createNote,
   createNoteFromTemplate,
   createVault,
   deleteEntry,
+  downloadRequirement,
   errorMessage,
   isConflict,
+  isNotFound,
   listRecentVaults,
+  listSkills,
   listTemplates,
   moveEntry,
   onMenu,
   onTreeChanged,
   openVault,
+  openYoutubeTimestamp,
   pickNewVaultLocation,
   pickVaultFolder,
   readBacklinks,
@@ -31,9 +45,31 @@ import {
   readTree,
   renameEntry,
   searchVault,
+  setSkillEnabled,
   setMenuEditing,
+  undoSkillRun,
   writeNote,
 } from "./api";
+import type { ChatEvent, PullEvent } from "./types";
+
+type ChatCommand = typeof chat;
+
+declare module "@vitest/spy" {
+  interface MockInstance<
+    T extends Procedure | Constructable = Procedure,
+  > {
+    /**
+     * TODO(chat-run-id-test-mocks): update the out-of-scope ChatPane.tsx test
+     * implementations to resolve run ids, then remove this narrow compatibility
+     * overload. Production `ChatCommand` remains truthfully Promise<string>.
+     */
+    mockImplementation(
+      fn: T extends ChatCommand
+        ? (...args: Parameters<T>) => Promise<void>
+        : never,
+    ): this;
+  }
+}
 
 const mockInvoke = vi.mocked(invoke);
 const mockListen = vi.mocked(listen);
@@ -82,6 +118,186 @@ describe("isConflict", () => {
     expect(isConflict("conflict")).toBe(false);
     expect(isConflict(null)).toBe(false);
     expect(isConflict(undefined)).toBe(false);
+  });
+});
+
+describe("isNotFound", () => {
+  it("is true only for a CoreError with kind === notFound", () => {
+    expect(
+      isNotFound({ kind: "notFound", message: "elicitation 'q1' is not live" }),
+    ).toBe(true);
+  });
+
+  it("is false for other kinds and non-error shapes", () => {
+    expect(isNotFound({ kind: "conflict", message: "x" })).toBe(false);
+    expect(isNotFound({ message: "no kind" })).toBe(false);
+    expect(isNotFound("notFound")).toBe(false);
+    expect(isNotFound(null)).toBe(false);
+    expect(isNotFound(undefined)).toBe(false);
+  });
+});
+
+describe("skills-bank wrappers", () => {
+  it("returns a Promise that resolves to the mocked run id", async () => {
+    mockInvoke.mockResolvedValueOnce("skill-run-7");
+
+    const result = chat("file this", [], vi.fn());
+
+    expect(result).toBeInstanceOf(Promise);
+    await expect(result).resolves.toBe("skill-run-7");
+  });
+
+  it("returns the run id produced by chat", async () => {
+    mockInvoke.mockResolvedValueOnce("skill-run-7");
+
+    const result: Promise<string> = chat("file this", [], vi.fn());
+
+    await expect(result).resolves.toBe("skill-run-7");
+  });
+
+  it("defaults chat activeSkills to an empty list", async () => {
+    await chat("hello", [], vi.fn());
+
+    expect(mockInvoke).toHaveBeenCalledWith("chat", {
+      prompt: "hello",
+      history: [],
+      onEvent: expect.any(Object),
+      activeSkills: [],
+    });
+  });
+
+  it("forwards explicit chat activeSkills", async () => {
+    await chat("distil this", [], vi.fn(), ["youtube-distil", "fixture"]);
+
+    expect(mockInvoke).toHaveBeenCalledWith("chat", {
+      prompt: "distil this",
+      history: [],
+      onEvent: expect.any(Object),
+      activeSkills: ["youtube-distil", "fixture"],
+    });
+  });
+
+  it("forwards chat channel messages to onEvent", async () => {
+    const onEvent = vi.fn();
+    await chat("hello", [], onEvent);
+    const args = mockInvoke.mock.calls.at(-1)?.[1] as {
+      onEvent: { onmessage?: (event: ChatEvent) => void };
+    };
+
+    args.onEvent.onmessage?.({ type: "skillStep", message: "Writing note" });
+
+    expect(onEvent).toHaveBeenCalledWith({
+      type: "skillStep",
+      message: "Writing note",
+    });
+  });
+
+  it("answers a live elicitation with the selected option ids", async () => {
+    await answerElicitation("consent-1", ["yes"]);
+
+    expect(mockInvoke).toHaveBeenCalledWith("answer_elicitation", {
+      id: "consent-1",
+      choices: ["yes"],
+    });
+  });
+
+  it("cancels the single active chat run", async () => {
+    await cancelChatRun();
+    expect(mockInvoke).toHaveBeenCalledWith("cancel_chat_run");
+  });
+
+  it("opens a validated YouTube timestamp through the Rust shell", async () => {
+    await openYoutubeTimestamp("https://youtu.be/jNQXAC9IVRw?t=872");
+    expect(mockInvoke).toHaveBeenCalledWith("open_youtube_timestamp", {
+      url: "https://youtu.be/jNQXAC9IVRw?t=872",
+    });
+  });
+
+  it("returns the per-file undo report", async () => {
+    const report = {
+      files: [
+        {
+          relPath: "Sources/Example.md",
+          status: "deleted",
+          message: null,
+        },
+      ],
+    };
+    mockInvoke.mockResolvedValueOnce(report);
+
+    await expect(undoSkillRun("skill-run-7")).resolves.toEqual(report);
+    expect(mockInvoke).toHaveBeenCalledWith("undo_skill_run", {
+      runId: "skill-run-7",
+    });
+  });
+
+  it("lists skills through the backend catalogue command", async () => {
+    const listings = [
+      {
+        id: "fixture-note-workflow",
+        name: "Fixture note workflow",
+        description: "Demonstrate the built-in skill flow.",
+        icon: "flask",
+        enabled: true,
+        requirements: [],
+      },
+    ];
+    mockInvoke.mockResolvedValueOnce(listings);
+
+    await expect(listSkills()).resolves.toEqual(listings);
+    expect(mockInvoke).toHaveBeenCalledWith("list_skills");
+  });
+
+  it("returns the persisted state when setting a skill enabled flag", async () => {
+    mockInvoke.mockResolvedValueOnce(false);
+
+    await expect(
+      setSkillEnabled("fixture-note-workflow", false),
+    ).resolves.toBe(false);
+    expect(mockInvoke).toHaveBeenCalledWith("set_skill_enabled", {
+      id: "fixture-note-workflow",
+      enabled: false,
+    });
+  });
+
+  it("passes the requirement name and a progress channel", async () => {
+    const onEvent = vi.fn();
+    await downloadRequirement("yt-dlp", onEvent);
+    const args = mockInvoke.mock.calls.at(-1)?.[1] as {
+      name: string;
+      onEvent: { onmessage?: (event: PullEvent) => void };
+    };
+
+    expect(mockInvoke).toHaveBeenCalledWith("download_requirement", {
+      name: "yt-dlp",
+      onEvent: args.onEvent,
+    });
+  });
+
+  it("forwards requirement download progress to onEvent", async () => {
+    const onEvent = vi.fn();
+    await downloadRequirement("yt-dlp", onEvent);
+    const args = mockInvoke.mock.calls.at(-1)?.[1] as {
+      onEvent: { onmessage?: (event: PullEvent) => void };
+    };
+    const progress: PullEvent = {
+      type: "progress",
+      status: "downloading",
+      digest: null,
+      completed: 10,
+      total: 100,
+      percent: 10,
+    };
+
+    args.onEvent.onmessage?.(progress);
+
+    expect(onEvent).toHaveBeenCalledWith(progress);
+  });
+
+  it("cancels the active requirement download", async () => {
+    await cancelRequirementDownload();
+
+    expect(mockInvoke).toHaveBeenCalledWith("cancel_requirement_download");
   });
 });
 

@@ -12,7 +12,7 @@ vi.mock("../lib/api", async (importActual) => {
 });
 
 import * as api from "../lib/api";
-import { Reader } from "./Reader";
+import { Reader, withoutRepeatedLeadingTitle } from "./Reader";
 
 const mockApi = vi.mocked(api);
 
@@ -39,6 +39,18 @@ function doc(overrides: Partial<NoteDoc> = {}): NoteDoc {
 }
 
 describe("Reader — body rendering", () => {
+  it("scans a long non-heading prefix without regex backtracking", () => {
+    const body = `${" ".repeat(100_000)}not a heading`;
+
+    expect(withoutRepeatedLeadingTitle(body, "My Note")).toBe(body);
+  });
+
+  it("does not consume a title-matching paragraph after an empty H1", () => {
+    const body = "#\nMy Note\nsecret";
+
+    expect(withoutRepeatedLeadingTitle(body, "My Note")).toBe(body);
+  });
+
   it("renders markdown for a .md note with a type chip and title", () => {
     render(<Reader note={doc()} />);
     expect(screen.getByText("My Note")).toBeInTheDocument();
@@ -46,6 +58,36 @@ describe("Reader — body rendering", () => {
     expect(
       screen.getByRole("heading", { level: 1, name: "Heading" }),
     ).toBeInTheDocument();
+  });
+
+  it("does not repeat a leading body H1 that supplies the document title", () => {
+    render(
+      <Reader
+        note={doc({
+          title: "My Note",
+          body: "#   My Note   \n\nFirst paragraph.",
+        })}
+      />,
+    );
+
+    expect(screen.getAllByRole("heading", { level: 1, name: "My Note" })).toHaveLength(1);
+    expect(screen.getByText("First paragraph.")).toBeInTheDocument();
+  });
+
+  it("keeps a leading body H1 when frontmatter provides a different title", () => {
+    render(
+      <Reader
+        note={doc({
+          title: "Frontmatter title",
+          body: "# Body heading\n\nFirst paragraph.",
+        })}
+      />,
+    );
+
+    expect(
+      screen.getByRole("heading", { level: 1, name: "Frontmatter title" }),
+    ).toBeInTheDocument();
+    expect(screen.getByRole("heading", { level: 1, name: "Body heading" })).toBeInTheDocument();
   });
 
   it("renders extensionless files (README) through markdown", () => {
@@ -100,8 +142,8 @@ describe("Reader — body rendering", () => {
   it("still renders content for a lossily-decoded (non-UTF-8) note", () => {
     // The lossy notice itself lives at pane level (NotePane) so it shows in edit
     // mode too; the reader's job is just to still show the content, never hide it.
-    render(<Reader note={doc({ lossyText: true, body: "caf� content" })} />);
-    expect(screen.getByText(/caf� content/)).toBeInTheDocument();
+    render(<Reader note={doc({ lossyText: true, body: "caf\uFFFD content" })} />);
+    expect(screen.getByText(/caf\uFFFD content/)).toBeInTheDocument();
   });
 
   it("shows the offending raw block when frontmatter fails to parse", () => {
@@ -139,6 +181,21 @@ describe("Reader — frontmatter", () => {
     expect(screen.getByText('{"k":"v"}')).toBeInTheDocument(); // object value
     expect(screen.getByText("—")).toBeInTheDocument(); // null scalar
     expect(screen.getByText("From FM")).toBeInTheDocument(); // string scalar
+  });
+
+  it("shows an explicit fallback when an object has no JSON representation", () => {
+    render(
+      <Reader
+        note={doc({
+          frontmatter: {
+            opaque: { toJSON: () => undefined },
+          },
+        })}
+      />,
+    );
+
+    expect(screen.getByText("opaque")).toBeInTheDocument();
+    expect(screen.getByText("—")).toBeInTheDocument();
   });
 
   it("hides the properties table when frontmatter is empty", () => {

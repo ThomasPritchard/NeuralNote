@@ -73,6 +73,21 @@ describe("Welcome — window chrome", () => {
     expect(strip).toHaveAttribute("aria-hidden");
     expect(strip?.childElementCount).toBe(0);
   });
+
+  it("keeps the populated welcome content scrollable at the minimum window height", () => {
+    mockUseVault.mockReturnValue(
+      ctx({
+        recents: [
+          { name: "Brain", path: "/Brain", lastOpened: 2 },
+          { name: "Archive", path: "/Archive", lastOpened: 1 },
+        ],
+      }),
+    );
+    const { container } = render(<Welcome />);
+
+    expect(container.firstElementChild).toHaveClass("nn-welcome");
+    expect(container.firstElementChild).toHaveClass("overflow-y-auto");
+  });
 });
 
 describe("Welcome — error channel", () => {

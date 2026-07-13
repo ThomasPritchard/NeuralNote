@@ -8,12 +8,13 @@ import type { ChatEvent } from "../lib/types";
 import {
   emptyAssistant,
   groupActivity,
+  isPartialSkillRun,
   reduceAssistant,
   resolveAnswerMarkers,
   showsNothingFoundCard,
-  showsReasoningBackstop,
   stripCitationMarkers,
   summarizeActivity,
+  modelReportedProvenance,
   toHistory,
   userMessage,
   type ActivityStep,
@@ -21,6 +22,37 @@ import {
   type ChatMessage,
   type CitationView,
 } from "./chatMessage";
+
+describe("skill report context", () => {
+  it("extracts distinct caption and Whisper provenance in first-seen order", () => {
+    const turn = {
+      ...emptyAssistant(),
+      skillSteps: [
+        "Video 1 of 3 landed with captions:en-auto.",
+        "Video 2 of 3 landed with whisper:small.en; captions:en-auto was already used.",
+      ],
+      answer: "Transcript provenance: whisper:small.en",
+    };
+
+    expect(modelReportedProvenance(turn)).toEqual([
+      "captions:en-auto",
+      "whisper:small.en",
+    ]);
+  });
+
+  it("marks a settled skill run partial only when output survived a stop", () => {
+    const partial = {
+      ...emptyAssistant(),
+      done: true,
+      skillActivations: [{ id: "youtube-distil", name: "YouTube distil" }],
+      writtenNotes: [{ relPath: "Literature/One.md", kind: "literature" as const }],
+      skillSteps: ["Cancelled after video 1 of 4."],
+    };
+    expect(isPartialSkillRun(partial)).toBe(true);
+    expect(isPartialSkillRun({ ...partial, writtenNotes: [] })).toBe(false);
+    expect(isPartialSkillRun({ ...partial, done: false })).toBe(false);
+  });
+});
 
 /** Fold a whole event script over a fresh assistant turn. */
 function run(events: ChatEvent[]): AssistantMessage {
@@ -35,56 +67,82 @@ describe("emptyAssistant", () => {
   it("pins a requested reasoning opt-in onto the turn", () => {
     expect(emptyAssistant(true).reasoningRequested).toBe(true);
   });
+
+  it("starts every skill-bank accumulator empty", () => {
+    const turn = emptyAssistant();
+    expect(turn.skillActivations).toEqual([]);
+    expect(turn.skillSteps).toEqual([]);
+    expect(turn.pendingElicitation).toBeNull();
+    expect(turn.writtenNotes).toEqual([]);
+  });
 });
 
-describe("showsReasoningBackstop", () => {
-  it("shows when a finished reasoning turn streamed no thinking tokens", () => {
-    const turn = { ...emptyAssistant(), reasoningRequested: true, done: true };
-    expect(showsReasoningBackstop(turn)).toBe(true);
+describe("reduceAssistant — skills bank", () => {
+  it("accumulates skill activations and progress steps in arrival order", () => {
+    const turn = run([
+      { type: "skillActivated", id: "first", name: "First skill" },
+      { type: "skillStep", message: "Fetching source" },
+      { type: "skillActivated", id: "second", name: "Second skill" },
+      { type: "skillStep", message: "Writing notes" },
+    ]);
+
+    expect(turn.skillActivations).toEqual([
+      { id: "first", name: "First skill" },
+      { id: "second", name: "Second skill" },
+    ]);
+    expect(turn.skillSteps).toEqual(["Fetching source", "Writing notes"]);
   });
 
-  it("stays hidden while the turn is running", () => {
-    const turn = { ...emptyAssistant(), reasoningRequested: true };
-    expect(showsReasoningBackstop(turn)).toBe(false);
-  });
-
-  it("stays hidden when reasoning was not requested", () => {
-    const turn = { ...emptyAssistant(), done: true };
-    expect(showsReasoningBackstop(turn)).toBe(false);
-  });
-
-  it("stays hidden when thinking tokens arrived", () => {
-    const turn = {
-      ...emptyAssistant(),
-      reasoningRequested: true,
-      thinking: "I should search the vault.",
-      done: true,
+  it("stores the latest elicitation as the pending prompt", () => {
+    const first = {
+      type: "elicit" as const,
+      id: "prompt-1",
+      question: "Continue?",
+      options: [
+        {
+          id: "yes",
+          label: "Yes",
+          description: "Proceed",
+          imageDataUri: null,
+        },
+      ],
+      multiSelect: false,
     };
-    expect(showsReasoningBackstop(turn)).toBe(false);
+    const second = {
+      type: "elicit" as const,
+      id: "prompt-2",
+      question: "Choose notes",
+      options: [
+        {
+          id: "a",
+          label: "Note A",
+          description: null,
+          imageDataUri: "data:image/png;base64,abc",
+        },
+      ],
+      multiSelect: true,
+    };
+
+    const turn = run([first, second]);
+
+    expect(turn.pendingElicitation).toEqual({
+      id: "prompt-2",
+      question: "Choose notes",
+      options: second.options,
+      multiSelect: true,
+    });
   });
 
-  it("shows when the only thinking tokens were whitespace", () => {
-    // The `Reasoning` disclosure hides itself on `text.trim() === ""`, so a
-    // lone "\n" delta renders no trace at all. If this predicate tested raw
-    // emptiness instead, the user would get neither the reasoning nor the
-    // notice explaining its absence.
-    const turn = {
-      ...emptyAssistant(),
-      reasoningRequested: true,
-      thinking: "\n  ",
-      done: true,
-    };
-    expect(showsReasoningBackstop(turn)).toBe(true);
-  });
+  it("accumulates written notes with their actual paths and kinds", () => {
+    const turn = run([
+      { type: "noteWritten", relPath: "Literature/Name.md", kind: "literature" },
+      { type: "noteWritten", relPath: "Atomic/Idea.md", kind: "atomic" },
+    ]);
 
-  it("stays hidden when the turn failed", () => {
-    const turn = {
-      ...emptyAssistant(),
-      reasoningRequested: true,
-      error: "provider unavailable",
-      done: true,
-    };
-    expect(showsReasoningBackstop(turn)).toBe(false);
+    expect(turn.writtenNotes).toEqual([
+      { relPath: "Literature/Name.md", kind: "literature" },
+      { relPath: "Atomic/Idea.md", kind: "atomic" },
+    ]);
   });
 });
 

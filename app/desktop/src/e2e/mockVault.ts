@@ -44,8 +44,10 @@ import type {
   RecentVault,
   SearchMatch,
   SearchResponse,
+  SkillListing,
   TemplateInfo,
   TreeNode,
+  UndoReport,
   Vault,
 } from "../lib/types";
 
@@ -101,8 +103,23 @@ export interface CreateMockVaultOptions {
     probedSupport?: ReasoningSupport;
   };
   /** The `ChatEvent` sequence the `chat` command streams to its Channel, in
-   *  order, exactly as the Rust core would (searching → … → done | error). */
+   *  order, exactly as the Rust core would (searching → … → done | error).
+   *  A script containing an `elicit` event pauses THERE, exactly as the Rust
+   *  run parks on `UserPrompt::ask`: the remainder streams only after a valid
+   *  `answer_elicitation`, and the `chat` invoke resolves (with its run id)
+   *  once the script is drained. */
   chatScript?: ChatEvent[];
+  /** Pause a scripted chat after this many frames until `cancel_chat_run`.
+   *  The optional tail is then streamed as the backend's honest wind-down. */
+  cancelChatAfterEvents?: number;
+  cancelChatTail?: ChatEvent[];
+  /** Test-only mirror of the implementation-authored folder picker that writes
+   *  the selected route to `.neuralnote/profile.json`. */
+  profileFolderElicitationId?: string;
+  /** What `undo_skill_run` reports. Defaults to every note the run wrote
+   *  deleting cleanly; seed explicit per-file outcomes (kept-edited, failed…)
+   *  to exercise the report card's honesty about partial undos. */
+  undoReport?: UndoReport;
   /** Fixed clock for template rendering. Defaults to the Rust test fixture time. */
   now?: Date;
   // ── Local-AI provider (ai_status / detect_hardware / recommend / pull / …) ──
@@ -123,9 +140,22 @@ export interface CreateMockVaultOptions {
    *  Defaults to a short progress→success run; a successful run also marks the
    *  model installed, exactly as Ollama would. */
   pullScript?: PullEvent[];
+  /** The streamed frames for the allowlisted skill-requirement installer. */
+  requirementDownloadScript?: PullEvent[];
   /** HF metadata by hfRepo for `hf_model_metadata`. A repo with no entry makes the
    *  command reject, which the UI treats as "no metadata" (non-fatal by contract). */
   hfMeta?: Record<string, HfModelMeta>;
+  /** The built-in skill catalogue `list_skills` reports (and `set_skill_enabled`
+   *  mutates). Defaults to the fixture skill, enabled, with no requirements —
+   *  mirroring the compiled-in registry. */
+  skills?: SkillListing[];
+}
+
+/** One `chat` invoke as the backend received it — lets a journey assert the
+ *  picker/chips actually fed `activeSkills` across the IPC boundary. */
+export interface ChatCallRecord {
+  prompt: string;
+  activeSkills: readonly string[];
 }
 
 export interface MockVault {
@@ -134,10 +164,25 @@ export interface MockVault {
   /** Force a command to reject with the given error (until cleared). */
   setFailure: (cmd: string, error: CoreErrorLike) => void;
   clearFailure: (cmd: string) => void;
+  /** End the parked run as the shell's elicitation TIMEOUT would — per spec
+   *  §3.4 the timeout ends the RUN, not the QUESTION. The question is retired
+   *  unanswered (a late `answer_elicitation` on its id rejects notFound,
+   *  exactly like the real dead-id path) and the script's remainder — the
+   *  run-end tail the test scripted, e.g. an honest wind-down answer plus
+   *  `done` — streams so the pending `chat` invoke resolves with its run id.
+   *  The card must then render dormant-but-clickable. Throws if no
+   *  elicitation is parked (a mis-scripted test must fail loudly). */
+  expireElicitation: () => void;
   /** Whether the OS window was actually destroyed (close path). */
   wasDestroyed: () => boolean;
   /** Ordered log of every command the app issued (for assertions/debugging). */
   readonly calls: readonly string[];
+  /** Every `chat` invoke, with the `activeSkills` it carried. */
+  readonly chatCalls: readonly ChatCallRecord[];
+  /** Folder persisted by the scripted unknown-scheme picker, if answered. */
+  readonly profileFolder: string | null;
+  /** Native YouTube timestamp opens, after the real frontend wrapper. */
+  readonly openedYoutubeUrls: readonly string[];
 }
 
 // ── Path helpers (POSIX `/`, absolute paths keyed in the entries map) ─────────
@@ -1233,10 +1278,12 @@ interface TauriInternalsLike {
   runCallback?: (id: number, data: unknown) => void;
 }
 
-/** Stream a scripted `ChatEvent[]` to the invoke's Channel exactly as the Rust
- *  core would: one in-order `{ index, message }` frame per event. Throws loudly
- *  if the channel isn't wired to the mock IPC — a dropped stream is never silent. */
-const emitToChannel = (channel: unknown, events: readonly unknown[]): void => {
+/** A per-stream sender that keeps its own `{ index, message }` sequence — the
+ *  Channel's ordering machinery expects one monotonically increasing index per
+ *  stream, so a script parked on an elicitation and resumed later must NOT
+ *  restart at zero. Throws loudly if the channel isn't wired to the mock IPC —
+ *  a dropped stream is never silent. */
+const channelSender = (channel: unknown): ((message: unknown) => void) => {
   const id = (channel as TauriChannelLike | null)?.id;
   const runCallback = (window as unknown as {
     __TAURI_INTERNALS__?: TauriInternalsLike;
@@ -1247,7 +1294,18 @@ const emitToChannel = (channel: unknown, events: readonly unknown[]): void => {
       message: "event channel is not wired to the mock IPC",
     } satisfies CoreErrorLike;
   }
-  events.forEach((message, index) => runCallback(id, { index, message }));
+  let nextIndex = 0;
+  return (message) => {
+    runCallback(id, { index: nextIndex, message });
+    nextIndex += 1;
+  };
+};
+
+/** Stream a scripted `ChatEvent[]` to the invoke's Channel exactly as the Rust
+ *  core would: one in-order `{ index, message }` frame per event. */
+const emitToChannel = (channel: unknown, events: readonly unknown[]): void => {
+  const send = channelSender(channel);
+  events.forEach(send);
 };
 
 // ── Local-AI defaults (a capable Apple-Silicon machine on the supported path) ──
@@ -1289,11 +1347,36 @@ const DEFAULT_RECOMMENDATION: Recommendation = {
   why: "Fits comfortably in your 11 GB of usable memory.",
 };
 
+/** Mirror of the compiled-in registry's fixture skill (`fixture_manifest`,
+ *  crates/neuralnote-core/src/ai/skills.rs), enabled by default as it ships. */
+const DEFAULT_SKILLS: SkillListing[] = [
+  {
+    id: "fixture-note-workflow",
+    name: "Fixture note workflow",
+    description: "Demonstrate progress, elicitation, and a guarded note write.",
+    icon: "flask",
+    enabled: true,
+    requirements: [],
+  },
+];
+
 /** A short, realistic pull: manifest → half → full → success. */
 const DEFAULT_PULL_SCRIPT: PullEvent[] = [
   { type: "progress", status: "pulling manifest", digest: null, completed: null, total: null, percent: null },
   { type: "progress", status: "downloading", digest: "sha256:abc", completed: 2_350_000_000, total: 4_700_000_000, percent: 50 },
   { type: "progress", status: "downloading", digest: "sha256:abc", completed: 4_700_000_000, total: 4_700_000_000, percent: 100 },
+  { type: "success" },
+];
+
+const DEFAULT_REQUIREMENT_DOWNLOAD_SCRIPT: PullEvent[] = [
+  {
+    type: "progress",
+    status: "downloading",
+    digest: null,
+    completed: null,
+    total: null,
+    percent: null,
+  },
   { type: "success" },
 ];
 
@@ -1307,6 +1390,8 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
   const failures = new Map<string, CoreErrorLike>();
   const calls: string[] = [];
   let destroyed = false;
+  let profileFolder: string | null = null;
+  const openedYoutubeUrls: string[] = [];
   const now = opts.now ?? new Date(2026, 0, 2, 15, 4, 5);
 
   // AI key state (mutated by save/clear, reported by api_key_status) + the chat
@@ -1325,6 +1410,78 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
   // The verdict the mount-time probe persists when it runs (see the option doc).
   const probedSupport = opts.apiKey?.probedSupport;
   const chatScript = opts.chatScript ?? [];
+
+  // The built-in skill catalogue, deep-copied so `set_skill_enabled` mutates
+  // backend state without aliasing the caller's fixture (mirrors the Rust
+  // registry + `disabled_skills` config the real commands read and write).
+  const skillsState: SkillListing[] = (opts.skills ?? DEFAULT_SKILLS).map(
+    (s) => ({ ...s, requirements: s.requirements.map((r) => ({ ...r })) }),
+  );
+
+  // ── Skill-run state (run ids, one parked elicitation, the undo ledger) ─────
+  // Mirrors the shell: `chat` resolves with a run id; an `elicit` frame parks
+  // the stream exactly as `UserPrompt::ask` parks the Rust run (the remainder
+  // plays only after a validated `answer_elicitation`); `undo_skill_run`
+  // reports per-file outcomes over what the run actually wrote.
+  let chatRunSeq = 0;
+  const chatCalls: ChatCallRecord[] = [];
+  const writtenByRun = new Map<string, string[]>();
+  interface ParkedElicitation {
+    id: string;
+    offeredIds: ReadonlySet<string>;
+    multiSelect: boolean;
+    send: (message: unknown) => void;
+    remainder: ChatEvent[];
+    runId: string;
+    /** Resolves the still-pending `chat` invoke with its run id. */
+    finish: () => void;
+  }
+  let parkedElicitation: ParkedElicitation | null = null;
+  interface PausedChat {
+    send: (message: unknown) => void;
+    runId: string;
+    finish: () => void;
+  }
+  let pausedChat: PausedChat | null = null;
+  let pendingRequirementDownload: {
+    timer: ReturnType<typeof setTimeout>;
+    send: (message: unknown) => void;
+    finish: () => void;
+  } | null = null;
+
+  /** Play script events until the stream parks on an `elicit` (the elicit
+   *  frame itself is emitted first) or drains, recording every `noteWritten`
+   *  into the run's undo ledger. Calls `finish` only when the script drains —
+   *  a parked run keeps its `chat` invoke pending, exactly like the shell. */
+  const advanceChatScript = (
+    send: (message: unknown) => void,
+    events: ChatEvent[],
+    runId: string,
+    finish: () => void,
+  ): void => {
+    for (let i = 0; i < events.length; i++) {
+      const event = events[i];
+      send(event);
+      if (event.type === "noteWritten") {
+        const written = writtenByRun.get(runId) ?? [];
+        written.push(event.relPath);
+        writtenByRun.set(runId, written);
+      }
+      if (event.type === "elicit") {
+        parkedElicitation = {
+          id: event.id,
+          offeredIds: new Set(event.options.map((o) => o.id)),
+          multiSelect: event.multiSelect,
+          send,
+          remainder: events.slice(i + 1),
+          runId,
+          finish,
+        };
+        return;
+      }
+    }
+    finish();
+  };
 
   // Local-AI provider state, mutated by set_active_provider / pull / delete and
   // reported by ai_status / list_local_models. `explicitProvider` mirrors the Rust
@@ -1800,6 +1957,68 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         }
         return undefined;
       }
+      case "download_requirement": {
+        const name = a.name as string;
+        if (name !== "yt-dlp") {
+          return fail("invalidName", `unknown requirement '${name}'`);
+        }
+        const script = opts.requirementDownloadScript ?? DEFAULT_REQUIREMENT_DOWNLOAD_SCRIPT;
+        if (script.length === 0) return undefined;
+        const send = channelSender(a.onEvent);
+        if (pendingRequirementDownload !== null) {
+          send({
+            type: "error",
+            message: "a skill requirement download is already in progress",
+          } satisfies PullEvent);
+          return undefined;
+        }
+        send(script[0]);
+        if (script.length === 1) return undefined;
+        return new Promise<void>((resolve) => {
+          const timer = setTimeout(() => {
+            script.slice(1).forEach(send);
+            pendingRequirementDownload = null;
+            resolve();
+          }, 50);
+          pendingRequirementDownload = {
+            timer,
+            send,
+            finish: resolve,
+          };
+        });
+      }
+      case "cancel_requirement_download": {
+        const pending = pendingRequirementDownload;
+        if (pending !== null) {
+          clearTimeout(pending.timer);
+          pending.send({
+            type: "error",
+            message: "Download cancelled.",
+          } satisfies PullEvent);
+          pendingRequirementDownload = null;
+          pending.finish();
+        }
+        return undefined;
+      }
+      case "list_skills":
+        // Fresh objects per call, exactly as serde would deserialise them —
+        // callers must never end up sharing (or mutating) backend state.
+        return skillsState.map((s) => ({
+          ...s,
+          requirements: s.requirements.map((r) => ({ ...r })),
+        }));
+      case "set_skill_enabled": {
+        // Mirrors `set_skill_enabled_in` (commands/ai.rs): an unknown id is an
+        // invalidName rejection; a valid write persists and returns the state
+        // READ BACK from the store — a fresh post-write lookup, never the
+        // request echoed — so if the store ever normalises a write, a frontend
+        // that renders the request instead of the response fails the e2e.
+        const id = a.id as string;
+        const skill = skillsState.find((s) => s.id === id);
+        if (!skill) return fail("invalidName", `unknown skill '${id}'`);
+        skill.enabled = a.enabled as boolean;
+        return skillsState.find((s) => s.id === id)!.enabled;
+      }
       case "save_api_key": {
         // The key itself never crosses back; only presence + model are reported.
         keyState.hasKey = true;
@@ -1811,10 +2030,118 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         return undefined;
       }
       case "chat": {
-        // Replay the scripted stream through the real Channel, then resolve —
-        // mirroring the Rust run that emits events and ends on `done`/`error`.
-        emitToChannel(a.onEvent, chatScript);
+        // Replay the scripted stream through the real Channel, then resolve
+        // with the run id — mirroring the Rust run that emits events, ends on
+        // `done`/`error`, and returns the id `undo_skill_run` takes. A script
+        // holding an `elicit` parks there; `answer_elicitation` resumes it.
+        const runId = `run-${++chatRunSeq}`;
+        chatCalls.push({
+          prompt: a.prompt as string,
+          activeSkills: [...((a.activeSkills as string[] | undefined) ?? [])],
+        });
+        const send = channelSender(a.onEvent);
+        return new Promise<string>((resolve) => {
+          const pauseAfter = opts.cancelChatAfterEvents;
+          if (pauseAfter !== undefined) {
+            advanceChatScript(send, chatScript.slice(0, pauseAfter), runId, () => {
+              pausedChat = { send, runId, finish: () => resolve(runId) };
+            });
+          } else {
+            advanceChatScript(send, [...chatScript], runId, () => resolve(runId));
+          }
+        });
+      }
+      case "cancel_chat_run": {
+        const paused = pausedChat;
+        if (paused === null) {
+          return fail("notFound", "no chat run is active");
+        }
+        pausedChat = null;
+        advanceChatScript(
+          paused.send,
+          opts.cancelChatTail ?? [],
+          paused.runId,
+          paused.finish,
+        );
         return undefined;
+      }
+      case "open_youtube_timestamp": {
+        const value = a.url as string;
+        const parsed = new URL(value);
+        if (
+          parsed.protocol !== "https:" ||
+          parsed.hostname !== "youtu.be" ||
+          !/^\/[A-Za-z0-9_-]{11}$/.test(parsed.pathname) ||
+          !/^\d+$/.test(parsed.searchParams.get("t") ?? "")
+        ) {
+          return fail("invalidName", "YouTube timestamp URL is invalid");
+        }
+        openedYoutubeUrls.push(value);
+        return undefined;
+      }
+      case "answer_elicitation": {
+        // Validation mirrors the shell (skills/elicitation.rs `answer`):
+        // invalid choices reject and LEAVE the question parked for a retry;
+        // only a valid answer consumes it and resumes the run.
+        const id = a.id as string;
+        const choices = a.choices as string[];
+        const parked = parkedElicitation;
+        if (parked === null || parked.id !== id) {
+          return fail(
+            "notFound",
+            `elicitation '${id}' is not live (it may have timed out or ended)`,
+          );
+        }
+        if (!parked.multiSelect && choices.length !== 1) {
+          return fail(
+            "invalidName",
+            `elicitation '${id}' is single-select and requires exactly one choice`,
+          );
+        }
+        const chosen = new Set<string>();
+        for (const choice of choices) {
+          if (!parked.offeredIds.has(choice)) {
+            return fail(
+              "invalidName",
+              `choice '${choice}' was not offered by elicitation '${id}'`,
+            );
+          }
+          if (chosen.has(choice)) {
+            return fail(
+              "invalidName",
+              `choice '${choice}' was supplied more than once for elicitation '${id}'`,
+            );
+          }
+          chosen.add(choice);
+        }
+        if (id === opts.profileFolderElicitationId) {
+          profileFolder = choices[0] ?? null;
+        }
+        parkedElicitation = null;
+        advanceChatScript(parked.send, parked.remainder, parked.runId, parked.finish);
+        return undefined;
+      }
+      case "undo_skill_run": {
+        const runId = a.runId as string;
+        const written = writtenByRun.get(runId);
+        if (!written || written.length === 0) {
+          return fail("notFound", `no undoable skill run '${runId}'`);
+        }
+        const report: UndoReport =
+          opts.undoReport ??
+          ({
+            files: written.map((relPath) => ({
+              relPath,
+              status: "deleted",
+              message: null,
+            })),
+          } satisfies UndoReport);
+        // Mirror the shell: a fully terminal report consumes the run; any
+        // failed file keeps it reserved so "Retry undo" can hit it again.
+        if (!report.files.some((f) => f.status === "failed")) {
+          writtenByRun.delete(runId);
+        }
+        return report;
       }
       case "move_entry": {
         const path = a.path as string;
@@ -1848,9 +2175,24 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     clearFailure(cmd) {
       failures.delete(cmd);
     },
+    expireElicitation() {
+      const parked = parkedElicitation;
+      if (parked === null) {
+        throw new Error("expireElicitation: no elicitation is parked");
+      }
+      // Retire the question FIRST (dead-id semantics for any late answer),
+      // then let the run end: the remainder streams and `chat` resolves.
+      parkedElicitation = null;
+      advanceChatScript(parked.send, parked.remainder, parked.runId, parked.finish);
+    },
     wasDestroyed() {
       return destroyed;
     },
     calls,
+    chatCalls,
+    get profileFolder() {
+      return profileFolder;
+    },
+    openedYoutubeUrls,
   };
 }

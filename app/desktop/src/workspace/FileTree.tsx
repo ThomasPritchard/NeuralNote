@@ -9,6 +9,7 @@
 import { memo, useEffect, useRef, useState } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { FilePlus2, Search, X } from "lucide-react";
+import { IconButton } from "@/components/ui/icon-button";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import type { TemplateInfo, TreeNode } from "../lib/types";
@@ -294,7 +295,7 @@ export const FileTree = memo(function FileTree({
   const creatingAtRoot = creating?.parentPath === vaultPath;
 
   return (
-    <aside className="flex w-60 shrink-0 flex-col border-r border-border bg-sidebar">
+    <aside className="nn-sidebar flex shrink-0 flex-col border-r border-border bg-sidebar">
       {/* Panel top row — filename filter + root note create, mirroring the
           SearchPanel's field-first opening. The vault switcher and its menu
           moved to the window titlebar; root note creation stays here because
@@ -318,26 +319,22 @@ export const FileTree = memo(function FileTree({
             className="w-full bg-transparent placeholder:text-muted-foreground/60 focus:outline-none"
           />
           {filter !== "" && (
-            <button
-              type="button"
-              aria-label="Clear filter"
-              title="Clear filter"
+            <IconButton
+              label="Clear filter"
               onClick={() => setFilter("")}
-              className="grid size-4 shrink-0 place-items-center rounded text-muted-foreground transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+              className="size-6 shrink-0"
             >
               <X className="size-3.5" aria-hidden />
-            </button>
+            </IconButton>
           )}
         </label>
-        <button
-          type="button"
-          aria-label="New note"
-          title="New note"
+        <IconButton
+          label="New note"
           onClick={() => startCreate(vaultPath, "note")}
-          className="grid size-6 shrink-0 place-items-center rounded text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+          className="size-6 shrink-0 text-muted-foreground hover:bg-sidebar-accent hover:text-foreground"
         >
           <FilePlus2 className="size-4" aria-hidden />
-        </button>
+        </IconButton>
       </div>
 
       {/* Tree — the scroll body is also the drop target for "move to vault root".

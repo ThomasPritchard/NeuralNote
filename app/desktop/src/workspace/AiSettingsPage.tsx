@@ -31,7 +31,7 @@ function CurrentProviderChip({ status }: Readonly<{ status: AiStatus | null }>) 
     return (
       <span className={cn(base, "text-muted-foreground")}>
         <span
-          className="size-1.5 rounded-full bg-primary shadow-[0_0_6px_var(--color-primary)]"
+          className="size-1.5 rounded-full bg-healthy"
           aria-hidden
         />
         {/* No space intended — the flex gap separates chip parts. */}
@@ -47,7 +47,7 @@ function CurrentProviderChip({ status }: Readonly<{ status: AiStatus | null }>) 
       return (
         <span className={cn(base, "text-muted-foreground")}>
           <span
-            className="size-1.5 rounded-full bg-primary shadow-[0_0_6px_var(--color-primary)]"
+            className="size-1.5 rounded-full bg-healthy"
             aria-hidden
           />
           {/* No space intended — the flex gap separates chip parts. */}

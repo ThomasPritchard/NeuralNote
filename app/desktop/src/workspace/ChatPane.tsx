@@ -22,13 +22,15 @@ import {
   Loader2,
   Send,
   Sparkles,
+  Square,
 } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import { cn } from "../lib/cn";
 import { useVault } from "../lib/store";
-import type { AiStatus, ChatEvent } from "../lib/types";
-import { BTN_PRIMARY } from "./buttonStyles";
+import type { AiStatus, ChatEvent, SkillListing } from "../lib/types";
+import { buttonVariants } from "@/components/ui/button";
+import { StatusPill as NeuralStatusPill } from "@/components/neural/patterns";
 import { ChatMessages } from "./ChatMessages";
 import {
   emptyAssistant,
@@ -41,6 +43,20 @@ import {
 import { DisconnectedPane, KeySetupPanel } from "./KeySetupPanel";
 import { ProviderPicker } from "./ProviderPicker";
 import { reasoningCapability } from "./reasoningSupport";
+import {
+  filterSkillSuggestions,
+  findSkillTrigger,
+  removeSkillTrigger,
+  type SkillPickerEntry,
+  type SkillTrigger,
+} from "./skillAutocomplete";
+import {
+  SkillChips,
+  SkillSuggestions,
+  SKILL_LISTBOX_ID,
+  skillOptionId,
+  type SkillPickerNotice,
+} from "./SkillPicker";
 
 type View =
   | "loading"
@@ -50,25 +66,187 @@ type View =
   | "disconnected"
   | "chat";
 
+interface ProviderDestination {
+  model: string;
+  view: Extract<View, "chat" | "setup" | "localSetup" | "picker">;
+}
+
+/** Map one backend status to the pane destination it authoritatively implies. */
+function providerDestination(status: AiStatus): ProviderDestination {
+  if (status.activeProvider === "openRouter") {
+    return {
+      model: status.openrouter.model,
+      view: status.openrouter.hasKey ? "chat" : "setup",
+    };
+  }
+  if (status.activeProvider === "local") {
+    return {
+      model: status.local.activeModelTag ?? "",
+      view: status.local.activeModelTag ? "chat" : "localSetup",
+    };
+  }
+  return { model: status.openrouter.model, view: "picker" };
+}
+
+/** The backend skill catalogue as an explicit state machine: until the load
+ *  resolves the picker can neither offer skills nor claim there are none —
+ *  "not yet known" must never silently read as "no skills" (the same union
+ *  discipline as LocalAiCard's installed-model scan). */
+type SkillsCatalogue =
+  | { status: "loading" }
+  | { status: "ready"; skills: SkillListing[] }
+  | { status: "error"; message: string };
+
+/** While the catalogue isn't usable yet, an active trigger still opens the
+ *  popup — showing this quiet loading/error line instead of options, so typing
+ *  `@` during the load never looks like "there are no skills". */
+function skillPickerNotice(
+  catalogue: SkillsCatalogue,
+): SkillPickerNotice | null {
+  if (catalogue.status === "loading") {
+    return { kind: "loading", message: "Loading skills…" };
+  }
+  if (catalogue.status === "error") {
+    return {
+      kind: "error",
+      message: `Couldn't load skills: ${catalogue.message}`,
+    };
+  }
+  return null;
+}
+
+/** What the composer's `@` popup shows for one render. */
+interface SkillPickerState {
+  trigger: SkillTrigger | null;
+  /** Identity of the current trigger — Escape/blur dismissals are keyed to it,
+   *  so typing another character re-derives the key and may reopen the popup. */
+  triggerKey: string | null;
+  suggestions: SkillListing[];
+  notice: SkillPickerNotice | null;
+  open: boolean;
+  active: number;
+}
+
+/** Derive the `@` picker's render state from the composer buffer, the caret,
+ *  and the async catalogue. A pure function of its inputs, exactly like the
+ *  trigger itself (the editor's `[[` autocomplete discipline). */
+function deriveSkillPicker(args: {
+  input: string;
+  caret: number;
+  dismissedKey: string | null;
+  pickerIndex: number;
+  catalogue: SkillsCatalogue;
+  activeSkills: readonly SkillPickerEntry[];
+}): SkillPickerState {
+  const { input, caret, dismissedKey, pickerIndex, catalogue, activeSkills } =
+    args;
+  const trigger = findSkillTrigger(input, caret);
+  const triggerKey =
+    trigger === null ? null : `${trigger.start}:${trigger.query}`;
+  // Only enabled skills are offerable — activation authority stays with the
+  // Rust `SkillRegistry`, and offering a disabled skill would set up a
+  // guaranteed "could not be activated" notice.
+  const offerableSkills =
+    catalogue.status === "ready"
+      ? catalogue.skills.filter((s) => s.enabled)
+      : [];
+  const suggestions =
+    trigger !== null && triggerKey !== dismissedKey
+      ? filterSkillSuggestions(
+          offerableSkills,
+          trigger.query,
+          activeSkills.map((s) => s.id),
+        )
+      : [];
+  const notice = skillPickerNotice(catalogue);
+  const open =
+    suggestions.length > 0 ||
+    (trigger !== null && triggerKey !== dismissedKey && notice !== null);
+  return {
+    trigger,
+    triggerKey,
+    suggestions,
+    notice,
+    open,
+    active:
+      suggestions.length > 0 ? Math.min(pickerIndex, suggestions.length - 1) : 0,
+  };
+}
+
+/** The provider+model a status would chat against, or null in a first-run
+ *  state with nothing to probe. A string key, so the probe effect re-fires
+ *  exactly when the effective provider or selected model changes — and only
+ *  then (`refreshReasoningSupport` is network I/O, never per-render). */
+function reasoningProbeTarget(status: AiStatus | null): string | null {
+  if (status?.activeProvider === "openRouter" && status.openrouter.hasKey) {
+    return `openRouter:${status.openrouter.model}`;
+  }
+  if (status?.activeProvider === "local" && status.local.activeModelTag) {
+    return `local:${status.local.activeModelTag}`;
+  }
+  return null;
+}
+
 /** Header status pill: the connected model id while chatting, "Not connected"
  *  after a skip; hidden during the transient first-run states. */
-function StatusPill({ view, model }: Readonly<{ view: View; model: string }>) {
+function ChatStatusPill({ view, model }: Readonly<{ view: View; model: string }>) {
   if (view === "chat") {
     return (
-      <span className="ml-auto flex items-center gap-1.5 rounded-full bg-background/50 px-2.5 py-1 text-[11px] text-muted-foreground ring-1 ring-inset ring-border">
-        <span className="size-1.5 rounded-full bg-primary shadow-[0_0_6px_var(--color-primary)]" aria-hidden />
-        <span className="nn-mono max-w-[9rem] truncate">{model.split("/").pop()}</span>
-      </span>
+      <NeuralStatusPill
+        status="neutral"
+        title={model}
+        className="nn-chat-model-pill ml-auto min-w-0 max-w-[9rem] shrink gap-1.5 px-2.5 py-1 text-[11px]"
+      >
+        <span className="size-1.5 rounded-full bg-healthy" aria-hidden />
+        <span className="nn-mono min-w-0 truncate">{model.split("/").pop()}</span>
+      </NeuralStatusPill>
     );
   }
   if (view === "disconnected") {
     return (
-      <span className="ml-auto flex items-center gap-1.5 rounded-full bg-background/50 px-2.5 py-1 text-[11px] text-muted-foreground ring-1 ring-inset ring-border">
+      <NeuralStatusPill status="neutral" className="ml-auto shrink-0 gap-1.5 px-2.5 py-1 text-[11px]">
         <Database className="size-3" aria-hidden /> Not connected
-      </span>
+      </NeuralStatusPill>
     );
   }
   return null;
+}
+
+function ComposerActionButton({
+  busy,
+  cancelling,
+  inputEmpty,
+  onSend,
+  onCancel,
+}: Readonly<{
+  busy: boolean;
+  cancelling: boolean;
+  inputEmpty: boolean;
+  onSend: () => void;
+  onCancel: () => void;
+}>) {
+  const label = busy ? "Cancel run" : "Send";
+  const disabled = busy ? cancelling : inputEmpty;
+  let icon = <Send className="size-4" aria-hidden />;
+  if (busy) {
+    icon = cancelling ? (
+      <Loader2 className="size-4 animate-spin motion-reduce:animate-none" aria-hidden />
+    ) : (
+      <Square className="size-3.5 fill-current" aria-hidden />
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={busy ? onCancel : onSend}
+      disabled={disabled}
+      aria-label={label}
+      className={cn(buttonVariants({ tone: "chat", size: "icon" }), "size-9")}
+    >
+      {icon}
+    </button>
+  );
 }
 
 export function ChatPane({
@@ -104,7 +282,99 @@ export function ChatPane({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const reasoningReasonId = useId();
+
+  // ── Skills: the chip row + the composer's `@` picker ────────────────────────
+  // Chips persist across sends on purpose: an activated skill is a mode the
+  // user switched on (and history-carried follow-ups — a late elicitation
+  // answer — should re-activate it), not a one-message attachment.
+  const [activeSkills, setActiveSkills] = useState<SkillPickerEntry[]>([]);
+  // The backend catalogue the picker offers (Settings › Skills is the other
+  // consumer). Loaded on mount and re-read whenever Settings closes — the one
+  // place a skill's enabled state can change out from under the picker.
+  const [skillsCatalogue, setSkillsCatalogue] = useState<SkillsCatalogue>({
+    status: "loading",
+  });
+  // Ref mirror (the messagesRef idiom below): the catalogue effect's failure
+  // handler needs to know whether a last-good catalogue exists, without the
+  // effect re-running on every catalogue change.
+  const skillsCatalogueRef = useRef(skillsCatalogue);
+  skillsCatalogueRef.current = skillsCatalogue;
+  // Run ids by assistant-message index, resolved as each run settles — the
+  // report card's Undo handle. Client-side only; never part of the transcript.
+  const [runIds, setRunIds] = useState<Record<number, string>>({});
+  // The caret mirrors the textarea's selectionStart (the trigger is a pure
+  // function of value + caret, exactly like the editor's `[[` autocomplete).
+  const [caret, setCaret] = useState(0);
+  const [pickerIndex, setPickerIndex] = useState(0);
+  // Escape/blur dismiss the popup for the CURRENT trigger text only — typing
+  // another character re-derives the key and the popup may reopen.
+  const [dismissedKey, setDismissedKey] = useState<string | null>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const pendingCaretRef = useRef<number | null>(null);
+
+  // Load the picker's catalogue. `refreshSignal` bumps when Settings closes,
+  // so a skill toggled there is reflected without remounting the pane. A
+  // failed REFRESH keeps the last good catalogue on screen (stale beats
+  // blank) but still surfaces the failure on the pane's shared error channel
+  // — exactly like a failed `aiStatus` read; only a load with nothing to fall
+  // back on lands on the quiet in-picker error line instead, surfaced where
+  // the data is consumed. Either way, never silent.
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .listSkills()
+      .then((skills) => {
+        if (!cancelled) setSkillsCatalogue({ status: "ready", skills });
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        if (skillsCatalogueRef.current.status === "ready") {
+          reportError(errorMessage(e));
+        } else {
+          setSkillsCatalogue({ status: "error", message: errorMessage(e) });
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [refreshSignal, reportError]);
+
+  // The popup's render state is a pure derivation of buffer + caret + the
+  // async catalogue — see `deriveSkillPicker` for the offerability and
+  // loading/error-notice rules.
+  const {
+    trigger,
+    triggerKey,
+    suggestions,
+    notice: pickerNotice,
+    open: pickerOpen,
+    active: pickerActive,
+  } = deriveSkillPicker({
+    input,
+    caret,
+    dismissedKey,
+    pickerIndex,
+    catalogue: skillsCatalogue,
+    activeSkills,
+  });
+
+  // A changed trigger is a new search: highlight from the top again.
+  useEffect(() => {
+    setPickerIndex(0);
+  }, [triggerKey]);
+
+  // Restore the caret after a pick edits the buffer mid-text (a controlled
+  // textarea moves the caret to the end on programmatic value changes).
+  useEffect(() => {
+    if (pendingCaretRef.current === null) return;
+    composerRef.current?.setSelectionRange(
+      pendingCaretRef.current,
+      pendingCaretRef.current,
+    );
+    pendingCaretRef.current = null;
+  }, [input]);
 
   // Latest transcript, read when building the next request's history without
   // rebuilding the send callback on every streamed delta.
@@ -118,24 +388,10 @@ export function ChatPane({
   /** Land on the view a provider-aware status implies. The `model` doubles as
    *  the status-pill label: the OpenRouter model id, or the local model tag. */
   const applyStatus = useCallback((next: AiStatus) => {
+    const destination = providerDestination(next);
     setStatus(next);
-    if (next.activeProvider === "openRouter") {
-      setModel(next.openrouter.model);
-      // hasKey false here would be a config hole — fall back to guided setup.
-      setView(next.openrouter.hasKey ? "chat" : "setup");
-    } else if (next.activeProvider === "local") {
-      if (next.local.activeModelTag) {
-        setModel(next.local.activeModelTag);
-        setView("chat");
-      } else {
-        // "Local" chosen but nothing downloaded — an honest hand-off into
-        // Settings, never a chat that would only error.
-        setView("localSetup");
-      }
-    } else {
-      setModel(next.openrouter.model);
-      setView("picker");
-    }
+    setModel(destination.model);
+    setView(destination.view);
   }, []);
 
   // On mount (and whenever Settings closes), read the effective provider. A
@@ -163,16 +419,10 @@ export function ChatPane({
     };
   }, [applyStatus, reportError, refreshSignal]);
 
-  // The provider+model this status would chat against, or null in a first-run
-  // state with nothing to probe. A string key, so the probe effect below
-  // re-fires exactly when the effective provider or selected model changes —
-  // and only then (`refreshReasoningSupport` is network I/O, never per-render).
-  let probeTarget: string | null = null;
-  if (status?.activeProvider === "openRouter" && status.openrouter.hasKey) {
-    probeTarget = `openRouter:${status.openrouter.model}`;
-  } else if (status?.activeProvider === "local" && status.local.activeModelTag) {
-    probeTarget = `local:${status.local.activeModelTag}`;
-  }
+  // The provider+model this status would chat against — the string key that
+  // makes the probe effect below re-fire exactly when the effective provider
+  // or selected model changes, and only then (see `reasoningProbeTarget`).
+  const probeTarget = reasoningProbeTarget(status);
 
   // Probe the selected model for reasoning support on mount and on every
   // provider/model change. A failed probe fails OPEN: capability stays
@@ -239,27 +489,78 @@ export function ChatPane({
     });
   }, []);
 
+  /** Run one chat turn. Shared by the composer and by a dormant elicitation's
+   *  late answer (which is an ordinary turn by design — spec §3.4). */
+  const sendPrompt = useCallback(
+    (prompt: string) => {
+      if (prompt === "" || busy) return;
+      const history = toHistory(messagesRef.current);
+      // Where the assistant turn is about to land — the run id resolved below
+      // is keyed to it so the report card's Undo targets the right run.
+      const assistantIndex = messagesRef.current.length + 1;
+      setBusy(true);
+      // Pin the live reasoning opt-in onto the turn at creation: the finished
+      // turn is judged (the backstop notice) against the opt-in it actually ran
+      // under, not a flag the user may have flipped mid-stream.
+      setMessages((prev) => [
+        ...prev,
+        userMessage(prompt),
+        emptyAssistant(effectiveReasoning),
+      ]);
+      // A transport-level rejection is surfaced as an inline error event, so a
+      // failed run is never silent and the composer always re-enables.
+      void api
+        .chat(prompt, history, applyEvent, activeSkills.map((s) => s.id))
+        .then((runId) => {
+          // Guarded: a rejected run has no id, and Undo without one is a lie.
+          if (typeof runId === "string" && runId !== "") {
+            setRunIds((prev) => ({ ...prev, [assistantIndex]: runId }));
+          }
+        })
+        .catch((e) => applyEvent({ type: "error", message: errorMessage(e) }))
+        .finally(() => setBusy(false));
+    },
+    [busy, effectiveReasoning, applyEvent, activeSkills],
+  );
+
   const send = useCallback(() => {
     const prompt = input.trim();
     if (prompt === "" || busy) return;
-    const history = toHistory(messagesRef.current);
     setInput("");
-    setBusy(true);
-    // Pin the live reasoning opt-in onto the turn at creation: the finished
-    // turn is judged (the backstop notice) against the opt-in it actually ran
-    // under, not a flag the user may have flipped mid-stream.
-    setMessages((prev) => [
-      ...prev,
-      userMessage(prompt),
-      emptyAssistant(effectiveReasoning),
-    ]);
-    // A transport-level rejection is surfaced as an inline error event, so a
-    // failed run is never silent and the composer always re-enables.
-    void api
-      .chat(prompt, history, applyEvent)
-      .catch((e) => applyEvent({ type: "error", message: errorMessage(e) }))
-      .finally(() => setBusy(false));
-  }, [input, busy, effectiveReasoning, applyEvent]);
+    sendPrompt(prompt);
+  }, [input, busy, sendPrompt]);
+
+  const cancelRun = useCallback(async () => {
+    if (!busy || cancelling) return;
+    setCancelling(true);
+    try {
+      await api.cancelChatRun();
+    } catch (error) {
+      reportError(errorMessage(error));
+    } finally {
+      setCancelling(false);
+    }
+  }, [busy, cancelling, reportError]);
+
+  /** Swap the typed `@query` for a chip; the picker and the chips both feed
+   *  the same `activeSkills` field on the next send. */
+  const pickSkill = useCallback(
+    (skill: SkillPickerEntry) => {
+      if (trigger === null) return;
+      const removed = removeSkillTrigger(input, trigger.start, caret);
+      setActiveSkills((prev) => [...prev, skill]);
+      setInput(removed.value);
+      setCaret(removed.caret);
+      pendingCaretRef.current = removed.caret;
+      // A mouse pick must not strand focus: typing continues in the composer.
+      composerRef.current?.focus();
+    },
+    [trigger, input, caret],
+  );
+
+  const removeSkill = useCallback((id: string) => {
+    setActiveSkills((prev) => prev.filter((s) => s.id !== id));
+  }, []);
 
   const handleSave = useCallback(
     async (key: string, chosenModel: string) => {
@@ -285,7 +586,45 @@ export function ChatPane({
     [openNoteAt, vaultPath],
   );
 
+  const syncCaret = (e: { currentTarget: HTMLTextAreaElement }) => {
+    setCaret(e.currentTarget.selectionStart ?? 0);
+  };
+
+  /** The keys the open `@` popup claims; true means the event was consumed.
+   *  With no options yet (the quiet loading/error line), only Escape is
+   *  claimed: arrows keep moving the caret and Enter falls through to an
+   *  ordinary send. */
+  const handlePickerKey = (e: KeyboardEvent<HTMLTextAreaElement>): boolean => {
+    const len = suggestions.length;
+    if (len > 0) {
+      if (e.key === "ArrowDown") {
+        e.preventDefault();
+        setPickerIndex((pickerActive + 1) % len);
+        return true;
+      }
+      if (e.key === "ArrowUp") {
+        e.preventDefault();
+        setPickerIndex((pickerActive - 1 + len) % len);
+        return true;
+      }
+      if (e.key === "Enter" || e.key === "Tab") {
+        e.preventDefault();
+        pickSkill(suggestions[pickerActive]);
+        return true;
+      }
+    }
+    if (e.key === "Escape") {
+      e.preventDefault();
+      setDismissedKey(triggerKey);
+      return true;
+    }
+    return false;
+  };
+
   const onComposerKeyDown = (e: KeyboardEvent<HTMLTextAreaElement>) => {
+    // While the `@` popup is open it owns the nav keys — Enter picks a skill,
+    // it never sends mid-pick.
+    if (pickerOpen && handlePickerKey(e)) return;
     if (e.key === "Enter" && !e.shiftKey) {
       e.preventDefault();
       send();
@@ -293,14 +632,14 @@ export function ChatPane({
   };
 
   return (
-    <aside className="relative flex w-[380px] shrink-0 flex-col border-l border-border bg-gradient-to-b from-primary/[0.07] via-sidebar to-sidebar">
+    <aside className="nn-chat-pane relative flex shrink-0 flex-col border-l border-border bg-sidebar">
       <header className="shrink-0 border-b border-border px-5 py-3.5">
-        <div className="flex items-center gap-2.5">
-          <span className="grid size-7 place-items-center rounded-lg bg-gradient-to-br from-primary to-primary/55 text-primary-foreground shadow-[0_0_18px_-5px_var(--color-primary),inset_0_1px_0_0_rgb(255_255_255/0.2)]">
+        <div className="flex min-w-0 items-center gap-2.5">
+          <span className="grid size-7 place-items-center rounded-lg border border-primary/25 bg-primary/12 text-primary">
             <Sparkles className="size-3.5" aria-hidden />
           </span>
-          <span className="nn-heading text-sm font-semibold">Cited recall</span>
-          <StatusPill view={view} model={model} />
+          <span className="nn-heading shrink-0 text-sm font-semibold">Cited recall</span>
+          <ChatStatusPill view={view} model={model} />
         </div>
         <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
           Ask questions across everything in your vault. Every claim is
@@ -347,7 +686,7 @@ export function ChatPane({
           <button
             type="button"
             onClick={onOpenSettings}
-            className={cn(BTN_PRIMARY, "mt-1 px-3.5")}
+            className={cn(buttonVariants({ tone: "primary", size: "sm" }), "mt-1 px-3.5")}
           >
             Open AI settings
           </button>
@@ -367,7 +706,7 @@ export function ChatPane({
           <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
             {messages.length === 0 ? (
               <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
-                <span className="grid size-11 place-items-center rounded-xl bg-primary/10 text-primary shadow-[0_0_24px_-8px_var(--color-primary)] ring-1 ring-inset ring-primary/20">
+                <span className="grid size-11 place-items-center rounded-xl bg-primary/10 text-primary ring-1 ring-inset ring-primary/20">
                   <Sparkles className="size-5" aria-hidden />
                 </span>
                 <div className="flex flex-col gap-1.5">
@@ -380,7 +719,13 @@ export function ChatPane({
                 </div>
               </div>
             ) : (
-              <ChatMessages messages={messages} onOpenCitation={openCitation} />
+              <ChatMessages
+                messages={messages}
+                onOpenCitation={openCitation}
+                onSendFollowUp={sendPrompt}
+                busy={busy}
+                runIds={runIds}
+              />
             )}
           </div>
 
@@ -396,32 +741,55 @@ export function ChatPane({
                 <span className="min-w-0 flex-1">{reasoningError}</span>
               </p>
             )}
-            <div className="flex items-end gap-2 rounded-xl bg-background/40 p-2 ring-1 ring-inset ring-border transition focus-within:bg-background/60 focus-within:ring-primary/40">
+            <SkillChips skills={activeSkills} onRemove={removeSkill} />
+            <div className="relative">
+              {pickerOpen && (
+                <SkillSuggestions
+                  suggestions={suggestions}
+                  notice={suggestions.length === 0 ? pickerNotice : null}
+                  active={pickerActive}
+                  onPick={pickSkill}
+                  onHover={setPickerIndex}
+                />
+              )}
+              <div className="flex items-end gap-2 rounded-xl bg-background/40 p-2 ring-1 ring-inset ring-border transition focus-within:bg-background/60 focus-within:ring-primary/40">
               <textarea
+                ref={composerRef}
                 rows={1}
                 value={input}
                 disabled={busy}
-                onChange={(e) => setInput(e.target.value)}
+                onChange={(e) => {
+                  setInput(e.target.value);
+                  syncCaret(e);
+                }}
                 onKeyDown={onComposerKeyDown}
+                onKeyUp={syncCaret}
+                onClick={syncCaret}
+                onBlur={() => setDismissedKey(triggerKey)}
+                // Coming back to the composer is a fresh session for the
+                // popup: a blur-dismissal must not outlive it (the key alone
+                // can collide with an identically retyped trigger).
+                onFocus={() => setDismissedKey(null)}
                 aria-label="Ask across your vault"
+                aria-autocomplete="list"
+                // The listbox exists only when there are options — a popup
+                // showing the quiet loading/error line is not a listbox, so
+                // the combobox wiring stays off until options render.
+                aria-controls={suggestions.length > 0 ? SKILL_LISTBOX_ID : undefined}
+                aria-activedescendant={
+                  suggestions.length > 0 ? skillOptionId(pickerActive) : undefined
+                }
                 placeholder="Ask across your vault…"
                 className="max-h-32 flex-1 resize-none bg-transparent px-2 py-1.5 text-[13px] leading-5 placeholder:text-muted-foreground/70 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
               />
-              <button
-                type="button"
-                onClick={send}
-                disabled={busy || input.trim() === ""}
-                aria-label="Send"
-                // The primary button in icon-only form: p-0 clears the text
-                // padding; the type-scale classes are inert on an svg child.
-                className={cn(BTN_PRIMARY, "grid size-9 shrink-0 place-items-center p-0")}
-              >
-                {busy ? (
-                  <Loader2 className="size-4 animate-spin motion-reduce:animate-none" aria-hidden />
-                ) : (
-                  <Send className="size-4" aria-hidden />
-                )}
-              </button>
+              <ComposerActionButton
+                busy={busy}
+                cancelling={cancelling}
+                inputEmpty={input.trim() === ""}
+                onSend={send}
+                onCancel={() => void cancelRun()}
+              />
+              </div>
             </div>
             {/* The composer's meta strip: the reasoning opt-in on the left (a
                 quiet chip — it changes what the next turn requests, so it lives
@@ -455,7 +823,7 @@ export function ChatPane({
                 <Brain className="size-3 shrink-0" aria-hidden />
                 Reasoning
               </button>
-              <p className="text-right text-[10px] leading-none text-muted-foreground/60">
+              <p className="nn-compact-label text-right text-[10px] leading-none text-muted-foreground/60">
                 Enter to send · Shift+Enter for a new line
               </p>
             </div>

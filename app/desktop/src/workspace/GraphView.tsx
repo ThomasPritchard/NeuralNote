@@ -19,7 +19,10 @@ import { AlertTriangle, Loader2, RotateCw } from "lucide-react";
 import { errorMessage, readLinkGraph } from "../lib/api";
 import type { LinkGraph } from "../lib/types";
 import { useVault } from "../lib/store";
-import { NeuralGalaxy } from "./galaxy/NeuralGalaxy";
+import {
+  GALAXY_COMPACT_TOOLBAR_WIDTH,
+  NeuralGalaxy,
+} from "./galaxy/NeuralGalaxy";
 import { toGalaxy } from "./graphTransform";
 
 type LoadState =
@@ -194,7 +197,14 @@ export function GraphView({
           />
           {(view.galaxy.truncation !== null || skippedFiles > 0) && (
             // Non-blocking degradation notices, kept near the stats/top area.
-            <div className="pointer-events-none absolute left-5 top-16 flex flex-col gap-1">
+            <div
+              data-layout={
+                size.width < GALAXY_COMPACT_TOOLBAR_WIDTH ? "compact" : "wide"
+              }
+              className={`pointer-events-none absolute left-5 flex flex-col gap-1 ${
+                size.width < GALAXY_COMPACT_TOOLBAR_WIDTH ? "top-32" : "top-16"
+              }`}
+            >
               {view.galaxy.truncation !== null && (
                 // The node cap trimmed this level (PA-006) — never let a
                 // partial galaxy pass silently as the whole vault.

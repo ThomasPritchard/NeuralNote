@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 description = "Client-agnostic vault domain for NeuralNote: tree scan, markdown + YAML frontmatter, file/folder CRUD, recent vaults, and path safety. No client/UI dependency."
 
+[features]
+default = ["youtube-audio"]
+youtube-audio = ["dep:symphonia", "dep:rubato", "dep:audioadapter-buffers"]
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -25,6 +29,19 @@ chrono = { version = "0.4", default-features = false, features = ["clock"] }
 # serde-compat (a default feature) makes ts-rs read the existing `#[serde(...)]`
 # attributes, so the emitted TS matches the exact JSON serde produces.
 ts-rs = "12.0.1"
+# Decode the pinned AAC-LC M4A rendition without shipping ffmpeg. Keep the
+# dependency feature surface to exactly the codec/container pair we consume.
+symphonia = { version = "0.6.0", default-features = false, features = ["aac", "isomp4"], optional = true }
+# Offline fixed-ratio resampling from YouTube's source rate to Whisper's 16 kHz.
+rubato = { version = "4.0.0", default-features = false, features = ["fft_resampler"], optional = true }
+# Slice-backed adapters required by rubato 4's batch API.
+audioadapter-buffers = { version = "4.0.0", default-features = false, features = ["std"], optional = true }
+# Thumbnail bytes cross the frozen elicitation contract only as bounded data URIs.
+base64 = "0.22.1"
+# Complete HTML named/numeric entity decoding for untrusted caption text.
+html-escape = "0.2.14"
+# Decode the three accepted thumbnail formats before they cross the IPC boundary.
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 
 [dev-dependencies]
 tempfile = "3"

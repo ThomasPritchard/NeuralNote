@@ -29,7 +29,7 @@ export function InlineInput({
   onCancel,
   blurWithin,
   className,
-}: InlineInputProps) {
+}: Readonly<InlineInputProps>) {
   const [value, setValue] = useState(initialValue);
   const inputRef = useRef<HTMLInputElement>(null);
   // Guards the blur handler: once we've confirmed/cancelled deliberately, the

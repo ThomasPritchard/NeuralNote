@@ -1,6 +1,7 @@
 import type { ReactNode } from "react";
 import { FolderOpen, Sparkles } from "lucide-react";
 import { cn } from "../lib/cn";
+import { buttonVariants } from "@/components/ui/button";
 
 interface VaultActionsProps {
   /** Open the native folder picker and open the chosen vault. */
@@ -10,7 +11,7 @@ interface VaultActionsProps {
 }
 
 /** The two primary entry points shown on the welcome screen. */
-export function VaultActions({ onOpen, onCreate }: VaultActionsProps) {
+export function VaultActions({ onOpen, onCreate }: Readonly<VaultActionsProps>) {
   return (
     <div className="grid grid-cols-2 gap-3">
       <ActionCard
@@ -44,20 +45,18 @@ function ActionCard({
   description,
   onClick,
   primary = false,
-}: ActionCardProps) {
+}: Readonly<ActionCardProps>) {
   return (
     <button
       type="button"
       onClick={onClick}
       className={cn(
-        "flex flex-col items-center gap-2 rounded-xl px-4 py-5 text-sm font-medium",
+        buttonVariants({ tone: primary ? "primary" : "quiet", size: "lg" }),
+        "h-auto flex-col gap-2 rounded-xl px-4 py-5",
         "transition duration-200 ease-spring",
         "hover:-translate-y-0.5 active:translate-y-0",
         "motion-reduce:transition-none motion-reduce:hover:translate-y-0",
-        "focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background",
-        primary
-          ? "bg-primary text-primary-foreground shadow-[0_0_22px_-8px_var(--color-primary)] hover:bg-primary/90"
-          : "border border-border bg-card text-foreground hover:border-primary/40 hover:bg-accent",
+        primary ? "text-primary-foreground" : "text-foreground hover:border-primary/35",
       )}
     >
       {icon}

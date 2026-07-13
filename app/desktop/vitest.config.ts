@@ -1,12 +1,18 @@
 /// <reference types="vitest/config" />
 import { configDefaults, defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
+import { fileURLToPath } from "node:url";
 
 // Standalone test config (kept separate from the Tauri vite.config so the dev/
 // build pipeline is untouched). jsdom + Testing Library; v8 coverage emitted as
 // lcov for the SonarQube scanner.
 export default defineConfig({
   plugins: [react()],
+  resolve: {
+    alias: {
+      "@": fileURLToPath(new URL("./src", import.meta.url)),
+    },
+  },
   test: {
     environment: "jsdom",
     globals: true,

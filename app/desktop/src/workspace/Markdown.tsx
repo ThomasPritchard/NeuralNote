@@ -10,7 +10,7 @@
 // webview away from the app would be worse than doing nothing. Without a
 // `noteIndex` (the chat pane) rendering is unchanged from before.
 
-import { useMemo } from "react";
+import { useEffect, useMemo, useState, type ImgHTMLAttributes } from "react";
 import ReactMarkdown, {
   defaultUrlTransform,
   type Components,
@@ -52,27 +52,27 @@ const components: Components = {
   // content is provably present (react-markdown would otherwise forward it via
   // the spread, which a static analyzer can't verify — see S6850).
   h1: ({ node: _node, children, ...props }) => (
-    <h1 className="nn-heading mt-8 mb-3 text-2xl font-semibold tracking-tight text-foreground first:mt-0" {...props}>
+    <h1 className="nn-heading mb-4 mt-10 text-[2rem] font-semibold leading-[1.15] tracking-[-0.035em] text-foreground first:mt-0" {...props}>
       {children}
     </h1>
   ),
   h2: ({ node: _node, children, ...props }) => (
-    <h2 className="nn-heading mt-7 mb-2.5 text-xl font-semibold tracking-tight text-foreground first:mt-0" {...props}>
+    <h2 className="nn-heading mb-3 mt-9 text-[1.5rem] font-semibold leading-tight tracking-[-0.025em] text-foreground first:mt-0" {...props}>
       {children}
     </h2>
   ),
   h3: ({ node: _node, children, ...props }) => (
-    <h3 className="nn-heading mt-6 mb-2 text-base font-semibold text-foreground first:mt-0" {...props}>
+    <h3 className="nn-heading mb-2.5 mt-8 text-lg font-semibold tracking-[-0.015em] text-foreground first:mt-0" {...props}>
       {children}
     </h3>
   ),
   h4: ({ node: _node, children, ...props }) => (
-    <h4 className="nn-heading mt-5 mb-2 text-sm font-semibold text-foreground first:mt-0" {...props}>
+    <h4 className="nn-heading mb-2 mt-7 text-base font-semibold text-foreground first:mt-0" {...props}>
       {children}
     </h4>
   ),
   p: ({ node: _node, ...props }) => (
-    <p className="my-3.5 text-[15px] leading-7 text-foreground/90" {...props} />
+    <p className="my-4 text-base leading-[1.8] text-foreground/90" {...props} />
   ),
   a: ({ node: _node, href, children, ...props }) => (
     <a
@@ -86,14 +86,14 @@ const components: Components = {
     </a>
   ),
   ul: ({ node: _node, ...props }) => (
-    <ul className="my-3.5 ml-5 list-disc space-y-1.5 text-[15px] leading-7 text-foreground/90 marker:text-primary/60" {...props} />
+    <ul className="my-4 ml-5 list-disc space-y-2 text-base leading-[1.75] text-foreground/90 marker:text-primary/60" {...props} />
   ),
   ol: ({ node: _node, ...props }) => (
-    <ol className="my-3.5 ml-5 list-decimal space-y-1.5 text-[15px] leading-7 text-foreground/90 marker:text-muted-foreground" {...props} />
+    <ol className="my-4 ml-5 list-decimal space-y-2 text-base leading-[1.75] text-foreground/90 marker:text-muted-foreground" {...props} />
   ),
   li: ({ node: _node, ...props }) => <li className="pl-1" {...props} />,
   blockquote: ({ node: _node, ...props }) => (
-    <blockquote className="my-4 border-l-2 border-l-primary rounded-r-md bg-accent/30 px-4 py-2 text-[14px] italic text-foreground/85" {...props} />
+    <blockquote className="my-6 rounded-lg bg-surface-raised px-5 py-3 text-[15px] italic leading-7 text-foreground/80" {...props} />
   ),
   hr: ({ node: _node, ...props }) => <hr className="my-6 border-border" {...props} />,
   pre: ({ node: _node, ...props }) => (
@@ -130,11 +130,36 @@ const components: Components = {
   td: ({ node: _node, ...props }) => (
     <td className="border-b border-border/60 px-3 py-2 text-foreground/85" {...props} />
   ),
-  img: ({ node: _node, ...props }) => (
-    // eslint-disable-next-line jsx-a11y/alt-text -- alt is forwarded via props
-    <img className="my-4 max-w-full rounded-lg border border-border" {...props} />
-  ),
+  img: ({ node: _node, ...props }) => <SafeMarkdownImage {...props} />,
 };
+
+function SafeMarkdownImage({
+  src,
+  alt = "",
+  ...props
+}: Readonly<ImgHTMLAttributes<HTMLImageElement>>) {
+  const [failed, setFailed] = useState(false);
+
+  useEffect(() => setFailed(false), [src]);
+
+  if (!src || failed) {
+    return (
+      <span className="my-4 inline-flex rounded-md border border-border bg-surface-raised px-3 py-2 text-xs text-muted-foreground">
+        {alt ? `Image unavailable: ${alt}` : "Image unavailable"}
+      </span>
+    );
+  }
+
+  return (
+    <img
+      src={src}
+      alt={alt}
+      onError={() => setFailed(true)}
+      className="my-5 max-w-full rounded-lg border border-border bg-surface-sunken"
+      {...props}
+    />
+  );
+}
 
 /** Build the `a` renderer that resolves wikilinks + internal markdown links
  *  against the vault's note index. Kept outside the component so the closure

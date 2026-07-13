@@ -8,7 +8,7 @@ interface RecentListProps {
 }
 
 /** The list of recently-opened vaults, with a tasteful empty state. */
-export function RecentList({ recents, onOpen }: RecentListProps) {
+export function RecentList({ recents, onOpen }: Readonly<RecentListProps>) {
   return (
     <section className="w-full text-left">
       <h2 className="mb-2 px-1 text-xs font-medium uppercase tracking-wider text-muted-foreground">

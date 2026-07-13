@@ -8,7 +8,7 @@ import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import { cn } from "../lib/cn";
 import type { AiStatus } from "../lib/types";
-import { BTN_PRIMARY, BTN_QUIET } from "./buttonStyles";
+import { buttonVariants } from "@/components/ui/button";
 import { FIELD, LABEL } from "./KeySetupPanel";
 import { InlineError, ProviderCard } from "./ProviderCard";
 import { reasoningCapability } from "./reasoningSupport";
@@ -142,12 +142,12 @@ export function OpenRouterCard({
             type="button"
             onClick={activateOpenRouter}
             disabled={!hasKey || switching}
-            className={BTN_PRIMARY}
+            className={buttonVariants({ tone: "primary", size: "sm" })}
           >
             Use OpenRouter
           </button>
         )}
-        <button type="button" onClick={openKeyForm} className={BTN_QUIET}>
+        <button type="button" onClick={openKeyForm} className={buttonVariants({ tone: "quiet", size: "sm" })}>
           {hasKey ? "Update key…" : "Connect a key…"}
         </button>
       </div>
@@ -220,14 +220,14 @@ export function OpenRouterCard({
             <button
               type="submit"
               disabled={keyValue.trim() === "" || savingKey}
-              className={BTN_PRIMARY}
+              className={buttonVariants({ tone: "primary", size: "sm" })}
             >
               {savingKey ? "Saving…" : "Save key"}
             </button>
             <button
               type="button"
               onClick={() => setKeyFormOpen(false)}
-              className={BTN_QUIET}
+              className={buttonVariants({ tone: "quiet", size: "sm" })}
             >
               Cancel
             </button>

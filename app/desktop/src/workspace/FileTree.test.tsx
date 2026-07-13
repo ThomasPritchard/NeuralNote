@@ -159,6 +159,15 @@ describe("FileTree — fold persistence", () => {
 });
 
 describe("FileTree — create", () => {
+  it("shows a visible tooltip for the root new-note control", async () => {
+    setup([]);
+
+    const button = screen.getByRole("button", { name: "New note" });
+    await userEvent.hover(button);
+
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("New note");
+  });
+
   it("creates a note at the vault root and selects it", async () => {
     const node = { ...fileNode("New.md"), path: "/v/New.md" };
     mockApi.createNote.mockResolvedValueOnce(node);
@@ -577,7 +586,10 @@ describe("FileTree — filename filter", () => {
 
     await userEvent.type(screen.getByLabelText("Filter files by name"), "a");
 
-    expect(screen.getByRole("button", { name: "Clear filter" })).toBeInTheDocument();
+    const clear = screen.getByRole("button", { name: "Clear filter" });
+    expect(clear).toBeInTheDocument();
+    await userEvent.hover(clear);
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Clear filter");
   });
 
   it("clearing via ✕ restores the full tree and the prior collapse state", async () => {

@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { fireEvent, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { VaultMenu } from "./VaultMenu";
@@ -12,7 +12,10 @@ function setup() {
     onCloseVault: vi.fn(),
   };
   render(<VaultMenu {...props} />);
-  return props;
+  return {
+    props,
+    trigger: screen.getByRole("button", { name: "Vault actions menu", hidden: true }),
+  };
 }
 
 describe("VaultMenu", () => {
@@ -25,30 +28,33 @@ describe("VaultMenu", () => {
   });
 
   it("each item closes the menu then runs its action", async () => {
-    const p = setup();
+    const { props: p, trigger } = setup();
     await userEvent.click(screen.getByRole("menuitem", { name: "New note" }));
     expect(p.onClose).toHaveBeenCalled();
     expect(p.onNewNote).toHaveBeenCalled();
 
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     await userEvent.click(screen.getByRole("menuitem", { name: "New folder" }));
     expect(p.onNewFolder).toHaveBeenCalled();
 
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     await userEvent.click(screen.getByRole("menuitem", { name: "Refresh tree" }));
     expect(p.onRefresh).toHaveBeenCalled();
 
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     await userEvent.click(screen.getByRole("menuitem", { name: "Close vault" }));
     expect(p.onCloseVault).toHaveBeenCalled();
   });
 
-  it("closes on Escape", () => {
-    const p = setup();
-    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape" }));
+  it("closes on Escape", async () => {
+    const { props: p } = setup();
+    await userEvent.keyboard("{Escape}");
     expect(p.onClose).toHaveBeenCalled();
   });
 
-  it("closes when the click-outside backdrop is clicked", async () => {
-    const p = setup();
-    await userEvent.click(screen.getByRole("button", { hidden: true }));
+  it("closes when its trigger is toggled", async () => {
+    const { props: p, trigger } = setup();
+    fireEvent.pointerDown(trigger, { button: 0, ctrlKey: false });
     expect(p.onClose).toHaveBeenCalled();
   });
 });

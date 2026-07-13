@@ -58,7 +58,7 @@ const ACTION_BTN =
   "grid size-5 place-items-center rounded text-muted-foreground transition-colors hover:bg-sidebar-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary";
 
 const ACTIONS_WRAP =
-  "absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 rounded-md bg-gradient-to-l from-sidebar via-sidebar to-transparent pl-3 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100";
+  "absolute right-1 top-1/2 flex -translate-y-1/2 items-center gap-0.5 rounded-md bg-sidebar pl-2 opacity-0 transition-opacity group-hover:opacity-100 group-focus-within:opacity-100";
 
 // Memoized so an unchanged row skips re-rendering when its siblings or an
 // ancestor re-render (e.g. the workspace re-rendering on each editor keystroke);
@@ -66,10 +66,10 @@ const ACTIONS_WRAP =
 export const TreeRow = memo(function TreeRow({
   node,
   ctx,
-}: {
+}: Readonly<{
   node: TreeNode;
   ctx: TreeContext;
-}) {
+}>) {
   if (ctx.renaming === node.path) {
     return (
       <div className="px-1 py-px">
@@ -91,7 +91,10 @@ export const TreeRow = memo(function TreeRow({
   );
 });
 
-function FolderRow({ node, ctx }: { node: TreeNode; ctx: TreeContext }) {
+function FolderRow({
+  node,
+  ctx,
+}: Readonly<{ node: TreeNode; ctx: TreeContext }>) {
   const [dropActive, setDropActive] = useState(false);
   const creatingHere = ctx.creating?.parentPath === node.path;
   // Mirrors flattenTree's open rule — the chevron and the row list must agree.
@@ -205,7 +208,7 @@ function FolderRow({ node, ctx }: { node: TreeNode; ctx: TreeContext }) {
   );
 }
 
-function FileRow({ node, ctx }: { node: TreeNode; ctx: TreeContext }) {
+function FileRow({ node, ctx }: Readonly<{ node: TreeNode; ctx: TreeContext }>) {
   const active = node.path === ctx.activePath;
   const Icon = iconForFile(node.ext);
   return (
@@ -275,7 +278,10 @@ function FileRow({ node, ctx }: { node: TreeNode; ctx: TreeContext }) {
  *  When the vault has templates and a note is being created, a compact picker
  *  appears under the name input (defaulting to "Blank note" — templates are
  *  strictly optional and add zero friction when unused). */
-export function CreateRow({ kind, ctx }: { kind: CreateKind; ctx: TreeContext }) {
+export function CreateRow({
+  kind,
+  ctx,
+}: Readonly<{ kind: CreateKind; ctx: TreeContext }>) {
   // Focus moving between the name input and the template picker must not end
   // the create session — InlineInput's blur-cancel is scoped to this row.
   const rowRef = useRef<HTMLDivElement>(null);

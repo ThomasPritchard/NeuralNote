@@ -11,8 +11,11 @@ function Router() {
 
 export default function App() {
   return (
-    <VaultProvider>
-      <Router />
-    </VaultProvider>
+    <>
+      <a className="nn-skip-link" href="#nn-main-content">Skip to content</a>
+      <VaultProvider>
+        <Router />
+      </VaultProvider>
+    </>
   );
 }

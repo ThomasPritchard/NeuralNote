@@ -315,10 +315,9 @@ describe("AiSettingsPage — download", () => {
     });
     expect(within(row).getByText("downloading model")).toBeInTheDocument();
     expect(within(row).getByText(/1\.2 GB \/ 4\.7 GB · 26%/)).toBeInTheDocument();
-    // Native <progress>: the value attribute is the progressbar's now-value.
     expect(
       within(row).getByRole("progressbar", { name: "Downloading qwen2.5:7b" }),
-    ).toHaveAttribute("value", "26");
+    ).toHaveAttribute("aria-valuenow", "26");
     // The other row's Download is held while a pull is in flight (one at a time).
     const otherRow = await findCatalogueRow("llama3.1:8b");
     expect(within(otherRow).getByRole("button", { name: /download/i })).toBeDisabled();

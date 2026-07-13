@@ -1,4 +1,8 @@
-use neuralnote_core::ai::{ChatEvent, EventSink, LlmMessage, Role};
+use neuralnote_core::ai::{
+    ChatEvent, EventSink, HardwareSpec, LlmMessage, NoUserPrompt, Role, SkillEnvironment,
+    SkillRegistry, SkillServices, UnavailableNoteWriter,
+};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 use std::time::Duration;
@@ -91,9 +95,39 @@ async fn run_case(
 ) -> Vec<ChatEvent> {
     let retriever = neuralnote_core::ai::KeywordRetriever::new(root.to_path_buf());
     let guards = neuralnote_core::ai::Guards::default();
+    let registry = SkillRegistry::built_in(&[]).expect("load built-in skills");
+    let environment = SkillEnvironment {
+        hardware: HardwareSpec {
+            total_ram_bytes: 0,
+            cpu_cores: 0,
+            cpu_brand: String::new(),
+            gpu_label: None,
+            arch: std::env::consts::ARCH.into(),
+            os: std::env::consts::OS.into(),
+            free_disk_bytes: 0,
+        },
+        app_data_bin_dir: std::path::PathBuf::from("/app-data/bin"),
+        available_binaries: BTreeSet::new(),
+    };
+    let skill_services = SkillServices::new(
+        &registry,
+        &environment,
+        &NoUserPrompt,
+        &UnavailableNoteWriter,
+        1,
+    );
     let mut sink = CollectingSink { events: Vec::new() };
     neuralnote_core::ai::run_chat(
-        prompt, history, root, model, &retriever, client, &mut sink, &guards,
+        prompt,
+        history,
+        Vec::new(),
+        root,
+        model,
+        &retriever,
+        client,
+        &skill_services,
+        &mut sink,
+        &guards,
     )
     .await
     .expect("run_chat resolves via the sink");

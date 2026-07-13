@@ -7,7 +7,6 @@
 // behaviour.
 
 import {
-  Brain,
   FilePlus2,
   Files,
   Network,
@@ -15,6 +14,8 @@ import {
   type LucideIcon,
 } from "lucide-react";
 import { cn } from "../lib/cn";
+import { IconButton } from "@/components/ui/icon-button";
+import { AiMark } from "@/components/neural/patterns";
 
 /** Which sidebar panel is showing (Workspace-local view state). */
 export type SidebarPanel = "files" | "search";
@@ -39,11 +40,9 @@ export function Ribbon({
   return (
     <nav
       aria-label="Workspace"
-      className="flex w-12 shrink-0 flex-col items-center border-r border-border bg-sidebar py-3"
+      className="nn-ribbon flex shrink-0 flex-col items-center border-r border-border bg-sidebar py-3"
     >
-      <div className="mb-3 grid size-8 place-items-center rounded-lg bg-gradient-to-br from-primary to-primary/55 text-primary-foreground shadow-[0_0_22px_-4px_var(--color-primary),inset_0_1px_0_0_rgb(255_255_255/0.2)]">
-        <Brain className="size-[18px]" aria-hidden />
-      </div>
+      <AiMark className="mb-3 size-8" />
 
       <RibbonButton
         icon={Files}
@@ -84,18 +83,16 @@ function RibbonButton({
 }: Readonly<RibbonButtonProps>) {
   const inert = !onClick;
   return (
-    <button
-      type="button"
+    <IconButton
       aria-label={inert ? `${label} (coming soon)` : label}
+      label={inert ? `${label} (coming soon)` : label}
+      tooltip={inert ? "Coming in a later phase" : label}
       aria-disabled={inert || undefined}
-      aria-pressed={inert ? undefined : active}
-      title={inert ? "Coming in a later phase" : label}
+      pressed={inert ? undefined : active}
       onClick={onClick}
       className={cn(
-        "relative grid size-9 place-items-center rounded-lg transition-colors duration-300 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
-        "ease-spring",        active
-          ? "bg-sidebar-accent text-foreground"
-          : "text-muted-foreground hover:bg-sidebar-accent/60 hover:text-foreground",
+        "relative size-9",
+        active && "bg-surface-selected text-foreground",
       )}
     >
       {active && (
@@ -105,6 +102,6 @@ function RibbonButton({
         />
       )}
       <Icon className="size-[18px]" aria-hidden />
-    </button>
+    </IconButton>
   );
 }

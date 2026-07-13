@@ -584,7 +584,7 @@ mod tests {
         let r = KeywordRetriever::new(dir.path());
         let span = r.read_note_span("m.md", 1, 1, 5).unwrap();
         assert!(span.text.len() <= 5);
-        // Truncation landed on a char boundary (valid UTF-8) — no panic, no �-split.
+        // Truncation landed on a char boundary (valid UTF-8), never inside a code point.
         assert!(std::str::from_utf8(span.text.as_bytes()).is_ok());
     }
 

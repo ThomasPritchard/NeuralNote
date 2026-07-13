@@ -31,12 +31,8 @@ export function Reader({ note, noteIndex, onOpenLink }: Readonly<ReaderProps>) {
   const TypeIcon = iconForFile(ext);
 
   return (
-    <article className="relative flex-1 overflow-y-auto px-6 py-9">
-      <div
-        className="pointer-events-none absolute inset-x-0 top-0 h-48 bg-gradient-to-b from-primary/[0.05] to-transparent"
-        aria-hidden
-      />
-      <div className="relative mx-auto w-full max-w-[42rem]">
+    <article className="relative flex-1 overflow-y-auto px-8 py-10">
+      <div className="relative mx-auto w-full max-w-[72ch]">
         <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/12 px-2.5 py-1 text-[11px] font-medium text-primary ring-1 ring-inset ring-primary/20">
           <TypeIcon className="size-3" aria-hidden /> {extLabel(ext)}
         </span>
@@ -104,10 +100,52 @@ function NoteBody({
   }
   // Markdown, plus extensionless text files (README, LICENSE).
   if (isMarkdownRenderable(ext)) {
-    return <Markdown body={note.body} noteIndex={noteIndex} onOpenLink={onOpenLink} />;
+    return (
+      <Markdown
+        body={withoutRepeatedLeadingTitle(note.body, note.title)}
+        noteIndex={noteIndex}
+        onOpenLink={onOpenLink}
+      />
+    );
   }
   // Other text-like files fall back to their raw bytes; anything else, no dump.
   return <UnsupportedNotice ext={ext} raw={isTextLikeExt(ext) ? note.raw : null} />;
+}
+
+/**
+ * The backend derives a note's title from frontmatter, then the first H1, then
+ * the filename. When that H1 is the first body element, the reader's document
+ * title already represents it; rendering both creates two competing H1s.
+ * Preserve every non-matching heading, including a body H1 below frontmatter's
+ * distinct title.
+ */
+export function withoutRepeatedLeadingTitle(body: string, title: string): string {
+  let headingStart = 0;
+  while (headingStart < body.length && body[headingStart].trim() === "") {
+    headingStart += 1;
+  }
+  if (body[headingStart] !== "#") return body;
+
+  let headingTextStart = headingStart + 1;
+  if (body[headingTextStart] !== " " && body[headingTextStart] !== "\t") return body;
+  while (body[headingTextStart] === " " || body[headingTextStart] === "\t") {
+    headingTextStart += 1;
+  }
+
+  let headingEnd = headingTextStart;
+  while (headingEnd < body.length && body[headingEnd] !== "\r" && body[headingEnd] !== "\n") {
+    headingEnd += 1;
+  }
+  if (headingEnd === headingTextStart) return body;
+
+  const normalize = (value: string) =>
+    value.normalize("NFKC").trim().replace(/\s+/g, " ");
+  if (normalize(body.slice(headingTextStart, headingEnd)) !== normalize(title)) return body;
+
+  const lineEnd = body[headingEnd] === "\r" && body[headingEnd + 1] === "\n"
+    ? headingEnd + 2
+    : Math.min(headingEnd + 1, body.length);
+  return `${body.slice(0, headingStart)}${body.slice(lineEnd)}`;
 }
 
 function UnsupportedNotice({
@@ -168,7 +206,7 @@ function FrontmatterValue({ value }: Readonly<{ value: unknown }>) {
     );
   }
   if (value !== null && typeof value === "object") {
-    return <span className="nn-mono text-foreground/80">{JSON.stringify(value)}</span>;
+    return <span className="nn-mono text-foreground/80">{stringifyScalar(value)}</span>;
   }
   return <span className="text-foreground/90">{stringifyScalar(value)}</span>;
 }
@@ -176,6 +214,21 @@ function FrontmatterValue({ value }: Readonly<{ value: unknown }>) {
 /** Render a scalar (or unknown) frontmatter value as a short display string. */
 function stringifyScalar(value: unknown): string {
   if (value === null || value === undefined) return "—";
-  if (typeof value === "object") return JSON.stringify(value);
-  return String(value);
+  if (typeof value === "object") {
+    try {
+      return JSON.stringify(value) ?? "—";
+    } catch {
+      return "—";
+    }
+  }
+  if (
+    typeof value === "string" ||
+    typeof value === "number" ||
+    typeof value === "bigint" ||
+    typeof value === "boolean" ||
+    typeof value === "symbol"
+  ) {
+    return value.toString();
+  }
+  return "—";
 }

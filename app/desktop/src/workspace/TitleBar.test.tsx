@@ -128,6 +128,27 @@ describe("TitleBar — vault switcher", () => {
     await userEvent.click(screen.getByRole("menuitem", { name: "Close vault" }));
     expect(props.onCloseVault).toHaveBeenCalledTimes(1);
   });
+
+  it("supports arrow-key navigation and returns focus to the trigger", async () => {
+    const { props } = renderTitleBar();
+    const switcher = screen.getByRole("button", { name: "MyVault" });
+
+    switcher.focus();
+    await userEvent.keyboard("{Enter}{ArrowDown}{ArrowDown}{Enter}");
+
+    expect(props.onRefresh).toHaveBeenCalledTimes(1);
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(switcher).toHaveFocus();
+  });
+});
+
+describe("TitleBar — tooltips", () => {
+  it("shows a visible tooltip for icon-only controls", async () => {
+    const user = userEvent.setup();
+    renderTitleBar();
+    await user.hover(screen.getByRole("button", { name: "Settings" }));
+    expect(await screen.findByRole("tooltip")).toHaveTextContent("Settings");
+  });
 });
 
 describe("TitleBar — note tab", () => {
@@ -144,7 +165,9 @@ describe("TitleBar — note tab", () => {
 
   it("fires onCloseNote from the tab's close button", async () => {
     const { props } = renderTitleBar({ note: makeNote() });
-    await userEvent.click(screen.getByRole("button", { name: "Close note" }));
+    const closeButton = screen.getByRole("button", { name: "Close note" });
+    expect(closeButton).toHaveClass("size-6");
+    await userEvent.click(closeButton);
     expect(props.onCloseNote).toHaveBeenCalledTimes(1);
   });
 

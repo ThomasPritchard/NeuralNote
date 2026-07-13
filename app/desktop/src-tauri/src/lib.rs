@@ -8,7 +8,7 @@
 
 use std::collections::HashSet;
 use std::path::PathBuf;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use neuralnote_core::CoreError;
 use notify::RecommendedWatcher;
@@ -19,6 +19,13 @@ mod commands;
 mod event_names;
 mod local;
 mod menu;
+mod requirement_detection;
+mod requirement_download;
+mod requirement_install_lock;
+mod requirement_installer;
+mod requirement_source_build;
+mod skills;
+mod youtube;
 
 // Re-exported solely for the network-gated behavioural eval integration test
 // (tests/behavioural_eval.rs), which drives the REAL provider clients through
@@ -39,6 +46,18 @@ pub(crate) struct VaultSession {
 pub(crate) struct AppState {
     pub(crate) session: Option<VaultSession>,
     pub(crate) local_ai: local::LocalAiState,
+    /// Session-scoped POT lifecycle and the single yt-dlp update allowance.
+    pub(crate) youtube: youtube::YoutubeHostState,
+    /// Parked structured-question responders. The Arc is cloned out under the
+    /// short AppState lock before any chat future awaits an answer.
+    pub(crate) pending_elicitations: Arc<skills::PendingElicitations>,
+    /// Separate cancellation slot for app-data requirement downloads. It must
+    /// never share Ollama's pull token: cancelling one download class must not
+    /// abort the other.
+    pub(crate) requirement_download: requirement_download::RequirementDownloadState,
+    /// Content hashes for at most the last eight non-empty skill runs. Bounded so
+    /// delete authority and memory cannot grow for the lifetime of the app.
+    pub(crate) skill_undo_runs: skills::UndoRunStore,
     /// Folders the user explicitly chose via the native picker this session.
     /// Only these — or a path already in the on-disk recents list (itself written
     /// only from a prior explicit pick) — may become a vault root. This stops a
@@ -69,6 +88,10 @@ impl Default for AppState {
         Self {
             session: None,
             local_ai: local::LocalAiState::default(),
+            youtube: youtube::YoutubeHostState::default(),
+            pending_elicitations: Arc::new(skills::PendingElicitations::default()),
+            requirement_download: requirement_download::RequirementDownloadState::default(),
+            skill_undo_runs: skills::UndoRunStore::default(),
             authorized: HashSet::new(),
             chat_visible: true,
             editing: false,
@@ -169,6 +192,8 @@ pub fn run() {
             commands::ai::save_api_key,
             commands::ai::clear_api_key,
             commands::ai::chat,
+            commands::ai::cancel_chat_run,
+            commands::ai::open_youtube_timestamp,
             commands::ai::ai_status,
             commands::ai::set_active_provider,
             commands::ai::set_reasoning,
@@ -181,15 +206,34 @@ pub fn run() {
             commands::ai::pull_local_model,
             commands::ai::cancel_pull,
             commands::ai::delete_local_model,
+            commands::ai::list_skills,
+            commands::ai::set_skill_enabled,
+            skills::answer_elicitation,
+            skills::undo_skill_run,
+            requirement_download::download_requirement,
+            requirement_download::cancel_requirement_download,
         ])
         .build(context)
         .expect("error while building tauri application")
         .run(|app, event| {
             if matches!(
+                &event,
+                tauri::RunEvent::Exit
+                    | tauri::RunEvent::WindowEvent {
+                        event: tauri::WindowEvent::Destroyed,
+                        ..
+                    }
+            ) {
+                let state = app.state::<Mutex<AppState>>();
+                lock_state(&state).pending_elicitations.cancel_all_runs();
+            }
+            if matches!(
                 event,
                 tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
             ) {
                 let state = app.state::<Mutex<AppState>>();
+                let youtube = lock_state(&state).youtube.clone();
+                youtube.shutdown();
                 local::shutdown_ollama(&state);
             }
         });

@@ -7,7 +7,7 @@
 //! final answer is streamed ([`LlmClient::complete_streaming`]) so the UI sees it
 //! arrive live. A mock (unit tests) and the real reqwest client both implement it.
 
-use crate::ai::events::EventSink;
+use crate::ai::events::{Elicitation, EventSink};
 use crate::error::CoreResult;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -146,6 +146,25 @@ pub trait LlmClient: Send + Sync {
         req: &LlmRequest,
         sink: &mut dyn EventSink,
     ) -> CoreResult<String>;
+}
+
+/// Host seam for a structured question. The shell may park a response channel;
+/// core tests use deterministic scripted answers.
+#[async_trait]
+pub trait UserPrompt: Send + Sync {
+    async fn ask(&self, elicitation: Elicitation) -> CoreResult<Option<Vec<String>>>;
+}
+
+/// Non-interactive client/test implementation. It returns `None` immediately;
+/// core handles that exactly like any other run where the user did not respond.
+#[derive(Debug, Default)]
+pub struct NoUserPrompt;
+
+#[async_trait]
+impl UserPrompt for NoUserPrompt {
+    async fn ask(&self, _elicitation: Elicitation) -> CoreResult<Option<Vec<String>>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

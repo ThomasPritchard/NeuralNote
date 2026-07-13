@@ -59,7 +59,7 @@ export function ProviderPicker({
   return (
     <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-y-auto px-6 py-8">
       <div className="flex flex-col items-center gap-2.5 text-center">
-        <span className="grid size-11 place-items-center rounded-xl bg-primary/10 text-primary shadow-[0_0_24px_-8px_var(--color-primary)] ring-1 ring-inset ring-primary/20">
+        <span className="grid size-11 place-items-center rounded-xl bg-primary/10 text-primary ring-1 ring-inset ring-primary/20">
           <Sparkles className="size-5" aria-hidden />
         </span>
         <p className="text-[14px] font-medium text-foreground/90">Choose your AI</p>

@@ -54,6 +54,15 @@ pub struct ProviderConfig {
     /// outliving a model change. See [`Self::reasoning_support`] for a planned newtype fold.
     #[serde(default)]
     pub reasoning_probed_model: Option<String>,
+    /// Stable skill ids the user disabled. An explicit empty list enables every
+    /// built-in skill; missing legacy state applies only the compiled-in defaults.
+    /// Existing skills remain enabled, while incomplete new skills can ship off.
+    #[serde(default = "default_disabled_skills")]
+    pub disabled_skills: Vec<String>,
+}
+
+fn default_disabled_skills() -> Vec<String> {
+    Vec::new()
 }
 
 impl Default for ProviderConfig {
@@ -66,6 +75,7 @@ impl Default for ProviderConfig {
             reasoning: false,
             reasoning_support: None,
             reasoning_probed_model: None,
+            disabled_skills: default_disabled_skills(),
         }
     }
 }
@@ -179,20 +189,12 @@ pub fn write_provider_config(config_dir: &Path, config: &ProviderConfig) -> Core
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ai::{ReasoningSupport, DEFAULT_MODEL};
+    use crate::ai::{ReasoningSupport, DEFAULT_MODEL, FIXTURE_SKILL_ID};
     use crate::CoreError;
     use std::fs;
 
     fn default_config() -> ProviderConfig {
-        ProviderConfig {
-            active_provider: None,
-            model: DEFAULT_MODEL.to_string(),
-            key_configured: false,
-            local_model_tag: None,
-            reasoning: false,
-            reasoning_support: None,
-            reasoning_probed_model: None,
-        }
+        ProviderConfig::default()
     }
 
     #[test]
@@ -206,6 +208,7 @@ mod tests {
             reasoning: true,
             reasoning_support: Some(ReasoningSupport::Supported),
             reasoning_probed_model: Some("qwen2.5:7b".into()),
+            disabled_skills: vec![FIXTURE_SKILL_ID.into()],
         };
 
         write_provider_config(dir.path(), &config).unwrap();
@@ -252,6 +255,7 @@ mod tests {
                 reasoning: false,
                 reasoning_support: None,
                 reasoning_probed_model: None,
+                disabled_skills: Vec::new(),
             },
         )
         .unwrap();
@@ -272,6 +276,11 @@ mod tests {
     }
 
     #[test]
+    fn new_install_enables_every_built_in_skill() {
+        assert!(ProviderConfig::default().disabled_skills.is_empty());
+    }
+
+    #[test]
     fn write_then_read_normalizes_model() {
         let dir = tempfile::tempdir().unwrap();
 
@@ -285,6 +294,7 @@ mod tests {
                 reasoning: false,
                 reasoning_support: None,
                 reasoning_probed_model: None,
+                disabled_skills: Vec::new(),
             },
         )
         .unwrap();
@@ -303,6 +313,7 @@ mod tests {
                 reasoning: false,
                 reasoning_support: None,
                 reasoning_probed_model: None,
+                disabled_skills: Vec::new(),
             },
         )
         .unwrap();
@@ -329,7 +340,36 @@ mod tests {
         assert_eq!(config.local_model_tag, None);
         assert_eq!(config.reasoning_support, None);
         assert_eq!(config.reasoning_probed_model, None);
+        assert!(config.disabled_skills.is_empty());
+        assert_eq!(config.disabled_skills, default_config().disabled_skills);
         assert_eq!(config.effective_provider(), Some(ProviderKind::OpenRouter));
+    }
+
+    #[test]
+    fn disabled_skills_round_trip_preserves_explicit_disabled_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut config = default_config();
+        config.disabled_skills = vec![FIXTURE_SKILL_ID.into()];
+
+        write_provider_config(dir.path(), &config).unwrap();
+        assert_eq!(
+            read_provider_config(dir.path()).unwrap().disabled_skills,
+            [FIXTURE_SKILL_ID]
+        );
+    }
+
+    #[test]
+    fn explicit_empty_disabled_skills_remains_enabled() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_file(dir.path()),
+            r#"{"model":"openai/gpt-4.1","keyConfigured":true,"disabledSkills":[]}"#,
+        )
+        .unwrap();
+        assert!(read_provider_config(dir.path())
+            .unwrap()
+            .disabled_skills
+            .is_empty());
     }
 
     #[test]
@@ -343,6 +383,7 @@ mod tests {
             reasoning: false,
             reasoning_support: None,
             reasoning_probed_model: None,
+            disabled_skills: Vec::new(),
         };
 
         write_provider_config(dir.path(), &config).unwrap();
@@ -363,6 +404,7 @@ mod tests {
             reasoning: false,
             reasoning_support: None,
             reasoning_probed_model: None,
+            disabled_skills: Vec::new(),
         };
 
         write_provider_config(dir.path(), &config).unwrap();
@@ -494,6 +536,7 @@ mod tests {
             reasoning: true,
             reasoning_support: Some(ReasoningSupport::Supported),
             reasoning_probed_model: Some("qwen2.5:7b".into()),
+            disabled_skills: vec![FIXTURE_SKILL_ID.into()],
         })
         .unwrap();
 
@@ -508,6 +551,10 @@ mod tests {
         assert_eq!(
             value.get("reasoningProbedModel"),
             Some(&serde_json::json!("qwen2.5:7b"))
+        );
+        assert_eq!(
+            value.get("disabledSkills"),
+            Some(&serde_json::json!([FIXTURE_SKILL_ID]))
         );
     }
 

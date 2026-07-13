@@ -26,8 +26,10 @@ import type {
   Recommendation,
   RecentVault,
   SearchResponse,
+  SkillListing,
   TemplateInfo,
   TreeNode,
+  UndoReport,
   Vault,
 } from "./types";
 
@@ -47,6 +49,17 @@ export function isConflict(e: unknown): boolean {
     typeof e === "object" &&
     "kind" in e &&
     (e as CoreError).kind === "conflict"
+  );
+}
+
+/** True when a thrown Tauri error is a not-found — e.g. answering an
+ *  elicitation whose question already timed out or whose run ended. */
+export function isNotFound(e: unknown): boolean {
+  return (
+    !!e &&
+    typeof e === "object" &&
+    "kind" in e &&
+    (e as CoreError).kind === "notFound"
   );
 }
 
@@ -207,17 +220,42 @@ export const clearApiKey = () => invoke<void>("clear_api_key");
 /** Run one cited-chat turn. `onEvent` fires for each streamed `ChatEvent`
  *  (searching / reading / verifying / answer / citation / coverage) as it
  *  happens; the returned promise resolves when the run ends (after its `done` or
- *  `error` event). The API key stays Rust-side — only the prompt + prior turns
- *  cross the boundary. */
+ *  `error` event) with the run id used by Undo. The API key stays Rust-side —
+ *  only the prompt, prior turns, and explicitly selected skills cross the
+ *  boundary. */
 export const chat = (
   prompt: string,
   history: ChatTurn[],
   onEvent: (event: ChatEvent) => void,
-): Promise<void> => {
+  activeSkills: string[] = [],
+): Promise<string> => {
   const channel = new Channel<ChatEvent>();
   channel.onmessage = onEvent;
-  return invoke<void>("chat", { prompt, history, onEvent: channel });
+  return invoke<string>("chat", {
+    prompt,
+    history,
+    onEvent: channel,
+    activeSkills,
+  });
 };
+
+/** Cancel the sole active chat run. Completed playlist work remains in the
+ *  run ledger and is reported by the normal streamed wind-down. */
+export const cancelChatRun = () => invoke<void>("cancel_chat_run");
+
+/** Resolve one live elicitation with option ids validated by the Rust shell. */
+export const answerElicitation = (id: string, choices: string[]) =>
+  invoke<void>("answer_elicitation", { id, choices });
+
+/** Open a core-validated YouTube timestamp through the native shell. External
+ *  navigation never bypasses the shell's URL policy from the webview. */
+export const openYoutubeTimestamp = (url: string) =>
+  invoke<void>("open_youtube_timestamp", { url });
+
+/** Undo one completed skill run. Each file reports whether it was safely deleted
+ *  or retained because it changed, disappeared, or could not be removed. */
+export const undoSkillRun = (runId: string) =>
+  invoke<UndoReport>("undo_skill_run", { runId });
 
 // ── AI: provider selection (OpenRouter vs local Ollama) ──────────────────────
 
@@ -293,7 +331,32 @@ export const pullLocalModel = (
 /** Cancel the in-flight local-model download, if any. */
 export const cancelPull = () => invoke<void>("cancel_pull");
 
+/** Download one allowlisted skill requirement into the app-owned binary folder,
+ *  forwarding progress and the single terminal event over a Tauri channel. */
+export const downloadRequirement = (
+  name: string,
+  onEvent: (event: PullEvent) => void,
+): Promise<void> => {
+  const channel = new Channel<PullEvent>();
+  channel.onmessage = onEvent;
+  return invoke<void>("download_requirement", { name, onEvent: channel });
+};
+
+/** Cancel the active skill-requirement download, if any. */
+export const cancelRequirementDownload = () =>
+  invoke<void>("cancel_requirement_download");
+
 /** Remove an installed local model (frees its disk). Starts the sidecar if
  *  needed. */
 export const deleteLocalModel = (tag: string) =>
   invoke<void>("delete_local_model", { tag });
+
+/** Every built-in skill, including disabled entries, with static requirement
+ *  status detected by the Rust backend. */
+export const listSkills = () => invoke<SkillListing[]>("list_skills");
+
+/** Enable or disable a built-in skill. Returns the freshly persisted enabled
+ *  state, so callers render what landed on disk rather than assuming the write
+ *  succeeded. */
+export const setSkillEnabled = (id: string, enabled: boolean) =>
+  invoke<boolean>("set_skill_enabled", { id, enabled });

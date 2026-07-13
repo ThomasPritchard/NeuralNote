@@ -29,7 +29,8 @@ jobs:
         platform: [ubuntu-latest, windows-latest]
 
     steps:
-      - uses: actions/checkout@v4
+      # Immutable action pins prevent a moved tag from changing privileged CI code.
+      - uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
 
       # WebKitWebDriver + the GTK/webkit build deps + a virtual display.
       - name: Tauri + WebDriver system dependencies (Linux)
@@ -47,21 +48,23 @@ jobs:
       - name: Install msedgedriver (Windows)
         if: matrix.platform == 'windows-latest'
         run: |
-          cargo install --git https://github.com/chippers/msedgedriver-tool --rev 8c4b34f51b45f5cf08013366d703de464ab871d1
+          cargo install --locked --git https://github.com/chippers/msedgedriver-tool --rev 8c4b34f51b45f5cf08013366d703de464ab871d1
           & "$HOME/.cargo/bin/msedgedriver-tool.exe"
           "$PWD" >> $env:GITHUB_PATH
 
       - name: Setup Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.0
 
       - name: Rust cache
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           # Single workspace at the repo root (crates/* + app/desktop/src-tauri).
           workspaces: "."
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
           cache: npm
@@ -76,7 +79,7 @@ jobs:
         run: npm ci
 
       - name: Install tauri-driver
-        run: cargo install tauri-driver --locked
+        run: cargo install tauri-driver --locked --version 2.0.6
 
       # wdio's onPrepare runs `tauri build --debug --no-bundle` before the session.
       - name: WebdriverIO (Linux, headless via xvfb)

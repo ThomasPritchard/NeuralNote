@@ -1,3 +1,4 @@
+import { useState } from "react";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
@@ -44,9 +45,9 @@ describe("ConfirmDialog", () => {
     expect(p.onCancel).toHaveBeenCalled();
   });
 
-  it("cancels on Escape", () => {
+  it("cancels on Escape", async () => {
     const p = setup();
-    window.dispatchEvent(new KeyboardEvent("keydown", { key: "Escape", cancelable: true }));
+    await userEvent.keyboard("{Escape}");
     expect(p.onCancel).toHaveBeenCalled();
   });
 
@@ -64,5 +65,32 @@ describe("ConfirmDialog", () => {
   it("supports the danger tone", () => {
     setup({ tone: "danger" });
     expect(screen.getByRole("button", { name: "Delete" })).toHaveClass("bg-destructive");
+  });
+
+  it("returns focus to the control that opened it", async () => {
+    function Harness() {
+      const [open, setOpen] = useState(false);
+      return (
+        <>
+          <button type="button" onClick={() => setOpen(true)}>Delete selected note</button>
+          {open && (
+            <ConfirmDialog
+              title="Delete note?"
+              message="This cannot be undone."
+              confirmLabel="Delete"
+              onConfirm={() => setOpen(false)}
+              onCancel={() => setOpen(false)}
+            />
+          )}
+        </>
+      );
+    }
+
+    const user = userEvent.setup();
+    render(<Harness />);
+    const opener = screen.getByRole("button", { name: "Delete selected note" });
+    await user.click(opener);
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await vi.waitFor(() => expect(opener).toHaveFocus());
   });
 });

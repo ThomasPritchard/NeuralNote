@@ -13,6 +13,7 @@ import {
   Save,
 } from "lucide-react";
 import { cn } from "../lib/cn";
+import { Toggle } from "@/components/ui/toggle";
 import { Editor } from "./Editor";
 import type { NoteIndexEntry } from "./linkResolve";
 import { Reader } from "./Reader";
@@ -88,7 +89,7 @@ export function NotePane({
     <main className="flex min-w-0 flex-1 flex-col bg-background">
       {/* Toolbar — breadcrumb + view controls. Its border-b separates it from
           the note body; the hairline above is the titlebar's own border-b. */}
-      <div className="flex h-9 shrink-0 items-center justify-between gap-3 border-b border-border px-5 text-[12px] text-muted-foreground">
+      <div className="flex h-(--note-toolbar-height) shrink-0 items-center justify-between gap-3 border-b border-border px-5 text-[12px] text-muted-foreground">
         <div className="nn-mono min-w-0 truncate" title={note.relPath}>
           {note.relPath}
         </div>
@@ -120,13 +121,13 @@ export function NotePane({
       </div>
 
       {/* Encoding warning — pane-level so it shows in BOTH read and edit mode.
-          It matters most in edit mode, where a save would bake the `�` in. */}
+          It matters most in edit mode, where saving would bake in replacement characters. */}
       {note.lossyText && (
         <div className="flex shrink-0 items-start gap-2 border-b border-warning/30 bg-warning/10 px-5 py-2 text-[12px] text-warning">
           <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
           <span className="leading-snug">
             This note isn&apos;t valid UTF-8, so some characters couldn&apos;t be read
-            and show as <code>�</code>. Fix them before saving — saving replaces the
+            and show as <code>{"\uFFFD"}</code>. Fix them before saving — saving replaces the
             unreadable characters permanently.
           </span>
         </div>
@@ -193,19 +194,18 @@ function ToggleButton({
   onClick: () => void;
 }>) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      aria-pressed={active}
+    <Toggle
+      pressed={active}
+      onPressedChange={onClick}
       className={cn(
-        "inline-flex items-center gap-1.5 rounded px-2 py-1 text-[12px] font-medium transition-colors duration-200 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
-        "ease-spring",        active
+        "h-7 gap-1.5 rounded px-2 text-[12px] font-medium",
+        active
           ? "bg-background text-foreground shadow-sm"
           : "text-muted-foreground hover:text-foreground",
       )}
     >
       <Icon className="size-3.5" aria-hidden />
       {label}
-    </button>
+    </Toggle>
   );
 }

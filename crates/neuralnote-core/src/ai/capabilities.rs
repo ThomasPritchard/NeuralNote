@@ -1,5 +1,6 @@
 //! Pure model-capability parsing shared by hosted and local AI providers.
 
+use crate::capture::ModelPricing;
 use crate::error::{CoreError, CoreResult};
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
@@ -35,6 +36,12 @@ struct RawOpenRouterModel {
     // from a present-but-empty one. Absent = the server never told us (→ `Unknown`,
     // fail open); present-empty = it told us and listed nothing (→ `Unsupported`).
     supported_parameters: Option<Vec<String>>,
+    pricing: Option<RawOpenRouterPricing>,
+}
+
+#[derive(Deserialize)]
+struct RawOpenRouterPricing {
+    prompt: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -92,6 +99,49 @@ pub fn openrouter_reasoning_support(models_json: &str, model_id: &str) -> Reason
     capability_verdict(model.supported_parameters.as_deref(), supports_reasoning)
 }
 
+pub fn parse_openrouter_input_pricing(
+    models_json: &str,
+    model_id: &str,
+) -> CoreResult<ModelPricing> {
+    let model_id = model_id.trim();
+    if model_id.is_empty() || model_id.len() > 256 || model_id.chars().any(char::is_control) {
+        return Err(CoreError::Llm(
+            "selected OpenRouter model id is invalid".into(),
+        ));
+    }
+    let raw: RawOpenRouterModels = serde_json::from_str(models_json)
+        .map_err(|error| CoreError::Llm(format!("could not parse OpenRouter pricing: {error}")))?;
+    let model = raw
+        .data
+        .into_iter()
+        .find(|model| model.id == model_id)
+        .ok_or_else(|| {
+            CoreError::Llm(format!(
+                "OpenRouter pricing did not include model '{model_id}'"
+            ))
+        })?;
+    let prompt = model
+        .pricing
+        .and_then(|pricing| pricing.prompt)
+        .ok_or_else(|| {
+            CoreError::Llm(format!("OpenRouter model '{model_id}' has no prompt price"))
+        })?;
+    let input_usd_per_token = prompt.parse::<f64>().map_err(|_| {
+        CoreError::Llm(format!(
+            "OpenRouter model '{model_id}' has an invalid prompt price"
+        ))
+    })?;
+    if !input_usd_per_token.is_finite() || input_usd_per_token < 0.0 {
+        return Err(CoreError::Llm(format!(
+            "OpenRouter model '{model_id}' has an invalid prompt price"
+        )));
+    }
+    Ok(ModelPricing {
+        model: model_id.to_string(),
+        input_usd_per_token,
+    })
+}
+
 pub fn parse_ollama_capabilities(json: &str) -> CoreResult<Vec<String>> {
     let raw: RawOllamaShow = serde_json::from_str(json)
         .map_err(|e| CoreError::LocalAi(format!("could not parse Ollama capabilities: {e}")))?;
@@ -128,6 +178,28 @@ pub fn effective_reasoning(opt_in: bool, support: ReasoningSupport) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selected_openrouter_model_pricing_parses_prompt_usd_per_token() {
+        let json = r#"{"data":[{"id":"other","pricing":{"prompt":"9"}},{"id":"openai/test","pricing":{"prompt":"0.000003"}}]}"#;
+
+        let pricing = parse_openrouter_input_pricing(json, "openai/test").unwrap();
+
+        assert_eq!(pricing.model, "openai/test");
+        assert_eq!(pricing.input_usd_per_token, 0.000003);
+    }
+
+    #[test]
+    fn selected_openrouter_model_pricing_fails_explicitly_when_missing_or_invalid() {
+        for json in [
+            r#"{"data":[]}"#,
+            r#"{"data":[{"id":"openai/test"}]}"#,
+            r#"{"data":[{"id":"openai/test","pricing":{"prompt":"nope"}}]}"#,
+            r#"{"data":[{"id":"openai/test","pricing":{"prompt":"-1"}}]}"#,
+        ] {
+            assert!(parse_openrouter_input_pricing(json, "openai/test").is_err());
+        }
+    }
     use crate::error::CoreError;
 
     const OPENROUTER_MODELS: &str = r#"{

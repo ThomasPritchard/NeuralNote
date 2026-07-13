@@ -13,7 +13,7 @@ use neuralnote_core::ai::{
 };
 use neuralnote_core::{CoreError, CoreResult};
 use std::net::TcpListener;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -155,7 +155,7 @@ impl PullSink for TauriPullSink {
     }
 }
 
-pub(super) fn detect_hardware() -> HardwareSpec {
+pub(super) fn detect_hardware(app_data_dir: Option<&Path>) -> HardwareSpec {
     let refresh = RefreshKind::nothing()
         .with_memory(MemoryRefreshKind::everything())
         .with_cpu(CpuRefreshKind::everything());
@@ -171,6 +171,13 @@ pub(super) fn detect_hardware() -> HardwareSpec {
         .filter(|brand| !brand.is_empty())
         .unwrap_or("unknown")
         .to_string();
+    let free_disk_bytes = match free_disk_bytes(app_data_dir) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            log::warn!("could not probe free space for skill requirements: {error}");
+            0
+        }
+    };
 
     HardwareSpec {
         total_ram_bytes: system.total_memory(),
@@ -181,12 +188,105 @@ pub(super) fn detect_hardware() -> HardwareSpec {
         gpu_label: None,
         arch: std::env::consts::ARCH.into(),
         os: std::env::consts::OS.into(),
+        free_disk_bytes,
+    }
+}
+
+/// Available bytes on the exact volume that will hold skill binaries. Probe
+/// failures stay distinct here so the caller can log them before mapping the wire
+/// value to core's unknown `0`; a successful probe may also report a genuinely
+/// full volume as `Ok(0)`.
+fn free_disk_bytes(probe_path: Option<&Path>) -> CoreResult<u64> {
+    #[cfg(unix)]
+    {
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+
+        let probe_path = probe_path.ok_or_else(|| {
+            CoreError::Io("no app-data path was available for the disk-space probe".into())
+        })?;
+        let display_path = probe_path.display().to_string();
+        let probe_path = CString::new(probe_path.as_os_str().as_bytes()).map_err(|_| {
+            CoreError::Io(format!(
+                "disk-space probe path '{display_path}' contains a NUL byte"
+            ))
+        })?;
+        let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+        // SAFETY: `probe_path` is a live NUL-terminated string and `stats` points
+        // to writable storage for exactly one `statvfs` result. We only assume it
+        // initialized after libc reports success.
+        if unsafe { libc::statvfs(probe_path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+            return Err(CoreError::Io(format!(
+                "could not inspect free space at '{display_path}': {}",
+                std::io::Error::last_os_error()
+            )));
+        }
+        // SAFETY: guarded by statvfs's zero return above.
+        let stats = unsafe { stats.assume_init() };
+        let bytes = (stats.f_bavail as u128)
+            .checked_mul(stats.f_frsize as u128)
+            .ok_or_else(|| CoreError::Io("free disk-space calculation overflowed".into()))?;
+        u64::try_from(bytes).map_err(|_| CoreError::Io("free disk-space result exceeds u64".into()))
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = probe_path;
+        Err(CoreError::Io(
+            "free disk-space probing is not supported on this platform".into(),
+        ))
+    }
+}
+
+async fn await_start_step<F, T>(
+    future: F,
+    close_signal: Option<&crate::ai::ChatRunCloseSignal>,
+) -> CoreResult<T>
+where
+    F: std::future::Future<Output = T>,
+{
+    let Some(close_signal) = close_signal else {
+        return Ok(future.await);
+    };
+    tokio::pin!(future);
+    tokio::select! {
+        biased;
+        output = &mut future => Ok(output),
+        () = close_signal.wait_closed() => Err(chat_run_closed_error()),
+    }
+}
+
+fn chat_run_closed_error() -> CoreError {
+    CoreError::Conflict("chat run ended because its vault or window closed".into())
+}
+
+fn ensure_chat_run_active(close_signal: Option<&crate::ai::ChatRunCloseSignal>) -> CoreResult<()> {
+    if close_signal.is_some_and(crate::ai::ChatRunCloseSignal::is_closed) {
+        Err(chat_run_closed_error())
+    } else {
+        Ok(())
     }
 }
 
 pub(super) async fn ensure_ollama_started(
     app: &AppHandle,
     state: &crate::SharedState<'_>,
+) -> CoreResult<u16> {
+    ensure_ollama_started_inner(app, state, None).await
+}
+
+pub(super) async fn ensure_ollama_started_for_chat(
+    app: &AppHandle,
+    state: &crate::SharedState<'_>,
+    close_signal: &crate::ai::ChatRunCloseSignal,
+) -> CoreResult<u16> {
+    ensure_ollama_started_inner(app, state, Some(close_signal)).await
+}
+
+async fn ensure_ollama_started_inner(
+    app: &AppHandle,
+    state: &crate::SharedState<'_>,
+    close_signal: Option<&crate::ai::ChatRunCloseSignal>,
 ) -> CoreResult<u16> {
     // Trust a cached port only if the sidecar still answers. A sidecar that
     // crashed, was OOM-killed, or was killed externally mid-session leaves stale
@@ -197,13 +297,15 @@ pub(super) async fn ensure_ollama_started(
     // `.await` — never hold it across an await point.)
     let cached_port = crate::lock_state(state).local_ai.running_port();
     if let Some(port) = cached_port {
-        if probe_ollama(port).await {
+        if await_start_step(probe_ollama(port), close_signal).await? {
+            ensure_chat_run_active(close_signal)?;
             return Ok(port);
         }
         log::warn!("Local AI sidecar on port {port} stopped answering; restarting it");
         stop_running_sidecar(state);
     }
 
+    ensure_chat_run_active(close_signal)?;
     let port = pick_loopback_port()?;
     let models_dir = ollama_models_dir(app)?;
     std::fs::create_dir_all(&models_dir)
@@ -263,7 +365,11 @@ pub(super) async fn ensure_ollama_started(
     // the `.await` below.
     let start_id = crate::lock_state(state).local_ai.register_starting(child);
 
-    let poll_result = wait_for_ollama(port, &stderr, &terminated).await;
+    let poll_result =
+        match await_start_step(wait_for_ollama(port, &stderr, &terminated), close_signal).await {
+            Ok(result) => result,
+            Err(cancellation) => Err(cancellation),
+        };
 
     // Reclaim our child under a fresh short lock. It's gone only if shutdown_ollama
     // reaped it mid-startup, in which case it has already been killed — surface that
@@ -652,6 +758,23 @@ fn captured_stderr(output: &Arc<Mutex<String>>) -> String {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn free_disk_probe_reports_space_for_a_real_volume() {
+        let dir = tempfile::tempdir().unwrap();
+
+        assert!(free_disk_bytes(Some(dir.path())).is_ok());
+    }
+
+    #[test]
+    fn free_disk_probe_reports_when_the_path_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+
+        assert!(free_disk_bytes(Some(&missing)).is_err());
+        assert!(free_disk_bytes(None).is_err());
+    }
+
     #[test]
     fn append_output_bounds_to_tail() {
         // Simulate a long-lived sidecar streaming far more stderr than the cap: the
@@ -765,6 +888,32 @@ mod tests {
         let result = handle_pull_line(&[0xff, 0xfe], &mut sink, &cancel);
         assert!(matches!(result, Err(CoreError::LocalAi(_))));
         assert!(sink.events.is_empty());
+    }
+
+    #[tokio::test]
+    async fn local_start_wait_is_interrupted_by_chat_lifecycle_close() {
+        let signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let closer = Arc::clone(&signal);
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            closer.close();
+        });
+
+        assert!(matches!(
+            await_start_step(std::future::pending::<()>(), Some(&signal)).await,
+            Err(CoreError::Conflict(message)) if message.contains("vault or window closed")
+        ));
+    }
+
+    #[tokio::test]
+    async fn completed_local_start_step_wins_a_simultaneous_close() {
+        let signal = crate::ai::ChatRunCloseSignal::default();
+        signal.close();
+
+        assert_eq!(
+            await_start_step(async { 7 }, Some(&signal)).await.unwrap(),
+            7
+        );
     }
 
     #[test]

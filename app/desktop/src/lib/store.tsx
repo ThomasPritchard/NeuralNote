@@ -47,7 +47,7 @@ export interface VaultContextValue {
 
 const VaultContext = createContext<VaultContextValue | null>(null);
 
-export function VaultProvider({ children }: { children: ReactNode }) {
+export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
   const [status, setStatus] = useState<VaultStatus>("welcome");
   const [vault, setVault] = useState<Vault | null>(null);
   const [tree, setTree] = useState<TreeNode[]>([]);

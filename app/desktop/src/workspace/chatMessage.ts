@@ -4,7 +4,7 @@
 // and a coverage footer). Keeping the fold pure and framework-free makes the
 // harness feel unit-testable without React.
 
-import type { ChatEvent, ChatTurn } from "../lib/types";
+import type { ChatEvent, ChatTurn, ElicitOption, NoteKind } from "../lib/types";
 
 /** One row in the live activity log — the visible trace of the agent working. */
 export type ActivityStep =
@@ -32,6 +32,13 @@ export interface CoverageView {
   skippedFiles: number;
 }
 
+export interface PendingElicitation {
+  id: string;
+  question: string;
+  options: ElicitOption[];
+  multiSelect: boolean;
+}
+
 export interface UserMessage {
   role: "user";
   content: string;
@@ -39,6 +46,10 @@ export interface UserMessage {
 
 export interface AssistantMessage {
   role: "assistant";
+  skillActivations: Array<{ id: string; name: string }>;
+  skillSteps: string[];
+  pendingElicitation: PendingElicitation | null;
+  writtenNotes: Array<{ relPath: string; kind: NoteKind }>;
   /** The live "searching / reading / verifying" trace, in order. */
   activity: ActivityStep[];
   /** Pinned at turn creation because reasoning can be toggled off mid-stream;
@@ -66,6 +77,10 @@ export function userMessage(content: string): UserMessage {
 export function emptyAssistant(reasoningRequested = false): AssistantMessage {
   return {
     role: "assistant",
+    skillActivations: [],
+    skillSteps: [],
+    pendingElicitation: null,
+    writtenNotes: [],
     activity: [],
     reasoningRequested,
     thinking: "",
@@ -77,20 +92,29 @@ export function emptyAssistant(reasoningRequested = false): AssistantMessage {
   };
 }
 
-/** Reasoning was requested but the model streamed no thinking tokens. */
-export function showsReasoningBackstop(turn: AssistantMessage): boolean {
-  // A failed run has a bigger problem to report; stacking this notice would
-  // bury the real one.
-  //
-  // `trim()` rather than `=== ""` so this agrees with the `Reasoning`
-  // disclosure, which hides itself on whitespace. A lone "\n" delta would
-  // otherwise render no trace *and* suppress the notice explaining why.
-  return (
-    turn.done &&
-    turn.reasoningRequested &&
-    turn.thinking.trim() === "" &&
-    turn.error === null
+/** Model-reported transcript source labels surfaced during a skill run.
+ *  These are presentation hints, not verified source metadata. Keep first-seen
+ *  order so a playlist's model narrative remains readable. */
+export function modelReportedProvenance(turn: AssistantMessage): string[] {
+  const narrative = [...turn.skillSteps, turn.answer, turn.error ?? ""].join("\n");
+  const labels = narrative.match(
+    /\b(?:captions:[A-Za-z0-9_-]+|whisper:[A-Za-z0-9_./:-]*[A-Za-z0-9_-])/g,
   );
+  return [...new Set(labels ?? [])];
+}
+
+/** Infer a possible partial run from model-authored narrative. NoteWritten is
+ *  authoritative for the file ledger; this status itself is not verified. */
+export function isPartialSkillRun(turn: AssistantMessage): boolean {
+  if (
+    !turn.done ||
+    turn.skillActivations.length === 0 ||
+    turn.writtenNotes.length === 0
+  ) {
+    return false;
+  }
+  const narrative = [...turn.skillSteps, turn.answer, turn.error ?? ""].join("\n");
+  return /\b(?:cancelled|canceled|stopped(?:\s+early)?|partial)\b/i.test(narrative);
 }
 
 /** The turn searched the vault and genuinely found nothing to cite.
@@ -140,6 +164,34 @@ export function reduceAssistant(
   event: ChatEvent,
 ): AssistantMessage {
   switch (event.type) {
+    case "skillActivated":
+      return {
+        ...turn,
+        skillActivations: [
+          ...turn.skillActivations,
+          { id: event.id, name: event.name },
+        ],
+      };
+    case "skillStep":
+      return { ...turn, skillSteps: [...turn.skillSteps, event.message] };
+    case "elicit":
+      return {
+        ...turn,
+        pendingElicitation: {
+          id: event.id,
+          question: event.question,
+          options: event.options,
+          multiSelect: event.multiSelect,
+        },
+      };
+    case "noteWritten":
+      return {
+        ...turn,
+        writtenNotes: [
+          ...turn.writtenNotes,
+          { relPath: event.relPath, kind: event.kind },
+        ],
+      };
     case "searching":
       return { ...turn, activity: [...turn.activity, { kind: "search", query: event.query }] };
     case "retrieved":

@@ -6,10 +6,18 @@
 import type { ReactNode } from "react";
 import { AlertTriangle, Check, Loader2, type LucideIcon } from "lucide-react";
 
-/** Inline failure notice — the page-level home for surfaced errors. */
-export function InlineError({ children }: Readonly<{ children: ReactNode }>) {
+/** Inline failure notice — the page-level home for surfaced errors. Pass
+ *  `alert` when the failure lands after a user action (a toggle that didn't
+ *  persist), so screen readers hear it without re-traversing the page. */
+export function InlineError({
+  children,
+  alert = false,
+}: Readonly<{ children: ReactNode; alert?: boolean }>) {
   return (
-    <p className="flex items-start gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[12px] leading-snug text-destructive">
+    <p
+      role={alert ? "alert" : undefined}
+      className="flex items-start gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[12px] leading-snug text-destructive"
+    >
       <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
       <span className="min-w-0 break-words">{children}</span>
     </p>

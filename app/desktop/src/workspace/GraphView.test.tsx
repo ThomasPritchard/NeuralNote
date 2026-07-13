@@ -150,8 +150,10 @@ describe("GraphView", () => {
   it("renders a non-blocking notice when files were skipped", async () => {
     mocks.readLinkGraph.mockResolvedValue(linkGraph({ skippedFiles: 2 }));
     render(<GraphView onOpenNote={vi.fn()} />);
-    fireResize(800, 600);
-    expect(await screen.findByText("2 file(s) couldn't be read")).toBeInTheDocument();
+    fireResize(700, 600);
+    const notice = await screen.findByText("2 file(s) couldn't be read");
+    expect(notice).toBeInTheDocument();
+    expect(notice.parentElement).toHaveAttribute("data-layout", "compact");
     expect(screen.getByTestId("force-graph-3d")).toBeInTheDocument();
   });
 

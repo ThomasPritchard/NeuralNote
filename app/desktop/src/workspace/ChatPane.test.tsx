@@ -26,8 +26,10 @@ vi.mock("../lib/api", async (importActual) => {
     aiStatus: vi.fn(),
     saveApiKey: vi.fn(),
     chat: vi.fn(),
+    cancelChatRun: vi.fn(),
     setReasoning: vi.fn(),
     refreshReasoningSupport: vi.fn(),
+    listSkills: vi.fn(),
   };
 });
 
@@ -37,6 +39,7 @@ import { ChatPane } from "./ChatPane";
 const mockAiStatus = vi.mocked(api.aiStatus);
 const mockSave = vi.mocked(api.saveApiKey);
 const mockChat = vi.mocked(api.chat);
+const mockCancelChat = vi.mocked(api.cancelChatRun);
 const mockSetReasoning = vi.mocked(api.setReasoning);
 const mockRefreshSupport = vi.mocked(api.refreshReasoningSupport);
 
@@ -151,12 +154,17 @@ beforeEach(() => {
   mockAiStatus.mockReset();
   mockSave.mockReset();
   mockChat.mockReset();
+  mockCancelChat.mockReset();
+  mockCancelChat.mockResolvedValue(undefined);
   mockSetReasoning.mockReset();
   mockRefreshSupport.mockReset();
   reportError.mockReset();
   // The capability probe is network I/O with its own tests below; by default it
   // stays in-flight so every other test renders pure mount-status state.
   mockRefreshSupport.mockImplementation(() => new Promise<AiStatus>(() => {}));
+  // The @ picker's catalogue load has its own suite (ChatPaneSkills.test.tsx);
+  // here it resolves empty so no popup interferes with the chat flows.
+  vi.mocked(api.listSkills).mockReset().mockResolvedValue([]);
 });
 
 afterEach(() => {
@@ -413,6 +421,44 @@ describe("ChatPane — chat view", () => {
     expect(sendButton()).toBeDisabled();
   });
 
+  it("replaces Send with an accessible cancel control while a chat run is active", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const run = deferred<string>();
+    mockChat.mockReturnValue(run.promise);
+    const { user } = setup();
+    await screen.findByLabelText("Ask across your vault");
+
+    await user.type(composer(), "distil the playlist");
+    await user.click(sendButton());
+
+    const cancel = await screen.findByRole("button", { name: "Cancel run" });
+    expect(cancel).toBeEnabled();
+    await user.click(cancel);
+    expect(mockCancelChat).toHaveBeenCalledOnce();
+
+    run.resolve("run-cancelled");
+    await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).toBeDisabled());
+  });
+
+  it("surfaces a rejected cancel and leaves the active run cancellable", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const run = deferred<string>();
+    mockChat.mockReturnValue(run.promise);
+    mockCancelChat.mockRejectedValueOnce({ kind: "io", message: "cancel channel failed" });
+    const { user } = setup();
+    await screen.findByLabelText("Ask across your vault");
+
+    await user.type(composer(), "distil the playlist");
+    await user.click(sendButton());
+    await user.click(await screen.findByRole("button", { name: "Cancel run" }));
+
+    await waitFor(() =>
+      expect(reportError).toHaveBeenCalledWith("cancel channel failed"),
+    );
+    expect(screen.getByRole("button", { name: "Cancel run" })).toBeEnabled();
+    run.resolve("run-still-active");
+  });
+
   it("labels the header status pill with the echoed OpenRouter model (PA-013)", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive("acme/echoed-default"));
     setup();
@@ -420,6 +466,15 @@ describe("ChatPane — chat view", () => {
     await screen.findByLabelText("Ask across your vault");
     // The pill shows the id's tail segment, straight from the status echo.
     expect(screen.getByText("echoed-default")).toBeInTheDocument();
+  });
+
+  it("keeps a long model name bounded while exposing its full identifier", async () => {
+    const model = "acme/a-very-long-model-name-that-must-not-widen-the-chat-pane";
+    mockAiStatus.mockResolvedValue(openRouterActive(model));
+    setup();
+
+    await screen.findByLabelText("Ask across your vault");
+    expect(screen.getByTitle(model)).toHaveClass("nn-chat-model-pill");
   });
 
   it("collapses a finished cited run to a summary line that expands to the full trace", async () => {
@@ -516,6 +571,35 @@ describe("ChatPane — chat view", () => {
     expect(screen.getByText(/Spacing\.md:1/)).toBeInTheDocument();
     expect(screen.queryByText(/1 search · 1 note/)).not.toBeInTheDocument();
     expect(document.querySelector("details")).toBeNull();
+  });
+
+  it("truncates long vault paths in activity and source rows while retaining full titles", async () => {
+    const relPath =
+      "Areas/Programming/Artificial Intelligence/Vibe coding/2026-07-10 The New GPT 5.6 Sol is Insanely Capable and Keeps Going.md";
+    await askInChat("q", [
+      { type: "reading", relPath, startLine: 123, endLine: 456 },
+      { type: "answer", delta: "A cited answer [e1]." },
+      {
+        type: "citation",
+        id: "e1",
+        relPath,
+        startLine: 321,
+        endLine: 321,
+        text: "The source text.",
+      },
+      { type: "done" },
+    ]);
+
+    const activityTail = screen.getByText(/The New GPT 5\.6 Sol.*:123/);
+    expect(activityTail).toHaveClass("min-w-0", "truncate");
+    expect(activityTail.closest("[title]")).toHaveAttribute(
+      "title",
+      `${relPath}:123–456`,
+    );
+
+    const sourcePath = screen.getByText(`${relPath}:321`);
+    expect(sourcePath).toHaveClass("min-w-0", "truncate");
+    expect(sourcePath.closest("[title]")).toHaveAttribute("title", `${relPath}:321`);
   });
 
   it("summarises a run that found nothing as 'N searches · nothing found', trace open", async () => {
@@ -647,6 +731,7 @@ describe("ChatPane — chat view", () => {
       "ask on enter",
       [],
       expect.any(Function),
+      [], // no skills picked → the send activates none
     );
   });
 
@@ -832,15 +917,14 @@ describe("ChatPane — composer reasoning toggle", () => {
 describe("ChatPane — reasoning backstop notice", () => {
   const BACKSTOP = /Reasoning was on, but the model didn't return any/;
 
-  it("shows one quiet notice when reasoning was on but no thinking arrived", async () => {
+  it("stays quiet when reasoning was on but no thinking arrived", async () => {
     await askInChat(
       "q",
       [{ type: "answer", delta: "an answer" }, { type: "done" }],
       openRouterActive(DEFAULT_MODEL, { reasoning: true }),
     );
 
-    expect(screen.getByText(BACKSTOP)).toBeInTheDocument();
-    // It fills the slot the Reasoning disclosure would have taken — never both.
+    expect(screen.queryByText(BACKSTOP)).not.toBeInTheDocument();
     expect(document.querySelector("details")).toBeNull();
   });
 
@@ -882,7 +966,7 @@ describe("ChatPane — reasoning backstop notice", () => {
     expect(screen.queryByText(BACKSTOP)).not.toBeInTheDocument();
   });
 
-  it("judges the turn against the opt-in it started under, not a mid-stream flip", async () => {
+  it("stays quiet when the reasoning opt-in changes mid-stream", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive(DEFAULT_MODEL, { reasoning: true }));
     const { user } = setup();
     await screen.findByLabelText("Ask across your vault");
@@ -905,15 +989,15 @@ describe("ChatPane — reasoning backstop notice", () => {
       ).toHaveAttribute("aria-pressed", "false"),
     );
 
-    // …but the in-flight turn finishes with zero thinking and is judged against
-    // the opt-in pinned at its start: the notice still explains the absence.
+    // The in-flight turn finishes with zero thinking. That remains an omitted
+    // implementation detail, regardless of the opt-in transition.
     await act(async () => {
       emit({ type: "answer", delta: "an answer" });
       emit({ type: "done" });
       gate.resolve();
       await gate.promise;
     });
-    expect(screen.getByText(BACKSTOP)).toBeInTheDocument();
+    expect(screen.queryByText(BACKSTOP)).not.toBeInTheDocument();
   });
 });
 

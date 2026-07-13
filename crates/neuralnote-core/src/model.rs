@@ -84,8 +84,8 @@ pub struct NoteDoc {
     pub binary: bool,
     /// True when a *text* note (`.md`/`.txt`) was not valid UTF-8 and had to be
     /// decoded lossily (e.g. a Windows-1252/Latin-1 note from a migrated vault).
-    /// Content is shown rather than hidden, but some bytes became `�` — the reader
-    /// surfaces a notice so the degradation is never silent.
+    /// Content is shown rather than hidden, but some bytes became U+FFFD replacement
+    /// characters; the reader surfaces a notice so the degradation is never silent.
     pub lossy_text: bool,
 }
 

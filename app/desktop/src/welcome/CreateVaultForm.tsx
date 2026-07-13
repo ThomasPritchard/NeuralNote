@@ -1,5 +1,7 @@
 import { useState } from "react";
 import { ArrowLeft, Check, FolderPlus, Loader2 } from "lucide-react";
+import { Button } from "@/components/ui/button";
+import { Input } from "@/components/ui/input";
 
 interface CreateVaultFormProps {
   /** The chosen parent directory the new vault folder will live inside. */
@@ -19,7 +21,7 @@ export function CreateVaultForm({
   submitting,
   onConfirm,
   onCancel,
-}: CreateVaultFormProps) {
+}: Readonly<CreateVaultFormProps>) {
   const [name, setName] = useState("");
   const trimmed = name.trim();
   const canConfirm = trimmed.length > 0 && !submitting;
@@ -59,7 +61,7 @@ export function CreateVaultForm({
         >
           Vault name
         </label>
-        <input
+        <Input
           id="new-vault-name"
           type="text"
           value={name}
@@ -67,24 +69,27 @@ export function CreateVaultForm({
           disabled={submitting}
           autoFocus
           placeholder="My Brain"
-          className="w-full rounded-lg border border-border bg-card px-3 py-2 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-60"
+          className="h-10 text-sm"
         />
       </div>
 
       <div className="flex items-center gap-2">
-        <button
+        <Button
           type="button"
           onClick={onCancel}
           disabled={submitting}
-          className="flex items-center justify-center gap-1.5 rounded-lg border border-border bg-card px-3 py-2 text-sm font-medium text-foreground transition-colors duration-200 ease-spring hover:bg-accent focus:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:opacity-60 motion-reduce:transition-none"
+          tone="quiet"
+          size="lg"
         >
           <ArrowLeft className="size-4" aria-hidden="true" />
           Back
-        </button>
-        <button
+        </Button>
+        <Button
           type="submit"
           disabled={!canConfirm}
-          className="flex flex-1 items-center justify-center gap-1.5 rounded-lg bg-primary px-3 py-2 text-sm font-medium text-primary-foreground transition-colors duration-200 ease-spring hover:bg-primary/90 focus:outline-none focus-visible:ring-2 focus-visible:ring-primary focus-visible:ring-offset-2 focus-visible:ring-offset-background disabled:cursor-not-allowed disabled:opacity-50 motion-reduce:transition-none"
+          tone="primary"
+          size="lg"
+          className="flex-1"
         >
           {submitting ? (
             <Loader2
@@ -95,7 +100,7 @@ export function CreateVaultForm({
             <Check className="size-4" aria-hidden="true" />
           )}
           {submitting ? "Creating…" : "Create vault"}
-        </button>
+        </Button>
       </div>
     </form>
   );

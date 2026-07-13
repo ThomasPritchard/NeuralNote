@@ -37,9 +37,19 @@ async-trait = "0.1"
 futures-util = "0.3"
 chrono = { version = "0.4", default-features = false, features = ["clock"] }
 sysinfo = "0.39"
-# Async sleep for the Ollama sidecar health-poll (tokio is already in the tree via
-# tauri/reqwest; we only need its timer here).
-tokio = { version = "1", features = ["time"] }
+sha2 = "0.10"
+flate2 = "1"
+tar = "0.4.46"
+# Unix filesystem capabilities for the skills shell: statvfs free-space probes,
+# stable directory FDs, openat create-only writes, and macOS F_GETPATH/xattrs.
+libc = "0.2"
+# Cross-platform atomic no-replace rename for Undo's quarantine step (maps to
+# renameatx_np on macOS and renameat2 on Linux).
+rustix = { version = "1", features = ["fs"] }
+# Timers for sidecar polling/elicitation timeout plus watch/select for immediate
+# channel-close wake-up. Declared directly so production lib builds do not rely on
+# feature unification from the test-only Tokio dependency below.
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "sync", "time"] }
 # Emits the TypeScript mirror of the shell-owned command types (AiStatus and the
 # per-provider status structs) into `app/desktop/src/lib/bindings/` during
 # `cargo test`, matching the generation the core crate does for the domain types.
@@ -50,3 +60,4 @@ ts-rs = "12.0.1"
 # vault, an async runtime for the real HTTP clients, and its own Ollama reachability probe.
 tempfile = "3"
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
