@@ -56,6 +56,9 @@ jobs:
           cache: npm
           cache-dependency-path: app/desktop/package-lock.json
 
+      - name: Validate release workflow contract
+        run: node scripts/check-release-workflow.mjs
+
       - name: Install locked dependencies
         working-directory: app/desktop
         run: npm ci

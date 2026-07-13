@@ -63,6 +63,7 @@ jobs:
         working-directory: app/desktop
         run: |
           set -euo pipefail
+          node ../../scripts/check-release-workflow.mjs
           case "$RELEASE_TAG" in
             0.1.0|v0.1.0) ;;
             *) echo "::error::Release tag must be 0.1.0 or v0.1.0"; exit 1 ;;
@@ -96,6 +97,11 @@ jobs:
           cargo install cargo-audit --locked --version 0.22.2
 
       - name: Run release gates
+        # These checks compile the Tauri shell but do not package or exercise
+        # sidecars. The verified release binaries are fetched immediately before
+        # the signed bundle build below.
+        env:
+          TAURI_CONFIG: '{"bundle":{"externalBin":[],"resources":[]}}'
         run: |
           set -euo pipefail
           npm --prefix app/desktop run lint
@@ -131,6 +137,9 @@ jobs:
             { mode: 0o600 },
           );
           NODE
+
+      - name: Fetch and verify Ollama sidecar
+        run: ./scripts/fetch-ollama-sidecar.sh
 
       - name: Import Apple Developer ID certificate
         env:
