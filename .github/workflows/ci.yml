@@ -91,6 +91,10 @@ jobs:
     name: Rust / test, lint, format, and bindings
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # Rust-only gates do not package or exercise the local-AI sidecars. Without
+    # this merge patch, tauri-build rejects clean runners before tests can start.
+    env:
+      TAURI_CONFIG: '{"bundle":{"externalBin":[],"resources":[]}}'
     steps:
       - name: Check out source
         uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
