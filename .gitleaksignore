@@ -1,0 +1,3 @@
+# Historical false positive: an old documentation example passed the Sonar token
+# from the environment as an HTTP basic-auth username. No credential was committed.
+3fd608e7296bdb7115ef582988d275e6384e2bac:docs/definition-of-done.md:curl-auth-user:138

@@ -5,8 +5,9 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
 **periodically — not on every feature**.
 
 > The one rule: *tests passing is not done.* A feature is done when it is **verified working
-> against the running app**, **both quality gates are green**, and it **cannot silently lose
-> data or break vault compatibility**. Everything below makes that concrete.
+> against the running app**, **the applicable hosted and local gates are green**, and it
+> **cannot silently lose data or break vault compatibility**. Everything below makes that
+> concrete.
 
 ---
 
@@ -22,34 +23,31 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
   `app/desktop/src/e2e/` (drives the app through its real IPC boundary). The native
   WebdriverIO tier (`app/desktop/e2e-native/`) is CI-only (macOS can't run `tauri-driver`).
 
-### Both quality gates GREEN
-- **SonarQube** (project key `NeuralNote`) — the gate is **Clean-as-You-Code** (it gates *new*
-  code): status **OK** means `new_violations = 0`, `new_coverage ≥ 80 %`, `new_duplicated_lines
-  ≤ 3 %`. On top of the gate, hold the project bars: **overall `coverage ≥ 90 %`**, **0 issues
-  above MINOR**, 0 vulnerabilities, 0 open hotspots. (Setup + how-to: `quality-gates-setup` memory.)
+### Hosted and native quality gates GREEN
+- **Pull request CI** — Oxlint, TypeScript type checking, frontend unit/component tests,
+  Rust workspace tests, Clippy, rustfmt, generated-binding drift, and full-history Gitleaks.
+  These checks are secret-free and must pass before merge.
 - **Rust-native gate** — `./scripts/rust-quality-gate.sh` prints **GREEN (all categories
   enforced)**: `clippy -D warnings`, `rustfmt --check`, `cargo llvm-cov --fail-under-lines 90`,
   `cargo-audit`. A SKIPPED category (e.g. audit offline) is **not** green — re-run with network.
+- **Main branch CI** — all frontend tests including mockIPC journeys, frontend and Rust
+  90 % line-coverage gates, production build, dependency audits, and the Linux/Windows native
+  WebDriver matrix. A red post-merge check blocks release readiness and is fixed immediately.
 
 ### Static checks clean
-- `npm run typecheck` (TS) clean, `cargo clippy` clean, `cargo fmt --check` / `npm`/prettier
-  formatting clean. No new warnings.
+- `npm run lint` and `npm run typecheck` clean, `cargo clippy` clean, and
+  `cargo fmt --check` clean. No new warnings.
 
 ### Verified against ground truth (not just tests)
 - **Actually run it** in the app (`npm run tauri dev`, or the built `.app`). Walk the golden
   path and the key edge cases by hand. A clean diff and green tests are necessary, not
   sufficient — type-checks and unit tests verify *code* correctness, not *feature* correctness.
 
-### Code review + triage (run as a pair — they drive each other)
-- When the change gets a review pass — **required** for security-adjacent changes (§2), and the
-  norm for any non-trivial feature — run the reviewers (`pr-review-toolkit:code-reviewer` +
-  `silent-failure-hunter`) **and** `code-triage` in **gate mode** *together*. They drive each
-  other: the reviewers surface issues; `code-triage` scores whether the **changed** code clears
-  the numeric bar (**Queue 1 to pass** — a measured bar, not "looks okay"). Fix findings
-  severity-first and re-run the review↔triage loop on the *delta* until it clears Queue 1.
-- ⚠️ This pairing is **not yet baked into the `pr-review-toolkit` plugin** — until it is, invoke
-  `code-triage` explicitly as the exit gate at the end of every review cycle so the reviewers and
-  the triage gate are never run apart.
+### Review
+- Every non-trivial change receives a focused review for correctness, silent failures, security,
+  data loss, compatibility, and scope. Fix findings severity-first and re-review the delta.
+- Security-adjacent changes require an independent adversarial reviewer who did not implement the
+  control. Green tests, lint, and static analysis are not a substitute for that review.
 
 ### Project invariants (the things this product refuses to break)
 - **Failures are never silent.** Capture / LLM / citation / parse / I/O errors are surfaced to
@@ -61,7 +59,8 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
   change to capture/chunking/retrieval must preserve exact source→citation mapping.
 
 ### Housekeeping
-- Spec / `CLAUDE.md` updated if behaviour or architecture changed.
+- The relevant specification, public documentation, and `AGENTS.md` are updated if behaviour,
+  architecture, or the agent operating contract changed.
 - Any deferred work left as a **greppable `TODO(<context>): <what + why + the trigger>`** at the
   code site — never only in a PR description or a doc that rots.
 
@@ -72,9 +71,8 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
 Applies when a change touches: **a parser/validator, untrusted input (note content, frontmatter,
 imported vaults), file paths, the IPC boundary, secrets/keys, or auth.**
 
-- **Independent adversarial review is REQUIRED**, paired with the `code-triage` gate (see
-  "Code review + triage" in §1 — they run together, never apart). A green test suite + green
-  Sonar is **not** sign-off here. A separate reviewer must try to *break* the control — comparing
+- **Independent adversarial review is REQUIRED.** A green test suite, lint result, or SonarQube
+  result is **not** sign-off here. A separate reviewer must try to *break* the control — comparing
   what the validator *thinks* it accepts against the *real* grammar/threat.
   - *Why this rule exists:* a YAML alias-bomb guard in this codebase passed its full unit suite
     **and** a green Sonar gate, yet adversarial review bypassed it twice (a quote mid-plain-scalar;
@@ -96,6 +94,11 @@ risk surface broadly — **not on every commit.**
 - **Full `/production-audit`** — the multi-engine sweep + gap-pass. Stop condition: **two
   consecutive rounds with 0 CRITICAL and 0 HIGH.** Carry deferred/accepted residuals as in-code
   comments (TODO for deferred, plain rationale for accepted), not a rotting report file.
+- **Local SonarQube** (project key `NeuralNote`) — maintainers run the Docker-based gate for
+  milestones and release readiness. Status **OK** means `new_violations = 0`,
+  `new_coverage ≥ 80 %`, and `new_duplicated_lines ≤ 3 %`; also hold overall coverage at
+  90 % or above with no vulnerabilities or open security hotspots. An unavailable local service
+  is reported as unavailable, never passed. See [Local SonarQube](local-sonarqube.md).
 - **Dependency audit** — `cargo-audit` runs inside the Rust gate every time; run `npm audit` and
   review transitive bumps periodically.
 - **a11y + UX pass** — `ux-audit` after a user-facing flow ships; keyboard/focus/contrast check.
@@ -110,20 +113,21 @@ Baseline (every feature)
 - [ ] Unit tests for changed logic (golden + failure/edge paths)
 - [ ] ≥90% coverage on changed code
 - [ ] e2e/journey test for any user-facing flow (src/e2e/)
-- [ ] SonarQube gate OK (new_violations 0, coverage ≥90%, 0 above-MINOR)
+- [ ] Pull request CI green: lint, typecheck, unit tests, Rust checks, bindings, Gitleaks
 - [ ] Rust gate GREEN — ./scripts/rust-quality-gate.sh (all categories enforced)
 - [ ] typecheck + clippy + fmt clean
 - [ ] Ran it in the app — golden path + key edge cases by hand
-- [ ] Code review + code-triage (gate mode) run TOGETHER; review↔triage loop clears Queue 1
+- [ ] Focused review complete; independent adversarial review when security-adjacent
 - [ ] Failures surfaced, never silent; no content lost/hidden
 - [ ] Obsidian markdown+YAML compatibility preserved
-- [ ] Spec/CLAUDE.md updated; deferrals left as TODO(context) in code
+- [ ] Specs/public docs/AGENTS.md updated; deferrals left as TODO(context) in code
 
 If security-adjacent (parser / untrusted input / paths / IPC / secrets / auth)
 - [ ] Independent adversarial review (not just tests + Sonar)
 - [ ] Used the library's own protection where possible; hand-rolled detection proven adversarially
 
 Periodic (milestone / batch / risk-surface — not every feature)
+- [ ] Local SonarQube gate OK, or explicitly not applicable for an external contribution
 - [ ] Full /production-audit → two consecutive rounds 0 CRITICAL / 0 HIGH
 - [ ] npm audit reviewed; a11y/ux-audit on new flows
 ```
@@ -134,19 +138,22 @@ Periodic (milestone / batch / risk-surface — not every feature)
 
 ```bash
 # Frontend (from app/desktop)
+npm run lint
 npm run typecheck
-npm run test:run          # unit + component
-npm run test:e2e          # jsdom + mockIPC journeys
-npm run coverage          # writes app/desktop/coverage/lcov.info
+npm run test:unit         # unit + component; excludes src/e2e
+npm run test:run          # all tests, including jsdom + mockIPC journeys
+npm run coverage          # all tests + 90% line gate; writes coverage/lcov.info
+npm run build
 
 # Rust (from repo root)
-cargo test --workspace
+cargo test --workspace --locked
 ./scripts/rust-quality-gate.sh           # clippy + fmt + llvm-cov(≥90) + audit
 cargo llvm-cov -p neuralnote-core --lcov --output-path lcov-rust.info
 
-# SonarQube (from repo root, after regenerating both lcov files above)
-source .env.sonar                        # SONAR_HOST_URL + SONAR_TOKEN (never committed)
-sonar-scanner
-# then confirm the gate is OK in the UI, or:
-#   curl -s -u "$SONAR_TOKEN:" "$SONAR_HOST_URL/api/qualitygates/project_status?projectKey=NeuralNote"
+# Repository and dependency security
+gitleaks git . --log-opts=--all --redact
+npm --prefix app/desktop audit --audit-level=high
+
+# Maintainer-only local SonarQube lifecycle and credential-safe scan
+# See docs/local-sonarqube.md
 ```

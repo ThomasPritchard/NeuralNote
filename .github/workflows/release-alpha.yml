@@ -29,16 +29,21 @@ jobs:
     env:
       RELEASE_VERSION: 0.1.0
       RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
-      RELEASE_CONFIG: ${{ runner.temp }}/tauri.release.conf.json
-      RELEASE_MANIFEST: ${{ runner.temp }}/latest-alpha.json
-      BUILD_KEYCHAIN: ${{ runner.temp }}/neuralnote-build.keychain-db
-      CERTIFICATE_PATH: ${{ runner.temp }}/neuralnote-certificate.p12
 
     steps:
       - name: Check out the release commit
         uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
         with:
           fetch-depth: 0
+
+      - name: Configure temporary release paths
+        run: |
+          {
+            echo "RELEASE_CONFIG=$RUNNER_TEMP/tauri.release.conf.json"
+            echo "RELEASE_MANIFEST=$RUNNER_TEMP/latest-alpha.json"
+            echo "BUILD_KEYCHAIN=$RUNNER_TEMP/neuralnote-build.keychain-db"
+            echo "CERTIFICATE_PATH=$RUNNER_TEMP/neuralnote-certificate.p12"
+          } >> "$GITHUB_ENV"
 
       - name: Set up Rust 1.96
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -51,6 +56,8 @@ jobs:
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
         with:
           node-version: 22
+          cache: npm
+          cache-dependency-path: app/desktop/package-lock.json
 
       - name: Validate release tag and all application versions
         working-directory: app/desktop
@@ -91,22 +98,14 @@ jobs:
       - name: Run release gates
         run: |
           set -euo pipefail
+          npm --prefix app/desktop run lint
           npm --prefix app/desktop run typecheck
-          npm --prefix app/desktop run test:run
-          npm --prefix app/desktop run test:e2e
           npm --prefix app/desktop run coverage
+          npm --prefix app/desktop run build
           npm --prefix app/desktop run check:bindings
           npm --prefix app/desktop audit --audit-level=high
           cargo test --workspace --locked
           ./scripts/rust-quality-gate.sh
-
-      - name: Enforce SonarQube quality gate
-        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
-        env:
-          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
-        with:
-          args: -Dsonar.qualitygate.wait=true
 
       - name: Validate public release configuration
         env:

@@ -132,22 +132,21 @@ layer. "Fully-local AI" is realistically a desktop strength; on-device phone mod
 fast, but the heavy models still want a desktop (treat this as a v1-era assumption, not a permanent
 law).
 
-**Open-core for trust — timed deliberately.** The long-term shape is an open desktop client with a
-closed server / managed-AI / sync layer. But *when* to open the client matters more than whether:
+**Open client for trust.** NeuralNote is preparing the desktop client for an open-source release
+before the cloud tier exists. The RAG code is not a secret worth guarding — it is already open-source
+elsewhere (AnythingLLM/Khoj/Reor). The value to protect is the product's brand, distribution,
+citation-fidelity execution, and the reliability of the hosted service.
 
-- **Not at v1.** Pre-traction the effort is better spent on the product than on running a clean
-  open-source release. And the RAG *code* is not a secret worth guarding — it is already open-source
-  elsewhere (AnythingLLM/Khoj/Reor). What's worth protecting is brand, distribution, accumulated user
-  trust, and citation-fidelity execution, none of which open-sourcing the client gives away. (This
-  corrects the earlier framing that the moat "lives in the client code" — it does not.)
-- **Open the client when the cloud tier launches**, as the trust counterweight to "we now offer
-  cloud sync + managed AI." That is the moment "is my data safe?" becomes a live question, and an
-  open, auditable client is what answers it — proving exactly what does and doesn't leave the device.
-- **Middle path:** "source-available" (visible, not freely forkable) can deliver the transparency
-  signal earlier without the fork-and-close risk, graduating to a true OSI licence later.
-- **Licence (deferred).** Permissive (MIT/Apache — maximum goodwill, but forkable-and-closable) vs
-  copyleft; **AGPL** on the client plus a proprietary server is the standard open-core stance that
-  blocks a closed rival fork. Decide when the cloud ships, not now.
+- **Open foundation:** the desktop client and Obsidian-compatible local data format are the public,
+  auditable base. Opening this layer makes the ownership and provider boundaries inspectable before
+  NeuralNote asks anyone to trust a sync service.
+- **Commercial layer:** the planned hosted sync API, managed AI, authentication, billing, and
+  operational infrastructure remain a separate service. Users pay for multi-device convenience,
+  not for access to their own files.
+- **Licence:** the client repository is licensed under GNU AGPL v3 or later. Distributed
+  modifications stay under the same terms, and modified versions used across a network must offer
+  their corresponding source to those users. The hosted sync API remains a separately developed
+  service outside this repository.
 
 **Data/AI shape.** Hybrid local-first: files you own on disk + cloud LLM for the smart parts.
 `local-first` vs `cloud-first` is just whether the local copy is the source of truth or a cache —
@@ -238,7 +237,7 @@ voice capture (1st capture fast-follow) · image/scanned-page-to-note (2nd captu
 mobile · managed cloud AI · PWA · billing · proactive nudges/resurface feed · NL-query-over-metadata
 (Dataview replacement; Bases is eating it anyway) · Notion import (first import fast-follow) ·
 tasks/kanban/canvas · spaced-repetition cards · live file-watching (v1 re-indexes on launch/focus
-instead) · open-source-release decision.
+instead).
 
 ---
 
@@ -389,11 +388,10 @@ current docs**, not asserted from memory here.
    contract to lock).
 4. v1 desktop reach: macOS-first vs all three desktop OSes.
 5. Live file-watching as a fast-follow to v1's launch/focus re-index.
-6. Open-client licence (deferred to cloud launch — Section 3).
 
 *Resolved since the review draft:* embeddings (API, committed); external-edit reconciliation
 (launch/focus re-index in v1); full-source storage layout (hidden in-vault sidecar); "project" scope
-(= vault folder).
+(= vault folder); open-client licence (GNU AGPL v3 or later).
 
 ---
 

@@ -1,0 +1,46 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  "categories": {
+    "correctness": "error",
+    "suspicious": "error"
+  },
+  "plugins": [
+    "eslint",
+    "typescript",
+    "unicorn",
+    "oxc",
+    "react",
+    "vitest",
+    "jsx-a11y"
+  ],
+  // TODO(lint-baseline): retire these adoption exceptions in scoped changes with
+  // regression or accessibility coverage; enabling them now creates 1,886
+  // pre-existing findings and would require an unrelated application rewrite.
+  "rules": {
+    "eslint/no-shadow": "off",
+    "eslint/no-underscore-dangle": "off",
+    "eslint/no-unmodified-loop-condition": "off",
+    "eslint/no-useless-escape": "off",
+    "jsx-a11y/control-has-associated-label": "off",
+    "jsx-a11y/no-autofocus": "off",
+    "jsx-a11y/no-noninteractive-element-interactions": "off",
+    "jsx-a11y/no-noninteractive-element-to-interactive-role": "off",
+    "jsx-a11y/prefer-tag-over-role": "off",
+    "react/react-in-jsx-scope": "off",
+    "typescript/no-extraneous-class": "off",
+    "typescript/triple-slash-reference": "off",
+    "unicorn/consistent-function-scoping": "off",
+    "unicorn/no-array-reverse": "off",
+    "unicorn/no-array-sort": "off",
+    "unicorn/no-useless-spread": "off",
+    "unicorn/prefer-add-event-listener": "off",
+    "vitest/require-mock-type-parameters": "off"
+  },
+  "ignorePatterns": [
+    "coverage/**",
+    "dist/**",
+    "src/lib/bindings/**",
+    "src-tauri/**",
+    "e2e-native/node_modules/**"
+  ]
+}

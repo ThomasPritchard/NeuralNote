@@ -18,7 +18,7 @@ ends in notes written to the vault.
 The load-bearing idea, stated plainly: **a skill is instructions + tools + prerequisites, not a
 Rust function.** The judgement — distilling, routing, writing in the user's voice — belongs to the
 model, driven by instruction markdown. Rust supplies the primitives (fetch a transcript, write a
-note, ask the user a question) and the guardrails. This is the reason the SecondBrain skill port
+note, ask the user a question) and the guardrails. This is the reason the reference skill port
 (Slice 5) works at all: the SKILL.md prose *is* most of the skill, and the framework's job is to
 deliver it to the model with the right tools attached.
 
@@ -41,7 +41,7 @@ first tools that *write*.
   `active_skills: Vec<String>` on the `chat` invoke; the orchestrator pre-loads those skills'
   instructions and tools before turn one. The `@` picker and the chip row both feed this one
   field — both doors converge on the same code path as `use_skill`.
-- **Vault writes: auto-route and announce, no confirm gate.** Full SecondBrain parity: the model
+- **Vault writes: auto-route and announce, no confirm gate.** Full reference-workflow parity: the model
   picks the folder, writes immediately, then reports where and why with an invitation to move it.
   This is the highest-blast-radius option, chosen deliberately — so the **engineering guardrails
   carry the weight** (§4): create-only, vault-confined, bounded, undoable.

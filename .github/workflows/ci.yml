@@ -1,0 +1,133 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+permissions:
+  contents: read
+
+jobs:
+  secrets:
+    name: Secrets / Gitleaks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out full history
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          fetch-depth: 0
+
+      - name: Install checksum-verified Gitleaks 8.30.1
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks_8.30.1_linux_x64.tar.gz"
+          curl -fsSL \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
+            -o "$archive"
+          printf '%s  %s\n' \
+            '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' \
+            "$archive" | sha256sum --check --status
+          tar -xzf "$archive" -C "$RUNNER_TEMP" gitleaks
+
+      - name: Scan all Git history
+        run: |
+          "$RUNNER_TEMP/gitleaks" git . --log-opts=--all --redact --no-banner
+
+  frontend:
+    name: Frontend / lint, types, and tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Set up Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: app/desktop/package-lock.json
+
+      - name: Install locked dependencies
+        working-directory: app/desktop
+        run: npm ci
+
+      - name: Lint
+        working-directory: app/desktop
+        run: npm run lint
+
+      - name: Type check
+        working-directory: app/desktop
+        run: npm run typecheck
+
+      - name: Unit and component tests
+        working-directory: app/desktop
+        run: npm run test:unit
+
+      - name: Full test suite and 90 percent line coverage
+        if: github.event_name != 'pull_request'
+        working-directory: app/desktop
+        run: npm run coverage
+
+      - name: Production build
+        if: github.event_name != 'pull_request'
+        working-directory: app/desktop
+        run: npm run build
+
+      - name: Audit high-severity npm vulnerabilities
+        if: github.event_name != 'pull_request'
+        working-directory: app/desktop
+        run: npm audit --audit-level=high
+
+  rust:
+    name: Rust / test, lint, format, and bindings
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+
+      - name: Set up Rust 1.96
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.0
+          components: clippy,rustfmt,llvm-tools-preview
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+        with:
+          workspaces: "."
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+
+      - name: Rustfmt
+        run: cargo fmt --all -- --check
+
+      - name: Check generated TypeScript bindings
+        run: npm --prefix app/desktop run check:bindings
+
+      - name: Install pinned main-branch gate tools
+        if: github.event_name != 'pull_request'
+        run: |
+          cargo install cargo-llvm-cov --locked --version 0.8.7
+          cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Enforce 90 percent Rust line coverage
+        if: github.event_name != 'pull_request'
+        run: cargo llvm-cov -p neuralnote-core --fail-under-lines 90 --lcov --output-path lcov-rust.info
+
+      - name: Audit Rust dependencies
+        if: github.event_name != 'pull_request'
+        run: cargo audit

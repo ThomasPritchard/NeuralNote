@@ -11,13 +11,13 @@
 
 ## 1. What this slice is — a port that must be a rewrite
 
-This skill ports Tom's SecondBrain `youtube-distill` skill (SKILL.md + `extract_transcript.py`)
+This skill ports the reference `youtube-distill` workflow (SKILL.md + `extract_transcript.py`)
 into NeuralNote: paste a YouTube link — or a playlist — and get back literature notes, atomic seed
 notes, and archived transcripts, auto-routed into the vault's own organising scheme and announced
 with an Undo.
 
 **The headline adaptation, and the reason this is a rewrite rather than a copy: timestamps.** The
-SecondBrain script's `clean_vtt()` strips every cue timing and joins the captions into one prose
+reference script's `clean_vtt()` strips every cue timing and joins the captions into one prose
 blob — fine for a human-read transcript, fatal for NeuralNote. The product spec promises "each
 claim citable back to the exact chunk or **timestamp**" (`specs/neural-note.md:31`) and names
 "Timestamp-accurate, never fabricated, regression-blocking" as moat pillar 3. So the pipeline is
@@ -81,10 +81,10 @@ For the GPL-3.0 POT provider, runtime download has a third consequence: NeuralNo
 the first ask; the Whisper toolchain (~466 MB `small` model + decoder) is optional, only offered
 when a video turns out to have no captions. Downloads reuse the cancellable progress pattern of
 `ai/local/pull.rs` (to a `.part` file, renamed on completion — the same interrupted-download
-discipline as the SecondBrain script's model fetch). Spawning stays in Rust by absolute path;
+discipline as the reference script's model fetch). Spawning stays in Rust by absolute path;
 `capabilities/default.json` keeps `shell:allow-execute` withheld (Slice 4 §4).
 
-### 3.2 Output: full SecondBrain parity, upgraded with timestamps
+### 3.2 Output: full reference-workflow parity, upgraded with timestamps
 
 Per video: a literature note and an archived transcript. Atomic notes are written **per concept,
 deduplicated across the run and against the vault** (§6.1) rather than per video — the one place
@@ -105,7 +105,7 @@ tracks** (empty `subtitles` and `automatic_captions` in the metadata) triggers t
 
 ### 3.4 Auto-route and announce
 
-Full SecondBrain parity: the model picks the folder — within the vault's own detected scheme
+Full reference-workflow parity: the model picks the folder — within the vault's own detected scheme
 (§6) — writes immediately via `write_note`, then reports where and why, inviting the user to move
 it. The safety weight is carried by the Slice-4 `write_note` guardrails (create-only,
 vault-confined, bounded per work item, Undo) — reviewed adversarially there; this skill adds no
@@ -204,7 +204,7 @@ branch keyed on the URL shape** (§7), not an accident of the existing call.
 ### 4.3 `capture/vtt.rs` — the cue model (the TDD heart of the slice)
 
 A pure core module parses VTT into `Vec<Cue { start_ms, end_ms, text }>` rather than a prose
-blob. The SecondBrain cleaner's passes are re-derived **over cues**:
+blob. The reference cleaner's passes are re-derived **over cues**:
 
 1. Strip headers, `-->` cue timings into the struct (not the bin), numeric indices, inline
    `<...>` word-timing tags; HTML-unescape.
@@ -281,7 +281,7 @@ is PARA-shaped, so the skill infers the vault's actual organising scheme and con
   **Johnny.Decimal** (`10-19 Area/11 Category/`). **Unknown is a first-class outcome, not a
   failure.**
 - **Then copy the local conventions.** Before writing, read one or two existing notes in the
-  chosen folder and match their frontmatter keys and heading structure. SecondBrain's SKILL.md
+  chosen folder and match their frontmatter keys and heading structure. The reference workflow's SKILL.md
   already instructs this ("Read a note already in that folder to copy its exact conventions
   before writing") — generalised here from a PARA-specific step to the general rule.
 - **Never invent a folder without asking.**
@@ -298,7 +298,7 @@ is PARA-shaped, so the skill infers the vault's actual organising scheme and con
 
 ### 6.1 Atomic notes are scoped to concepts, not to videos
 
-The SecondBrain skill spins out "1–3 seeds per video". Ported literally into a playlist run that
+The reference workflow spins out "1–3 seeds per video". Ported literally into a playlist run that
 produces one seed per video per idea, which is the wrong grain: three videos that each discuss
 Markov chains should yield **one** `Markov chains.md`, wikilinked from all three literature notes —
 not three near-duplicate seeds. Tom's framing: *"recurring notes that can be moved to an atomic note

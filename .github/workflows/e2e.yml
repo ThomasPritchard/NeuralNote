@@ -1,7 +1,7 @@
 # Tier-2 native end-to-end tests: drive the real NeuralNote window via
 # WebdriverIO + tauri-driver. Linux + Windows ONLY — tauri-driver has no macOS
 # WebDriver, so the Mac path is covered by the Tier-1 mockIPC suite
-# (app/desktop: `npm run test:e2e`), which runs in the unit job elsewhere.
+# (app/desktop: `npm run test:e2e`), which runs in the main-branch frontend job.
 #
 # Mirrors the official Tauri WebDriver CI pattern:
 # https://v2.tauri.app/develop/tests/webdriver/ci
@@ -11,11 +11,14 @@ name: e2e-native
 on:
   push:
     branches: [main]
-  pull_request:
   workflow_dispatch:
 
-# Least privilege: this workflow only builds and drives the app; it needs no write
-# scopes. A fork PR's token is read-only anyway, but declaring it makes that explicit.
+concurrency:
+  group: e2e-native-${{ github.ref }}
+  cancel-in-progress: false
+
+# Least privilege: this post-merge workflow only builds and drives the app, so it
+# needs no write scopes.
 permissions:
   contents: read
 
@@ -23,6 +26,7 @@ jobs:
   webdriver:
     name: WebdriverIO (${{ matrix.platform }})
     runs-on: ${{ matrix.platform }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

@@ -25,6 +25,7 @@ lcov-rust.info
 *.log
 .env
 .env.*
+!.env.sonar.example
 
 # Stray pasted screenshots at the repo root (PA-033)
 /clipboard-*.png
