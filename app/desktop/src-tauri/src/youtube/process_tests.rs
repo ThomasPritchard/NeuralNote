@@ -30,6 +30,22 @@ fn process_exists(pid: i32) -> bool {
     result == 0 || std::io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
 }
 
+#[cfg(unix)]
+async fn process_disappears_within(pid: i32, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !process_exists(pid) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        // A killed grandchild is reaped by its new parent, not by this runner.
+        // Under host load it can remain briefly observable as a zombie.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 fn spec(program: impl Into<PathBuf>) -> ProcessSpec {
     ProcessSpec {
         program: program.into(),
@@ -238,7 +254,7 @@ async fn timeout_remains_active_until_inherited_output_pipes_close() {
         .parse::<i32>()
         .unwrap();
     assert!(
-        !process_exists(descendant_pid),
+        process_disappears_within(descendant_pid, Duration::from_secs(1)).await,
         "timed-out descendant {descendant_pid} must be terminated"
     );
 }
