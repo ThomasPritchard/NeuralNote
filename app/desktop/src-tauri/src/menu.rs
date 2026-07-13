@@ -32,6 +32,8 @@ const CUSTOM_ACTIONS: &[&str] = &[
     "new-note",
     "new-folder",
     "open-vault",
+    "close-tab",
+    "close-window",
     "close-vault",
     "save",
     "search",
@@ -179,6 +181,13 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         MenuItem::with_id(app, "open-vault", "Open Vault…", true, Some("CmdOrCtrl+O"))?;
     let recent = recent_submenu(app)?;
     let save = MenuItem::with_id(app, "save", "Save", vault_open, Some("CmdOrCtrl+S"))?;
+    let close_tab = MenuItem::with_id(
+        app,
+        "close-tab",
+        "Close Tab",
+        vault_open,
+        Some("CmdOrCtrl+W"),
+    )?;
     let close_vault =
         MenuItem::with_id(app, "close-vault", "Close Vault", vault_open, None::<&str>)?;
     let file_menu = SubmenuBuilder::new(app, "File")
@@ -189,6 +198,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&recent)
         .separator()
         .item(&save)
+        .item(&close_tab)
         .separator()
         .item(&close_vault)
         .build()?;
@@ -318,11 +328,18 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&PredefinedMenuItem::fullscreen(app, None)?)
         .build()?;
 
+    let close_window = MenuItem::with_id(
+        app,
+        "close-window",
+        "Close Window",
+        true,
+        Some("CmdOrCtrl+Shift+W"),
+    )?;
     let window_menu = SubmenuBuilder::new(app, "Window")
         .item(&PredefinedMenuItem::minimize(app, None)?)
         .item(&PredefinedMenuItem::maximize(app, None)?)
         .separator()
-        .item(&PredefinedMenuItem::close_window(app, None)?)
+        .item(&close_window)
         .build()?;
 
     // TODO(menu-help): add a Help submenu once there's something real to point it
@@ -363,6 +380,15 @@ pub fn refresh(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Notify the renderer that a native Cmd-Q / Dock Quit request needs to pass
+/// through the unsaved-edit guard before the app may exit.
+pub(crate) fn emit_quit_requested(app: &AppHandle) {
+    let payload = MenuActionPayload::simple("quit-app");
+    if let Err(error) = app.emit(MENU_ACTION, &payload) {
+        log::warn!("could not emit guarded quit request: {error}");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -374,6 +400,18 @@ mod tests {
             assert_eq!(payload.action, *action);
             assert!(payload.path.is_none());
         }
+    }
+
+    #[test]
+    fn tab_and_window_close_are_distinct_guardable_actions() {
+        assert_eq!(
+            parse_menu_id("close-tab").map(|payload| payload.action),
+            Some("close-tab".to_string())
+        );
+        assert_eq!(
+            parse_menu_id("close-window").map(|payload| payload.action),
+            Some("close-window".to_string())
+        );
     }
 
     #[test]

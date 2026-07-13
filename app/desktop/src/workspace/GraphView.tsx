@@ -108,7 +108,7 @@ export function GraphView({
     trail.length > 0 ? (
       <nav
         aria-label="Folder breadcrumb"
-        className="nn-mono text-[10px] uppercase tracking-wider text-muted-foreground"
+        className="nn-mono text-[0.625rem] uppercase tracking-wider text-muted-foreground"
       >
         <button
           type="button"
@@ -161,11 +161,11 @@ export function GraphView({
         <div className="grid h-full place-items-center px-6">
           <div className="flex max-w-sm flex-col items-center gap-3 text-center">
             <AlertTriangle className="size-6 text-destructive" aria-hidden />
-            <p className="text-[13px] leading-relaxed text-muted-foreground">{state.message}</p>
+            <p className="text-[0.8125rem] leading-relaxed text-muted-foreground">{state.message}</p>
             <button
               type="button"
               onClick={() => void load()}
-              className="inline-flex items-center gap-1.5 rounded-md bg-muted px-3 py-1.5 text-[13px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+              className="inline-flex items-center gap-1.5 rounded-md bg-muted px-3 py-1.5 text-[0.8125rem] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
             >
               <RotateCw className="size-3.5" aria-hidden /> Retry
             </button>
@@ -175,7 +175,7 @@ export function GraphView({
 
       {view?.galaxy.data.nodes.length === 0 && (
         <div className="grid h-full place-items-center">
-          <p className="text-[13px] leading-relaxed text-muted-foreground">No notes yet</p>
+          <p className="text-[0.8125rem] leading-relaxed text-muted-foreground">No notes yet</p>
         </div>
       )}
 
@@ -208,13 +208,13 @@ export function GraphView({
               {view.galaxy.truncation !== null && (
                 // The node cap trimmed this level (PA-006) — never let a
                 // partial galaxy pass silently as the whole vault.
-                <p className="nn-mono text-[11px] text-muted-foreground">
+                <p className="nn-mono text-[0.6875rem] text-muted-foreground">
                   Showing the {view.galaxy.truncation.shown} most-linked of{" "}
                   {view.galaxy.truncation.total} notes — open a cluster to see more
                 </p>
               )}
               {skippedFiles > 0 && (
-                <p className="nn-mono text-[11px] text-muted-foreground">
+                <p className="nn-mono text-[0.6875rem] text-muted-foreground">
                   {skippedFiles} file(s) couldn't be read
                 </p>
               )}

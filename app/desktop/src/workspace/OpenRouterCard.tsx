@@ -119,7 +119,7 @@ export function OpenRouterCard({
       description="Bring your own key — cited chat runs on a cloud model of your choice."
       active={orActive}
     >
-      <p className="flex flex-wrap items-center gap-1.5 text-[12px]">
+      <p className="flex flex-wrap items-center gap-1.5 text-[0.75rem]">
         {hasKey ? (
           <>
             <Check className="size-3.5 text-primary" aria-hidden />
@@ -158,7 +158,7 @@ export function OpenRouterCard({
           <label
             title={capability.reason ?? undefined}
             className={cn(
-              "flex w-fit items-center gap-2 text-[12px] text-foreground/90",
+              "flex w-fit items-center gap-2 text-[0.75rem] text-foreground/90",
               capability.disabled ? "cursor-not-allowed" : "cursor-pointer",
             )}
           >
@@ -177,7 +177,7 @@ export function OpenRouterCard({
               and announced — instead of a billing note for a moot toggle. */}
           <p
             id={reasoningHintId}
-            className="pl-5.5 text-[11px] leading-snug text-muted-foreground"
+            className="pl-5.5 text-[0.6875rem] leading-snug text-muted-foreground"
           >
             {capability.reason ?? "Reasoning tokens are billed by OpenRouter."}
           </p>

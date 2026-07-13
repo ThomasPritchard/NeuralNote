@@ -34,11 +34,11 @@ function OptionBody({ option }: Readonly<{ option: ElicitOption }>) {
         />
       )}
       <span className="min-w-0 flex-1">
-        <span className="block text-[12px] font-medium leading-snug text-foreground/90">
+        <span className="block text-[0.75rem] font-medium leading-snug text-foreground/90">
           {option.label}
         </span>
         {option.description !== null && (
-          <span className="mt-0.5 block text-[11px] leading-snug text-muted-foreground">
+          <span className="mt-0.5 block text-[0.6875rem] leading-snug text-muted-foreground">
             {option.description}
           </span>
         )}
@@ -161,7 +161,7 @@ export function ElicitCard({
     >
       <p
         id={questionId}
-        className="text-[12px] font-medium leading-snug text-foreground/90"
+        className="text-[0.75rem] font-medium leading-snug text-foreground/90"
       >
         {question}
       </p>
@@ -169,7 +169,7 @@ export function ElicitCard({
       {multiSelect ? (
         <>
           <div className="flex items-center justify-between gap-3 rounded-lg border border-border/60 bg-background/30 px-2.5 py-1.5">
-            <span className="nn-mono text-[10px] text-muted-foreground">
+            <span className="nn-mono text-[0.625rem] text-muted-foreground">
               {answered ? answer.length : ticked.size} selected on this page
             </span>
             {!answered && (
@@ -178,7 +178,7 @@ export function ElicitCard({
                   type="button"
                   onClick={() => setTicked(new Set(options.map((option) => option.id)))}
                   disabled={submitting || ticked.size === options.length}
-                  className="text-[10px] font-medium text-primary transition-colors hover:text-primary/80 disabled:text-muted-foreground/50"
+                  className="text-[0.625rem] font-medium text-primary transition-colors hover:text-primary/80 disabled:text-muted-foreground/50"
                 >
                   Select page
                 </button>
@@ -189,7 +189,7 @@ export function ElicitCard({
                   type="button"
                   onClick={() => setTicked(new Set())}
                   disabled={submitting || ticked.size === 0}
-                  className="text-[10px] font-medium text-muted-foreground transition-colors hover:text-foreground disabled:text-muted-foreground/40"
+                  className="text-[0.625rem] font-medium text-muted-foreground transition-colors hover:text-foreground disabled:text-muted-foreground/40"
                 >
                   Clear page
                 </button>
@@ -283,7 +283,7 @@ export function ElicitCard({
 
       {/* Always-mounted status slot: reads as padding while empty, announces
           the answered/expired transitions politely without layout jump. */}
-      <output className="min-h-4 text-[10px] leading-snug text-muted-foreground/70">
+      <output className="min-h-4 text-[0.625rem] leading-snug text-muted-foreground/70">
         {answered && "Answered."}
         {!answered &&
           expired &&
@@ -293,7 +293,7 @@ export function ElicitCard({
       {error && (
         <p
           role="alert"
-          className="flex items-start gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-[11px] leading-snug text-destructive"
+          className="flex items-start gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-[0.6875rem] leading-snug text-destructive"
         >
           <AlertTriangle className="mt-px size-3 shrink-0" aria-hidden />
           <span className="min-w-0 flex-1">{error}</span>

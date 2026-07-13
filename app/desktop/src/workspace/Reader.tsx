@@ -33,16 +33,16 @@ export function Reader({ note, noteIndex, onOpenLink }: Readonly<ReaderProps>) {
   return (
     <article className="relative flex-1 overflow-y-auto px-8 py-10">
       <div className="relative mx-auto w-full max-w-[72ch]">
-        <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/12 px-2.5 py-1 text-[11px] font-medium text-primary ring-1 ring-inset ring-primary/20">
+        <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/12 px-2.5 py-1 text-[0.6875rem] font-medium text-primary ring-1 ring-inset ring-primary/20">
           <TypeIcon className="size-3" aria-hidden /> {extLabel(ext)}
         </span>
 
-        <h1 className="nn-heading mt-4 text-[28px] font-semibold leading-tight tracking-tight">
+        <h1 className="nn-heading mt-4 text-[1.75rem] font-semibold leading-tight tracking-tight">
           {note.title}
         </h1>
 
         {note.frontmatterError && (
-          <div className="mt-4 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-[12px] text-destructive">
+          <div className="mt-4 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-[0.75rem] text-destructive">
             <div className="flex items-start gap-2">
               <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
               <span className="leading-snug">
@@ -52,7 +52,7 @@ export function Reader({ note, noteIndex, onOpenLink }: Readonly<ReaderProps>) {
             {note.frontmatterRaw && (
               // Show the offending block so the user can see (and fix) what failed,
               // rather than just being told it failed.
-              <pre className="nn-mono mt-2 max-h-48 overflow-auto rounded-md bg-background/60 p-2 text-[11px] leading-5 text-muted-foreground">
+              <pre className="nn-mono mt-2 max-h-48 overflow-auto rounded-md bg-background/60 p-2 text-[0.6875rem] leading-5 text-muted-foreground">
                 {note.frontmatterRaw}
               </pre>
             )}
@@ -157,12 +157,12 @@ function UnsupportedNotice({
 }>) {
   return (
     <div className="rounded-lg border border-border bg-card/50 p-5">
-      <div className="flex items-center gap-2 text-[13px] font-medium text-foreground/90">
+      <div className="flex items-center gap-2 text-[0.8125rem] font-medium text-foreground/90">
         <FileQuestion className="size-4 text-primary" aria-hidden />
         Preview not available for {ext ? `.${ext}` : "these"} files yet
       </div>
       {raw !== null && (
-        <pre className="nn-mono mt-3 max-h-[60vh] overflow-auto rounded-md bg-background/60 p-3 text-[12px] leading-6 text-muted-foreground">
+        <pre className="nn-mono mt-3 max-h-[60vh] overflow-auto rounded-md bg-background/60 p-3 text-[0.75rem] leading-6 text-muted-foreground">
           {raw}
         </pre>
       )}
@@ -175,10 +175,10 @@ function Properties({ frontmatter }: Readonly<{ frontmatter: Record<string, unkn
     <dl className="mt-5 flex flex-col divide-y divide-border/70 overflow-hidden rounded-lg border border-border bg-card/50">
       {Object.entries(frontmatter).map(([key, value]) => (
         <div key={key} className="flex items-start gap-3 px-4 py-2.5">
-          <dt className="nn-mono flex w-28 shrink-0 items-center pt-px text-[12px] text-muted-foreground">
+          <dt className="nn-mono flex w-28 shrink-0 items-center pt-px text-[0.75rem] text-muted-foreground">
             {key}
           </dt>
-          <dd className="min-w-0 flex-1 text-[13px]">
+          <dd className="min-w-0 flex-1 text-[0.8125rem]">
             <FrontmatterValue value={value} />
           </dd>
         </div>
@@ -196,7 +196,7 @@ function FrontmatterValue({ value }: Readonly<{ value: unknown }>) {
           return (
             <span
               key={`${label}-${i}`}
-              className="nn-mono rounded-sm bg-primary/12 px-1.5 py-0.5 text-[12px] text-primary ring-1 ring-inset ring-primary/15"
+              className="nn-mono rounded-sm bg-primary/12 px-1.5 py-0.5 text-[0.75rem] text-primary ring-1 ring-inset ring-primary/15"
             >
               {label}
             </span>

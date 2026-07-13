@@ -13,9 +13,12 @@ import {
   createNoteFromTemplate,
   downloadRequirement,
   listTemplates,
+  loadWorkspaceState,
   readBacklinks,
   readLinkGraph,
   readNote,
+  resetWorkspaceState,
+  saveWorkspaceState,
   searchVault,
 } from "../lib/api";
 import type { PullEvent } from "../lib/types";
@@ -679,6 +682,42 @@ describe("mockVault unknown commands", () => {
     await expect(invoke("bogus_cmd")).rejects.toEqual({
       kind: "io",
       message: "unknown command: bogus_cmd",
+    });
+  });
+});
+
+describe("mockVault workspace state", () => {
+  it("round-trips saved tab paths and resets them to the safe empty state", async () => {
+    seedVault([]);
+
+    expect(await loadWorkspaceState()).toEqual({
+      state: { openPaths: [], activePath: null },
+      recoveredFromCorrupt: false,
+      recoveryMessage: null,
+    });
+
+    await saveWorkspaceState({
+      openPaths: ["A.md", "folder/B.md"],
+      activePath: "folder/B.md",
+    });
+    expect(await loadWorkspaceState()).toEqual({
+      state: {
+        openPaths: ["A.md", "folder/B.md"],
+        activePath: "folder/B.md",
+      },
+      recoveredFromCorrupt: false,
+      recoveryMessage: null,
+    });
+
+    expect(await resetWorkspaceState()).toEqual({
+      state: { openPaths: [], activePath: null },
+      recoveredFromCorrupt: false,
+      recoveryMessage: null,
+    });
+    expect(await loadWorkspaceState()).toEqual({
+      state: { openPaths: [], activePath: null },
+      recoveredFromCorrupt: false,
+      recoveryMessage: null,
     });
   });
 });

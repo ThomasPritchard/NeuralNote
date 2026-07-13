@@ -49,6 +49,8 @@ pub struct Elicitation {
 )]
 #[ts(export)]
 pub enum ChatEvent {
+    /// The backend accepted the run and is preparing the first model request.
+    Processing,
     /// A skill became active and granted its declared tools.
     SkillActivated { id: String, name: String },
     /// A user-facing progress update emitted by an active skill.
@@ -139,6 +141,7 @@ mod tests {
     #[test]
     fn tags_events_by_type_in_camel_case() {
         assert_eq!(json(&ChatEvent::Done)["type"], "done");
+        assert_eq!(json(&ChatEvent::Processing)["type"], "processing");
         assert_eq!(json(&ChatEvent::Verifying)["type"], "verifying");
         assert_eq!(
             json(&ChatEvent::Searching {

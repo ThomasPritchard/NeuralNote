@@ -16,7 +16,9 @@ use tauri::{AppHandle, Emitter};
 use tauri_plugin_dialog::DialogExt;
 
 use crate::event_names::TREE_CHANGED;
-use crate::{config_dir, lock_state, menu, root_of, AppState, SharedState, VaultSession};
+use crate::{
+    config_dir, lock_state, menu, root_of, vault_mutation_of, AppState, SharedState, VaultSession,
+};
 
 /// Canonical form for authorization comparisons, falling back to the path as
 /// given if it can't be resolved (e.g. just deleted). Without this, the PA-004
@@ -205,6 +207,7 @@ pub(crate) fn open_vault(
             root,
             _watcher: watcher,
         });
+        guard.vault_mutations = Default::default();
         guard.chat_visible = true;
         guard.editing = false;
     }
@@ -245,6 +248,7 @@ pub(crate) fn create_vault(
             root,
             _watcher: watcher,
         });
+        guard.vault_mutations = Default::default();
         guard.chat_visible = true;
         guard.editing = false;
     }
@@ -329,7 +333,12 @@ pub(crate) async fn write_note(
     content: String,
     expected_hash: Option<String>,
 ) -> Result<NoteDoc, CoreError> {
-    neuralnote_core::note::write_note(&root_of(&state)?, Path::new(&path), &content, expected_hash)
+    let mutation = vault_mutation_of(&state)?;
+    mutation
+        .run(|root| {
+            neuralnote_core::note::write_note(root, Path::new(&path), &content, expected_hash)
+        })
+        .await
 }
 
 // `search_vault`/`read_link_graph` follow the same recipe as `read_tree` above:
@@ -420,28 +429,39 @@ pub(crate) fn create_note_from_template(
 }
 
 #[tauri::command]
-pub(crate) fn rename_entry(
-    state: SharedState,
+pub(crate) async fn rename_entry(
+    state: SharedState<'_>,
     path: String,
     new_name: String,
 ) -> Result<TreeNode, CoreError> {
-    neuralnote_core::entries::rename_entry(&root_of(&state)?, Path::new(&path), &new_name)
+    let mutation = vault_mutation_of(&state)?;
+    mutation
+        .run(|root| neuralnote_core::entries::rename_entry(root, Path::new(&path), &new_name))
+        .await
 }
 
 #[tauri::command]
-pub(crate) fn delete_entry(state: SharedState, path: String) -> Result<(), CoreError> {
-    neuralnote_core::entries::delete_entry(&root_of(&state)?, Path::new(&path))
+pub(crate) async fn delete_entry(state: SharedState<'_>, path: String) -> Result<(), CoreError> {
+    let mutation = vault_mutation_of(&state)?;
+    mutation
+        .run(|root| neuralnote_core::entries::delete_entry(root, Path::new(&path)))
+        .await
 }
 
 #[tauri::command]
-pub(crate) fn move_entry(
-    state: SharedState,
+pub(crate) async fn move_entry(
+    state: SharedState<'_>,
     path: String,
     new_parent_path: String,
 ) -> Result<TreeNode, CoreError> {
-    neuralnote_core::entries::move_entry(
-        &root_of(&state)?,
-        Path::new(&path),
-        Path::new(&new_parent_path),
-    )
+    let mutation = vault_mutation_of(&state)?;
+    mutation
+        .run(|root| {
+            neuralnote_core::entries::move_entry(
+                root,
+                Path::new(&path),
+                Path::new(&new_parent_path),
+            )
+        })
+        .await
 }

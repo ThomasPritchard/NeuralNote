@@ -39,7 +39,7 @@ export function SkillSuggestions({
   if (suggestions.length === 0 && notice === null) return null;
   return (
     <div className="absolute inset-x-0 bottom-full z-30 mb-1.5 overflow-hidden rounded-lg border border-border bg-popover shadow-xl">
-      <p className="px-2.5 pt-1.5 text-[9px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/60">
+      <p className="px-2.5 pt-1.5 text-[0.5625rem] font-semibold uppercase tracking-[0.08em] text-muted-foreground/60">
         Skills
       </p>
       {suggestions.length === 0 && notice !== null && (
@@ -47,7 +47,7 @@ export function SkillSuggestions({
         // and typing continues; the popup just says why it has nothing yet.
         <output
           className={cn(
-            "block px-2.5 pb-2 pt-1 text-[11px] leading-snug",
+            "block px-2.5 pb-2 pt-1 text-[0.6875rem] leading-snug",
             notice.kind === "error"
               ? "text-destructive"
               : "text-muted-foreground/70",
@@ -85,10 +85,10 @@ export function SkillSuggestions({
               aria-hidden
             />
             <span className="min-w-0 flex-1">
-              <span className="block truncate text-[12px] font-medium leading-snug">
+              <span className="block truncate text-[0.75rem] font-medium leading-snug">
                 {skill.name}
               </span>
-              <span className="block truncate text-[10px] leading-snug text-muted-foreground">
+              <span className="block truncate text-[0.625rem] leading-snug text-muted-foreground">
                 {skill.description}
               </span>
             </span>
@@ -97,7 +97,7 @@ export function SkillSuggestions({
       </ul>
       )}
       {suggestions.length > 0 && (
-        <p className="border-t border-border bg-muted/40 px-2.5 py-1 text-[10px] leading-relaxed text-muted-foreground/70">
+        <p className="border-t border-border bg-muted/40 px-2.5 py-1 text-[0.625rem] leading-relaxed text-muted-foreground/70">
           ↑↓ navigate · ↵ add skill · esc dismiss
         </p>
       )}
@@ -121,7 +121,7 @@ export function SkillChips({
       {skills.map((skill) => (
         <li
           key={skill.id}
-          className="flex items-center gap-1 rounded-full bg-primary/10 py-0.5 pl-2 pr-0.5 text-[10px] font-medium text-primary ring-1 ring-inset ring-primary/30"
+          className="flex items-center gap-1 rounded-full bg-primary/10 py-0.5 pl-2 pr-0.5 text-[0.625rem] font-medium text-primary ring-1 ring-inset ring-primary/30"
         >
           <Wand2 className="size-3 shrink-0" aria-hidden />
           {skill.name}

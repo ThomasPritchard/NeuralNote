@@ -25,7 +25,7 @@ export function PanelHeader({
   return (
     <header className={cn("flex min-h-11 items-center gap-2 border-b border-border px-3", className)}>
       {Icon && <Icon className="size-3.5 text-muted-foreground" aria-hidden />}
-      <h2 className="nn-heading min-w-0 flex-1 truncate text-[13px] font-semibold text-foreground">{title}</h2>
+      <h2 className="nn-heading min-w-0 flex-1 truncate text-[0.8125rem] font-semibold text-foreground">{title}</h2>
       {meta}
     </header>
   );
@@ -83,7 +83,7 @@ export function EmptyState({
         <Icon className="size-4.5" aria-hidden />
       </span>
       <div className="space-y-1">
-        <p className="text-[13px] font-medium text-foreground">{title}</p>
+        <p className="text-[0.8125rem] font-medium text-foreground">{title}</p>
         <p className="text-xs leading-5 text-muted-foreground">{description}</p>
       </div>
       {action}

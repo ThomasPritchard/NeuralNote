@@ -14,6 +14,8 @@ use neuralnote_core::CoreError;
 use notify::RecommendedWatcher;
 use tauri::{AppHandle, Manager, State};
 
+use crate::vault_mutation::{VaultMutationContext, VaultMutationGate};
+
 mod ai;
 mod commands;
 mod event_names;
@@ -25,6 +27,7 @@ mod requirement_install_lock;
 mod requirement_installer;
 mod requirement_source_build;
 mod skills;
+mod vault_mutation;
 mod youtube;
 
 // Re-exported solely for the network-gated behavioural eval integration test
@@ -81,6 +84,9 @@ pub(crate) struct AppState {
     /// only when this is true — an enabled-but-inert Format item would be a silent
     /// no-op. Pushed from the webview via `set_menu_editing`; reset on vault change.
     pub(crate) editing: bool,
+    /// Replaced whenever a different vault opens. All note writes and entry
+    /// rename/move/delete commands capture this gate together with the root.
+    pub(crate) vault_mutations: VaultMutationGate,
 }
 
 impl Default for AppState {
@@ -95,6 +101,7 @@ impl Default for AppState {
             authorized: HashSet::new(),
             chat_visible: true,
             editing: false,
+            vault_mutations: VaultMutationGate::default(),
         }
     }
 }
@@ -120,10 +127,52 @@ pub(crate) fn root_of(state: &SharedState) -> Result<PathBuf, CoreError> {
         .ok_or_else(|| CoreError::Io("no vault is open".into()))
 }
 
+/// Capture the current root and its mutation gate in one AppState critical
+/// section so a concurrent vault switch cannot mix two vault generations.
+pub(crate) fn vault_mutation_of(state: &SharedState) -> Result<VaultMutationContext, CoreError> {
+    let guard = lock_state(state);
+    let root = guard
+        .session
+        .as_ref()
+        .map(|session| session.root.clone())
+        .ok_or_else(|| CoreError::Io("no vault is open".into()))?;
+    Ok(VaultMutationContext::new(
+        root,
+        guard.vault_mutations.clone(),
+    ))
+}
+
 pub(crate) fn config_dir(app: &AppHandle) -> Result<PathBuf, CoreError> {
     app.path()
         .app_config_dir()
         .map_err(|e| CoreError::Io(format!("no config dir: {e}")))
+}
+
+fn updater_public_key_is_configured(config: &tauri::Config) -> bool {
+    config
+        .plugins
+        .0
+        .get("updater")
+        .and_then(|updater| updater.get("pubkey"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|key| !key.trim().is_empty())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExitRequestDisposition {
+    GuardAndNotify,
+    ExitNow,
+}
+
+/// Native user interaction has no exit code and must cross the renderer's
+/// unsaved-edit guard. `AppHandle::exit` carries a code and is the explicit,
+/// already-confirmed path back from that guard.
+fn exit_request_disposition(code: Option<i32>) -> ExitRequestDisposition {
+    if code.is_some() {
+        ExitRequestDisposition::ExitNow
+    } else {
+        ExitRequestDisposition::GuardAndNotify
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -155,18 +204,46 @@ pub fn run() {
                 .build(),
         )
         .plugin(tauri_plugin_dialog::init())
+        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_shell::init())
         .manage(Mutex::new(AppState::default()))
         // Install the NeuralNote application menu, replacing Tauri's generic
         // default. A failure here would leave the app menu-less — surface it in
         // the log rather than dropping it silently (PA-007 discipline).
         .setup(|app| {
+            #[cfg(desktop)]
+            {
+                if updater_public_key_is_configured(app.config()) {
+                    app.handle()
+                        .plugin(tauri_plugin_updater::Builder::new().build())?;
+                } else {
+                    // Release builds merge a config containing the real public key.
+                    // Development and unsigned smoke builds deliberately have no
+                    // placeholder key; leave updater IPC unavailable instead of
+                    // crashing the whole app during setup.
+                    log::warn!("updater disabled: no public verification key configured");
+                }
+                app.handle().plugin(tauri_plugin_autostart::init(
+                    tauri_plugin_autostart::MacosLauncher::LaunchAgent,
+                    None,
+                ))?;
+            }
             if let Err(e) = menu::install(app.handle()) {
                 log::error!("could not install the application menu: {e}");
             }
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            commands::preferences::load_app_preferences,
+            commands::preferences::save_app_preferences,
+            commands::templates::load_template_settings,
+            commands::templates::save_template_settings,
+            commands::templates::reset_template_settings,
+            commands::templates::pick_template_folder,
+            commands::workspace_state::load_workspace_state,
+            commands::workspace_state::save_workspace_state,
+            commands::workspace_state::reset_workspace_state,
+            commands::lifecycle::quit_app,
             commands::vault::list_recent_vaults,
             commands::vault::pick_vault_folder,
             commands::vault::pick_new_vault_location,
@@ -227,14 +304,64 @@ pub fn run() {
                 let state = app.state::<Mutex<AppState>>();
                 lock_state(&state).pending_elicitations.cancel_all_runs();
             }
-            if matches!(
-                event,
-                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit
-            ) {
+            let should_shutdown = match &event {
+                tauri::RunEvent::ExitRequested { code, api, .. }
+                    if exit_request_disposition(*code)
+                        == ExitRequestDisposition::GuardAndNotify =>
+                {
+                    api.prevent_exit();
+                    menu::emit_quit_requested(app);
+                    false
+                }
+                tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit => true,
+                _ => false,
+            };
+            if should_shutdown {
                 let state = app.state::<Mutex<AppState>>();
                 let youtube = lock_state(&state).youtube.clone();
                 youtube.shutdown();
                 local::shutdown_ollama(&state);
             }
         });
+}
+
+#[cfg(test)]
+mod updater_config_tests {
+    use super::{
+        exit_request_disposition, updater_public_key_is_configured, ExitRequestDisposition,
+    };
+
+    #[test]
+    fn native_exit_requests_are_guarded_but_confirmed_programmatic_exits_are_allowed() {
+        assert_eq!(
+            exit_request_disposition(None),
+            ExitRequestDisposition::GuardAndNotify
+        );
+        assert_eq!(
+            exit_request_disposition(Some(0)),
+            ExitRequestDisposition::ExitNow
+        );
+    }
+
+    #[test]
+    fn updater_requires_a_nonempty_public_key() {
+        let mut config = tauri::Config::default();
+        config.plugins.0.insert(
+            "updater".into(),
+            serde_json::json!({ "endpoints": ["https://example.invalid/latest.json"] }),
+        );
+        assert!(!updater_public_key_is_configured(&config));
+
+        config
+            .plugins
+            .0
+            .insert("updater".into(), serde_json::json!({ "pubkey": "  " }));
+        assert!(!updater_public_key_is_configured(&config));
+
+        config.plugins.0.insert(
+            "updater".into(),
+            serde_json::json!({ "pubkey": "trusted-public-key" }),
+        );
+        assert!(updater_public_key_is_configured(&config));
+    }
 }

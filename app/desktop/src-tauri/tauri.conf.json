@@ -19,7 +19,7 @@
         "minHeight": 600,
         "titleBarStyle": "Overlay",
         "hiddenTitle": true,
-        "trafficLightPosition": { "x": 19, "y": 14 }
+        "trafficLightPosition": { "x": 16, "y": 23 }
       }
     ],
     "security": {
@@ -29,6 +29,7 @@
   },
   "bundle": {
     "active": true,
+    "createUpdaterArtifacts": true,
     "targets": "all",
     "externalBin": ["binaries/ollama", "binaries/llama-server"],
     "resources": ["ollama-libs/**/*"],
@@ -39,5 +40,12 @@
       "icons/icon.icns",
       "icons/icon.ico"
     ]
+  },
+  "plugins": {
+    "updater": {
+      "endpoints": [
+        "https://raw.githubusercontent.com/ThomasPritchard/NeuralNote/release-manifests/latest-alpha.json"
+      ]
+    }
   }
 }

@@ -205,7 +205,7 @@ fn shifted(now: DateTime<Local>, days: i64) -> DateTime<Local> {
     now.checked_add_signed(Duration::days(days)).unwrap_or(now)
 }
 
-fn format_moment(format: &str, now: DateTime<Local>) -> String {
+pub(super) fn format_moment(format: &str, now: DateTime<Local>) -> String {
     let mut out = String::with_capacity(format.len());
     let mut cursor = 0usize;
     while cursor < format.len() {

@@ -83,7 +83,7 @@ export function InlineInput({
         cancel();
       }}
       className={cn(
-        "w-full rounded-md border border-primary/60 bg-background px-1.5 py-[3px] text-[13px] text-foreground",
+        "w-full rounded-md border border-primary/60 bg-background px-1.5 py-[3px] text-[0.8125rem] text-foreground",
         "outline-none ring-1 ring-primary/30 placeholder:text-muted-foreground/60",
         className,
       )}

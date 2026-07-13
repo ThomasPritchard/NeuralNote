@@ -137,6 +137,7 @@ describe("Journey 8: local AI — reconfigure from the Settings cog", () => {
     // The ribbon Settings cog is now a live control (not the inert placeholder).
     await user.click(screen.getByRole("button", { name: "Settings" }));
     const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: "AI" }));
 
     // The already-installed model is never offered for re-download: once the
     // installed scan resolves, its catalogue row carries the Installed chip

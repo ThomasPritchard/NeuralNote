@@ -288,7 +288,7 @@ export function Editor({
       {conflict && (
         <div
           role="alert"
-          className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-warning/30 bg-warning/10 px-6 py-2.5 text-[12px] text-warning"
+          className="flex flex-wrap items-center gap-x-3 gap-y-2 border-b border-warning/30 bg-warning/10 px-6 py-2.5 text-[0.75rem] text-warning"
         >
           <span className="flex items-center gap-2">
             <AlertTriangle className="size-3.5 shrink-0" aria-hidden />
@@ -313,7 +313,7 @@ export function Editor({
         </div>
       )}
       {saveError && (
-        <div className="flex items-start gap-2 border-b border-destructive/30 bg-destructive/10 px-6 py-2 text-[12px] text-destructive">
+        <div className="flex items-start gap-2 border-b border-destructive/30 bg-destructive/10 px-6 py-2 text-[0.75rem] text-destructive">
           <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
           <span className="leading-snug">Couldn&apos;t save: {saveError}</span>
         </div>
@@ -348,7 +348,7 @@ export function Editor({
         aria-autocomplete="list"
         aria-controls={open ? "nn-wikilink-listbox" : undefined}
         aria-activedescendant={open ? `nn-wikilink-option-${active}` : undefined}
-        className="nn-mono min-h-0 flex-1 resize-none bg-background px-6 py-6 text-[13px] leading-6 text-foreground/90 outline-none placeholder:text-muted-foreground/60"
+        className="nn-mono min-h-0 flex-1 resize-none bg-background px-6 py-6 text-[0.8125rem] leading-6 text-foreground/90 outline-none placeholder:text-muted-foreground/60"
         placeholder="Write in Markdown…"
       />
 
@@ -380,20 +380,20 @@ export function Editor({
                 onClick={() => applySuggestion(s)}
                 onMouseEnter={() => setActiveIndex(i)}
                 className={cn(
-                  "flex cursor-pointer items-baseline gap-2 rounded-md px-2 py-1.5 text-[13px] transition-colors",
+                  "flex cursor-pointer items-baseline gap-2 rounded-md px-2 py-1.5 text-[0.8125rem] transition-colors",
                   "ease-spring",                  i === active
                     ? "bg-accent text-accent-foreground"
                     : "text-foreground/90",
                 )}
               >
                 <span className="min-w-0 flex-1 truncate">{s.name}</span>
-                <span className="nn-mono max-w-[45%] shrink-0 truncate text-[10px] text-muted-foreground/70">
+                <span className="nn-mono max-w-[45%] shrink-0 truncate text-[0.625rem] text-muted-foreground/70">
                   {s.relPath}
                 </span>
               </li>
             ))}
           </ul>
-          <p className="border-t border-border bg-muted/40 px-2.5 py-1 text-[10px] leading-relaxed text-muted-foreground/70">
+          <p className="border-t border-border bg-muted/40 px-2.5 py-1 text-[0.625rem] leading-relaxed text-muted-foreground/70">
             ↑↓ navigate · ↵ link · esc dismiss
           </p>
         </div>

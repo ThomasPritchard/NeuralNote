@@ -11,6 +11,7 @@ function renderRibbon(over: Partial<RibbonProps> = {}) {
     centerView: "note",
     onShowFiles: vi.fn(),
     onShowSearch: vi.fn(),
+    onInsertTemplate: vi.fn(),
     onToggleGraph: vi.fn(),
     ...over,
   };
@@ -85,19 +86,26 @@ describe("Ribbon — callbacks", () => {
     expect(props.onToggleGraph).toHaveBeenCalledTimes(1);
   });
 
+  it("fires onInsertTemplate for the template button", async () => {
+    const props = renderRibbon();
+    await userEvent.click(
+      screen.getByRole("button", { name: "Insert from template" }),
+    );
+    expect(props.onInsertTemplate).toHaveBeenCalledTimes(1);
+  });
+
   it("has no Settings button — Settings lives in the titlebar", () => {
     renderRibbon();
     expect(screen.queryByRole("button", { name: /Settings/ })).not.toBeInTheDocument();
   });
 });
 
-describe("Ribbon — placeholders", () => {
-  it("keeps Capture as an aria-disabled coming-soon button", async () => {
+describe("Ribbon — live actions", () => {
+  it("exposes Insert from template as an enabled action", () => {
     const props = renderRibbon();
-    const btn = screen.getByRole("button", { name: "Capture (coming soon)" });
-    expect(btn).toHaveAttribute("aria-disabled", "true");
+    const btn = screen.getByRole("button", { name: "Insert from template" });
+    expect(btn).not.toHaveAttribute("aria-disabled");
     expect(btn).not.toHaveAttribute("aria-pressed");
-    await userEvent.click(btn);
     expect(props.onShowFiles).not.toHaveBeenCalled();
     expect(props.onShowSearch).not.toHaveBeenCalled();
     expect(props.onToggleGraph).not.toHaveBeenCalled();

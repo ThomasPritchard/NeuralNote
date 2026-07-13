@@ -1,7 +1,7 @@
 // Journeys 8–9: the safety rails.
-//   8. Unsaved-edit guard — navigating away (and the OS window-close path) from a
-//      dirty buffer raises the discard confirm; cancel keeps the buffer, discard
-//      proceeds.
+//   8. Unsaved-edit guard — note navigation preserves a dirty buffer in its own
+//      tab, while the destructive OS window-close path still requires explicit
+//      discard consent.
 //   9. Error surfacing — when a backend command rejects, the failure is shown in
 //      a real error channel; it is never swallowed.
 
@@ -34,28 +34,22 @@ const TWO_NOTES: SeedEntry[] = [
 ];
 
 describe("Journey 8: unsaved-edit guard", () => {
-  it("blocks navigation: cancel keeps the buffer, discard proceeds", async () => {
+  it("preserves a dirty note in its tab when navigating to another note", async () => {
     const ctx = await openVault(TWO_NOTES);
     const { user } = ctx;
     await openAndDirty(ctx);
 
-    // Attempt to open B → discard confirm appears.
+    // Opening B is non-destructive: the dirty A buffer stays in a background tab.
     await user.click(screen.getByRole("button", { name: "B.md" }));
-    let dialog = await screen.findByRole("alertdialog");
-    expect(within(dialog).getByText("Discard unsaved changes?")).toBeInTheDocument();
-
-    // Cancel → dialog dismissed, still editing A, buffer intact.
-    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
-    await waitFor(() => expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument());
-    expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "Note source" })).toBeInTheDocument();
-
-    // Try again → discard → B opens (read mode), buffer gone.
-    await user.click(screen.getByRole("button", { name: "B.md" }));
-    dialog = await screen.findByRole("alertdialog");
-    await user.click(within(dialog).getByRole("button", { name: "Discard" }));
     expect(await screen.findByRole("heading", { name: "B", level: 1 })).toBeInTheDocument();
-    expect(screen.queryByLabelText("Unsaved changes")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "A, unsaved changes" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "B" })).toHaveAttribute("aria-selected", "true");
+
+    // Returning to A restores its exact edit buffer rather than re-reading disk.
+    await user.click(screen.getByRole("tab", { name: "A, unsaved changes" }));
+    expect(screen.getByRole("textbox", { name: "Note source" })).toHaveValue("aaa body edit");
+    expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
   });
 
   it("intercepts the OS window-close request and destroys only on discard", async () => {

@@ -11,13 +11,12 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
-  LayoutTemplate,
   Pencil,
   Plus,
   Trash2,
 } from "lucide-react";
 import { cn } from "../lib/cn";
-import type { TemplateInfo, TreeNode } from "../lib/types";
+import type { TreeNode } from "../lib/types";
 import { iconForFile, isPathInside } from "./fileMeta";
 import { InlineInput } from "./InlineInput";
 
@@ -35,14 +34,8 @@ export interface TreeContext {
   creating: CreatingState | null;
   renaming: string | null;
   dragPath: string | null;
-  /** Vault templates offered while creating a note; empty = no picker (the
-   *  plain create flow, unchanged). */
-  templates: TemplateInfo[];
-  /** relPath of the chosen template, or null for a blank note. */
-  selectedTemplate: string | null;
-  onSelectTemplate: (relPath: string | null) => void;
   toggle: (relPath: string) => void;
-  onSelect: (path: string) => void;
+  onSelect: (path: string, openInNewTab: boolean) => void;
   onStartCreate: (parentPath: string, kind: CreateKind) => void;
   onStartRename: (path: string) => void;
   onDelete: (node: TreeNode) => void;
@@ -145,7 +138,7 @@ function FolderRow({
         onDoubleClick={() => ctx.onStartRename(node.path)}
         aria-expanded={isOpen}
         className={cn(
-          "flex min-w-0 flex-1 items-center gap-1 rounded-md px-1 py-1 text-left text-[13px] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
+          "flex min-w-0 flex-1 items-center gap-1 rounded-md px-1 py-1 text-left text-[0.8125rem] font-medium text-sidebar-foreground transition-colors hover:bg-sidebar-accent/40 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
           "ease-spring",        )}
       >
         <ChevronRight
@@ -161,7 +154,7 @@ function FolderRow({
           <Folder className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
         )}
         <span className="truncate">{node.name}</span>
-        <span className="nn-mono ml-auto pr-1 text-[10px] text-muted-foreground/60">
+        <span className="nn-mono ml-auto pr-1 text-[0.625rem] text-muted-foreground/60">
           {node.children?.length ?? 0}
         </span>
       </button>
@@ -226,7 +219,7 @@ function FileRow({ node, ctx }: Readonly<{ node: TreeNode; ctx: TreeContext }>) 
     >
       <button
         type="button"
-        onClick={() => ctx.onSelect(node.path)}
+        onClick={(event) => ctx.onSelect(node.path, event.metaKey)}
         onDoubleClick={() => ctx.onStartRename(node.path)}
         draggable
         onDragStart={(e) => {
@@ -237,7 +230,7 @@ function FileRow({ node, ctx }: Readonly<{ node: TreeNode; ctx: TreeContext }>) 
         onDragEnd={ctx.onDragEnd}
         aria-current={active || undefined}
         className={cn(
-          "flex min-w-0 flex-1 items-center gap-1.5 rounded-md py-[5px] pl-1.5 pr-2 text-left text-[13px] transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
+          "flex min-w-0 flex-1 items-center gap-1.5 rounded-md py-[5px] pl-1.5 pr-2 text-left text-[0.8125rem] transition focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
           "ease-spring",          active
             ? "bg-primary/12 text-foreground ring-1 ring-inset ring-primary/25"
             : "text-muted-foreground hover:bg-sidebar-accent/50 hover:text-foreground",
@@ -274,10 +267,7 @@ function FileRow({ node, ctx }: Readonly<{ node: TreeNode; ctx: TreeContext }>) 
   );
 }
 
-/** The inline "name your new note/folder" row shown inside the target folder.
- *  When the vault has templates and a note is being created, a compact picker
- *  appears under the name input (defaulting to "Blank note" — templates are
- *  strictly optional and add zero friction when unused). */
+/** The inline blank-note/folder creation row shown inside the target folder. */
 export function CreateRow({
   kind,
   ctx,
@@ -286,7 +276,6 @@ export function CreateRow({
   // the create session — InlineInput's blur-cancel is scoped to this row.
   const rowRef = useRef<HTMLDivElement>(null);
   const Icon = kind === "folder" ? Folder : iconForFile("md");
-  const showTemplates = kind === "note" && ctx.templates.length > 0;
 
   return (
     <div ref={rowRef} className="py-px pl-1.5 pr-1">
@@ -300,40 +289,6 @@ export function CreateRow({
           blurWithin={rowRef}
         />
       </div>
-      {showTemplates && (
-        <div className="mt-1 flex items-center gap-1.5 pl-5">
-          <LayoutTemplate
-            className="size-3 shrink-0 text-muted-foreground/70"
-            aria-hidden
-          />
-          <select
-            aria-label="Note template"
-            value={ctx.selectedTemplate ?? ""}
-            onChange={(e) =>
-              ctx.onSelectTemplate(e.target.value === "" ? null : e.target.value)
-            }
-            onKeyDown={(e) => {
-              if (e.key === "Enter") {
-                // Enter here means "done choosing" — hand focus back to the
-                // name input so the next Enter creates the note.
-                e.preventDefault();
-                rowRef.current?.querySelector("input")?.focus();
-              } else if (e.key === "Escape") {
-                e.preventDefault();
-                ctx.onCancelEdit();
-              }
-            }}
-            className="w-full min-w-0 cursor-pointer rounded-md border border-border bg-background px-1 py-[3px] text-[12px] text-muted-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
-          >
-            <option value="">Blank note</option>
-            {ctx.templates.map((t) => (
-              <option key={t.relPath} value={t.relPath}>
-                {t.name}
-              </option>
-            ))}
-          </select>
-        </div>
-      )}
     </div>
   );
 }

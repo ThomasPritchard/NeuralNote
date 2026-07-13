@@ -166,7 +166,7 @@ function requirementKey(r: Requirement): string {
 function StatusChip({ status }: Readonly<{ status: RequirementStatus }>) {
   if (status.status === "installed") {
     return (
-      <span className="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+      <span className="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[0.625rem] font-medium text-muted-foreground">
         <Check className="size-2.5" aria-hidden />
         Installed
       </span>
@@ -174,14 +174,14 @@ function StatusChip({ status }: Readonly<{ status: RequirementStatus }>) {
   }
   if (status.status === "undetected") {
     return (
-      <span className="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+      <span className="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[0.625rem] font-medium text-muted-foreground">
         <AlertTriangle className="size-2.5" aria-hidden />
         Couldn&apos;t check
       </span>
     );
   }
   return (
-    <span className="flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-[10px] font-medium text-destructive ring-1 ring-inset ring-destructive/30">
+    <span className="flex items-center gap-1 rounded-full bg-destructive/10 px-2 py-0.5 text-[0.625rem] font-medium text-destructive ring-1 ring-inset ring-destructive/30">
       <AlertTriangle className="size-2.5" aria-hidden />
       Missing
     </span>
@@ -197,7 +197,7 @@ function ReasonList({ reasons }: Readonly<{ reasons: readonly string[] }>) {
       {reasons.map((reason, i) => (
         <li
           key={`${reason}-${i}`}
-          className="text-[11px] leading-snug text-muted-foreground"
+          className="text-[0.6875rem] leading-snug text-muted-foreground"
         >
           {reason}
         </li>
@@ -364,7 +364,7 @@ export function SkillsSettingsPage() {
         <h3 className="nn-heading text-sm font-semibold text-foreground">
           Skills
         </h3>
-        <p className="text-[12px] leading-relaxed text-muted-foreground">
+        <p className="text-[0.75rem] leading-relaxed text-muted-foreground">
           Built-in workflows the AI can run in chat. Add one to a message by
           typing @ in the composer; switch one off to keep it out of the picker.
         </p>
@@ -407,10 +407,10 @@ export function SkillsSettingsPage() {
                   <Icon className="size-4" aria-hidden />
                 </span>
                 <div className="min-w-0 flex-1">
-                  <h4 className="nn-heading text-[13px] font-semibold text-foreground">
+                  <h4 className="nn-heading text-[0.8125rem] font-semibold text-foreground">
                     {skill.name}
                   </h4>
-                  <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+                  <p className="mt-0.5 text-[0.6875rem] leading-snug text-muted-foreground">
                     {skill.description}
                   </p>
                 </div>
@@ -432,7 +432,7 @@ export function SkillsSettingsPage() {
                 )}
 
                 {skill.requirements.length === 0 ? (
-                  <p className="text-[11px] text-muted-foreground">
+                  <p className="text-[0.6875rem] text-muted-foreground">
                     No extra software needed.
                   </p>
                 ) : (
@@ -459,7 +459,7 @@ export function SkillsSettingsPage() {
                             className="flex flex-col gap-1.5 rounded-lg bg-background/50 px-3 py-2 ring-1 ring-inset ring-border"
                           >
                             <div className="flex flex-wrap items-center gap-2">
-                              <span className="text-[12px] font-medium text-foreground">
+                              <span className="text-[0.75rem] font-medium text-foreground">
                                 {label.prefix}
                                 <span className={cn(label.mono && "nn-mono")}>
                                   {label.text}
@@ -473,7 +473,7 @@ export function SkillsSettingsPage() {
                             <ReasonList reasons={statusReasons(req.status)} />
                             {downloading && download && (
                               <div className="flex flex-col gap-1.5">
-                                <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                                <div className="flex items-center justify-between gap-2 text-[0.6875rem] text-muted-foreground">
                                   <span className="min-w-0 truncate">
                                     {download.status}
                                   </span>

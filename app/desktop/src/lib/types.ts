@@ -25,6 +25,18 @@ export type { Backlink } from "./bindings/Backlink";
 export type { UnlinkedMention } from "./bindings/UnlinkedMention";
 export type { Backlinks } from "./bindings/Backlinks";
 
+// ── Generated: global preferences + vault template settings ────────────────
+export type { AppPreferences } from "./bindings/AppPreferences";
+export type { AppPreferencesLoad } from "./bindings/AppPreferencesLoad";
+export type { ThemeId } from "./bindings/ThemeId";
+export type { FontScale } from "./bindings/FontScale";
+export type { FontFamily } from "./bindings/FontFamily";
+export type { TemplateSettings } from "./bindings/TemplateSettings";
+export type { TemplateSettingsStatus } from "./bindings/TemplateSettingsStatus";
+export type { TemplateSettingsSource } from "./bindings/TemplateSettingsSource";
+export type { WorkspaceState } from "./bindings/WorkspaceState";
+export type { WorkspaceStateLoad } from "./bindings/WorkspaceStateLoad";
+
 // ── Generated: error contract (crates/neuralnote-core/src/error.rs) ───────────
 // A discriminated union over `kind` — the exact adjacently-tagged wire shape, so
 // `e.kind === "conflict"` narrows and every member carries `message`.

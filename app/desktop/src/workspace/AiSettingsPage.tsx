@@ -18,7 +18,7 @@ import { InlineError } from "./ProviderCard";
 /** Header chip mirroring ChatPane's StatusPill: the *effective* provider. */
 function CurrentProviderChip({ status }: Readonly<{ status: AiStatus | null }>) {
   const base =
-    "flex shrink-0 items-center gap-1.5 rounded-full bg-background/50 px-2.5 py-1 text-[11px] ring-1 ring-inset ring-border";
+    "flex shrink-0 items-center gap-1.5 rounded-full bg-background/50 px-2.5 py-1 text-[0.6875rem] ring-1 ring-inset ring-border";
   if (!status) {
     return (
       <output className={cn(base, "text-muted-foreground/70")}>
@@ -132,7 +132,7 @@ export function AiSettingsPage() {
           </h3>
           <CurrentProviderChip status={status} />
         </div>
-        <p className="text-[12px] leading-relaxed text-muted-foreground">
+        <p className="text-[0.75rem] leading-relaxed text-muted-foreground">
           Choose where cited chat runs. You can switch providers at any time.
         </p>
         {statusError && (

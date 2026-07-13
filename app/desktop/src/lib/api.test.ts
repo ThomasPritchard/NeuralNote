@@ -32,6 +32,7 @@ import {
   listRecentVaults,
   listSkills,
   listTemplates,
+  loadWorkspaceState,
   moveEntry,
   onMenu,
   onTreeChanged,
@@ -44,6 +45,9 @@ import {
   readNote,
   readTree,
   renameEntry,
+  resetWorkspaceState,
+  quitApp,
+  saveWorkspaceState,
   searchVault,
   setSkillEnabled,
   setMenuEditing,
@@ -302,6 +306,34 @@ describe("skills-bank wrappers", () => {
 });
 
 describe("vault lifecycle wrappers", () => {
+  it("quits only through the explicit confirmation command", async () => {
+    await quitApp();
+    expect(mockInvoke).toHaveBeenCalledWith("quit_app");
+  });
+
+  it("loads, saves, and resets vault workspace state through the typed IPC seam", async () => {
+    const state = {
+      openPaths: ["Ideas.md", "Projects/Plan.md"],
+      activePath: "Projects/Plan.md",
+    };
+    const loaded = {
+      state,
+      recoveredFromCorrupt: false,
+      recoveryMessage: null,
+    };
+    mockInvoke.mockResolvedValueOnce(loaded);
+
+    await expect(loadWorkspaceState()).resolves.toEqual(loaded);
+    expect(mockInvoke).toHaveBeenCalledWith("load_workspace_state");
+
+    await saveWorkspaceState(state);
+    expect(mockInvoke).toHaveBeenCalledWith("save_workspace_state", { state });
+
+    mockInvoke.mockResolvedValueOnce(loaded);
+    await expect(resetWorkspaceState()).resolves.toEqual(loaded);
+    expect(mockInvoke).toHaveBeenCalledWith("reset_workspace_state");
+  });
+
   it("listRecentVaults calls list_recent_vaults", async () => {
     mockInvoke.mockResolvedValueOnce([{ name: "v", path: "/v", lastOpened: 1 }]);
     const out = await listRecentVaults();

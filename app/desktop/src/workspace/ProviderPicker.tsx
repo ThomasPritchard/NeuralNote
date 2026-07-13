@@ -33,8 +33,8 @@ function ProviderOption({
         <Icon className="size-4" aria-hidden />
       </span>
       <span className="flex min-w-0 flex-1 flex-col gap-0.5">
-        <span className="text-[13px] font-medium text-foreground/90">{title}</span>
-        <span className="text-[11px] leading-snug text-muted-foreground">
+        <span className="text-[0.8125rem] font-medium text-foreground/90">{title}</span>
+        <span className="text-[0.6875rem] leading-snug text-muted-foreground">
           {description}
         </span>
       </span>
@@ -62,8 +62,8 @@ export function ProviderPicker({
         <span className="grid size-11 place-items-center rounded-xl bg-primary/10 text-primary ring-1 ring-inset ring-primary/20">
           <Sparkles className="size-5" aria-hidden />
         </span>
-        <p className="text-[14px] font-medium text-foreground/90">Choose your AI</p>
-        <p className="mx-auto max-w-[17rem] text-[12px] leading-relaxed text-muted-foreground">
+        <p className="text-[0.875rem] font-medium text-foreground/90">Choose your AI</p>
+        <p className="mx-auto max-w-[17rem] text-[0.75rem] leading-relaxed text-muted-foreground">
           Cited chat needs a model. Bring an OpenRouter key, or run one privately
           on this machine.
         </p>
@@ -87,7 +87,7 @@ export function ProviderPicker({
       <button
         type="button"
         onClick={onSkip}
-        className="mx-auto rounded text-[12px] text-muted-foreground underline decoration-muted-foreground/40 underline-offset-2 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+        className="mx-auto rounded text-[0.75rem] text-muted-foreground underline decoration-muted-foreground/40 underline-offset-2 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
       >
         Skip for now
       </button>

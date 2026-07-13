@@ -46,6 +46,8 @@ export interface UserMessage {
 
 export interface AssistantMessage {
   role: "assistant";
+  /** The last progress phase backed by an actual transport/backend event. */
+  phase: "sending" | "thinking" | "searching" | "reading" | "verifying";
   skillActivations: Array<{ id: string; name: string }>;
   skillSteps: string[];
   pendingElicitation: PendingElicitation | null;
@@ -77,6 +79,7 @@ export function userMessage(content: string): UserMessage {
 export function emptyAssistant(reasoningRequested = false): AssistantMessage {
   return {
     role: "assistant",
+    phase: "sending",
     skillActivations: [],
     skillSteps: [],
     pendingElicitation: null,
@@ -164,6 +167,8 @@ export function reduceAssistant(
   event: ChatEvent,
 ): AssistantMessage {
   switch (event.type) {
+    case "processing":
+      return { ...turn, phase: "thinking" };
     case "skillActivated":
       return {
         ...turn,
@@ -193,21 +198,34 @@ export function reduceAssistant(
         ],
       };
     case "searching":
-      return { ...turn, activity: [...turn.activity, { kind: "search", query: event.query }] };
+      return {
+        ...turn,
+        phase: "searching",
+        activity: [...turn.activity, { kind: "search", query: event.query }],
+      };
     case "retrieved":
       return { ...turn, activity: withHitCount(turn.activity, event.query, event.hitCount) };
     case "reading":
       return {
         ...turn,
+        phase: "reading",
         activity: [
           ...turn.activity,
           { kind: "reading", relPath: event.relPath, startLine: event.startLine, endLine: event.endLine },
         ],
       };
     case "verifying":
-      return { ...turn, activity: [...turn.activity, { kind: "verifying" }] };
+      return {
+        ...turn,
+        phase: "verifying",
+        activity: [...turn.activity, { kind: "verifying" }],
+      };
     case "citationDropped":
-      return { ...turn, activity: [...turn.activity, { kind: "dropped", reason: event.reason }] };
+      return {
+        ...turn,
+        phase: "verifying",
+        activity: [...turn.activity, { kind: "dropped", reason: event.reason }],
+      };
     case "thinking":
       return { ...turn, thinking: turn.thinking + event.delta };
     case "answer":

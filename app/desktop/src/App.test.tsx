@@ -14,6 +14,9 @@ vi.mock("./welcome/Welcome", () => ({
 vi.mock("./workspace/Workspace", () => ({
   Workspace: () => <div>workspace-screen</div>,
 }));
+vi.mock("./updates/UpdateCoordinator", () => ({
+  UpdateCoordinator: ({ children }: { children: ReactNode }) => <>{children}</>,
+}));
 
 import App from "./App";
 

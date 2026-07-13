@@ -10,6 +10,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import { MENU_ACTION, TREE_CHANGED } from "./bindings/events";
 import type {
   AiStatus,
+  AppPreferences,
+  AppPreferencesLoad,
   ApiKeyStatus,
   Backlinks,
   CandidateModel,
@@ -28,10 +30,33 @@ import type {
   SearchResponse,
   SkillListing,
   TemplateInfo,
+  TemplateSettings,
+  TemplateSettingsStatus,
   TreeNode,
   UndoReport,
   Vault,
+  WorkspaceState,
+  WorkspaceStateLoad,
 } from "./types";
+
+// ── Global preferences + per-vault template settings ──────────────────────
+export const loadAppPreferences = () =>
+  invoke<AppPreferencesLoad>("load_app_preferences");
+
+export const saveAppPreferences = (preferences: AppPreferences) =>
+  invoke<void>("save_app_preferences", { preferences });
+
+export const loadTemplateSettings = () =>
+  invoke<TemplateSettingsStatus>("load_template_settings");
+
+export const saveTemplateSettings = (settings: TemplateSettings) =>
+  invoke<TemplateSettingsStatus>("save_template_settings", { settings });
+
+export const resetTemplateSettings = () =>
+  invoke<TemplateSettingsStatus>("reset_template_settings");
+
+export const pickTemplateFolder = () =>
+  invoke<string | null>("pick_template_folder");
 
 /** Normalise a thrown Tauri error (a serialised CoreError, or anything) to a
  *  message string the UI can show. Failures are surfaced, never swallowed. */
@@ -78,6 +103,20 @@ export const createVault = (parentDir: string, name: string) =>
   invoke<Vault>("create_vault", { parentDir, name });
 
 export const closeVault = () => invoke<void>("close_vault");
+
+/** Complete a user-confirmed application quit. Native Quit requests are first
+ *  intercepted by Rust and routed through the unsaved-edit guard; only that
+ *  guard (or the welcome/loading shell, where no drafts exist) calls this. */
+export const quitApp = () => invoke<void>("quit_app");
+
+export const loadWorkspaceState = () =>
+  invoke<WorkspaceStateLoad>("load_workspace_state");
+
+export const saveWorkspaceState = (state: WorkspaceState) =>
+  invoke<void>("save_workspace_state", { state });
+
+export const resetWorkspaceState = () =>
+  invoke<WorkspaceStateLoad>("reset_workspace_state");
 
 /**
  * Tell the native menu whether a note is open in edit mode, so it can enable the
@@ -158,13 +197,11 @@ export const createNoteFromTemplate = (
 export const onTreeChanged = (cb: () => void): Promise<UnlistenFn> =>
   listen(TREE_CHANGED, () => cb());
 
-/** Every action the native menu can emit. Kept in lockstep with the Rust menu's
- *  item ids (src-tauri/src/menu.rs `CUSTOM_ACTIONS`) except `open-recent`, which
- *  is in this union but deliberately not that list: Rust synthesizes it from the
- *  `open-recent:` prefix in `parse_menu_id`. Reconciling the lists naively is a
- *  trap — adding `open-recent` to `CUSTOM_ACTIONS` is inert, and deleting it here
- *  breaks Open Recent. Predefined items (undo/copy/quit…) are handled natively by
- *  the OS and never reach here. */
+/** Every action the native shell can emit. Kept in lockstep with the Rust menu's
+ *  item ids (src-tauri/src/menu.rs `CUSTOM_ACTIONS`) except `open-recent` and
+ *  `quit-app`: Rust synthesizes the former from the recent-path prefix and the
+ *  latter when a predefined native Quit reaches `RunEvent::ExitRequested`.
+ *  Other predefined items (undo/copy/etc.) stay entirely native. */
 // TODO(menu-action-bindings): parity with Rust's `CUSTOM_ACTIONS` is
 // hand-maintained and unenforced while sibling event names are generated
 // (`event_names.rs` -> `bindings/events.ts`, gated by `rust-quality-gate.sh`).
@@ -176,6 +213,9 @@ export type MenuAction =
   | "new-folder"
   | "open-vault"
   | "open-recent"
+  | "close-tab"
+  | "close-window"
+  | "quit-app"
   | "close-vault"
   | "save"
   | "search"

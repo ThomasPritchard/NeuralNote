@@ -60,6 +60,10 @@ function run(events: ChatEvent[]): AssistantMessage {
 }
 
 describe("emptyAssistant", () => {
+  it("starts in the sending phase", () => {
+    expect(emptyAssistant().phase).toBe("sending");
+  });
+
   it("defaults reasoning to not requested", () => {
     expect(emptyAssistant().reasoningRequested).toBe(false);
   });
@@ -74,6 +78,29 @@ describe("emptyAssistant", () => {
     expect(turn.skillSteps).toEqual([]);
     expect(turn.pendingElicitation).toBeNull();
     expect(turn.writtenNotes).toEqual([]);
+  });
+});
+
+describe("reduceAssistant — grounded progress", () => {
+  it("moves through only phases confirmed by backend events", () => {
+    let turn = emptyAssistant();
+
+    turn = reduceAssistant(turn, { type: "processing" });
+    expect(turn.phase).toBe("thinking");
+
+    turn = reduceAssistant(turn, { type: "searching", query: "active recall" });
+    expect(turn.phase).toBe("searching");
+
+    turn = reduceAssistant(turn, {
+      type: "reading",
+      relPath: "Learning.md",
+      startLine: 3,
+      endLine: 8,
+    });
+    expect(turn.phase).toBe("reading");
+
+    turn = reduceAssistant(turn, { type: "verifying" });
+    expect(turn.phase).toBe("verifying");
   });
 });
 

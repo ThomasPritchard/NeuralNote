@@ -60,7 +60,7 @@ function count(n: number, one: string, many: string): string {
 // the workspace — never an emoji) plus the step's line. The most recent step of
 // an in-flight run reads as "active" (violet glyph); everything settled is calm
 // and muted, so the trace looks like an agent working, not debug output.
-const ROW = "flex items-start gap-2 text-[11px] leading-snug";
+const ROW = "flex items-start gap-2 text-[0.6875rem] leading-snug";
 const GLYPH = "size-3.5 shrink-0 translate-y-px";
 
 function ActivityRow({
@@ -210,11 +210,11 @@ function YoutubeRequirementCard({ requirement }: Readonly<{ requirement: "yt-dlp
           )}
         </span>
         <div className="min-w-0 flex-1">
-          <h3 className="text-[12px] font-semibold text-foreground">
+          <h3 className="text-[0.75rem] font-semibold text-foreground">
             {install.status === "ready" ? "YouTube imports are ready" : "Set up YouTube imports"}
           </h3>
           {install.status !== "ready" && (
-            <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+            <p className="mt-0.5 text-[0.6875rem] leading-relaxed text-muted-foreground">
               YouTube imports need yt-dlp, and it isn&apos;t installed yet. NeuralNote can
               download its pinned, verified copy for you.
             </p>
@@ -227,7 +227,7 @@ function YoutubeRequirementCard({ requirement }: Readonly<{ requirement: "yt-dlp
             aria-atomic="true"
             className={
               install.status === "ready"
-                ? "mt-0.5 block text-[11px] leading-relaxed text-muted-foreground"
+                ? "mt-0.5 block text-[0.6875rem] leading-relaxed text-muted-foreground"
                 : "sr-only"
             }
           >
@@ -240,7 +240,7 @@ function YoutubeRequirementCard({ requirement }: Readonly<{ requirement: "yt-dlp
 
       {active && (
         <output className="flex flex-col gap-1.5">
-          <span className="flex items-center justify-between gap-2 text-[10px] text-muted-foreground">
+          <span className="flex items-center justify-between gap-2 text-[0.625rem] text-muted-foreground">
             <span className="min-w-0 truncate">
               {install.status === "cancelling" ? "Cancelling…" : install.label}
             </span>
@@ -258,7 +258,7 @@ function YoutubeRequirementCard({ requirement }: Readonly<{ requirement: "yt-dlp
       {install.status === "error" && (
         <p
           role="alert"
-          className="break-words rounded-md border border-destructive/30 bg-destructive/10 px-2.5 py-2 text-[11px] leading-snug text-destructive"
+          className="break-words rounded-md border border-destructive/30 bg-destructive/10 px-2.5 py-2 text-[0.6875rem] leading-snug text-destructive"
         >
           Couldn&apos;t install yt-dlp: {install.message}
         </p>
@@ -300,11 +300,11 @@ function SkillActivations({
       {activations.map((activation) => (
         <p
           key={activation.id}
-          className="flex items-center gap-1.5 border-b border-border/50 pb-1.5 text-[11px] font-medium text-foreground/85"
+          className="flex items-center gap-1.5 border-b border-border/50 pb-1.5 text-[0.6875rem] font-medium text-foreground/85"
         >
           <Wand2 className="size-3.5 shrink-0 text-primary" aria-hidden />
           <span className="min-w-0 truncate">{activation.name}</span>
-          <span className="ml-auto shrink-0 text-[9px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/60">
+          <span className="ml-auto shrink-0 text-[0.5625rem] font-semibold uppercase tracking-[0.08em] text-muted-foreground/60">
             Skill
           </span>
         </p>
@@ -383,17 +383,42 @@ function SkillSteps({
 // hidden ones; the window's height is reserved so it can't jitter as rows roll.
 const LIVE_WINDOW_CAP = 3;
 
-/** The live header verb, tracking the phase the run is actually in — so it never
- *  claims "Searching" while it's reading or verifying. */
-function livePhase(grouped: GroupedStep[]): string {
-  switch (grouped.at(-1)?.kind) {
+const PLAYFUL_PROGRESS_COPY = [
+  { sending: "Sending message", thinking: "Thinking" },
+  { sending: "Dispatching a tiny messenger", thinking: "Connecting the dots" },
+  {
+    sending: "Knocking on the model's door",
+    thinking: "Rummaging through the mental drawers",
+  },
+  { sending: "Launching a thought balloon", thinking: "Consulting the inner librarian" },
+] as const;
+
+/** Pick one voice for the whole turn. The prompt-derived hash makes the choice
+ * stable across React renders and phase changes without persisting UI trivia or
+ * introducing random, flaky behaviour. */
+function playfulProgressCopy(prompt: string) {
+  let hash = 2_166_136_261;
+  for (let index = 0; index < prompt.length; index += 1) {
+    hash ^= prompt.charCodeAt(index);
+    hash = Math.imul(hash, 16_777_619);
+  }
+  return PLAYFUL_PROGRESS_COPY[(hash >>> 0) % PLAYFUL_PROGRESS_COPY.length];
+}
+
+/** A phase is visible only after the event that grounds it arrives. */
+function livePhase(phase: AssistantMessage["phase"], prompt: string): string {
+  const playful = playfulProgressCopy(prompt);
+  switch (phase) {
+    case "sending":
+      return playful.sending;
+    case "thinking":
+      return playful.thinking;
+    case "searching":
+      return "Searching your vault";
     case "reading":
       return "Reading notes";
     case "verifying":
-    case "dropped":
       return "Verifying citations";
-    default:
-      return "Searching your vault";
   }
 }
 
@@ -405,13 +430,20 @@ function livePhase(grouped: GroupedStep[]): string {
 function LiveActivity({
   grouped,
   totalSteps,
-}: Readonly<{ grouped: GroupedStep[]; totalSteps: number }>) {
+  phase,
+  prompt,
+}: Readonly<{
+  grouped: GroupedStep[];
+  totalSteps: number;
+  phase: AssistantMessage["phase"];
+  prompt: string;
+}>) {
   const shown = grouped.slice(-LIVE_WINDOW_CAP);
   const offset = grouped.length - shown.length;
   const lastShown = shown.length - 1;
   return (
     <div className="flex flex-col gap-1.5">
-      <p className="flex items-center gap-2 text-[11px] font-medium text-muted-foreground/90">
+      <p className="flex items-center gap-2 text-[0.6875rem] font-medium text-muted-foreground/90">
         <Loader2
           className="size-3.5 shrink-0 animate-spin text-primary motion-reduce:animate-none"
           aria-hidden
@@ -420,7 +452,7 @@ function LiveActivity({
             The step tally is aria-hidden so its per-step churn stays silent.
             <output> carries an implicit status role (and renders inline, like
             the span it replaced). */}
-        <output>{livePhase(grouped)}</output>
+        <output>{livePhase(phase, prompt)}</output>
         {totalSteps > 0 && (
           <span aria-hidden className="font-normal text-muted-foreground/60">
             · {count(totalSteps, "step", "steps")}
@@ -531,7 +563,7 @@ function ActivitySummaryDisclosure({
   return (
     <details
       open={open}
-      className="group rounded-lg border border-border/60 bg-background/30 px-2.5 py-1.5 text-[11px] text-muted-foreground"
+      className="group rounded-lg border border-border/60 bg-background/30 px-2.5 py-1.5 text-[0.6875rem] text-muted-foreground"
     >
       <summary className="flex cursor-pointer list-none select-none items-center gap-1.5 font-medium text-muted-foreground/90 [&::-webkit-details-marker]:hidden">
         <ChevronRight
@@ -557,7 +589,7 @@ function StoppedActivity({
 }: Readonly<{ grouped: GroupedStep[]; summary: ActivitySummary }>) {
   return (
     <div className="flex flex-col gap-1.5">
-      <p className="text-[11px] font-medium text-muted-foreground/90">
+      <p className="text-[0.6875rem] font-medium text-muted-foreground/90">
         Stopped — {count(summary.searches, "search", "searches")} ·{" "}
         {count(summary.notesRead, "note", "notes")}
       </p>
@@ -573,19 +605,23 @@ function StoppedActivity({
 //     inline (no chevron guarding a row or two); empty activity renders nothing.
 function ActivityTrace({
   activity,
+  phase,
+  prompt,
   answering,
   done,
   errored,
-  suppressEmptyLive,
+  suppressLive,
 }: Readonly<{
   activity: ActivityStep[];
+  phase: AssistantMessage["phase"];
+  prompt: string;
   answering: boolean;
   done: boolean;
   errored: boolean;
   /** A skill narrative (header/steps/question) is already carrying the live
    *  view — an empty retrieval trace must not add a "Searching your vault"
    *  spinner over a run that isn't searching (it may be waiting on the user). */
-  suppressEmptyLive: boolean;
+  suppressLive: boolean;
 }>) {
   const grouped = groupActivity(activity);
   const summary = summarizeActivity(activity);
@@ -599,8 +635,15 @@ function ActivityTrace({
 
   // Still searching/reading/verifying, no answer yet: the live "watch it work" view.
   if (!done && !answering) {
-    if (grouped.length === 0 && suppressEmptyLive) return null;
-    return <LiveActivity grouped={grouped} totalSteps={summary.totalSteps} />;
+    if (suppressLive) return null;
+    return (
+      <LiveActivity
+        grouped={grouped}
+        totalSteps={summary.totalSteps}
+        phase={phase}
+        prompt={prompt}
+      />
+    );
   }
 
   // Settled: an answer with no trace shows nothing; a short trace stays inline; a
@@ -621,7 +664,7 @@ function ActivityTrace({
 function Reasoning({ text }: Readonly<{ text: string }>) {
   if (text.trim() === "") return null;
   return (
-    <details className="group rounded-lg border border-border/60 bg-background/30 px-2.5 py-1.5 text-[11px] text-muted-foreground">
+    <details className="group rounded-lg border border-border/60 bg-background/30 px-2.5 py-1.5 text-[0.6875rem] text-muted-foreground">
       <summary className="flex cursor-pointer list-none select-none items-center gap-1.5 font-medium text-muted-foreground/90 [&::-webkit-details-marker]:hidden">
         <ChevronRight
           className="size-3 shrink-0 text-muted-foreground/60 transition-transform group-open:rotate-90 motion-reduce:transition-none"
@@ -653,7 +696,7 @@ function NothingFoundCard({ terms }: Readonly<{ terms: string[] }>) {
   });
   return (
     <div className="flex flex-col gap-2 rounded-lg border border-border/60 bg-background/30 px-3 py-2.5">
-      <p className="flex items-center gap-1.5 text-[11px] font-medium text-foreground/80">
+      <p className="flex items-center gap-1.5 text-[0.6875rem] font-medium text-foreground/80">
         <SearchX className="size-3.5 shrink-0 text-muted-foreground/70" aria-hidden />
         Nothing in your vault covers this
       </p>
@@ -661,13 +704,13 @@ function NothingFoundCard({ terms }: Readonly<{ terms: string[] }>) {
         {keyed.map(({ term, key }) => (
           <li
             key={key}
-            className="nn-mono rounded-full bg-muted/40 px-2 py-0.5 text-[10px] text-muted-foreground ring-1 ring-inset ring-border"
+            className="nn-mono rounded-full bg-muted/40 px-2 py-0.5 text-[0.625rem] text-muted-foreground ring-1 ring-inset ring-border"
           >
             {term}
           </li>
         ))}
       </ul>
-      <p className="text-[11px] leading-snug text-muted-foreground">
+      <p className="text-[0.6875rem] leading-snug text-muted-foreground">
         Answers only come from your notes. Research this and add a note, then
         ask again.
       </p>
@@ -698,7 +741,7 @@ function SourceChip({
   const sourceBody = (
     <>
       <span
-        className="nn-mono flex min-w-0 max-w-full items-center gap-1.5 text-[10px] text-primary/90"
+        className="nn-mono flex min-w-0 max-w-full items-center gap-1.5 text-[0.625rem] text-primary/90"
         title={`${citation.relPath}:${citation.startLine}`}
       >
         <FileText className="size-3 shrink-0 opacity-80" aria-hidden />
@@ -706,7 +749,7 @@ function SourceChip({
           {citation.relPath}:{citation.startLine}
         </span>
       </span>
-      <span className="line-clamp-2 break-words border-l border-border pl-2 text-[11px] italic leading-snug text-muted-foreground">
+      <span className="line-clamp-2 break-words border-l border-border pl-2 text-[0.6875rem] italic leading-snug text-muted-foreground">
         “{citation.text}”
       </span>
     </>
@@ -735,7 +778,7 @@ function SourceChip({
             onClick={() => void openTimestamp()}
             disabled={openingTimestamp}
             aria-label={`Watch at ${timestampJump.label} on YouTube`}
-            className="nn-mono flex w-full items-center gap-1.5 border-t border-border/60 px-2.5 py-1.5 text-left text-[10px] font-medium text-primary/90 transition-colors hover:bg-primary/[0.08] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-primary disabled:text-muted-foreground"
+            className="nn-mono flex w-full items-center gap-1.5 border-t border-border/60 px-2.5 py-1.5 text-left text-[0.625rem] font-medium text-primary/90 transition-colors hover:bg-primary/[0.08] focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-inset focus-visible:ring-primary disabled:text-muted-foreground"
           >
             {openingTimestamp ? (
               <Loader2 className="size-3 animate-spin motion-reduce:animate-none" aria-hidden />
@@ -747,7 +790,7 @@ function SourceChip({
           {timestampError !== null && (
             <p
               role="alert"
-              className="break-words border-t border-destructive/30 bg-destructive/10 px-2.5 py-1.5 text-[10px] leading-snug text-destructive"
+              className="break-words border-t border-destructive/30 bg-destructive/10 px-2.5 py-1.5 text-[0.625rem] leading-snug text-destructive"
             >
               {timestampError}
             </p>
@@ -768,7 +811,7 @@ function Sources({
   if (citations.length === 0) return null;
   return (
     <div className="flex flex-col gap-1.5">
-      <p className="text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/70">
+      <p className="text-[0.625rem] font-semibold uppercase tracking-[0.08em] text-muted-foreground/70">
         Sources
       </p>
       <ul aria-label="Cited sources" className="flex flex-col gap-1.5">
@@ -790,7 +833,7 @@ function CoverageFooter({ coverage }: Readonly<{ coverage: CoverageView }>) {
   const { truncated, skippedFiles } = coverage;
   if (!truncated && skippedFiles === 0) return null;
   return (
-    <div className="flex flex-col gap-1.5 border-t border-border/50 pt-2.5 text-[10px] leading-snug text-muted-foreground/70">
+    <div className="flex flex-col gap-1.5 border-t border-border/50 pt-2.5 text-[0.625rem] leading-snug text-muted-foreground/70">
       {/* Partial coverage is surfaced, never hidden — thin support must not read
           as if the whole vault was seen. Calm, token-only notice (mirrors
           SearchPanel's truncation banner): visible, not alarming. */}
@@ -810,7 +853,9 @@ function CoverageFooter({ coverage }: Readonly<{ coverage: CoverageView }>) {
 
 function AssistantTurn({
   turn,
+  prompt,
   onOpenCitation,
+  onOpenNote,
   onSendFollowUp,
   busy,
   runId,
@@ -818,7 +863,9 @@ function AssistantTurn({
   onElicitAnswered,
 }: Readonly<{
   turn: AssistantMessage;
+  prompt: string;
   onOpenCitation: (citation: CitationView) => void;
+  onOpenNote: (relPath: string) => void;
   /** Issues an ordinary chat turn (a dormant elicitation's late answer). */
   onSendFollowUp: (text: string) => void;
   /** A run is streaming somewhere in the pane — late sends must wait. */
@@ -853,10 +900,12 @@ function AssistantTurn({
       />
       <ActivityTrace
         activity={turn.activity}
+        phase={turn.phase}
+        prompt={prompt}
         answering={answering}
         done={turn.done}
         errored={turn.error !== null}
-        suppressEmptyLive={hasSkillNarrative}
+        suppressLive={hasSkillNarrative}
       />
       <Reasoning text={turn.thinking} />
       {turn.pendingElicitation !== null && (
@@ -877,7 +926,7 @@ function AssistantTurn({
         // narrow measure, with outer block margins collapsed so it sits flush.
         <div
           aria-live="polite"
-          className="text-[13px] leading-6 text-foreground/90 [&_.nn-markdown>:first-child]:mt-0 [&_.nn-markdown>:last-child]:mb-0 [&_.nn-markdown_h1]:mt-4 [&_.nn-markdown_h1]:text-base [&_.nn-markdown_h2]:mt-3.5 [&_.nn-markdown_h2]:text-[15px] [&_.nn-markdown_h3]:mt-3 [&_.nn-markdown_h3]:text-[13px] [&_.nn-markdown_li]:leading-6 [&_.nn-markdown_ol]:my-2 [&_.nn-markdown_ol]:text-[13px] [&_.nn-markdown_p]:my-2 [&_.nn-markdown_p]:text-[13px] [&_.nn-markdown_p]:leading-6 [&_.nn-markdown_pre]:my-2 [&_.nn-markdown_pre]:text-[12px] [&_.nn-markdown_ul]:my-2 [&_.nn-markdown_ul]:text-[13px]"
+          className="text-[0.8125rem] leading-6 text-foreground/90 [&_.nn-markdown>:first-child]:mt-0 [&_.nn-markdown>:last-child]:mb-0 [&_.nn-markdown_h1]:mt-4 [&_.nn-markdown_h1]:text-base [&_.nn-markdown_h2]:mt-3.5 [&_.nn-markdown_h2]:text-[0.9375rem] [&_.nn-markdown_h3]:mt-3 [&_.nn-markdown_h3]:text-[0.8125rem] [&_.nn-markdown_li]:leading-6 [&_.nn-markdown_ol]:my-2 [&_.nn-markdown_ol]:text-[0.8125rem] [&_.nn-markdown_p]:my-2 [&_.nn-markdown_p]:text-[0.8125rem] [&_.nn-markdown_p]:leading-6 [&_.nn-markdown_pre]:my-2 [&_.nn-markdown_pre]:text-[0.75rem] [&_.nn-markdown_ul]:my-2 [&_.nn-markdown_ul]:text-[0.8125rem]"
         >
           <Markdown body={answer} />
         </div>
@@ -892,6 +941,7 @@ function AssistantTurn({
           done={turn.done}
           partial={isPartialSkillRun(turn)}
           provenance={modelReportedProvenance(turn)}
+          onOpen={onOpenNote}
         />
       )}
       <Sources citations={turn.citations} onOpen={onOpenCitation} />
@@ -899,7 +949,7 @@ function AssistantTurn({
       {turn.error && (
         <div
           role="alert"
-          className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[12px] text-destructive"
+          className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[0.75rem] text-destructive"
         >
           <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
           <span className="min-w-0 flex-1 break-words leading-snug">{turn.error}</span>
@@ -912,7 +962,7 @@ function AssistantTurn({
 function UserBubble({ content }: Readonly<{ content: string }>) {
   return (
     <div className="flex justify-end">
-      <p className="max-w-[85%] whitespace-pre-wrap rounded-xl rounded-br-sm bg-primary/15 px-3 py-2 text-[13px] leading-snug text-foreground ring-1 ring-inset ring-primary/25">
+      <p className="max-w-[85%] whitespace-pre-wrap rounded-xl rounded-br-sm bg-primary/15 px-3 py-2 text-[0.8125rem] leading-snug text-foreground ring-1 ring-inset ring-primary/25">
         {content}
       </p>
     </div>
@@ -922,12 +972,14 @@ function UserBubble({ content }: Readonly<{ content: string }>) {
 export function ChatMessages({
   messages,
   onOpenCitation,
+  onOpenNote,
   onSendFollowUp,
   busy,
   runIds,
 }: Readonly<{
   messages: ChatMessage[];
   onOpenCitation: (citation: CitationView) => void;
+  onOpenNote: (relPath: string) => void;
   /** Issues an ordinary chat turn — a dormant elicitation's late answer. */
   onSendFollowUp: (text: string) => void;
   /** A run is currently streaming (late elicitation sends must wait). */
@@ -950,21 +1002,25 @@ export function ChatMessages({
   // "the nth user / nth assistant message" is a durable identity. Content can't
   // key an assistant turn — it mutates as the answer streams.
   const counts = { user: 0, assistant: 0 };
+  let latestUserPrompt = "";
   const keyed = messages.map((message, index) => {
     const n = counts[message.role];
     counts[message.role] = n + 1;
-    return { message, index, key: `${message.role}-${n}` };
+    if (message.role === "user") latestUserPrompt = message.content;
+    return { message, index, key: `${message.role}-${n}`, prompt: latestUserPrompt };
   });
   return (
     <div className="flex flex-col gap-3.5">
-      {keyed.map(({ message, index, key }) =>
+      {keyed.map(({ message, index, key, prompt }) =>
         message.role === "user" ? (
           <UserBubble key={key} content={message.content} />
         ) : (
           <AssistantTurn
             key={key}
             turn={message}
+            prompt={prompt}
             onOpenCitation={onOpenCitation}
+            onOpenNote={onOpenNote}
             onSendFollowUp={onSendFollowUp}
             busy={busy}
             runId={runIds[index] ?? null}

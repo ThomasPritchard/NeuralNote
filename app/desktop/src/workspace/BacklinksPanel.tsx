@@ -61,7 +61,7 @@ export function BacklinksPanel({
   return (
     <section aria-label="Backlinks" className="mt-14 border-t border-border pt-4">
       {/* Eyebrow matches the app's section-label idiom (ChatMessages coverage). */}
-      <h2 className="px-2.5 text-[10px] font-semibold uppercase tracking-[0.08em] text-muted-foreground/70">
+      <h2 className="px-2.5 text-[0.625rem] font-semibold uppercase tracking-[0.08em] text-muted-foreground/70">
         Backlinks
       </h2>
       <div className="mt-2">
@@ -83,7 +83,7 @@ function PanelBody({
   if (state.kind === "loading") {
     // <output> carries an implicit status role + polite live region.
     return (
-      <output className="flex items-center gap-2 px-2.5 py-1.5 text-[12px] text-muted-foreground/70">
+      <output className="flex items-center gap-2 px-2.5 py-1.5 text-[0.75rem] text-muted-foreground/70">
         <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" aria-hidden />
         Finding backlinks…
       </output>
@@ -92,7 +92,7 @@ function PanelBody({
 
   if (state.kind === "error") {
     return (
-      <div className="mx-2.5 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[12px] text-destructive">
+      <div className="mx-2.5 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-md border border-destructive/30 bg-destructive/10 px-3 py-2 text-[0.75rem] text-destructive">
         <span className="flex min-w-0 items-start gap-2">
           <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
           <span className="min-w-0 break-words leading-snug">
@@ -118,13 +118,13 @@ function PanelBody({
       {/* Shown even in the empty state: a partially-failed scan must never
           read as a clean "no backlinks". */}
       {skippedFiles > 0 && (
-        <p className="mx-2.5 mb-2 rounded-md border border-destructive/30 bg-destructive/10 px-2.5 py-1.5 text-[11px] leading-snug text-destructive">
+        <p className="mx-2.5 mb-2 rounded-md border border-destructive/30 bg-destructive/10 px-2.5 py-1.5 text-[0.6875rem] leading-snug text-destructive">
           {skippedFiles} {skippedFiles === 1 ? "file" : "files"} couldn&apos;t be
           read
         </p>
       )}
       {empty ? (
-        <p className="px-2.5 py-1.5 text-[12px] leading-relaxed text-muted-foreground/70">
+        <p className="px-2.5 py-1.5 text-[0.75rem] leading-relaxed text-muted-foreground/70">
           No backlinks yet — nothing links to or mentions this note.
         </p>
       ) : (
@@ -171,7 +171,7 @@ function MentionSection({
         aria-expanded={open}
         onClick={() => setOpen((o) => !o)}
         className={cn(
-          "flex w-full items-center gap-1.5 rounded-md px-2.5 py-1.5 text-left text-[13px] font-medium text-foreground/90 transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
+          "flex w-full items-center gap-1.5 rounded-md px-2.5 py-1.5 text-left text-[0.8125rem] font-medium text-foreground/90 transition-colors hover:bg-muted/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary",
           "ease-spring",        )}
       >
         <ChevronRight
@@ -183,14 +183,14 @@ function MentionSection({
         />
         <Icon className="size-3.5 shrink-0 text-primary/80" aria-hidden />
         <span className="min-w-0 truncate">{label}</span>
-        <span className="nn-mono ml-auto shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[10px] tabular-nums text-muted-foreground">
+        <span className="nn-mono ml-auto shrink-0 rounded-full bg-muted px-1.5 py-0.5 text-[0.625rem] tabular-nums text-muted-foreground">
           {entries.length}
         </span>
       </button>
 
       {open &&
         (entries.length === 0 ? (
-          <p className="py-1 pl-[34px] pr-2.5 text-[12px] text-muted-foreground/70">
+          <p className="py-1 pl-[34px] pr-2.5 text-[0.75rem] text-muted-foreground/70">
             None found.
           </p>
         ) : (
@@ -228,14 +228,14 @@ function MentionRow({
           "ease-spring",        )}
       >
         <span className="flex w-full items-baseline gap-2">
-          <span className="min-w-0 truncate text-[13px] font-medium text-foreground/90">
+          <span className="min-w-0 truncate text-[0.8125rem] font-medium text-foreground/90">
             {entry.sourceTitle}
           </span>
-          <span className="nn-mono ml-auto shrink-0 text-[10px] tabular-nums text-muted-foreground/60">
+          <span className="nn-mono ml-auto shrink-0 text-[0.625rem] tabular-nums text-muted-foreground/60">
             :{entry.line}
           </span>
         </span>
-        <span className="w-full truncate text-[12px] leading-snug text-muted-foreground">
+        <span className="w-full truncate text-[0.75rem] leading-snug text-muted-foreground">
           {entry.snippet}
         </span>
       </button>

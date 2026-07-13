@@ -1,6 +1,6 @@
 // The footer status bar. Shows the vault name and live counts derived from the
-// current tree, plus the word count of the open note. The dot reflects that the
-// store keeps the tree in step with the local disk — not any cloud sync.
+// current tree, plus the word count of the open note. The dot marks the local
+// vault as healthy; it does not imply that cloud sync exists or is connected.
 //
 // Memoized: the editor draft lives a few components up, so this re-renders on
 // every keystroke. React.memo keeps it inert while its props are unchanged, and
@@ -29,7 +29,7 @@ export const StatusBar = memo(function StatusBar({
   );
 
   return (
-    <footer className="nn-mono flex h-(--statusbar-height) shrink-0 items-center justify-between border-t border-border bg-titlebar px-3 text-[11px] text-muted-foreground">
+    <footer className="nn-mono flex h-(--statusbar-height) shrink-0 items-center justify-between border-t border-border bg-titlebar px-3 text-[0.6875rem] text-muted-foreground">
       <div className="flex min-w-0 items-center gap-3">
         <span className="truncate text-foreground/70">{vaultName}</span>
         {words !== null && (
@@ -50,7 +50,7 @@ export const StatusBar = memo(function StatusBar({
         <span className="opacity-40">·</span>
         <span className="flex items-center gap-1.5 text-foreground/70">
           <span className="size-1.5 rounded-full bg-healthy" aria-hidden />
-          <span>In sync with disk</span>
+          <span>Local only</span>
         </span>
       </div>
     </footer>

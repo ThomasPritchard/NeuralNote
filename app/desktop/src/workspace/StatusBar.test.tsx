@@ -66,9 +66,9 @@ describe("StatusBar", () => {
     expect(screen.queryByText(/words/)).not.toBeInTheDocument();
   });
 
-  it("labels the indicator as local-disk sync, never cloud 'Synced'", () => {
+  it("labels the healthy vault as local-only, never cloud 'Synced'", () => {
     render(<StatusBar vaultName="V" tree={[]} note={null} />);
-    expect(screen.getByText("In sync with disk")).toBeInTheDocument();
+    expect(screen.getByText("Local only")).toBeInTheDocument();
     expect(screen.queryByText("Synced")).not.toBeInTheDocument();
   });
 });

@@ -1,6 +1,13 @@
 import { VaultProvider, useVault } from "./lib/store";
 import { Welcome } from "./welcome/Welcome";
 import { Workspace } from "./workspace/Workspace";
+import type { AppPreferencesLoad } from "./lib/types";
+import { ToastProvider } from "./notifications";
+import {
+  DEFAULT_PREFERENCES,
+  PreferencesProvider,
+} from "./preferences/preferences";
+import { UpdateCoordinator } from "./updates/UpdateCoordinator";
 
 /** Top-level route: the workspace once a vault is open, otherwise the welcome
  *  screen (which also renders the brief "loading" state while a vault opens). */
@@ -9,13 +16,25 @@ function Router() {
   return status === "open" ? <Workspace /> : <Welcome />;
 }
 
-export default function App() {
+const DEFAULT_LOAD: AppPreferencesLoad = {
+  preferences: DEFAULT_PREFERENCES,
+  recoveredFromCorrupt: false,
+  recoveryMessage: null,
+};
+
+export default function App({
+  initialPreferences = DEFAULT_LOAD,
+}: Readonly<{ initialPreferences?: AppPreferencesLoad }>) {
   return (
-    <>
+    <ToastProvider>
       <a className="nn-skip-link" href="#nn-main-content">Skip to content</a>
-      <VaultProvider>
-        <Router />
-      </VaultProvider>
-    </>
+      <PreferencesProvider initial={initialPreferences}>
+        <UpdateCoordinator>
+          <VaultProvider>
+            <Router />
+          </VaultProvider>
+        </UpdateCoordinator>
+      </PreferencesProvider>
+    </ToastProvider>
   );
 }

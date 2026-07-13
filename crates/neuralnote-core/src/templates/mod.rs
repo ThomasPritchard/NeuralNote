@@ -7,9 +7,15 @@
 
 mod discovery;
 mod render;
+mod settings;
 
 pub use discovery::{create_note_from_template, list_templates};
 pub use render::{render_template, TemplateContext};
+pub use settings::{
+    load_template_settings, preview_template_format, reset_template_settings,
+    save_template_settings, validate_template_format, TemplateSettings, TemplateSettingsSource,
+    TemplateSettingsStatus,
+};
 
 #[cfg(test)]
 pub(crate) use discovery::remove_created_note_after_template_write_failure;

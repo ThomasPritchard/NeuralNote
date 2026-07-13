@@ -34,10 +34,12 @@ async function openWorkspace(opts: CreateMockVaultOptions = {}) {
   return result;
 }
 
-/** Open Settings from the ribbon cog and return the live dialog. */
+/** Open Settings from the ribbon cog, navigate to AI, and return the live dialog. */
 async function openSettings(user: Awaited<ReturnType<typeof openWorkspace>>["user"]) {
   await user.click(screen.getByRole("button", { name: "Settings" }));
-  return screen.findByRole("dialog");
+  const dialog = await screen.findByRole("dialog");
+  await user.click(within(dialog).getByRole("button", { name: "AI" }));
+  return dialog;
 }
 
 describe("Journey 9: OpenRouter reasoning — opt-in", () => {

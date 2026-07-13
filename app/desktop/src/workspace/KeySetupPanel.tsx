@@ -9,8 +9,8 @@ import { buttonVariants } from "@/components/ui/button";
 // Exported so the settings page's key form (AiSettingsPage) shares the exact
 // field idiom — two key UIs that can't drift apart.
 export const FIELD =
-  "w-full rounded-lg border border-border bg-background/50 px-3 py-2 text-[13px] text-foreground placeholder:text-muted-foreground/60 transition focus:border-primary/60 focus:outline-none focus:ring-1 focus:ring-primary/30";
-export const LABEL = "text-[11px] font-medium text-muted-foreground";
+  "w-full rounded-lg border border-border bg-background/50 px-3 py-2 text-[0.8125rem] text-foreground placeholder:text-muted-foreground/60 transition focus:border-primary/60 focus:outline-none focus:ring-1 focus:ring-primary/30";
+export const LABEL = "text-[0.6875rem] font-medium text-muted-foreground";
 
 /** Guided API-key setup, shown inside the pane when no key is stored. */
 export function KeySetupPanel({
@@ -38,8 +38,8 @@ export function KeySetupPanel({
         <span className="grid size-11 place-items-center rounded-xl bg-primary/10 text-primary ring-1 ring-inset ring-primary/20">
           <KeyRound className="size-5" aria-hidden />
         </span>
-        <p className="text-[14px] font-medium text-foreground/90">Connect an AI key</p>
-        <p className="mx-auto max-w-[17rem] text-[12px] leading-relaxed text-muted-foreground">
+        <p className="text-[0.875rem] font-medium text-foreground/90">Connect an AI key</p>
+        <p className="mx-auto max-w-[17rem] text-[0.75rem] leading-relaxed text-muted-foreground">
           Add an OpenRouter key to chat with your vault. Your key is stored in the
           OS keychain, so it never leaves this machine.
         </p>
@@ -70,7 +70,7 @@ export function KeySetupPanel({
             {/* No whitespace intended between the two — justify-between spaces
                 them; the expression container makes that explicit. */}
             {"Model"}
-            <span className="text-[10px] font-normal text-muted-foreground/60">
+            <span className="text-[0.625rem] font-normal text-muted-foreground/60">
               optional
             </span>
           </span>
@@ -81,7 +81,7 @@ export function KeySetupPanel({
             aria-label="Model"
             className={`nn-mono ${FIELD}`}
           />
-          <span className="text-[10px] leading-snug text-muted-foreground/60">
+          <span className="text-[0.625rem] leading-snug text-muted-foreground/60">
             A capable default is already set for you.
           </span>
         </label>
@@ -98,7 +98,7 @@ export function KeySetupPanel({
       <button
         type="button"
         onClick={onSkip}
-        className="mx-auto rounded text-[12px] text-muted-foreground underline decoration-muted-foreground/40 underline-offset-2 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
+        className="mx-auto rounded text-[0.75rem] text-muted-foreground underline decoration-muted-foreground/40 underline-offset-2 transition-colors hover:text-foreground focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary"
       >
         Skip for now
       </button>
@@ -114,8 +114,8 @@ export function DisconnectedPane({ onConnect }: Readonly<{ onConnect: () => void
       <span className="grid size-11 place-items-center rounded-xl bg-card text-muted-foreground ring-1 ring-inset ring-border">
         <Sparkles className="size-5" aria-hidden />
       </span>
-      <p className="text-[13px] font-medium text-foreground/90">Cited chat is off</p>
-      <p className="mx-auto max-w-[17rem] text-[12px] leading-relaxed text-muted-foreground">
+      <p className="text-[0.8125rem] font-medium text-foreground/90">Cited chat is off</p>
+      <p className="mx-auto max-w-[17rem] text-[0.75rem] leading-relaxed text-muted-foreground">
         Connect a model — an OpenRouter key or Local AI — to ask questions
         across your vault and get answers grounded in the exact source.
       </p>

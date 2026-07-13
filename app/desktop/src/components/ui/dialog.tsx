@@ -79,5 +79,5 @@ export const DialogDescription = forwardRef<
   ComponentRef<typeof DialogPrimitive.Description>,
   ComponentPropsWithoutRef<typeof DialogPrimitive.Description>
 >(function DialogDescription({ className, ...props }, ref) {
-  return <DialogPrimitive.Description ref={ref} className={cn("text-[13px] leading-5 text-muted-foreground", className)} {...props} />;
+  return <DialogPrimitive.Description ref={ref} className={cn("text-[0.8125rem] leading-5 text-muted-foreground", className)} {...props} />;
 });

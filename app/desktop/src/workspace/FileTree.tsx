@@ -12,9 +12,9 @@ import { FilePlus2, Search, X } from "lucide-react";
 import { IconButton } from "@/components/ui/icon-button";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
-import type { TemplateInfo, TreeNode } from "../lib/types";
-import { ConfirmDialog } from "./ConfirmDialog";
-import { isPathInside, normSep } from "./fileMeta";
+import { useToast } from "../notifications";
+import type { TreeNode } from "../lib/types";
+import { normSep } from "./fileMeta";
 import { filterTree } from "./filterTree";
 import { flattenTree, rowKey, type FlatRow } from "./flattenTree";
 import {
@@ -63,11 +63,10 @@ interface FileTreeProps {
   vaultPath: string;
   tree: TreeNode[];
   activePath: string | null;
-  /** Whether the open note has unsaved edits — so deleting it can warn first. */
-  activeDirty: boolean;
   refreshTree: () => Promise<void>;
-  onSelect: (path: string) => void;
-  onDeleted: (node: TreeNode) => void;
+  onSelect: (path: string, openInNewTab: boolean) => void;
+  /** Workspace owns delete confirmation because background tabs may be dirty. */
+  onDeleteRequest: (node: TreeNode) => void;
   onRemap: (oldPath: string, newNode: TreeNode) => void;
   /** A native-menu request to create a note/folder at the vault root, or null.
    *  Consumed via onCreateConsumed so it opens the inline row exactly once. */
@@ -82,14 +81,14 @@ export const FileTree = memo(function FileTree({
   vaultPath,
   tree,
   activePath,
-  activeDirty,
   refreshTree,
   onSelect,
-  onDeleted,
+  onDeleteRequest,
   onRemap,
   pendingCreate,
   onCreateConsumed,
 }: FileTreeProps) {
+  const toast = useToast();
   // Folders are open by default (empty set); the user's manual folds persist per
   // vault so they survive an app restart. Lazy-loaded once — vaultPath is stable
   // for a mount because App swaps Workspace↔Welcome on any vault change.
@@ -99,13 +98,18 @@ export const FileTree = memo(function FileTree({
   const [renaming, setRenaming] = useState<string | null>(null);
   const [dragPath, setDragPath] = useState<string | null>(null);
   const [opError, setOpError] = useState<string | null>(null);
-  const [pendingDelete, setPendingDelete] = useState<TreeNode | null>(null);
-  // Templates offered in the note-create row (fetched when a create begins)
-  // and the picked one (null = blank note). A monotonic token guards a slow
-  // list_templates response from landing on a later create session.
-  const [templates, setTemplates] = useState<TemplateInfo[]>([]);
-  const [selectedTemplate, setSelectedTemplate] = useState<string | null>(null);
-  const templatesReq = useRef(0);
+
+  const surfaceOperationError = (error: unknown, allowInlineValidation = false) => {
+    const kind =
+      error && typeof error === "object" && "kind" in error
+        ? String((error as { kind: unknown }).kind)
+        : null;
+    if (allowInlineValidation && (kind === "invalidName" || kind === "alreadyExists")) {
+      setOpError(errorMessage(error));
+    } else {
+      toast.error(errorMessage(error));
+    }
+  };
 
   // Mirror the fold state to storage on every change. Cheap (a short array) and
   // idempotent, so the redundant write on mount is harmless.
@@ -117,21 +121,6 @@ export const FileTree = memo(function FileTree({
     setRenaming(null);
     setOpError(null);
     setCreating({ parentPath, kind });
-    setTemplates([]);
-    setSelectedTemplate(null);
-    const id = ++templatesReq.current;
-    if (kind !== "note") return;
-    // Templates are strictly optional: with none (or on failure) the create
-    // flow is byte-identical to before — a blank note, zero added friction.
-    api
-      .listTemplates()
-      .then((list) => {
-        if (id === templatesReq.current) setTemplates(list);
-      })
-      .catch((e) => {
-        // Surfaced (never silent), but it must not block creating the note.
-        if (id === templatesReq.current) setOpError(errorMessage(e));
-      });
   };
 
   // Open the inline create row when the native menu (File → New Note/Folder)
@@ -147,14 +136,12 @@ export const FileTree = memo(function FileTree({
   }, [pendingCreate, vaultPath, onCreateConsumed]);
 
   const startRename = (path: string) => {
-    templatesReq.current++;
     setCreating(null);
     setOpError(null);
     setRenaming(path);
   };
 
   const cancelEdit = () => {
-    templatesReq.current++;
     setCreating(null);
     setRenaming(null);
   };
@@ -171,19 +158,16 @@ export const FileTree = memo(function FileTree({
       let node: TreeNode;
       if (kind === "folder") {
         node = await api.createFolder(parentPath, name);
-      } else if (selectedTemplate === null) {
-        node = await api.createNote(parentPath, name);
       } else {
-        node = await api.createNoteFromTemplate(parentPath, name, selectedTemplate);
+        node = await api.createNote(parentPath, name);
       }
-      templatesReq.current++;
       setCreating(null);
       await refreshTree();
-      if (kind === "note") onSelect(node.path);
+      if (kind === "note") onSelect(node.path, false);
     } catch (e) {
       // Keep the input open (and the chosen template) so the user can correct
       // the name.
-      setOpError(errorMessage(e));
+      surfaceOperationError(e, true);
     }
   };
 
@@ -194,20 +178,7 @@ export const FileTree = memo(function FileTree({
       await refreshTree();
       onRemap(path, node);
     } catch (e) {
-      setOpError(errorMessage(e));
-    }
-  };
-
-  const confirmDelete = async () => {
-    const node = pendingDelete;
-    if (!node) return;
-    setPendingDelete(null);
-    try {
-      await api.deleteEntry(node.path);
-      await refreshTree();
-      onDeleted(node);
-    } catch (e) {
-      setOpError(errorMessage(e));
+      surfaceOperationError(e, true);
     }
   };
 
@@ -223,7 +194,7 @@ export const FileTree = memo(function FileTree({
       await refreshTree();
       onRemap(src, node);
     } catch (e) {
-      setOpError(errorMessage(e));
+      surfaceOperationError(e);
     }
   };
 
@@ -266,9 +237,6 @@ export const FileTree = memo(function FileTree({
     creating,
     renaming,
     dragPath,
-    templates,
-    selectedTemplate,
-    onSelectTemplate: setSelectedTemplate,
     toggle: (relPath) => {
       // A toggle while filtering would mutate the real collapse state with no
       // visible effect (everything renders expanded) — ignore it instead.
@@ -283,7 +251,7 @@ export const FileTree = memo(function FileTree({
     onSelect,
     onStartCreate: startCreate,
     onStartRename: startRename,
-    onDelete: setPendingDelete,
+    onDelete: onDeleteRequest,
     onSubmitCreate: submitCreate,
     onSubmitRename: submitRename,
     onCancelEdit: cancelEdit,
@@ -303,7 +271,7 @@ export const FileTree = memo(function FileTree({
           search lives in the ⌘K SearchPanel; this filter only matches file
           names. */}
       <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
-        <label className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background/40 px-2 py-1.5 text-[13px] text-muted-foreground/70">
+        <label className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background/40 px-2 py-1.5 text-[0.8125rem] text-muted-foreground/70">
           <Search className="size-3.5 shrink-0" aria-hidden />
           <input
             value={filter}
@@ -355,12 +323,12 @@ export const FileTree = memo(function FileTree({
         }}
       >
         {tree.length === 0 && !creatingAtRoot && (
-          <p className="px-2 py-6 text-center text-[12px] leading-relaxed text-muted-foreground/70">
+          <p className="px-2 py-6 text-center text-[0.75rem] leading-relaxed text-muted-foreground/70">
             This vault is empty. Use the + above to create your first note.
           </p>
         )}
         {tree.length > 0 && filterActive && visibleTree.length === 0 && (
-          <p className="px-2 py-6 text-center text-[12px] leading-relaxed text-muted-foreground/70">
+          <p className="px-2 py-6 text-center text-[0.75rem] leading-relaxed text-muted-foreground/70">
             No files match &quot;{filter}&quot;
           </p>
         )}
@@ -389,7 +357,7 @@ export const FileTree = memo(function FileTree({
 
       {opError && (
         <div className="shrink-0 border-t border-destructive/30 bg-destructive/10 px-3 py-2">
-          <div className="flex items-start gap-2 text-[12px] text-destructive">
+          <div className="flex items-start gap-2 text-[0.75rem] text-destructive">
             <span className="min-w-0 flex-1 break-words leading-snug">{opError}</span>
             <button
               type="button"
@@ -401,23 +369,6 @@ export const FileTree = memo(function FileTree({
             </button>
           </div>
         </div>
-      )}
-
-      {pendingDelete && (
-        <ConfirmDialog
-          title={`Delete ${pendingDelete.kind === "folder" ? "folder" : "note"}?`}
-          message={
-            activeDirty &&
-            activePath !== null &&
-            isPathInside(activePath, pendingDelete.path)
-              ? `"${pendingDelete.name}" will be moved to your system trash. The open note has unsaved changes that will be lost — the trash only restores the last saved version.`
-              : `"${pendingDelete.name}" will be moved to your system trash, where you can restore it.`
-          }
-          confirmLabel="Move to trash"
-          tone="danger"
-          onConfirm={() => void confirmDelete()}
-          onCancel={() => setPendingDelete(null)}
-        />
       )}
     </aside>
   );

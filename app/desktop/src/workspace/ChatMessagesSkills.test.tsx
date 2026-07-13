@@ -7,7 +7,7 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { emptyAssistant, type AssistantMessage } from "./chatMessage";
+import { emptyAssistant, reduceAssistant, type AssistantMessage } from "./chatMessage";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -32,20 +32,29 @@ const mockCancelRequirementDownload = vi.mocked(api.cancelRequirementDownload);
 const MISSING_YTDLP_STEP =
   "Skill 'youtube-distil' could not be activated: skill 'youtube-distil' is not eligible: unmet requirements: required binary 'yt-dlp' is missing from the app-data bin directory — continuing without it";
 
+const PLAYFUL_PROGRESS_PAIRS = [
+  ["Sending message", "Thinking"],
+  ["Dispatching a tiny messenger", "Connecting the dots"],
+  ["Knocking on the model's door", "Rummaging through the mental drawers"],
+  ["Launching a thought balloon", "Consulting the inner librarian"],
+] as const;
+
 function renderMessages(turn: AssistantMessage, runIds: Record<number, string> = {}) {
   const onOpenCitation = vi.fn();
+  const onOpenNote = vi.fn();
   const onSendFollowUp = vi.fn();
   const user = userEvent.setup();
   render(
     <ChatMessages
       messages={[{ role: "user", content: "run the fixture" }, turn]}
       onOpenCitation={onOpenCitation}
+      onOpenNote={onOpenNote}
       onSendFollowUp={onSendFollowUp}
       busy={!turn.done}
       runIds={runIds}
     />,
   );
-  return { onOpenCitation, onSendFollowUp, user };
+  return { onOpenCitation, onOpenNote, onSendFollowUp, user };
 }
 
 const skillTurn = (overrides: Partial<AssistantMessage>): AssistantMessage => ({
@@ -298,9 +307,125 @@ describe("ChatMessages — skill turns", () => {
     expect(screen.queryByText("Searching your vault")).not.toBeInTheDocument();
   });
 
-  it("keeps the live retrieval header for plain (non-skill) turns", () => {
+  it("shows sending before the backend accepts a plain turn without claiming search", () => {
     renderMessages({ ...emptyAssistant() });
+    expect(screen.getByText("Sending message")).toBeInTheDocument();
+    expect(screen.queryByText("Searching your vault")).not.toBeInTheDocument();
+  });
+
+  it("varies the playful copy across prompts while keeping one voice per prompt", () => {
+    const labels = [
+      "Summarise my project notes",
+      "What did I decide about search?",
+      "Find the meeting follow-ups",
+      "Explain the citation strategy",
+      "Draft a short release note",
+      "Connect the ideas in this folder",
+    ].map((prompt) => {
+      const view = render(
+        <ChatMessages
+          messages={[{ role: "user", content: prompt }, emptyAssistant()]}
+          onOpenCitation={vi.fn()}
+          onOpenNote={vi.fn()}
+          onSendFollowUp={vi.fn()}
+          busy
+          runIds={{}}
+        />,
+      );
+      const first = view.container.querySelector("output")?.textContent;
+      view.rerender(
+        <ChatMessages
+          messages={[
+            { role: "user", content: prompt },
+            reduceAssistant(emptyAssistant(), { type: "processing" }),
+          ]}
+          onOpenCitation={vi.fn()}
+          onOpenNote={vi.fn()}
+          onSendFollowUp={vi.fn()}
+          busy
+          runIds={{}}
+        />,
+      );
+      const thinking = view.container.querySelector("output")?.textContent;
+      expect(
+        PLAYFUL_PROGRESS_PAIRS.some(
+          ([sending, matchingThinking]) =>
+            sending === first && matchingThinking === thinking,
+        ),
+      ).toBe(true);
+      view.unmount();
+      return first;
+    });
+
+    expect(new Set(labels).size).toBeGreaterThan(1);
+    expect(
+      labels.every((label) =>
+        PLAYFUL_PROGRESS_PAIRS.some(([sending]) => sending === label),
+      ),
+    ).toBe(true);
+  });
+
+  it("shows thinking only after Processing and search only after Searching", () => {
+    const accepted = reduceAssistant(emptyAssistant(), { type: "processing" });
+    const { rerender } = render(
+      <ChatMessages
+        messages={[{ role: "user", content: "question" }, accepted]}
+        onOpenCitation={vi.fn()}
+        onOpenNote={vi.fn()}
+        onSendFollowUp={vi.fn()}
+        busy
+        runIds={{}}
+      />,
+    );
+    const thinkingLabel = document.querySelector("output")?.textContent;
+    expect(PLAYFUL_PROGRESS_PAIRS.map(([, thinking]) => thinking)).toContain(
+      thinkingLabel,
+    );
+    expect(screen.queryByText("Searching your vault")).not.toBeInTheDocument();
+
+    const searching = reduceAssistant(accepted, { type: "searching", query: "notes" });
+    rerender(
+      <ChatMessages
+        messages={[{ role: "user", content: "question" }, searching]}
+        onOpenCitation={vi.fn()}
+        onOpenNote={vi.fn()}
+        onSendFollowUp={vi.fn()}
+        busy
+        runIds={{}}
+      />,
+    );
     expect(screen.getByText("Searching your vault")).toBeInTheDocument();
+
+    const reading = reduceAssistant(searching, {
+      type: "reading",
+      relPath: "Notes/Example.md",
+      startLine: 1,
+      endLine: 2,
+    });
+    rerender(
+      <ChatMessages
+        messages={[{ role: "user", content: "question" }, reading]}
+        onOpenCitation={vi.fn()}
+        onOpenNote={vi.fn()}
+        onSendFollowUp={vi.fn()}
+        busy
+        runIds={{}}
+      />,
+    );
+    expect(screen.getByText("Reading notes")).toBeInTheDocument();
+
+    const verifying = reduceAssistant(reading, { type: "verifying" });
+    rerender(
+      <ChatMessages
+        messages={[{ role: "user", content: "question" }, verifying]}
+        onOpenCitation={vi.fn()}
+        onOpenNote={vi.fn()}
+        onSendFollowUp={vi.fn()}
+        busy
+        runIds={{}}
+      />,
+    );
+    expect(screen.getByText("Verifying citations")).toBeInTheDocument();
   });
 
   it("pins an answered elicitation through the transcript's own state", async () => {

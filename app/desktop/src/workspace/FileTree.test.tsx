@@ -1,8 +1,13 @@
-import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TreeNode } from "../lib/types";
 import type { CreateKind } from "./TreeRow";
+
+const { toastError } = vi.hoisted(() => ({ toastError: vi.fn() }));
+vi.mock("../notifications", () => ({
+  useToast: () => ({ error: toastError }),
+}));
 
 // Mock only the api CRUD calls; keep errorMessage real so surfaced text is honest.
 vi.mock("../lib/api", async (importActual) => {
@@ -14,7 +19,6 @@ vi.mock("../lib/api", async (importActual) => {
     createNoteFromTemplate: vi.fn(),
     listTemplates: vi.fn(),
     renameEntry: vi.fn(),
-    deleteEntry: vi.fn(),
     moveEntry: vi.fn(),
   };
 });
@@ -47,10 +51,9 @@ function setup(tree: TreeNode[], over: Partial<Parameters<typeof FileTree>[0]> =
     vaultPath: "/v",
     tree,
     activePath: null as string | null,
-    activeDirty: false,
     refreshTree: vi.fn().mockResolvedValue(undefined),
     onSelect: vi.fn(),
-    onDeleted: vi.fn(),
+    onDeleteRequest: vi.fn(),
     onRemap: vi.fn(),
     pendingCreate: null as CreateKind | null,
     onCreateConsumed: vi.fn(),
@@ -82,11 +85,11 @@ function stubLocalStorage() {
 
 beforeEach(() => {
   stubLocalStorage();
+  toastError.mockReset();
   mockApi.createFolder.mockReset();
   mockApi.createNote.mockReset();
   mockApi.createNoteFromTemplate.mockReset();
   mockApi.renameEntry.mockReset();
-  mockApi.deleteEntry.mockReset();
   mockApi.moveEntry.mockReset();
   // No templates by default — the create flow must be exactly the plain one.
   mockApi.listTemplates.mockReset();
@@ -124,10 +127,9 @@ describe("FileTree — fold persistence", () => {
         vaultPath="/v"
         tree={tree}
         activePath={null}
-        activeDirty={false}
         refreshTree={vi.fn().mockResolvedValue(undefined)}
         onSelect={vi.fn()}
-        onDeleted={vi.fn()}
+        onDeleteRequest={vi.fn()}
         onRemap={vi.fn()}
         pendingCreate={null}
         onCreateConsumed={vi.fn()}
@@ -145,10 +147,9 @@ describe("FileTree — fold persistence", () => {
         vaultPath="/v"
         tree={tree}
         activePath={null}
-        activeDirty={false}
         refreshTree={vi.fn().mockResolvedValue(undefined)}
         onSelect={vi.fn()}
-        onDeleted={vi.fn()}
+        onDeleteRequest={vi.fn()}
         onRemap={vi.fn()}
         pendingCreate={null}
         onCreateConsumed={vi.fn()}
@@ -181,11 +182,29 @@ describe("FileTree — create", () => {
       expect(mockApi.createNote).toHaveBeenCalledWith("/v", "New.md"),
     );
     expect(p.refreshTree).toHaveBeenCalled();
-    expect(p.onSelect).toHaveBeenCalledWith("/v/New.md");
+    expect(p.onSelect).toHaveBeenCalledWith("/v/New.md", false);
+  });
+
+  it("keeps ordinary note creation blank-only without loading templates", async () => {
+    mockApi.listTemplates.mockResolvedValue([
+      { relPath: "Templates/Daily.md", name: "Daily" },
+    ]);
+    mockApi.createNote.mockResolvedValueOnce(fileNode("Blank.md"));
+    setup([]);
+
+    await userEvent.click(screen.getByRole("button", { name: "New note" }));
+    expect(mockApi.listTemplates).not.toHaveBeenCalled();
+    expect(screen.queryByLabelText("Note template")).not.toBeInTheDocument();
+
+    await userEvent.type(screen.getByLabelText("New note name"), "Blank.md{Enter}");
+    await waitFor(() =>
+      expect(mockApi.createNote).toHaveBeenCalledWith("/v", "Blank.md"),
+    );
+    expect(mockApi.createNoteFromTemplate).not.toHaveBeenCalled();
   });
 
   it("keeps the input open and surfaces an error when creation fails", async () => {
-    mockApi.createNote.mockRejectedValueOnce({ message: "Already exists" });
+    mockApi.createNote.mockRejectedValueOnce({ kind: "alreadyExists", message: "Already exists" });
     setup([]);
 
     await userEvent.click(screen.getByRole("button", { name: "New note" }));
@@ -226,101 +245,7 @@ describe("FileTree — create", () => {
     await waitFor(() =>
       expect(mockApi.createNote).toHaveBeenCalledWith("/v/Notes", "child.md"),
     );
-    expect(p.onSelect).toHaveBeenCalledWith("/v/Notes/child.md");
-  });
-});
-
-describe("FileTree — template picker", () => {
-  const TEMPLATES = [
-    { relPath: "Templates/Meeting.md", name: "Meeting" },
-    { relPath: "Templates/Daily.md", name: "Daily" },
-  ];
-
-  it("offers no picker when the vault has no templates (zero-config create)", async () => {
-    mockApi.createNote.mockResolvedValueOnce(fileNode("Plain.md"));
-    setup([]);
-
-    await userEvent.click(screen.getByRole("button", { name: "New note" }));
-    // listTemplates resolved empty — the create row must look exactly as before.
-    expect(screen.queryByLabelText("Note template")).not.toBeInTheDocument();
-    await userEvent.type(screen.getByLabelText("New note name"), "Plain.md{Enter}");
-
-    await waitFor(() =>
-      expect(mockApi.createNote).toHaveBeenCalledWith("/v", "Plain.md"),
-    );
-    expect(mockApi.createNoteFromTemplate).not.toHaveBeenCalled();
-  });
-
-  it("creates from the chosen template", async () => {
-    mockApi.listTemplates.mockResolvedValue(TEMPLATES);
-    const node = { ...fileNode("Standup.md"), path: "/v/Standup.md" };
-    mockApi.createNoteFromTemplate.mockResolvedValueOnce(node);
-    const p = setup([]);
-
-    await userEvent.click(screen.getByRole("button", { name: "New note" }));
-    const picker = await screen.findByLabelText("Note template");
-    await userEvent.selectOptions(picker, "Templates/Meeting.md");
-    await userEvent.type(screen.getByLabelText("New note name"), "Standup.md{Enter}");
-
-    await waitFor(() =>
-      expect(mockApi.createNoteFromTemplate).toHaveBeenCalledWith(
-        "/v",
-        "Standup.md",
-        "Templates/Meeting.md",
-      ),
-    );
-    expect(mockApi.createNote).not.toHaveBeenCalled();
-    expect(p.onSelect).toHaveBeenCalledWith("/v/Standup.md");
-  });
-
-  it("defaults to a blank note even when templates exist", async () => {
-    mockApi.listTemplates.mockResolvedValue(TEMPLATES);
-    mockApi.createNote.mockResolvedValueOnce(fileNode("Blank.md"));
-    setup([]);
-
-    await userEvent.click(screen.getByRole("button", { name: "New note" }));
-    await screen.findByLabelText("Note template"); // picker present, untouched
-    await userEvent.type(screen.getByLabelText("New note name"), "Blank.md{Enter}");
-
-    await waitFor(() =>
-      expect(mockApi.createNote).toHaveBeenCalledWith("/v", "Blank.md"),
-    );
-    expect(mockApi.createNoteFromTemplate).not.toHaveBeenCalled();
-  });
-
-  it("surfaces a template-listing failure without blocking the blank create", async () => {
-    mockApi.listTemplates.mockRejectedValueOnce({ message: "template scan failed" });
-    mockApi.createNote.mockResolvedValueOnce(fileNode("Still.md"));
-    setup([]);
-
-    await userEvent.click(screen.getByRole("button", { name: "New note" }));
-    expect(await screen.findByText("template scan failed")).toBeInTheDocument();
-
-    await userEvent.type(screen.getByLabelText("New note name"), "Still.md{Enter}");
-    await waitFor(() =>
-      expect(mockApi.createNote).toHaveBeenCalledWith("/v", "Still.md"),
-    );
-  });
-
-  it("keeps the row (and template choice) open when creation fails", async () => {
-    mockApi.listTemplates.mockResolvedValue(TEMPLATES);
-    mockApi.createNoteFromTemplate.mockRejectedValueOnce({ message: "Already exists" });
-    setup([]);
-
-    await userEvent.click(screen.getByRole("button", { name: "New note" }));
-    const picker = await screen.findByLabelText("Note template");
-    await userEvent.selectOptions(picker, "Templates/Daily.md");
-    await userEvent.type(screen.getByLabelText("New note name"), "Dup.md{Enter}");
-
-    expect(await screen.findByText("Already exists")).toBeInTheDocument();
-    expect(screen.getByLabelText("New note name")).toBeInTheDocument();
-    expect(screen.getByLabelText("Note template")).toHaveValue("Templates/Daily.md");
-  });
-
-  it("does not fetch templates for folder creation", () => {
-    setup([], { pendingCreate: "folder" });
-    expect(screen.getByLabelText("New folder name")).toBeInTheDocument();
-    expect(mockApi.listTemplates).not.toHaveBeenCalled();
+    expect(p.onSelect).toHaveBeenCalledWith("/v/Notes/child.md", false);
   });
 });
 
@@ -343,7 +268,7 @@ describe("FileTree — rename", () => {
   });
 
   it("surfaces a rename failure", async () => {
-    mockApi.renameEntry.mockRejectedValueOnce({ message: "Invalid name" });
+    mockApi.renameEntry.mockRejectedValueOnce({ kind: "invalidName", message: "Invalid name" });
     setup([fileNode("a.md")]);
 
     await userEvent.click(screen.getByRole("button", { name: "Rename a.md" }));
@@ -352,69 +277,6 @@ describe("FileTree — rename", () => {
     await userEvent.type(input, "bad/name{Enter}");
 
     expect(await screen.findByText("Invalid name")).toBeInTheDocument();
-  });
-});
-
-describe("FileTree — delete", () => {
-  it("confirms then deletes, refreshing and notifying", async () => {
-    mockApi.deleteEntry.mockResolvedValueOnce(undefined);
-    const p = setup([fileNode("a.md")]);
-
-    await userEvent.click(screen.getByRole("button", { name: "Delete a.md" }));
-    const dialog = screen.getByRole("alertdialog");
-    expect(within(dialog).getByText(/Delete note\?/i)).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Move to trash" }));
-
-    await waitFor(() =>
-      expect(mockApi.deleteEntry).toHaveBeenCalledWith("/v/a.md"),
-    );
-    expect(p.refreshTree).toHaveBeenCalled();
-    expect(p.onDeleted).toHaveBeenCalled();
-  });
-
-  it("can cancel the delete confirmation", async () => {
-    setup([fileNode("a.md")]);
-    await userEvent.click(screen.getByRole("button", { name: "Delete a.md" }));
-    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
-    expect(mockApi.deleteEntry).not.toHaveBeenCalled();
-  });
-
-  it("surfaces a delete failure", async () => {
-    mockApi.deleteEntry.mockRejectedValueOnce({ message: "Permission denied" });
-    setup([folderNode("Notes", [])]);
-
-    await userEvent.click(screen.getByRole("button", { name: "Delete Notes" }));
-    await userEvent.click(screen.getByRole("button", { name: "Move to trash" }));
-    expect(await screen.findByText("Permission denied")).toBeInTheDocument();
-  });
-
-  it("warns about lost unsaved edits when deleting the open dirty note", async () => {
-    // Round-8: every other destructive path is guarded; delete must not silently
-    // wipe unsaved edits. The confirm warns so the user can cancel and save first.
-    setup([fileNode("a.md")], { activePath: "/v/a.md", activeDirty: true });
-    await userEvent.click(screen.getByRole("button", { name: "Delete a.md" }));
-    const dialog = screen.getByRole("alertdialog");
-    expect(within(dialog).getByText(/unsaved changes that will be lost/i)).toBeInTheDocument();
-  });
-
-  it("warns when deleting a folder that contains the open dirty note", async () => {
-    setup([folderNode("Notes", [])], {
-      activePath: "/v/Notes/a.md",
-      activeDirty: true,
-    });
-    await userEvent.click(screen.getByRole("button", { name: "Delete Notes" }));
-    expect(
-      within(screen.getByRole("alertdialog")).getByText(/unsaved changes that will be lost/i),
-    ).toBeInTheDocument();
-  });
-
-  it("shows the normal restore message when the open note is clean", async () => {
-    setup([fileNode("a.md")], { activePath: "/v/a.md", activeDirty: false });
-    await userEvent.click(screen.getByRole("button", { name: "Delete a.md" }));
-    expect(
-      within(screen.getByRole("alertdialog")).getByText(/where you can restore it/i),
-    ).toBeInTheDocument();
   });
 });
 
@@ -497,6 +359,30 @@ describe("FileTree — drag and drop", () => {
 });
 
 describe("FileTree — TreeRow interactions", () => {
+  it("reports ordinary and Command-click note selection separately", async () => {
+    const p = setup([fileNode("a.md")]);
+    const note = screen.getByText("a.md").closest("button")!;
+
+    await userEvent.click(note);
+    fireEvent.click(note, { metaKey: true });
+
+    expect(p.onSelect).toHaveBeenNthCalledWith(1, "/v/a.md", false);
+    expect(p.onSelect).toHaveBeenNthCalledWith(2, "/v/a.md", true);
+  });
+
+  it("raises deletion to Workspace without opening its own confirmation", async () => {
+    const onDeleteRequest = vi.fn();
+    setup(
+      [fileNode("a.md")],
+      { onDeleteRequest } as never,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Delete a.md" }));
+
+    expect(onDeleteRequest).toHaveBeenCalledWith(fileNode("a.md"));
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
   it("renames a folder via double-click", async () => {
     setup([folderNode("Notes", [])]);
     await userEvent.dblClick(screen.getByText("Notes").closest("button")!);
@@ -681,7 +567,7 @@ describe("FileTree — virtualization (PA-005)", () => {
 
     // Select a mounted file row.
     await userEvent.click(screen.getByText("note-000.md").closest("button")!);
-    expect(p.onSelect).toHaveBeenCalledWith("/v/note-000.md");
+    expect(p.onSelect).toHaveBeenCalledWith("/v/note-000.md", false);
 
     // Collapse the folder: its child leaves the flat list entirely.
     expect(screen.getByText("inside.md")).toBeInTheDocument();

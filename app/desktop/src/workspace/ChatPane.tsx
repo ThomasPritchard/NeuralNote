@@ -195,7 +195,7 @@ function ChatStatusPill({ view, model }: Readonly<{ view: View; model: string }>
       <NeuralStatusPill
         status="neutral"
         title={model}
-        className="nn-chat-model-pill ml-auto min-w-0 max-w-[9rem] shrink gap-1.5 px-2.5 py-1 text-[11px]"
+        className="nn-chat-model-pill ml-auto min-w-0 max-w-[9rem] shrink gap-1.5 px-2.5 py-1 text-[0.6875rem]"
       >
         <span className="size-1.5 rounded-full bg-healthy" aria-hidden />
         <span className="nn-mono min-w-0 truncate">{model.split("/").pop()}</span>
@@ -204,7 +204,7 @@ function ChatStatusPill({ view, model }: Readonly<{ view: View; model: string }>
   }
   if (view === "disconnected") {
     return (
-      <NeuralStatusPill status="neutral" className="ml-auto shrink-0 gap-1.5 px-2.5 py-1 text-[11px]">
+      <NeuralStatusPill status="neutral" className="ml-auto shrink-0 gap-1.5 px-2.5 py-1 text-[0.6875rem]">
         <Database className="size-3" aria-hidden /> Not connected
       </NeuralStatusPill>
     );
@@ -586,6 +586,13 @@ export function ChatPane({
     [openNoteAt, vaultPath],
   );
 
+  const openWrittenNote = useCallback(
+    (relPath: string) => {
+      if (vaultPath) openNoteAt(`${vaultPath}/${relPath}`);
+    },
+    [openNoteAt, vaultPath],
+  );
+
   const syncCaret = (e: { currentTarget: HTMLTextAreaElement }) => {
     setCaret(e.currentTarget.selectionStart ?? 0);
   };
@@ -641,14 +648,14 @@ export function ChatPane({
           <span className="nn-heading shrink-0 text-sm font-semibold">Cited recall</span>
           <ChatStatusPill view={view} model={model} />
         </div>
-        <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
+        <p className="mt-2 text-[0.6875rem] leading-snug text-muted-foreground">
           Ask questions across everything in your vault. Every claim is
           citation-checked against its source.
         </p>
       </header>
 
       {view === "loading" && (
-        <output className="flex min-h-0 flex-1 items-center justify-center gap-2 text-[12px] text-muted-foreground/70">
+        <output className="flex min-h-0 flex-1 items-center justify-center gap-2 text-[0.75rem] text-muted-foreground/70">
           <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" aria-hidden />
           Checking connection…
         </output>
@@ -676,10 +683,10 @@ export function ChatPane({
           <span className="grid size-11 place-items-center rounded-xl bg-card text-muted-foreground ring-1 ring-inset ring-border">
             <Cpu className="size-5" aria-hidden />
           </span>
-          <p className="text-[13px] font-medium text-foreground/90">
+          <p className="text-[0.8125rem] font-medium text-foreground/90">
             Local AI needs a model
           </p>
-          <p className="mx-auto max-w-[17rem] text-[12px] leading-relaxed text-muted-foreground">
+          <p className="mx-auto max-w-[17rem] text-[0.75rem] leading-relaxed text-muted-foreground">
             Local AI is selected, but no model is set up yet. Pick one to
             download in the AI settings.
           </p>
@@ -710,10 +717,10 @@ export function ChatPane({
                   <Sparkles className="size-5" aria-hidden />
                 </span>
                 <div className="flex flex-col gap-1.5">
-                  <p className="text-[13px] font-medium text-foreground/90">
+                  <p className="text-[0.8125rem] font-medium text-foreground/90">
                     Ask anything across your vault
                   </p>
-                  <p className="mx-auto max-w-[15rem] text-[12px] leading-relaxed text-muted-foreground">
+                  <p className="mx-auto max-w-[15rem] text-[0.75rem] leading-relaxed text-muted-foreground">
                     Watch the answer get searched, read and citation-checked live.
                   </p>
                 </div>
@@ -722,6 +729,7 @@ export function ChatPane({
               <ChatMessages
                 messages={messages}
                 onOpenCitation={openCitation}
+                onOpenNote={openWrittenNote}
                 onSendFollowUp={sendPrompt}
                 busy={busy}
                 runIds={runIds}
@@ -735,7 +743,7 @@ export function ChatPane({
               // a toggle that silently failed to persist would misbill the user.
               <p
                 role="alert"
-                className="mb-2 flex items-start gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-[11px] leading-snug text-destructive"
+                className="mb-2 flex items-start gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-[0.6875rem] leading-snug text-destructive"
               >
                 <AlertTriangle className="mt-px size-3 shrink-0" aria-hidden />
                 <span className="min-w-0 flex-1">{reasoningError}</span>
@@ -780,7 +788,7 @@ export function ChatPane({
                   suggestions.length > 0 ? skillOptionId(pickerActive) : undefined
                 }
                 placeholder="Ask across your vault…"
-                className="max-h-32 flex-1 resize-none bg-transparent px-2 py-1.5 text-[13px] leading-5 placeholder:text-muted-foreground/70 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
+                className="max-h-32 flex-1 resize-none bg-transparent px-2 py-1.5 text-[0.8125rem] leading-5 placeholder:text-muted-foreground/70 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
               />
               <ComposerActionButton
                 busy={busy}
@@ -810,7 +818,7 @@ export function ChatPane({
                 aria-label="Show model reasoning"
                 aria-describedby={capability.reason ? reasoningReasonId : undefined}
                 className={cn(
-                  "flex items-center gap-1 rounded-full px-2 py-0.5 text-[10px] font-medium ring-1 ring-inset transition-colors motion-reduce:transition-none",
+                  "flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.625rem] font-medium ring-1 ring-inset transition-colors motion-reduce:transition-none",
                   "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
                   reasoningOn
                     ? "bg-primary/10 text-primary ring-primary/30"
@@ -823,7 +831,7 @@ export function ChatPane({
                 <Brain className="size-3 shrink-0" aria-hidden />
                 Reasoning
               </button>
-              <p className="nn-compact-label text-right text-[10px] leading-none text-muted-foreground/60">
+              <p className="nn-compact-label text-right text-[0.625rem] leading-none text-muted-foreground/60">
                 Enter to send · Shift+Enter for a new line
               </p>
             </div>
@@ -833,7 +841,7 @@ export function ChatPane({
               // chip's accessible description.
               <p
                 id={reasoningReasonId}
-                className="mt-1 px-1 text-[10px] leading-snug text-muted-foreground/70"
+                className="mt-1 px-1 text-[0.625rem] leading-snug text-muted-foreground/70"
               >
                 {capability.reason}
               </p>

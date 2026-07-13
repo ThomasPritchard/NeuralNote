@@ -7,17 +7,20 @@
 pub mod ai;
 pub mod backlinks;
 pub mod capture;
+mod config_io;
 pub mod entries;
 pub mod error;
 pub mod links;
 pub mod model;
 pub mod note;
 pub mod paths;
+pub mod preferences;
 pub mod recents;
 pub mod search;
 pub mod templates;
 pub mod tree;
 pub mod vault;
+pub mod workspace_state;
 
 pub use error::{CoreError, CoreResult};
 pub use model::{

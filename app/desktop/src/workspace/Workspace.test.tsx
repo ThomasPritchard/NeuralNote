@@ -6,11 +6,22 @@ import { invoke } from "@tauri-apps/api/core";
 import { MENU_ACTION } from "../lib/bindings/events";
 import type { TreeNode } from "../lib/types";
 import type { OpenNote } from "./useOpenNote";
+import type { NoteTab, NoteTabsController } from "./useNoteTabs";
 
 // Controllable store + open-note state, captured child props, and a fake Tauri
 // window so the close-guard and navigation guards can be driven directly.
 const { mockUseVault } = vi.hoisted(() => ({ mockUseVault: vi.fn() }));
+const notification = vi.hoisted(() => ({
+  error: vi.fn(),
+  warning: vi.fn(),
+  success: vi.fn(),
+  info: vi.fn(),
+  dismiss: vi.fn(),
+}));
 const openState = vi.hoisted(() => ({ current: null as unknown as OpenNote }));
+const tabsState = vi.hoisted(() => ({
+  current: null as unknown as NoteTabsController,
+}));
 const captured = vi.hoisted(() => ({
   fileTree: {} as Record<string, (...a: never[]) => void>,
   notePane: {} as Record<string, (...a: never[]) => void>,
@@ -22,9 +33,12 @@ const captured = vi.hoisted(() => ({
     chatOpen: boolean;
     onToggleChat: () => void;
     onOpenSettings: () => void;
-    note: unknown;
-    noteDirty: boolean;
-    onCloseNote: () => void;
+    tabs: Array<{ id: string; title: string; path: string; dirty: boolean }>;
+    activeTabId: string | null;
+    activeView: "note" | "graph";
+    onActivateTab: (id: string) => void;
+    onCloseTab: (id: string) => void;
+    onCloseGraph: () => void;
     onNewNote: () => void;
     onNewFolder: () => void;
     onRefresh: () => void;
@@ -37,7 +51,13 @@ const captured = vi.hoisted(() => ({
     onOpenSettings: () => void;
     refreshSignal: number;
   },
-  settingsModal: {} as { open: boolean; onClose: () => void },
+  settingsModal: {} as { open: boolean; onClose: () => void; initialSection: string },
+  templateDialog: {} as {
+    open: boolean;
+    templates: Array<{ relPath: string; name: string }>;
+    onCreate: (template: string, name: string, parentPath: string) => void;
+    onClose: () => void;
+  },
 }));
 const win = vi.hoisted(() => {
   const state: { closeCb?: (e: { preventDefault: () => void }) => void } = {};
@@ -52,7 +72,8 @@ const win = vi.hoisted(() => {
 });
 
 vi.mock("../lib/store", () => ({ useVault: mockUseVault }));
-vi.mock("./useOpenNote", () => ({ useOpenNote: () => openState.current }));
+vi.mock("../notifications", () => ({ useToast: () => notification }));
+vi.mock("./useNoteTabs", () => ({ useNoteTabs: () => tabsState.current }));
 // The Workspace subscribes to MENU_ACTION; mock the event bus so listen()
 // resolves and tests can drive the registered handler directly.
 vi.mock("@tauri-apps/api/event", () => ({
@@ -102,9 +123,20 @@ vi.mock("./ChatPane", () => ({
   },
 }));
 vi.mock("./SettingsModal", () => ({
-  SettingsModal: (props: { open: boolean; onClose: () => void }) => {
+  SettingsModal: (props: { open: boolean; onClose: () => void; initialSection: string }) => {
     captured.settingsModal = props;
     return props.open ? <div data-testid="settings-modal" /> : null;
+  },
+}));
+vi.mock("./TemplateInsertDialog", () => ({
+  TemplateInsertDialog: (props: {
+    open: boolean;
+    templates: Array<{ relPath: string; name: string }>;
+    onCreate: (template: string, name: string, parentPath: string) => void;
+    onClose: () => void;
+  }) => {
+    captured.templateDialog = props;
+    return props.open ? <div data-testid="template-insert-dialog" /> : null;
   },
 }));
 vi.mock("./Ribbon", () => ({
@@ -114,6 +146,10 @@ vi.mock("./Ribbon", () => ({
   },
 }));
 vi.mock("./TitleBar", () => ({
+  GRAPH_PANEL_ID: "nn-graph-panel",
+  GRAPH_TAB_ID: "nn-graph-tab",
+  noteTabPanelId: (id: string) => `nn-note-panel-${id}`,
+  noteTabTriggerId: (id: string) => `nn-note-tab-${id}`,
   TitleBar: (props: Record<string, unknown>) => {
     captured.titlebar = props as typeof captured.titlebar;
     return <div data-testid="titlebar" />;
@@ -172,12 +208,106 @@ function makeOpen(over: Partial<OpenNote> = {}): OpenNote {
   };
 }
 
+function makeTabs(over: Partial<NoteTabsController> = {}): NoteTabsController {
+  const currentTab = () => {
+    const active = openState.current;
+    return active.path
+      ? {
+          id: "tab-1",
+          path: active.path,
+          note: active.note,
+          loading: active.loading,
+          error: active.error,
+          mode: active.mode,
+          draft: active.draft,
+          dirty: active.dirty,
+          saving: active.saving,
+          saveError: active.saveError,
+          conflict: active.conflict,
+          loadRevision: 1,
+          saveRevision: 0,
+        }
+      : null;
+  };
+  return {
+    get tabs() {
+      const tab = currentTab();
+      return tab ? [tab] : [];
+    },
+    get activeTabId() {
+      return currentTab()?.id ?? null;
+    },
+    get activeTab() {
+      return currentTab();
+    },
+    get active() {
+      return openState.current;
+    },
+    get dirtyTabs() {
+      const tab = currentTab();
+      return tab?.dirty ? [tab] : [];
+    },
+    open: vi.fn(() => "tab-new"),
+    activate: vi.fn(),
+    close: vi.fn(),
+    remap: vi.fn(),
+    removeDescendants: vi.fn(),
+    tabsInside: vi.fn(() => []),
+    clear: vi.fn(),
+    ...over,
+  };
+}
+
+function makeTab(path: string, over: Partial<NoteTab> = {}): NoteTab {
+  return {
+    id: `tab:${path}`,
+    path,
+    note: {
+      path,
+      relPath: path.replace(/^\/v\//, ""),
+      title: path.split("/").at(-1)?.replace(/\.md$/, "") ?? "Note",
+      frontmatter: null,
+      frontmatterRaw: null,
+      frontmatterError: null,
+      body: "body",
+      raw: "body",
+      contentHash: "hash",
+      binary: false,
+      lossyText: false,
+    },
+    loading: false,
+    error: null,
+    mode: "read",
+    draft: "body",
+    dirty: false,
+    saving: false,
+    saveError: null,
+    conflict: false,
+    loadRevision: 1,
+    saveRevision: 0,
+    ...over,
+  };
+}
+
+function defaultInvoke(command: string) {
+  if (command === "load_workspace_state" || command === "reset_workspace_state") {
+    return Promise.resolve({
+      state: { openPaths: [], activePath: null },
+      recoveredFromCorrupt: false,
+      recoveryMessage: null,
+    });
+  }
+  return Promise.resolve(undefined);
+}
+
 function vaultCtx(over: Record<string, unknown> = {}) {
   return {
     vault: { name: "MyVault", path: "/v" },
     tree: [] as TreeNode[],
     refreshTree: vi.fn().mockResolvedValue(undefined),
     close: vi.fn().mockResolvedValue(undefined),
+    openExisting: vi.fn().mockResolvedValue(undefined),
+    openByPath: vi.fn().mockResolvedValue(undefined),
     error: null as string | null,
     clearError: vi.fn(),
     reportError: vi.fn(),
@@ -187,11 +317,14 @@ function vaultCtx(over: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   mockUseVault.mockReset();
-  mockInvoke.mockClear();
+  Object.values(notification).forEach((mock) => mock.mockReset());
+  mockInvoke.mockReset();
+  mockInvoke.mockImplementation((command) => defaultInvoke(String(command)));
   win.state.closeCb = undefined;
   win.destroy.mockClear();
   win.onCloseRequested.mockClear();
   openState.current = makeOpen();
+  tabsState.current = makeTabs();
 });
 
 afterEach(() => {
@@ -205,16 +338,73 @@ describe("Workspace — shell", () => {
     expect(container.firstChild).toBeNull();
   });
 
-  it("renders the panes and a dismissible error banner", async () => {
+  it("routes lifecycle failures through the app notification service", async () => {
     const ctx = vaultCtx({ error: "lifecycle boom" });
     mockUseVault.mockReturnValue(ctx);
     render(<Workspace />);
 
     expect(screen.getByTestId("filetree")).toBeInTheDocument();
     expect(screen.getByTestId("statusbar")).toHaveTextContent("MyVault");
-    expect(screen.getByText("lifecycle boom")).toBeInTheDocument();
-    await userEvent.click(screen.getByRole("button", { name: "Dismiss error" }));
-    expect(ctx.clearError).toHaveBeenCalled();
+    await waitFor(() =>
+      expect(notification.error).toHaveBeenCalledWith("lifecycle boom", {
+        dedupKey: "vault-error:lifecycle boom",
+      }),
+    );
+    expect(ctx.clearError).toHaveBeenCalledOnce();
+  });
+
+  it("clears tabs from the previous vault before restoring the next vault", async () => {
+    let ctx = vaultCtx();
+    mockUseVault.mockImplementation(() => ctx);
+    const { rerender } = render(<Workspace />);
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("load_workspace_state"),
+    );
+
+    ctx = vaultCtx({ vault: { name: "Other", path: "/other" } });
+    rerender(<Workspace />);
+
+    expect(tabsState.current.clear).toHaveBeenCalledOnce();
+  });
+
+  it("does not let a stale recovery action reset the next vault", async () => {
+    let ctx = vaultCtx();
+    let loadCount = 0;
+    mockUseVault.mockImplementation(() => ctx);
+    mockInvoke.mockImplementation((command) => {
+      if (command === "load_workspace_state") {
+        loadCount += 1;
+        return Promise.resolve(
+          loadCount === 1
+            ? {
+                state: { openPaths: [], activePath: null },
+                recoveredFromCorrupt: true,
+                recoveryMessage: "bad state",
+              }
+            : {
+                state: { openPaths: [], activePath: null },
+                recoveredFromCorrupt: false,
+                recoveryMessage: null,
+              },
+        );
+      }
+      return defaultInvoke(String(command));
+    });
+    const { rerender } = render(<Workspace />);
+    await waitFor(() => expect(notification.error).toHaveBeenCalledWith(
+      "bad state",
+      expect.objectContaining({ dedupKey: "workspace-state-recovery" }),
+    ));
+    const options = notification.error.mock.calls.at(-1)?.[1] as {
+      action: { onClick: () => void };
+    };
+
+    ctx = vaultCtx({ vault: { name: "Other", path: "/other" } });
+    rerender(<Workspace />);
+    act(() => options.action.onClick());
+    await Promise.resolve();
+
+    expect(mockInvoke).not.toHaveBeenCalledWith("reset_workspace_state");
   });
 });
 
@@ -227,17 +417,19 @@ describe("Workspace — note index + rel-path opener threading", () => {
     ]);
   });
 
-  it("opens wikilink/backlink targets via the guarded absolute-path open", async () => {
+  it("opens wikilink/backlink targets through the tab controller", async () => {
     mockUseVault.mockReturnValue(vaultCtx({ tree: [node("/v/Target.md")] }));
     render(<Workspace />);
     const { onOpenLink } = captured.notePane as unknown as {
       onOpenLink: (rel: string) => void;
     };
     await act(async () => onOpenLink("Target.md"));
-    expect(openState.current.open).toHaveBeenCalledWith("/v/Target.md");
+    expect(tabsState.current.open).toHaveBeenCalledWith("/v/Target.md", {
+      forceNew: false,
+    });
   });
 
-  it("routes a dirty wikilink navigation through the discard guard", async () => {
+  it("preserves a dirty tab while opening a wikilink without a discard prompt", async () => {
     openState.current = makeOpen({ path: "/v/a.md", dirty: true });
     mockUseVault.mockReturnValue(vaultCtx({ tree: [node("/v/Target.md")] }));
     render(<Workspace />);
@@ -245,8 +437,10 @@ describe("Workspace — note index + rel-path opener threading", () => {
       onOpenLink: (rel: string) => void;
     };
     await act(async () => onOpenLink("Target.md"));
-    expect(screen.getByText("Discard unsaved changes?")).toBeInTheDocument();
-    expect(openState.current.open).not.toHaveBeenCalled();
+    expect(screen.queryByText("Discard unsaved changes?")).not.toBeInTheDocument();
+    expect(tabsState.current.open).toHaveBeenCalledWith("/v/Target.md", {
+      forceNew: false,
+    });
   });
 });
 
@@ -255,78 +449,86 @@ describe("Workspace — selection guard", () => {
     openState.current = makeOpen({ path: "/v/a.md" });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
-    await act(async () => captured.fileTree.onSelect("/v/a.md" as never));
-    expect(openState.current.open).not.toHaveBeenCalled();
+    await act(async () => captured.fileTree.onSelect("/v/a.md" as never, false as never));
+    expect(tabsState.current.open).not.toHaveBeenCalled();
   });
 
   it("opens a different note directly when the buffer is clean", async () => {
     openState.current = makeOpen({ path: "/v/a.md", dirty: false });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
-    await act(async () => captured.fileTree.onSelect("/v/b.md" as never));
-    expect(openState.current.open).toHaveBeenCalledWith("/v/b.md");
+    await act(async () => captured.fileTree.onSelect("/v/b.md" as never, false as never));
+    expect(tabsState.current.open).toHaveBeenCalledWith("/v/b.md", {
+      forceNew: false,
+    });
   });
 
-  it("routes a dirty selection through the discard guard (confirm)", async () => {
+  it("opens from a dirty active tab without prompting", async () => {
     openState.current = makeOpen({ path: "/v/a.md", dirty: true });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
 
-    await act(async () => captured.fileTree.onSelect("/v/b.md" as never));
-    expect(screen.getByText("Discard unsaved changes?")).toBeInTheDocument();
-    expect(openState.current.open).not.toHaveBeenCalled();
-
-    await userEvent.click(screen.getByRole("button", { name: "Discard" }));
-    expect(openState.current.open).toHaveBeenCalledWith("/v/b.md");
-  });
-
-  it("cancels a dirty selection, leaving the note untouched", async () => {
-    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
-    mockUseVault.mockReturnValue(vaultCtx());
-    render(<Workspace />);
-
-    await act(async () => captured.fileTree.onSelect("/v/b.md" as never));
-    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    await act(async () => captured.fileTree.onSelect("/v/b.md" as never, false as never));
     expect(screen.queryByText("Discard unsaved changes?")).not.toBeInTheDocument();
-    expect(openState.current.open).not.toHaveBeenCalled();
+    expect(tabsState.current.open).toHaveBeenCalledWith("/v/b.md", {
+      forceNew: false,
+    });
+  });
+
+  it("threads Command-click as a forced new-tab request", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: false });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    await act(async () => captured.fileTree.onSelect("/v/b.md" as never, true as never));
+    expect(tabsState.current.open).toHaveBeenCalledWith("/v/b.md", {
+      forceNew: true,
+    });
   });
 });
 
 describe("Workspace — deletion sync", () => {
-  it("clears the reader when the open note is inside the deleted node", async () => {
-    openState.current = makeOpen({ path: "/v/Notes/a.md" });
-    mockUseVault.mockReturnValue(vaultCtx());
+  it("deletes then removes every affected tab after confirmation", async () => {
+    const ctx = vaultCtx();
+    const affected = makeTab("/v/Notes/a.md", { dirty: true });
+    tabsState.current = makeTabs({
+      tabs: [affected],
+      activeTabId: affected.id,
+      activeTab: affected,
+      dirtyTabs: [affected],
+      tabsInside: vi.fn(() => [affected]),
+    });
+    mockUseVault.mockReturnValue(ctx);
     render(<Workspace />);
-    await act(async () => captured.fileTree.onDeleted(node("/v/Notes") as never));
-    expect(openState.current.clear).toHaveBeenCalled();
+    act(() => captured.fileTree.onDeleteRequest(node("/v/Notes") as never));
+    expect(screen.getByText("Delete note?")).toBeInTheDocument();
+    await userEvent.click(screen.getByRole("button", { name: "Move to Trash" }));
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("delete_entry", { path: "/v/Notes" }),
+    );
+    expect(ctx.refreshTree).toHaveBeenCalled();
+    expect(tabsState.current.removeDescendants).toHaveBeenCalledWith("/v/Notes");
   });
 
-  it("leaves the reader alone for an unrelated deletion", async () => {
-    openState.current = makeOpen({ path: "/v/x.md" });
+  it("does not remove tabs when deletion is cancelled", async () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
-    await act(async () => captured.fileTree.onDeleted(node("/v/Notes") as never));
-    expect(openState.current.clear).not.toHaveBeenCalled();
-  });
-
-  it("does nothing when no note is open", async () => {
-    openState.current = makeOpen({ path: null });
-    mockUseVault.mockReturnValue(vaultCtx());
-    render(<Workspace />);
-    await act(async () => captured.fileTree.onDeleted(node("/v/Notes") as never));
-    expect(openState.current.clear).not.toHaveBeenCalled();
+    act(() => captured.fileTree.onDeleteRequest(node("/v/Notes") as never));
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(mockInvoke).not.toHaveBeenCalledWith("delete_entry", expect.anything());
+    expect(tabsState.current.removeDescendants).not.toHaveBeenCalled();
   });
 });
 
 describe("Workspace — rename/move remap", () => {
-  it("reopens the moved note when the buffer is clean", async () => {
+  it("remaps all affected tabs for a clean rename", async () => {
     openState.current = makeOpen({ path: "/v/a.md", dirty: false });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
     await act(async () =>
       captured.fileTree.onRemap("/v/a.md" as never, node("/v/b.md") as never),
     );
-    expect(openState.current.open).toHaveBeenCalledWith("/v/b.md");
+    expect(tabsState.current.remap).toHaveBeenCalledWith("/v/a.md", "/v/b.md", "b.md");
   });
 
   it("repaths in place (preserving the buffer) when dirty", async () => {
@@ -337,8 +539,7 @@ describe("Workspace — rename/move remap", () => {
     await act(async () =>
       captured.fileTree.onRemap("/v/a.md" as never, renamed as never),
     );
-    expect(openState.current.repath).toHaveBeenCalledWith("/v/b.md", "b.md");
-    expect(openState.current.open).not.toHaveBeenCalled();
+    expect(tabsState.current.remap).toHaveBeenCalledWith("/v/a.md", "/v/b.md", "b.md");
   });
 
   it("ignores a remap that does not affect the open note", async () => {
@@ -348,8 +549,11 @@ describe("Workspace — rename/move remap", () => {
     await act(async () =>
       captured.fileTree.onRemap("/v/other" as never, node("/v/moved") as never),
     );
-    expect(openState.current.open).not.toHaveBeenCalled();
-    expect(openState.current.repath).not.toHaveBeenCalled();
+    expect(tabsState.current.remap).toHaveBeenCalledWith(
+      "/v/other",
+      "/v/moved",
+      "moved",
+    );
   });
 
   it("does nothing when no note is open", async () => {
@@ -359,7 +563,7 @@ describe("Workspace — rename/move remap", () => {
     await act(async () =>
       captured.fileTree.onRemap("/v/a.md" as never, node("/v/b.md") as never),
     );
-    expect(openState.current.open).not.toHaveBeenCalled();
+    expect(tabsState.current.remap).toHaveBeenCalledWith("/v/a.md", "/v/b.md", "b.md");
   });
 });
 
@@ -375,7 +579,7 @@ describe("Workspace — close vault + close note", () => {
 
   it("guards close-vault behind the discard dialog when dirty", async () => {
     const ctx = vaultCtx();
-    openState.current = makeOpen({ dirty: true });
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
     mockUseVault.mockReturnValue(ctx);
     render(<Workspace />);
     await act(async () => captured.titlebar.onCloseVault());
@@ -383,26 +587,153 @@ describe("Workspace — close vault + close note", () => {
     expect(ctx.close).toHaveBeenCalled();
   });
 
-  it("clears the note directly from the titlebar tab when clean", async () => {
-    openState.current = makeOpen({ dirty: false });
+  it("closes the requested titlebar tab directly when clean", async () => {
+    const tab = makeTab("/v/a.md");
+    tabsState.current = makeTabs({
+      tabs: [tab],
+      activeTabId: tab.id,
+      activeTab: tab,
+    });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
-    await act(async () => captured.titlebar.onCloseNote());
-    expect(openState.current.clear).toHaveBeenCalled();
+    await act(async () => captured.titlebar.onCloseTab(tab.id));
+    expect(tabsState.current.close).toHaveBeenCalledWith(tab.id);
   });
 
-  it("guards clearing the note from the titlebar tab when dirty", async () => {
-    openState.current = makeOpen({ dirty: true });
+  it("moves focus to the selected neighbour after closing a focused tab", async () => {
+    const first = makeTab("/v/a.md", { id: "first" });
+    const next = makeTab("/v/b.md", { id: "next" });
+    tabsState.current = makeTabs({
+      tabs: [first, next],
+      activeTabId: first.id,
+      activeTab: first,
+    });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
-    await act(async () => captured.titlebar.onCloseNote());
-    expect(openState.current.clear).not.toHaveBeenCalled();
+    const nextTrigger = document.createElement("button");
+    nextTrigger.id = "nn-note-tab-next";
+    document.body.append(nextTrigger);
+
+    await act(async () => captured.titlebar.onCloseTab(first.id));
+    await waitFor(() => expect(nextTrigger).toHaveFocus());
+    nextTrigger.remove();
+  });
+
+  it("moves focus to the empty note panel after closing the last tab", async () => {
+    const only = makeTab("/v/a.md", { id: "only" });
+    tabsState.current = makeTabs({
+      tabs: [only],
+      activeTabId: only.id,
+      activeTab: only,
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const emptyPanel = document.createElement("div");
+    emptyPanel.id = "nn-empty-note-panel";
+    emptyPanel.tabIndex = -1;
+    document.body.append(emptyPanel);
+
+    await act(async () => captured.titlebar.onCloseTab(only.id));
+    await waitFor(() => expect(emptyPanel).toHaveFocus());
+    emptyPanel.remove();
+  });
+
+  it("guards only the requested dirty titlebar tab", async () => {
+    const tab = makeTab("/v/a.md", { dirty: true, draft: "edited" });
+    tabsState.current = makeTabs({
+      tabs: [tab],
+      activeTabId: tab.id,
+      activeTab: tab,
+      dirtyTabs: [tab],
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    await act(async () => captured.titlebar.onCloseTab(tab.id));
+    expect(tabsState.current.close).not.toHaveBeenCalled();
     await userEvent.click(screen.getByRole("button", { name: "Discard" }));
-    expect(openState.current.clear).toHaveBeenCalled();
+    expect(tabsState.current.close).toHaveBeenCalledWith(tab.id);
   });
 });
 
 describe("Workspace — view state (sidebar panel + center view)", () => {
+  it("loads templates from the ribbon and creates then opens the chosen note", async () => {
+    const ctx = vaultCtx();
+    mockUseVault.mockReturnValue(ctx);
+    mockInvoke.mockImplementation((command) => {
+      if (command === "list_templates") {
+        return Promise.resolve([
+          { relPath: "Templates/Daily.md", name: "Daily" },
+        ]);
+      }
+      if (command === "create_note_from_template") {
+        return Promise.resolve(node("/v/Journal.md"));
+      }
+      return defaultInvoke(String(command));
+    });
+    render(<Workspace />);
+
+    await act(async () => captured.ribbon.onInsertTemplate());
+    expect(screen.getByTestId("template-insert-dialog")).toBeInTheDocument();
+    expect(captured.templateDialog.templates).toEqual([
+      { relPath: "Templates/Daily.md", name: "Daily" },
+    ]);
+
+    await act(async () =>
+      captured.templateDialog.onCreate(
+        "Templates/Daily.md",
+        "Journal.md",
+        "/v",
+      ),
+    );
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("create_note_from_template", {
+        parentPath: "/v",
+        name: "Journal.md",
+        template: "Templates/Daily.md",
+      }),
+    );
+    expect(ctx.refreshTree).toHaveBeenCalled();
+    expect(tabsState.current.open).toHaveBeenCalledWith("/v/Journal.md", {
+      forceNew: false,
+    });
+  });
+
+  it("creates from a template without discarding a dirty background draft", async () => {
+    openState.current = makeOpen({ path: "/v/Draft.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    mockInvoke.mockImplementation((command) => {
+      if (command === "list_templates") {
+        return Promise.resolve([{ relPath: "Templates/Daily.md", name: "Daily" }]);
+      }
+      if (command === "create_note_from_template") {
+        return Promise.resolve(node("/v/Journal.md"));
+      }
+      return defaultInvoke(String(command));
+    });
+    render(<Workspace />);
+
+    await act(async () => captured.ribbon.onInsertTemplate());
+    await act(async () =>
+      captured.templateDialog.onCreate(
+        "Templates/Daily.md",
+        "Journal.md",
+        "/v",
+      ),
+    );
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "create_note_from_template",
+        expect.anything(),
+      ),
+    );
+    expect(screen.queryByText("Discard unsaved changes?")).not.toBeInTheDocument();
+    await waitFor(() =>
+      expect(tabsState.current.open).toHaveBeenCalledWith("/v/Journal.md", {
+        forceNew: false,
+      }),
+    );
+  });
+
   it("swaps the sidebar between files and search via the ribbon", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
@@ -527,14 +858,14 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     );
   });
 
-  it("the close-vault action closes when there are no unsaved edits", () => {
+  it("the close-vault action closes when there are no unsaved edits", async () => {
     const ctx = vaultCtx();
     openState.current = makeOpen({ dirty: false });
     mockUseVault.mockReturnValue(ctx);
     render(<Workspace />);
 
     fireMenu({ action: "close-vault" });
-    expect(ctx.close).toHaveBeenCalled();
+    await waitFor(() => expect(ctx.close).toHaveBeenCalled());
   });
 
   it("the toggle-graph action swaps the center pane to the graph and back", () => {
@@ -550,8 +881,9 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     expect(screen.getByTestId("notepane")).toBeInTheDocument();
   });
 
-  it("view-files shows the files sidebar; store-handled actions are ignored here", () => {
-    mockUseVault.mockReturnValue(vaultCtx());
+  it("view-files shows the files sidebar and a clean Open Vault reaches the store", async () => {
+    const ctx = vaultCtx();
+    mockUseVault.mockReturnValue(ctx);
     render(<Workspace />);
 
     fireMenu({ action: "search" });
@@ -560,9 +892,8 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     fireMenu({ action: "view-files" });
     expect(screen.getByTestId("filetree")).toBeInTheDocument();
 
-    // open-vault / open-recent are the store's job — they fall through the
-    // Workspace switch as a no-op without disturbing the current view.
     fireMenu({ action: "open-vault" });
+    await waitFor(() => expect(ctx.openExisting).toHaveBeenCalled());
     expect(screen.getByTestId("filetree")).toBeInTheDocument();
   });
 
@@ -584,39 +915,60 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     act(() => captured.ribbon.onToggleGraph());
 
     act(() => captured.searchPanel.onOpen("/v/b.md"));
-    expect(openState.current.open).toHaveBeenCalledWith("/v/b.md");
+    expect(tabsState.current.open).toHaveBeenCalledWith("/v/b.md", {
+      forceNew: false,
+    });
     expect(screen.getByTestId("notepane")).toBeInTheDocument();
     expect(screen.queryByTestId("graphview")).not.toBeInTheDocument();
   });
 
-  it("keeps the graph view when a guarded open is cancelled", async () => {
+  it("opens a graph target without discarding the dirty active tab", async () => {
     openState.current = makeOpen({ path: "/v/a.md", dirty: true });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
     act(() => captured.ribbon.onToggleGraph());
 
     act(() => captured.graphView.onOpenNote("b.md"));
-    expect(screen.getByText("Discard unsaved changes?")).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
-    expect(screen.getByTestId("graphview")).toBeInTheDocument();
-    expect(openState.current.open).not.toHaveBeenCalled();
+    expect(screen.queryByText("Discard unsaved changes?")).not.toBeInTheDocument();
+    expect(screen.getByTestId("notepane")).toBeInTheDocument();
+    expect(tabsState.current.open).toHaveBeenCalledWith("/v/b.md", {
+      forceNew: false,
+    });
   });
 
-  it("joins the vault path for a confirmed graph open and returns to note view", async () => {
+  it("joins the vault path for a graph open and returns to note view", async () => {
     openState.current = makeOpen({ path: "/v/a.md", dirty: true });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
     act(() => captured.ribbon.onToggleGraph());
 
     act(() => captured.graphView.onOpenNote("Notes/b.md"));
-    await userEvent.click(screen.getByRole("button", { name: "Discard" }));
-    expect(openState.current.open).toHaveBeenCalledWith("/v/Notes/b.md");
+    expect(tabsState.current.open).toHaveBeenCalledWith("/v/Notes/b.md", {
+      forceNew: false,
+    });
     expect(screen.getByTestId("notepane")).toBeInTheDocument();
   });
 });
 
 describe("Workspace — settings modal", () => {
+  it("offers template settings when insertion finds no templates", async () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    mockInvoke.mockImplementation((command) =>
+      command === "list_templates" ? Promise.resolve([]) : Promise.resolve(),
+    );
+    render(<Workspace />);
+
+    await act(() => captured.ribbon.onInsertTemplate());
+    expect(notification.warning).toHaveBeenCalledWith("No templates found", {
+      dedupKey: "no-templates",
+      action: expect.objectContaining({ label: "Open template settings" }),
+    });
+    const options = notification.warning.mock.calls[0][1];
+    act(() => options.action.onClick());
+    expect(captured.settingsModal.initialSection).toBe("templates");
+    expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
+  });
+
   it("opens from the titlebar cog and closes back", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
@@ -647,17 +999,39 @@ describe("Workspace — settings modal", () => {
 });
 
 describe("Workspace — titlebar + sidebar", () => {
-  it("passes the vault name and open-note state through to the titlebar", () => {
-    openState.current = makeOpen({
-      note: { title: "A" } as unknown as OpenNote["note"],
-      dirty: true,
+  it("passes the vault name and every note-tab summary through to the titlebar", () => {
+    const a = makeTab("/v/A.md", { dirty: true, draft: "edited" });
+    const b = makeTab("/v/B.md", { loading: true, note: null });
+    tabsState.current = makeTabs({
+      tabs: [a, b],
+      activeTabId: a.id,
+      activeTab: a,
+      dirtyTabs: [a],
     });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
     expect(captured.titlebar.vaultName).toBe("MyVault");
     expect(captured.titlebar.sidebarOpen).toBe(true);
     expect(captured.titlebar.chatOpen).toBe(true);
-    expect(captured.titlebar.noteDirty).toBe(true);
+    expect(captured.titlebar.tabs).toEqual([
+      expect.objectContaining({ id: a.id, title: "A", path: "/v/A.md", dirty: true }),
+      expect.objectContaining({ id: b.id, title: "B", path: "/v/B.md", loading: true }),
+    ]);
+    expect(captured.titlebar.activeTabId).toBe(a.id);
+    expect(captured.titlebar.activeView).toBe("note");
+  });
+
+  it("activates a note tab and exits graph view", () => {
+    const tab = makeTab("/v/A.md");
+    tabsState.current = makeTabs({ tabs: [tab], activeTabId: tab.id, activeTab: tab });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    act(() => captured.ribbon.onToggleGraph());
+    expect(captured.titlebar.activeView).toBe("graph");
+
+    act(() => captured.titlebar.onActivateTab(tab.id));
+    expect(tabsState.current.activate).toHaveBeenCalledWith(tab.id);
+    expect(captured.titlebar.activeView).toBe("note");
   });
 
   it("keeps both secondary panes mounted in the compact workspace", () => {
@@ -798,6 +1172,72 @@ describe("Workspace — titlebar + sidebar", () => {
 });
 
 describe("Workspace — OS close guard", () => {
+  it("quits a clean workspace through the explicit native command", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: false });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "quit-app" });
+
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("quit_app"));
+    expect(screen.queryByText("Discard unsaved changes?")).not.toBeInTheDocument();
+  });
+
+  it("cancels native Quit without exiting when a tab is dirty", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "quit-app" });
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(mockInvoke).not.toHaveBeenCalledWith("quit_app");
+  });
+
+  it("flushes pending workspace state before confirmed native Quit", async () => {
+    let resolveSave!: () => void;
+    const savePending = new Promise<void>((resolve) => {
+      resolveSave = resolve;
+    });
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockInvoke.mockImplementation((command) => {
+      if (command === "load_workspace_state") return defaultInvoke(String(command));
+      if (command === "save_workspace_state") return savePending;
+      return Promise.resolve(undefined);
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "save_workspace_state",
+        expect.any(Object),
+      ),
+    );
+
+    fireMenu({ action: "quit-app" });
+    await userEvent.click(screen.getByRole("button", { name: "Discard" }));
+    expect(mockInvoke).not.toHaveBeenCalledWith("quit_app");
+
+    resolveSave();
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("quit_app"));
+  });
+
+  it("does not replace or duplicate an in-flight dirty Quit request", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "quit-app" });
+    fireMenu({ action: "quit-app" });
+    expect(screen.getAllByText("Discard unsaved changes?")).toHaveLength(1);
+
+    await userEvent.click(screen.getByRole("button", { name: "Discard" }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("quit_app"));
+    expect(
+      mockInvoke.mock.calls.filter(([command]) => command === "quit_app"),
+    ).toHaveLength(1);
+  });
+
   it("registers an onCloseRequested handler", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
@@ -805,17 +1245,18 @@ describe("Workspace — OS close guard", () => {
     expect(typeof win.state.closeCb).toBe("function");
   });
 
-  it("lets a clean window close without intervention", () => {
+  it("holds a clean close long enough to flush state, then destroys the window", async () => {
     openState.current = makeOpen({ dirty: false });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
     const event = { preventDefault: vi.fn() };
     act(() => win.state.closeCb!(event));
-    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(event.preventDefault).toHaveBeenCalled();
+    await waitFor(() => expect(win.destroy).toHaveBeenCalled());
   });
 
   it("holds a dirty window open, then destroys it on discard", async () => {
-    openState.current = makeOpen({ dirty: true });
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
 

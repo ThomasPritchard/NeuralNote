@@ -216,6 +216,7 @@ pub async fn run_chat(
             return Ok(UndoLedger::default());
         }
     };
+    sink.send(ChatEvent::Processing);
     if let Err(e) = session
         .drive(user_input, history, &active_skills, &mut writes, sink)
         .await
@@ -2491,6 +2492,11 @@ mod tests {
         );
         let events = run(v.path(), &mock, &Guards::default());
 
+        assert!(matches!(events.first(), Some(ChatEvent::Processing)));
+        assert_eq!(
+            count(&events, |event| matches!(event, ChatEvent::Processing)),
+            1
+        );
         assert!(events
             .iter()
             .any(|e| matches!(e, ChatEvent::Searching { query } if query == "components")));
@@ -2516,6 +2522,10 @@ mod tests {
 
         // Event ordering: search cue precedes retrieval; verify precedes citation.
         let pos = |pred: fn(&ChatEvent) -> bool| events.iter().position(pred).unwrap();
+        assert!(
+            pos(|e| matches!(e, ChatEvent::Processing))
+                < pos(|e| matches!(e, ChatEvent::Searching { .. }))
+        );
         assert!(
             pos(|e| matches!(e, ChatEvent::Searching { .. }))
                 < pos(|e| matches!(e, ChatEvent::Retrieved { .. }))

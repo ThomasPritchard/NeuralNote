@@ -60,7 +60,7 @@ function PathLabel({ relPath }: Readonly<{ relPath: string }>) {
   const base = slash >= 0 ? relPath.slice(slash + 1) : relPath;
   return (
     <span
-      className="nn-mono flex min-w-0 flex-1 items-baseline text-[11px] text-foreground/90"
+      className="nn-mono flex min-w-0 flex-1 items-baseline text-[0.6875rem] text-foreground/90"
       title={relPath}
     >
       {dir !== "" && (
@@ -77,6 +77,7 @@ export function SkillReportCard({
   done,
   partial = false,
   provenance = [],
+  onOpen = () => undefined,
 }: Readonly<{
   /** The `NoteWritten` accumulation, in write order. */
   files: ReadonlyArray<{ relPath: string; kind: NoteKind }>;
@@ -89,6 +90,8 @@ export function SkillReportCard({
   partial?: boolean;
   /** Distinct provenance labels extracted from model-authored narrative. */
   provenance?: readonly string[];
+  /** Opens a trusted path emitted by NoteWritten through workspace navigation. */
+  onOpen?: (relPath: string) => void;
 }>) {
   const [undo, setUndo] = useState<UndoState>({ status: "idle" });
 
@@ -125,7 +128,7 @@ export function SkillReportCard({
       aria-label="Notes written by this run"
       className="flex min-w-0 flex-col gap-2 rounded-lg border border-border/60 bg-background/30 px-3 py-2.5"
     >
-      <p className="flex items-center gap-1.5 text-[11px] font-medium text-foreground/80">
+      <p className="flex items-center gap-1.5 text-[0.6875rem] font-medium text-foreground/80">
         <FilePlus2 className="size-3.5 shrink-0 text-primary" aria-hidden />
         {count(files.length, "note written", "notes written")}
       </p>
@@ -134,10 +137,10 @@ export function SkillReportCard({
         <div className="flex items-start gap-2 rounded-lg border border-amber-500/25 bg-amber-500/[0.07] px-2.5 py-2 text-amber-200/90">
           <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
           <span className="min-w-0">
-            <span className="block text-[11px] font-medium">
+            <span className="block text-[0.6875rem] font-medium">
               Model-reported partial run
             </span>
-            <span className="block text-[10px] leading-snug text-muted-foreground">
+            <span className="block text-[0.625rem] leading-snug text-muted-foreground">
               The model reports that {count(files.length, "note was", "notes were")} kept
               before the run stopped.
             </span>
@@ -148,18 +151,28 @@ export function SkillReportCard({
       <ul aria-label="Written notes" className="flex min-w-0 flex-col gap-1.5">
         {files.map((file) => {
           const outcome = outcomeFor(file.relPath);
+          const removed =
+            outcome?.status === "deleted" || outcome?.status === "skippedMissing";
           return (
             <li key={file.relPath} className="flex min-w-0 flex-col gap-0.5">
-              <span className="flex min-w-0 items-center gap-2">
-                <span className="nn-mono shrink-0 rounded-full bg-muted/40 px-1.5 py-px text-[9px] uppercase tracking-[0.08em] text-muted-foreground ring-1 ring-inset ring-border">
+              <div className="flex min-w-0 items-center gap-2">
+                <span className="nn-mono shrink-0 rounded-full bg-muted/40 px-1.5 py-px text-[0.5625rem] uppercase tracking-[0.08em] text-muted-foreground ring-1 ring-inset ring-border">
                   {file.kind}
                 </span>
-                <PathLabel relPath={file.relPath} />
-              </span>
+                <button
+                  type="button"
+                  aria-label={`Open ${file.relPath}`}
+                  disabled={removed}
+                  onClick={() => onOpen(file.relPath)}
+                  className="flex min-h-6 min-w-0 flex-1 rounded-sm text-left hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-45"
+                >
+                  <PathLabel relPath={file.relPath} />
+                </button>
+              </div>
               {outcome && (
                 <span
                   className={cn(
-                    "flex items-start gap-1.5 pl-1 text-[10px] leading-snug",
+                    "flex items-start gap-1.5 pl-1 text-[0.625rem] leading-snug",
                     outcome.status === "failed"
                       ? "text-destructive"
                       : "text-muted-foreground/80",
@@ -176,7 +189,7 @@ export function SkillReportCard({
 
       {provenance.length > 0 && (
         <div className="flex flex-col gap-1 border-t border-border/50 pt-2">
-          <p className="text-[10px] font-medium text-muted-foreground">
+          <p className="text-[0.625rem] font-medium text-muted-foreground">
             Model-reported provenance
           </p>
           <ul aria-label="Model-reported provenance" className="flex flex-wrap gap-1">
@@ -184,7 +197,7 @@ export function SkillReportCard({
               <li
                 key={source}
                 title={source}
-                className="nn-mono max-w-full truncate rounded-full bg-muted/40 px-2 py-0.5 text-[9px] text-muted-foreground ring-1 ring-inset ring-border"
+                className="nn-mono max-w-full truncate rounded-full bg-muted/40 px-2 py-0.5 text-[0.5625rem] text-muted-foreground ring-1 ring-inset ring-border"
               >
                 {source}
               </li>
@@ -215,7 +228,7 @@ export function SkillReportCard({
       {/* Always-mounted status slot: empty it reads as padding; on undo it
           announces the summary politely (partial success is a status, not an
           alert — the per-file rows above carry the detail). */}
-      <output className="min-h-4 text-[10px] leading-snug text-muted-foreground/70">
+      <output className="min-h-4 text-[0.625rem] leading-snug text-muted-foreground/70">
         {report &&
           `Undo finished — ${count(removedCount, "note removed", "notes removed")}` +
             (report.files.length - removedCount > 0
@@ -226,7 +239,7 @@ export function SkillReportCard({
       {undo.status === "error" && (
         <p
           role="alert"
-          className="flex items-start gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-[11px] leading-snug text-destructive"
+          className="flex items-start gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-[0.6875rem] leading-snug text-destructive"
         >
           <AlertTriangle className="mt-px size-3 shrink-0" aria-hidden />
           <span className="min-w-0 flex-1">{undo.message}</span>

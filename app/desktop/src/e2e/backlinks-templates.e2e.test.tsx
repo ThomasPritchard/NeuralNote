@@ -4,11 +4,11 @@
 //   16. The backlinks panel shows linked + unlinked mentions, and a linked row
 //       opens its source note.
 //   17. The editor's [[ autocomplete lists matching notes and inserts a link.
-//   18. The template picker creates a note with the rendered template body.
-//   19. With no templates, the create flow stays blank-note-simple.
+//   18. The dedicated template action creates a note with the rendered body.
+//   19. Ordinary New note stays blank-note-simple and never loads templates.
 
 import { describe, it, expect } from "vitest";
-import { screen, waitFor, within } from "@testing-library/react";
+import { screen, within } from "@testing-library/react";
 import { renderApp, type RenderAppResult } from "./renderApp";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
 
@@ -120,10 +120,16 @@ describe("Journey 18: create from template", () => {
   it("creates a note from the chosen template and renders {{title}} into the body", async () => {
     const { user, backend } = await openVault(FEATURE_SEED);
 
-    await user.click(screen.getByRole("button", { name: "New note" }));
-    const picker = await screen.findByLabelText("Note template");
-    await user.selectOptions(picker, "Templates/Starter.md");
-    await user.type(screen.getByLabelText("New note name"), "Project Plan{Enter}");
+    await user.click(screen.getByRole("button", { name: "Insert from template" }));
+    const picker = await screen.findByRole("dialog", { name: "Insert from template" });
+    await user.click(
+      within(picker).getByRole("button", {
+        name: "Starter, Templates/Starter.md",
+      }),
+    );
+    await user.type(within(picker).getByLabelText("Note name"), "Project Plan");
+    expect(within(picker).getByLabelText("Destination folder")).toHaveValue(VAULT_ROOT);
+    await user.click(within(picker).getByRole("button", { name: "Create note" }));
 
     expect(await screen.findByRole("heading", { name: "Project Plan", level: 1 })).toBeInTheDocument();
     const article = screen.getByRole("article");
@@ -141,14 +147,13 @@ describe("Journey 19: create without templates", () => {
     ]);
 
     await user.click(screen.getByRole("button", { name: "New note" }));
-    await waitFor(() => expect(backend.calls).toContain("list_templates"));
-    expect(screen.queryByLabelText("Note template")).not.toBeInTheDocument();
     await user.type(screen.getByLabelText("New note name"), "Scratch{Enter}");
 
     expect(await screen.findByRole("heading", { name: "Scratch", level: 1 })).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Edit" }));
     expect(screen.getByRole("textbox", { name: "Note source" })).toHaveValue("");
     expect(backend.calls).toContain("create_note");
+    expect(backend.calls).not.toContain("list_templates");
     expect(backend.calls).not.toContain("create_note_from_template");
   });
 });

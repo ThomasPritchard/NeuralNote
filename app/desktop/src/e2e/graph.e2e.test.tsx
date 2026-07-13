@@ -3,8 +3,8 @@
 //       read_link_graph faithfully, so wikilink/md-link resolution, clusters,
 //       and cross-folder bridges are honestly end-to-end); node click → detail
 //       panel with neighbours → "Open in reader" lands back in the note view.
-//   13. The unsaved-edit guard holds across the graph path, and a backend
-//       failure shows the in-pane error + Retry — never a silent empty galaxy.
+//   13. Graph navigation preserves dirty note tabs, and a backend failure shows
+//       the in-pane error + Retry — never a silent empty galaxy.
 //
 // Only the WebGL renderer is stubbed: react-force-graph-3d is module-mocked to
 // record its props (the DATA path stays real), mirroring the unit suites in
@@ -213,7 +213,7 @@ describe("Journey 12: graph view over real link data", () => {
 });
 
 describe("Journey 13: graph guard and failure surfacing", () => {
-  it("guards a dirty buffer on open-in-reader: cancel keeps the graph, discard lands in the reader", async () => {
+  it("opens a graph note in a new tab while preserving the dirty buffer", async () => {
     const { user } = await openVault(LINKED_SEED);
 
     // Open Beta and dirty its buffer.
@@ -226,25 +226,22 @@ describe("Journey 13: graph guard and failure surfacing", () => {
     // Switching to the graph is not destructive — no dialog, buffer preserved.
     await enterGraphView(user);
 
-    // Open-in-reader for a DIFFERENT note → the discard guard fires.
+    // Open-in-reader for a DIFFERENT note is non-destructive: it gets its own
+    // tab and the dirty Beta buffer stays available in the background.
     clickNode("essays/Gamma.md");
     await user.click(screen.getByRole("button", { name: "Open in reader" }));
-    let dialog = await screen.findByRole("alertdialog");
-    expect(within(dialog).getByText("Discard unsaved changes?")).toBeInTheDocument();
-
-    // Cancel → still in the graph view, panel intact.
-    await user.click(within(dialog).getByRole("button", { name: "Cancel" }));
-    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
-    expect(screen.getByTestId("force-graph-3d")).toBeInTheDocument();
-
-    // Retry → Discard → the reader opens on the new note, buffer gone.
-    await user.click(screen.getByRole("button", { name: "Open in reader" }));
-    dialog = await screen.findByRole("alertdialog");
-    await user.click(within(dialog).getByRole("button", { name: "Discard" }));
     expect(await screen.findByRole("heading", { name: "Gamma", level: 1 })).toBeInTheDocument();
     expect(screen.getByText("essays/Gamma.md")).toBeInTheDocument();
     expect(screen.queryByTestId("force-graph-3d")).not.toBeInTheDocument();
-    expect(screen.queryByLabelText("Unsaved changes")).not.toBeInTheDocument();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Beta, unsaved changes" })).toBeInTheDocument();
+    expect(screen.getByRole("tab", { name: "Gamma" })).toHaveAttribute("aria-selected", "true");
+
+    await user.click(screen.getByRole("tab", { name: "Beta, unsaved changes" }));
+    expect(screen.getByRole("textbox", { name: "Note source" })).toHaveValue(
+      "Beta body. edit",
+    );
+    expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
   });
 
   it("shows the in-pane error with Retry on failure, and Retry loads the graph once cleared", async () => {

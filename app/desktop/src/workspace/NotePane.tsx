@@ -43,7 +43,7 @@ export function NotePane({
           <span className="grid size-12 place-items-center rounded-xl bg-card text-muted-foreground ring-1 ring-inset ring-border">
             <FileText className="size-5" aria-hidden />
           </span>
-          <p className="text-[13px] leading-relaxed text-muted-foreground">
+          <p className="text-[0.8125rem] leading-relaxed text-muted-foreground">
             Select a note from the sidebar, or create one to begin.
           </p>
         </div>
@@ -64,13 +64,13 @@ export function NotePane({
       <main className="grid flex-1 place-items-center bg-background px-6">
         <div className="flex max-w-sm flex-col items-center gap-3 text-center">
           <AlertTriangle className="size-6 text-destructive" aria-hidden />
-          <p className="text-[13px] leading-relaxed text-muted-foreground">
+          <p className="text-[0.8125rem] leading-relaxed text-muted-foreground">
             {open.error ?? "This note couldn't be opened."}
           </p>
           <button
             type="button"
             onClick={open.reload}
-            className="inline-flex items-center gap-1.5 rounded-md bg-muted px-3 py-1.5 text-[13px] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+            className="inline-flex items-center gap-1.5 rounded-md bg-muted px-3 py-1.5 text-[0.8125rem] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
           >
             <RotateCw className="size-3.5" aria-hidden /> Retry
           </button>
@@ -89,7 +89,7 @@ export function NotePane({
     <main className="flex min-w-0 flex-1 flex-col bg-background">
       {/* Toolbar — breadcrumb + view controls. Its border-b separates it from
           the note body; the hairline above is the titlebar's own border-b. */}
-      <div className="flex h-(--note-toolbar-height) shrink-0 items-center justify-between gap-3 border-b border-border px-5 text-[12px] text-muted-foreground">
+      <div className="flex h-(--note-toolbar-height) shrink-0 items-center justify-between gap-3 border-b border-border px-5 text-[0.75rem] text-muted-foreground">
         <div className="nn-mono min-w-0 truncate" title={note.relPath}>
           {note.relPath}
         </div>
@@ -100,7 +100,7 @@ export function NotePane({
               onClick={() => void open.save()}
               disabled={!open.dirty || open.saving}
               className={cn(
-                "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[12px] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
+                "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[0.75rem] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
                 !open.dirty || open.saving
                   ? "cursor-not-allowed bg-muted/50 text-muted-foreground"
                   : "bg-primary text-primary-foreground hover:opacity-90",
@@ -123,7 +123,7 @@ export function NotePane({
       {/* Encoding warning — pane-level so it shows in BOTH read and edit mode.
           It matters most in edit mode, where saving would bake in replacement characters. */}
       {note.lossyText && (
-        <div className="flex shrink-0 items-start gap-2 border-b border-warning/30 bg-warning/10 px-5 py-2 text-[12px] text-warning">
+        <div className="flex shrink-0 items-start gap-2 border-b border-warning/30 bg-warning/10 px-5 py-2 text-[0.75rem] text-warning">
           <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
           <span className="leading-snug">
             This note isn&apos;t valid UTF-8, so some characters couldn&apos;t be read
@@ -198,7 +198,7 @@ function ToggleButton({
       pressed={active}
       onPressedChange={onClick}
       className={cn(
-        "h-7 gap-1.5 rounded px-2 text-[12px] font-medium",
+        "h-7 gap-1.5 rounded px-2 text-[0.75rem] font-medium",
         active
           ? "bg-background text-foreground shadow-sm"
           : "text-muted-foreground hover:text-foreground",

@@ -10,6 +10,7 @@ import {
   useContext,
   useEffect,
   useMemo,
+  useRef,
   useState,
   type ReactNode,
 } from "react";
@@ -53,6 +54,7 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
   const [tree, setTree] = useState<TreeNode[]>([]);
   const [recents, setRecents] = useState<RecentVault[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const quitRequestedRef = useRef(false);
 
   const clearError = useCallback(() => setError(null), []);
   const reportError = useCallback((message: string) => setError(message), []);
@@ -189,6 +191,22 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
     let unlisten: UnlistenFn | undefined;
     void api
       .onMenu((e) => {
+        // Rust prevents native Cmd-Q / Dock Quit and emits this action. With no
+        // mounted Workspace there cannot be an unsaved editor draft, so confirm
+        // the quit immediately. While open, Workspace owns the draft guard.
+        if (e.action === "quit-app") {
+          if (status === "open" || quitRequestedRef.current) return;
+          quitRequestedRef.current = true;
+          void api.quitApp().catch((quitError) => {
+            quitRequestedRef.current = false;
+            setError(errorMessage(quitError));
+          });
+          return;
+        }
+        // Once a vault is open, Workspace owns these actions so it can protect
+        // every dirty note tab before switching vaults. The provider remains
+        // responsible on the welcome screen where Workspace is not mounted.
+        if (status !== "welcome") return;
         if (e.action === "open-vault") void openExisting();
         else if (e.action === "open-recent" && e.path) void openByPath(e.path);
       })
@@ -201,7 +219,7 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
       cancelled = true;
       unlisten?.();
     };
-  }, [openExisting, openByPath]);
+  }, [status, openExisting, openByPath]);
 
   // Memoised so the context value is referentially stable across renders that
   // don't change any field — otherwise every consumer re-renders each tick (S6481).

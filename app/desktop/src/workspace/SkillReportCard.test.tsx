@@ -40,6 +40,24 @@ afterEach(() => {
 });
 
 describe("SkillReportCard", () => {
+  it("opens every authoritative written-note path", async () => {
+    const user = userEvent.setup();
+    const onOpen = vi.fn();
+    render(
+      <SkillReportCard files={FILES} runId={null} done={false} onOpen={onOpen} />,
+    );
+
+    await user.click(
+      screen.getByRole("button", { name: "Open Literature/Zettelkasten talk.md" }),
+    );
+    expect(onOpen).toHaveBeenCalledExactlyOnceWith(
+      "Literature/Zettelkasten talk.md",
+    );
+    expect(
+      screen.getByRole("button", { name: "Open Literature/Zettelkasten talk.md" }),
+    ).toHaveClass("min-h-6");
+  });
+
   it("lists every written note with its kind chip and path", () => {
     render(<SkillReportCard files={FILES} runId={null} done={false} />);
     expect(screen.getByText("2 notes written")).toBeInTheDocument();
@@ -116,6 +134,9 @@ describe("SkillReportCard", () => {
     expect(screen.getByText(/Undo finished — 2 notes removed\./)).toBeInTheDocument();
     // Everything reached a terminal, non-failed outcome: nothing left to undo.
     expect(screen.queryByRole("button", { name: /Undo/ })).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: "Open Literature/Zettelkasten talk.md" }),
+    ).toBeDisabled();
   });
 
   it("keeps per-file honesty on a partial undo and offers a retry after a failure", async () => {
@@ -141,6 +162,12 @@ describe("SkillReportCard", () => {
     expect(screen.getByText("Couldn't be removed")).toBeInTheDocument();
     expect(screen.getByText(/0 notes removed, 2 notes kept\./)).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Retry undo" })).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "Open Literature/Zettelkasten talk.md" }),
+    ).toBeEnabled();
+    expect(
+      screen.getByRole("button", { name: "Open Atomic/Atomic notes.md" }),
+    ).toBeEnabled();
   });
 
   it("surfaces a rejected undo command and keeps the retry affordance", async () => {

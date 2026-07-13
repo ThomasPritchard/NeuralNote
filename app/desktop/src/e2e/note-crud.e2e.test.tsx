@@ -109,7 +109,7 @@ describe("Journey 6: delete a note", () => {
     await user.click(screen.getByRole("button", { name: "Delete Trash.md" }));
     const dialog = await screen.findByRole("alertdialog");
     expect(within(dialog).getByText("Delete note?")).toBeInTheDocument();
-    await user.click(within(dialog).getByRole("button", { name: "Move to trash" }));
+    await user.click(within(dialog).getByRole("button", { name: "Move to Trash" }));
 
     await waitFor(() => expect(screen.queryByText("Trash.md")).not.toBeInTheDocument());
     // Reader cleared back to the empty state.

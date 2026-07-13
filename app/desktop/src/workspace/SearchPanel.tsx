@@ -27,10 +27,10 @@ import type { FileHit, SearchMatch, SearchResponse } from "../lib/types";
 const DEBOUNCE_MS = 200;
 const MIN_QUERY_CHARS = 2;
 // Centered helper text for the transient states (idle/loading/empty/error).
-const HINT = "px-2 py-6 text-center text-[12px] leading-relaxed";
+const HINT = "px-2 py-6 text-center text-[0.75rem] leading-relaxed";
 const ROW_FOCUS =
   "focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-primary";
-const BANNER = "mb-1.5 rounded-md border px-2 py-1.5 text-[11px] leading-snug";
+const BANNER = "mb-1.5 rounded-md border px-2 py-1.5 text-[0.6875rem] leading-snug";
 
 type SearchState =
   | { kind: "idle" }
@@ -86,10 +86,10 @@ function MatchRow({
         onClick={onOpen}
         className={`flex w-full items-baseline gap-1.5 rounded px-1.5 py-1 text-left transition-colors hover:bg-sidebar-accent ${ROW_FOCUS} ease-spring`}
       >
-        <span className="nn-mono shrink-0 text-[10px] tabular-nums text-muted-foreground/60">
+        <span className="nn-mono shrink-0 text-[0.625rem] tabular-nums text-muted-foreground/60">
           {match.line}
         </span>
-        <span className="min-w-0 flex-1 truncate text-[12px] leading-snug text-muted-foreground">
+        <span className="min-w-0 flex-1 truncate text-[0.75rem] leading-snug text-muted-foreground">
           {highlightSnippet(match.snippet, match.ranges)}
         </span>
       </button>
@@ -111,10 +111,10 @@ function FileHitGroup({
         onClick={() => onOpen(hit.path)}
         className={`flex w-full flex-col items-start rounded-md px-2 py-1.5 text-left transition-colors hover:bg-sidebar-accent ${ROW_FOCUS} ease-spring`}
       >
-        <span className="w-full truncate text-[13px] font-medium text-sidebar-foreground">
+        <span className="w-full truncate text-[0.8125rem] font-medium text-sidebar-foreground">
           {hit.title}
         </span>
-        <span className="nn-mono w-full truncate text-[10px] text-muted-foreground/60">
+        <span className="nn-mono w-full truncate text-[0.625rem] text-muted-foreground/60">
           {hit.relPath}
         </span>
       </button>
@@ -278,7 +278,7 @@ export function SearchPanel({
       {/* Field — faithful port of the prototype's search row. */}
       <div className="px-3 pb-2 pt-3">
         <label
-          className={`flex items-center gap-2 rounded-md border border-border bg-background/60 px-2 py-1.5 text-[13px] text-muted-foreground transition focus-within:border-primary/60 focus-within:ring-1 focus-within:ring-primary/30 ease-spring`}
+          className={`flex items-center gap-2 rounded-md border border-border bg-background/60 px-2 py-1.5 text-[0.8125rem] text-muted-foreground transition focus-within:border-primary/60 focus-within:ring-1 focus-within:ring-primary/30 ease-spring`}
         >
           <Search className="size-3.5 shrink-0" aria-hidden />
           <input
@@ -290,7 +290,7 @@ export function SearchPanel({
             placeholder="Search vault…"
             className="w-full bg-transparent placeholder:text-muted-foreground/70 focus:outline-none"
           />
-          <kbd className="nn-mono rounded bg-muted px-1.5 py-0.5 text-[10px] text-muted-foreground">
+          <kbd className="nn-mono rounded bg-muted px-1.5 py-0.5 text-[0.625rem] text-muted-foreground">
             ⌘K
           </kbd>
         </label>

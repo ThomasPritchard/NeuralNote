@@ -27,6 +27,7 @@ interface RibbonProps {
   centerView: CenterView;
   onShowFiles: () => void;
   onShowSearch: () => void;
+  onInsertTemplate: () => void;
   onToggleGraph: () => void;
 }
 
@@ -35,6 +36,7 @@ export function Ribbon({
   centerView,
   onShowFiles,
   onShowSearch,
+  onInsertTemplate,
   onToggleGraph,
 }: Readonly<RibbonProps>) {
   return (
@@ -56,7 +58,11 @@ export function Ribbon({
         active={sidebarPanel === "search"}
         onClick={onShowSearch}
       />
-      <RibbonButton icon={FilePlus2} label="Capture" active={false} />
+      <RibbonButton
+        icon={FilePlus2}
+        label="Insert from template"
+        onClick={onInsertTemplate}
+      />
       <RibbonButton
         icon={Network}
         label="Graph view"
@@ -70,7 +76,8 @@ export function Ribbon({
 interface RibbonButtonProps {
   icon: LucideIcon;
   label: string;
-  active: boolean;
+  /** Toggle actions pass their selected state; one-shot actions omit it. */
+  active?: boolean;
   /** Absent for the not-yet-built placeholders (aria-disabled, no-op). */
   onClick?: () => void;
 }
@@ -88,7 +95,7 @@ function RibbonButton({
       label={inert ? `${label} (coming soon)` : label}
       tooltip={inert ? "Coming in a later phase" : label}
       aria-disabled={inert || undefined}
-      pressed={inert ? undefined : active}
+      pressed={inert || active === undefined ? undefined : active}
       onClick={onClick}
       className={cn(
         "relative size-9",

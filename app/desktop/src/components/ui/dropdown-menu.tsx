@@ -34,7 +34,7 @@ export const DropdownMenuItem = forwardRef<
     <DropdownPrimitive.Item
       ref={ref}
       className={cn(
-        "relative flex h-8 cursor-default select-none items-center gap-2 rounded-md px-2.5 text-[13px] outline-none data-[disabled]:pointer-events-none data-[highlighted]:bg-surface-selected data-[highlighted]:text-foreground data-[disabled]:opacity-45",
+        "relative flex h-8 cursor-default select-none items-center gap-2 rounded-md px-2.5 text-[0.8125rem] outline-none data-[disabled]:pointer-events-none data-[highlighted]:bg-surface-selected data-[highlighted]:text-foreground data-[disabled]:opacity-45",
         danger && "text-destructive data-[highlighted]:bg-destructive/10 data-[highlighted]:text-destructive",
         className,
       )}

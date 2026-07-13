@@ -6,6 +6,10 @@
 //! substitution engine lives in the sibling `render` module.
 
 use super::render::{render_template, TemplateContext};
+use super::settings::{
+    configured_template_folder, load_template_settings, parse_relative_path, TemplateSettings,
+    TemplateSettingsSource,
+};
 use super::{DEFAULT_DATE_FORMAT, DEFAULT_TIME_FORMAT};
 use crate::error::{CoreError, CoreResult};
 use crate::model::TemplateInfo;
@@ -13,22 +17,15 @@ use crate::paths::{ensure_within, rel_path};
 use crate::{entries, note, tree};
 use chrono::{DateTime, Local};
 use serde_json::Value;
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 const DEFAULT_TEMPLATE_FOLDER: &str = "Templates";
 const FALLBACK_FOLDERS: [&str; 3] = ["Templates", "_templates", "templates"];
 
-#[derive(Debug, Clone)]
-struct TemplateSettings {
-    folder: PathBuf,
-    date_format: String,
-    time_format: String,
-}
-
 /// List markdown templates in the inferred template folder.
 pub fn list_templates(root: &Path) -> CoreResult<Vec<TemplateInfo>> {
     let root = canon_root(root)?;
-    let settings = infer_template_settings(&root);
+    let settings = load_template_settings(&root)?.settings;
     let Some(folder) = existing_template_folder(&root, &settings)? else {
         return Ok(Vec::new());
     };
@@ -56,7 +53,7 @@ pub fn create_note_from_template(
     now: DateTime<Local>,
 ) -> CoreResult<crate::model::TreeNode> {
     let root = canon_root(root)?;
-    let settings = infer_template_settings(&root);
+    let settings = load_template_settings(&root)?.settings;
     let template_content = match template {
         Some(template) => Some(read_template(&root, &settings, template)?),
         None => None,
@@ -104,7 +101,7 @@ fn resolve_template_file(
     let Some(folder) = existing_template_folder(root, settings)? else {
         return Err(CoreError::NotFound(format!(
             "template folder not found: {}",
-            rel_path(root, &root.join(&settings.folder))
+            settings.folder
         )));
     };
     let rel = parse_relative_path(template)
@@ -144,43 +141,63 @@ fn existing_template_folder(
     root: &Path,
     settings: &TemplateSettings,
 ) -> CoreResult<Option<PathBuf>> {
-    let folder = root.join(&settings.folder);
-    if !folder.exists() {
-        return Ok(None);
-    }
-    let folder = ensure_within(root, &folder)?;
-    if folder.is_dir() {
-        Ok(Some(folder))
-    } else {
-        Ok(None)
-    }
+    configured_template_folder(root, settings)
 }
 
-fn infer_template_settings(root: &Path) -> TemplateSettings {
+pub(super) fn infer_legacy_template_settings(
+    root: &Path,
+) -> (TemplateSettings, TemplateSettingsSource) {
     let mut settings = TemplateSettings {
-        folder: PathBuf::from(DEFAULT_TEMPLATE_FOLDER),
+        folder: DEFAULT_TEMPLATE_FOLDER.into(),
         date_format: DEFAULT_DATE_FORMAT.to_string(),
         time_format: DEFAULT_TIME_FORMAT.to_string(),
     };
 
-    let config_folder = read_obsidian_template_config(root, &mut settings);
-    settings.folder = config_folder
-        .or_else(|| discover_top_level_template_folder(root))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_TEMPLATE_FOLDER));
-    settings
+    let (config_folder, valid_obsidian_config) = read_obsidian_template_config(root, &mut settings);
+    let discovered = discover_top_level_template_folder(root);
+    let folder = config_folder.or(discovered.clone());
+    settings.folder = folder
+        .as_deref()
+        .map(path_to_relative_string)
+        .unwrap_or_else(|| DEFAULT_TEMPLATE_FOLDER.into());
+    let source = if valid_obsidian_config {
+        TemplateSettingsSource::Obsidian
+    } else if discovered.is_some() {
+        TemplateSettingsSource::Discovery
+    } else {
+        TemplateSettingsSource::Default
+    };
+    (settings, source)
 }
 
-fn read_obsidian_template_config(root: &Path, settings: &mut TemplateSettings) -> Option<PathBuf> {
-    let config_path = root.join(".obsidian/templates.json");
+fn read_obsidian_template_config(
+    root: &Path,
+    settings: &mut TemplateSettings,
+) -> (Option<PathBuf>, bool) {
+    let requested_config_path = root.join(".obsidian/templates.json");
+    let config_path = if requested_config_path.exists() {
+        match ensure_within(root, &requested_config_path) {
+            Ok(path) => path,
+            Err(error) => {
+                log::warn!(
+                    "templates: refused Obsidian template config outside vault {}: {error}",
+                    requested_config_path.display()
+                );
+                return (None, false);
+            }
+        }
+    } else {
+        requested_config_path
+    };
     let data = match std::fs::read_to_string(&config_path) {
         Ok(data) => data,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (None, false),
         Err(e) => {
             log::warn!(
                 "templates: could not read Obsidian template config {}: {e}",
                 config_path.display()
             );
-            return None;
+            return (None, false);
         }
     };
     let parsed = match serde_json::from_str::<Value>(&data) {
@@ -190,7 +207,7 @@ fn read_obsidian_template_config(root: &Path, settings: &mut TemplateSettings) -
                 "templates: could not parse Obsidian template config {}: {e}",
                 config_path.display()
             );
-            return None;
+            return (None, false);
         }
     };
     let Some(obj) = parsed.as_object() else {
@@ -198,7 +215,7 @@ fn read_obsidian_template_config(root: &Path, settings: &mut TemplateSettings) -
             "templates: Obsidian template config {} is not a JSON object",
             config_path.display()
         );
-        return None;
+        return (None, false);
     };
 
     if let Some(value) = obj.get("dateFormat").and_then(Value::as_str) {
@@ -212,9 +229,12 @@ fn read_obsidian_template_config(root: &Path, settings: &mut TemplateSettings) -
         }
     }
 
-    obj.get("folder")
-        .and_then(Value::as_str)
-        .and_then(parse_relative_path)
+    (
+        obj.get("folder")
+            .and_then(Value::as_str)
+            .and_then(parse_relative_path),
+        true,
+    )
 }
 
 fn discover_top_level_template_folder(root: &Path) -> Option<PathBuf> {
@@ -262,29 +282,11 @@ fn discover_top_level_template_folder(root: &Path) -> Option<PathBuf> {
     matches.into_iter().next().map(PathBuf::from)
 }
 
-fn parse_relative_path(raw: &str) -> Option<PathBuf> {
-    let normalized = raw.trim().replace('\\', "/");
-    if normalized.is_empty() {
-        return None;
-    }
-    let path = Path::new(&normalized);
-    if path.is_absolute() {
-        return None;
-    }
-
-    let mut out = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::Normal(part) => out.push(part),
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
-        }
-    }
-    if out.as_os_str().is_empty() {
-        None
-    } else {
-        Some(out)
-    }
+fn path_to_relative_string(path: &Path) -> String {
+    path.components()
+        .map(|component| component.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn is_markdown_path(path: &Path) -> bool {

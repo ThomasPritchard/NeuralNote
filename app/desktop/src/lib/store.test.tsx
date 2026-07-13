@@ -9,6 +9,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { MENU_ACTION } from "./bindings/events";
 import { VaultProvider, useVault } from "./store";
 
 const mockInvoke = vi.mocked(invoke);
@@ -168,6 +169,98 @@ describe("VaultProvider — openExisting", () => {
   });
 });
 
+describe("VaultProvider — native vault menu ownership", () => {
+  it("confirms native Quit directly while no workspace is mounted", async () => {
+    routeInvoke();
+    renderHook(() => useVault(), { wrapper });
+
+    await waitFor(() =>
+      expect(mockListen.mock.calls.some(([event]) => event === MENU_ACTION)).toBe(true),
+    );
+    const handler = mockListen.mock.calls.find(([event]) => event === MENU_ACTION)![1] as (
+      event: { payload: { action: string } },
+    ) => void;
+    act(() => handler({ payload: { action: "quit-app" } }));
+
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("quit_app"));
+  });
+
+  it("confirms native Quit while a vault is still loading", async () => {
+    let resolveOpen!: (value: typeof vault) => void;
+    const opening = new Promise<typeof vault>((resolve) => {
+      resolveOpen = resolve;
+    });
+    routeInvoke();
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "open_vault") return opening;
+      if (cmd === "list_recent_vaults") return Promise.resolve(recents);
+      if (cmd === "read_tree") return Promise.resolve(tree);
+      return Promise.resolve(undefined);
+    });
+    const { result } = renderHook(() => useVault(), { wrapper });
+
+    act(() => {
+      void result.current.openByPath("/v");
+    });
+    await waitFor(() => expect(result.current.status).toBe("loading"));
+    await waitFor(() =>
+      expect(mockListen.mock.calls.filter(([event]) => event === MENU_ACTION).length).toBeGreaterThan(1),
+    );
+    const handler = mockListen.mock.calls.filter(([event]) => event === MENU_ACTION).at(-1)![1] as (
+      event: { payload: { action: string } },
+    ) => void;
+    act(() => handler({ payload: { action: "quit-app" } }));
+
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("quit_app"));
+    resolveOpen(vault);
+  });
+
+  it("leaves native Quit to Workspace while a vault is open", async () => {
+    routeInvoke();
+    const { result } = renderHook(() => useVault(), { wrapper });
+    await act(async () => result.current.openByPath("/v"));
+    mockInvoke.mockClear();
+
+    const handler = mockListen.mock.calls.filter(([event]) => event === MENU_ACTION).at(-1)![1] as (
+      event: { payload: { action: string } },
+    ) => void;
+    act(() => handler({ payload: { action: "quit-app" } }));
+
+    expect(mockInvoke).not.toHaveBeenCalledWith("quit_app");
+  });
+
+  it("handles Open Vault on the welcome screen", async () => {
+    routeInvoke({ pick_vault_folder: "/v" });
+    renderHook(() => useVault(), { wrapper });
+
+    await waitFor(() =>
+      expect(mockListen.mock.calls.some(([event]) => event === MENU_ACTION)).toBe(true),
+    );
+    const handler = mockListen.mock.calls.find(([event]) => event === MENU_ACTION)![1] as (
+      event: { payload: { action: string } },
+    ) => void;
+    act(() => handler({ payload: { action: "open-vault" } }));
+
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("pick_vault_folder"));
+  });
+
+  it("leaves Open Vault to Workspace while a vault is open so dirty tabs can guard it", async () => {
+    routeInvoke({ pick_vault_folder: "/other" });
+    const { result } = renderHook(() => useVault(), { wrapper });
+    await act(async () => result.current.openByPath("/v"));
+    mockInvoke.mockClear();
+
+    const handlers = mockListen.mock.calls.filter(([event]) => event === MENU_ACTION);
+    const handler = handlers.at(-1)![1] as (
+      event: { payload: { action: string } },
+    ) => void;
+    act(() => handler({ payload: { action: "open-vault" } }));
+
+    expect(mockInvoke).not.toHaveBeenCalledWith("pick_vault_folder");
+    expect(mockInvoke).not.toHaveBeenCalledWith("open_vault", expect.anything());
+  });
+});
+
 describe("VaultProvider — pickNewLocation", () => {
   it("returns the chosen directory", async () => {
     routeInvoke({ pick_new_vault_location: "/parent" });
@@ -313,7 +406,9 @@ describe("VaultProvider — live tree-changed subscription", () => {
       expect.any(Function),
     );
 
-    const handler = mockListen.mock.calls.at(-1)![1] as () => void;
+    const handler = mockListen.mock.calls.find(
+      ([event]) => event === "vault://tree-changed",
+    )![1] as () => void;
     mockInvoke.mockClear();
     await act(async () => {
       handler();

@@ -16,6 +16,18 @@ vi.mock("./SkillsSettingsPage", () => ({
   SkillsSettingsPage: () => <div data-testid="skills-settings-page" />,
 }));
 
+vi.mock("./GeneralSettingsPage", () => ({
+  GeneralSettingsPage: () => <div data-testid="general-settings-page" />,
+}));
+
+vi.mock("./AppearanceSettingsPage", () => ({
+  AppearanceSettingsPage: () => <div data-testid="appearance-settings-page" />,
+}));
+
+vi.mock("./TemplatesSettingsPage", () => ({
+  TemplatesSettingsPage: () => <div data-testid="templates-settings-page" />,
+}));
+
 import { SettingsModal } from "./SettingsModal";
 
 function setup(props: Partial<Parameters<typeof SettingsModal>[0]> = {}) {
@@ -31,16 +43,18 @@ describe("SettingsModal — shell", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it("opens as a labelled modal dialog, defaulting to the AI section", () => {
+  it("opens as a labelled modal dialog, defaulting to General", () => {
     setup();
     const dialog = screen.getByRole("dialog", { name: "Settings" });
     expect(dialog).toHaveAttribute("aria-modal", "true");
-    // Default section is Configure the AI — the reason the modal exists in v1.
-    expect(screen.getByTestId("ai-settings-page")).toBeInTheDocument();
+    expect(screen.getByTestId("general-settings-page")).toBeInTheDocument();
     // The section nav lists every shipped section.
     const nav = screen.getByRole("navigation", { name: "Settings sections" });
+    expect(nav).toContainElement(screen.getByRole("button", { name: "General" }));
+    expect(nav).toContainElement(screen.getByRole("button", { name: "Appearance" }));
+    expect(nav).toContainElement(screen.getByRole("button", { name: "Templates" }));
     expect(nav).toContainElement(
-      screen.getByRole("button", { name: "Configure the AI" }),
+      screen.getByRole("button", { name: "AI" }),
     );
     expect(nav).toContainElement(screen.getByRole("button", { name: "Skills" }));
     expect(nav).toContainElement(screen.getByRole("button", { name: "About" }));
@@ -48,6 +62,12 @@ describe("SettingsModal — shell", () => {
 
   it("switches sections from the left nav", async () => {
     const { user } = setup();
+
+    await user.click(screen.getByRole("button", { name: "Appearance" }));
+    expect(screen.getByTestId("appearance-settings-page")).toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Templates" }));
+    expect(screen.getByTestId("templates-settings-page")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "About" }));
     expect(screen.getByText("NeuralNote")).toBeInTheDocument();
@@ -57,16 +77,15 @@ describe("SettingsModal — shell", () => {
     expect(screen.getByTestId("skills-settings-page")).toBeInTheDocument();
     expect(screen.queryByTestId("ai-settings-page")).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Configure the AI" }));
+    await user.click(screen.getByRole("button", { name: "AI" }));
     expect(screen.getByTestId("ai-settings-page")).toBeInTheDocument();
     expect(screen.queryByTestId("skills-settings-page")).not.toBeInTheDocument();
   });
 
-  it("ships no empty General section — no nav entry, no placeholder copy (PA-017)", () => {
+  it("ships a real General section without placeholder copy", () => {
     setup();
-    // A live nav item whose page says only "coming soon" is a shipped
-    // placeholder; General stays hidden until it has a real setting.
-    expect(screen.queryByRole("button", { name: "General" })).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "General" })).toBeInTheDocument();
+    expect(screen.getByTestId("general-settings-page")).toBeInTheDocument();
     expect(screen.queryByText(/coming soon/i)).not.toBeInTheDocument();
   });
 

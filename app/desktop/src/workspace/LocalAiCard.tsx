@@ -341,7 +341,7 @@ export function LocalAiCard({
       >
         {/* Hardware readout driving the recommendation. */}
         {hardware && (
-          <p className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg bg-background/50 px-3 py-2 text-[11px] text-muted-foreground ring-1 ring-inset ring-border">
+          <p className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg bg-background/50 px-3 py-2 text-[0.6875rem] text-muted-foreground ring-1 ring-inset ring-border">
             <span className="font-medium text-foreground/80">This machine</span>
             <span className="nn-mono">{wholeGb(hardware.totalRamBytes)} RAM</span>
             <span aria-hidden>·</span>
@@ -374,7 +374,7 @@ export function LocalAiCard({
         )}
         {recommendation?.status === "supported" && (
           <div className="rounded-lg bg-primary/[0.07] px-3 py-2.5 ring-1 ring-inset ring-primary/25">
-            <p className="flex flex-wrap items-center gap-1.5 text-[12px] font-medium text-foreground/90">
+            <p className="flex flex-wrap items-center gap-1.5 text-[0.75rem] font-medium text-foreground/90">
               <Check className="size-3.5 shrink-0 text-primary" aria-hidden />
               Recommended for this machine:
               <span className="nn-mono text-primary">{recommendation.modelTag}</span>
@@ -382,7 +382,7 @@ export function LocalAiCard({
                 ({recommendation.params})
               </span>
             </p>
-            <p className="mt-1 text-[11px] leading-snug text-muted-foreground">
+            <p className="mt-1 text-[0.6875rem] leading-snug text-muted-foreground">
               {recommendation.why} Uses about {gb(recommendation.estRamBytes)} of
               memory while running.
             </p>
@@ -412,34 +412,34 @@ export function LocalAiCard({
                     className="flex flex-col gap-2 rounded-lg bg-background/50 p-3 ring-1 ring-inset ring-border"
                   >
                     <div className="flex flex-wrap items-center gap-2">
-                      <span className="nn-mono text-[13px] font-medium text-foreground">
+                      <span className="nn-mono text-[0.8125rem] font-medium text-foreground">
                         {c.tag}
                       </span>
                       {c.tag === recommendedTag && (
-                        <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[10px] font-medium text-primary ring-1 ring-inset ring-primary/30">
+                        <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[0.625rem] font-medium text-primary ring-1 ring-inset ring-primary/30">
                           Recommended
                         </span>
                       )}
                       {isInstalled && (
-                        <span className="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[10px] font-medium text-muted-foreground">
+                        <span className="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[0.625rem] font-medium text-muted-foreground">
                           <Check className="size-2.5" aria-hidden />
                           Installed
                         </span>
                       )}
                       <span className="ml-auto">{catalogueAction(c)}</span>
                     </div>
-                    <p className="text-[11px] text-muted-foreground">
+                    <p className="text-[0.6875rem] text-muted-foreground">
                       {c.params} · {gb(c.downloadBytes)} download · needs{" "}
                       {wholeGb(c.minRamBytes)} RAM · {c.license}
                     </p>
                     {metaBits.length > 0 && (
-                      <p className="text-[11px] text-muted-foreground/70">
+                      <p className="text-[0.6875rem] text-muted-foreground/70">
                         {metaBits.join(" · ")}
                       </p>
                     )}
                     {pulling && pull && (
                       <div className="flex flex-col gap-1.5">
-                        <div className="flex items-center justify-between gap-2 text-[11px] text-muted-foreground">
+                        <div className="flex items-center justify-between gap-2 text-[0.6875rem] text-muted-foreground">
                           <span className="min-w-0 truncate">{pull.status}</span>
                           <span className="nn-mono shrink-0">
                             {pull.completed != null && pull.total != null
@@ -488,7 +488,7 @@ export function LocalAiCard({
             </div>
           )}
           {installedScan.status === "ready" && installedScan.models.length === 0 && (
-            <p className="text-[12px] text-muted-foreground">
+            <p className="text-[0.75rem] text-muted-foreground">
               No local models installed yet.
             </p>
           )}
@@ -508,10 +508,10 @@ export function LocalAiCard({
                     className="flex items-center gap-3 rounded-lg bg-background/50 px-3 py-2.5 ring-1 ring-inset ring-border"
                   >
                     <div className="min-w-0 flex-1">
-                      <p className="nn-mono truncate text-[13px] text-foreground">
+                      <p className="nn-mono truncate text-[0.8125rem] text-foreground">
                         {m.tag}
                       </p>
-                      <p className="text-[11px] text-muted-foreground">
+                      <p className="text-[0.6875rem] text-muted-foreground">
                         {diskBits.join(" · ")}
                       </p>
                     </div>

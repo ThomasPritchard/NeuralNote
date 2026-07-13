@@ -93,11 +93,11 @@ const components: Components = {
   ),
   li: ({ node: _node, ...props }) => <li className="pl-1" {...props} />,
   blockquote: ({ node: _node, ...props }) => (
-    <blockquote className="my-6 rounded-lg bg-surface-raised px-5 py-3 text-[15px] italic leading-7 text-foreground/80" {...props} />
+    <blockquote className="my-6 rounded-lg bg-surface-raised px-5 py-3 text-[0.9375rem] italic leading-7 text-foreground/80" {...props} />
   ),
   hr: ({ node: _node, ...props }) => <hr className="my-6 border-border" {...props} />,
   pre: ({ node: _node, ...props }) => (
-    <pre className="my-4 overflow-x-auto rounded-lg border border-border bg-card/70 p-4 text-[13px] leading-6" {...props} />
+    <pre className="my-4 overflow-x-auto rounded-lg border border-border bg-card/70 p-4 text-[0.8125rem] leading-6" {...props} />
   ),
   code: ({ node: _node, className, children, ...props }) => {
     const isBlock = /language-/.test(className ?? "");
@@ -120,7 +120,7 @@ const components: Components = {
   em: ({ node: _node, ...props }) => <em className="italic" {...props} />,
   table: ({ node: _node, ...props }) => (
     <div className="my-4 overflow-x-auto rounded-lg border border-border">
-      <table className="w-full border-collapse text-[13px]" {...props} />
+      <table className="w-full border-collapse text-[0.8125rem]" {...props} />
     </div>
   ),
   thead: ({ node: _node, ...props }) => <thead className="bg-muted/60" {...props} />,

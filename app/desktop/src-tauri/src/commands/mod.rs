@@ -7,4 +7,8 @@
 //! the crate can reach a command without naming the split.
 
 pub(crate) mod ai;
+pub(crate) mod lifecycle;
+pub(crate) mod preferences;
+pub(crate) mod templates;
 pub(crate) mod vault;
+pub(crate) mod workspace_state;

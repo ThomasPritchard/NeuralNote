@@ -655,6 +655,25 @@ describe("ChatPane — chat view", () => {
     );
   });
 
+  it("opens an authoritative generated note through workspace navigation", async () => {
+    const { openNoteAt, user } = await askInChat("make a note", [
+      {
+        type: "noteWritten",
+        relPath: "Atomic/Generated insight.md",
+        kind: "atomic",
+      },
+      { type: "answer", delta: "I created the note." },
+      { type: "done" },
+    ]);
+
+    await user.click(
+      screen.getByRole("button", { name: "Open Atomic/Generated insight.md" }),
+    );
+    expect(openNoteAt).toHaveBeenCalledExactlyOnceWith(
+      "/vault/Atomic/Generated insight.md",
+    );
+  });
+
   it("surfaces an inline, non-fatal error event and re-enables the composer", async () => {
     await askInChat("q", [
       { type: "searching", query: "x" },

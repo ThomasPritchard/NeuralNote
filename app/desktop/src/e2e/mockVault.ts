@@ -49,6 +49,8 @@ import type {
   TreeNode,
   UndoReport,
   Vault,
+  WorkspaceState,
+  WorkspaceStateLoad,
 } from "../lib/types";
 
 export const VAULT_ROOT = "/vault";
@@ -1390,6 +1392,7 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
   const failures = new Map<string, CoreErrorLike>();
   const calls: string[] = [];
   let destroyed = false;
+  let workspaceState: WorkspaceState = { openPaths: [], activePath: null };
   let profileFolder: string | null = null;
   const openedYoutubeUrls: string[] = [];
   const now = opts.now ?? new Date(2026, 0, 2, 15, 4, 5);
@@ -1813,6 +1816,33 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         return { name: a.name as string, path: root } satisfies Vault;
       }
       case "close_vault":
+        return undefined;
+      case "load_workspace_state":
+        return {
+          state: {
+            openPaths: [...workspaceState.openPaths],
+            activePath: workspaceState.activePath,
+          },
+          recoveredFromCorrupt: false,
+          recoveryMessage: null,
+        } satisfies WorkspaceStateLoad;
+      case "save_workspace_state": {
+        const next = a.state as WorkspaceState;
+        workspaceState = {
+          openPaths: [...next.openPaths],
+          activePath: next.activePath,
+        };
+        return undefined;
+      }
+      case "reset_workspace_state":
+        workspaceState = { openPaths: [], activePath: null };
+        return {
+          state: { openPaths: [], activePath: null },
+          recoveredFromCorrupt: false,
+          recoveryMessage: null,
+        } satisfies WorkspaceStateLoad;
+      case "set_menu_editing":
+      case "set_chat_visible":
         return undefined;
       case "read_tree":
         return childrenOf(root);

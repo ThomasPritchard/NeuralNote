@@ -636,7 +636,7 @@ export function NeuralGalaxy({
             <div className="nn-heading flex items-center gap-2 text-lg font-semibold text-foreground">
               <Sparkles className="size-4 text-primary" /> Neural galaxy
             </div>
-            <div className="nn-mono text-[11px] text-muted-foreground">
+            <div className="nn-mono text-[0.6875rem] text-muted-foreground">
               {plural(stats.notes, "note")} · {plural(stats.links, "link")} ·{" "}
               {plural(stats.crossFolderLinks, "cross-folder link")}
               {/* Only an isolated folder has links leaving the view (0 at root). */}
@@ -709,7 +709,7 @@ export function NeuralGalaxy({
                   >
                     <span className="size-2 shrink-0 rounded-full" style={{ background: n.color }} />
                     <span className="truncate">{n.title}</span>
-                    <span className="nn-mono ml-auto shrink-0 text-[10px] text-muted-foreground">
+                    <span className="nn-mono ml-auto shrink-0 text-[0.625rem] text-muted-foreground">
                       {clusters[n.cluster]?.label ?? n.cluster}
                     </span>
                   </button>
@@ -729,7 +729,7 @@ export function NeuralGalaxy({
           non-interactive. */}
       <div className="absolute bottom-5 left-5 flex flex-col gap-1.5 rounded-lg border border-border bg-card/80 px-4 py-3 backdrop-blur">
         {breadcrumb}
-        <div className="nn-mono mb-1 text-[10px] uppercase tracking-wider text-muted-foreground">Clusters</div>
+        <div className="nn-mono mb-1 text-[0.625rem] uppercase tracking-wider text-muted-foreground">Clusters</div>
         {Object.entries(clusters).map(([key, c]) =>
           key === "" ? (
             <button
@@ -773,7 +773,7 @@ export function NeuralGalaxy({
         <div className="absolute right-5 top-24 w-72 rounded-xl border border-border bg-card/90 p-4 backdrop-blur">
           <div className="flex items-start justify-between gap-2">
             <span
-              className="nn-mono rounded-full px-2 py-0.5 text-[10px]"
+              className="nn-mono rounded-full px-2 py-0.5 text-[0.625rem]"
               style={{ background: `${selected.color}22`, color: selected.color }}
             >
               {clusters[selected.cluster]?.label ?? selected.cluster}
@@ -783,7 +783,7 @@ export function NeuralGalaxy({
             </button>
           </div>
           <h3 className="nn-heading mt-2 text-base font-semibold leading-snug text-foreground">{selected.title}</h3>
-          <div className="nn-mono mt-3 text-[10px] uppercase tracking-wider text-muted-foreground">
+          <div className="nn-mono mt-3 text-[0.625rem] uppercase tracking-wider text-muted-foreground">
             {plural(neighbours.length, "connected note")}
           </div>
           <div className="mt-1.5 max-h-56 overflow-y-auto">
@@ -799,7 +799,7 @@ export function NeuralGalaxy({
                 <span className="size-2 shrink-0 rounded-full" style={{ background: nb.color }} />
                 <span className="truncate">{nb.title}</span>
                 {bridge && (
-                  <span className="nn-mono ml-auto shrink-0 text-[9px]" style={{ color: BRIDGE_PINK }}>
+                  <span className="nn-mono ml-auto shrink-0 text-[0.5625rem]" style={{ color: BRIDGE_PINK }}>
                     Cross-folder
                   </span>
                 )}

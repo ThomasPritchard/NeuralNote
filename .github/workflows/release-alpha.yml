@@ -1,0 +1,261 @@
+name: release-macos-alpha
+
+on:
+  push:
+    tags:
+      - "0.1.0"
+      - "v0.1.0"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: Existing or new tag for the 0.1.0 alpha release
+        required: true
+        default: v0.1.0
+
+concurrency:
+  group: release-macos-alpha
+  cancel-in-progress: false
+
+# The job creates one release and updates one dedicated manifest branch. No other
+# repository, issue, package, or workflow permission is granted.
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Sign and publish Apple Silicon alpha
+    runs-on: macos-14
+    timeout-minutes: 90
+    env:
+      RELEASE_VERSION: 0.1.0
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      RELEASE_CONFIG: ${{ runner.temp }}/tauri.release.conf.json
+      RELEASE_MANIFEST: ${{ runner.temp }}/latest-alpha.json
+      BUILD_KEYCHAIN: ${{ runner.temp }}/neuralnote-build.keychain-db
+      CERTIFICATE_PATH: ${{ runner.temp }}/neuralnote-certificate.p12
+
+    steps:
+      - name: Check out the release commit
+        uses: actions/checkout@08eba0b27e820071cde6df949e0beb9ba4906955 # v4.3.0
+        with:
+          fetch-depth: 0
+
+      - name: Set up Rust 1.96
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.0
+          targets: aarch64-apple-darwin
+          components: clippy,rustfmt,llvm-tools-preview
+
+      - name: Set up Node 22
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        with:
+          node-version: 22
+
+      - name: Validate release tag and all application versions
+        working-directory: app/desktop
+        run: |
+          set -euo pipefail
+          case "$RELEASE_TAG" in
+            0.1.0|v0.1.0) ;;
+            *) echo "::error::Release tag must be 0.1.0 or v0.1.0"; exit 1 ;;
+          esac
+          node <<'NODE'
+          const fs = require('node:fs');
+          const packageVersion = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
+          const tauriVersion = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8')).version;
+          const cargo = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
+          const workflow = fs.readFileSync('../../.github/workflows/release-alpha.yml', 'utf8');
+          const cargoVersion = cargo.match(/^version = "([^"]+)"$/m)?.[1];
+          const versions = { packageVersion, tauriVersion, cargoVersion };
+          for (const [source, version] of Object.entries(versions)) {
+            if (version !== process.env.RELEASE_VERSION) {
+              throw new Error(`${source} is ${version}; expected ${process.env.RELEASE_VERSION}`);
+            }
+          }
+          const actionLines = workflow.split('\n').filter((line) => /^\s+uses:/.test(line));
+          if (!actionLines.length || actionLines.some((line) => !/@[a-f0-9]{40}(?:\s|#|$)/.test(line))) {
+            throw new Error('Every release action must be pinned to a full commit SHA');
+          }
+          NODE
+
+      - name: Install locked frontend dependencies
+        working-directory: app/desktop
+        run: npm ci
+
+      - name: Install pinned Rust gate tools
+        run: |
+          cargo install cargo-llvm-cov --locked --version 0.8.7
+          cargo install cargo-audit --locked --version 0.22.2
+
+      - name: Run release gates
+        run: |
+          set -euo pipefail
+          npm --prefix app/desktop run typecheck
+          npm --prefix app/desktop run test:run
+          npm --prefix app/desktop run test:e2e
+          npm --prefix app/desktop run coverage
+          npm --prefix app/desktop run check:bindings
+          npm --prefix app/desktop audit --audit-level=high
+          cargo test --workspace --locked
+          ./scripts/rust-quality-gate.sh
+
+      - name: Enforce SonarQube quality gate
+        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
+        env:
+          SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+          SONAR_HOST_URL: ${{ vars.SONAR_HOST_URL }}
+        with:
+          args: -Dsonar.qualitygate.wait=true
+
+      - name: Validate public release configuration
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+        run: |
+          set -euo pipefail
+          for name in TAURI_UPDATER_PUBLIC_KEY APPLE_SIGNING_IDENTITY; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name is not configured"
+              exit 1
+            fi
+          done
+          node <<'NODE'
+          const fs = require('node:fs');
+          const key = process.env.TAURI_UPDATER_PUBLIC_KEY;
+          if (!key || key.length < 40 || /PRIVATE KEY/i.test(key)) {
+            throw new Error('TAURI_UPDATER_PUBLIC_KEY is not a valid public verification key');
+          }
+          fs.writeFileSync(
+            process.env.RELEASE_CONFIG,
+            JSON.stringify({ plugins: { updater: { pubkey: key } } }),
+            { mode: 0o600 },
+          );
+          NODE
+
+      - name: Import Apple Developer ID certificate
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
+          chmod 600 "$CERTIFICATE_PATH"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$BUILD_KEYCHAIN"
+          security default-keychain -s "$BUILD_KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$BUILD_KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$BUILD_KEYCHAIN"
+          security import "$CERTIFICATE_PATH" -k "$BUILD_KEYCHAIN" -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$BUILD_KEYCHAIN"
+          rm -f "$CERTIFICATE_PATH"
+
+      - name: Build, sign, and notarize Apple Silicon bundles
+        working-directory: app/desktop
+        env:
+          APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          npm run tauri build -- --target aarch64-apple-darwin --bundles app,dmg --config "$RELEASE_CONFIG"
+
+      - name: Verify signed app and locate artifacts
+        run: |
+          set -euo pipefail
+          BUNDLE_DIR="target/aarch64-apple-darwin/release/bundle"
+          APP_BUNDLE="$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' -print -quit)"
+          UPDATE_BUNDLE="$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app.tar.gz' -print -quit)"
+          DMG_BUNDLE="$(find "$BUNDLE_DIR/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -d "$APP_BUNDLE"
+          test -f "$UPDATE_BUNDLE"
+          test -f "$UPDATE_BUNDLE.sig"
+          test -f "$DMG_BUNDLE"
+          codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
+          spctl --assess --type execute --verbose=2 "$APP_BUNDLE"
+          printf 'UPDATE_BUNDLE=%s\n' "$UPDATE_BUNDLE" >> "$GITHUB_ENV"
+          printf 'UPDATE_SIGNATURE=%s\n' "$UPDATE_BUNDLE.sig" >> "$GITHUB_ENV"
+          printf 'DMG_BUNDLE=%s\n' "$DMG_BUNDLE" >> "$GITHUB_ENV"
+
+      - name: Build and validate latest-alpha.json
+        env:
+          RELEASE_ASSET_BASE: https://github.com/${{ github.repository }}/releases/download
+        run: |
+          set -euo pipefail
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const signature = fs.readFileSync(process.env.UPDATE_SIGNATURE, 'utf8').trim();
+          if (!signature) throw new Error('Updater signature is empty');
+          const artifactName = path.basename(process.env.UPDATE_BUNDLE);
+          const manifest = {
+            version: process.env.RELEASE_VERSION,
+            notes: 'NeuralNote 0.1.0 ALPHA',
+            pub_date: new Date().toISOString(),
+            platforms: {
+              'darwin-aarch64': {
+                signature,
+                url: `${process.env.RELEASE_ASSET_BASE}/${process.env.RELEASE_TAG}/${artifactName}`,
+              },
+            },
+          };
+          if (!/^https:\/\//.test(manifest.platforms['darwin-aarch64'].url)) {
+            throw new Error('Updater artifact URL must use HTTPS');
+          }
+          fs.writeFileSync(process.env.RELEASE_MANIFEST, `${JSON.stringify(manifest, null, 2)}\n`);
+          const parsed = JSON.parse(fs.readFileSync(process.env.RELEASE_MANIFEST, 'utf8'));
+          if (parsed.version !== '0.1.0' || !parsed.platforms?.['darwin-aarch64']?.signature) {
+            throw new Error('Generated alpha manifest is incomplete');
+          }
+          NODE
+
+      - name: Publish 0.1.0 ALPHA GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "$RELEASE_TAG" \
+            "$DMG_BUNDLE" \
+            "$UPDATE_BUNDLE" \
+            "$UPDATE_SIGNATURE" \
+            "$RELEASE_MANIFEST" \
+            --target "$GITHUB_SHA" \
+            --title "0.1.0 ALPHA" \
+            --notes "NeuralNote 0.1.0 ALPHA. This macOS build targets Apple Silicon." \
+            --prerelease
+
+      # This is deliberately last: clients never see a manifest until the signed
+      # artifact, signature, and GitHub release have all succeeded.
+      - name: Publish dedicated release-manifests branch
+        run: |
+          set -euo pipefail
+          MANIFEST_WORKTREE="$RUNNER_TEMP/release-manifests"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --exit-code --heads origin release-manifests >/dev/null 2>&1; then
+            git fetch origin release-manifests
+            git worktree add -B release-manifests "$MANIFEST_WORKTREE" origin/release-manifests
+          else
+            git worktree add --detach "$MANIFEST_WORKTREE"
+            git -C "$MANIFEST_WORKTREE" switch --orphan release-manifests
+            git -C "$MANIFEST_WORKTREE" rm -rf .
+          fi
+          cp "$RELEASE_MANIFEST" "$MANIFEST_WORKTREE/latest-alpha.json"
+          git -C "$MANIFEST_WORKTREE" add latest-alpha.json
+          if git -C "$MANIFEST_WORKTREE" diff --cached --quiet; then
+            echo "::error::release-manifests already contains this manifest"
+            exit 1
+          fi
+          git -C "$MANIFEST_WORKTREE" commit -m "release: publish NeuralNote 0.1.0 alpha manifest"
+          git -C "$MANIFEST_WORKTREE" push origin HEAD:release-manifests
+
+      - name: Remove temporary signing keychain
+        if: always()
+        run: |
+          rm -f "$CERTIFICATE_PATH"
+          if [ -f "$BUILD_KEYCHAIN" ]; then
+            security delete-keychain "$BUILD_KEYCHAIN"
+          fi

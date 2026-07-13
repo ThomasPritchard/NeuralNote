@@ -16,7 +16,7 @@ export function InlineError({
   return (
     <p
       role={alert ? "alert" : undefined}
-      className="flex items-start gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[12px] leading-snug text-destructive"
+      className="flex items-start gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[0.75rem] leading-snug text-destructive"
     >
       <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
       <span className="min-w-0 break-words">{children}</span>
@@ -27,7 +27,7 @@ export function InlineError({
 /** In-flight indicator (an <output> so it's announced, matching ChatPane). */
 export function LoadingRow({ label }: Readonly<{ label: string }>) {
   return (
-    <output className="flex items-center gap-2 text-[12px] text-muted-foreground/70">
+    <output className="flex items-center gap-2 text-[0.75rem] text-muted-foreground/70">
       <Loader2 className="size-3.5 animate-spin motion-reduce:animate-none" aria-hidden />
       {label}
     </output>
@@ -36,7 +36,7 @@ export function LoadingRow({ label }: Readonly<{ label: string }>) {
 
 export function ActiveBadge() {
   return (
-    <span className="flex shrink-0 items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[11px] font-medium text-primary ring-1 ring-inset ring-primary/30">
+    <span className="flex shrink-0 items-center gap-1 rounded-full bg-primary/10 px-2 py-0.5 text-[0.6875rem] font-medium text-primary ring-1 ring-inset ring-primary/30">
       <Check className="size-3" aria-hidden />
       Active
     </span>
@@ -64,10 +64,10 @@ export function ProviderCard({
           <Icon className="size-4" aria-hidden />
         </span>
         <div className="min-w-0 flex-1">
-          <h4 className="nn-heading text-[13px] font-semibold text-foreground">
+          <h4 className="nn-heading text-[0.8125rem] font-semibold text-foreground">
             {title}
           </h4>
-          <p className="mt-0.5 text-[11px] leading-snug text-muted-foreground">
+          <p className="mt-0.5 text-[0.6875rem] leading-snug text-muted-foreground">
             {description}
           </p>
         </div>
