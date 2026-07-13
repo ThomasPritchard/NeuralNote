@@ -20,6 +20,8 @@ import path from "node:path";
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
+import { assertTauriBuildSucceeded, getTauriBuildInvocation } from "./wdio-build.js";
+
 const here = path.dirname(fileURLToPath(import.meta.url));
 const isWindows = process.platform === "win32";
 const exe = isWindows ? ".exe" : "";
@@ -31,7 +33,8 @@ const BINARY_NAME = "desktop";
 const application = path.resolve(
   here,
   "..",
-  "src-tauri",
+  "..",
+  "..",
   "target",
   "debug",
   `${BINARY_NAME}${exe}`,
@@ -70,13 +73,17 @@ export const config: WebdriverIO.Config = {
 
   // Build the debug binary the WebDriver sessions expect to exist. Runs from the
   // desktop app root; `--no-bundle` skips installer packaging (we only need the
-  // raw binary), `--debug` keeps it fast and unsigned.
+  // raw binary), `--debug` keeps it fast and unsigned. The E2E config removes
+  // local-AI sidecars and resources that this smoke test does not exercise.
   onPrepare: () => {
-    spawnSync("npm", ["run", "tauri", "build", "--", "--debug", "--no-bundle"], {
+    const invocation = getTauriBuildInvocation(here);
+    const result = spawnSync(invocation.command, invocation.args, {
       cwd: path.resolve(here, ".."),
       stdio: "inherit",
-      shell: true,
+      shell: false,
     });
+
+    assertTauriBuildSucceeded(result);
   },
 
   // Start tauri-driver before each session so it can proxy WebDriver requests.

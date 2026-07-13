@@ -51,12 +51,15 @@ xvfb-run npm test       # Linux (headless display)
 
 | File | Purpose |
 | --- | --- |
+| `wdio-build.ts` | Cross-platform, no-shell Tauri build invocation and explicit build-result validation. |
 | `wdio.conf.ts` | WebdriverIO config: `browserName: "wry"` + `tauri:options.application` pointing at the debug binary; spawns/stops `tauri-driver`; builds the app in `onPrepare`. |
+| `tauri.e2e.conf.json` | Build overlay that removes the Ollama sidecars and resources; the smoke test does not exercise local AI. |
 | `specs/smoke.spec.ts` | Smoke test: the window boots and the welcome brand heading + vault entry points are visible. |
 
 ### Binary name
 
-`wdio.conf.ts` points at `../src-tauri/target/debug/desktop` (`.exe` on Windows).
+`wdio.conf.ts` points at the workspace-level `../../../target/debug/desktop` (`.exe`
+on Windows), because Cargo builds every workspace member into the root target directory.
 `mainBinaryName` is unset in `tauri.conf.json`, so the binary keeps the Cargo crate
 name (`desktop`), not the `productName` (`NeuralNote`). If a `mainBinaryName` is added
 to the Tauri config later, update `BINARY_NAME` in `wdio.conf.ts` to match.
