@@ -21,6 +21,9 @@ mod commands;
 mod event_names;
 mod local;
 mod menu;
+mod openrouter_catalogue;
+#[cfg(test)]
+mod openrouter_catalogue_contract_tests;
 mod requirement_detection;
 mod requirement_download;
 mod requirement_install_lock;
@@ -61,6 +64,10 @@ pub(crate) struct AppState {
     /// Content hashes for at most the last eight non-empty skill runs. Bounded so
     /// delete authority and memory cannot grow for the lifetime of the app.
     pub(crate) skill_undo_runs: skills::UndoRunStore,
+    /// Session-only OpenRouter ranking cache and the exact validated model IDs
+    /// last offered to the webview. Provider bodies and credentials never enter
+    /// this state.
+    pub(crate) openrouter_catalogue: openrouter_catalogue::OpenRouterCatalogueState,
     /// Folders the user explicitly chose via the native picker this session.
     /// Only these — or a path already in the on-disk recents list (itself written
     /// only from a prior explicit pick) — may become a vault root. This stops a
@@ -98,6 +105,7 @@ impl Default for AppState {
             pending_elicitations: Arc::new(skills::PendingElicitations::default()),
             requirement_download: requirement_download::RequirementDownloadState::default(),
             skill_undo_runs: skills::UndoRunStore::default(),
+            openrouter_catalogue: openrouter_catalogue::OpenRouterCatalogueState::default(),
             authorized: HashSet::new(),
             chat_visible: true,
             editing: false,
@@ -272,6 +280,9 @@ pub fn run() {
             commands::ai::cancel_chat_run,
             commands::ai::open_youtube_timestamp,
             commands::ai::ai_status,
+            commands::ai::openrouter_model_menu,
+            commands::ai::select_openrouter_model,
+            commands::ai::open_openrouter_rankings,
             commands::ai::set_active_provider,
             commands::ai::set_reasoning,
             commands::ai::refresh_reasoning_support,

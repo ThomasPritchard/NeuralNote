@@ -12,7 +12,10 @@ use neuralnote_core::{ai::ReasoningSupport, CoreError};
 use tauri::{AppHandle, Manager};
 use ts_rs::TS;
 
-use crate::{ai, config_dir, local, lock_state, requirement_detection, skills, SharedState};
+use crate::{
+    ai, config_dir, local, lock_state, openrouter_catalogue, requirement_detection, skills,
+    SharedState,
+};
 
 #[tauri::command]
 pub(crate) fn api_key_status(app: AppHandle) -> Result<ai::ApiKeyStatus, CoreError> {
@@ -74,6 +77,81 @@ pub(crate) fn ai_status(app: AppHandle) -> Result<AiStatus, CoreError> {
     Ok(build_ai_status(neuralnote_core::ai::read_provider_config(
         &config_dir(&app)?,
     )?))
+}
+
+/// Return today's validated OpenRouter model choices. A successful result,
+/// including an empty list, is cached for the completed UTC day. `force_refresh`
+/// bypasses that cache but never discards it when the replacement request fails.
+#[tauri::command]
+pub(crate) async fn openrouter_model_menu(
+    app: AppHandle,
+    state: SharedState<'_>,
+    force_refresh: bool,
+) -> Result<openrouter_catalogue::OpenRouterModelMenu, CoreError> {
+    let dir = config_dir(&app)?;
+    let config = neuralnote_core::ai::read_provider_config(&dir)?;
+    let selected_model = config.model;
+    let day = neuralnote_core::ai::latest_completed_utc_day(chrono::Utc::now());
+
+    if !force_refresh {
+        let mut app_state = lock_state(&state);
+        if app_state
+            .openrouter_catalogue
+            .cached_for(day, false)
+            .is_some()
+        {
+            return app_state
+                .openrouter_catalogue
+                .offer_for(day, &selected_model);
+        }
+    }
+
+    let api_key = ai::read_api_key()?.ok_or_else(|| {
+        CoreError::Llm("Set an OpenRouter API key before loading model choices.".into())
+    })?;
+    let transport = openrouter_catalogue::ReqwestCatalogueTransport::new()?;
+    let ranked =
+        openrouter_catalogue::fetch_validated_catalogue(&transport, &day.to_string(), &api_key)
+            .await?;
+    let selected_model = neuralnote_core::ai::read_provider_config(&dir)?.model;
+
+    // The AppState guard is acquired only after both network requests and core
+    // validation complete. No shared-state lock crosses an await boundary.
+    let mut app_state = lock_state(&state);
+    app_state.openrouter_catalogue.remember(day, ranked);
+    app_state
+        .openrouter_catalogue
+        .offer_for(day, &selected_model)
+}
+
+/// Persist only the model selected from the exact validated list last offered
+/// to this app session, then return the freshly-read status. The API key never
+/// crosses IPC and every other AI preference remains unchanged.
+#[tauri::command]
+pub(crate) fn select_openrouter_model(
+    app: AppHandle,
+    state: SharedState<'_>,
+    model: String,
+) -> Result<AiStatus, CoreError> {
+    let offered = lock_state(&state).openrouter_catalogue.offered_models();
+    let config =
+        openrouter_catalogue::persist_selected_model(&config_dir(&app)?, &offered, &model)?;
+    Ok(build_ai_status(config))
+}
+
+/// Open OpenRouter's rankings attribution page. The target is compiled into
+/// Rust; the webview cannot supply or redirect this privileged URL.
+#[tauri::command]
+#[allow(deprecated)]
+pub(crate) fn open_openrouter_rankings(app: AppHandle) -> Result<(), CoreError> {
+    use tauri_plugin_shell::ShellExt as _;
+
+    app.shell()
+        .open(
+            openrouter_catalogue::OPENROUTER_RANKINGS_ATTRIBUTION_URL,
+            None,
+        )
+        .map_err(|_| CoreError::Io("Could not open the OpenRouter rankings page.".into()))
 }
 
 /// Map the persisted config onto the provider-aware status DTO. Split from the
