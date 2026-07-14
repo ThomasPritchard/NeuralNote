@@ -3,6 +3,10 @@
 use crate::error::{CoreError, CoreResult};
 use crate::model::NoteDoc;
 use crate::paths::{ensure_within, rel_path};
+use crate::rich_edit::{
+    analyze_note_for_rich_edit, apply_rich_edit_patch, RichEditDocument, RichEditError,
+    RichEditPatch,
+};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -99,6 +103,43 @@ pub fn read_note(root: &Path, target: &Path) -> CoreResult<NoteDoc> {
                 Ok(build_binary_doc(root, &path))
             }
         }
+    }
+}
+
+/// Read a note for guarded rich editing without ever lossily decoding bytes.
+/// The core owns path authorization and Markdown compatibility analysis; hosts
+/// only forward the resulting source-preserving DTO.
+pub fn read_rich_note(root: &Path, target: &Path) -> CoreResult<RichEditDocument> {
+    let path = ensure_within(root, target)?;
+    if !path.is_file() {
+        return Err(CoreError::NotFound(path.display().to_string()));
+    }
+    let bytes = std::fs::read(path)?;
+    analyze_note_for_rich_edit(&bytes).map_err(rich_edit_error_to_core)
+}
+
+/// Apply a validated source-range patch and atomically persist the exact result.
+/// A second optimistic-concurrency check in [`write_note`] closes the ordinary
+/// external-edit window between analysis and the atomic replace.
+pub fn write_rich_note(root: &Path, target: &Path, patch: &RichEditPatch) -> CoreResult<NoteDoc> {
+    let path = ensure_within(root, target)?;
+    if !path.is_file() {
+        return Err(CoreError::NotFound(path.display().to_string()));
+    }
+    let current = std::fs::read(&path)?;
+    let applied = apply_rich_edit_patch(&current, patch).map_err(rich_edit_error_to_core)?;
+    write_note(
+        root,
+        &path,
+        &applied.content,
+        Some(patch.expected_revision.clone()),
+    )
+}
+
+fn rich_edit_error_to_core(error: RichEditError) -> CoreError {
+    match error {
+        RichEditError::StaleRevision => CoreError::Conflict(error.to_string()),
+        other => CoreError::InvalidContent(other.to_string()),
     }
 }
 

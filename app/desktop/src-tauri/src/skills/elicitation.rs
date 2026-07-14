@@ -1,12 +1,44 @@
 use async_trait::async_trait;
 use neuralnote_core::ai::{Elicitation, UserPrompt};
 use neuralnote_core::{CoreError, CoreResult};
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 use tokio::sync::oneshot;
+use ts_rs::TS;
+use uuid::Uuid;
 
 const ELICITATION_TIMEOUT: Duration = Duration::from_secs(300);
+const MAX_COMPLETED_CHAT_RUNS: usize = 64;
+const MAX_PENDING_CHAT_STOPS: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub(crate) enum CancelChatRunStatus {
+    Cancelled,
+    AlreadyCompleted,
+    // Kept in the frozen 0.2.0 wire vocabulary for forward-compatible callers.
+    #[allow(dead_code)]
+    NotCurrent,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub(crate) struct CancelChatRunOutcome {
+    pub(crate) turn_id: String,
+    pub(crate) status: CancelChatRunStatus,
+}
+
+impl CancelChatRunOutcome {
+    fn new(turn_id: Uuid, status: CancelChatRunStatus) -> Self {
+        Self {
+            turn_id: turn_id.to_string(),
+            status,
+        }
+    }
+}
 
 /// One responder parked at the Rust/UI boundary.
 ///
@@ -34,7 +66,9 @@ pub(crate) struct ParkedResponse {
 struct RegistryState {
     // TODO(elicit-run-scope): key PendingElicitations by (run_id, id) to close cross-run id collision.
     entries: HashMap<String, PendingElicitation>,
-    run_signals: HashMap<String, Arc<crate::ai::ChatRunCloseSignal>>,
+    run_signals: HashMap<Uuid, Arc<crate::ai::ChatRunCloseSignal>>,
+    pending_stops: VecDeque<Uuid>,
+    completed_runs: VecDeque<Uuid>,
     next_registration: u64,
     lifecycle_generation: u64,
 }
@@ -165,6 +199,7 @@ impl PendingElicitations {
     /// Remove every pending question owned by `run_id`. Dropping the senders wakes
     /// their inline `ask` futures as `None`, so an early return cannot strand an
     /// asynchronous task behind a response the UI can no longer send.
+    #[cfg(test)]
     pub(crate) fn purge_run(&self, run_id: &str) -> usize {
         let removed = {
             let mut state = self.lock();
@@ -185,13 +220,10 @@ impl PendingElicitations {
 
     fn register_run(
         &self,
-        run_id: &str,
+        run_id: Uuid,
         close_signal: Arc<crate::ai::ChatRunCloseSignal>,
         expected_generation: u64,
     ) -> CoreResult<()> {
-        if run_id.trim().is_empty() {
-            return Err(CoreError::InvalidName("chat run id cannot be blank".into()));
-        }
         let mut state = self.lock();
         if state.lifecycle_generation != expected_generation {
             drop(state);
@@ -200,12 +232,22 @@ impl PendingElicitations {
                 "chat run '{run_id}' cannot start because the workspace changed"
             )));
         }
-        if state.run_signals.contains_key(run_id) {
+        if state.completed_runs.contains(&run_id) {
+            return Err(CoreError::Conflict(format!(
+                "chat run '{run_id}' has already completed"
+            )));
+        }
+        if state.run_signals.contains_key(&run_id) {
             return Err(CoreError::Conflict(format!(
                 "chat run '{run_id}' is already registered"
             )));
         }
-        state.run_signals.insert(run_id.to_string(), close_signal);
+        if take_pending_stop(&mut state, run_id) {
+            close_signal.stop_by_user();
+            remember_completed(&mut state, run_id);
+            return Ok(());
+        }
+        state.run_signals.insert(run_id, close_signal);
         Ok(())
     }
 
@@ -220,9 +262,13 @@ impl PendingElicitations {
             // a workspace that has since been replaced. Wrapping would require
             // 2^64 vault lifecycle changes during one process lifetime.
             state.lifecycle_generation = state.lifecycle_generation.wrapping_add(1);
-            let signals = state
-                .run_signals
-                .drain()
+            state.pending_stops.clear();
+            let active_runs = state.run_signals.drain().collect::<Vec<_>>();
+            for (run_id, _) in &active_runs {
+                remember_completed(&mut state, *run_id);
+            }
+            let signals = active_runs
+                .into_iter()
                 .map(|(_, signal)| signal)
                 .collect::<Vec<_>>();
             let parked = state
@@ -240,24 +286,30 @@ impl PendingElicitations {
         count
     }
 
-    /// Cancel the UI's sole active chat run without changing the vault lifecycle
-    /// generation. A second concurrent run is an explicit conflict rather than
-    /// an arbitrary cancellation target.
-    pub(crate) fn cancel_active_run(&self) -> CoreResult<bool> {
-        let (run_id, signal, parked) = {
+    /// Stop only the caller's exact UUID, retaining a bounded stop when its chat
+    /// command has not registered yet. Completion and cancellation move the id to
+    /// the bounded completed set under this mutex, so their race has one winner.
+    pub(crate) fn cancel_run(&self, turn_id: Uuid) -> CancelChatRunOutcome {
+        let (status, parked) = {
             let mut state = self.lock();
-            if state.run_signals.len() > 1 {
-                return Err(CoreError::Conflict(
-                    "more than one chat run is active; refusing an ambiguous cancellation".into(),
-                ));
-            }
-            let Some(run_id) = state.run_signals.keys().next().cloned() else {
-                return Ok(false);
+            let Some(signal) = state.run_signals.remove(&turn_id) else {
+                let status = if state.completed_runs.contains(&turn_id)
+                    || state.pending_stops.contains(&turn_id)
+                {
+                    CancelChatRunStatus::AlreadyCompleted
+                } else {
+                    remember_pending_stop(&mut state, turn_id);
+                    CancelChatRunStatus::Cancelled
+                };
+                return CancelChatRunOutcome::new(turn_id, status);
             };
-            let signal = state
-                .run_signals
-                .remove(&run_id)
-                .expect("active run id came from the same map");
+            let status = if signal.stop_by_user() {
+                CancelChatRunStatus::Cancelled
+            } else {
+                CancelChatRunStatus::AlreadyCompleted
+            };
+            remember_completed(&mut state, turn_id);
+            let run_id = turn_id.to_string();
             let ids = state
                 .entries
                 .iter()
@@ -267,12 +319,11 @@ impl PendingElicitations {
                 .into_iter()
                 .filter_map(|id| state.entries.remove(&id))
                 .collect::<Vec<_>>();
-            (run_id, signal, parked)
+            (status, parked)
         };
-        signal.close();
         drop(parked);
-        log::debug!("cancelled chat run {run_id}");
-        Ok(true)
+        log::debug!("resolved stop request for chat turn {turn_id}: {status:?}");
+        CancelChatRunOutcome::new(turn_id, status)
     }
 
     /// Snapshot the workspace lifecycle used to reject a run that was paused
@@ -281,9 +332,29 @@ impl PendingElicitations {
         self.lock().lifecycle_generation
     }
 
-    fn finish_run(&self, run_id: &str) {
-        self.lock().run_signals.remove(run_id);
-        self.purge_run(run_id);
+    fn finish_run(&self, run_id: Uuid, owned_signal: &Arc<crate::ai::ChatRunCloseSignal>) {
+        let removed = {
+            let mut state = self.lock();
+            let owns_registration = state
+                .run_signals
+                .get(&run_id)
+                .is_some_and(|registered| Arc::ptr_eq(registered, owned_signal));
+            if !owns_registration {
+                return;
+            }
+            state.run_signals.remove(&run_id);
+            remember_completed(&mut state, run_id);
+            let run_id = run_id.to_string();
+            let ids = state
+                .entries
+                .iter()
+                .filter_map(|(id, pending)| (pending.run_id == run_id).then_some(id.clone()))
+                .collect::<Vec<_>>();
+            ids.into_iter()
+                .filter_map(|id| state.entries.remove(&id))
+                .collect::<Vec<_>>()
+        };
+        drop(removed);
     }
 
     /// Win timeout ownership only if `id` still names the exact registration this
@@ -309,11 +380,44 @@ impl PendingElicitations {
         self.lock().entries.len()
     }
 
+    #[cfg(test)]
+    fn completed_len(&self) -> usize {
+        self.lock().completed_runs.len()
+    }
+
     fn lock(&self) -> MutexGuard<'_, RegistryState> {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+}
+
+fn remember_completed(state: &mut RegistryState, run_id: Uuid) {
+    state.completed_runs.retain(|stored| stored != &run_id);
+    while state.completed_runs.len() >= MAX_COMPLETED_CHAT_RUNS {
+        state.completed_runs.pop_front();
+    }
+    state.completed_runs.push_back(run_id);
+}
+
+fn remember_pending_stop(state: &mut RegistryState, run_id: Uuid) {
+    state.pending_stops.retain(|stored| stored != &run_id);
+    while state.pending_stops.len() >= MAX_PENDING_CHAT_STOPS {
+        state.pending_stops.pop_front();
+    }
+    state.pending_stops.push_back(run_id);
+}
+
+fn take_pending_stop(state: &mut RegistryState, run_id: Uuid) -> bool {
+    let Some(index) = state
+        .pending_stops
+        .iter()
+        .position(|stored| stored == &run_id)
+    else {
+        return false;
+    };
+    state.pending_stops.remove(index);
+    true
 }
 
 /// Desktop implementation of core's structured-question seam. It parks exactly
@@ -415,25 +519,29 @@ impl UserPrompt for ShellUserPrompt {
 /// it, which closes all response senders belonging to that run.
 pub(crate) struct RunElicitationGuard {
     pending: Arc<PendingElicitations>,
-    run_id: String,
+    run_id: Uuid,
+    close_signal: Arc<crate::ai::ChatRunCloseSignal>,
 }
 
 impl RunElicitationGuard {
     pub(crate) fn try_new(
         pending: Arc<PendingElicitations>,
-        run_id: impl Into<String>,
+        run_id: Uuid,
         close_signal: Arc<crate::ai::ChatRunCloseSignal>,
         expected_generation: u64,
     ) -> CoreResult<Self> {
-        let run_id = run_id.into();
-        pending.register_run(&run_id, close_signal, expected_generation)?;
-        Ok(Self { pending, run_id })
+        pending.register_run(run_id, Arc::clone(&close_signal), expected_generation)?;
+        Ok(Self {
+            pending,
+            run_id,
+            close_signal,
+        })
     }
 }
 
 impl Drop for RunElicitationGuard {
     fn drop(&mut self) {
-        self.pending.finish_run(&self.run_id);
+        self.pending.finish_run(self.run_id, &self.close_signal);
     }
 }
 
@@ -618,16 +726,17 @@ mod tests {
     async fn run_guard_drop_wakes_shell_prompt_with_none() {
         let pending = Arc::new(PendingElicitations::default());
         let closed = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let id = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e11");
         let guard = RunElicitationGuard::try_new(
             Arc::clone(&pending),
-            "run-1",
+            id,
             Arc::clone(&closed),
             pending.lifecycle_generation(),
         )
         .unwrap();
         let prompt = ShellUserPrompt::with_timeout_and_close(
             Arc::clone(&pending),
-            "run-1",
+            id.to_string(),
             Duration::from_secs(10),
             closed,
         );
@@ -687,14 +796,14 @@ mod tests {
         let generation = pending.lifecycle_generation();
         let _first_guard = RunElicitationGuard::try_new(
             Arc::clone(&pending),
-            "run-1",
+            turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e12"),
             Arc::clone(&first_closed),
             generation,
         )
         .unwrap();
         let _second_guard = RunElicitationGuard::try_new(
             Arc::clone(&pending),
-            "run-2",
+            turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e13"),
             Arc::clone(&second_closed),
             generation,
         )
@@ -736,7 +845,7 @@ mod tests {
         assert!(matches!(
             RunElicitationGuard::try_new(
                 Arc::clone(&pending),
-                "stale-run",
+                turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e14"),
                 Arc::clone(&stale_closed),
                 stale_generation,
             ),
@@ -747,7 +856,7 @@ mod tests {
         let fresh_closed = Arc::new(crate::ai::ChatRunCloseSignal::default());
         let fresh = RunElicitationGuard::try_new(
             Arc::clone(&pending),
-            "fresh-run",
+            turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e15"),
             Arc::clone(&fresh_closed),
             pending.lifecycle_generation(),
         )
@@ -761,13 +870,404 @@ mod tests {
         let pending = PendingElicitations::default();
         let generation = pending.lifecycle_generation();
         let signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let id = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e16");
         pending
-            .register_run("run-1", Arc::clone(&signal), generation)
+            .register_run(id, Arc::clone(&signal), generation)
             .unwrap();
 
-        assert!(pending.cancel_active_run().unwrap());
+        assert_eq!(
+            pending.cancel_run(id).status,
+            CancelChatRunStatus::Cancelled
+        );
         assert!(signal.is_closed());
         assert_eq!(pending.lifecycle_generation(), generation);
-        assert!(!pending.cancel_active_run().unwrap());
+        assert_eq!(
+            pending.cancel_run(id).status,
+            CancelChatRunStatus::AlreadyCompleted
+        );
+    }
+
+    fn turn_id(value: &str) -> uuid::Uuid {
+        uuid::Uuid::parse_str(value).unwrap()
+    }
+
+    #[test]
+    fn cancellation_targets_only_the_exact_uuid_and_echoes_it() {
+        let pending = PendingElicitations::default();
+        let active = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e01");
+        let pending_id = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e02");
+        let later = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e0a");
+        let signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        pending
+            .register_run(active, Arc::clone(&signal), pending.lifecycle_generation())
+            .unwrap();
+
+        let queued = pending.cancel_run(pending_id);
+        assert_eq!(queued.turn_id, pending_id.to_string());
+        assert_eq!(queued.status, CancelChatRunStatus::Cancelled);
+        assert!(!signal.is_closed());
+
+        let cancelled = pending.cancel_run(active);
+        assert_eq!(cancelled.turn_id, active.to_string());
+        assert_eq!(cancelled.status, CancelChatRunStatus::Cancelled);
+        assert_eq!(
+            signal.reason(),
+            Some(crate::ai::ChatRunCloseReason::UserStop)
+        );
+
+        let repeated = pending.cancel_run(active);
+        assert_eq!(repeated.status, CancelChatRunStatus::AlreadyCompleted);
+
+        let later_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        pending
+            .register_run(
+                later,
+                Arc::clone(&later_signal),
+                pending.lifecycle_generation(),
+            )
+            .unwrap();
+        assert_eq!(
+            pending.cancel_run(active).status,
+            CancelChatRunStatus::AlreadyCompleted
+        );
+        assert!(
+            !later_signal.is_closed(),
+            "a delayed stop for the completed id must not reach the later turn"
+        );
+    }
+
+    #[test]
+    fn stop_requested_before_registration_is_consumed_by_that_exact_run() {
+        let pending = Arc::new(PendingElicitations::default());
+        let id = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e07");
+
+        assert_eq!(
+            pending.cancel_run(id).status,
+            CancelChatRunStatus::Cancelled
+        );
+
+        let signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let guard = RunElicitationGuard::try_new(
+            Arc::clone(&pending),
+            id,
+            Arc::clone(&signal),
+            pending.lifecycle_generation(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            signal.reason(),
+            Some(crate::ai::ChatRunCloseReason::UserStop)
+        );
+        assert_eq!(
+            pending.cancel_run(id).status,
+            CancelChatRunStatus::AlreadyCompleted
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn stop_requested_before_registration_survives_an_unrelated_active_run() {
+        let pending = Arc::new(PendingElicitations::default());
+        let active_id = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e17");
+        let pending_id = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e18");
+        let active_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let active_guard = RunElicitationGuard::try_new(
+            Arc::clone(&pending),
+            active_id,
+            Arc::clone(&active_signal),
+            pending.lifecycle_generation(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            pending.cancel_run(pending_id).status,
+            CancelChatRunStatus::Cancelled
+        );
+
+        let pending_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let pending_guard = RunElicitationGuard::try_new(
+            Arc::clone(&pending),
+            pending_id,
+            Arc::clone(&pending_signal),
+            pending.lifecycle_generation(),
+        )
+        .unwrap();
+
+        assert!(!active_signal.is_closed());
+        assert_eq!(
+            pending_signal.reason(),
+            Some(crate::ai::ChatRunCloseReason::UserStop)
+        );
+        drop(active_guard);
+        drop(pending_guard);
+    }
+
+    #[test]
+    fn pending_stop_memory_is_bounded_and_evicts_the_oldest_uuid() {
+        let pending = Arc::new(PendingElicitations::default());
+        for sequence in 1..=65 {
+            assert_eq!(
+                pending.cancel_run(uuid::Uuid::from_u128(sequence)).status,
+                CancelChatRunStatus::Cancelled
+            );
+        }
+
+        let oldest_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let oldest_guard = RunElicitationGuard::try_new(
+            Arc::clone(&pending),
+            uuid::Uuid::from_u128(1),
+            Arc::clone(&oldest_signal),
+            pending.lifecycle_generation(),
+        )
+        .unwrap();
+        assert!(!oldest_signal.is_closed());
+
+        let newest_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let newest_guard = RunElicitationGuard::try_new(
+            Arc::clone(&pending),
+            uuid::Uuid::from_u128(65),
+            Arc::clone(&newest_signal),
+            pending.lifecycle_generation(),
+        )
+        .unwrap();
+        assert_eq!(
+            newest_signal.reason(),
+            Some(crate::ai::ChatRunCloseReason::UserStop)
+        );
+
+        drop(oldest_guard);
+        drop(newest_guard);
+    }
+
+    #[test]
+    fn lifecycle_cancellation_discards_pre_registration_stops() {
+        let pending = Arc::new(PendingElicitations::default());
+        let id = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e09");
+        assert_eq!(
+            pending.cancel_run(id).status,
+            CancelChatRunStatus::Cancelled
+        );
+
+        assert_eq!(pending.cancel_all_runs(), 0);
+
+        let signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let guard = RunElicitationGuard::try_new(
+            Arc::clone(&pending),
+            id,
+            Arc::clone(&signal),
+            pending.lifecycle_generation(),
+        )
+        .unwrap();
+        assert!(!signal.is_closed());
+        drop(guard);
+    }
+
+    #[test]
+    fn lifecycle_cancelled_active_uuid_is_remembered_as_completed() {
+        let pending = Arc::new(PendingElicitations::default());
+        let id = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e19");
+        let signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let guard = RunElicitationGuard::try_new(
+            Arc::clone(&pending),
+            id,
+            Arc::clone(&signal),
+            pending.lifecycle_generation(),
+        )
+        .unwrap();
+
+        assert_eq!(pending.cancel_all_runs(), 1);
+
+        assert!(signal.is_closed());
+        assert_eq!(
+            pending.cancel_run(id).status,
+            CancelChatRunStatus::AlreadyCompleted
+        );
+        drop(guard);
+    }
+
+    #[test]
+    fn an_old_guard_cannot_finish_a_later_registration_reusing_its_uuid() {
+        let pending = Arc::new(PendingElicitations::default());
+        let id = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e08");
+        let old_guard = RunElicitationGuard::try_new(
+            Arc::clone(&pending),
+            id,
+            Arc::new(crate::ai::ChatRunCloseSignal::default()),
+            pending.lifecycle_generation(),
+        )
+        .unwrap();
+        assert_eq!(
+            pending.cancel_run(id).status,
+            CancelChatRunStatus::Cancelled
+        );
+
+        for sequence in 1..=MAX_COMPLETED_CHAT_RUNS {
+            let other = uuid::Uuid::from_u128(sequence as u128);
+            let guard = RunElicitationGuard::try_new(
+                Arc::clone(&pending),
+                other,
+                Arc::new(crate::ai::ChatRunCloseSignal::default()),
+                pending.lifecycle_generation(),
+            )
+            .unwrap();
+            drop(guard);
+        }
+
+        let later_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let later_guard = RunElicitationGuard::try_new(
+            Arc::clone(&pending),
+            id,
+            Arc::clone(&later_signal),
+            pending.lifecycle_generation(),
+        )
+        .unwrap();
+
+        drop(old_guard);
+
+        assert_eq!(
+            pending.cancel_run(id).status,
+            CancelChatRunStatus::Cancelled
+        );
+        assert_eq!(
+            later_signal.reason(),
+            Some(crate::ai::ChatRunCloseReason::UserStop)
+        );
+        drop(later_guard);
+    }
+
+    #[test]
+    fn a_completed_uuid_cannot_be_registered_again() {
+        let pending = PendingElicitations::default();
+        let id = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e06");
+        let signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        pending
+            .register_run(id, Arc::clone(&signal), pending.lifecycle_generation())
+            .unwrap();
+        pending.finish_run(id, &signal);
+
+        assert!(matches!(
+            pending.register_run(
+                id,
+                Arc::new(crate::ai::ChatRunCloseSignal::default()),
+                pending.lifecycle_generation(),
+            ),
+            Err(CoreError::Conflict(_))
+        ));
+    }
+
+    #[test]
+    fn normal_completion_wins_before_a_later_cancel() {
+        let pending = Arc::new(PendingElicitations::default());
+        let id = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e03");
+        let signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let guard = RunElicitationGuard::try_new(
+            Arc::clone(&pending),
+            id,
+            Arc::clone(&signal),
+            pending.lifecycle_generation(),
+        )
+        .unwrap();
+
+        drop(guard);
+
+        assert_eq!(
+            pending.cancel_run(id).status,
+            CancelChatRunStatus::AlreadyCompleted
+        );
+        assert_eq!(signal.reason(), None);
+    }
+
+    #[test]
+    fn user_cancel_wins_before_a_later_normal_finish() {
+        let pending = Arc::new(PendingElicitations::default());
+        let id = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e0b");
+        let signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let guard = RunElicitationGuard::try_new(
+            Arc::clone(&pending),
+            id,
+            Arc::clone(&signal),
+            pending.lifecycle_generation(),
+        )
+        .unwrap();
+
+        assert_eq!(
+            pending.cancel_run(id).status,
+            CancelChatRunStatus::Cancelled
+        );
+        drop(guard);
+
+        assert_eq!(
+            pending.cancel_run(id).status,
+            CancelChatRunStatus::AlreadyCompleted
+        );
+        assert_eq!(
+            signal.reason(),
+            Some(crate::ai::ChatRunCloseReason::UserStop)
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelling_an_exact_run_purges_only_its_elicitations() {
+        let pending = PendingElicitations::default();
+        let stopped = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e04");
+        let retained = turn_id("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e05");
+        pending
+            .register_run(
+                stopped,
+                Arc::new(crate::ai::ChatRunCloseSignal::default()),
+                pending.lifecycle_generation(),
+            )
+            .unwrap();
+        pending
+            .register_run(
+                retained,
+                Arc::new(crate::ai::ChatRunCloseSignal::default()),
+                pending.lifecycle_generation(),
+            )
+            .unwrap();
+        let stopped_prompt = pending
+            .park(&stopped.to_string(), elicitation("stopped-q", false))
+            .unwrap();
+        let retained_prompt = pending
+            .park(&retained.to_string(), elicitation("retained-q", false))
+            .unwrap();
+
+        assert_eq!(
+            pending.cancel_run(stopped).status,
+            CancelChatRunStatus::Cancelled
+        );
+        assert!(stopped_prompt.receiver.await.is_err());
+        assert_eq!(pending.len(), 1);
+        pending.answer("retained-q", vec!["yes".into()]).unwrap();
+        assert_eq!(
+            retained_prompt.receiver.await.unwrap(),
+            Some(vec!["yes".into()])
+        );
+    }
+
+    #[test]
+    fn completed_turn_memory_is_bounded() {
+        let pending = PendingElicitations::default();
+        for sequence in 1..=(MAX_COMPLETED_CHAT_RUNS + 1) {
+            let id = uuid::Uuid::from_u128(sequence as u128);
+            let signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+            pending
+                .register_run(id, Arc::clone(&signal), pending.lifecycle_generation())
+                .unwrap();
+            pending.finish_run(id, &signal);
+        }
+
+        assert_eq!(pending.completed_len(), MAX_COMPLETED_CHAT_RUNS);
+        assert_eq!(
+            pending.cancel_run(uuid::Uuid::from_u128(1)).status,
+            CancelChatRunStatus::Cancelled
+        );
+        assert_eq!(
+            pending
+                .cancel_run(uuid::Uuid::from_u128((MAX_COMPLETED_CHAT_RUNS + 1) as u128))
+                .status,
+            CancelChatRunStatus::AlreadyCompleted
+        );
     }
 }

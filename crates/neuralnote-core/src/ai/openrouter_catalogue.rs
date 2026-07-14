@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 
 const MIN_CONTEXT_LENGTH: u64 = 32_768;
+const MAX_JAVASCRIPT_SAFE_CONTEXT_LENGTH: u64 = 9_007_199_254_740_991;
 const MAX_MODELS: usize = 10;
 const MAX_RANKING_RECORDS: usize = 64;
 const MAX_CATALOGUE_RECORDS: usize = 4_096;
@@ -217,6 +218,12 @@ fn validate_catalogue(
             MAX_MODEL_NAME_LENGTH,
             "OpenRouter catalogue model name",
         )?;
+        if model.context_length > MAX_JAVASCRIPT_SAFE_CONTEXT_LENGTH {
+            return Err(CoreError::Llm(
+                "OpenRouter catalogue context length exceeds the exact JavaScript integer range"
+                    .into(),
+            ));
+        }
         if model.supported_parameters.len() > MAX_SUPPORTED_PARAMETERS {
             return Err(CoreError::Llm(
                 "OpenRouter catalogue model listed too many supported parameters".into(),
@@ -638,6 +645,23 @@ mod tests {
             "supported_parameters": ["tools"]
         })]);
         assert!(rank_openrouter_models(&rankings, &malformed_catalogue, DATE).is_err());
+    }
+
+    #[test]
+    fn context_lengths_that_cannot_cross_javascript_exactly_fail_closed() {
+        let rankings = rankings_json(vec![ranking("vendor/model", "100")]);
+        let catalogue = catalogue_json(vec![catalogue_model(
+            "vendor/model",
+            "vendor/model",
+            "Model",
+            9_007_199_254_740_992,
+            &["tools"],
+        )]);
+
+        assert!(matches!(
+            rank_openrouter_models(&rankings, &catalogue, DATE),
+            Err(CoreError::Llm(message)) if message.contains("context length")
+        ));
     }
 
     #[test]

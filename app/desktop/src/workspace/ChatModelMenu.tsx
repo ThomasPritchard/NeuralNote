@@ -13,7 +13,6 @@ import {
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import type { AiStatus, OpenRouterModelChoice, OpenRouterModelMenu } from "../lib/types";
-import { cn } from "../lib/cn";
 
 type CatalogueState =
   | { kind: "idle" }
@@ -27,17 +26,6 @@ function modelLabel(status: AiStatus): string {
       ? status.local.activeModelTag
       : status.openrouter.model;
   return model?.split("/").pop() ?? "Choose model";
-}
-
-function rankedDate(value: string): string {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value);
-  if (match === null) return value;
-  return new Intl.DateTimeFormat("en-GB", {
-    day: "numeric",
-    month: "long",
-    year: "numeric",
-    timeZone: "UTC",
-  }).format(new Date(Date.UTC(Number(match[1]), Number(match[2]) - 1, Number(match[3]))));
 }
 
 export function ChatModelMenu({
@@ -56,6 +44,8 @@ export function ChatModelMenu({
   const [writing, setWriting] = useState(false);
   const [writeError, setWriteError] = useState<string | null>(null);
 
+  // TODO(model-catalogue-request-order): guard loads with a request generation
+  // (or abort signal) and cover an older close/reopen response resolving last.
   const load = useCallback(async (forceRefresh: boolean) => {
     setCatalogue({ kind: "loading" });
     try {
@@ -68,11 +58,7 @@ export function ChatModelMenu({
   const handleOpenChange = (nextOpen: boolean) => {
     if (nextOpen && (busy || writing)) return;
     setOpen(nextOpen);
-    if (
-      nextOpen &&
-      status.activeProvider === "openRouter" &&
-      (catalogue.kind === "idle" || catalogue.kind === "error")
-    ) {
+    if (nextOpen && status.activeProvider === "openRouter") {
       void load(false);
     }
   };
@@ -86,6 +72,7 @@ export function ChatModelMenu({
     setWriteError(null);
     try {
       onStatusChange(await api.selectOpenRouterModel(model));
+      setCatalogue({ kind: "idle" });
       setOpen(false);
     } catch (error) {
       setWriteError(errorMessage(error));
@@ -110,7 +97,7 @@ export function ChatModelMenu({
           type="button"
           disabled={busy || writing}
           aria-label={`Choose AI model, current ${modelLabel(status)}`}
-          className="flex min-w-0 max-w-[11rem] items-center gap-1.5 rounded-md px-1.5 py-1 text-[0.6875rem] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
+          className="nn-mono flex min-w-0 max-w-[11rem] items-center gap-1.5 rounded-md px-1.5 py-1 text-[0.6875rem] font-medium text-muted-foreground transition-colors hover:bg-muted hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary disabled:cursor-not-allowed disabled:opacity-50"
         >
           {writing ? (
             <Loader2 className="size-3.5 shrink-0 animate-spin motion-reduce:animate-none" aria-hidden />
@@ -122,6 +109,13 @@ export function ChatModelMenu({
         </button>
       </DropdownMenuTrigger>
       <DropdownMenuContent align="start" side="top" className="w-72">
+        <p role="status" aria-atomic="true" className="sr-only">
+          {status.activeProvider === "openRouter" && catalogue.kind === "loading"
+            ? "Loading model choices…"
+            : status.activeProvider === "openRouter" && catalogue.kind === "ready"
+              ? "Model choices loaded."
+              : ""}
+        </p>
         {status.activeProvider === "local" ? (
           <DropdownMenuItem onSelect={onOpenSettings}>
             <Settings2 className="size-3.5" aria-hidden />
@@ -206,8 +200,16 @@ function OpenRouterMenuBody({
             key={choice.id}
             value={choice.id}
             disabled={writing}
-            textValue={choice.pinned ? `Current ${choice.name}` : `#${choice.rank} ${choice.name}`}
-            aria-label={choice.pinned ? `Current model ${choice.name}` : `#${choice.rank} ${choice.name}`}
+            textValue={
+              choice.pinned
+                ? `Current model ${choice.name}`
+                : `#${choice.rank} ${choice.name}, ${choice.id}, ${Math.round(choice.contextLength / 1_000)}k context`
+            }
+            aria-label={
+              choice.pinned
+                ? `Current model ${choice.name}`
+                : `#${choice.rank} ${choice.name}, ${choice.id}, ${Math.round(choice.contextLength / 1_000)}k context`
+            }
             onSelect={(event) => {
               event.preventDefault();
               onSelect(choice.id);
@@ -221,7 +223,7 @@ function OpenRouterMenuBody({
                 {choice.pinned ? "Current" : `#${choice.rank}`} · {choice.name}
               </span>
               {!choice.pinned && (
-                <span className="block truncate text-[0.625rem] text-muted-foreground">
+                <span className="nn-mono block truncate text-[0.625rem] text-muted-foreground">
                   {choice.id} · {Math.round(choice.contextLength / 1_000)}k context
                 </span>
               )}
@@ -237,8 +239,9 @@ function OpenRouterMenuBody({
         }}
       >
         <ExternalLink className="size-3.5" aria-hidden />
-        <span className="flex-1">OpenRouter rankings</span>
-        <span className={cn("text-[0.625rem] text-muted-foreground")}>Ranked {rankedDate(state.menu.asOf)}</span>
+        <span className="nn-mono text-[0.625rem] text-muted-foreground">
+          Source: OpenRouter (openrouter.ai/rankings), as of {state.menu.asOf}
+        </span>
       </DropdownMenuItem>
     </>
   );

@@ -287,11 +287,23 @@ html[data-font-family="sourceSerif4"] {
 }
 
 .nn-titlebar {
+  --titlebar-toggle-clearance: 122px;
   grid-template-columns:
-    calc(var(--navigation-width) + var(--sidebar-width) + var(--splitter-width))
+    max(
+      calc(var(--navigation-width) + var(--sidebar-width) + var(--splitter-width)),
+      var(--titlebar-toggle-clearance)
+    )
     minmax(0, 1fr)
     max-content;
   align-items: center;
+}
+
+.nn-titlebar-toggle-clearance-windowed {
+  --titlebar-toggle-clearance: 122px;
+}
+
+.nn-titlebar-toggle-clearance-fullscreen {
+  --titlebar-toggle-clearance: 60px;
 }
 
 .nn-tab-strip {
@@ -466,6 +478,112 @@ html[data-font-family="sourceSerif4"] {
 .nn-markdown {
   max-width: 72ch;
   text-wrap: pretty;
+}
+
+/* MDXEditor is an interaction engine inside NeuralNote, not a visual island.
+   Map its primitives onto the app tokens and make the editable surface match
+   the reading typography so clicking into a note does not cause a mode shift. */
+.nn-rich-editor {
+  --basePageBg: var(--background);
+  --baseBase: var(--card);
+  --baseBg: var(--muted);
+  --baseBgSubtle: var(--surface-sunken);
+  --baseBgHover: var(--surface-hover);
+  --baseBgActive: var(--surface-selected);
+  --baseLine: var(--border);
+  --baseBorder: var(--border);
+  --baseBorderHover: var(--input);
+  --baseSolid: var(--muted-foreground);
+  --baseSolidHover: var(--foreground);
+  --baseText: var(--muted-foreground);
+  --baseTextContrast: var(--foreground);
+  --accentBg: var(--accent);
+  --accentBgHover: var(--surface-selected);
+  --accentBorder: var(--primary);
+  --accentSolid: var(--primary);
+  --accentText: var(--primary);
+  --accentTextContrast: var(--primary-foreground);
+  --font-body: var(--font-sans);
+}
+
+.nn-rich-editor :where([class*="contentEditable"]) {
+  padding: 0;
+}
+
+.nn-rich-editor-content {
+  min-height: 50vh;
+  color: color-mix(in oklab, var(--foreground) 90%, transparent);
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  line-height: 1.8;
+  text-wrap: pretty;
+  caret-color: var(--primary);
+}
+
+.nn-rich-editor-content:focus-visible {
+  outline: none;
+}
+
+.nn-rich-editor-content :where(h1, h2, h3, h4, h5, h6) {
+  color: var(--foreground);
+  font-family: var(--font-heading);
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.15;
+}
+
+.nn-rich-editor-content h1 {
+  margin-block: 0 1rem;
+  font-size: 1.75rem;
+}
+
+.nn-rich-editor-content h2 {
+  margin-block: 2.25rem 0.75rem;
+  font-size: 1.5rem;
+}
+
+.nn-rich-editor-content h3 {
+  margin-block: 2rem 0.625rem;
+  font-size: 1.125rem;
+}
+
+.nn-rich-editor-content p {
+  margin-block: 1rem;
+}
+
+.nn-rich-editor-content :where(ul, ol) {
+  margin-block: 1rem;
+  padding-left: 1.5rem;
+}
+
+.nn-rich-editor-content li::marker {
+  color: color-mix(in oklab, var(--primary) 65%, transparent);
+}
+
+.nn-rich-editor-content blockquote {
+  margin-block: 1.5rem;
+  border: 0;
+  border-radius: var(--radius);
+  background: var(--surface-raised);
+  padding: 0.75rem 1.25rem;
+  color: color-mix(in oklab, var(--foreground) 80%, transparent);
+  font-style: italic;
+}
+
+.nn-rich-editor-content :where(code, pre, textarea) {
+  font-family: var(--font-mono);
+}
+
+.nn-rich-editor-content a {
+  color: var(--primary);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--primary) 40%, transparent);
+  text-underline-offset: 0.2em;
+}
+
+.nn-rich-editor-content hr {
+  margin-block: 1.5rem;
+  border-color: var(--border);
 }
 
 .nn-skip-link {

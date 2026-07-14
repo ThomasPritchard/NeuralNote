@@ -8,6 +8,7 @@ import { cleanup } from "@testing-library/react";
 
 afterEach(() => {
   cleanup();
+  globalThis.localStorage?.clear();
 });
 
 // jsdom has no matchMedia. Default stub: no media query matches (i.e. no
@@ -34,6 +35,11 @@ class ResizeObserverStub implements ResizeObserver {
   disconnect = vi.fn();
 }
 globalThis.ResizeObserver ??= ResizeObserverStub;
+
+// Lexical scrolls a freshly edited selection into view. jsdom implements Range
+// but not its layout methods; a zero rect is sufficient for interaction tests.
+Range.prototype.getBoundingClientRect ??= () => new DOMRect();
+Range.prototype.getClientRects ??= () => [] as unknown as DOMRectList;
 
 // jsdom's <dialog> carries only the `open` property — showModal()/close() are
 // unimplemented (jsdom/jsdom#3294). Minimal polyfill so components can drive a

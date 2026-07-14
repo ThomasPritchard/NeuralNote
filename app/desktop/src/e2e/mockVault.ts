@@ -37,6 +37,7 @@ import type {
   InstalledModel,
   LinkGraph,
   NoteDoc,
+  OpenRouterModelMenu,
   ProviderKind,
   PullEvent,
   ReasoningSupport,
@@ -44,6 +45,8 @@ import type {
   RecentVault,
   SearchMatch,
   SearchResponse,
+  RichEditDocument,
+  RichEditPatch,
   SkillListing,
   TemplateInfo,
   TreeNode,
@@ -1426,9 +1429,9 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
   // the stream exactly as `UserPrompt::ask` parks the Rust run (the remainder
   // plays only after a validated `answer_elicitation`); `undo_skill_run`
   // reports per-file outcomes over what the run actually wrote.
-  let chatRunSeq = 0;
   const chatCalls: ChatCallRecord[] = [];
   const writtenByRun = new Map<string, string[]>();
+  const completedChatRuns = new Set<string>();
   interface ParkedElicitation {
     id: string;
     offeredIds: ReadonlySet<string>;
@@ -1512,6 +1515,36 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     },
     local: { activeModelTag: aiState.localActiveTag },
   });
+
+  const rankedOpenRouterModels = [
+    ["anthropic/claude-sonnet-4.5", "Claude Sonnet 4.5", 200_000],
+    ["openai/gpt-5.2", "GPT-5.2", 400_000],
+    ["google/gemini-2.5-pro", "Gemini 2.5 Pro", 1_048_576],
+    ["anthropic/claude-opus-4.1", "Claude Opus 4.1", 200_000],
+    ["openai/gpt-5-mini", "GPT-5 Mini", 400_000],
+    ["deepseek/deepseek-v3.2", "DeepSeek V3.2", 163_840],
+    ["x-ai/grok-4", "Grok 4", 256_000],
+    ["qwen/qwen3-235b-a22b", "Qwen3 235B", 131_072],
+    ["meta-llama/llama-4-maverick", "Llama 4 Maverick", 1_048_576],
+    ["mistralai/mistral-large-2512", "Mistral Large", 262_144],
+  ] as const;
+  let offeredOpenRouterModels = new Set<string>();
+
+  const buildOpenRouterMenu = (): OpenRouterModelMenu => {
+    const models = rankedOpenRouterModels.map(([id, name, contextLength], index) => ({
+      id,
+      name,
+      contextLength,
+      rank: index + 1,
+    }));
+    offeredOpenRouterModels = new Set(models.map((model) => model.id));
+    return {
+      models,
+      asOf: "2026-07-13",
+      selectedModel: keyState.model,
+      pinnedSelectedModel: offeredOpenRouterModels.has(keyState.model) ? null : keyState.model,
+    };
+  };
 
   const relOf = (p: string): string => p.slice(root.length + 1);
 
@@ -1610,6 +1643,32 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
       contentHash: hashContent(raw),
       binary: false,
       lossyText: false,
+    };
+  };
+
+  const buildRichDoc = (raw: string): RichEditDocument => {
+    const parsed = parseFrontmatter(raw);
+    const revision = hashContent(raw);
+    const wikilinkFallback = parsed.body.includes("[[")
+      ? {
+          kind: "raw" as const,
+          reason: {
+            code: "unsupported_syntax" as const,
+            message: "Wikilinks are open as raw Markdown in this release.",
+          },
+        }
+      : { kind: "rich" as const };
+    return {
+      revision,
+      frontmatterPrefix: raw.slice(0, raw.length - parsed.body.length),
+      body: parsed.body,
+      disposition: wikilinkFallback,
+      blocks: parsed.body === "" ? [] : [{
+        id: `mock-block:${revision}`,
+        leadingSeparator: "",
+        markdown: parsed.body,
+        trailingSeparator: "",
+      }],
     };
   };
 
@@ -1850,6 +1909,10 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         const path = a.path as string;
         return buildDoc(path, requireFile(path).content);
       }
+      case "read_rich_note": {
+        const path = a.path as string;
+        return buildRichDoc(requireFile(path).content);
+      }
       case "write_note": {
         const path = a.path as string;
         const content = a.content as string;
@@ -1860,6 +1923,24 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         }
         file.content = content;
         return buildDoc(path, content);
+      }
+      case "write_rich_note": {
+        const path = a.path as string;
+        const patch = a.patch as RichEditPatch;
+        const file = requireFile(path);
+        const current = buildRichDoc(file.content);
+        if (patch.expectedRevision !== current.revision) {
+          fail("conflict", "this note changed on disk since you opened it");
+        }
+        const validIds = new Set(current.blocks.map((block) => block.id));
+        if (
+          patch.changedBlockIds.some((id) => !validIds.has(id)) ||
+          (current.blocks.length > 0 && patch.changedBlockIds.length !== 1)
+        ) {
+          fail("conflict", "the rich edit source range is stale");
+        }
+        file.content = `${current.frontmatterPrefix}${patch.replacementMarkdown}`;
+        return buildDoc(path, file.content);
       }
       case "create_folder": {
         const target = `${a.parentPath as string}/${(a.name as string).trim()}`;
@@ -1920,6 +2001,18 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         return { hasKey: keyState.hasKey, model: keyState.model } satisfies ApiKeyStatus;
       case "ai_status":
         return buildAiStatus();
+      case "openrouter_model_menu":
+        return buildOpenRouterMenu();
+      case "select_openrouter_model": {
+        const model = a.model as string;
+        if (!offeredOpenRouterModels.has(model)) {
+          return fail("invalidName", "model was not offered by the current OpenRouter menu");
+        }
+        keyState.model = model;
+        return buildAiStatus();
+      }
+      case "open_openrouter_rankings":
+        return undefined;
       case "detect_hardware":
         return opts.hardware ?? DEFAULT_HARDWARE;
       case "recommend_local_model":
@@ -2064,36 +2157,51 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         // with the run id — mirroring the Rust run that emits events, ends on
         // `done`/`error`, and returns the id `undo_skill_run` takes. A script
         // holding an `elicit` parks there; `answer_elicitation` resumes it.
-        const runId = `run-${++chatRunSeq}`;
+        const runId = a.turnId as string;
         chatCalls.push({
           prompt: a.prompt as string,
           activeSkills: [...((a.activeSkills as string[] | undefined) ?? [])],
         });
         const send = channelSender(a.onEvent);
         return new Promise<string>((resolve) => {
+          const finish = () => {
+            completedChatRuns.add(runId);
+            resolve(runId);
+          };
           const pauseAfter = opts.cancelChatAfterEvents;
           if (pauseAfter !== undefined) {
             advanceChatScript(send, chatScript.slice(0, pauseAfter), runId, () => {
-              pausedChat = { send, runId, finish: () => resolve(runId) };
+              pausedChat = { send, runId, finish };
             });
           } else {
-            advanceChatScript(send, [...chatScript], runId, () => resolve(runId));
+            advanceChatScript(send, [...chatScript], runId, finish);
           }
         });
       }
       case "cancel_chat_run": {
+        const turnId = a.turnId as string;
         const paused = pausedChat;
-        if (paused === null) {
-          return fail("notFound", "no chat run is active");
+        if (paused === null || paused.runId !== turnId) {
+          return {
+            turnId,
+            status: completedChatRuns.has(turnId) ? "alreadyCompleted" : "notCurrent",
+          };
         }
         pausedChat = null;
-        advanceChatScript(
-          paused.send,
-          opts.cancelChatTail ?? [],
-          paused.runId,
-          paused.finish,
-        );
-        return undefined;
+        // The native command returns its typed acknowledgement as soon as the
+        // exact run signal wins. Provider/skill wind-down happens afterwards;
+        // scheduling the tail in the next task preserves that causal order and
+        // prevents a terminal tail from clearing the active turn before the UI
+        // can apply the matching `cancelled` outcome.
+        setTimeout(() => {
+          advanceChatScript(
+            paused.send,
+            opts.cancelChatTail ?? [],
+            paused.runId,
+            paused.finish,
+          );
+        }, 0);
+        return { turnId, status: "cancelled" };
       }
       case "open_youtube_timestamp": {
         const value = a.url as string;

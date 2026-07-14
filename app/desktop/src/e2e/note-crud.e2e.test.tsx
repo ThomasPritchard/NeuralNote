@@ -7,6 +7,7 @@
 import { describe, it, expect } from "vitest";
 import { screen, waitFor, within } from "@testing-library/react";
 import { renderApp } from "./renderApp";
+import { readNote } from "../lib/api";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
 
 const recents = [{ name: "My Brain", path: VAULT_ROOT, lastOpened: 1_700_000_000_000 }];
@@ -33,32 +34,35 @@ describe("Journey 3: create and open a note", () => {
     expect(await screen.findByRole("button", { name: "Rename Ideas.md" })).toBeInTheDocument();
     expect(await screen.findByRole("heading", { name: "Ideas", level: 1 })).toBeInTheDocument();
 
-    // Open the seeded note and confirm the editor is seeded with its raw content.
+    // Open the seeded note and confirm the in-place editor is seeded with its content.
     await user.click(screen.getByRole("button", { name: "Welcome.md" }));
     await screen.findByRole("heading", { name: "Welcome", level: 1 });
-    await user.click(screen.getByRole("button", { name: "Edit" }));
-    expect(screen.getByRole("textbox", { name: "Note source" })).toHaveValue("Hello vault.");
+    expect(await screen.findByRole("textbox", { name: "Note content" })).toHaveTextContent("Hello vault.");
   });
 });
 
 describe("Journey 4: edit and save", () => {
   it("reflects the saved state and clears the unsaved indicator", async () => {
-    const { user } = await openVault([
+    const { user, backend } = await openVault([
       { kind: "file", relPath: "Edit.md", content: "original draft" },
     ]);
 
     await user.click(await screen.findByRole("button", { name: "Edit.md" }));
     await screen.findByRole("heading", { name: "Edit", level: 1 }); // stem-derived title
-    await user.click(screen.getByRole("button", { name: "Edit" })); // switch to edit mode
 
-    const textarea = screen.getByRole("textbox", { name: "Note source" });
+    const textarea = await screen.findByRole("textbox", { name: "Note content" });
+    await waitFor(() =>
+      expect(textarea.closest(".nn-rich-editor")).toHaveAttribute("aria-busy", "false"),
+    );
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled(); // clean buffer
     await user.clear(textarea);
     await user.type(textarea, "updated body");
 
     // Dirty: the unsaved dot shows and Save enables.
-    expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    await waitFor(() => {
+      expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Save" })).toBeEnabled();
+    });
 
     await user.click(screen.getByRole("button", { name: "Save" }));
 
@@ -68,9 +72,40 @@ describe("Journey 4: edit and save", () => {
     );
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
 
-    // Persisted: read mode renders the new body.
-    await user.click(screen.getByRole("button", { name: "Read" }));
-    expect(await screen.findByText("updated body")).toBeInTheDocument();
+    // Persisted through the guarded source-range path; no whole-file write was used.
+    expect(backend.calls).toContain("write_rich_note");
+    expect(backend.calls).not.toContain("write_note");
+  });
+
+  it("isolates dirty raw-fallback drafts while switching A → B → A and saving", async () => {
+    const { user } = await openVault([
+      { kind: "file", relPath: "A.md", content: "A links [[Target]]." },
+      { kind: "file", relPath: "B.md", content: "B links [[Target]]." },
+    ]);
+
+    await user.click(await screen.findByRole("button", { name: "A.md" }));
+    const aEditor = await screen.findByRole("textbox", { name: "Note source" });
+    await user.clear(aEditor);
+    await user.type(aEditor, "A private draft [[[[Target]].");
+
+    await user.click(screen.getByRole("button", { name: "B.md" }));
+    const bEditor = await screen.findByRole("textbox", { name: "Note source" });
+    expect(bEditor).toHaveValue("B links [[Target]].");
+    await user.clear(bEditor);
+    await user.type(bEditor, "B private draft [[[[Target]].");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await user.click(screen.getByRole("tab", { name: /A, unsaved changes/i }));
+    const restoredA = await screen.findByRole("textbox", { name: "Note source" });
+    expect(restoredA).toHaveValue("A private draft [[Target]].");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await expect(readNote(`${VAULT_ROOT}/A.md`)).resolves.toMatchObject({
+      raw: "A private draft [[Target]].",
+    });
+    await expect(readNote(`${VAULT_ROOT}/B.md`)).resolves.toMatchObject({
+      raw: "B private draft [[Target]].",
+    });
   });
 });
 

@@ -1,8 +1,9 @@
 import { useCallback, useMemo, useReducer, useRef } from "react";
 import * as api from "../lib/api";
 import { errorMessage, isConflict } from "../lib/api";
-import type { NoteDoc } from "../lib/types";
+import type { NoteDoc, RichEditDocument } from "../lib/types";
 import { isPathInside, normSep, remapPath } from "./fileMeta";
+import { buildRichEditPatch } from "./richEditorAdapter";
 import type { NoteMode, OpenNote } from "./useOpenNote";
 
 export interface NoteTab {
@@ -12,6 +13,11 @@ export interface NoteTab {
   loading: boolean;
   error: string | null;
   mode: NoteMode;
+  richDocument: RichEditDocument | null;
+  richBody: string;
+  richError: string | null;
+  richPast: string[];
+  richFuture: string[];
   draft: string;
   dirty: boolean;
   saving: boolean;
@@ -67,6 +73,25 @@ type Action =
   | { type: "close"; id: string }
   | { type: "set-mode"; id: string; mode: NoteMode }
   | { type: "set-draft"; id: string; draft: string }
+  | { type: "set-rich-document"; id: string; document: RichEditDocument }
+  | { type: "set-rich-error"; id: string; message: string }
+  | {
+      type: "refresh-rich-document";
+      id: string;
+      pathAtStart: string;
+      revision: number;
+      document: RichEditDocument;
+    }
+  | {
+      type: "refresh-rich-error";
+      id: string;
+      pathAtStart: string;
+      revision: number;
+      message: string;
+    }
+  | { type: "set-rich-body"; id: string; body: string }
+  | { type: "undo-rich"; id: string }
+  | { type: "redo-rich"; id: string }
   | { type: "save-start"; id: string; revision: number }
   | {
       type: "save-success";
@@ -74,6 +99,7 @@ type Action =
       revision: number;
       pathAtStart: string;
       doc: NoteDoc;
+      refreshPending: boolean;
     }
   | {
       type: "save-error";
@@ -92,6 +118,30 @@ type Action =
   | { type: "clear" };
 
 const EMPTY_STATE: TabsState = { tabs: [], activeTabId: null };
+const MAX_RICH_HISTORY_ENTRIES = 100;
+const MAX_RICH_HISTORY_BYTES = 8 * 1024 * 1024;
+const UTF8_ENCODER = new TextEncoder();
+
+// TODO(rich-history-byte-cost): store byte totals/lengths incrementally, or keep
+// this scan only after the specified 500 KiB WKWebView key-to-paint p95 passes.
+function boundedHistory(history: string[], value: string): string[] {
+  const next = [...history, value].slice(-MAX_RICH_HISTORY_ENTRIES);
+  const byteLengths = next.map((entry) => UTF8_ENCODER.encode(entry).byteLength);
+  let bytes = byteLengths.reduce((total, length) => total + length, 0);
+  while (next.length > 1 && bytes > MAX_RICH_HISTORY_BYTES) {
+    bytes -= byteLengths.shift()!;
+    next.shift();
+  }
+  return next;
+}
+
+function contentWithRichBody(document: RichEditDocument, body: string): string {
+  return `${document.frontmatterPrefix}${body}`;
+}
+
+function isInvalidContent(error: unknown): boolean {
+  return !!error && typeof error === "object" && "kind" in error && error.kind === "invalidContent";
+}
 
 /** Syntactic identity used only while Rust resolves the canonical path. */
 export function normalizeRequestedPath(path: string): string {
@@ -118,6 +168,35 @@ function replaceTab(
     ...state,
     tabs: state.tabs.map((tab) => (tab.id === id ? update(tab) : tab)),
   };
+}
+
+function withRichDocument(tab: NoteTab, document: RichEditDocument): NoteTab {
+  if (!tab.note || document.revision !== tab.note.contentHash) {
+    return {
+      ...tab,
+      richDocument: null,
+      richError: "The note changed while rich editing was being prepared. Reload it to continue safely.",
+    };
+  }
+  const preserveDraft = tab.richDocument !== null && tab.dirty;
+  const richBody = preserveDraft ? tab.richBody : document.body;
+  return {
+    ...tab,
+    richDocument: document,
+    richBody,
+    richError: null,
+    draft: preserveDraft
+      ? tab.draft
+      : contentWithRichBody(document, document.body),
+    dirty: preserveDraft,
+    richPast: preserveDraft ? tab.richPast : [],
+    richFuture: preserveDraft ? tab.richFuture : [],
+  };
+}
+
+function ownsSaveRefresh(tab: NoteTab, pathAtStart: string, revision: number): boolean {
+  return tab.saveRevision === revision
+    && normalizeRequestedPath(tab.path) === normalizeRequestedPath(pathAtStart);
 }
 
 function reconciledLoad(
@@ -206,6 +285,11 @@ export function noteTabsReducer(state: TabsState, action: Action): TabsState {
         loading: true,
         error: null,
         mode: "read",
+        richDocument: null,
+        richBody: "",
+        richError: null,
+        richPast: [],
+        richFuture: [],
         draft: "",
         dirty: false,
         saving: false,
@@ -247,6 +331,67 @@ export function noteTabsReducer(state: TabsState, action: Action): TabsState {
         draft: action.draft,
         dirty: tab.note !== null && action.draft !== tab.note.raw,
       }));
+    case "set-rich-document":
+      return replaceTab(state, action.id, (tab) => withRichDocument(tab, action.document));
+    case "set-rich-error":
+      return replaceTab(state, action.id, (tab) => ({
+        ...tab,
+        richDocument: null,
+        richError: action.message,
+      }));
+    case "refresh-rich-document":
+      return replaceTab(state, action.id, (tab) =>
+        ownsSaveRefresh(tab, action.pathAtStart, action.revision)
+          ? { ...withRichDocument(tab, action.document), saving: false }
+          : tab,
+      );
+    case "refresh-rich-error":
+      return replaceTab(state, action.id, (tab) =>
+        ownsSaveRefresh(tab, action.pathAtStart, action.revision)
+          ? { ...tab, richDocument: null, richError: action.message, saving: false }
+          : tab,
+      );
+    case "set-rich-body":
+      return replaceTab(state, action.id, (tab) => {
+        if (!tab.richDocument || action.body === tab.richBody) return tab;
+        const draft = contentWithRichBody(tab.richDocument, action.body);
+        return {
+          ...tab,
+          richBody: action.body,
+          draft,
+          dirty: tab.note !== null && draft !== tab.note.raw,
+          richPast: boundedHistory(tab.richPast, tab.richBody),
+          richFuture: [],
+        };
+      });
+    case "undo-rich":
+      return replaceTab(state, action.id, (tab) => {
+        if (!tab.richDocument || tab.richPast.length === 0) return tab;
+        const body = tab.richPast.at(-1)!;
+        const draft = contentWithRichBody(tab.richDocument, body);
+        return {
+          ...tab,
+          richBody: body,
+          draft,
+          dirty: tab.note !== null && draft !== tab.note.raw,
+          richPast: tab.richPast.slice(0, -1),
+          richFuture: boundedHistory(tab.richFuture, tab.richBody),
+        };
+      });
+    case "redo-rich":
+      return replaceTab(state, action.id, (tab) => {
+        if (!tab.richDocument || tab.richFuture.length === 0) return tab;
+        const body = tab.richFuture.at(-1)!;
+        const draft = contentWithRichBody(tab.richDocument, body);
+        return {
+          ...tab,
+          richBody: body,
+          draft,
+          dirty: tab.note !== null && draft !== tab.note.raw,
+          richPast: boundedHistory(tab.richPast, tab.richBody),
+          richFuture: tab.richFuture.slice(0, -1),
+        };
+      });
     case "save-start":
       return replaceTab(state, action.id, (tab) => ({
         ...tab,
@@ -266,7 +411,7 @@ export function noteTabsReducer(state: TabsState, action: Action): TabsState {
         return {
           ...tab,
           note: savedDoc,
-          saving: false,
+          saving: action.refreshPending,
           saveError: null,
           conflict: false,
           dirty: tab.draft !== savedDoc.raw,
@@ -325,6 +470,11 @@ function loadingTab(id: string, path: string): NoteTab {
     loading: true,
     error: null,
     mode: "read",
+    richDocument: null,
+    richBody: "",
+    richError: null,
+    richPast: [],
+    richFuture: [],
     draft: "",
     dirty: false,
     saving: false,
@@ -340,6 +490,7 @@ export function useNoteTabs(): NoteTabsController {
   const stateRef = useRef(state);
   stateRef.current = state;
   const nextId = useRef(0);
+  const savingTabIds = useRef(new Set<string>());
 
   const dispatch = useCallback((action: Action) => {
     stateRef.current = noteTabsReducer(stateRef.current, action);
@@ -351,6 +502,27 @@ export function useNoteTabs(): NoteTabsController {
       (doc) => dispatch({ type: "load-success", id, requestedPath: target, revision, doc }),
       (error: unknown) => dispatch({ type: "load-error", id, revision, message: errorMessage(error) }),
     );
+  }, [dispatch]);
+
+  const runSaveRichRefresh = useCallback(async (id: string, path: string, revision: number) => {
+    try {
+      const document = await api.readRichNote(path);
+      dispatch({
+        type: "refresh-rich-document",
+        id,
+        pathAtStart: path,
+        revision,
+        document,
+      });
+    } catch (error) {
+      dispatch({
+        type: "refresh-rich-error",
+        id,
+        pathAtStart: path,
+        revision,
+        message: `The note was saved, but rich editing could not be restored: ${errorMessage(error)}`,
+      });
+    }
   }, [dispatch]);
 
   const open = useCallback((target: string, options: OpenTabOptions = {}) => {
@@ -385,7 +557,12 @@ export function useNoteTabs(): NoteTabsController {
 
   const activeOperation = useCallback((action:
     | { type: "set-mode"; mode: NoteMode }
-    | { type: "set-draft"; draft: string }) => {
+    | { type: "set-draft"; draft: string }
+    | { type: "set-rich-document"; document: RichEditDocument }
+    | { type: "set-rich-error"; message: string }
+    | { type: "set-rich-body"; body: string }
+    | { type: "undo-rich" }
+    | { type: "redo-rich" }) => {
     const id = stateRef.current.activeTabId;
     if (id) dispatch({ ...action, id } as Action);
   }, [dispatch]);
@@ -400,32 +577,75 @@ export function useNoteTabs(): NoteTabsController {
 
   const persist = useCallback(async (overwrite: boolean) => {
     const tab = stateRef.current.tabs.find((item) => item.id === stateRef.current.activeTabId);
-    if (!tab?.note) return;
+    if (!tab?.note || tab.saving || savingTabIds.current.has(tab.id)) return;
+    savingTabIds.current.add(tab.id);
     const revision = tab.saveRevision + 1;
     const pathAtStart = tab.path;
     const draftAtStart = tab.draft;
+    const richSave = !overwrite && tab.richDocument?.disposition.kind === "rich";
+    const refreshAfterSave = tab.richDocument?.disposition.kind === "rich";
+    let richPatchBuilt = !richSave;
     dispatch({ type: "save-start", id: tab.id, revision });
     try {
-      const saved = await api.writeNote(
+      const patch = richSave
+        ? buildRichEditPatch(tab.richDocument!, tab.richBody)
+        : null;
+      richPatchBuilt = true;
+      const saved = patch
+        ? await api.writeRichNote(pathAtStart, patch)
+        : await api.writeNote(
+            pathAtStart,
+            draftAtStart,
+            overwrite ? null : tab.note.contentHash,
+          );
+      dispatch({
+        type: "save-success",
+        id: tab.id,
+        revision,
         pathAtStart,
-        draftAtStart,
-        overwrite ? null : tab.note.contentHash,
-      );
-      dispatch({ type: "save-success", id: tab.id, revision, pathAtStart, doc: saved });
+        doc: saved,
+        refreshPending: refreshAfterSave,
+      });
+      if (refreshAfterSave) {
+        savingTabIds.current.delete(tab.id);
+        const owner = stateRef.current.tabs.find((item) => item.id === tab.id);
+        const refreshPath = owner?.saveRevision === revision ? owner.path : pathAtStart;
+        await runSaveRichRefresh(tab.id, refreshPath, revision);
+      }
     } catch (error) {
+      const message = errorMessage(error);
       dispatch({
         type: "save-error",
         id: tab.id,
         revision,
-        message: errorMessage(error),
+        message,
         conflict: isConflict(error),
       });
+      if (richSave && (!richPatchBuilt || isInvalidContent(error))) {
+        dispatch({ type: "set-rich-error", id: tab.id, message });
+      }
+    } finally {
+      savingTabIds.current.delete(tab.id);
     }
-  }, [dispatch]);
+  }, [dispatch, runSaveRichRefresh]);
 
   const remap = useCallback((oldPath: string, newPath: string, newRelPath?: string) => {
+    const replacementRefreshes = stateRef.current.tabs.flatMap((tab) => {
+      const path = remapPath(tab.path, oldPath, newPath);
+      const hasStaleSavedRichDocument = path
+        && tab.saving
+        && tab.note
+        && tab.richDocument?.disposition.kind === "rich"
+        && tab.richDocument.revision !== tab.note.contentHash;
+      return hasStaleSavedRichDocument
+        ? [{ id: tab.id, path, revision: tab.saveRevision }]
+        : [];
+    });
     dispatch({ type: "remap", oldPath, newPath, newRelPath });
-  }, [dispatch]);
+    for (const refresh of replacementRefreshes) {
+      void runSaveRichRefresh(refresh.id, refresh.path, refresh.revision);
+    }
+  }, [dispatch, runSaveRichRefresh]);
   const removeDescendants = useCallback((path: string) => {
     dispatch({ type: "remove-descendants", path });
   }, [dispatch]);
@@ -442,6 +662,9 @@ export function useNoteTabs(): NoteTabsController {
     loading: activeTab?.loading ?? false,
     error: activeTab?.error ?? null,
     mode: activeTab?.mode ?? "read",
+    richDocument: activeTab?.richDocument ?? null,
+    richBody: activeTab?.richBody ?? "",
+    richError: activeTab?.richError ?? null,
     draft: activeTab?.draft ?? "",
     dirty: activeTab?.dirty ?? false,
     saving: activeTab?.saving ?? false,
@@ -455,6 +678,11 @@ export function useNoteTabs(): NoteTabsController {
     },
     setMode: (mode) => activeOperation({ type: "set-mode", mode }),
     setDraft: (draft) => activeOperation({ type: "set-draft", draft }),
+    setRichDocument: (document) => activeOperation({ type: "set-rich-document", document }),
+    setRichError: (message) => activeOperation({ type: "set-rich-error", message }),
+    setRichBody: (body) => activeOperation({ type: "set-rich-body", body }),
+    undoRich: () => activeOperation({ type: "undo-rich" }),
+    redoRich: () => activeOperation({ type: "redo-rich" }),
     save: () => persist(false),
     clear: () => {
       if (activeTab) close(activeTab.id);

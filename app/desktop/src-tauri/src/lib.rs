@@ -14,6 +14,7 @@ use neuralnote_core::CoreError;
 use notify::RecommendedWatcher;
 use tauri::{AppHandle, Manager, State};
 
+use crate::provider_config_mutation::ProviderConfigMutationGate;
 use crate::vault_mutation::{VaultMutationContext, VaultMutationGate};
 
 mod ai;
@@ -24,6 +25,7 @@ mod menu;
 mod openrouter_catalogue;
 #[cfg(test)]
 mod openrouter_catalogue_contract_tests;
+mod provider_config_mutation;
 mod requirement_detection;
 mod requirement_download;
 mod requirement_install_lock;
@@ -68,6 +70,10 @@ pub(crate) struct AppState {
     /// last offered to the webview. Provider bodies and credentials never enter
     /// this state.
     pub(crate) openrouter_catalogue: openrouter_catalogue::OpenRouterCatalogueState,
+    /// Serializes native read-modify-write updates to `ai-config.json`. Kept
+    /// separate from the broad AppState lock so filesystem and keychain I/O do
+    /// not block unrelated session-state access.
+    pub(crate) provider_config_mutations: ProviderConfigMutationGate,
     /// Folders the user explicitly chose via the native picker this session.
     /// Only these — or a path already in the on-disk recents list (itself written
     /// only from a prior explicit pick) — may become a vault root. This stops a
@@ -106,6 +112,7 @@ impl Default for AppState {
             requirement_download: requirement_download::RequirementDownloadState::default(),
             skill_undo_runs: skills::UndoRunStore::default(),
             openrouter_catalogue: openrouter_catalogue::OpenRouterCatalogueState::default(),
+            provider_config_mutations: ProviderConfigMutationGate::default(),
             authorized: HashSet::new(),
             chat_visible: true,
             editing: false,
@@ -263,6 +270,8 @@ pub fn run() {
             commands::vault::read_tree,
             commands::vault::read_note,
             commands::vault::write_note,
+            commands::vault::read_rich_note,
+            commands::vault::write_rich_note,
             commands::vault::search_vault,
             commands::vault::read_link_graph,
             commands::vault::read_backlinks,

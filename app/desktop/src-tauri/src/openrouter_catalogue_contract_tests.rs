@@ -9,6 +9,7 @@ use crate::openrouter_catalogue::{
     CatalogueTransport, OpenRouterCatalogueState, TransportFailure,
     OPENROUTER_RANKINGS_ATTRIBUTION_URL,
 };
+use crate::provider_config_mutation::ProviderConfigMutationGate;
 
 const DATE: &str = "2026-07-13";
 const KEY: &str = "sk-or-test-secret";
@@ -187,12 +188,14 @@ fn model_selection_changes_only_the_model_and_rejects_unoffered_values() {
         reasoning: true,
         reasoning_support: Some(neuralnote_core::ai::ReasoningSupport::Supported),
         reasoning_probed_model: Some("vendor/old".into()),
+        reasoning_probe_generation: 7,
         disabled_skills: vec!["youtube-distil".into()],
     };
     neuralnote_core::ai::write_provider_config(dir.path(), &original).unwrap();
     let offered = ["vendor/new".to_string()].into_iter().collect();
 
-    let persisted = persist_selected_model(dir.path(), &offered, "vendor/new").unwrap();
+    let gate = ProviderConfigMutationGate::default();
+    let persisted = persist_selected_model(dir.path(), &gate, &offered, "vendor/new").unwrap();
 
     assert_eq!(persisted.model, "vendor/new");
     assert_eq!(persisted.active_provider, original.active_provider);
@@ -200,6 +203,10 @@ fn model_selection_changes_only_the_model_and_rejects_unoffered_values() {
     assert_eq!(persisted.key_configured, original.key_configured);
     assert_eq!(persisted.reasoning, original.reasoning);
     assert_eq!(persisted.reasoning_support, original.reasoning_support);
+    assert_eq!(
+        persisted.reasoning_probe_generation,
+        original.reasoning_probe_generation
+    );
     assert_eq!(
         persisted.reasoning_probed_model,
         original.reasoning_probed_model
@@ -210,12 +217,43 @@ fn model_selection_changes_only_the_model_and_rejects_unoffered_values() {
         dir.path(),
     ))
     .unwrap();
-    assert!(persist_selected_model(dir.path(), &offered, "vendor/not-offered").is_err());
+    assert!(persist_selected_model(dir.path(), &gate, &offered, "vendor/not-offered").is_err());
     let after = std::fs::read_to_string(neuralnote_core::ai::provider_config::config_file(
         dir.path(),
     ))
     .unwrap();
     assert_eq!(after, before);
+}
+
+#[test]
+fn active_openrouter_model_selection_invalidates_probe_ownership_and_cache() {
+    let dir = tempfile::tempdir().unwrap();
+    neuralnote_core::ai::write_provider_config(
+        dir.path(),
+        &ProviderConfig {
+            active_provider: Some(neuralnote_core::ai::ProviderKind::OpenRouter),
+            model: "vendor/old".into(),
+            key_configured: true,
+            reasoning_support: Some(neuralnote_core::ai::ReasoningSupport::Supported),
+            reasoning_probed_model: Some("vendor/old".into()),
+            reasoning_probe_generation: 7,
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let offered = ["vendor/new".to_string()].into_iter().collect();
+
+    let persisted = persist_selected_model(
+        dir.path(),
+        &ProviderConfigMutationGate::default(),
+        &offered,
+        "vendor/new",
+    )
+    .unwrap();
+
+    assert_eq!(persisted.reasoning_probe_generation, 8);
+    assert_eq!(persisted.reasoning_support, None);
+    assert_eq!(persisted.reasoning_probed_model, None);
 }
 
 #[test]

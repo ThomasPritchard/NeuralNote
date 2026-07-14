@@ -89,7 +89,7 @@ const reasoningScript: ChatEvent[] = [
 async function openWorkspace(opts: CreateMockVaultOptions = {}) {
   const result = renderApp({ recents, ...opts });
   await result.user.click(await screen.findByRole("button", { name: "Open My Brain" }));
-  await screen.findByText("Cited recall"); // the chat pane header, in every view
+  await screen.findByText("Neural Assistant AI"); // the chat pane header, in every view
   return result;
 }
 
@@ -113,6 +113,23 @@ describe("Journey 7: cited chat — no API key", () => {
     expect(screen.getByRole("button", { name: "Skip for now" })).toBeInTheDocument();
     // We're in setup, so the chat composer isn't rendered.
     expect(screen.queryByLabelText("Ask across your vault")).not.toBeInTheDocument();
+  });
+});
+
+describe("Journey 7: chat model selection", () => {
+  it("loads the native-ranked menu and persists an offered OpenRouter model", async () => {
+    const { user, backend } = await openWorkspace();
+
+    await user.click(
+      await screen.findByRole("button", { name: /choose ai model, current claude-sonnet-4\.5/i }),
+    );
+    await user.click(await screen.findByRole("menuitemradio", { name: /gpt-5\.2/i }));
+
+    expect(
+      await screen.findByRole("button", { name: /choose ai model, current gpt-5\.2/i }),
+    ).toBeInTheDocument();
+    expect(backend.calls).toContain("openrouter_model_menu");
+    expect(backend.calls).toContain("select_openrouter_model");
   });
 });
 

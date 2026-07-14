@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -5,7 +7,7 @@ vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
-import type { NoteDoc } from "../lib/types";
+import type { NoteDoc, RichEditDocument } from "../lib/types";
 import { useNoteTabs } from "./useNoteTabs";
 
 const mockInvoke = vi.mocked(invoke);
@@ -36,9 +38,195 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
+function rich(body: string, revision = `hash:${body}`): RichEditDocument {
+  return {
+    revision,
+    frontmatterPrefix: "",
+    body,
+    disposition: { kind: "rich" },
+    blocks: [{ id: `block:${revision}`, leadingSeparator: "", markdown: body, trailingSeparator: "" }],
+  };
+}
+
 beforeEach(() => mockInvoke.mockReset());
 
 describe("useNoteTabs - collection behavior", () => {
+  it("keeps rich drafts and bounded undo history with their owning tabs", async () => {
+    mockInvoke
+      .mockResolvedValueOnce(doc("/v/a.md", "A"))
+      .mockResolvedValueOnce(doc("/v/b.md", "B"));
+    const { result } = renderHook(() => useNoteTabs());
+
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    act(() => result.current.active.setRichDocument(rich("A")));
+    act(() => result.current.active.setRichBody("A first"));
+    act(() => result.current.active.setRichBody("A second"));
+
+    act(() => result.current.open("/v/b.md", { forceNew: true }));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("B"));
+    act(() => result.current.active.setRichDocument(rich("B")));
+    act(() => result.current.active.setRichBody("B first"));
+    act(() => result.current.active.undoRich());
+    expect(result.current.active.richBody).toBe("B");
+
+    act(() => result.current.activate(result.current.tabs[0].id));
+    expect(result.current.active.richBody).toBe("A second");
+    act(() => result.current.active.undoRich());
+    expect(result.current.active.richBody).toBe("A first");
+    act(() => result.current.active.redoRich());
+    expect(result.current.active.richBody).toBe("A second");
+  });
+
+  it("bounds rich undo history by UTF-8 bytes for CJK drafts", async () => {
+    const historyBudget = 8 * 1024 * 1024;
+    const oversizedCjkDraft = "界".repeat(Math.floor(historyBudget / 3) + 1);
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
+    const { result } = renderHook(() => useNoteTabs());
+
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    act(() => result.current.active.setRichDocument(rich("A")));
+    act(() => result.current.active.setRichBody(oversizedCjkDraft));
+    act(() => result.current.active.setRichBody("latest"));
+
+    expect(result.current.activeTab?.richPast).toHaveLength(1);
+    expect(result.current.activeTab?.richPast[0]).toBe(oversizedCjkDraft);
+  });
+
+  it("bounds rich undo history by UTF-8 bytes for emoji drafts", async () => {
+    const historyBudget = 8 * 1024 * 1024;
+    const oversizedEmojiDraft = "😀".repeat(Math.floor(historyBudget / 4) + 1);
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
+    const { result } = renderHook(() => useNoteTabs());
+
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    act(() => result.current.active.setRichDocument(rich("A")));
+    act(() => result.current.active.setRichBody(oversizedEmojiDraft));
+    act(() => result.current.active.setRichBody("latest"));
+
+    expect(result.current.activeTab?.richPast).toHaveLength(1);
+    expect(result.current.activeTab?.richPast[0]).toBe(oversizedEmojiDraft);
+  });
+
+  it("persists rich edits through an opaque source-range patch", async () => {
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    act(() => result.current.active.setRichDocument(rich("A")));
+    act(() => result.current.active.setRichBody("A changed"));
+
+    mockInvoke
+      .mockResolvedValueOnce(doc("/v/a.md", "A changed"))
+      .mockResolvedValueOnce(rich("A changed"));
+    await act(() => result.current.active.save());
+
+    expect(mockInvoke).toHaveBeenNthCalledWith(2, "write_rich_note", {
+      path: "/v/a.md",
+      patch: {
+        expectedRevision: "hash:A",
+        changedBlockIds: ["block:hash:A"],
+        replacementMarkdown: "A changed",
+      },
+    });
+    expect(result.current.active.dirty).toBe(false);
+    expect(result.current.active.richDocument?.revision).toBe("hash:A changed");
+  });
+
+  it("falls back to raw Markdown when native rich preservation rejects the patch", async () => {
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    act(() => result.current.active.setRichDocument(rich("A")));
+    act(() => result.current.active.setRichBody("A changed"));
+
+    mockInvoke.mockRejectedValueOnce({
+      kind: "invalidContent",
+      message: "mailto link is malformed",
+    });
+    await act(() => result.current.active.save());
+
+    expect(result.current.active.richDocument).toBeNull();
+    expect(result.current.active.richError).toBe("mailto link is malformed");
+    expect(result.current.active.draft).toBe("A changed");
+    expect(result.current.active.dirty).toBe(true);
+  });
+
+  it("falls back locally without writing when rich preflight rejects malformed mailto", async () => {
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    act(() => result.current.active.setRichDocument(rich("A")));
+    act(() => result.current.active.setRichBody("[mail](mailto:invalid)"));
+
+    await act(() => result.current.active.save());
+
+    expect(result.current.active.richDocument).toBeNull();
+    expect(result.current.active.richError).toContain("unsafe link");
+    expect(result.current.active.draft).toBe("[mail](mailto:invalid)");
+    expect(mockInvoke.mock.calls.some(([command]) => command === "write_rich_note")).toBe(false);
+  });
+
+  it("refreshes the rich revision after conflict overwrite without losing newer typing", async () => {
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    act(() => result.current.active.setRichDocument(rich("A")));
+    act(() => result.current.active.setRichBody("local edit"));
+
+    mockInvoke.mockRejectedValueOnce({ kind: "conflict", message: "changed on disk" });
+    await act(() => result.current.active.save());
+    expect(result.current.active.conflict).toBe(true);
+
+    const overwrite = deferred<NoteDoc>();
+    const refresh = deferred<RichEditDocument>();
+    mockInvoke
+      .mockReturnValueOnce(overwrite.promise as Promise<unknown>)
+      .mockReturnValueOnce(refresh.promise as Promise<unknown>);
+    let overwriteSave!: Promise<void>;
+    act(() => { overwriteSave = result.current.active.overwrite(); });
+    act(() => result.current.active.setRichBody("local edit plus more"));
+    await act(async () => {
+      overwrite.resolve(doc("/v/a.md", "local edit"));
+      await overwrite.promise;
+    });
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("read_rich_note", { path: "/v/a.md" }),
+    );
+    expect(result.current.active.saving).toBe(true);
+    await act(async () => {
+      refresh.resolve(rich("local edit"));
+      await overwriteSave;
+    });
+
+    expect(result.current.active.richDocument?.revision).toBe("hash:local edit");
+    expect(result.current.active.richBody).toBe("local edit plus more");
+    expect(result.current.active.dirty).toBe(true);
+
+    mockInvoke
+      .mockResolvedValueOnce(doc("/v/a.md", "local edit plus more"))
+      .mockResolvedValueOnce(rich("local edit plus more"));
+    await act(() => result.current.active.save());
+
+    expect(mockInvoke).toHaveBeenLastCalledWith("read_rich_note", {
+      path: "/v/a.md",
+    });
+    expect(mockInvoke).toHaveBeenNthCalledWith(5, "write_rich_note", {
+      path: "/v/a.md",
+      patch: {
+        expectedRevision: "hash:local edit",
+        changedBlockIds: ["block:hash:local edit"],
+        replacementMarkdown: "local edit plus more",
+      },
+    });
+    expect(result.current.active.dirty).toBe(false);
+  });
+
   it("keeps two notes loaded and preserves each tab's draft and mode", async () => {
     mockInvoke
       .mockResolvedValueOnce(doc("/v/a.md", "A"))
@@ -156,6 +344,185 @@ describe("useNoteTabs - collection behavior", () => {
 });
 
 describe("useNoteTabs - async ownership", () => {
+  it("keeps each tab save single-flight when save is requested twice", async () => {
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    act(() => result.current.active.setDraft("saved once"));
+
+    const write = deferred<NoteDoc>();
+    mockInvoke.mockReturnValue(write.promise as Promise<unknown>);
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+    act(() => {
+      first = result.current.active.save();
+      second = result.current.active.save();
+    });
+    await act(async () => {
+      write.resolve(doc("/v/a.md", "saved once"));
+      await Promise.all([first, second]);
+    });
+
+    expect(mockInvoke.mock.calls.filter(([command]) => command === "write_note")).toHaveLength(1);
+    expect(result.current.active.conflict).toBe(false);
+    expect(result.current.active.dirty).toBe(false);
+  });
+
+  it("keeps a rich save visibly in flight until its revision refresh completes", async () => {
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    act(() => result.current.active.setRichDocument(rich("A")));
+    act(() => result.current.active.setRichBody("first edit"));
+
+    const refresh = deferred<RichEditDocument>();
+    mockInvoke
+      .mockResolvedValueOnce(doc("/v/a.md", "first edit"))
+      .mockReturnValueOnce(refresh.promise as Promise<unknown>);
+    let first!: Promise<void>;
+    act(() => { first = result.current.active.save(); });
+    await waitFor(() =>
+      expect(mockInvoke.mock.calls.some(([command]) => command === "read_rich_note")).toBe(true),
+    );
+    expect(result.current.active.saving).toBe(true);
+
+    act(() => result.current.active.setRichBody("second edit"));
+    expect(result.current.active.saving).toBe(true);
+    await act(() => result.current.active.save());
+
+    expect(mockInvoke.mock.calls.filter(([command]) => command === "write_rich_note")).toHaveLength(1);
+
+    await act(async () => {
+      refresh.resolve(rich("first edit"));
+      await first;
+    });
+    expect(result.current.active.saving).toBe(false);
+    expect(result.current.active.dirty).toBe(true);
+  });
+
+  it("reloads the rich revision at a remapped path before allowing the next save", async () => {
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    act(() => result.current.active.setRichDocument(rich("A")));
+    act(() => result.current.active.setRichBody("first edit"));
+
+    const oldPathRefresh = deferred<RichEditDocument>();
+    const remappedPathRefresh = deferred<RichEditDocument>();
+    mockInvoke
+      .mockResolvedValueOnce(doc("/v/a.md", "first edit"))
+      .mockReturnValueOnce(oldPathRefresh.promise as Promise<unknown>)
+      .mockReturnValueOnce(remappedPathRefresh.promise as Promise<unknown>);
+    let firstSave!: Promise<void>;
+    act(() => { firstSave = result.current.active.save(); });
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("read_rich_note", { path: "/v/a.md" }),
+    );
+
+    act(() => result.current.remap("/v/a.md", "/v/renamed.md", "renamed.md"));
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("read_rich_note", { path: "/v/renamed.md" }),
+    );
+    expect(result.current.active.saving).toBe(true);
+
+    await act(async () => {
+      remappedPathRefresh.resolve(rich("first edit"));
+      await remappedPathRefresh.promise;
+    });
+    expect(result.current.active.richDocument?.revision).toBe("hash:first edit");
+    expect(result.current.active.saving).toBe(false);
+
+    await act(async () => {
+      oldPathRefresh.resolve(rich("first edit"));
+      await firstSave;
+    });
+    expect(result.current.active.richDocument?.revision).toBe("hash:first edit");
+
+    act(() => result.current.active.setRichBody("second edit"));
+    mockInvoke
+      .mockResolvedValueOnce(doc("/v/renamed.md", "second edit"))
+      .mockResolvedValueOnce(rich("second edit"));
+    await act(() => result.current.active.save());
+
+    const richWrites = mockInvoke.mock.calls.filter(([command]) => command === "write_rich_note");
+    expect(richWrites).toHaveLength(2);
+    expect(richWrites.at(-1)?.[1]).toMatchObject({
+      path: "/v/renamed.md",
+      patch: { expectedRevision: "hash:first edit" },
+    });
+  });
+
+  it("ignores a successful rich refresh after its clean tab is reused for another note", async () => {
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    act(() => result.current.active.setRichDocument(rich("A")));
+    act(() => result.current.active.setRichBody("A saved"));
+
+    const refresh = deferred<RichEditDocument>();
+    mockInvoke
+      .mockResolvedValueOnce(doc("/v/a.md", "A saved"))
+      .mockReturnValueOnce(refresh.promise as Promise<unknown>);
+    let save!: Promise<void>;
+    act(() => { save = result.current.active.save(); });
+    await waitFor(() =>
+      expect(mockInvoke.mock.calls.some(([command]) => command === "read_rich_note")).toBe(true),
+    );
+
+    const reusedTabId = result.current.activeTabId;
+    mockInvoke.mockResolvedValueOnce(doc("/v/b.md", "B"));
+    act(() => result.current.open("/v/b.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("B"));
+    expect(result.current.activeTabId).toBe(reusedTabId);
+
+    await act(async () => {
+      refresh.resolve(rich("A saved"));
+      await save;
+    });
+
+    expect(result.current.active.note?.raw).toBe("B");
+    expect(result.current.active.richDocument).toBeNull();
+    expect(result.current.active.richError).toBeNull();
+  });
+
+  it("ignores a failed rich refresh after its clean tab is reused for another note", async () => {
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    act(() => result.current.active.setRichDocument(rich("A")));
+    act(() => result.current.active.setRichBody("A saved"));
+
+    const refresh = deferred<RichEditDocument>();
+    mockInvoke
+      .mockResolvedValueOnce(doc("/v/a.md", "A saved"))
+      .mockReturnValueOnce(refresh.promise as Promise<unknown>);
+    let save!: Promise<void>;
+    act(() => { save = result.current.active.save(); });
+    await waitFor(() =>
+      expect(mockInvoke.mock.calls.some(([command]) => command === "read_rich_note")).toBe(true),
+    );
+
+    const reusedTabId = result.current.activeTabId;
+    mockInvoke.mockResolvedValueOnce(doc("/v/b.md", "B"));
+    act(() => result.current.open("/v/b.md"));
+    await waitFor(() => expect(result.current.active.note?.raw).toBe("B"));
+    expect(result.current.activeTabId).toBe(reusedTabId);
+
+    await act(async () => {
+      refresh.reject(new Error("old refresh failed"));
+      await save;
+    });
+
+    expect(result.current.active.note?.raw).toBe("B");
+    expect(result.current.active.richDocument).toBeNull();
+    expect(result.current.active.richError).toBeNull();
+  });
+
   it("keeps the renamed relative path when a read resolves after the rename", async () => {
     const read = deferred<NoteDoc>();
     mockInvoke.mockReturnValueOnce(read.promise as Promise<unknown>);

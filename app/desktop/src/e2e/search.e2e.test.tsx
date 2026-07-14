@@ -10,7 +10,7 @@
 // findBy* queries, exactly as a user would wait.
 
 import { describe, it, expect } from "vitest";
-import { act, screen, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
 import { renderApp, type RenderAppResult } from "./renderApp";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
@@ -42,7 +42,9 @@ describe("Journey 10: full-text vault search", () => {
     await user.click(screen.getByRole("button", { name: "Search" }));
     const input = await screen.findByLabelText("Search vault");
     expect(input).toHaveFocus();
-    expect(screen.queryByLabelText("Filter files by name")).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Filter files by name").closest(".nn-primary-sidebar-panel"),
+    ).toHaveAttribute("hidden");
 
     // Type a ≥2-char query and ride out the 200 ms debounce.
     await user.type(input, "recipe");
@@ -58,9 +60,8 @@ describe("Journey 10: full-text vault search", () => {
     // Click the match row → the note opens in the reader.
     await user.click(within(results).getByRole("button", { name: /Tried a new recipe today/ }));
     expect(await screen.findByRole("heading", { name: "Journal", level: 1 })).toBeInTheDocument();
-    expect(
-      within(screen.getByRole("article")).getByText("Tried a new recipe today."),
-    ).toBeInTheDocument();
+    const editor = await screen.findByRole("textbox", { name: "Note content" });
+    await waitFor(() => expect(editor).toHaveTextContent("Tried a new recipe today."));
     // The sidebar stayed on search (results still visible).
     expect(screen.getByLabelText("Search vault")).toBeInTheDocument();
     expect(screen.getByRole("list", { name: "Search results" })).toBeInTheDocument();
@@ -76,7 +77,9 @@ describe("Journey 10: full-text vault search", () => {
 
     const input = await screen.findByLabelText("Search vault");
     expect(input).toHaveFocus();
-    expect(screen.queryByLabelText("Filter files by name")).not.toBeInTheDocument();
+    expect(
+      screen.getByLabelText("Filter files by name").closest(".nn-primary-sidebar-panel"),
+    ).toHaveAttribute("hidden");
   });
 
   it("ranks a file whose name matches above content-only hits", async () => {

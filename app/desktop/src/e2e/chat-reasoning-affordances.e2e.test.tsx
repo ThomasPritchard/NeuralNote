@@ -29,7 +29,7 @@ const BACKSTOP = /Reasoning was on, but the model didn't return any/;
 async function openWorkspace(opts: CreateMockVaultOptions = {}) {
   const result = renderApp({ recents, ...opts });
   await result.user.click(await screen.findByRole("button", { name: "Open My Brain" }));
-  await screen.findByText("Cited recall");
+  await screen.findByText("Neural Assistant AI");
   return result;
 }
 

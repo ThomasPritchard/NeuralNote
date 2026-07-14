@@ -7,6 +7,8 @@ use chrono::NaiveDate;
 use futures_util::StreamExt;
 use neuralnote_core::ai::{OpenRouterRankedModels, ProviderConfig};
 use neuralnote_core::CoreError;
+
+use crate::provider_config_mutation::ProviderConfigMutationGate;
 use serde::Serialize;
 use ts_rs::TS;
 
@@ -253,6 +255,7 @@ pub(crate) async fn fetch_validated_catalogue<T: CatalogueTransport + ?Sized>(
 
 pub(crate) fn persist_selected_model(
     config_dir: &Path,
+    mutation_gate: &ProviderConfigMutationGate,
     offered: &HashSet<String>,
     model: &str,
 ) -> Result<ProviderConfig, CoreError> {
@@ -263,10 +266,10 @@ pub(crate) fn persist_selected_model(
         ));
     }
 
-    let mut config = neuralnote_core::ai::read_provider_config(config_dir)?;
-    config.model = model.to_string();
-    neuralnote_core::ai::write_provider_config(config_dir, &config)?;
-    neuralnote_core::ai::read_provider_config(config_dir)
+    mutation_gate.update(config_dir, |config| {
+        config.model = model.to_string();
+        Ok(())
+    })
 }
 
 fn validate_model_id(model: &str) -> Result<(), CoreError> {

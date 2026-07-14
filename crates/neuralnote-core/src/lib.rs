@@ -16,6 +16,7 @@ pub mod note;
 pub mod paths;
 pub mod preferences;
 pub mod recents;
+pub mod rich_edit;
 pub mod search;
 pub mod templates;
 pub mod tree;

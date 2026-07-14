@@ -2,7 +2,7 @@
 
 The local updater harness proves NeuralNote's real Tauri update path without publishing a release,
 changing the production endpoint, or requiring a paid Apple Developer account. It builds an isolated
-`NeuralNote Updater Harness` app at `0.1.0`, signs a `0.1.1` updater archive with the configured
+`NeuralNote Updater Harness` app at `0.1.1`, signs a `0.2.0` updater archive with the configured
 Tauri updater key, and serves it only from `127.0.0.1`.
 
 This harness is a recommended one-time preflight, not a prerequisite for a GitHub release. Production
@@ -66,10 +66,10 @@ npm --prefix app/desktop run updater:local -- serve \
   --mode invalid
 ```
 
-In the opened harness app, use **Settings → General → Check for updates**, review `0.1.1`, and attempt
+In the opened harness app, use **Settings → General → Check for updates**, review `0.2.0`, and attempt
 the install. This journey serves an archive with exactly one changed byte while retaining the genuine
 signature, so Tauri must reject it during cryptographic verification. The failure must be visible.
-Stop the server with `Ctrl+C`, then verify that the app remains at `0.1.0`:
+Stop the server with `Ctrl+C`, then verify that the app remains at `0.1.1`:
 
 ```bash
 npm --prefix app/desktop run updater:local -- verify \
@@ -90,7 +90,7 @@ npm --prefix app/desktop run updater:local -- serve \
 ```
 
 Repeat the check, review, install, and relaunch flow. Stop the server after relaunch, then verify the
-independent valid app copy is now `0.1.1`:
+independent valid app copy is now `0.2.0`:
 
 ```bash
 npm --prefix app/desktop run updater:local -- verify \

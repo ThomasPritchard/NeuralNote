@@ -45,10 +45,11 @@ responses, downloaded requirement bytes, helper output, and webview IPC argument
 |---|---|---|
 | Vault open/read/write | traversal, symlink escape, overwrite, parser DoS | user-selected roots, canonical parent checks, no-follow/regular-file checks, bounded parsing, create-new semantics, hash-guarded undo |
 | Markdown/frontmatter render | XSS, remote beacons, broken content hiding | no raw HTML, safe URL transform, inert links, CSP, failed-image fallback, explicit lossy/parse notices |
+| Rich-editor preflight/save IPC | source normalization, unsafe Markdown activation, forged ranges, stale overwrite, parser or allocation DoS | strict UTF-8 and syntax allowlist, bounded DTO deserialization, opaque revision-bound block IDs, contiguous-range validation, exact frontmatter preservation, optimistic concurrency, atomic write, raw fallback |
 | Window-state IPC | unintended native window authority | `core:window:allow-is-fullscreen` exposes only the current main-window fullscreen boolean; it grants no window mutation authority |
 | Chat/tool loop | prompt injection, excessive writes, forged citations | capability grants, fixed schemas, Rust dispatch validation, per-item budgets, evidence hashes, citation revalidation, iteration and span caps |
 | Elicitation | model-provided active media, choice forgery | model images rejected, implementation images fully decoded and bounded, offered IDs and arity validated |
-| Provider IPC/network | key disclosure, arbitrary requests, ranking-data poisoning, hangs | OS keychain, redaction, fixed HTTPS origins, no redirects, authenticated daily rankings, bounded reads, connect/total timeouts, defensive join/filter validation, exact last-offered model selection |
+| Provider IPC/network and settings | key disclosure, arbitrary requests, ranking-data poisoning, hangs, concurrent preference loss | OS keychain, redaction, fixed HTTPS origins, no redirects, authenticated daily rankings, bounded reads, connect/total timeouts, defensive join/filter validation, exact last-offered model selection, in-process mutation sequencing, cross-process advisory lock, atomic config replacement |
 | Ollama sidecar | port hijack, arbitrary model operation | loopback binding, child ownership/health checks, app-owned model store, curated pull/select/chat/delete tags |
 | YouTube helpers | command injection, ambient config/plugin execution, output DoS | typed YouTube URLs, fixed argv, no shell, absolute binaries, cleared environment, no config/default plugins, explicit pinned POT directory, time/output/cancel bounds |
 | Requirement installer | malicious archive/binary, race, partial install | compiled HTTPS URL and digest, streamed SHA-256, archive entry/type/size limits, install locks, atomic publication |
@@ -80,6 +81,14 @@ the actual parent, create without overwrite, retain the filesystem's stored spel
 content hashes for undo. Downloaded helpers are verified before atomic publication. Citation spans
 are rechecked against note hashes before emission.
 
+The rich editor never receives writable byte offsets. Rust reads the current exact note bytes,
+classifies unsupported or ambiguous Markdown as raw-only, and binds opaque block IDs to the note
+revision and complete source ranges. A save must present the current revision and one contiguous,
+ordered ID range; Rust reparses the replacement and full result, preserves the exact frontmatter
+prefix and all bytes outside that range, then performs the existing hash-guarded atomic write.
+Non-UTF-8 notes, unsafe links, raw HTML/MDX, Obsidian extensions, malformed syntax, oversized input,
+and ambiguous editor round trips fail closed without replacing the original draft.
+
 ### Repudiation
 
 NeuralNote is single-user and has no audit-log identity system. User-visible progress, explicit
@@ -110,6 +119,9 @@ only through explicit skill activation and can never bypass Rust write or citati
 
 - `../`, absolute, Unicode-normalised, case-variant, and symlink-swapped note paths.
 - Alias-amplified or malformed YAML, huge lines, invalid UTF-8, and binary files.
+- Forged, duplicate, reordered, non-contiguous, stale, oversized, or allocation-amplifying rich-edit
+  patches; nested unsupported Markdown; encoded link traversal; and editor output that cannot make an
+  exact second round trip.
 - Unknown citation IDs and notes modified between retrieval and answer emission.
 - Model-authored remote and data image URIs.
 - Unknown Hugging Face repositories and Ollama tags sent directly over IPC.

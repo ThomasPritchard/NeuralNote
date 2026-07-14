@@ -1,4 +1,4 @@
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { Editor } from "./Editor";
@@ -36,6 +36,12 @@ function renderEditor(props: Props = {}) {
   return handlers;
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 /** The menu-action handler the Editor's onMenu subscription registered (latest
  *  mount). onMenu wraps it as `(e) => cb(e.payload)`, so drive it with a
  *  `{ payload }` envelope. */
@@ -60,6 +66,45 @@ describe("Editor — buffer", () => {
     expect(ta.value).toBe("seed");
     await userEvent.type(ta, "X");
     expect(h.onChange).toHaveBeenLastCalledWith("seedX");
+  });
+
+  it("contains an asynchronous listener cleanup failure after unmount", async () => {
+    const subscription = deferred<() => void>();
+    mockListen.mockReturnValueOnce(subscription.promise);
+    const warning = vi.spyOn(console, "warn").mockImplementation(() => {});
+    const { unmount } = render(
+      <Editor
+        value="source"
+        onChange={vi.fn()}
+        saveError={null}
+        conflict={false}
+        onOverwrite={vi.fn()}
+        onReload={vi.fn()}
+      />,
+    );
+    unmount();
+
+    await act(async () => {
+      subscription.resolve((() => Promise.reject(new Error("listener already cleared"))) as unknown as () => void);
+      await Promise.resolve();
+    });
+
+    await waitFor(() =>
+      expect(warning).toHaveBeenCalledWith(
+        "failed to unsubscribe from format actions:",
+        expect.any(Error),
+      ),
+    );
+  });
+
+  it("shows a high-contrast focus indicator on the raw editing surface", () => {
+    renderEditor();
+
+    expect(textarea()).toHaveClass(
+      "focus-visible:ring-2",
+      "focus-visible:ring-ring",
+      "focus-visible:ring-offset-2",
+    );
   });
 });
 
@@ -117,6 +162,21 @@ const INDEX: NoteIndexEntry[] = [
 const textarea = () => screen.getByLabelText("Note source") as HTMLTextAreaElement;
 
 describe("Editor — [[ autocomplete", () => {
+  it("preserves native multiline textbox semantics while exposing autocomplete state", async () => {
+    renderEditor({ value: "", noteIndex: INDEX });
+    const ta = screen.getByRole("textbox", { name: "Note source" });
+
+    expect(ta).not.toHaveAttribute("role");
+    expect(ta).toHaveAttribute("aria-autocomplete", "list");
+    expect(ta).not.toHaveAttribute("aria-expanded");
+    expect(ta).not.toHaveAttribute("aria-controls");
+    await userEvent.type(ta, "[[[[");
+    expect(ta).toHaveAttribute("aria-controls", "nn-wikilink-listbox");
+
+    await userEvent.keyboard("{Escape}");
+    expect(ta).not.toHaveAttribute("aria-controls");
+  });
+
   it("opens on [[ , filters by the typed prefix, and inserts on Enter", async () => {
     const h = renderEditor({ value: "", noteIndex: INDEX });
     const ta = textarea();

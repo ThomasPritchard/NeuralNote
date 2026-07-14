@@ -6,7 +6,7 @@
 import { useCallback, useRef, useState } from "react";
 import * as api from "../lib/api";
 import { errorMessage, isConflict } from "../lib/api";
-import type { NoteDoc } from "../lib/types";
+import type { NoteDoc, RichEditDocument } from "../lib/types";
 
 export type NoteMode = "read" | "edit";
 
@@ -17,6 +17,9 @@ export interface OpenNote {
   /** Read error for the active note. */
   error: string | null;
   mode: NoteMode;
+  richDocument: RichEditDocument | null;
+  richBody: string;
+  richError: string | null;
   /** The editor buffer (the full raw file). */
   draft: string;
   dirty: boolean;
@@ -36,6 +39,11 @@ export interface OpenNote {
   repath: (newPath: string, newRelPath?: string) => void;
   setMode: (mode: NoteMode) => void;
   setDraft: (value: string) => void;
+  setRichDocument: (document: RichEditDocument) => void;
+  setRichError: (message: string) => void;
+  setRichBody: (body: string) => void;
+  undoRich: () => void;
+  redoRich: () => void;
   save: () => Promise<void>;
   /** Clear the reader entirely (e.g. the open note was deleted). */
   clear: () => void;
@@ -164,6 +172,9 @@ export function useOpenNote(): OpenNote {
     loading,
     error,
     mode,
+    richDocument: null,
+    richBody: "",
+    richError: null,
     draft,
     dirty: note !== null && draft !== note.raw,
     saving,
@@ -175,6 +186,11 @@ export function useOpenNote(): OpenNote {
     repath,
     setMode,
     setDraft,
+    setRichDocument: () => {},
+    setRichError: () => {},
+    setRichBody: () => {},
+    undoRich: () => {},
+    redoRich: () => {},
     save,
     clear,
   };

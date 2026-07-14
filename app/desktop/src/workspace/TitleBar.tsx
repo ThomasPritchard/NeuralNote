@@ -88,7 +88,7 @@ export function TitleBar({
 
   return (
     <header
-      className="nn-titlebar relative grid h-(--titlebar-height) shrink-0 border-b border-border bg-titlebar"
+      className={`nn-titlebar ${macOSFullscreen ? "nn-titlebar-toggle-clearance-fullscreen" : "nn-titlebar-toggle-clearance-windowed"} relative grid h-(--titlebar-height) shrink-0 border-b border-border bg-titlebar`}
       data-navigation-expanded={navigationExpanded}
       data-chat-open={chatOpen}
     >
@@ -139,6 +139,9 @@ function isMacOSRuntime(): boolean {
 }
 
 function useMacOSFullscreen(): boolean {
+  // TODO(fullscreen-first-paint): represent macOS fullscreen as unknown until
+  // the initial native query resolves so an already-fullscreen launch never
+  // paints the 74 px traffic-light offset first; cover that launch state.
   const [fullscreen, setFullscreen] = useState(false);
 
   useEffect(() => {

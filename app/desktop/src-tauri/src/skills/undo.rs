@@ -9,10 +9,12 @@ use neuralnote_core::{CoreError, CoreResult};
 use serde::Serialize;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+#[cfg(test)]
 use std::sync::atomic::{AtomicU64, Ordering};
 use ts_rs::TS;
 
 const MAX_UNDO_RUNS: usize = 8;
+#[cfg(test)]
 static CHAT_RUN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 /// Per-file Undo outcome. Every non-deletion carries a user-facing reason.
@@ -136,6 +138,7 @@ fn unavailable_undo(run_id: &str) -> CoreError {
     ))
 }
 
+#[cfg(test)]
 pub(crate) fn next_chat_run_id() -> String {
     let sequence = CHAT_RUN_SEQUENCE.fetch_add(1, Ordering::Relaxed);
     format!("chat-run-{}-{sequence}", std::process::id())

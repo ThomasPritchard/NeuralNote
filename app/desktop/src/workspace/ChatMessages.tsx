@@ -16,6 +16,7 @@ import {
   Search,
   SearchX,
   ShieldCheck,
+  Square,
   Wand2,
 } from "lucide-react";
 import * as api from "../lib/api";
@@ -580,17 +581,17 @@ function ActivitySummaryDisclosure({
 }
 
 // A run that errored: show the failing context, always expanded, framed as
-// "Stopped —" (never a normal grey completed summary — that reads as "finished,
+// "Failed —" (never a normal grey completed summary — that reads as "finished,
 // then something unrelated broke"). The last row is where it died, so it's the
 // diagnostic context for the error box rendered directly beneath.
-function StoppedActivity({
+function FailedActivity({
   grouped,
   summary,
 }: Readonly<{ grouped: GroupedStep[]; summary: ActivitySummary }>) {
   return (
     <div className="flex flex-col gap-1.5">
       <p className="text-[0.6875rem] font-medium text-muted-foreground/90">
-        Stopped — {count(summary.searches, "search", "searches")} ·{" "}
+        Failed — {count(summary.searches, "search", "searches")} ·{" "}
         {count(summary.notesRead, "note", "notes")}
       </p>
       <ActivityRows grouped={grouped} />
@@ -599,7 +600,7 @@ function StoppedActivity({
 }
 
 // The activity trace, routed by run phase:
-//   • errored               → the "Stopped" context, always expanded (diagnostic).
+//   • errored               → the "Failed" context, always expanded (diagnostic).
 //   • streaming, pre-answer  → the bounded live window (the signature view).
 //   • settled (done or answering) → one collapsed summary line; ≤2 steps render
 //     inline (no chevron guarding a row or two); empty activity renders nothing.
@@ -629,7 +630,7 @@ function ActivityTrace({
   if (errored) {
     // An error that struck before any step: the error box alone speaks.
     return grouped.length === 0 ? null : (
-      <StoppedActivity grouped={grouped} summary={summary} />
+      <FailedActivity grouped={grouped} summary={summary} />
     );
   }
 
@@ -907,6 +908,12 @@ function AssistantTurn({
         errored={turn.error !== null}
         suppressLive={hasSkillNarrative}
       />
+      {turn.stopped && (
+        <p className="flex items-center gap-1.5 text-[0.6875rem] font-medium text-muted-foreground">
+          <Square className="size-3 fill-current" aria-hidden />
+          Stopped
+        </p>
+      )}
       <Reasoning text={turn.thinking} />
       {turn.pendingElicitation !== null && (
         // Keyed by elicitation id: a follow-up question in the same turn is a

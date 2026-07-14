@@ -156,9 +156,15 @@ describe("TitleBar — native fullscreen geometry", () => {
 
     await waitFor(() => expect(nativeWindow.isFullscreen).toHaveBeenCalledOnce());
     expect(leftCluster).toHaveClass("pl-[74px]");
+    expect(leftCluster?.closest(".nn-titlebar")).toHaveClass(
+      "nn-titlebar-toggle-clearance-windowed",
+    );
 
     act(() => nativeWindow.resizeHandler?.());
     await waitFor(() => expect(leftCluster).toHaveClass("pl-[12px]"));
+    expect(leftCluster?.closest(".nn-titlebar")).toHaveClass(
+      "nn-titlebar-toggle-clearance-fullscreen",
+    );
     expect(nativeWindow.isFullscreen).toHaveBeenCalledTimes(2);
   });
 

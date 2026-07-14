@@ -12,7 +12,9 @@ dist/
 build/
 app/desktop/src-tauri/binaries/ollama-*
 app/desktop/src-tauri/binaries/llama-server-*
-app/desktop/src-tauri/ollama-libs/
+# Ignore both the fetched directory and temporary absolute symlinks used by
+# isolated worktrees; neither is reviewed source or release provenance.
+app/desktop/src-tauri/ollama-libs
 
 # Coverage + SonarQube scanner artifacts
 coverage/

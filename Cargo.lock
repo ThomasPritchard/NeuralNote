@@ -765,7 +765,7 @@ dependencies = [
 
 [[package]]
 name = "desktop"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "chrono",
@@ -795,6 +795,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "ts-rs",
+ "uuid",
 ]
 
 [[package]]
@@ -2322,7 +2323,7 @@ dependencies = [
 
 [[package]]
 name = "neuralnote-core"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "async-trait",
  "audioadapter-buffers",
@@ -2344,7 +2345,7 @@ dependencies = [
 
 [[package]]
 name = "neuralnote-release"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "base64 0.22.1",
  "minisign-verify",

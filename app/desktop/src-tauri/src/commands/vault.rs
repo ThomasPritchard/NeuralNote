@@ -10,6 +10,7 @@ use std::path::{Path, PathBuf};
 use neuralnote_core::model::{
     Backlinks, LinkGraph, NoteDoc, RecentVault, SearchResponse, TemplateInfo, TreeNode, Vault,
 };
+use neuralnote_core::rich_edit::{RichEditDocument, RichEditPatch};
 use neuralnote_core::CoreError;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter};
@@ -338,6 +339,26 @@ pub(crate) async fn write_note(
         .run(|root| {
             neuralnote_core::note::write_note(root, Path::new(&path), &content, expected_hash)
         })
+        .await
+}
+
+#[tauri::command]
+pub(crate) async fn read_rich_note(
+    state: SharedState<'_>,
+    path: String,
+) -> Result<RichEditDocument, CoreError> {
+    neuralnote_core::note::read_rich_note(&root_of(&state)?, Path::new(&path))
+}
+
+#[tauri::command]
+pub(crate) async fn write_rich_note(
+    state: SharedState<'_>,
+    path: String,
+    patch: RichEditPatch,
+) -> Result<NoteDoc, CoreError> {
+    let mutation = vault_mutation_of(&state)?;
+    mutation
+        .run(|root| neuralnote_core::note::write_rich_note(root, Path::new(&path), &patch))
         .await
 }
 

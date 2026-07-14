@@ -47,6 +47,8 @@ const mockSetReasoning = vi.mocked(api.setReasoning);
 const mockRefreshSupport = vi.mocked(api.refreshReasoningSupport);
 
 const DEFAULT_MODEL = "anthropic/claude-sonnet-4.5";
+const TURN_ID = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e21";
+const SECOND_TURN_ID = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e22";
 
 // ── AiStatus builders (the three effective-provider shapes the pane branches on) ──
 // `reasoningSupported` defaults to "unknown": no model has been probed, and
@@ -75,10 +77,12 @@ const localActive = (tag: string | null): AiStatus => ({
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((res) => {
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((res, rej) => {
     resolve = res;
+    reject = rej;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
 
 /** Render the pane with captured callbacks and a fresh user-event session. */
@@ -108,8 +112,9 @@ async function openKeySetup(user: ReturnType<typeof userEvent.setup>) {
 
 /** Script `chat` to replay `events` through the passed onEvent, then resolve. */
 function scriptChat(events: ChatEvent[]) {
-  mockChat.mockImplementation(async (_prompt, _history, onEvent) => {
+  mockChat.mockImplementation(async (_turnId, _prompt, _history, onEvent) => {
     for (const ev of events) onEvent(ev);
+    return TURN_ID;
   });
 }
 
@@ -154,11 +159,12 @@ async function askInChat(
 }
 
 beforeEach(() => {
+  vi.spyOn(globalThis.crypto, "randomUUID").mockReturnValue(TURN_ID);
   mockAiStatus.mockReset();
   mockSave.mockReset();
   mockChat.mockReset();
   mockCancelChat.mockReset();
-  mockCancelChat.mockResolvedValue(undefined);
+  mockCancelChat.mockResolvedValue({ turnId: TURN_ID, status: "cancelled" });
   mockSetReasoning.mockReset();
   mockRefreshSupport.mockReset();
   reportError.mockReset();
@@ -179,7 +185,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
 
 describe("ChatPane — first-run provider branching", () => {
@@ -233,6 +239,15 @@ describe("ChatPane — first-run provider branching", () => {
     expect(
       screen.getByRole("button", { name: /choose ai model.*qwen2.5:7b/i }),
     ).toBeInTheDocument();
+  });
+
+  it("uses the full focus token for the composer instead of a low-contrast tint", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    setup();
+
+    const surface = (await screen.findByLabelText("Ask across your vault")).parentElement;
+    expect(surface).toHaveClass("focus-within:ring-2", "focus-within:ring-ring");
+    expect(surface).not.toHaveClass("focus-within:ring-primary/40");
   });
 
   it("hands off to settings when local is selected but no model is set up", async () => {
@@ -296,6 +311,93 @@ describe("ChatPane — first-run provider branching", () => {
 
     await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));
     expect(screen.getByText(/cited chat is off/i)).toBeInTheDocument();
+  });
+
+  it("does not let an older status refresh undo a newer reasoning mutation echo", async () => {
+    const staleRefresh = deferred<AiStatus>();
+    mockAiStatus
+      .mockResolvedValueOnce(openRouterActive())
+      .mockReturnValueOnce(staleRefresh.promise);
+    mockSetReasoning.mockResolvedValue(
+      openRouterActive(DEFAULT_MODEL, { reasoning: true }),
+    );
+    const { openNoteAt, onOpenSettings, user, view } = setup(0);
+    const reasoning = await screen.findByRole("button", {
+      name: "Show model reasoning",
+    });
+
+    view.rerender(
+      <ChatPane
+        openNoteAt={openNoteAt}
+        onOpenSettings={onOpenSettings}
+        refreshSignal={1}
+      />,
+    );
+    await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));
+
+    await user.click(reasoning);
+    await waitFor(() => expect(reasoning).toHaveAttribute("aria-pressed", "true"));
+
+    await act(async () => {
+      staleRefresh.resolve(openRouterActive());
+      await staleRefresh.promise;
+    });
+
+    expect(reasoning).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("does not let an older status refresh undo a newer model-selection echo", async () => {
+    const staleRefresh = deferred<AiStatus>();
+    const selectedModel = "acme/new-model";
+    mockAiStatus
+      .mockResolvedValueOnce(openRouterActive())
+      .mockReturnValueOnce(staleRefresh.promise);
+    vi.mocked(api.openRouterModelMenu).mockResolvedValue({
+      models: [
+        {
+          id: selectedModel,
+          name: "New model",
+          contextLength: 128_000,
+          rank: 1,
+        },
+      ],
+      asOf: "2026-07-13",
+      selectedModel: DEFAULT_MODEL,
+      pinnedSelectedModel: DEFAULT_MODEL,
+    });
+    vi.mocked(api.selectOpenRouterModel).mockResolvedValue(
+      openRouterActive(selectedModel),
+    );
+    const { openNoteAt, onOpenSettings, user, view } = setup(0);
+    await screen.findByLabelText("Ask across your vault");
+
+    view.rerender(
+      <ChatPane
+        openNoteAt={openNoteAt}
+        onOpenSettings={onOpenSettings}
+        refreshSignal={1}
+      />,
+    );
+    await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));
+
+    await user.click(screen.getByRole("button", { name: /choose ai model/i }));
+    await user.click(
+      await screen.findByRole("menuitemradio", { name: /new model/i }),
+    );
+    await waitFor(() =>
+      expect(
+        screen.getByRole("button", { name: /choose ai model.*new-model/i }),
+      ).toBeInTheDocument(),
+    );
+
+    await act(async () => {
+      staleRefresh.resolve(openRouterActive());
+      await staleRefresh.promise;
+    });
+
+    expect(
+      screen.getByRole("button", { name: /choose ai model.*new-model/i }),
+    ).toBeInTheDocument();
   });
 
   it("falls back to the picker and surfaces the failure if the status check throws", async () => {
@@ -443,26 +545,117 @@ describe("ChatPane — chat view", () => {
     expect(sendButton()).toBeDisabled();
   });
 
-  it("replaces Send with an accessible cancel control while a chat run is active", async () => {
+  it("moves keyboard focus from the composer to Stop and restores it after completion", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive());
     const run = deferred<string>();
     mockChat.mockReturnValue(run.promise);
+    const { user } = setup();
+    const input = await screen.findByLabelText("Ask across your vault");
+
+    await user.type(input, "question from the keyboard");
+    expect(input).toHaveFocus();
+    await user.keyboard("{Enter}");
+
+    expect(await screen.findByRole("button", { name: "Stop response" })).toHaveFocus();
+
+    await act(async () => {
+      run.resolve(TURN_ID);
+      await run.promise;
+    });
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(input).toBeEnabled();
+  });
+
+  it("restores composer focus after a keyboard-stopped run unwinds", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const run = deferred<string>();
+    mockChat.mockReturnValue(run.promise);
+    const { user } = setup();
+    const input = await screen.findByLabelText("Ask across your vault");
+
+    await user.type(input, "stop this response");
+    await user.keyboard("{Enter}");
+    expect(await screen.findByRole("button", { name: "Stop response" })).toHaveFocus();
+
+    await user.keyboard("{Enter}");
+    expect(await screen.findByText("Stopped")).toBeInTheDocument();
+    await act(async () => {
+      run.resolve(TURN_ID);
+      await run.promise;
+    });
+
+    await waitFor(() => expect(input).toHaveFocus());
+    expect(input).toBeEnabled();
+  });
+
+  it("stops the exact UUID, preserves partial output, and stays busy until chat unwinds", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const run = deferred<string>();
+    const stop = deferred<{ turnId: string; status: "cancelled" }>();
+    mockChat.mockImplementation((_turnId, _prompt, _history, onEvent) => {
+      onEvent({ type: "answer", delta: "Partial answer remains." });
+      return run.promise;
+    });
+    mockCancelChat.mockReturnValue(stop.promise);
     const { user } = setup();
     await screen.findByLabelText("Ask across your vault");
 
     await user.type(composer(), "distil the playlist");
     await user.click(sendButton());
 
-    const cancel = await screen.findByRole("button", { name: "Cancel run" });
-    expect(cancel).toBeEnabled();
-    await user.click(cancel);
-    expect(mockCancelChat).toHaveBeenCalledOnce();
+    const stopButton = await screen.findByRole("button", { name: "Stop response" });
+    await user.click(stopButton);
+    expect(mockCancelChat).toHaveBeenCalledExactlyOnceWith(TURN_ID);
+    expect(screen.getByRole("button", { name: "Stopping" })).toBeDisabled();
 
-    run.resolve("run-cancelled");
+    stop.resolve({ turnId: TURN_ID, status: "cancelled" });
+    expect(await screen.findByText("Stopped")).toBeInTheDocument();
+    expect(screen.getByText("Response stopped.", { selector: '[aria-live="polite"]' })).toBeInTheDocument();
+    expect(screen.getByText("Partial answer remains.")).toBeInTheDocument();
+    expect(composer()).toBeDisabled();
+    expect(screen.getByRole("button", { name: "Stopping" })).toBeDisabled();
+
+    run.resolve(TURN_ID);
     await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).toBeDisabled());
   });
 
-  it("surfaces a rejected cancel and leaves the active run cancellable", async () => {
+  it("keeps a queued committed-note ledger after stop without reviving terminal chat events", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const run = deferred<string>();
+    let emit!: (event: ChatEvent) => void;
+    mockChat.mockImplementation((_turnId, _prompt, _history, onEvent) => {
+      emit = onEvent;
+      onEvent({ type: "skillActivated", id: "youtube-distil", name: "YouTube distil" });
+      return run.promise;
+    });
+    const { user } = setup();
+    await screen.findByLabelText("Ask across your vault");
+
+    await user.type(composer(), "distil the playlist");
+    await user.click(sendButton());
+    await user.click(await screen.findByRole("button", { name: "Stop response" }));
+    expect(await screen.findByText("Stopped")).toBeInTheDocument();
+
+    act(() => {
+      emit({ type: "noteWritten", relPath: "Literature/Committed.md", kind: "literature" });
+      emit({ type: "answer", delta: "late answer must stay hidden" });
+      emit({ type: "error", message: "late cancellation error must stay hidden" });
+      emit({ type: "done" });
+    });
+    await act(async () => {
+      run.resolve(TURN_ID);
+      await run.promise;
+    });
+
+    expect(screen.getByText("1 note written")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Open Literature/Committed.md" })).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Undo" })).toBeEnabled();
+    expect(screen.getByText("Stopped")).toBeInTheDocument();
+    expect(screen.queryByText("late answer must stay hidden")).not.toBeInTheDocument();
+    expect(screen.queryByText("late cancellation error must stay hidden")).not.toBeInTheDocument();
+  });
+
+  it("shows the exact stop failure inline and allows a retry", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive());
     const run = deferred<string>();
     mockChat.mockReturnValue(run.promise);
@@ -472,13 +665,71 @@ describe("ChatPane — chat view", () => {
 
     await user.type(composer(), "distil the playlist");
     await user.click(sendButton());
-    await user.click(await screen.findByRole("button", { name: "Cancel run" }));
+    await user.click(await screen.findByRole("button", { name: "Stop response" }));
 
-    await waitFor(() =>
-      expect(reportError).toHaveBeenCalledWith("cancel channel failed"),
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Couldn't stop the response",
     );
-    expect(screen.getByRole("button", { name: "Cancel run" })).toBeEnabled();
-    run.resolve("run-still-active");
+    const retry = screen.getByRole("button", { name: "Stop response" });
+    expect(retry).toBeEnabled();
+    await user.click(retry);
+    expect(mockCancelChat).toHaveBeenCalledTimes(2);
+    run.resolve(TURN_ID);
+  });
+
+  it("does not relabel a turn when native completion already won", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const run = deferred<string>();
+    mockChat.mockReturnValue(run.promise);
+    mockCancelChat.mockResolvedValue({ turnId: TURN_ID, status: "alreadyCompleted" });
+    const { user } = setup();
+    await screen.findByLabelText("Ask across your vault");
+
+    await user.type(composer(), "quick question");
+    await user.click(sendButton());
+    await user.click(screen.getByRole("button", { name: "Stop response" }));
+
+    await waitFor(() => expect(mockCancelChat).toHaveBeenCalledWith(TURN_ID));
+    expect(screen.queryByText("Stopped")).not.toBeInTheDocument();
+    run.resolve(TURN_ID);
+  });
+
+  it("ignores a delayed stop outcome for an older UUID after a new turn starts", async () => {
+    vi.mocked(globalThis.crypto.randomUUID)
+      .mockReturnValueOnce(TURN_ID)
+      .mockReturnValueOnce(SECOND_TURN_ID);
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const firstRun = deferred<string>();
+    const secondRun = deferred<string>();
+    const oldStop = deferred<{ turnId: string; status: "cancelled" }>();
+    let finishFirst!: (event: ChatEvent) => void;
+    mockChat
+      .mockImplementationOnce((_turnId, _prompt, _history, onEvent) => {
+        finishFirst = onEvent;
+        return firstRun.promise;
+      })
+      .mockImplementationOnce(() => secondRun.promise);
+    mockCancelChat.mockReturnValue(oldStop.promise);
+    const { user } = setup();
+    await screen.findByLabelText("Ask across your vault");
+
+    await user.type(composer(), "first");
+    await user.click(sendButton());
+    await user.click(screen.getByRole("button", { name: "Stop response" }));
+    act(() => finishFirst({ type: "done" }));
+    firstRun.resolve(TURN_ID);
+    await waitFor(() => expect(composer()).toBeEnabled());
+
+    await user.type(composer(), "second");
+    await user.click(sendButton());
+    expect(mockChat.mock.calls.at(-1)?.[0]).toBe(SECOND_TURN_ID);
+    oldStop.resolve({ turnId: TURN_ID, status: "cancelled" });
+
+    await waitFor(() => {
+      expect(screen.queryByText("Stopped")).not.toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Stop response" })).toBeEnabled();
+    });
+    secondRun.resolve(SECOND_TURN_ID);
   });
 
   it("places the echoed OpenRouter model in the composer and removes the header pill", async () => {
@@ -545,10 +796,10 @@ describe("ChatPane — chat view", () => {
     const { user } = setup();
     await screen.findByLabelText("Ask across your vault");
 
-    const gate = deferred<void>();
+    const gate = deferred<string>();
     // Emit far more steps than the live cap, then stay in-flight (no `done`) so
     // the turn keeps streaming — this is the thorough-run bloat case.
-    mockChat.mockImplementation((_p, _h, onEvent) => {
+    mockChat.mockImplementation((_turnId, _p, _h, onEvent) => {
       onEvent({ type: "searching", query: "recall" });
       for (let n = 1; n <= 10; n++) {
         onEvent({
@@ -579,7 +830,7 @@ describe("ChatPane — chat view", () => {
 
     // Settle the run so the deferred doesn't leak into the next test.
     await act(async () => {
-      gate.resolve();
+      gate.resolve(TURN_ID);
       await gate.promise;
     });
   });
@@ -656,6 +907,9 @@ describe("ChatPane — chat view", () => {
   });
 
   it("passes the prior turn as history on the next question", async () => {
+    vi.mocked(globalThis.crypto.randomUUID)
+      .mockReturnValueOnce(TURN_ID)
+      .mockReturnValueOnce(SECOND_TURN_ID);
     const { user } = await askInChat("first question", CITED_RUN);
     await waitFor(() => expect(composer()).toBeEnabled());
 
@@ -664,8 +918,9 @@ describe("ChatPane — chat view", () => {
     await user.click(sendButton());
 
     const lastCall = mockChat.mock.calls.at(-1);
-    expect(lastCall?.[0]).toBe("second question");
-    expect(lastCall?.[1]).toEqual([
+    expect(lastCall?.[0]).toBe(SECOND_TURN_ID);
+    expect(lastCall?.[1]).toBe("second question");
+    expect(lastCall?.[2]).toEqual([
       { role: "user", content: "first question" },
       { role: "assistant", content: "Active recall means testing yourself." },
     ]);
@@ -733,8 +988,8 @@ describe("ChatPane — chat view", () => {
     const { user } = setup();
     await screen.findByLabelText("Ask across your vault");
 
-    const gate = deferred<void>();
-    mockChat.mockImplementation((_p, _h, onEvent) => {
+    const gate = deferred<string>();
+    mockChat.mockImplementation((_turnId, _p, _h, onEvent) => {
       onEvent({ type: "searching", query: "x" });
       return gate.promise; // stays in-flight
     });
@@ -744,7 +999,7 @@ describe("ChatPane — chat view", () => {
     expect(composer()).toBeDisabled();
 
     await act(async () => {
-      gate.resolve();
+      gate.resolve(TURN_ID);
       await gate.promise;
     });
     expect(composer()).toBeEnabled();
@@ -775,6 +1030,7 @@ describe("ChatPane — chat view", () => {
 
     await user.keyboard("{Enter}");
     expect(mockChat).toHaveBeenCalledExactlyOnceWith(
+      TURN_ID,
       "ask on enter",
       [],
       expect.any(Function),
@@ -834,6 +1090,244 @@ describe("ChatPane — composer reasoning toggle", () => {
     expect(toggle).toHaveAttribute("aria-pressed", "true");
     expect(toggle).toBeEnabled();
     await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(1));
+  });
+
+  it("merges an in-flight same-model support verdict without undoing a newer reasoning mutation", async () => {
+    const probe = deferred<AiStatus>();
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    mockRefreshSupport.mockReturnValue(probe.promise);
+    mockSetReasoning.mockResolvedValue(
+      openRouterActive(DEFAULT_MODEL, { reasoning: true }),
+    );
+    const { user } = setup();
+
+    const toggle = await findChip();
+    await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(1));
+    await user.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+
+    await act(async () => {
+      probe.resolve(
+        openRouterActive(DEFAULT_MODEL, {
+          reasoning: false,
+          reasoningSupported: "unsupported",
+        }),
+      );
+      await probe.promise;
+    });
+
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(toggle).toHaveAttribute("aria-disabled", "true");
+    expect(
+      screen.getByRole("button", { name: /choose ai model.*claude-sonnet-4\.5/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("surfaces an in-flight same-model support-probe failure after a reasoning mutation", async () => {
+    const probe = deferred<AiStatus>();
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    mockRefreshSupport.mockReturnValue(probe.promise);
+    mockSetReasoning.mockResolvedValue(
+      openRouterActive(DEFAULT_MODEL, { reasoning: true }),
+    );
+    const { user } = setup();
+
+    const toggle = await findChip();
+    await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(1));
+    await user.click(toggle);
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+
+    await act(async () => {
+      probe.reject({ kind: "llm", message: "same-model probe failed" });
+      await probe.promise.catch(() => undefined);
+    });
+
+    expect(reportError).toHaveBeenCalledWith("same-model probe failed");
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(toggle).not.toHaveAttribute("aria-disabled");
+  });
+
+  it("does not let a later same-model mutation downgrade a completed support verdict", async () => {
+    const probe = deferred<AiStatus>();
+    const mutation = deferred<AiStatus>();
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    mockRefreshSupport.mockReturnValue(probe.promise);
+    mockSetReasoning.mockReturnValue(mutation.promise);
+    const { user } = setup();
+
+    const toggle = await findChip();
+    await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(1));
+    await user.click(toggle);
+    await waitFor(() => expect(mockSetReasoning).toHaveBeenCalledExactlyOnceWith(true));
+
+    await act(async () => {
+      probe.resolve(
+        openRouterActive(DEFAULT_MODEL, { reasoningSupported: "unsupported" }),
+      );
+      await probe.promise;
+    });
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "true"));
+
+    await act(async () => {
+      mutation.resolve(openRouterActive(DEFAULT_MODEL, { reasoning: true }));
+      await mutation.promise;
+    });
+
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+    expect(toggle).toHaveAttribute("aria-disabled", "true");
+  });
+
+  it("rejects a completed stale probe after the selected model changes", async () => {
+    const staleProbe = deferred<AiStatus>();
+    const selectedModel = "acme/new-model";
+    mockAiStatus.mockResolvedValue(openRouterActive(DEFAULT_MODEL));
+    mockRefreshSupport
+      .mockReturnValueOnce(staleProbe.promise)
+      .mockResolvedValueOnce(openRouterActive(selectedModel));
+    vi.mocked(api.openRouterModelMenu).mockResolvedValue({
+      models: [{
+        id: selectedModel,
+        name: "New model",
+        contextLength: 128_000,
+        rank: 1,
+      }],
+      asOf: "2026-07-13",
+      selectedModel: DEFAULT_MODEL,
+      pinnedSelectedModel: DEFAULT_MODEL,
+    });
+    vi.mocked(api.selectOpenRouterModel).mockResolvedValue(
+      openRouterActive(selectedModel),
+    );
+    const { user } = setup();
+
+    await findChip();
+    await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: /choose ai model/i }));
+    await user.click(await screen.findByRole("menuitemradio", { name: /new model/i }));
+    await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      staleProbe.resolve(
+        openRouterActive(DEFAULT_MODEL, { reasoningSupported: "unsupported" }),
+      );
+      await staleProbe.promise;
+    });
+
+    expect(
+      screen.getByRole("button", { name: /choose ai model.*new-model/i }),
+    ).toBeInTheDocument();
+    expect(chip()).not.toHaveAttribute("aria-disabled");
+  });
+
+  it("ignores a stale support-probe failure after the selected model changes", async () => {
+    const staleProbe = deferred<AiStatus>();
+    const selectedModel = "acme/new-model";
+    mockAiStatus.mockResolvedValue(openRouterActive(DEFAULT_MODEL));
+    mockRefreshSupport
+      .mockReturnValueOnce(staleProbe.promise)
+      .mockResolvedValueOnce(openRouterActive(selectedModel));
+    vi.mocked(api.openRouterModelMenu).mockResolvedValue({
+      models: [{
+        id: selectedModel,
+        name: "New model",
+        contextLength: 128_000,
+        rank: 1,
+      }],
+      asOf: "2026-07-13",
+      selectedModel: DEFAULT_MODEL,
+      pinnedSelectedModel: DEFAULT_MODEL,
+    });
+    vi.mocked(api.selectOpenRouterModel).mockResolvedValue(
+      openRouterActive(selectedModel),
+    );
+    const { user } = setup();
+
+    await findChip();
+    await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: /choose ai model/i }));
+    await user.click(await screen.findByRole("menuitemradio", { name: /new model/i }));
+    await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(2));
+
+    await act(async () => {
+      staleProbe.reject({ kind: "llm", message: "old model probe failed" });
+      await staleProbe.promise.catch(() => undefined);
+    });
+
+    expect(reportError).not.toHaveBeenCalledWith("old model probe failed");
+    expect(
+      screen.getByRole("button", { name: /choose ai model.*new-model/i }),
+    ).toBeInTheDocument();
+  });
+
+  it("keeps an in-flight support probe owned across a successful same-model refresh", async () => {
+    const probe = deferred<AiStatus>();
+    const refresh = deferred<AiStatus>();
+    mockAiStatus
+      .mockResolvedValueOnce(openRouterActive())
+      .mockReturnValueOnce(refresh.promise);
+    mockRefreshSupport.mockReturnValue(probe.promise);
+    const { openNoteAt, onOpenSettings, view } = setup(0);
+
+    const toggle = await findChip();
+    await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(1));
+    view.rerender(
+      <ChatPane
+        openNoteAt={openNoteAt}
+        onOpenSettings={onOpenSettings}
+        refreshSignal={1}
+      />,
+    );
+    await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      refresh.resolve(openRouterActive());
+      await refresh.promise;
+    });
+
+    await act(async () => {
+      probe.resolve(
+        openRouterActive(DEFAULT_MODEL, { reasoningSupported: "unsupported" }),
+      );
+      await probe.promise;
+    });
+
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "true"));
+  });
+
+  it("keeps an in-flight support probe owned across a failed same-model refresh", async () => {
+    const probe = deferred<AiStatus>();
+    const refresh = deferred<AiStatus>();
+    mockAiStatus
+      .mockResolvedValueOnce(openRouterActive())
+      .mockReturnValueOnce(refresh.promise);
+    mockRefreshSupport.mockReturnValue(probe.promise);
+    const { openNoteAt, onOpenSettings, view } = setup(0);
+
+    const toggle = await findChip();
+    await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(1));
+    view.rerender(
+      <ChatPane
+        openNoteAt={openNoteAt}
+        onOpenSettings={onOpenSettings}
+        refreshSignal={1}
+      />,
+    );
+    await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));
+    await act(async () => {
+      refresh.reject({ kind: "io", message: "status refresh failed" });
+      await refresh.promise.catch(() => undefined);
+    });
+    await waitFor(() =>
+      expect(reportError).toHaveBeenCalledWith("status refresh failed"),
+    );
+
+    await act(async () => {
+      probe.resolve(
+        openRouterActive(DEFAULT_MODEL, { reasoningSupported: "unsupported" }),
+      );
+      await probe.promise;
+    });
+
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-disabled", "true"));
   });
 
   it("marks the toggle inert and shows the why — visibly — when the probe verified no support", async () => {
@@ -1018,9 +1512,9 @@ describe("ChatPane — reasoning backstop notice", () => {
     const { user } = setup();
     await screen.findByLabelText("Ask across your vault");
 
-    const gate = deferred<void>();
+    const gate = deferred<string>();
     let emit!: (ev: ChatEvent) => void;
-    mockChat.mockImplementation((_p, _h, onEvent) => {
+    mockChat.mockImplementation((_turnId, _p, _h, onEvent) => {
       emit = onEvent;
       return gate.promise; // stays in-flight while the user flips the toggle
     });
@@ -1041,7 +1535,7 @@ describe("ChatPane — reasoning backstop notice", () => {
     await act(async () => {
       emit({ type: "answer", delta: "an answer" });
       emit({ type: "done" });
-      gate.resolve();
+      gate.resolve(TURN_ID);
       await gate.promise;
     });
     expect(screen.queryByText(BACKSTOP)).not.toBeInTheDocument();

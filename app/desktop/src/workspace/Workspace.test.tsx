@@ -1,9 +1,12 @@
+// @vitest-environment jsdom
+
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { MENU_ACTION } from "../lib/bindings/events";
+import type { MenuAction } from "../lib/api";
 import type { TreeNode } from "../lib/types";
 import type { OpenNote } from "./useOpenNote";
 import type { NoteTab, NoteTabsController } from "./useNoteTabs";
@@ -205,6 +208,9 @@ function makeOpen(over: Partial<OpenNote> = {}): OpenNote {
     loading: false,
     error: null,
     mode: "read",
+    richDocument: null,
+    richBody: "",
+    richError: null,
     draft: "",
     dirty: false,
     saving: false,
@@ -216,6 +222,11 @@ function makeOpen(over: Partial<OpenNote> = {}): OpenNote {
     repath: vi.fn(),
     setMode: vi.fn(),
     setDraft: vi.fn(),
+    setRichDocument: vi.fn(),
+    setRichError: vi.fn(),
+    setRichBody: vi.fn(),
+    undoRich: vi.fn(),
+    redoRich: vi.fn(),
     save: vi.fn(),
     clear: vi.fn(),
     ...over,
@@ -233,6 +244,11 @@ function makeTabs(over: Partial<NoteTabsController> = {}): NoteTabsController {
           loading: active.loading,
           error: active.error,
           mode: active.mode,
+          richDocument: active.richDocument,
+          richBody: active.richBody,
+          richError: active.richError,
+          richPast: [],
+          richFuture: [],
           draft: active.draft,
           dirty: active.dirty,
           saving: active.saving,
@@ -292,6 +308,11 @@ function makeTab(path: string, over: Partial<NoteTab> = {}): NoteTab {
     loading: false,
     error: null,
     mode: "read",
+    richDocument: null,
+    richBody: "",
+    richError: null,
+    richPast: [],
+    richFuture: [],
     draft: "body",
     dirty: false,
     saving: false,
@@ -339,7 +360,7 @@ beforeEach(() => {
   win.onCloseRequested.mockClear();
   openState.current = makeOpen();
   tabsState.current = makeTabs();
-  localStorage.clear();
+  globalThis.localStorage?.clear();
 });
 
 afterEach(() => {
@@ -847,7 +868,7 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     expect(openState.current.save).not.toHaveBeenCalled();
   });
 
-  it("the toggle-mode action flips a text note between read and edit", () => {
+  it("ignores the retired toggle-mode action because notes are always editable", () => {
     openState.current = makeOpen({
       path: "/v/a.md",
       note: { binary: false } as unknown as OpenNote["note"],
@@ -856,11 +877,11 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
 
-    fireMenu({ action: "toggle-mode" });
-    expect(openState.current.setMode).toHaveBeenCalledWith("edit");
+    fireMenu({ action: "toggle-mode" as MenuAction });
+    expect(openState.current.setMode).not.toHaveBeenCalled();
   });
 
-  it("tells the native menu to enable Format only while editing a text note", async () => {
+  it("tells the native menu to enable Format whenever a text note is open", async () => {
     mockUseVault.mockReturnValue(vaultCtx());
     // Read mode (no note): Format disabled.
     openState.current = makeOpen();
@@ -869,19 +890,19 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
       expect(mockInvoke).toHaveBeenCalledWith("set_menu_editing", { editing: false }),
     );
 
-    // A text note open in edit mode: Format enabled.
+    // A text note is editable in place without a separate mode: Format enabled.
     mockInvoke.mockClear();
     openState.current = makeOpen({
       path: "/v/a.md",
       note: { binary: false } as unknown as OpenNote["note"],
-      mode: "edit",
+      mode: "read",
     });
     rerender(<Workspace />);
     await waitFor(() =>
       expect(mockInvoke).toHaveBeenCalledWith("set_menu_editing", { editing: true }),
     );
 
-    // A binary attachment in edit mode has no editable text: Format stays disabled.
+    // A binary attachment has no editable text: Format stays disabled.
     mockInvoke.mockClear();
     openState.current = makeOpen({
       path: "/v/img.png",

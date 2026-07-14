@@ -5,7 +5,7 @@
 // Every failure lands inline next to the thing that failed — never a silent
 // blank.
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AlertTriangle, Loader2 } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
@@ -75,13 +75,27 @@ export function AiSettingsPage() {
   /** One provider switch in flight at a time — shared so both cards' activate
    *  buttons disable together. */
   const [switching, setSwitching] = useState(false);
+  const statusGeneration = useRef(0);
+
+  const applyStatus = useCallback((next: AiStatus) => {
+    statusGeneration.current += 1;
+    setStatus(next);
+    setStatusError(null);
+  }, []);
 
   const refreshStatus = useCallback(async () => {
+    const generation = statusGeneration.current + 1;
+    statusGeneration.current = generation;
     try {
-      setStatus(await api.aiStatus());
-      setStatusError(null);
+      const next = await api.aiStatus();
+      if (statusGeneration.current === generation) {
+        setStatus(next);
+        setStatusError(null);
+      }
     } catch (e) {
-      setStatusError(errorMessage(e));
+      if (statusGeneration.current === generation) {
+        setStatusError(errorMessage(e));
+      }
     }
   }, []);
 
@@ -90,13 +104,17 @@ export function AiSettingsPage() {
   // same way.)
   useEffect(() => {
     let cancelled = false;
+    const generation = statusGeneration.current + 1;
+    statusGeneration.current = generation;
     void api
       .aiStatus()
       .then((s) => {
-        if (!cancelled) setStatus(s);
+        if (!cancelled && statusGeneration.current === generation) setStatus(s);
       })
       .catch((e: unknown) => {
-        if (!cancelled) setStatusError(errorMessage(e));
+        if (!cancelled && statusGeneration.current === generation) {
+          setStatusError(errorMessage(e));
+        }
       });
     return () => {
       cancelled = true;
@@ -112,15 +130,15 @@ export function AiSettingsPage() {
       try {
         // Keep the no-tag call unary — an explicit `undefined` tag is not the
         // same invoke payload as an absent one.
-        await (tag === undefined
+        const next = await (tag === undefined
           ? api.setActiveProvider(provider)
           : api.setActiveProvider(provider, tag));
-        await refreshStatus();
+        applyStatus(next);
       } finally {
         setSwitching(false);
       }
     },
-    [refreshStatus],
+    [applyStatus],
   );
 
   return (
@@ -145,7 +163,7 @@ export function AiSettingsPage() {
         switching={switching}
         onActivate={() => switchProvider("openRouter")}
         refreshStatus={refreshStatus}
-        applyStatus={setStatus}
+        applyStatus={applyStatus}
       />
 
       <LocalAiCard

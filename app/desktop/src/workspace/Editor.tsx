@@ -5,11 +5,9 @@
 // The textarea is *uncontrolled* (`defaultValue` + onChange) so a multi-MB note
 // doesn't pay an O(size) controlled re-render on every keystroke; dirty/draft
 // state is still tracked via onChange. `defaultValue` seeds the buffer on mount
-// and is enough because every disk-content swap that should replace the buffer
-// (opening another note, reloading from disk) drops to read mode in useOpenNote,
-// which unmounts this editor — so the next edit-mode mount re-seeds from the
-// fresh draft. Save/overwrite keep it mounted, but the buffer already holds the
-// saved bytes, so no re-seed is needed and the cursor stays put.
+// and is enough because NotePane keys this editor by note path: changing notes
+// remounts and re-seeds the DOM buffer, while ordinary draft/save updates keep
+// it mounted so the cursor stays put.
 //
 // `[[` autocomplete: when the caret sits after an unclosed `[[`, a suggestion
 // popup lists the vault's note names (from `noteIndex`), filtered by the typed
@@ -139,6 +137,16 @@ interface EditorProps {
   reportError?: (message: string) => void;
 }
 
+function releaseMenuListener(unlisten: UnlistenFn) {
+  try {
+    void Promise.resolve(unlisten()).catch((error: unknown) => {
+      console.warn("failed to unsubscribe from format actions:", error);
+    });
+  } catch (error) {
+    console.warn("failed to unsubscribe from format actions:", error);
+  }
+}
+
 export function Editor({
   value,
   onChange,
@@ -179,7 +187,7 @@ export function Editor({
         ta.focus();
       })
       .then((fn) => {
-        if (cancelled) fn();
+        if (cancelled) releaseMenuListener(fn);
         else unlisten = fn;
       })
       // A failed listen leaves every Format menu item silently dead — surface
@@ -193,7 +201,7 @@ export function Editor({
       });
     return () => {
       cancelled = true;
-      unlisten?.();
+      if (unlisten) releaseMenuListener(unlisten);
     };
   }, [onChange, reportError]);
 
@@ -348,7 +356,7 @@ export function Editor({
         aria-autocomplete="list"
         aria-controls={open ? "nn-wikilink-listbox" : undefined}
         aria-activedescendant={open ? `nn-wikilink-option-${active}` : undefined}
-        className="nn-mono min-h-0 flex-1 resize-none bg-background px-6 py-6 text-[0.8125rem] leading-6 text-foreground/90 outline-none placeholder:text-muted-foreground/60"
+        className="nn-mono min-h-0 flex-1 resize-none rounded-sm bg-background px-6 py-6 text-[0.8125rem] leading-6 text-foreground/90 outline-none placeholder:text-muted-foreground/60 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background"
         placeholder="Write in Markdown…"
       />
 
@@ -357,7 +365,7 @@ export function Editor({
           className="absolute z-30 w-72 overflow-hidden rounded-lg border border-border bg-popover shadow-xl"
           style={{ left: ac.left, top: ac.top }}
         >
-          <ul // NOSONAR(S6819): correct ARIA combobox pattern — DOM focus stays in the textarea, which drives this popup via aria-activedescendant; a native <select> can't provide an inline caret-anchored autocomplete
+          <ul // NOSONAR(S6819): DOM focus stays in the native multiline textbox, which drives this caret-anchored autocomplete popup via aria-activedescendant
             ref={listRef}
             role="listbox"
             id="nn-wikilink-listbox"
@@ -365,7 +373,7 @@ export function Editor({
             className="max-h-56 overflow-y-auto p-1"
           >
             {suggestions.map((s, i) => (
-              // The textarea keeps DOM focus (combobox pattern); the option is
+              // The textarea keeps DOM focus; the option is
               // "focused" via aria-activedescendant, so no tabindex here. The
               // row's mousedown is swallowed (not the whole popup's — the list
               // scrollbar must stay draggable) so focus never leaves the

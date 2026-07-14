@@ -75,17 +75,20 @@ function cleanWikilinkTarget(target: string): string {
   return normSep(target.split(/[#|]/)[0]?.trim() ?? "");
 }
 
-function normalizeMarkdownHref(href: string): string | null {
+function normalizeMarkdownHref(href: string, sourceRelPath: string): string | null {
   const target = normSep(href).trim().split("#")[0] ?? "";
   if (target === "" || target.startsWith("/") || URL_SCHEME_RE.test(target)) {
     return null;
   }
-  const segs: string[] = [];
+  const segs = normSep(sourceRelPath).split("/");
+  segs.pop();
   for (const part of target.replaceAll("%20", " ").split("/")) {
     if (part === "" || part === ".") continue;
     if (part === "..") {
-      if (segs.length === 0) return null;
-      segs.pop();
+      // Rich-edit admission deliberately rejects every parent segment. Keep
+      // navigation equally strict even where core graph resolution can prove
+      // a parent link remains inside the vault.
+      return null;
     } else {
       segs.push(part);
     }
@@ -142,8 +145,9 @@ export function resolveWikilink(
 export function resolveMarkdownLink(
   href: string,
   index: NoteIndexEntry[],
+  sourceRelPath = "",
 ): string | null {
-  const cand = normalizeMarkdownHref(href);
+  const cand = normalizeMarkdownHref(href, sourceRelPath);
   if (cand === null) return null;
   return resolveMdRel(cand, byRel(index));
 }

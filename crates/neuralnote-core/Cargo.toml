@@ -1,6 +1,6 @@
 [package]
 name = "neuralnote-core"
-version = "0.1.1"
+version = "0.2.0"
 edition = "2021"
 license = "AGPL-3.0-or-later"
 description = "Client-agnostic vault domain for NeuralNote: tree scan, markdown + YAML frontmatter, file/folder CRUD, recent vaults, and path safety. No client/UI dependency."

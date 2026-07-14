@@ -653,11 +653,6 @@ export function Workspace() {
           case "save":
             if (o.note && o.dirty && !o.saving) void o.save();
             break;
-          case "toggle-mode":
-            if (o.note && !o.note.binary) {
-              o.setMode(o.mode === "edit" ? "read" : "edit");
-            }
-            break;
           case "close-tab": {
             const tabId = noteTabsRef.current.activeTabId;
             if (tabId) {
@@ -734,11 +729,9 @@ export function Workspace() {
     toggleNavigation,
   ]);
 
-  // Keep the native Format menu honest: those items act on the editor's textarea,
-  // which is mounted only when a text note is open in edit mode. Push that fact to
-  // Rust so it enables Format only then. Best-effort — the enabled state is
-  // cosmetic, and Rust skips the rebuild when the flag is unchanged.
-  const editing = !!open.note && !open.note.binary && open.mode === "edit";
+  // Every compatible text note is directly editable. Keep Format enabled while
+  // a text note is open; the focused rich/raw editor still owns the command.
+  const editing = !!open.note && !open.note.binary;
   useEffect(() => {
     void api
       .setMenuEditing(editing)

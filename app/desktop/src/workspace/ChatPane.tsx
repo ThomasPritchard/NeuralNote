@@ -13,6 +13,7 @@ import {
   useRef,
   useState,
   type KeyboardEvent,
+  type RefObject,
 } from "react";
 import {
   AlertTriangle,
@@ -35,7 +36,8 @@ import { ChatMessages } from "./ChatMessages";
 import { ChatModelMenu } from "./ChatModelMenu";
 import {
   emptyAssistant,
-  reduceAssistant,
+  markAssistantStopped,
+  reduceAssistantForTurn,
   toHistory,
   userMessage,
   type ChatMessage,
@@ -188,6 +190,19 @@ function reasoningProbeTarget(status: AiStatus | null): string | null {
   return null;
 }
 
+/** A same-model status echo owns provider/config fields, but an `unknown`
+ * capability must not erase a support verdict already returned by the probe. */
+function mergeStatusRead(current: AiStatus | null, next: AiStatus): AiStatus {
+  if (
+    current !== null &&
+    reasoningProbeTarget(current) === reasoningProbeTarget(next) &&
+    next.reasoningSupported === "unknown"
+  ) {
+    return { ...next, reasoningSupported: current.reasoningSupported };
+  }
+  return next;
+}
+
 /** Header connection pill. The active model now belongs at the point of send
  *  in the composer, leaving only the disconnected state in the header. */
 function ChatStatusPill({ view }: Readonly<{ view: View }>) {
@@ -202,23 +217,25 @@ function ChatStatusPill({ view }: Readonly<{ view: View }>) {
 }
 
 function ComposerActionButton({
+  buttonRef,
   busy,
-  cancelling,
+  stopping,
   inputEmpty,
   onSend,
   onCancel,
 }: Readonly<{
+  buttonRef: RefObject<HTMLButtonElement | null>;
   busy: boolean;
-  cancelling: boolean;
+  stopping: boolean;
   inputEmpty: boolean;
   onSend: () => void;
   onCancel: () => void;
 }>) {
-  const label = busy ? "Cancel run" : "Send";
-  const disabled = busy ? cancelling : inputEmpty;
+  const label = busy ? (stopping ? "Stopping" : "Stop response") : "Send";
+  const disabled = busy ? stopping : inputEmpty;
   let icon = <Send className="size-4" aria-hidden />;
   if (busy) {
-    icon = cancelling ? (
+    icon = stopping ? (
       <Loader2 className="size-4 animate-spin motion-reduce:animate-none" aria-hidden />
     ) : (
       <Square className="size-3.5 fill-current" aria-hidden />
@@ -227,6 +244,7 @@ function ComposerActionButton({
 
   return (
     <button
+      ref={buttonRef}
       type="button"
       onClick={busy ? onCancel : onSend}
       disabled={disabled}
@@ -271,7 +289,10 @@ export function ChatPane({
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  const [cancelling, setCancelling] = useState(false);
+  const [stoppingTurnId, setStoppingTurnId] = useState<string | null>(null);
+  const [stopError, setStopError] = useState<string | null>(null);
+  const [liveAnnouncement, setLiveAnnouncement] = useState("");
+  const activeTurnIdRef = useRef<string | null>(null);
   const reasoningReasonId = useId();
 
   // ── Skills: the chip row + the composer's `@` picker ────────────────────────
@@ -301,7 +322,23 @@ export function ChatPane({
   // another character re-derives the key and the popup may reopen.
   const [dismissedKey, setDismissedKey] = useState<string | null>(null);
   const composerRef = useRef<HTMLTextAreaElement>(null);
+  const composerActionRef = useRef<HTMLButtonElement>(null);
+  const composerRunOwnsFocusRef = useRef(false);
+  const previousBusyRef = useRef(false);
   const pendingCaretRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    if (busy === previousBusyRef.current) return;
+
+    if (busy && composerRunOwnsFocusRef.current) {
+      composerActionRef.current?.focus();
+    } else if (!busy && composerRunOwnsFocusRef.current) {
+      composerRunOwnsFocusRef.current = false;
+      composerRef.current?.focus();
+    }
+
+    previousBusyRef.current = busy;
+  }, [busy]);
 
   // Load the picker's catalogue. `refreshSignal` bumps when Settings closes,
   // so a skill toggled there is reflected without remounting the pane. A
@@ -373,40 +410,63 @@ export function ChatPane({
   // (and re-fetching) every time the user walks through the first-run states.
   const viewRef = useRef(view);
   viewRef.current = view;
+  const statusRef = useRef(status);
+  statusRef.current = status;
+  const statusGenerationRef = useRef(0);
+  const probeTargetGenerationRef = useRef(0);
 
-  /** Land on the view a provider-aware status implies. The `model` doubles as
-   *  the status-pill label: the OpenRouter model id, or the local model tag. */
-  const applyStatus = useCallback((next: AiStatus) => {
+  const commitStatus = useCallback((next: AiStatus) => {
     const destination = providerDestination(next);
+    if (
+      reasoningProbeTarget(statusRef.current) !== reasoningProbeTarget(next)
+    ) {
+      // Provider/model identity owns probe validity. Advancing only for a target
+      // change lets a same-model config mutation and its in-flight probe merge
+      // their disjoint fields, while still rejecting changed-target and ABA
+      // responses even before React has run the old effect's cleanup.
+      probeTargetGenerationRef.current += 1;
+    }
+    statusRef.current = next;
     setStatus(next);
     setModel(destination.model);
     setView(destination.view);
   }, []);
+
+  /** Land on the view a provider-aware status implies. The `model` doubles as
+   *  the status-pill label: the OpenRouter model id, or the local model tag.
+   *  Mutation echoes are authoritative, so applying one invalidates every
+   *  older status read that may still be crossing the IPC boundary. */
+  const applyStatus = useCallback((next: AiStatus) => {
+    statusGenerationRef.current += 1;
+    commitStatus(mergeStatusRead(statusRef.current, next));
+  }, [commitStatus]);
 
   // On mount (and whenever Settings closes), read the effective provider. A
   // failed check still lands on the first-run picker (never a raw error) but
   // is surfaced on the shared channel.
   useEffect(() => {
     let cancelled = false;
+    const generation = statusGenerationRef.current + 1;
+    statusGenerationRef.current = generation;
     api
       .aiStatus()
       .then((status) => {
-        if (cancelled) return;
+        if (cancelled || statusGenerationRef.current !== generation) return;
         // A later refresh that still reports "nothing configured" must not
         // stomp a manually-chosen first-run view (guided setup / skipped);
         // only the mount pass may land on the picker from scratch.
         if (status.activeProvider === null && viewRef.current !== "loading") return;
-        applyStatus(status);
+        commitStatus(mergeStatusRead(statusRef.current, status));
       })
       .catch((e) => {
-        if (cancelled) return;
+        if (cancelled || statusGenerationRef.current !== generation) return;
         reportError(errorMessage(e));
         if (viewRef.current === "loading") setView("picker");
       });
     return () => {
       cancelled = true;
     };
-  }, [applyStatus, reportError, refreshSignal]);
+  }, [commitStatus, reportError, refreshSignal]);
 
   // The provider+model this status would chat against — the string key that
   // makes the probe effect below re-fire exactly when the effective provider
@@ -420,18 +480,36 @@ export function ChatPane({
   useEffect(() => {
     if (probeTarget === null) return;
     let cancelled = false;
+    const targetGeneration = probeTargetGenerationRef.current;
+    const target = probeTarget;
     api
       .refreshReasoningSupport()
       .then((fresh) => {
-        if (!cancelled) applyStatus(fresh);
+        const current = statusRef.current;
+        if (
+          cancelled ||
+          probeTargetGenerationRef.current !== targetGeneration ||
+          reasoningProbeTarget(current) !== target ||
+          reasoningProbeTarget(fresh) !== target ||
+          current === null
+        ) return;
+        // The probe owns capability only. Preserve any same-target provider or
+        // reasoning state refreshed while its network request was in flight.
+        commitStatus({ ...current, reasoningSupported: fresh.reasoningSupported });
       })
       .catch((e) => {
-        if (!cancelled) reportError(errorMessage(e));
+        if (
+          !cancelled &&
+          probeTargetGenerationRef.current === targetGeneration &&
+          reasoningProbeTarget(statusRef.current) === target
+        ) {
+          reportError(errorMessage(e));
+        }
       });
     return () => {
       cancelled = true;
     };
-  }, [probeTarget, applyStatus, reportError]);
+  }, [probeTarget, commitStatus, reportError]);
 
   // The persisted opt-in + the probed capability — both straight from the
   // status echo (see `reasoningSupport.ts` for the fail-open rule).
@@ -469,67 +547,91 @@ export function ChatPane({
     }
   }, [savingReasoning, capability.disabled, reasoningOn, applyStatus]);
 
-  // Fold each streamed event into the in-flight (last) assistant turn.
-  const applyEvent = useCallback((event: ChatEvent) => {
-    setMessages((prev) => {
-      const last = prev.at(-1);
-      if (last?.role !== "assistant") return prev;
-      return [...prev.slice(0, -1), reduceAssistant(last, event)];
-    });
-  }, []);
-
   /** Run one chat turn. Shared by the composer and by a dormant elicitation's
    *  late answer (which is an ordinary turn by design — spec §3.4). */
   const sendPrompt = useCallback(
     (prompt: string) => {
       if (prompt === "" || busy) return;
+      const turnId = crypto.randomUUID();
       const history = toHistory(messagesRef.current);
       // Where the assistant turn is about to land — the run id resolved below
       // is keyed to it so the report card's Undo targets the right run.
       const assistantIndex = messagesRef.current.length + 1;
+      activeTurnIdRef.current = turnId;
       setBusy(true);
+      setStopError(null);
+      setLiveAnnouncement("");
       // Pin the live reasoning opt-in onto the turn at creation: the finished
       // turn is judged (the backstop notice) against the opt-in it actually ran
       // under, not a flag the user may have flipped mid-stream.
       setMessages((prev) => [
         ...prev,
         userMessage(prompt),
-        emptyAssistant(effectiveReasoning),
+        emptyAssistant(effectiveReasoning, turnId),
       ]);
+      const applyTurnEvent = (event: ChatEvent) => {
+        setMessages((prev) => reduceAssistantForTurn(prev, turnId, event));
+      };
       // A transport-level rejection is surfaced as an inline error event, so a
       // failed run is never silent and the composer always re-enables.
       void api
-        .chat(prompt, history, applyEvent, activeSkills.map((s) => s.id))
+        .chat(turnId, prompt, history, applyTurnEvent, activeSkills.map((s) => s.id))
         .then((runId) => {
-          // Guarded: a rejected run has no id, and Undo without one is a lie.
-          if (typeof runId === "string" && runId !== "") {
+          // The caller UUID is the sole run identity. A mismatched native echo
+          // never receives an Undo handle.
+          if (runId === turnId) {
             setRunIds((prev) => ({ ...prev, [assistantIndex]: runId }));
           }
         })
-        .catch((e) => applyEvent({ type: "error", message: errorMessage(e) }))
-        .finally(() => setBusy(false));
+        .catch((e) => applyTurnEvent({ type: "error", message: errorMessage(e) }))
+        .finally(() => {
+          if (activeTurnIdRef.current === turnId) {
+            activeTurnIdRef.current = null;
+            setBusy(false);
+          }
+          setStoppingTurnId((current) => (current === turnId ? null : current));
+        });
     },
-    [busy, effectiveReasoning, applyEvent, activeSkills],
+    [busy, effectiveReasoning, activeSkills],
   );
 
   const send = useCallback(() => {
     const prompt = input.trim();
     if (prompt === "" || busy) return;
+    composerRunOwnsFocusRef.current = true;
     setInput("");
     sendPrompt(prompt);
   }, [input, busy, sendPrompt]);
 
   const cancelRun = useCallback(async () => {
-    if (!busy || cancelling) return;
-    setCancelling(true);
+    const turnId = activeTurnIdRef.current;
+    if (!busy || turnId === null || stoppingTurnId === turnId) return;
+    setStoppingTurnId(turnId);
+    setStopError(null);
     try {
-      await api.cancelChatRun();
-    } catch (error) {
-      reportError(errorMessage(error));
-    } finally {
-      setCancelling(false);
+      const outcome = await api.cancelChatRun(turnId);
+      if (activeTurnIdRef.current !== turnId) return;
+      if (outcome.turnId !== turnId) {
+        setStopError("Couldn't stop the response");
+        setStoppingTurnId(null);
+        return;
+      }
+      if (outcome.status === "cancelled") {
+        // TODO(done-cancel-announcement): announce stopped only when
+        // markAssistantStopped actually transitions this turn; Done must keep
+        // its completed announcement if native guard cleanup is still pending.
+        setMessages((prev) => markAssistantStopped(prev, turnId));
+        setLiveAnnouncement("Response stopped.");
+      } else {
+        setStoppingTurnId(null);
+      }
+    } catch {
+      if (activeTurnIdRef.current === turnId) {
+        setStopError("Couldn't stop the response");
+        setStoppingTurnId(null);
+      }
     }
-  }, [busy, cancelling, reportError]);
+  }, [busy, stoppingTurnId]);
 
   /** Swap the typed `@query` for a chip; the picker and the chips both feed
    *  the same `activeSkills` field on the next send. */
@@ -558,7 +660,14 @@ export function ChatPane({
         await api.saveApiKey(key, chosenModel);
         // Re-read the effective provider: a fresh key with no explicit choice
         // reads as "openRouter", which lands the pane in the chat view.
-        applyStatus(await api.aiStatus());
+        const generation = statusGenerationRef.current + 1;
+        statusGenerationRef.current = generation;
+        try {
+          const next = await api.aiStatus();
+          if (statusGenerationRef.current === generation) applyStatus(next);
+        } catch (error) {
+          if (statusGenerationRef.current === generation) throw error;
+        }
       } catch (e) {
         reportError(errorMessage(e));
       } finally {
@@ -629,6 +738,9 @@ export function ChatPane({
 
   return (
     <aside className="nn-chat-pane relative flex shrink-0 flex-col border-l border-border bg-sidebar">
+      <p aria-live="polite" aria-atomic="true" className="sr-only">
+        {liveAnnouncement}
+      </p>
       <header className="shrink-0 border-b border-border px-5 py-3.5">
         <div className="flex min-w-0 items-center gap-2.5">
           <span className="grid size-7 place-items-center rounded-lg border border-primary/25 bg-primary/12 text-primary">
@@ -729,6 +841,15 @@ export function ChatPane({
           </div>
 
           <div className="shrink-0 border-t border-border px-4 pb-3 pt-3">
+            {stopError && (
+              <p
+                role="alert"
+                className="mb-2 flex items-start gap-1.5 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-1.5 text-[0.6875rem] leading-snug text-destructive"
+              >
+                <AlertTriangle className="mt-px size-3 shrink-0" aria-hidden />
+                {stopError}
+              </p>
+            )}
             {reasoningError && (
               // The pane's error voice (mirrors the turn error box), announced:
               // a toggle that silently failed to persist would misbill the user.
@@ -751,7 +872,7 @@ export function ChatPane({
                   onHover={setPickerIndex}
                 />
               )}
-              <div className="flex items-end gap-2 rounded-xl bg-background/40 p-2 ring-1 ring-inset ring-border transition focus-within:bg-background/60 focus-within:ring-primary/40">
+              <div className="flex items-end gap-2 rounded-xl bg-background/40 p-2 ring-1 ring-inset ring-border transition focus-within:bg-background/60 focus-within:ring-2 focus-within:ring-ring">
               <textarea
                 ref={composerRef}
                 rows={1}
@@ -782,8 +903,12 @@ export function ChatPane({
                 className="max-h-32 flex-1 resize-none bg-transparent px-2 py-1.5 text-[0.8125rem] leading-5 placeholder:text-muted-foreground/70 focus:outline-none disabled:cursor-not-allowed disabled:opacity-60"
               />
               <ComposerActionButton
+                buttonRef={composerActionRef}
                 busy={busy}
-                cancelling={cancelling}
+                stopping={
+                  activeTurnIdRef.current !== null &&
+                  stoppingTurnId === activeTurnIdRef.current
+                }
                 inputEmpty={input.trim() === ""}
                 onSend={send}
                 onCancel={() => void cancelRun()}

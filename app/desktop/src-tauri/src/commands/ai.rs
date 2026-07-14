@@ -8,14 +8,38 @@
 
 use std::path::{Path, PathBuf};
 
-use neuralnote_core::{ai::ReasoningSupport, CoreError};
+use neuralnote_core::{
+    ai::{ProviderKind, ReasoningProbeTarget, ReasoningSupport},
+    CoreError,
+};
 use tauri::{AppHandle, Manager};
 use ts_rs::TS;
 
 use crate::{
-    ai, config_dir, local, lock_state, openrouter_catalogue, requirement_detection, skills,
+    ai, config_dir, local, lock_state, openrouter_catalogue,
+    provider_config_mutation::ProviderConfigMutationGate, requirement_detection, skills,
     SharedState,
 };
+
+fn provider_config_mutation_gate(state: &SharedState<'_>) -> ProviderConfigMutationGate {
+    provider_config_mutation_gate_from(&lock_state(state))
+}
+
+fn provider_config_mutation_gate_from(app_state: &crate::AppState) -> ProviderConfigMutationGate {
+    app_state.provider_config_mutations.clone()
+}
+
+fn openrouter_selection_context(
+    app_state: &crate::AppState,
+) -> (
+    std::collections::HashSet<String>,
+    ProviderConfigMutationGate,
+) {
+    (
+        app_state.openrouter_catalogue.offered_models(),
+        provider_config_mutation_gate_from(app_state),
+    )
+}
 
 #[tauri::command]
 pub(crate) fn api_key_status(app: AppHandle) -> Result<ai::ApiKeyStatus, CoreError> {
@@ -23,19 +47,26 @@ pub(crate) fn api_key_status(app: AppHandle) -> Result<ai::ApiKeyStatus, CoreErr
 }
 
 #[tauri::command]
-pub(crate) fn save_api_key(app: AppHandle, key: String, model: String) -> Result<(), CoreError> {
+pub(crate) fn save_api_key(
+    app: AppHandle,
+    state: SharedState<'_>,
+    key: String,
+    model: String,
+) -> Result<(), CoreError> {
     let model = model.trim();
     let model = if model.is_empty() {
         neuralnote_core::ai::DEFAULT_MODEL
     } else {
         model
     };
-    ai::save_api_key(&config_dir(&app)?, key.trim(), model)
+    let dir = config_dir(&app)?;
+    provider_config_mutation_gate(&state).run(&dir, || ai::save_api_key(&dir, key.trim(), model))
 }
 
 #[tauri::command]
-pub(crate) fn clear_api_key(app: AppHandle) -> Result<(), CoreError> {
-    ai::clear_api_key(&config_dir(&app)?)
+pub(crate) fn clear_api_key(app: AppHandle, state: SharedState<'_>) -> Result<(), CoreError> {
+    let dir = config_dir(&app)?;
+    provider_config_mutation_gate(&state).run(&dir, || ai::clear_api_key(&dir))
 }
 
 /// Provider-aware AI status for the settings UI and the chat pane's first-run
@@ -133,9 +164,16 @@ pub(crate) fn select_openrouter_model(
     state: SharedState<'_>,
     model: String,
 ) -> Result<AiStatus, CoreError> {
-    let offered = lock_state(&state).openrouter_catalogue.offered_models();
-    let config =
-        openrouter_catalogue::persist_selected_model(&config_dir(&app)?, &offered, &model)?;
+    let (offered, mutation_gate) = {
+        let app_state = lock_state(&state);
+        openrouter_selection_context(&app_state)
+    };
+    let config = openrouter_catalogue::persist_selected_model(
+        &config_dir(&app)?,
+        &mutation_gate,
+        &offered,
+        &model,
+    )?;
     Ok(build_ai_status(config))
 }
 
@@ -191,6 +229,7 @@ fn app_data_dir_or_warn(app: &AppHandle, purpose: &str) -> Option<PathBuf> {
 #[tauri::command]
 pub(crate) fn set_active_provider(
     app: AppHandle,
+    state: SharedState<'_>,
     provider: neuralnote_core::ai::ProviderKind,
     local_model_tag: Option<String>,
 ) -> Result<(), CoreError> {
@@ -205,12 +244,15 @@ pub(crate) fn set_active_provider(
         }
     }
     let dir = config_dir(&app)?;
-    let mut cfg = neuralnote_core::ai::read_provider_config(&dir)?;
-    cfg.active_provider = Some(provider);
-    if let Some(tag) = local_model_tag {
-        cfg.local_model_tag = Some(tag);
-    }
-    neuralnote_core::ai::write_provider_config(&dir, &cfg)
+    provider_config_mutation_gate(&state)
+        .update(&dir, move |cfg| {
+            cfg.active_provider = Some(provider);
+            if let Some(tag) = local_model_tag {
+                cfg.local_model_tag = Some(tag);
+            }
+            Ok(())
+        })
+        .map(|_| ())
 }
 
 /// Opt into (or out of) reasoning tokens on the answer turn. Persisted to the
@@ -223,11 +265,24 @@ pub(crate) fn set_active_provider(
 /// the config says "on", silently billing the user for reasoning they never consented
 /// to. Returning the state removes the window rather than detecting it.
 #[tauri::command]
-pub(crate) fn set_reasoning(app: AppHandle, enabled: bool) -> Result<AiStatus, CoreError> {
+pub(crate) fn set_reasoning(
+    app: AppHandle,
+    state: SharedState<'_>,
+    enabled: bool,
+) -> Result<AiStatus, CoreError> {
     let dir = config_dir(&app)?;
-    let mut cfg = neuralnote_core::ai::read_provider_config(&dir)?;
-    cfg.reasoning = enabled;
-    neuralnote_core::ai::write_provider_config(&dir, &cfg)?;
+    set_reasoning_in(&dir, &provider_config_mutation_gate(&state), enabled)
+}
+
+fn set_reasoning_in(
+    config_dir: &Path,
+    mutation_gate: &ProviderConfigMutationGate,
+    enabled: bool,
+) -> Result<AiStatus, CoreError> {
+    let cfg = mutation_gate.update(config_dir, |cfg| {
+        cfg.reasoning = enabled;
+        Ok(())
+    })?;
     Ok(build_ai_status(cfg))
 }
 
@@ -240,67 +295,76 @@ pub(crate) async fn refresh_reasoning_support(
     state: SharedState<'_>,
 ) -> Result<AiStatus, CoreError> {
     let dir = config_dir(&app)?;
-    let cfg = neuralnote_core::ai::read_provider_config(&dir)?;
+    let mutation_gate = provider_config_mutation_gate(&state);
+    let (cfg, target) = begin_reasoning_probe(&dir, &mutation_gate)?;
 
-    match probed_verdict(&app, &state, &cfg).await {
-        Some((support, model)) => persist_reasoning_verdict(&dir, support, model),
+    match target {
+        Some(target) => {
+            let support = probed_verdict(&app, &state, &target).await;
+            persist_reasoning_verdict(&dir, &mutation_gate, support, target)
+        }
         None => Ok(build_ai_status(cfg)),
     }
 }
 
-// TODO(config-write-serialization): the ai-config.json writers do read-modify-write
-// without a shared lock. `persist_reasoning_verdict` already narrows the blast radius —
-// it re-reads fresh and overwrites only the two capability fields, so the multi-second
-// probe window can't clobber a concurrent `set_reasoning` / `set_active_provider` /
-// `set_skill_enabled` / `save_api_key`. What remains is the sub-ms gap between each writer's
-// own read and write:
-// two writers landing in that window still lose one update. Acceptable while config writes
-// are rare and user-driven (you can't realistically race yourself across two settings
-// controls). Fix trigger: any writer that fires without direct user action (a background
-// re-probe, a sync loop) — then serialize all writers behind one async mutex.
+/// Allocate and persist probe ownership while holding the cross-process config
+/// gate. The returned guard is plain data; no lock survives into provider I/O.
+fn begin_reasoning_probe(
+    dir: &Path,
+    mutation_gate: &ProviderConfigMutationGate,
+) -> Result<
+    (
+        neuralnote_core::ai::ProviderConfig,
+        Option<ReasoningProbeTarget>,
+    ),
+    CoreError,
+> {
+    mutation_gate.run(dir, || {
+        let mut cfg = neuralnote_core::ai::read_provider_config(dir)?;
+        let target = cfg.start_reasoning_probe()?;
+        if target.is_some() {
+            neuralnote_core::ai::write_provider_config(dir, &cfg)?;
+        }
+        Ok((cfg, target))
+    })
+}
 
-/// Persist a freshly-probed reasoning verdict without clobbering config that the
-/// probe's multi-second window let another writer change. The probe can run for
-/// seconds (OpenRouter ~8s, an Ollama cold-start ~30s); during it a concurrent
-/// `set_reasoning` / `set_active_provider` / `set_skill_enabled` / `save_api_key` may land.
-/// Re-read fresh and overwrite ONLY the two capability fields, so those writes survive.
-/// Returns the persisted status so the caller renders exactly what reached disk.
+/// Persist a freshly-probed reasoning verdict only while its provider/model target
+/// is still selected. The probe can run for seconds (OpenRouter ~8s, an Ollama
+/// cold-start ~30s); during it another process may select and probe a newer target.
+/// Re-read under the cross-process mutation gate and leave that newer verdict intact.
 fn persist_reasoning_verdict(
     dir: &Path,
+    mutation_gate: &ProviderConfigMutationGate,
     support: ReasoningSupport,
-    probed_model: String,
+    target: ReasoningProbeTarget,
 ) -> Result<AiStatus, CoreError> {
-    let mut cfg = neuralnote_core::ai::read_provider_config(dir)?;
-    cfg.reasoning_support = Some(support);
-    cfg.reasoning_probed_model = Some(probed_model);
-    neuralnote_core::ai::write_provider_config(dir, &cfg)?;
-    Ok(build_ai_status(cfg))
+    mutation_gate.run(dir, || {
+        let mut cfg = neuralnote_core::ai::read_provider_config(dir)?;
+        if cfg.apply_reasoning_probe(&target, support) {
+            neuralnote_core::ai::write_provider_config(dir, &cfg)?;
+        }
+        Ok(build_ai_status(cfg))
+    })
 }
 
 async fn probed_verdict(
     app: &AppHandle,
     state: &SharedState<'_>,
-    cfg: &neuralnote_core::ai::ProviderConfig,
-) -> Option<(ReasoningSupport, String)> {
-    match cfg.effective_provider()? {
-        neuralnote_core::ai::ProviderKind::OpenRouter => Some((
-            ai::probe_openrouter_reasoning(&cfg.model).await,
-            cfg.model.clone(),
-        )),
-        neuralnote_core::ai::ProviderKind::Local => {
-            let tag = cfg.local_model_tag.clone()?;
-            let support = match local::ensure_ollama_started(app, state).await {
-                Ok(port) => local::probe_ollama_reasoning(port, &tag).await,
-                Err(e) => {
-                    log::warn!(
-                        "reasoning probe: local sidecar unavailable: {}",
-                        ai::error_detail(e)
-                    );
-                    ReasoningSupport::Unknown
-                }
-            };
-            Some((support, tag))
-        }
+    target: &ReasoningProbeTarget,
+) -> ReasoningSupport {
+    match target.provider {
+        ProviderKind::OpenRouter => ai::probe_openrouter_reasoning(&target.model).await,
+        ProviderKind::Local => match local::ensure_ollama_started(app, state).await {
+            Ok(port) => local::probe_ollama_reasoning(port, &target.model).await,
+            Err(e) => {
+                log::warn!(
+                    "reasoning probe: local sidecar unavailable: {}",
+                    ai::error_detail(e)
+                );
+                ReasoningSupport::Unknown
+            }
+        },
     }
 }
 
@@ -500,11 +564,13 @@ pub(crate) fn list_skills(
 #[tauri::command]
 pub(crate) fn set_skill_enabled(
     app: AppHandle,
+    state: SharedState<'_>,
     id: String,
     enabled: bool,
 ) -> Result<bool, CoreError> {
     let dir = config_dir(&app)?;
-    set_built_in_skill_enabled_in(&dir, &id, enabled)
+    provider_config_mutation_gate(&state)
+        .run(&dir, || set_built_in_skill_enabled_in(&dir, &id, enabled))
 }
 
 fn set_built_in_skill_enabled_in(
@@ -554,6 +620,7 @@ fn set_skill_enabled_in(
 pub(crate) async fn chat(
     app: AppHandle,
     state: SharedState<'_>,
+    turn_id: String,
     prompt: String,
     history: Vec<ai::ChatTurn>,
     active_skills: Vec<String>,
@@ -564,10 +631,19 @@ pub(crate) async fn chat(
         ProviderKind,
     };
 
-    let run_id = skills::next_chat_run_id();
     let close_signal = std::sync::Arc::new(ai::ChatRunCloseSignal::default());
     let mut sink =
         ai::TauriChannelSink::with_close_signal(on_event, std::sync::Arc::clone(&close_signal));
+    let turn_id = match parse_chat_turn_id(&turn_id) {
+        Ok(turn_id) => turn_id,
+        Err(error) => {
+            sink.send(ChatEvent::Error {
+                message: format!("Couldn't start chat: {error}"),
+            });
+            return Ok(turn_id);
+        }
+    };
+    let run_id = turn_id.to_string();
     // Root and lifecycle generation are one AppState snapshot. Vault mutations
     // take the same outer lock while incrementing the pending registry's
     // generation, so a command paused before registration can never bind itself
@@ -593,7 +669,7 @@ pub(crate) async fn chat(
     };
     let _elicitation_cleanup = match skills::RunElicitationGuard::try_new(
         std::sync::Arc::clone(&pending),
-        run_id.clone(),
+        turn_id,
         std::sync::Arc::clone(&close_signal),
         lifecycle_generation,
     ) {
@@ -702,6 +778,12 @@ pub(crate) async fn chat(
     // untouched). The provider-independent inputs travel together as one `ChatRun`;
     // run_chat emits its own Done/Error, and a returned Err (defensive) is surfaced
     // as a final Error so a failure is never silent.
+    let cancellation_observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut causal_sink = CausalRunEventSink::new(
+        &mut sink,
+        std::sync::Arc::clone(&close_signal),
+        std::sync::Arc::clone(&cancellation_observed),
+    );
     let mut run = ChatRun {
         prompt: &prompt,
         history: &history,
@@ -717,8 +799,9 @@ pub(crate) async fn chat(
         youtube_requirements,
         capture_cancellation,
         extractor_updates: youtube_host.extractor_updates(),
-        sink: &mut sink,
+        sink: &mut causal_sink,
         close_signal: &close_signal,
+        cancellation_observed,
     };
     let ledger = match cfg.effective_provider() {
         None => {
@@ -752,12 +835,24 @@ pub(crate) async fn chat(
 }
 
 #[tauri::command]
-pub(crate) fn cancel_chat_run(state: SharedState<'_>) -> Result<(), String> {
+pub(crate) fn cancel_chat_run(
+    state: SharedState<'_>,
+    turn_id: String,
+) -> Result<skills::CancelChatRunOutcome, CoreError> {
+    let turn_id = parse_chat_turn_id(&turn_id)?;
     let pending = std::sync::Arc::clone(&crate::lock_state(&state).pending_elicitations);
-    pending
-        .cancel_active_run()
-        .map(|_| ())
-        .map_err(crate::ai::error_detail)
+    Ok(pending.cancel_run(turn_id))
+}
+
+fn parse_chat_turn_id(value: &str) -> Result<uuid::Uuid, CoreError> {
+    let parsed = uuid::Uuid::parse_str(value)
+        .map_err(|_| CoreError::InvalidName("chat turn id must be a UUID".into()))?;
+    if parsed.to_string() != value {
+        return Err(CoreError::InvalidName(
+            "chat turn id must use canonical lowercase hyphenated UUID form".into(),
+        ));
+    }
+    Ok(parsed)
 }
 
 #[tauri::command]
@@ -794,6 +889,43 @@ where
 struct RunLlmClient<'a> {
     inner: &'a dyn neuralnote_core::ai::LlmClient,
     close_signal: &'a ai::ChatRunCloseSignal,
+    cancellation_observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+/// Suppress only the core terminal error caused by the matching run's typed user
+/// stop. Partial answer events pass through unchanged, and provider/lifecycle
+/// failures never set `cancellation_observed`, so they retain normal error UI.
+struct CausalRunEventSink<'a> {
+    inner: &'a mut dyn neuralnote_core::ai::EventSink,
+    close_signal: std::sync::Arc<ai::ChatRunCloseSignal>,
+    cancellation_observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+}
+
+impl<'a> CausalRunEventSink<'a> {
+    fn new(
+        inner: &'a mut dyn neuralnote_core::ai::EventSink,
+        close_signal: std::sync::Arc<ai::ChatRunCloseSignal>,
+        cancellation_observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        Self {
+            inner,
+            close_signal,
+            cancellation_observed,
+        }
+    }
+}
+
+impl neuralnote_core::ai::EventSink for CausalRunEventSink<'_> {
+    fn send(&mut self, event: neuralnote_core::ai::ChatEvent) {
+        let is_causal_user_stop = matches!(event, neuralnote_core::ai::ChatEvent::Error { .. })
+            && self.close_signal.reason() == Some(ai::ChatRunCloseReason::UserStop)
+            && self
+                .cancellation_observed
+                .swap(false, std::sync::atomic::Ordering::SeqCst);
+        if !is_causal_user_stop {
+            self.inner.send(event);
+        }
+    }
 }
 
 /// Bridges the existing webview/vault lifecycle signal into core's runtime-neutral
@@ -825,15 +957,26 @@ impl<'a> RunLlmClient<'a> {
     fn new(
         inner: &'a dyn neuralnote_core::ai::LlmClient,
         close_signal: &'a ai::ChatRunCloseSignal,
+        cancellation_observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> Self {
         Self {
             inner,
             close_signal,
+            cancellation_observed,
         }
     }
 
-    fn closed_error() -> CoreError {
-        CoreError::Conflict("chat run was cancelled or its vault or window closed".into())
+    fn closed_error(&self) -> CoreError {
+        match self.close_signal.reason() {
+            Some(ai::ChatRunCloseReason::UserStop) => {
+                self.cancellation_observed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                CoreError::Conflict("chat run stopped by the user".into())
+            }
+            Some(ai::ChatRunCloseReason::Lifecycle) | None => {
+                CoreError::Conflict("chat run ended because its vault or window closed".into())
+            }
+        }
     }
 }
 
@@ -845,7 +988,7 @@ impl neuralnote_core::ai::LlmClient for RunLlmClient<'_> {
     ) -> neuralnote_core::CoreResult<neuralnote_core::ai::Completion> {
         await_run_or_close(self.inner.complete(request), self.close_signal)
             .await
-            .ok_or_else(Self::closed_error)?
+            .ok_or_else(|| self.closed_error())?
     }
 
     async fn complete_streaming(
@@ -858,7 +1001,7 @@ impl neuralnote_core::ai::LlmClient for RunLlmClient<'_> {
             self.close_signal,
         )
         .await
-        .ok_or_else(Self::closed_error)?
+        .ok_or_else(|| self.closed_error())?
     }
 }
 
@@ -880,20 +1023,23 @@ struct ChatRun<'a> {
     youtube_requirements: &'a dyn neuralnote_core::ai::YoutubeRequirementInstaller,
     capture_cancellation: neuralnote_core::ai::CaptureCancellation,
     extractor_updates: neuralnote_core::ai::ExtractorUpdateSession,
-    sink: &'a mut ai::TauriChannelSink,
+    sink: &'a mut dyn neuralnote_core::ai::EventSink,
     close_signal: &'a ai::ChatRunCloseSignal,
+    cancellation_observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 fn stop_if_chat_run_closed(run: &mut ChatRun<'_>) -> bool {
     if !run.close_signal.is_closed() {
         return false;
     }
-    neuralnote_core::ai::EventSink::send(
-        run.sink,
-        neuralnote_core::ai::ChatEvent::Error {
-            message: "Chat ended because its vault or window closed.".into(),
-        },
-    );
+    if run.close_signal.reason() == Some(ai::ChatRunCloseReason::Lifecycle) {
+        neuralnote_core::ai::EventSink::send(
+            run.sink,
+            neuralnote_core::ai::ChatEvent::Error {
+                message: "Chat ended because its vault or window closed.".into(),
+            },
+        );
+    }
     true
 }
 
@@ -906,7 +1052,7 @@ async fn chat_via_openrouter(
     model: &str,
     reasoning: bool,
 ) -> Option<neuralnote_core::ai::UndoLedger> {
-    use neuralnote_core::ai::{run_chat, ChatEvent, EventSink, SkillServices};
+    use neuralnote_core::ai::{run_chat, ChatEvent, SkillServices};
 
     if stop_if_chat_run_closed(run) {
         return None;
@@ -932,7 +1078,11 @@ async fn chat_via_openrouter(
     let pricing =
         ai::cached_openrouter_pricing(model).map(neuralnote_core::capture::PricingInput::Hosted);
     let transport = ai::OpenAiChatClient::new(key, reasoning);
-    let client = RunLlmClient::new(&transport, run.close_signal);
+    let client = RunLlmClient::new(
+        &transport,
+        run.close_signal,
+        std::sync::Arc::clone(&run.cancellation_observed),
+    );
     let mut skill_services = SkillServices::new(
         run.skill_registry,
         run.skill_environment,
@@ -981,7 +1131,7 @@ async fn chat_via_local(
     tag: &str,
     reasoning_opt_in: bool,
 ) -> Option<neuralnote_core::ai::UndoLedger> {
-    use neuralnote_core::ai::{run_chat, ChatEvent, EventSink, SkillServices};
+    use neuralnote_core::ai::{run_chat, ChatEvent, SkillServices};
 
     if stop_if_chat_run_closed(run) {
         return None;
@@ -1052,7 +1202,11 @@ async fn chat_via_local(
     }
     let effective = neuralnote_core::ai::effective_reasoning(reasoning_opt_in, support);
     let transport = local::ollama_chat_client(port, effective);
-    let client = RunLlmClient::new(&transport, run.close_signal);
+    let client = RunLlmClient::new(
+        &transport,
+        run.close_signal,
+        std::sync::Arc::clone(&run.cancellation_observed),
+    );
     let pricing = neuralnote_core::capture::PricingInput::Local;
     let skill_services = SkillServices::new(
         run.skill_registry,
@@ -1093,15 +1247,115 @@ async fn chat_via_local(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::provider_config_mutation::ProviderConfigMutationGate;
     use neuralnote_core::ai::{
         read_provider_config, run_chat, write_provider_config, ChatEvent, Completion, EventSink,
         Guards, HardwareSpec, KeywordRetriever, LlmClient, LlmRequest, NoUserPrompt,
-        ProviderConfig, ProviderKind, ReasoningSupport, SkillEnvironment, SkillLookupError,
-        SkillRegistry, SkillServices, ToolCall, FIXTURE_SKILL_ID, YOUTUBE_DISTIL_SKILL_ID,
+        ProviderConfig, ProviderKind, ReasoningProbeTarget, ReasoningSupport, SkillEnvironment,
+        SkillLookupError, SkillRegistry, SkillServices, ToolCall, FIXTURE_SKILL_ID,
+        YOUTUBE_DISTIL_SKILL_ID,
     };
     use neuralnote_core::CoreResult;
     use std::collections::BTreeSet;
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Barrier};
+    use std::time::{Duration, Instant};
+
+    const STALE_PROBE_CHILD_DIR: &str = "NEURALNOTE_STALE_PROBE_CHILD_DIR";
+    const MATCHING_PROBE_CHILD_DIR: &str = "NEURALNOTE_MATCHING_PROBE_CHILD_DIR";
+    const SAME_TARGET_PROBE_CHILD_DIR: &str = "NEURALNOTE_SAME_TARGET_PROBE_CHILD_DIR";
+
+    fn concurrent_provider_updates_preserve_both_fields(reasoning_starts_first: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                model: "vendor/old".into(),
+                reasoning: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let gate = ProviderConfigMutationGate::default();
+        let offered: std::collections::HashSet<String> =
+            ["vendor/new".to_string()].into_iter().collect();
+        let first_loaded = Arc::new(Barrier::new(2));
+        let release_first = Arc::new(Barrier::new(2));
+        let second_entering_gate = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let first_loaded_for_thread = Arc::clone(&first_loaded);
+            let release_first_for_thread = Arc::clone(&release_first);
+            let first_gate = gate.clone();
+            let first_dir = dir.path().to_path_buf();
+            let first = scope.spawn(move || {
+                first_gate.update(&first_dir, |config| {
+                    if reasoning_starts_first {
+                        config.reasoning = false;
+                    } else {
+                        config.model = "vendor/new".into();
+                    }
+                    first_loaded_for_thread.wait();
+                    release_first_for_thread.wait();
+                    Ok(())
+                })
+            });
+
+            // The first writer has read its snapshot but cannot write it yet. Start
+            // the real second command in that exact stale-snapshot window.
+            first_loaded.wait();
+            let second_gate = gate.clone_with_entry_barrier(Arc::clone(&second_entering_gate));
+            let second_dir = dir.path().to_path_buf();
+            let second = scope.spawn(move || {
+                if reasoning_starts_first {
+                    openrouter_catalogue::persist_selected_model(
+                        &second_dir,
+                        &second_gate,
+                        &offered,
+                        "vendor/new",
+                    )
+                    .map(|_| ())
+                } else {
+                    set_reasoning_in(&second_dir, &second_gate, false).map(|_| ())
+                }
+            });
+
+            // The second command has reached the shared gate while the first
+            // still owns it. Releasing the first now gives a deterministic
+            // serialized ordering without timing or scheduler assumptions.
+            second_entering_gate.wait();
+            release_first.wait();
+            first.join().unwrap().unwrap();
+            second.join().unwrap().unwrap();
+        });
+
+        let persisted = read_provider_config(dir.path()).unwrap();
+        assert_eq!(persisted.model, "vendor/new");
+        assert!(
+            !persisted.reasoning,
+            "a concurrent reasoning opt-out must not be restored from a stale model-selection snapshot"
+        );
+    }
+
+    #[test]
+    fn reasoning_off_then_model_selection_does_not_lose_either_update() {
+        concurrent_provider_updates_preserve_both_fields(true);
+    }
+
+    #[test]
+    fn model_selection_then_reasoning_off_does_not_lose_either_update() {
+        concurrent_provider_updates_preserve_both_fields(false);
+    }
+
+    #[test]
+    fn provider_commands_clone_one_app_state_mutation_gate() {
+        let app_state = crate::AppState::default();
+        let reasoning_gate = provider_config_mutation_gate_from(&app_state);
+        let (_, model_gate) = openrouter_selection_context(&app_state);
+
+        assert!(reasoning_gate.shares_lock_with(&model_gate));
+    }
 
     #[test]
     fn curated_model_boundary_accepts_only_catalogue_tags_and_repositories() {
@@ -1242,39 +1496,46 @@ mod tests {
     }
 
     #[test]
-    fn persist_reasoning_verdict_preserves_a_concurrent_write() {
+    fn persist_reasoning_verdict_ignores_an_old_model_after_a_newer_probe() {
         // Reproduces the probe-window race: refresh_reasoning_support reads config,
         // then awaits a multi-second probe (OpenRouter ~8s, an Ollama cold-start ~30s).
-        // During that await a concurrent writer — set_reasoning here, plus a model
-        // switch — persists new values. Persisting the verdict must NOT revert them:
-        // only the two capability fields are ours to write.
+        // During that await the user disables reasoning, selects model B, and B's
+        // own probe persists a verdict. The late A result has no fields left to own.
         let dir = tempfile::tempdir().unwrap();
         let concurrent = ProviderConfig {
             active_provider: Some(ProviderKind::OpenRouter),
             model: "user/switched-to-this".into(),
             key_configured: true,
             reasoning: false, // the user toggled reasoning OFF mid-probe
+            reasoning_support: Some(ReasoningSupport::Unsupported),
+            reasoning_probed_model: Some("user/switched-to-this".into()),
             ..Default::default()
         };
         write_provider_config(dir.path(), &concurrent).unwrap();
 
-        // The fix drops the pre-await snapshot from the write path entirely: the verdict
-        // is persisted by re-reading the CURRENT config, so the concurrent write survives.
-        let status =
-            persist_reasoning_verdict(dir.path(), ReasoningSupport::Supported, "old/model".into())
-                .unwrap();
+        // Persistence re-reads under the mutation gate and rejects the obsolete target.
+        let status = persist_reasoning_verdict(
+            dir.path(),
+            &ProviderConfigMutationGate::default(),
+            ReasoningSupport::Supported,
+            ReasoningProbeTarget {
+                provider: ProviderKind::OpenRouter,
+                model: "old/model".into(),
+                generation: 0,
+            },
+        )
+        .unwrap();
 
         let persisted = read_provider_config(dir.path()).unwrap();
-        // The two capability fields are updated…
+        // The obsolete A probe must not replace the newer B verdict.
         assert_eq!(
             persisted.reasoning_support,
-            Some(ReasoningSupport::Supported)
+            Some(ReasoningSupport::Unsupported)
         );
         assert_eq!(
             persisted.reasoning_probed_model.as_deref(),
-            Some("old/model")
+            Some("user/switched-to-this")
         );
-        // …but every other field reflects the concurrent write, not the stale snapshot.
         assert!(
             !persisted.reasoning,
             "a concurrent opt-out must survive the probe"
@@ -1282,6 +1543,413 @@ mod tests {
         assert_eq!(persisted.model, "user/switched-to-this");
         assert!(!status.openrouter.reasoning);
         assert_eq!(status.openrouter.model, "user/switched-to-this");
+        assert_eq!(status.reasoning_supported, ReasoningSupport::Unsupported);
+    }
+
+    #[test]
+    fn persist_reasoning_verdict_requires_the_same_effective_provider() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                active_provider: Some(ProviderKind::Local),
+                model: "shared/model".into(),
+                local_model_tag: Some("shared/model".into()),
+                reasoning_support: Some(ReasoningSupport::Unsupported),
+                reasoning_probed_model: Some("shared/model".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let status = persist_reasoning_verdict(
+            dir.path(),
+            &ProviderConfigMutationGate::default(),
+            ReasoningSupport::Supported,
+            ReasoningProbeTarget {
+                provider: ProviderKind::OpenRouter,
+                model: "shared/model".into(),
+                generation: 0,
+            },
+        )
+        .unwrap();
+
+        let persisted = read_provider_config(dir.path()).unwrap();
+        assert_eq!(persisted.active_provider, Some(ProviderKind::Local));
+        assert_eq!(
+            persisted.reasoning_support,
+            Some(ReasoningSupport::Unsupported)
+        );
+        assert_eq!(status.reasoning_supported, ReasoningSupport::Unsupported);
+    }
+
+    #[test]
+    fn persist_reasoning_verdict_writes_for_the_matching_target() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                active_provider: Some(ProviderKind::OpenRouter),
+                model: "vendor/current".into(),
+                key_configured: true,
+                reasoning_probe_generation: 1,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        let status = persist_reasoning_verdict(
+            dir.path(),
+            &ProviderConfigMutationGate::default(),
+            ReasoningSupport::Supported,
+            ReasoningProbeTarget {
+                provider: ProviderKind::OpenRouter,
+                model: "vendor/current".into(),
+                generation: 1,
+            },
+        )
+        .unwrap();
+
+        let persisted = read_provider_config(dir.path()).unwrap();
+        assert_eq!(
+            persisted.reasoning_support,
+            Some(ReasoningSupport::Supported)
+        );
+        assert_eq!(
+            persisted.reasoning_probed_model.as_deref(),
+            Some("vendor/current")
+        );
+        assert_eq!(status.reasoning_supported, ReasoningSupport::Supported);
+    }
+
+    fn run_probe_persistence_child(env_key: &str, config: ProviderConfig) -> bool {
+        let Ok(directory) = std::env::var(env_key) else {
+            return false;
+        };
+        let directory = std::path::PathBuf::from(directory);
+        ProviderConfigMutationGate::default()
+            .run(&directory, || {
+                write_provider_config(&directory, &config)?;
+                std::fs::write(directory.join("probe-child-ready"), b"ready").unwrap();
+                while !directory.join("release-probe-child").exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(())
+            })
+            .unwrap();
+        true
+    }
+
+    fn persist_probe_behind_separate_process(
+        test_name: &str,
+        env_key: &str,
+        initial: ProviderConfig,
+        support: ReasoningSupport,
+        target: ReasoningProbeTarget,
+    ) -> (AiStatus, ProviderConfig) {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(dir.path(), &initial).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(env_key, dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("probe-child-ready").exists() {
+            assert!(Instant::now() < deadline, "probe child never acquired lock");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let entering_gate = Arc::new(Barrier::new(2));
+        let gate = ProviderConfigMutationGate::default()
+            .clone_with_entry_barrier(Arc::clone(&entering_gate));
+        let dir_path = dir.path().to_path_buf();
+        let status = std::thread::spawn(move || {
+            persist_reasoning_verdict(&dir_path, &gate, support, target)
+        });
+        entering_gate.wait();
+        std::fs::write(dir.path().join("release-probe-child"), b"release").unwrap();
+
+        let status = status.join().unwrap().unwrap();
+        assert!(child.wait().unwrap().success());
+        let persisted = read_provider_config(dir.path()).unwrap();
+        (status, persisted)
+    }
+
+    #[test]
+    fn separate_process_new_model_probe_wins_over_an_older_probe() {
+        let newer = ProviderConfig {
+            active_provider: Some(ProviderKind::OpenRouter),
+            model: "vendor/new".into(),
+            key_configured: true,
+            reasoning_support: Some(ReasoningSupport::Unsupported),
+            reasoning_probed_model: Some("vendor/new".into()),
+            reasoning_probe_generation: 2,
+            ..Default::default()
+        };
+        if run_probe_persistence_child(STALE_PROBE_CHILD_DIR, newer.clone()) {
+            return;
+        }
+
+        let (status, persisted) = persist_probe_behind_separate_process(
+            "commands::ai::tests::separate_process_new_model_probe_wins_over_an_older_probe",
+            STALE_PROBE_CHILD_DIR,
+            ProviderConfig {
+                active_provider: Some(ProviderKind::OpenRouter),
+                model: "vendor/old".into(),
+                key_configured: true,
+                ..Default::default()
+            },
+            ReasoningSupport::Supported,
+            ReasoningProbeTarget {
+                provider: ProviderKind::OpenRouter,
+                model: "vendor/old".into(),
+                generation: 1,
+            },
+        );
+
+        assert_eq!(persisted, newer);
+        assert_eq!(status.openrouter.model, "vendor/new");
+        assert_eq!(status.reasoning_supported, ReasoningSupport::Unsupported);
+    }
+
+    #[test]
+    fn separate_process_matching_target_accepts_the_probe() {
+        let current = ProviderConfig {
+            active_provider: Some(ProviderKind::OpenRouter),
+            model: "vendor/current".into(),
+            key_configured: true,
+            reasoning_probe_generation: 1,
+            ..Default::default()
+        };
+        if run_probe_persistence_child(MATCHING_PROBE_CHILD_DIR, current.clone()) {
+            return;
+        }
+
+        let (status, persisted) = persist_probe_behind_separate_process(
+            "commands::ai::tests::separate_process_matching_target_accepts_the_probe",
+            MATCHING_PROBE_CHILD_DIR,
+            current,
+            ReasoningSupport::Supported,
+            ReasoningProbeTarget {
+                provider: ProviderKind::OpenRouter,
+                model: "vendor/current".into(),
+                generation: 1,
+            },
+        );
+
+        assert_eq!(
+            persisted.reasoning_support,
+            Some(ReasoningSupport::Supported)
+        );
+        assert_eq!(
+            persisted.reasoning_probed_model.as_deref(),
+            Some("vendor/current")
+        );
+        assert_eq!(status.reasoning_supported, ReasoningSupport::Supported);
+    }
+
+    #[test]
+    fn same_target_probe_completion_order_keeps_the_newer_verdict() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                active_provider: Some(ProviderKind::OpenRouter),
+                model: "vendor/current".into(),
+                key_configured: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let gate = ProviderConfigMutationGate::default();
+        let (_, older) = begin_reasoning_probe(dir.path(), &gate).unwrap();
+        let (_, newer) = begin_reasoning_probe(dir.path(), &gate).unwrap();
+        let older = older.unwrap();
+        let newer = newer.unwrap();
+
+        persist_reasoning_verdict(dir.path(), &gate, ReasoningSupport::Unsupported, newer).unwrap();
+        let status =
+            persist_reasoning_verdict(dir.path(), &gate, ReasoningSupport::Supported, older)
+                .unwrap();
+
+        assert_eq!(status.reasoning_supported, ReasoningSupport::Unsupported);
+        assert_eq!(
+            read_provider_config(dir.path()).unwrap().reasoning_support,
+            Some(ReasoningSupport::Unsupported)
+        );
+    }
+
+    #[test]
+    fn aba_model_selection_does_not_revalidate_the_first_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                active_provider: Some(ProviderKind::OpenRouter),
+                model: "vendor/a".into(),
+                key_configured: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let gate = ProviderConfigMutationGate::default();
+        let (_, old_a) = begin_reasoning_probe(dir.path(), &gate).unwrap();
+        gate.update(dir.path(), |cfg| {
+            cfg.model = "vendor/b".into();
+            Ok(())
+        })
+        .unwrap();
+        let _ = begin_reasoning_probe(dir.path(), &gate).unwrap();
+        gate.update(dir.path(), |cfg| {
+            cfg.model = "vendor/a".into();
+            Ok(())
+        })
+        .unwrap();
+        let (_, new_a) = begin_reasoning_probe(dir.path(), &gate).unwrap();
+
+        persist_reasoning_verdict(
+            dir.path(),
+            &gate,
+            ReasoningSupport::Unsupported,
+            new_a.unwrap(),
+        )
+        .unwrap();
+        let status = persist_reasoning_verdict(
+            dir.path(),
+            &gate,
+            ReasoningSupport::Supported,
+            old_a.unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(status.reasoning_supported, ReasoningSupport::Unsupported);
+        assert_eq!(
+            read_provider_config(dir.path())
+                .unwrap()
+                .reasoning_probe_generation,
+            5
+        );
+    }
+
+    #[test]
+    fn aba_target_change_rejects_the_first_probe_before_a_replacement_is_allocated() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                active_provider: Some(ProviderKind::OpenRouter),
+                model: "vendor/a".into(),
+                key_configured: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let gate = ProviderConfigMutationGate::default();
+        let (_, old_a) = begin_reasoning_probe(dir.path(), &gate).unwrap();
+
+        gate.update(dir.path(), |cfg| {
+            cfg.model = "vendor/b".into();
+            Ok(())
+        })
+        .unwrap();
+        gate.update(dir.path(), |cfg| {
+            cfg.model = "vendor/a".into();
+            Ok(())
+        })
+        .unwrap();
+
+        let status = persist_reasoning_verdict(
+            dir.path(),
+            &gate,
+            ReasoningSupport::Supported,
+            old_a.unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(status.reasoning_supported, ReasoningSupport::Unknown);
+        let persisted = read_provider_config(dir.path()).unwrap();
+        assert_eq!(persisted.reasoning_probe_generation, 3);
+        assert_eq!(persisted.reasoning_support, None);
+        assert_eq!(persisted.reasoning_probed_model, None);
+    }
+
+    #[test]
+    fn separate_process_newer_same_target_probe_wins() {
+        if let Ok(directory) = std::env::var(SAME_TARGET_PROBE_CHILD_DIR) {
+            let directory = std::path::PathBuf::from(directory);
+            let gate = ProviderConfigMutationGate::default();
+            let (_, target) = begin_reasoning_probe(&directory, &gate).unwrap();
+            persist_reasoning_verdict(
+                &directory,
+                &gate,
+                ReasoningSupport::Unsupported,
+                target.unwrap(),
+            )
+            .unwrap();
+            gate.run(&directory, || {
+                std::fs::write(directory.join("probe-child-ready"), b"ready").unwrap();
+                while !directory.join("release-probe-child").exists() {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                Ok(())
+            })
+            .unwrap();
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                active_provider: Some(ProviderKind::OpenRouter),
+                model: "vendor/current".into(),
+                key_configured: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let gate = ProviderConfigMutationGate::default();
+        let (_, older) = begin_reasoning_probe(dir.path(), &gate).unwrap();
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg("commands::ai::tests::separate_process_newer_same_target_probe_wins")
+            .arg("--nocapture")
+            .env(SAME_TARGET_PROBE_CHILD_DIR, dir.path())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dir.path().join("probe-child-ready").exists() {
+            assert!(Instant::now() < deadline, "probe child never acquired lock");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+
+        let entering_gate = Arc::new(Barrier::new(2));
+        let stale_gate = ProviderConfigMutationGate::default()
+            .clone_with_entry_barrier(Arc::clone(&entering_gate));
+        let dir_path = dir.path().to_path_buf();
+        let stale = std::thread::spawn(move || {
+            persist_reasoning_verdict(
+                &dir_path,
+                &stale_gate,
+                ReasoningSupport::Supported,
+                older.unwrap(),
+            )
+        });
+        entering_gate.wait();
+        std::fs::write(dir.path().join("release-probe-child"), b"release").unwrap();
+
+        let status = stale.join().unwrap().unwrap();
+        assert!(child.wait().unwrap().success());
+        let persisted = read_provider_config(dir.path()).unwrap();
+        assert_eq!(persisted.reasoning_probe_generation, 2);
+        assert_eq!(
+            persisted.reasoning_support,
+            Some(ReasoningSupport::Unsupported)
+        );
+        assert_eq!(status.reasoning_supported, ReasoningSupport::Unsupported);
     }
 
     #[test]
@@ -1325,6 +1993,28 @@ mod tests {
         assert_eq!(stale.reasoning_supported, ReasoningSupport::Unknown);
     }
 
+    #[test]
+    fn chat_turn_ids_require_canonical_lowercase_hyphenated_uuids() {
+        let canonical = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e21";
+        assert_eq!(
+            parse_chat_turn_id(canonical).unwrap().to_string(),
+            canonical
+        );
+
+        for invalid in [
+            "",
+            "not-a-uuid",
+            "018F5F6C-8D5F-7C64-B8E7-8F9F238D9E21",
+            "018f5f6c8d5f7c64b8e78f9f238d9e21",
+            " 018f5f6c-8d5f-7c64-b8e7-8f9f238d9e21",
+        ] {
+            assert!(matches!(
+                parse_chat_turn_id(invalid),
+                Err(CoreError::InvalidName(_))
+            ));
+        }
+    }
+
     #[tokio::test]
     async fn chat_run_future_stops_when_its_lifecycle_closes() {
         let signal = std::sync::Arc::new(ai::ChatRunCloseSignal::default());
@@ -1363,6 +2053,141 @@ mod tests {
         signal.close();
 
         assert_eq!(await_run_or_close(async { 42 }, &signal).await, Some(42));
+    }
+
+    #[derive(Default)]
+    struct RecordedEvents(Vec<ChatEvent>);
+
+    impl EventSink for RecordedEvents {
+        fn send(&mut self, event: ChatEvent) {
+            self.0.push(event);
+        }
+    }
+
+    #[test]
+    fn causal_sink_suppresses_only_an_observed_user_stop_error() {
+        let signal = std::sync::Arc::new(ai::ChatRunCloseSignal::default());
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut events = RecordedEvents::default();
+        {
+            let mut sink = CausalRunEventSink::new(
+                &mut events,
+                std::sync::Arc::clone(&signal),
+                std::sync::Arc::clone(&observed),
+            );
+            signal.stop_by_user();
+            observed.store(true, Ordering::SeqCst);
+            sink.send(ChatEvent::Answer {
+                delta: "partial".into(),
+            });
+            sink.send(ChatEvent::Error {
+                message: "typed cancellation reached core".into(),
+            });
+            sink.send(ChatEvent::Error {
+                message: "later independent failure".into(),
+            });
+        }
+        assert_eq!(
+            events.0,
+            vec![
+                ChatEvent::Answer {
+                    delta: "partial".into()
+                },
+                ChatEvent::Error {
+                    message: "later independent failure".into()
+                }
+            ]
+        );
+
+        let signal = std::sync::Arc::new(ai::ChatRunCloseSignal::default());
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut events = RecordedEvents::default();
+        let mut sink = CausalRunEventSink::new(&mut events, signal, observed);
+        sink.send(ChatEvent::Error {
+            message: "provider failed".into(),
+        });
+        assert!(
+            matches!(events.0.as_slice(), [ChatEvent::Error { message }] if message == "provider failed")
+        );
+
+        let signal = std::sync::Arc::new(ai::ChatRunCloseSignal::default());
+        signal.close();
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut events = RecordedEvents::default();
+        let mut sink = CausalRunEventSink::new(&mut events, signal, observed);
+        sink.send(ChatEvent::Error {
+            message: "vault closed".into(),
+        });
+        assert!(
+            matches!(events.0.as_slice(), [ChatEvent::Error { message }] if message == "vault closed")
+        );
+    }
+
+    struct PendingUntilDropped {
+        started: std::sync::Arc<tokio::sync::Notify>,
+        dropped: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    struct DropObservation(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropObservation {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for PendingUntilDropped {
+        async fn complete(&self, _request: &LlmRequest) -> CoreResult<Completion> {
+            self.started.notify_one();
+            let _observation = DropObservation(std::sync::Arc::clone(&self.dropped));
+            std::future::pending().await
+        }
+
+        async fn complete_streaming(
+            &self,
+            _request: &LlmRequest,
+            _sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            unreachable!("this probe exercises the non-streaming transport await")
+        }
+    }
+
+    #[tokio::test]
+    async fn deterministic_provider_is_interrupted_promptly_by_user_stop() {
+        let signal = ai::ChatRunCloseSignal::default();
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider = PendingUntilDropped {
+            started: std::sync::Arc::clone(&started),
+            dropped: std::sync::Arc::clone(&dropped),
+        };
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let client = RunLlmClient::new(&provider, &signal, observed);
+        let request = LlmRequest {
+            model: "test".into(),
+            messages: vec![],
+            tools: vec![],
+        };
+
+        let run = client.complete(&request);
+        let cancel = async {
+            started.notified().await;
+            let started_at = std::time::Instant::now();
+            assert!(signal.stop_by_user());
+            tokio::time::timeout(std::time::Duration::from_millis(100), async {
+                while !dropped.load(Ordering::SeqCst) {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("provider must observe cancellation within 100 ms");
+            started_at
+        };
+
+        let (result, started_at) = tokio::join!(run, cancel);
+        assert!(result.is_err());
+        assert!(started_at.elapsed() < std::time::Duration::from_secs(1));
     }
 
     struct CloseAfterWriteLlm {
@@ -1411,7 +2236,11 @@ mod tests {
             calls: AtomicUsize::new(0),
             close_signal: std::sync::Arc::clone(&close_signal),
         };
-        let llm = RunLlmClient::new(&inner, &close_signal);
+        let llm = RunLlmClient::new(
+            &inner,
+            &close_signal,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
         let registry = SkillRegistry::built_in(&[]).unwrap();
         let environment = SkillEnvironment {
             hardware: HardwareSpec {

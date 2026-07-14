@@ -27,7 +27,7 @@ const pixel =
 async function openWorkspace(opts: CreateMockVaultOptions) {
   const result = renderApp({ recents, skills: [youtubeSkill], ...opts });
   await result.user.click(await screen.findByRole("button", { name: "Open My Brain" }));
-  await screen.findByText("Cited recall");
+  await screen.findByText("Neural Assistant AI");
   return result;
 }
 
@@ -213,12 +213,16 @@ describe("Journey 10: YouTube playlist selection", () => {
     await user.click(screen.getByRole("button", { name: /Continue/ }));
 
     expect(await screen.findByText(/Video 1 of 21/)).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { name: "Cancel run" }));
+    await user.click(screen.getByRole("button", { name: "Stop response" }));
 
     expect(await screen.findByText("Model-reported partial run")).toBeInTheDocument();
+    expect(screen.getByText("Stopped")).toBeInTheDocument();
     expect(
       screen.getByText(/The model reports that 2 notes were kept before the run stopped/),
     ).toBeInTheDocument();
+    expect(
+      screen.queryByText(/The playlist was cancelled\. Kept the completed video/),
+    ).not.toBeInTheDocument();
     expect(screen.getByText("captions:en-auto")).toBeInTheDocument();
     expect(screen.getByText("Agent talk 1.md")).toBeInTheDocument();
     expect(screen.queryByText("Agent talk 2.md")).not.toBeInTheDocument();

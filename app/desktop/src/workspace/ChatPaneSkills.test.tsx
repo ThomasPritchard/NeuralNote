@@ -261,6 +261,7 @@ describe("ChatPane — skills on send", () => {
     await user.keyboard("{Enter}");
 
     expect(mockChat).toHaveBeenCalledExactlyOnceWith(
+      expect.any(String),
       "distil my note",
       [],
       expect.any(Function),
@@ -280,9 +281,9 @@ describe("ChatPane — skills on send", () => {
       { type: "noteWritten", relPath: "Literature/Talk.md", kind: "literature" },
       { type: "done" },
     ];
-    mockChat.mockImplementation(async (_prompt, _history, onEvent) => {
+    mockChat.mockImplementation(async (turnId, _prompt, _history, onEvent) => {
       for (const ev of events) onEvent(ev);
-      return "run-7";
+      return turnId;
     });
     const { user } = setup();
     const box = await screen.findByLabelText("Ask across your vault");
