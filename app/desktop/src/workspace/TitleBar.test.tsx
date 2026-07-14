@@ -34,9 +34,8 @@ beforeEach(() => {
 
 function renderTitleBar(over: Partial<TitleBarProps> = {}) {
   const props: TitleBarProps = {
-    vaultName: "MyVault",
-    sidebarOpen: true,
-    onToggleSidebar: vi.fn(),
+    navigationExpanded: true,
+    onToggleNavigation: vi.fn(),
     chatOpen: false,
     onToggleChat: vi.fn(),
     onOpenSettings: vi.fn(),
@@ -46,10 +45,6 @@ function renderTitleBar(over: Partial<TitleBarProps> = {}) {
     onActivateTab: vi.fn(),
     onCloseTab: vi.fn(),
     onCloseGraph: vi.fn(),
-    onNewNote: vi.fn(),
-    onNewFolder: vi.fn(),
-    onRefresh: vi.fn(),
-    onCloseVault: vi.fn(),
     ...over,
   };
   const view = render(<TitleBar {...props} />);
@@ -57,10 +52,10 @@ function renderTitleBar(over: Partial<TitleBarProps> = {}) {
 }
 
 describe("TitleBar — panel toggles", () => {
-  it("reflects sidebarOpen/chatOpen as aria-pressed", () => {
-    renderTitleBar({ sidebarOpen: true, chatOpen: false });
+  it("reflects navigationExpanded/chatOpen as aria-pressed", () => {
+    renderTitleBar({ navigationExpanded: true, chatOpen: false });
     expect(
-      screen.getByRole("button", { name: "Toggle sidebar" }),
+      screen.getByRole("button", { name: "Toggle navigation sidebar" }),
     ).toHaveAttribute("aria-pressed", "true");
     expect(
       screen.getByRole("button", { name: "Toggle chat panel" }),
@@ -68,19 +63,21 @@ describe("TitleBar — panel toggles", () => {
   });
 
   it("reflects the flipped panel states too", () => {
-    renderTitleBar({ sidebarOpen: false, chatOpen: true });
+    renderTitleBar({ navigationExpanded: false, chatOpen: true });
     expect(
-      screen.getByRole("button", { name: "Toggle sidebar" }),
+      screen.getByRole("button", { name: "Toggle navigation sidebar" }),
     ).toHaveAttribute("aria-pressed", "false");
     expect(
       screen.getByRole("button", { name: "Toggle chat panel" }),
     ).toHaveAttribute("aria-pressed", "true");
   });
 
-  it("fires onToggleSidebar for the sidebar toggle", async () => {
+  it("fires onToggleNavigation for the navigation toggle", async () => {
     const { props } = renderTitleBar();
-    await userEvent.click(screen.getByRole("button", { name: "Toggle sidebar" }));
-    expect(props.onToggleSidebar).toHaveBeenCalledTimes(1);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Toggle navigation sidebar" }),
+    );
+    expect(props.onToggleNavigation).toHaveBeenCalledTimes(1);
     expect(props.onToggleChat).not.toHaveBeenCalled();
   });
 
@@ -90,7 +87,7 @@ describe("TitleBar — panel toggles", () => {
       screen.getByRole("button", { name: "Toggle chat panel" }),
     );
     expect(props.onToggleChat).toHaveBeenCalledTimes(1);
-    expect(props.onToggleSidebar).not.toHaveBeenCalled();
+    expect(props.onToggleNavigation).not.toHaveBeenCalled();
   });
 
   it("fires onOpenSettings for the settings button (not a toggle)", async () => {
@@ -102,55 +99,20 @@ describe("TitleBar — panel toggles", () => {
   });
 });
 
-describe("TitleBar — vault switcher", () => {
-  it("renders the vault name with a closed menu", () => {
-    renderTitleBar({ vaultName: "Second Brain" });
-    const switcher = screen.getByRole("button", { name: "Second Brain" });
-    expect(switcher).toHaveAttribute("aria-haspopup", "menu");
-    expect(switcher).toHaveAttribute("aria-expanded", "false");
+describe("TitleBar — navigation ownership", () => {
+  it("does not render vault identity or actions", () => {
+    renderTitleBar();
     expect(screen.queryByRole("menu")).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "MyVault" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Vault actions/ })).not.toBeInTheDocument();
   });
 
-  it("opens the vault menu and fires the create actions", async () => {
-    const { props } = renderTitleBar();
-    const switcher = screen.getByRole("button", { name: "MyVault" });
-
-    await userEvent.click(switcher);
-    expect(switcher).toHaveAttribute("aria-expanded", "true");
-    expect(screen.getByRole("menu", { name: "Vault actions" })).toBeInTheDocument();
-
-    await userEvent.click(screen.getByRole("menuitem", { name: "New note" }));
-    expect(props.onNewNote).toHaveBeenCalledTimes(1);
-    // Selecting an item closes the menu.
-    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
-
-    await userEvent.click(switcher);
-    await userEvent.click(screen.getByRole("menuitem", { name: "New folder" }));
-    expect(props.onNewFolder).toHaveBeenCalledTimes(1);
-  });
-
-  it("fires refresh and close-vault from the menu", async () => {
-    const { props } = renderTitleBar();
-
-    await userEvent.click(screen.getByRole("button", { name: "MyVault" }));
-    await userEvent.click(screen.getByRole("menuitem", { name: "Refresh tree" }));
-    expect(props.onRefresh).toHaveBeenCalledTimes(1);
-
-    await userEvent.click(screen.getByRole("button", { name: "MyVault" }));
-    await userEvent.click(screen.getByRole("menuitem", { name: "Close vault" }));
-    expect(props.onCloseVault).toHaveBeenCalledTimes(1);
-  });
-
-  it("supports arrow-key navigation and returns focus to the trigger", async () => {
-    const { props } = renderTitleBar();
-    const switcher = screen.getByRole("button", { name: "MyVault" });
-
-    switcher.focus();
-    await userEvent.keyboard("{Enter}{ArrowDown}{ArrowDown}{Enter}");
-
-    expect(props.onRefresh).toHaveBeenCalledTimes(1);
-    expect(screen.queryByRole("menu")).not.toBeInTheDocument();
-    expect(switcher).toHaveFocus();
+  it("exposes navigation state on the titlebar geometry boundary", () => {
+    const { view } = renderTitleBar({ navigationExpanded: false });
+    expect(view.container.querySelector(".nn-titlebar")).toHaveAttribute(
+      "data-navigation-expanded",
+      "false",
+    );
   });
 });
 

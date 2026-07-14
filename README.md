@@ -76,7 +76,7 @@ The current release path targets Apple Silicon macOS. Linux and Windows run nati
 
 Install:
 
-- Node.js 22
+- Node.js 24 LTS (recommended), or Node.js 22.12 or later in the 22.x release line
 - Rust 1.96 through `rustup`
 - The [Tauri 2 system prerequisites](https://v2.tauri.app/start/prerequisites/) for your operating system
 
@@ -109,7 +109,7 @@ cargo test --workspace --locked
 npm --prefix app/desktop run check:bindings
 ```
 
-Pull requests targeting `main` run these fast checks plus a full-history Gitleaks scan. Pushes to `main` add all frontend journeys, 90 percent frontend and Rust line-coverage gates, the production build, dependency audits, and the Linux/Windows native WebDriver matrix.
+Pull requests targeting `main` run the fast frontend checks on Node.js 22 and 24, plus a full-history Gitleaks scan. Pushes to `main` keep those compatibility checks and run the heavier frontend journeys, coverage, build, and npm audit gates once on Node.js 24. They also add the Rust gates and the Linux/Windows native WebDriver matrix.
 
 The complete Rust gate also needs `cargo-llvm-cov` and `cargo-audit`:
 
@@ -120,6 +120,10 @@ cargo install cargo-audit --locked --version 0.22.2
 ```
 
 Maintainers can run the SonarQube milestone gate locally through Docker. It is not required for external pull requests and is never called from GitHub-hosted runners. See [Local SonarQube](docs/local-sonarqube.md).
+
+macOS alpha publication is manual and supports ad-hoc or Developer ID signing. Current public alpha
+builds may be ad-hoc signed and unnotarized, so macOS can require approval in System Settings before
+opening them. Maintainers should follow [Releasing the macOS alpha](docs/releasing-macos-alpha.md).
 
 Read [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Coding agents should also read [AGENTS.md](AGENTS.md).
 

@@ -1,6 +1,6 @@
 // Sidebar full-text search panel. The prop contract is FROZEN (see
 // specs/search-and-graph-view.md §Frontend) so Workspace never changes:
-// `focusSignal` bumps when ⌘K / the ribbon Search icon wants the field focused;
+// `focusSignal` bumps when ⌘K / the navigation Search action wants the field focused;
 // `onOpen` routes result clicks through Workspace's guarded open (absolute path).
 //
 // Query flow: 200 ms trailing debounce, minimum 2 trimmed chars, and a
@@ -217,7 +217,7 @@ export function SearchPanel({
     return () => clearTimeout(timer);
   }, [query, runSearch]);
 
-  // ⌘K / the ribbon Search icon: Workspace bumps focusSignal to request focus.
+  // ⌘K / navigation Search: Workspace bumps focusSignal to request focus.
   // 0 is the mount value — never steal focus for it.
   useEffect(() => {
     if (focusSignal > 0) inputRef.current?.focus();

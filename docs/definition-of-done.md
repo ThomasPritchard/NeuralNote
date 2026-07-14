@@ -33,6 +33,10 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
 - **Main branch CI** — all frontend tests including mockIPC journeys, frontend and Rust
   90 % line-coverage gates, production build, dependency audits, and the Linux/Windows native
   WebDriver matrix. A red post-merge check blocks release readiness and is fixed immediately.
+- **macOS release verification** — the selected lane passes its platform checks. Ad-hoc releases
+  require strict `codesign` verification plus the Tauri updater signature. Developer ID releases
+  additionally require Gatekeeper assessment and notarisation. Before declaring a release ready,
+  an installed older build must detect the published version from the production manifest.
 
 ### Static checks clean
 - `npm run lint` and `npm run typecheck` clean, `cargo clippy` clean, and
@@ -121,6 +125,7 @@ Baseline (every feature)
 - [ ] Failures surfaced, never silent; no content lost/hidden
 - [ ] Obsidian markdown+YAML compatibility preserved
 - [ ] Specs/public docs/AGENTS.md updated; deferrals left as TODO(context) in code
+- [ ] Release only: selected macOS trust checks pass and an older build detects the published update
 
 If security-adjacent (parser / untrusted input / paths / IPC / secrets / auth)
 - [ ] Independent adversarial review (not just tests + Sonar)

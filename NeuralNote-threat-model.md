@@ -10,7 +10,9 @@ OpenRouter or an app-owned loopback Ollama sidecar, optionally reads curated Hug
 and runs app-owned capture helpers for YouTube. Mobile, sync, billing, managed cloud AI, and the
 future full-source capture pipeline are out of scope.
 
-The host OS, signed NeuralNote bundle, OS keychain, and user-approved vault selection are trusted.
+The host OS, signed NeuralNote bundle, OS keychain, updater public key embedded in a release build,
+and user-approved vault selection are trusted. The updater signing private key is a release asset
+that must remain outside the repository and webview.
 Vault markdown, frontmatter, imported filenames, provider responses, model tool calls, YouTube
 responses, downloaded requirement bytes, helper output, and webview IPC arguments are untrusted.
 
@@ -31,7 +33,8 @@ responses, downloaded requirement bytes, helper output, and webview IPC argument
 2. Vault filesystem: notes and directory structure may be malformed, oversized, non-UTF-8, or
    symlinked.
 3. Model boundary: provider text and tool calls are untrusted proposals, not authority.
-4. Network boundary: OpenRouter, Hugging Face, GitHub release assets, and YouTube are external.
+4. Network boundary: OpenRouter, Hugging Face, GitHub updater manifests/release assets, and YouTube
+   are external and untrusted until their application-specific validation completes.
 5. Process boundary: Ollama, yt-dlp, POT, and transcription helpers run outside the Rust process.
 6. CI and build boundary: third-party actions, npm packages, crates, and downloaded tools can affect
    produced binaries and test verdicts.
@@ -48,7 +51,10 @@ responses, downloaded requirement bytes, helper output, and webview IPC argument
 | Ollama sidecar | port hijack, arbitrary model operation | loopback binding, child ownership/health checks, app-owned model store, curated pull/select/chat/delete tags |
 | YouTube helpers | command injection, ambient config/plugin execution, output DoS | typed YouTube URLs, fixed argv, no shell, absolute binaries, cleared environment, no config/default plugins, explicit pinned POT directory, time/output/cancel bounds |
 | Requirement installer | malicious archive/binary, race, partial install | compiled HTTPS URL and digest, streamed SHA-256, archive entry/type/size limits, install locks, atomic publication |
-| CI | mutable dependency execution, secret misuse | full action commit hashes, exact locked Rust tools, read-only token, no workflow secrets |
+| Application updater | manifest spoofing, malicious or downgraded archive, signing-key loss/theft | HTTPS production endpoint, mandatory Tauri artifact signature, embedded public key, strictly newer version comparison, explicit review/install consent, minimal updater/process capabilities |
+| Local updater harness | replacement of the real app, private-key leak, exposed local files, insecure transport escaping to production | distinct bundle identity, unique ignored target, owner-only key path, allowlisted build environment, exact loopback binding/routes, generated-only HTTP override, valid and one-byte-tampered archive journeys |
+| Contributor CI | mutable dependency execution, secret misuse | full action commit hashes, exact locked Rust tools, read-only token, no workflow secrets |
+| Release pipeline | signing-key exfiltration, write-token misuse, tag/ref race, artifact substitution, updater-key mismatch, trust-mode mislabelling | protected signing environment, secret-free preflight, protected immutable release tags, repeated remote tag-to-commit validation, read-only build token, signing-secret-free write publisher, fixed checksum-bound artifact set, updater signature verified with the configured public key before upload, exact-asset recovery check, explicit signing-mode notes, manifest published last |
 
 ## Threat analysis
 
@@ -102,13 +108,22 @@ only through explicit skill activation and can never bypass Rust write or citati
   metadata, captions, playlists, thumbnails, stderr, and process output.
 - Portable/system yt-dlp configuration and default plugin locations.
 - Archive traversal, symlink entries, oversized extraction, checksum mismatch, and concurrent install.
+- Spoofed, malformed, equal-version, downgraded, empty-signature, and wrong-signature updater manifests.
+- Local updater traversal requests, config/signature/key-file requests, non-loopback endpoints, and
+  harness app paths that resolve outside the unique session.
+- Release dispatch from a non-main ref, missing or moved tag, tag/main mismatch, missing mode-specific
+  credentials, absent ad-hoc acknowledgement, duplicate release or manifest, unexpected transferred
+  artifact, checksum mismatch, and an ad-hoc build labelled as notarized.
 
 ## Residual risk and review triggers
 
 - Revisit the model when full-source article/PDF capture, embeddings, sync, mobile, managed cloud AI,
-  plugin installation, or auto-update authority is added.
+  or plugin installation authority is added. Revisit updater controls when adding another release
+  origin, downgrade support, background installation, or key rotation.
 - Any new Tauri command, capability, external origin, helper binary, archive format, or model tool must
   be added to the boundary table and receive adversarial tests.
+- Gatekeeper friction is accepted for ad-hoc alpha builds until Developer ID credentials are
+  available. The release notes and runbook must not describe an ad-hoc build as Apple-verified.
 - A future Linux release should re-evaluate Tauri's GTK/WebKit dependency chain and RustSec
   informational advisories on the actual Linux target.
 - Sync or multiple identities will require authentication, authorization, conflict integrity, and an

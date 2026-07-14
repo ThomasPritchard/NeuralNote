@@ -1,7 +1,7 @@
 // The integrated titlebar (macOS overlay style). The webview extends
 // under the native traffic lights, so this bar draws the window chrome around
-// them: a traffic-light spacer clears the lights, then sidebar toggle + vault
-// switcher, the horizontally scrolling document tabs, and quiet window actions.
+// them: a traffic-light spacer clears the lights, then the navigation toggle,
+// horizontally scrolling document tabs, and quiet window actions.
 //
 // Dragging: a dedicated absolutely-positioned layer BEHIND the interactive
 // clusters carries `data-tauri-drag-region`; the clusters sit above it (z-10)
@@ -9,11 +9,10 @@
 // the drag layer and move the window. Native traffic-light clicks are OS-handled;
 // the spacer is padding on the left cluster, so it does not fall through.
 //
-// Pure presentation, prop-driven. Radix owns the vault menu's interaction state.
+// Pure presentation, prop-driven. Vault identity and actions live in Ribbon.
 
 import {
   AlertTriangle,
-  ChevronDown,
   LoaderCircle,
   Network,
   PanelLeft,
@@ -25,7 +24,6 @@ import {
 import { useEffect, useRef, type KeyboardEvent, type RefObject } from "react";
 import { IconButton } from "@/components/ui/icon-button";
 import { extFromPath, iconForFile } from "./fileMeta";
-import { VaultMenu } from "./VaultMenu";
 
 export interface TitleBarTabSummary {
   id: string;
@@ -50,11 +48,9 @@ export function noteTabPanelId(tabId: string): string {
 }
 
 export interface TitleBarProps {
-  /** Vault display name, shown in the switcher. */
-  vaultName: string;
-  /** Whether the left sidebar (FileTree/SearchPanel) is showing. */
-  sidebarOpen: boolean;
-  onToggleSidebar: () => void;
+  /** The user's navigation preference after responsive constraints. */
+  navigationExpanded: boolean;
+  onToggleNavigation: () => void;
   /** Whether the cited-recall chat panel is showing. */
   chatOpen: boolean;
   onToggleChat: () => void;
@@ -66,17 +62,11 @@ export interface TitleBarProps {
   onActivateTab: (tabId: string) => void;
   onCloseTab: (tabId: string) => void;
   onCloseGraph: () => void;
-  /** Vault-menu actions. */
-  onNewNote: () => void;
-  onNewFolder: () => void;
-  onRefresh: () => void;
-  onCloseVault: () => void;
 }
 
 export function TitleBar({
-  vaultName,
-  sidebarOpen,
-  onToggleSidebar,
+  navigationExpanded,
+  onToggleNavigation,
   chatOpen,
   onToggleChat,
   onOpenSettings,
@@ -86,47 +76,24 @@ export function TitleBar({
   onActivateTab,
   onCloseTab,
   onCloseGraph,
-  onNewNote,
-  onNewFolder,
-  onRefresh,
-  onCloseVault,
 }: Readonly<TitleBarProps>) {
   return (
     <header
       className="nn-titlebar relative grid h-(--titlebar-height) shrink-0 border-b border-border bg-titlebar"
-      data-sidebar-open={sidebarOpen}
+      data-navigation-expanded={navigationExpanded}
       data-chat-open={chatOpen}
     >
       {/* Drag layer — behind the z-10 clusters. If a button click ever moves
           the window instead of firing, this layering is what broke. */}
       <div data-tauri-drag-region aria-hidden className="absolute inset-0" />
 
-      {/* Left: traffic-light spacer (pl), sidebar toggle, vault switcher. */}
+      {/* Left: traffic-light spacer (pl), then navigation toggle. */}
       <div className="relative z-10 flex min-w-0 items-center gap-1 self-stretch pl-[74px] pr-2">
         <TitleBarButton
           icon={PanelLeft}
-          label="Toggle sidebar"
-          pressed={sidebarOpen}
-          onClick={onToggleSidebar}
-        />
-
-        {/* `relative` anchor for VaultMenu (the FileTree header idiom);
-            self-stretch makes `top-full` the bar's bottom edge. */}
-        <VaultMenu
-          trigger={
-            <button
-              type="button"
-              title="Vault actions"
-              className="flex min-w-0 max-w-48 items-center gap-1 rounded-md px-1.5 py-1 text-[0.8125rem] font-semibold text-sidebar-foreground transition-colors duration-150 ease-spring hover:bg-surface-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
-            >
-              <span className="truncate">{vaultName}</span>
-              <ChevronDown className="size-3.5 shrink-0 opacity-70" aria-hidden />
-            </button>
-          }
-          onNewNote={onNewNote}
-          onNewFolder={onNewFolder}
-          onRefresh={onRefresh}
-          onCloseVault={onCloseVault}
+          label="Toggle navigation sidebar"
+          pressed={navigationExpanded}
+          onClick={onToggleNavigation}
         />
       </div>
 

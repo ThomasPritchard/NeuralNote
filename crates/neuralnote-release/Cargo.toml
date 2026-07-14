@@ -1,0 +1,15 @@
+[package]
+name = "neuralnote-release"
+version = "0.1.1"
+edition = "2021"
+license = "AGPL-3.0-or-later"
+description = "Maintainer-only release integrity tools for NeuralNote."
+publish = false
+
+[dependencies]
+base64 = "0.22.1"
+minisign-verify = "0.2.5"
+
+[[bin]]
+name = "verify-updater-signature"
+path = "src/bin/verify-updater-signature.rs"

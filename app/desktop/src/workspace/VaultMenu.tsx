@@ -7,9 +7,16 @@ import {
   DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
+import {
+  Tooltip,
+  TooltipContent,
+  TooltipProvider,
+  TooltipTrigger,
+} from "@/components/ui/tooltip";
 
 interface VaultMenuProps {
   trigger?: ReactElement;
+  triggerTooltip?: string;
   onClose?: () => void;
   onNewNote: () => void;
   onNewFolder: () => void;
@@ -19,6 +26,7 @@ interface VaultMenuProps {
 
 export function VaultMenu({
   trigger,
+  triggerTooltip,
   onClose,
   onNewNote,
   onNewFolder,
@@ -34,13 +42,24 @@ export function VaultMenu({
         if (!open) onClose?.();
       }}
     >
-      <DropdownMenuTrigger asChild>
-        {trigger ?? (
+      {trigger ? (
+        <TooltipProvider delayDuration={250}>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <DropdownMenuTrigger asChild>
+                {trigger}
+              </DropdownMenuTrigger>
+            </TooltipTrigger>
+            {triggerTooltip && <TooltipContent>{triggerTooltip}</TooltipContent>}
+          </Tooltip>
+        </TooltipProvider>
+      ) : (
+        <DropdownMenuTrigger asChild>
           <button type="button" className="sr-only" aria-label="Vault actions menu">
             Vault actions
           </button>
-        )}
-      </DropdownMenuTrigger>
+        </DropdownMenuTrigger>
+      )}
       <DropdownMenuContent
         aria-labelledby="vault-actions-menu-label"
         onCloseAutoFocus={(event) => {

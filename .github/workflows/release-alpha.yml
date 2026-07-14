@@ -1,49 +1,139 @@
 name: release-macos-alpha
 
 on:
-  push:
-    tags:
-      - "0.1.0"
-      - "v0.1.0"
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing or new tag for the 0.1.0 alpha release
+        description: Existing tag for the 0.1.1 alpha release
         required: true
-        default: v0.1.0
+        default: v0.1.1
+      signing_mode:
+        description: macOS signing and trust mode
+        type: choice
+        required: true
+        default: ad-hoc
+        options:
+          - ad-hoc
+          - developer-id
+      confirm_unnotarized:
+        description: I understand that an ad-hoc build is unnotarized and may require macOS approval
+        type: boolean
+        required: true
+        default: false
 
 concurrency:
   group: release-macos-alpha
   cancel-in-progress: false
 
-# The job creates one release and updates one dedicated manifest branch. No other
-# repository, issue, package, or workflow permission is granted.
+# Quality checks and signing run without a repository write token. A separate
+# signing-secret-free job receives write access only after the release artifacts exist.
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
-    name: Sign and publish Apple Silicon alpha
+  preflight:
+    name: Validate manual release request
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Reject untrusted release dispatch
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+          CONFIRM_UNNOTARIZED: ${{ inputs.confirm_unnotarized }}
+          DISPATCH_REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          if [ "$DISPATCH_REF" != "refs/heads/main" ]; then
+            echo "::error::Release runs must be dispatched from main"
+            exit 1
+          fi
+          case "$RELEASE_TAG" in
+            0.1.1|v0.1.1) ;;
+            *) echo "::error::Release tag must be 0.1.1 or v0.1.1"; exit 1 ;;
+          esac
+          case "$SIGNING_MODE" in
+            ad-hoc|developer-id) ;;
+            *) echo "::error::Unknown signing mode"; exit 1 ;;
+          esac
+          if [ "$SIGNING_MODE" = "ad-hoc" ] && [ "$CONFIRM_UNNOTARIZED" != "true" ]; then
+            echo "::error::Ad-hoc releases require explicit unnotarized-build confirmation"
+            exit 1
+          fi
+
+  build:
+    name: Verify, sign, and stage Apple Silicon alpha
+    needs: preflight
+    environment: release
     runs-on: macos-14
     timeout-minutes: 90
+    permissions:
+      contents: read
+    outputs:
+      release_sha: ${{ steps.release_source.outputs.RELEASE_SHA }}
     env:
-      RELEASE_VERSION: 0.1.0
-      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.release_tag || github.ref_name }}
+      RELEASE_VERSION: 0.1.1
+      RELEASE_TAG: ${{ inputs.release_tag }}
 
     steps:
-      - name: Check out the release commit
+      - name: Check out the existing release tag
         uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
         with:
+          ref: refs/tags/${{ inputs.release_tag }}
           fetch-depth: 0
+          persist-credentials: false
+
+      - name: Validate release source and signing choice
+        id: release_source
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag }}
+          SIGNING_MODE: ${{ inputs.signing_mode }}
+          CONFIRM_UNNOTARIZED: ${{ inputs.confirm_unnotarized }}
+          DISPATCH_REF: ${{ github.ref }}
+          DISPATCH_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$DISPATCH_REF" != "refs/heads/main" ]; then
+            echo "::error::Release runs must be dispatched from main"
+            exit 1
+          fi
+          case "$RELEASE_TAG" in
+            0.1.1|v0.1.1) ;;
+            *) echo "::error::Release tag must be 0.1.1 or v0.1.1"; exit 1 ;;
+          esac
+          case "$SIGNING_MODE" in
+            ad-hoc|developer-id) ;;
+            *) echo "::error::Unknown signing mode"; exit 1 ;;
+          esac
+          if [ "$SIGNING_MODE" = "ad-hoc" ] && [ "$CONFIRM_UNNOTARIZED" != "true" ]; then
+            echo "::error::Ad-hoc releases require explicit unnotarized-build confirmation"
+            exit 1
+          fi
+          git show-ref --verify "refs/tags/$RELEASE_TAG"
+          RELEASE_SHA="$(git rev-list -n 1 "$RELEASE_TAG")"
+          CHECKED_OUT_SHA="$(git rev-parse HEAD)"
+          if [ "$RELEASE_SHA" != "$CHECKED_OUT_SHA" ]; then
+            echo "::error::Checked-out commit does not match the release tag"
+            exit 1
+          fi
+          if [ "$RELEASE_SHA" != "$DISPATCH_SHA" ]; then
+            echo "::error::Release tag must point at the current main commit"
+            exit 1
+          fi
+          printf 'RELEASE_SHA=%s\n' "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Configure temporary release paths
         run: |
           {
             echo "RELEASE_CONFIG=$RUNNER_TEMP/tauri.release.conf.json"
             echo "RELEASE_MANIFEST=$RUNNER_TEMP/latest-alpha.json"
+            echo "RELEASE_ARTIFACT_DIR=$RUNNER_TEMP/release-artifacts"
             echo "BUILD_KEYCHAIN=$RUNNER_TEMP/neuralnote-build.keychain-db"
             echo "CERTIFICATE_PATH=$RUNNER_TEMP/neuralnote-certificate.p12"
           } >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/release-artifacts"
 
       - name: Set up Rust 1.96
         uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
@@ -52,38 +142,29 @@ jobs:
           targets: aarch64-apple-darwin
           components: clippy,rustfmt,llvm-tools-preview
 
-      - name: Set up Node 22
+      - name: Set up Node 24 LTS
         uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
         with:
-          node-version: 22
+          node-version: 24
           cache: npm
           cache-dependency-path: app/desktop/package-lock.json
 
-      - name: Validate release tag and all application versions
+      - name: Validate application versions and workflow contract
         working-directory: app/desktop
         run: |
           set -euo pipefail
           node ../../scripts/check-release-workflow.mjs
-          case "$RELEASE_TAG" in
-            0.1.0|v0.1.0) ;;
-            *) echo "::error::Release tag must be 0.1.0 or v0.1.0"; exit 1 ;;
-          esac
           node <<'NODE'
           const fs = require('node:fs');
           const packageVersion = JSON.parse(fs.readFileSync('package.json', 'utf8')).version;
           const tauriVersion = JSON.parse(fs.readFileSync('src-tauri/tauri.conf.json', 'utf8')).version;
           const cargo = fs.readFileSync('src-tauri/Cargo.toml', 'utf8');
-          const workflow = fs.readFileSync('../../.github/workflows/release-alpha.yml', 'utf8');
           const cargoVersion = cargo.match(/^version = "([^"]+)"$/m)?.[1];
           const versions = { packageVersion, tauriVersion, cargoVersion };
           for (const [source, version] of Object.entries(versions)) {
             if (version !== process.env.RELEASE_VERSION) {
               throw new Error(`${source} is ${version}; expected ${process.env.RELEASE_VERSION}`);
             }
-          }
-          const actionLines = workflow.split('\n').filter((line) => /^\s+uses:/.test(line));
-          if (!actionLines.length || actionLines.some((line) => !/@[a-f0-9]{40}(?:\s|#|$)/.test(line))) {
-            throw new Error('Every release action must be pinned to a full commit SHA');
           }
           NODE
 
@@ -109,7 +190,7 @@ jobs:
           npm --prefix app/desktop run coverage
           npm --prefix app/desktop run build
           npm --prefix app/desktop run check:bindings
-          npm --prefix app/desktop audit --audit-level=high
+          npm --prefix app/desktop run audit:all
           cargo test --workspace --locked
           ./scripts/rust-quality-gate.sh
 
@@ -117,23 +198,34 @@ jobs:
         env:
           TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
+          SIGNING_MODE: ${{ inputs.signing_mode }}
         run: |
           set -euo pipefail
-          for name in TAURI_UPDATER_PUBLIC_KEY APPLE_SIGNING_IDENTITY; do
-            if [ -z "${!name:-}" ]; then
-              echo "::error::$name is not configured"
-              exit 1
-            fi
-          done
+          if [ -z "$TAURI_UPDATER_PUBLIC_KEY" ]; then
+            echo "::error::TAURI_UPDATER_PUBLIC_KEY is not configured"
+            exit 1
+          fi
+          if [ "$SIGNING_MODE" = "developer-id" ] && [ -z "$APPLE_SIGNING_IDENTITY" ]; then
+            echo "::error::APPLE_SIGNING_IDENTITY is required for Developer ID releases"
+            exit 1
+          fi
           node <<'NODE'
           const fs = require('node:fs');
           const key = process.env.TAURI_UPDATER_PUBLIC_KEY;
+          const signingMode = process.env.SIGNING_MODE;
+          const signingIdentity = signingMode === "ad-hoc" ? "-" : process.env.APPLE_SIGNING_IDENTITY;
           if (!key || key.length < 40 || /PRIVATE KEY/i.test(key)) {
             throw new Error('TAURI_UPDATER_PUBLIC_KEY is not a valid public verification key');
           }
+          if (!["ad-hoc", "developer-id"].includes(signingMode)) {
+            throw new Error('Unknown macOS signing mode');
+          }
           fs.writeFileSync(
             process.env.RELEASE_CONFIG,
-            JSON.stringify({ plugins: { updater: { pubkey: key } } }),
+            JSON.stringify({
+              bundle: { macOS: { signingIdentity } },
+              plugins: { updater: { pubkey: key } },
+            }),
             { mode: 0o600 },
           );
           NODE
@@ -142,12 +234,19 @@ jobs:
         run: ./scripts/fetch-ollama-sidecar.sh
 
       - name: Import Apple Developer ID certificate
+        if: ${{ inputs.signing_mode == 'developer-id' }}
         env:
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
         run: |
           set -euo pipefail
+          for name in APPLE_CERTIFICATE APPLE_CERTIFICATE_PASSWORD KEYCHAIN_PASSWORD; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name is required for Developer ID releases"
+              exit 1
+            fi
+          done
           printf '%s' "$APPLE_CERTIFICATE" | base64 --decode > "$CERTIFICATE_PATH"
           chmod 600 "$CERTIFICATE_PATH"
           security create-keychain -p "$KEYCHAIN_PASSWORD" "$BUILD_KEYCHAIN"
@@ -158,7 +257,22 @@ jobs:
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$BUILD_KEYCHAIN"
           rm -f "$CERTIFICATE_PATH"
 
-      - name: Build, sign, and notarize Apple Silicon bundles
+      - name: Build ad-hoc Apple Silicon bundles
+        if: ${{ inputs.signing_mode == 'ad-hoc' }}
+        working-directory: app/desktop
+        env:
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$TAURI_SIGNING_PRIVATE_KEY" ]; then
+            echo "::error::TAURI_SIGNING_PRIVATE_KEY is not configured"
+            exit 1
+          fi
+          npm run tauri build -- --target aarch64-apple-darwin --bundles app,dmg --config "$RELEASE_CONFIG"
+
+      - name: Build Developer ID Apple Silicon bundles
+        if: ${{ inputs.signing_mode == 'developer-id' }}
         working-directory: app/desktop
         env:
           APPLE_SIGNING_IDENTITY: ${{ vars.APPLE_SIGNING_IDENTITY }}
@@ -169,28 +283,55 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         run: |
           set -euo pipefail
+          for name in APPLE_SIGNING_IDENTITY APPLE_ID APPLE_PASSWORD APPLE_TEAM_ID TAURI_SIGNING_PRIVATE_KEY; do
+            if [ -z "${!name:-}" ]; then
+              echo "::error::$name is required for Developer ID releases"
+              exit 1
+            fi
+          done
           npm run tauri build -- --target aarch64-apple-darwin --bundles app,dmg --config "$RELEASE_CONFIG"
 
-      - name: Verify signed app and locate artifacts
+      - name: Verify signed app and locate release artifacts
+        env:
+          SIGNING_MODE: ${{ inputs.signing_mode }}
         run: |
           set -euo pipefail
           BUNDLE_DIR="target/aarch64-apple-darwin/release/bundle"
-          APP_BUNDLE="$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' -print -quit)"
-          UPDATE_BUNDLE="$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app.tar.gz' -print -quit)"
-          DMG_BUNDLE="$(find "$BUNDLE_DIR/dmg" -maxdepth 1 -name '*.dmg' -print -quit)"
-          test -d "$APP_BUNDLE"
-          test -f "$UPDATE_BUNDLE"
-          test -f "$UPDATE_BUNDLE.sig"
-          test -f "$DMG_BUNDLE"
+          APP_COUNT="$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' -type d | wc -l | tr -d ' ')"
+          UPDATE_COUNT="$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app.tar.gz' -type f | wc -l | tr -d ' ')"
+          DMG_COUNT="$(find "$BUNDLE_DIR/dmg" -maxdepth 1 -name '*.dmg' -type f | wc -l | tr -d ' ')"
+          if [ "$APP_COUNT" != "1" ] || [ "$UPDATE_COUNT" != "1" ] || [ "$DMG_COUNT" != "1" ]; then
+            echo "::error::Expected exactly one app, updater archive, and DMG"
+            exit 1
+          fi
+          APP_BUNDLE="$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app' -type d -print -quit)"
+          UPDATE_BUNDLE="$(find "$BUNDLE_DIR/macos" -maxdepth 1 -name '*.app.tar.gz' -type f -print -quit)"
+          UPDATE_SIGNATURE="$UPDATE_BUNDLE.sig"
+          DMG_BUNDLE="$(find "$BUNDLE_DIR/dmg" -maxdepth 1 -name '*.dmg' -type f -print -quit)"
+          test -f "$UPDATE_SIGNATURE"
           codesign --verify --deep --strict --verbose=2 "$APP_BUNDLE"
-          spctl --assess --type execute --verbose=2 "$APP_BUNDLE"
+          if [ "$SIGNING_MODE" = "developer-id" ]; then
+            spctl --assess --type execute --verbose=2 "$APP_BUNDLE"
+          else
+            SIGNATURE_INFO="$(codesign --display --verbose=4 "$APP_BUNDLE" 2>&1)"
+            printf '%s\n' "$SIGNATURE_INFO" | grep -Fx "Signature=adhoc"
+          fi
           printf 'UPDATE_BUNDLE=%s\n' "$UPDATE_BUNDLE" >> "$GITHUB_ENV"
-          printf 'UPDATE_SIGNATURE=%s\n' "$UPDATE_BUNDLE.sig" >> "$GITHUB_ENV"
+          printf 'UPDATE_SIGNATURE=%s\n' "$UPDATE_SIGNATURE" >> "$GITHUB_ENV"
           printf 'DMG_BUNDLE=%s\n' "$DMG_BUNDLE" >> "$GITHUB_ENV"
 
-      - name: Build and validate latest-alpha.json
+      - name: Verify updater archive signature
+        env:
+          TAURI_UPDATER_PUBLIC_KEY: ${{ vars.TAURI_UPDATER_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          cargo run --locked --package neuralnote-release --bin verify-updater-signature -- \
+            "$UPDATE_BUNDLE" "$UPDATE_SIGNATURE"
+
+      - name: Generate updater manifest and stage release artifacts
         env:
           RELEASE_ASSET_BASE: https://github.com/${{ github.repository }}/releases/download
+          SIGNING_MODE: ${{ inputs.signing_mode }}
         run: |
           set -euo pipefail
           node <<'NODE'
@@ -199,9 +340,12 @@ jobs:
           const signature = fs.readFileSync(process.env.UPDATE_SIGNATURE, 'utf8').trim();
           if (!signature) throw new Error('Updater signature is empty');
           const artifactName = path.basename(process.env.UPDATE_BUNDLE);
+          const isAdHoc = process.env.SIGNING_MODE === 'ad-hoc';
           const manifest = {
             version: process.env.RELEASE_VERSION,
-            notes: 'NeuralNote 0.1.0 ALPHA',
+            notes: isAdHoc
+              ? 'NeuralNote 0.1.1 ALPHA. Ad-hoc signed and unnotarized.'
+              : 'NeuralNote 0.1.1 ALPHA. Developer ID signed and notarized.',
             pub_date: new Date().toISOString(),
             platforms: {
               'darwin-aarch64': {
@@ -215,55 +359,286 @@ jobs:
           }
           fs.writeFileSync(process.env.RELEASE_MANIFEST, `${JSON.stringify(manifest, null, 2)}\n`);
           const parsed = JSON.parse(fs.readFileSync(process.env.RELEASE_MANIFEST, 'utf8'));
-          if (parsed.version !== '0.1.0' || !parsed.platforms?.['darwin-aarch64']?.signature) {
+          if (
+            parsed.version !== process.env.RELEASE_VERSION ||
+            !parsed.platforms?.['darwin-aarch64']?.signature
+          ) {
             throw new Error('Generated alpha manifest is incomplete');
           }
           NODE
 
-      - name: Publish 0.1.0 ALPHA GitHub release
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          gh release create "$RELEASE_TAG" \
-            "$DMG_BUNDLE" \
-            "$UPDATE_BUNDLE" \
-            "$UPDATE_SIGNATURE" \
-            "$RELEASE_MANIFEST" \
-            --target "$GITHUB_SHA" \
-            --title "0.1.0 ALPHA" \
-            --notes "NeuralNote 0.1.0 ALPHA. This macOS build targets Apple Silicon." \
-            --prerelease
+          cp "$DMG_BUNDLE" "$RELEASE_ARTIFACT_DIR/"
+          cp "$UPDATE_BUNDLE" "$RELEASE_ARTIFACT_DIR/"
+          cp "$UPDATE_SIGNATURE" "$RELEASE_ARTIFACT_DIR/"
+          cp "$RELEASE_MANIFEST" "$RELEASE_ARTIFACT_DIR/latest-alpha.json"
+          (
+            cd "$RELEASE_ARTIFACT_DIR"
+            shasum -a 256 *.dmg *.app.tar.gz *.app.tar.gz.sig latest-alpha.json > SHA256SUMS
+          )
 
-      # This is deliberately last: clients never see a manifest until the signed
-      # artifact, signature, and GitHub release have all succeeded.
-      - name: Publish dedicated release-manifests branch
-        run: |
-          set -euo pipefail
-          MANIFEST_WORKTREE="$RUNNER_TEMP/release-manifests"
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          if git ls-remote --exit-code --heads origin release-manifests >/dev/null 2>&1; then
-            git fetch origin release-manifests
-            git worktree add -B release-manifests "$MANIFEST_WORKTREE" origin/release-manifests
-          else
-            git worktree add --detach "$MANIFEST_WORKTREE"
-            git -C "$MANIFEST_WORKTREE" switch --orphan release-manifests
-            git -C "$MANIFEST_WORKTREE" rm -rf .
-          fi
-          cp "$RELEASE_MANIFEST" "$MANIFEST_WORKTREE/latest-alpha.json"
-          git -C "$MANIFEST_WORKTREE" add latest-alpha.json
-          if git -C "$MANIFEST_WORKTREE" diff --cached --quiet; then
-            echo "::error::release-manifests already contains this manifest"
-            exit 1
-          fi
-          git -C "$MANIFEST_WORKTREE" commit -m "release: publish NeuralNote 0.1.0 alpha manifest"
-          git -C "$MANIFEST_WORKTREE" push origin HEAD:release-manifests
+      - name: Upload validated release artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: neuralnote-macos-alpha
+          path: ${{ runner.temp }}/release-artifacts
+          if-no-files-found: error
+          retention-days: 1
 
       - name: Remove temporary signing keychain
-        if: always()
+        if: ${{ always() && inputs.signing_mode == 'developer-id' }}
         run: |
           rm -f "$CERTIFICATE_PATH"
           if [ -f "$BUILD_KEYCHAIN" ]; then
             security delete-keychain "$BUILD_KEYCHAIN"
           fi
+
+  publish:
+    name: Publish Apple Silicon alpha
+    needs: build
+    if: ${{ github.ref == 'refs/heads/main' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      actions: read
+      contents: write
+    env:
+      RELEASE_VERSION: 0.1.1
+      RELEASE_TAG: ${{ inputs.release_tag }}
+      RELEASE_SHA: ${{ needs.build.outputs.release_sha }}
+      SIGNING_MODE: ${{ inputs.signing_mode }}
+      RELEASE_ARTIFACT_DIR: ${{ runner.temp }}/release-artifacts
+
+    steps:
+      - name: Download validated release artifacts
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
+        with:
+          name: neuralnote-macos-alpha
+          path: ${{ runner.temp }}/release-artifacts
+
+      - name: Validate downloaded release artifacts
+        run: |
+          set -euo pipefail
+          EXPECTED_FILE_COUNT=5
+          ACTUAL_FILE_COUNT="$(find "$RELEASE_ARTIFACT_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+          if [ "$ACTUAL_FILE_COUNT" != "$EXPECTED_FILE_COUNT" ]; then
+            echo "::error::Release artifact set contains missing or unexpected files"
+            exit 1
+          fi
+          (
+            cd "$RELEASE_ARTIFACT_DIR"
+            sha256sum --check SHA256SUMS
+          )
+          UPDATE_COUNT="$(find "$RELEASE_ARTIFACT_DIR" -maxdepth 1 -name '*.app.tar.gz' -type f | wc -l | tr -d ' ')"
+          DMG_COUNT="$(find "$RELEASE_ARTIFACT_DIR" -maxdepth 1 -name '*.dmg' -type f | wc -l | tr -d ' ')"
+          if [ "$UPDATE_COUNT" != "1" ] || [ "$DMG_COUNT" != "1" ]; then
+            echo "::error::Expected exactly one updater archive and DMG"
+            exit 1
+          fi
+          UPDATE_BUNDLE="$(find "$RELEASE_ARTIFACT_DIR" -maxdepth 1 -name '*.app.tar.gz' -type f -print -quit)"
+          UPDATE_SIGNATURE="$UPDATE_BUNDLE.sig"
+          DMG_BUNDLE="$(find "$RELEASE_ARTIFACT_DIR" -maxdepth 1 -name '*.dmg' -type f -print -quit)"
+          RELEASE_MANIFEST="$RELEASE_ARTIFACT_DIR/latest-alpha.json"
+          test -f "$UPDATE_SIGNATURE"
+          test -f "$RELEASE_MANIFEST"
+          export UPDATE_BUNDLE UPDATE_SIGNATURE DMG_BUNDLE RELEASE_MANIFEST
+          node <<'NODE'
+          const fs = require('node:fs');
+          const path = require('node:path');
+          const manifest = JSON.parse(fs.readFileSync(process.env.RELEASE_MANIFEST, 'utf8'));
+          const platform = manifest.platforms?.['darwin-aarch64'];
+          const expectedUrl =
+            `https://github.com/${process.env.GITHUB_REPOSITORY}/releases/download/` +
+            `${process.env.RELEASE_TAG}/${path.basename(process.env.UPDATE_BUNDLE)}`;
+          const signature = fs.readFileSync(process.env.UPDATE_SIGNATURE, 'utf8').trim();
+          if (
+            manifest.version !== process.env.RELEASE_VERSION ||
+            platform?.url !== expectedUrl ||
+            platform?.signature !== signature ||
+            !signature
+          ) {
+            throw new Error('Downloaded release manifest does not match the signed updater artifact');
+          }
+          NODE
+          {
+            echo "UPDATE_BUNDLE=$UPDATE_BUNDLE"
+            echo "UPDATE_SIGNATURE=$UPDATE_SIGNATURE"
+            echo "DMG_BUNDLE=$DMG_BUNDLE"
+            echo "RELEASE_MANIFEST=$RELEASE_MANIFEST"
+          } >> "$GITHUB_ENV"
+
+      - name: Create draft GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          resolve_remote_tag_sha() {
+            local tag_type tag_sha
+            read -r tag_type tag_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+                --jq '.object.type + " " + .object.sha'
+            )
+            while [ "$tag_type" = "tag" ]; do
+              read -r tag_type tag_sha < <(
+                gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" \
+                  --jq '.object.type + " " + .object.sha'
+              )
+            done
+            if [ "$tag_type" != "commit" ] || [ -z "$tag_sha" ]; then
+              echo "::error::Release tag did not resolve to a commit" >&2
+              return 1
+            fi
+            printf '%s\n' "$tag_sha"
+          }
+          REMOTE_TAG_SHA="$(resolve_remote_tag_sha)"
+          if [ "$REMOTE_TAG_SHA" != "$RELEASE_SHA" ]; then
+            echo "::error::Release tag moved after the signed build completed"
+            exit 1
+          fi
+          if [ "$SIGNING_MODE" = "ad-hoc" ]; then
+            RELEASE_TITLE="0.1.1 ALPHA (ad-hoc signed, unnotarized)"
+            RELEASE_NOTES="NeuralNote 0.1.1 ALPHA for Apple Silicon. This build is ad-hoc signed and unnotarized. macOS may block it until the user allows it in System Settings > Privacy & Security. The Tauri updater signature authenticates update archives independently and does not satisfy Gatekeeper."
+          else
+            RELEASE_TITLE="0.1.1 ALPHA"
+            RELEASE_NOTES="NeuralNote 0.1.1 ALPHA for Apple Silicon. This build is Developer ID signed and notarized."
+          fi
+          if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            read -r RELEASE_IS_DRAFT RELEASE_IS_PRERELEASE < <(
+              gh release view "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json isDraft,isPrerelease \
+                --jq '[.isDraft, .isPrerelease] | @tsv'
+            )
+            if [ "$RELEASE_IS_PRERELEASE" != "true" ]; then
+              echo "::error::Existing release is not a prerelease"
+              exit 1
+            fi
+            RELEASE_NAME="$(
+              gh release view "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json name \
+                --jq '.name'
+            )"
+            RELEASE_BODY="$(
+              gh release view "$RELEASE_TAG" \
+                --repo "$GITHUB_REPOSITORY" \
+                --json body \
+                --jq '.body'
+            )"
+            if [ "$RELEASE_NAME" != "$RELEASE_TITLE" ]; then
+              echo "::error::Existing release title does not match the selected signing mode"
+              exit 1
+            fi
+            if [ "$RELEASE_BODY" != "$RELEASE_NOTES" ]; then
+              echo "::error::Existing release notes do not match the selected signing mode"
+              exit 1
+            fi
+            REMOTE_ASSET_DIR="$RUNNER_TEMP/existing-release-assets"
+            mkdir -p "$REMOTE_ASSET_DIR"
+            gh release download "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --dir "$REMOTE_ASSET_DIR"
+            REMOTE_ASSET_COUNT="$(find "$REMOTE_ASSET_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')"
+            if [ "$REMOTE_ASSET_COUNT" != "4" ]; then
+              echo "::error::Existing release has an unexpected asset set"
+              exit 1
+            fi
+            for local_asset in "$DMG_BUNDLE" "$UPDATE_BUNDLE" "$UPDATE_SIGNATURE" "$RELEASE_MANIFEST"; do
+              remote_asset="$REMOTE_ASSET_DIR/$(basename "$local_asset")"
+              test -f "$remote_asset"
+              cmp -- "$local_asset" "$remote_asset"
+            done
+            echo "RELEASE_ALREADY_EXISTS=true" >> "$GITHUB_ENV"
+            if [ "$RELEASE_IS_DRAFT" = "false" ]; then
+              echo "RELEASE_ALREADY_PUBLISHED=true" >> "$GITHUB_ENV"
+            fi
+          else
+            gh release create "$RELEASE_TAG" \
+              "$DMG_BUNDLE" \
+              "$UPDATE_BUNDLE" \
+              "$UPDATE_SIGNATURE" \
+              "$RELEASE_MANIFEST" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --target "$RELEASE_SHA" \
+              --title "$RELEASE_TITLE" \
+              --notes "$RELEASE_NOTES" \
+              --draft \
+              --prerelease \
+              --latest=false
+          fi
+
+      - name: Publish GitHub prerelease
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          resolve_remote_tag_sha() {
+            local tag_type tag_sha
+            read -r tag_type tag_sha < <(
+              gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$RELEASE_TAG" \
+                --jq '.object.type + " " + .object.sha'
+            )
+            while [ "$tag_type" = "tag" ]; do
+              read -r tag_type tag_sha < <(
+                gh api "repos/$GITHUB_REPOSITORY/git/tags/$tag_sha" \
+                  --jq '.object.type + " " + .object.sha'
+              )
+            done
+            if [ "$tag_type" != "commit" ] || [ -z "$tag_sha" ]; then
+              echo "::error::Release tag did not resolve to a commit" >&2
+              return 1
+            fi
+            printf '%s\n' "$tag_sha"
+          }
+          REMOTE_TAG_SHA="$(resolve_remote_tag_sha)"
+          if [ "$REMOTE_TAG_SHA" != "$RELEASE_SHA" ]; then
+            echo "::error::Release tag moved before prerelease publication"
+            exit 1
+          fi
+          if [ "${RELEASE_ALREADY_PUBLISHED:-false}" = "true" ]; then
+            echo "Existing prerelease assets match; resuming manifest publication"
+          else
+            gh release edit "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --draft=false \
+              --prerelease \
+              --latest=false
+          fi
+          RELEASE_IS_IMMUTABLE="$(
+            gh release view "$RELEASE_TAG" \
+              --repo "$GITHUB_REPOSITORY" \
+              --json isImmutable \
+              --jq '.isImmutable'
+          )"
+          if [ "$RELEASE_IS_IMMUTABLE" != "true" ]; then
+            echo "::error::Published release is not immutable; enable release immutability before exposing the updater manifest"
+            exit 1
+          fi
+
+      # This remains last: clients never see a manifest until the signed artifact,
+      # checksum-validated transfer, and public GitHub prerelease all exist.
+      - name: Publish dedicated release-manifests branch
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          MANIFEST_WORKTREE="$RUNNER_TEMP/release-manifests"
+          git init "$MANIFEST_WORKTREE"
+          git -C "$MANIFEST_WORKTREE" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
+          gh auth setup-git
+          if git ls-remote --exit-code --heads origin release-manifests >/dev/null 2>&1; then
+            git -C "$MANIFEST_WORKTREE" fetch --depth=1 origin release-manifests
+            git -C "$MANIFEST_WORKTREE" checkout -b release-manifests FETCH_HEAD
+          else
+            git -C "$MANIFEST_WORKTREE" checkout --orphan release-manifests
+          fi
+          cp "$RELEASE_MANIFEST" "$MANIFEST_WORKTREE/latest-alpha.json"
+          git -C "$MANIFEST_WORKTREE" config user.name "github-actions[bot]"
+          git -C "$MANIFEST_WORKTREE" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git -C "$MANIFEST_WORKTREE" add latest-alpha.json
+          if git -C "$MANIFEST_WORKTREE" diff --cached --quiet; then
+            echo "release-manifests already contains this manifest; nothing to publish"
+            exit 0
+          fi
+          git -C "$MANIFEST_WORKTREE" commit -m "release: publish NeuralNote 0.1.1 alpha manifest"
+          git -C "$MANIFEST_WORKTREE" push origin HEAD:release-manifests

@@ -18,7 +18,7 @@ Do not infer that a planned feature already exists. Keep the README distinction 
 
 An agent that has not worked in this checkout must establish the local baseline before editing:
 
-1. Confirm Node.js 22, npm, Rust 1.96, Cargo, and the operating-system prerequisites for Tauri 2 are installed.
+1. Confirm Node.js 24 LTS (preferred) or Node.js 22.12 or later in the 22.x release line, npm, Rust 1.96, Cargo, and the operating-system prerequisites for Tauri 2 are installed.
 2. Install locked frontend dependencies with `npm --prefix app/desktop ci`. Do not update a lockfile during setup.
 3. Confirm the Rust components and quality tools are available. If they are missing,
    request approval before installing them with:
@@ -40,6 +40,8 @@ An agent that has not worked in this checkout must establish the local baseline 
    ```
 
 Do not install software, start a large service, or alter credentials without approval. A failed or unavailable prerequisite is a blocker to report, not permission to work around the repository's controls.
+
+Frontend pull-request CI runs the fast checks on both supported Node.js lines. Release and native end-to-end workflows use Node.js 24 LTS.
 
 ### Local SonarQube
 

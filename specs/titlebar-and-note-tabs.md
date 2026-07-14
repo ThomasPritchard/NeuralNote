@@ -19,9 +19,10 @@ opens a separate tab, and open paths are restored for each vault.
 - Set the initial macOS traffic-light position to `{ x: 16, y: 23 }`, then verify
   the result in a real Tauri window against the reference image. Any adjustment
   must be based on that screenshot comparison rather than an unmeasured offset.
-- Keep the sidebar toggle and vault switcher aligned on the same vertical axis as
-  the traffic lights.
-- Place the tab strip after the vault cluster and align its bottom edge with the
+- Keep the navigation toggle aligned on the same vertical axis as the traffic
+  lights. The vault identity and vault switcher live at the top of navigation,
+  not in the titlebar.
+- Place the tab strip at the editor column and align its bottom edge with the
   titlebar border.
 - Render tabs 36 pixels high with top corners only. The active tab uses the note
   pane surface, has no visible bottom border, and reads as attached to the note
@@ -34,6 +35,45 @@ opens a separate tab, and open paths are restored for each vault.
   the active tab scrolls into view automatically. No overflow menu is included in
   this slice.
 - Preserve the dedicated Tauri drag layer behind all interactive controls.
+
+## Workspace navigation and pane geometry
+
+- Replace the icon-only ribbon with a navigation sidebar that is 56 CSS pixels
+  wide in compact mode and 192 pixels wide in expanded mode. Expanded mode shows
+  the vault identity, vault actions, and a labelled `Quick links` group for Files,
+  Search, Insert from template, and Graph view. Compact controls retain accessible
+  names, visible tooltips, active states, and visible focus indicators. Keep the
+  56-CSS-pixel icon gutter fixed at every font scale while labels translate and
+  fade so controls do not jump during the width transition.
+- Keep Files and Search in a distinct primary pane. Navigation selects which view
+  is active; expanding or compacting navigation does not hide, unmount, or reset
+  that pane. The titlebar and native View-menu toggle change navigation expansion
+  only. The native action id remains `toggle-sidebar` for compatibility, while its
+  label is `Toggle Navigation Sidebar`.
+- Make the Files/Search pane 296 pixels wide by default and resizable from 192 to
+  420 pixels. Its approximately 8-pixel hit target surrounds a quiet 1-pixel
+  visual divider and has a visible keyboard focus state.
+- Implement the resize control as a vertical `role="separator"` that exposes the
+  controlled pane id and its current, minimum, and maximum widths. Pointer input
+  uses capture so drags continue outside the handle. Left and Right resize by 8
+  pixels, Shift+Left and Shift+Right by 32 pixels, Home and End select the bounds,
+  and Enter toggles between 192 pixels and the previous width.
+- Store the preferred `navigationExpanded` and `sidebarWidth` values as global,
+  frontend-only `WorkspaceLayoutState` under the versioned
+  `nn:workspace-layout:v1` local-storage key. Validate stored types and finite
+  widths. Missing or malformed data falls back to expanded navigation and 296
+  pixels. Storage failures do not block the workspace.
+- Derive effective geometry from the measured workspace width, accounting for the
+  navigation and chat slots' current rendered widths during animation. Reserve
+  an opening chat's full target width immediately so responsive navigation
+  compaction starts alongside it. Preserve at least 192 pixels for Files/Search
+  and 240 pixels for the editor. Clamp the pane temporarily when space is tight;
+  if expanded navigation cannot preserve both minimums, use compact navigation
+  temporarily without changing the saved preference. Restore both preferences
+  when space returns.
+- Feed the effective navigation and Files/Search widths into the workspace's
+  shared CSS variables. The titlebar consumes the same values so the note-tab
+  strip remains aligned with the editor during dragging and responsive changes.
 
 ## Tab state model
 

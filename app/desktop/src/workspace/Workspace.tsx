@@ -1,4 +1,4 @@
-// The workspace: ribbon · file tree / search panel · reader/editor / graph ·
+// The workspace: navigation · file tree / search panel · reader/editor / graph ·
 // cited-chat stub · status bar. This orchestrator owns the multi-note tab state,
 // the Workspace-local view state (which sidebar panel and
 // center view are showing — deliberately NOT in the vault store), and the
@@ -14,6 +14,7 @@ import {
   useReducer,
   useRef,
   useState,
+  type CSSProperties,
 } from "react";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -28,6 +29,7 @@ import { normSep } from "./fileMeta";
 import { GraphView } from "./GraphView";
 import { buildNoteIndex, type NoteIndexEntry } from "./linkResolve";
 import { NotePane } from "./NotePane";
+import { PaneSplitter } from "./PaneSplitter";
 import { Ribbon, type CenterView, type SidebarPanel } from "./Ribbon";
 import { SearchPanel } from "./SearchPanel";
 import { SettingsModal, type SettingsSection } from "./SettingsModal";
@@ -43,6 +45,13 @@ import {
 } from "./TitleBar";
 import type { CreateKind } from "./TreeRow";
 import { useNoteTabs, type NoteTab } from "./useNoteTabs";
+import {
+  deriveEffectiveWorkspaceLayout,
+  loadWorkspaceLayout,
+  saveWorkspaceLayout,
+  SIDEBAR_MIN_WIDTH,
+  type WorkspaceMeasurements,
+} from "./workspaceLayout";
 import { createWorkspaceStateWriter } from "./workspaceStateWriter";
 
 type PendingIntent =
@@ -96,10 +105,15 @@ export function Workspace() {
   // Workspace-local view state (specs/search-and-graph-view.md §View model).
   const [sidebarPanel, setSidebarPanel] = useState<SidebarPanel>("files");
   const [centerView, setCenterView] = useState<CenterView>("note");
-  // React owns sidebar visibility outright: the native "Toggle Sidebar" menu item
-  // is a plain MenuItem with no checkmark, so there's no state-sync obligation back
-  // to Rust (unlike the chat toggle's CheckMenuItem, synced via setChatVisible).
-  const [sidebarOpen, setSidebarOpen] = useState(true);
+  const [layoutPreference, setLayoutPreference] = useState(loadWorkspaceLayout);
+  const [workspaceMeasurements, setWorkspaceMeasurements] =
+    useState<WorkspaceMeasurements>({
+      workspaceWidth: 0,
+      chatWidth: 0,
+      navigationWidth: 0,
+      reservedChatWidth: 0,
+    });
+  const workspacePanesRef = useRef<HTMLDivElement>(null);
   // Whether the cited-recall chat panel is shown. The webview owns this state now;
   // an effect below pushes each change to Rust, which keeps a copy only to paint the
   // View-menu checkmark (mirrors the editing → setMenuEditing pattern).
@@ -107,7 +121,7 @@ export function Workspace() {
   // A menu-requested "new note/folder" awaiting the FileTree to open its inline
   // create row; cleared once consumed so it can't re-fire on a sidebar remount.
   const [pendingCreate, setPendingCreate] = useState<CreateKind | null>(null);
-  // Bumped whenever ⌘K / the ribbon Search icon wants the search field focused.
+  // Bumped whenever ⌘K / the navigation Search action wants the field focused.
   const [searchFocusSignal, bumpSearchFocus] = useReducer((n: number) => n + 1, 0);
   // Settings modal state, plus a version bumped when it closes so the chat
   // pane re-reads the AI status (a provider configured in Settings must reach
@@ -117,6 +131,70 @@ export function Workspace() {
   const [templateInsertOpen, setTemplateInsertOpen] = useState(false);
   const [templates, setTemplates] = useState<Awaited<ReturnType<typeof api.listTemplates>>>([]);
   const [aiStatusVersion, bumpAiStatusVersion] = useReducer((n: number) => n + 1, 0);
+
+  const effectiveLayout = useMemo(
+    () =>
+      deriveEffectiveWorkspaceLayout(layoutPreference, workspaceMeasurements),
+    [layoutPreference, workspaceMeasurements],
+  );
+  const effectiveNavigationExpandedRef = useRef(
+    effectiveLayout.navigationExpanded,
+  );
+  effectiveNavigationExpandedRef.current = effectiveLayout.navigationExpanded;
+
+  const toggleNavigation = useCallback(() => {
+    setLayoutPreference((current) => ({
+      ...current,
+      // Toggle what the user can currently see. If responsive layout has
+      // temporarily compacted an expanded preference, an attempted expansion
+      // remains expanded in preference rather than silently reversing it.
+      navigationExpanded: !effectiveNavigationExpandedRef.current,
+    }));
+  }, []);
+
+  useEffect(() => saveWorkspaceLayout(layoutPreference), [layoutPreference]);
+
+  useEffect(() => {
+    const workspace = workspacePanesRef.current;
+    if (!workspace) return;
+    const chatSlot = workspace.querySelector<HTMLElement>(".nn-chat-slot");
+    const chatPane = workspace.querySelector<HTMLElement>(".nn-chat-pane");
+    const navigation = workspace.querySelector<HTMLElement>(".nn-ribbon");
+    const measure = () => {
+      const chatWidth = chatSlot?.getBoundingClientRect().width ?? 0;
+      const chatTargetWidth = chatPane?.getBoundingClientRect().width ?? 0;
+      const next = {
+        workspaceWidth: workspace.getBoundingClientRect().width,
+        // Read the slot's current rendered width so responsive clamping follows
+        // the chat animation instead of jumping to its final state.
+        chatWidth,
+        navigationWidth: navigation?.getBoundingClientRect().width ?? 0,
+        // Reserve the chat's target width as soon as it starts opening. This
+        // starts navigation compaction at the same time as the chat transition,
+        // rather than waiting until the editor has nearly run out of space.
+        reservedChatWidth: showChat
+          ? chatTargetWidth > 0
+            ? chatTargetWidth
+            : chatWidth
+          : chatWidth,
+      };
+      setWorkspaceMeasurements((current) =>
+        current.workspaceWidth === next.workspaceWidth &&
+        current.chatWidth === next.chatWidth &&
+        current.navigationWidth === next.navigationWidth &&
+        current.reservedChatWidth === next.reservedChatWidth
+          ? current
+          : next,
+      );
+    };
+    const observer = new ResizeObserver(measure);
+    observer.observe(workspace);
+    if (chatSlot) observer.observe(chatSlot);
+    if (chatPane) observer.observe(chatPane);
+    if (navigation) observer.observe(navigation);
+    measure();
+    return () => observer.disconnect();
+  }, [showChat, vault?.path]);
 
   // Stable callbacks read the latest collection without re-registering native
   // listeners on every editor keystroke.
@@ -388,15 +466,10 @@ export function Workspace() {
     bumpAiStatusVersion();
   }, []);
 
-  /** Show a sidebar panel. Both force the sidebar open: selecting a panel that
-   *  stays hidden is a silent no-op, and every caller — the ribbon icons, the
-   *  View menu, ⌘K — means "show me this", not "pre-select it for later". */
   const handleShowFiles = useCallback(() => {
-    setSidebarOpen(true);
     setSidebarPanel("files");
   }, []);
   const handleShowSearch = useCallback(() => {
-    setSidebarOpen(true);
     setSidebarPanel("search");
     bumpSearchFocus();
   }, []);
@@ -406,12 +479,8 @@ export function Workspace() {
   );
   const consumeCreate = useCallback(() => setPendingCreate(null), []);
 
-  /** Arm an inline create in the FileTree: force the sidebar open on the Files
-   *  panel — its create row lives ONLY there, so a collapsed or Search sidebar
-   *  would swallow the action — then set pendingCreate. Shared by the New
-   *  Note/Folder menu items and the titlebar vault menu (four call sites). */
+  /** Arm an inline create in the FileTree and select its owning Files pane. */
   const startCreate = useCallback((kind: CreateKind) => {
-    setSidebarOpen(true);
     setSidebarPanel("files");
     setPendingCreate(kind);
   }, []);
@@ -559,9 +628,6 @@ export function Workspace() {
       .onMenu((e) => {
         const o = noteTabsRef.current.active;
         switch (e.action) {
-          // New Note/Folder + the view-switch actions all force the sidebar open
-          // (via startCreate / handleShow*): their effect is invisible while it's
-          // collapsed, so a menu-driven create/search would otherwise silently no-op.
           case "new-note":
             startCreate("note");
             break;
@@ -618,7 +684,7 @@ export function Workspace() {
             setShowChat((v) => !v);
             break;
           case "toggle-sidebar":
-            setSidebarOpen((v) => !v);
+            toggleNavigation();
             break;
           default:
             break;
@@ -643,7 +709,14 @@ export function Workspace() {
       cancelled = true;
       unlisten?.();
     };
-  }, [reportError, requestIntent, startCreate, handleShowFiles, handleShowSearch]);
+  }, [
+    reportError,
+    requestIntent,
+    startCreate,
+    handleShowFiles,
+    handleShowSearch,
+    toggleNavigation,
+  ]);
 
   // Keep the native Format menu honest: those items act on the editor's textarea,
   // which is mounted only when a text note is open in edit mode. Push that fact to
@@ -715,12 +788,19 @@ export function Workspace() {
 
   if (!vault) return null;
 
+  const layoutStyle = {
+    "--navigation-width": `${effectiveLayout.navigationWidth}px`,
+    "--sidebar-width": `${effectiveLayout.sidebarWidth}px`,
+  } as CSSProperties;
+
   return (
-    <div className="nn-app-shell flex h-full w-full flex-col bg-background text-foreground">
+    <div
+      className="nn-app-shell flex h-full w-full flex-col bg-background text-foreground"
+      style={layoutStyle}
+    >
       <TitleBar
-        vaultName={vault.name}
-        sidebarOpen={sidebarOpen}
-        onToggleSidebar={() => setSidebarOpen((v) => !v)}
+        navigationExpanded={effectiveLayout.navigationExpanded}
+        onToggleNavigation={toggleNavigation}
         chatOpen={showChat}
         onToggleChat={() => setShowChat((v) => !v)}
         onOpenSettings={handleOpenSettings}
@@ -730,32 +810,33 @@ export function Workspace() {
         onActivateTab={handleActivateTab}
         onCloseTab={handleCloseTab}
         onCloseGraph={handleCloseGraph}
-        onNewNote={() => startCreate("note")}
-        onNewFolder={() => startCreate("folder")}
-        onRefresh={() => void refreshTree()}
-        onCloseVault={handleCloseVault}
       />
       <div
+        ref={workspacePanesRef}
         id="nn-main-content"
         tabIndex={-1}
         data-testid="workspace-panes"
         className="nn-workspace-panes flex min-h-0 flex-1 overflow-hidden outline-none"
       >
         <Ribbon
+          navigationExpanded={effectiveLayout.navigationExpanded}
+          vaultName={vault.name}
           sidebarPanel={sidebarPanel}
           centerView={centerView}
           onShowFiles={handleShowFiles}
           onShowSearch={handleShowSearch}
           onInsertTemplate={() => void handleInsertTemplate()}
           onToggleGraph={handleToggleGraph}
+          onNewNote={() => startCreate("note")}
+          onNewFolder={() => startCreate("folder")}
+          onRefresh={() => void refreshTree()}
+          onCloseVault={handleCloseVault}
         />
-        {/* Collapse the sidebar by UNMOUNTING it (not display:none): FileTree
-            already unmounts on the Files↔Search swap, and its folder folds
-            persist to localStorage, so there's no live in-memory state to lose.
-            Contrast ChatPane below, which is deliberately kept mounted because it
-            owns a live streamed IPC Channel that unmounting would kill. */}
-        {sidebarOpen &&
-          (sidebarPanel === "files" ? (
+        <div
+          id="nn-primary-sidebar"
+          className="nn-primary-sidebar flex min-h-0 shrink-0"
+        >
+          {sidebarPanel === "files" ? (
             <FileTree
               vaultPath={vault.path}
               tree={tree}
@@ -769,7 +850,17 @@ export function Workspace() {
             />
           ) : (
             <SearchPanel focusSignal={searchFocusSignal} onOpen={openNoteAt} />
-          ))}
+          )}
+        </div>
+        <PaneSplitter
+          paneId="nn-primary-sidebar"
+          width={effectiveLayout.sidebarWidth}
+          minWidth={SIDEBAR_MIN_WIDTH}
+          maxWidth={effectiveLayout.sidebarMaxWidth}
+          onResize={(sidebarWidth) =>
+            setLayoutPreference((current) => ({ ...current, sidebarWidth }))
+          }
+        />
         {centerView === "graph" ? (
           <div
             id={GRAPH_PANEL_ID}
@@ -804,13 +895,15 @@ export function Workspace() {
             />
           </div>
         )}
-        {/* Keep ChatPane mounted and toggle it with CSS, never conditionally
-            unmount it: unmounting would discard the cited-recall transcript and
-            silently abandon an in-flight streamed answer (the Rust `chat` call
-            would run against a dead channel). Using `display:contents` lets its
-            <aside> sit in the flex row as if unwrapped; `none` drops the subtree
-            from layout while React keeps it — and its stream — alive. */}
-        <div className="nn-chat-slot" data-visible={showChat} hidden={!showChat}>
+        {/* Keep ChatPane mounted and collapse only its clipping slot. Unmounting
+            would discard the transcript and abandon an in-flight streamed answer;
+            inert + aria-hidden remove the collapsed controls from interaction. */}
+        <div
+          className="nn-chat-slot"
+          data-visible={showChat}
+          aria-hidden={!showChat}
+          inert={!showChat}
+        >
           <ChatPane
             openNoteAt={openNoteAt}
             onOpenSettings={() => handleOpenSettings("ai")}

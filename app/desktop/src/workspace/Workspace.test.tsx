@@ -25,11 +25,23 @@ const tabsState = vi.hoisted(() => ({
 const captured = vi.hoisted(() => ({
   fileTree: {} as Record<string, (...a: never[]) => void>,
   notePane: {} as Record<string, (...a: never[]) => void>,
-  ribbon: {} as Record<string, (...a: never[]) => void>,
-  titlebar: {} as {
+  ribbon: {} as {
+    navigationExpanded: boolean;
     vaultName: string;
-    sidebarOpen: boolean;
-    onToggleSidebar: () => void;
+    sidebarPanel: "files" | "search";
+    centerView: "note" | "graph";
+    onShowFiles: () => void;
+    onShowSearch: () => void;
+    onInsertTemplate: () => void;
+    onToggleGraph: () => void;
+    onNewNote: () => void;
+    onNewFolder: () => void;
+    onRefresh: () => void;
+    onCloseVault: () => void;
+  },
+  titlebar: {} as {
+    navigationExpanded: boolean;
+    onToggleNavigation: () => void;
     chatOpen: boolean;
     onToggleChat: () => void;
     onOpenSettings: () => void;
@@ -39,10 +51,6 @@ const captured = vi.hoisted(() => ({
     onActivateTab: (id: string) => void;
     onCloseTab: (id: string) => void;
     onCloseGraph: () => void;
-    onNewNote: () => void;
-    onNewFolder: () => void;
-    onRefresh: () => void;
-    onCloseVault: () => void;
   },
   searchPanel: {} as { focusSignal: number; onOpen: (absPath: string) => void },
   graphView: {} as { onOpenNote: (relPath: string) => void },
@@ -119,7 +127,13 @@ vi.mock("./ChatPane", () => ({
     refreshSignal: number;
   }) => {
     captured.chatPane = props;
-    return <div data-testid="chatpane" data-refresh-signal={props.refreshSignal} />;
+    return (
+      <div
+        className="nn-chat-pane"
+        data-testid="chatpane"
+        data-refresh-signal={props.refreshSignal}
+      />
+    );
   },
 }));
 vi.mock("./SettingsModal", () => ({
@@ -140,8 +154,8 @@ vi.mock("./TemplateInsertDialog", () => ({
   },
 }));
 vi.mock("./Ribbon", () => ({
-  Ribbon: (props: Record<string, (...a: never[]) => void>) => {
-    captured.ribbon = props;
+  Ribbon: (props: Record<string, unknown>) => {
+    captured.ribbon = props as typeof captured.ribbon;
     return <div data-testid="ribbon" />;
   },
 }));
@@ -325,6 +339,7 @@ beforeEach(() => {
   win.onCloseRequested.mockClear();
   openState.current = makeOpen();
   tabsState.current = makeTabs();
+  localStorage.clear();
 });
 
 afterEach(() => {
@@ -573,7 +588,7 @@ describe("Workspace — close vault + close note", () => {
     openState.current = makeOpen({ dirty: false });
     mockUseVault.mockReturnValue(ctx);
     render(<Workspace />);
-    await act(async () => captured.titlebar.onCloseVault());
+    await act(async () => captured.ribbon.onCloseVault());
     expect(ctx.close).toHaveBeenCalled();
   });
 
@@ -582,7 +597,7 @@ describe("Workspace — close vault + close note", () => {
     openState.current = makeOpen({ path: "/v/a.md", dirty: true });
     mockUseVault.mockReturnValue(ctx);
     render(<Workspace />);
-    await act(async () => captured.titlebar.onCloseVault());
+    await act(async () => captured.ribbon.onCloseVault());
     await userEvent.click(screen.getByRole("button", { name: "Discard" }));
     expect(ctx.close).toHaveBeenCalled();
   });
@@ -999,7 +1014,7 @@ describe("Workspace — settings modal", () => {
 });
 
 describe("Workspace — titlebar + sidebar", () => {
-  it("passes the vault name and every note-tab summary through to the titlebar", () => {
+  it("passes the vault identity to navigation and note-tab summaries to the titlebar", () => {
     const a = makeTab("/v/A.md", { dirty: true, draft: "edited" });
     const b = makeTab("/v/B.md", { loading: true, note: null });
     tabsState.current = makeTabs({
@@ -1010,8 +1025,9 @@ describe("Workspace — titlebar + sidebar", () => {
     });
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
-    expect(captured.titlebar.vaultName).toBe("MyVault");
-    expect(captured.titlebar.sidebarOpen).toBe(true);
+    expect(captured.ribbon.vaultName).toBe("MyVault");
+    expect(captured.ribbon.navigationExpanded).toBe(true);
+    expect(captured.titlebar.navigationExpanded).toBe(true);
     expect(captured.titlebar.chatOpen).toBe(true);
     expect(captured.titlebar.tabs).toEqual([
       expect.objectContaining({ id: a.id, title: "A", path: "/v/A.md", dirty: true }),
@@ -1042,63 +1058,186 @@ describe("Workspace — titlebar + sidebar", () => {
     expect(panes).toContainElement(screen.getByTestId("chatpane"));
   });
 
-  it("collapses the sidebar (unmounting the file tree) via the titlebar toggle", () => {
+  it("compacts navigation without unmounting the active file pane", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
-    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+    const fileTree = screen.getByTestId("filetree");
 
-    act(() => captured.titlebar.onToggleSidebar());
-    expect(captured.titlebar.sidebarOpen).toBe(false);
-    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+    act(() => captured.titlebar.onToggleNavigation());
+    expect(captured.titlebar.navigationExpanded).toBe(false);
+    expect(captured.ribbon.navigationExpanded).toBe(false);
+    expect(screen.getByTestId("filetree")).toBe(fileTree);
 
-    act(() => captured.titlebar.onToggleSidebar());
-    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+    act(() => captured.titlebar.onToggleNavigation());
+    expect(captured.titlebar.navigationExpanded).toBe(true);
+    expect(screen.getByTestId("filetree")).toBe(fileTree);
   });
 
-  it("toggles the sidebar off and back on from the menu", () => {
+  it("toggles navigation from the compatible menu action without hiding Files", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
-    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+    const fileTree = screen.getByTestId("filetree");
 
     fireMenu({ action: "toggle-sidebar" });
-    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+    expect(captured.titlebar.navigationExpanded).toBe(false);
+    expect(screen.getByTestId("filetree")).toBe(fileTree);
 
     fireMenu({ action: "toggle-sidebar" });
-    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+    expect(captured.titlebar.navigationExpanded).toBe(true);
+    expect(screen.getByTestId("filetree")).toBe(fileTree);
   });
 
-  // Regression: selecting a panel while the sidebar is collapsed used to swap
-  // `sidebarPanel` behind a hidden sidebar — the click did nothing visible.
-  // Every "show me this panel" caller must force the sidebar open.
-  it("re-opens a collapsed sidebar when the ribbon's Files icon is clicked", () => {
+  it("keeps compact navigation when selecting Files", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
-    act(() => captured.titlebar.onToggleSidebar());
-    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+    act(() => captured.titlebar.onToggleNavigation());
 
     act(() => captured.ribbon.onShowFiles());
     expect(screen.getByTestId("filetree")).toBeInTheDocument();
-    expect(captured.titlebar.sidebarOpen).toBe(true);
+    expect(captured.titlebar.navigationExpanded).toBe(false);
   });
 
-  it("re-opens a collapsed sidebar when the ribbon's Search icon is clicked", () => {
+  it("keeps compact navigation when selecting Search", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
-    act(() => captured.titlebar.onToggleSidebar());
-    expect(screen.queryByTestId("searchpanel")).not.toBeInTheDocument();
+    act(() => captured.titlebar.onToggleNavigation());
 
     act(() => captured.ribbon.onShowSearch());
     expect(screen.getByTestId("searchpanel")).toBeInTheDocument();
-    expect(captured.titlebar.sidebarOpen).toBe(true);
+    expect(captured.titlebar.navigationExpanded).toBe(false);
+  });
+
+  it("renders a semantic splitter and aligns shared layout variables", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    const panes = screen.getByTestId("workspace-panes");
+    const sidebar = screen.getByTestId("filetree").parentElement;
+    expect(sidebar).toHaveAttribute("id", "nn-primary-sidebar");
+    expect(screen.getByRole("separator")).toHaveAttribute(
+      "aria-controls",
+      "nn-primary-sidebar",
+    );
+    expect(panes.parentElement).toHaveStyle({
+      "--navigation-width": "192px",
+      "--sidebar-width": "296px",
+    });
+  });
+
+  it("resizes the primary pane without remounting note or chat content", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const notePane = screen.getByTestId("notepane");
+    const chatPane = screen.getByTestId("chatpane");
+
+    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowRight" });
+
+    expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
+      "--sidebar-width": "304px",
+    });
+    expect(screen.getByTestId("notepane")).toBe(notePane);
+    expect(screen.getByTestId("chatpane")).toBe(chatPane);
+  });
+
+  it("resizes the primary pane without remounting the active graph", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    act(() => captured.ribbon.onToggleGraph());
+    const graph = screen.getByTestId("graphview");
+
+    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowRight" });
+
+    expect(screen.getByTestId("graphview")).toBe(graph);
+  });
+
+  it("auto-compacts for the measured chat width without overwriting expansion preference", () => {
+    let workspaceWidth = 920;
+    let chatSlotWidth = 0;
+    let navigationWidth = 192;
+    const chatTargetWidth = 324;
+    let resizeCallback: ResizeObserverCallback | undefined;
+    class ControlledResizeObserver implements ResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        resizeCallback = callback;
+      }
+      observe = vi.fn();
+      unobserve = vi.fn();
+      disconnect = vi.fn();
+    }
+    vi.stubGlobal("ResizeObserver", ControlledResizeObserver);
+    vi.spyOn(HTMLElement.prototype, "getBoundingClientRect").mockImplementation(
+      function (this: HTMLElement) {
+        const width = this.matches('[data-testid="workspace-panes"]')
+          ? workspaceWidth
+          : this.matches(".nn-chat-slot")
+            ? chatSlotWidth
+            : this.matches(".nn-chat-pane")
+              ? chatTargetWidth
+              : this.matches(".nn-ribbon")
+                ? navigationWidth
+                : 0;
+        return {
+          x: 0,
+          y: 0,
+          top: 0,
+          right: width,
+          bottom: 0,
+          left: 0,
+          width,
+          height: 0,
+          toJSON: () => ({}),
+        };
+      },
+    );
+
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const fileTree = screen.getByTestId("filetree");
+    const notePane = screen.getByTestId("notepane");
+    const chatPane = screen.getByTestId("chatpane");
+
+    expect(captured.titlebar.navigationExpanded).toBe(false);
+    expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
+      "--navigation-width": "56px",
+      "--sidebar-width": "296px",
+    });
+
+    chatSlotWidth = 324;
+    navigationWidth = 56;
+    act(() => resizeCallback?.([], {} as ResizeObserver));
+    expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
+      "--navigation-width": "56px",
+      "--sidebar-width": "292px",
+    });
+
+    act(() => captured.titlebar.onToggleNavigation());
+    workspaceWidth = 1_200;
+    act(() => resizeCallback?.([], {} as ResizeObserver));
+
+    expect(captured.titlebar.navigationExpanded).toBe(true);
+    expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
+      "--navigation-width": "192px",
+      "--sidebar-width": "296px",
+    });
+    expect(screen.getByTestId("filetree")).toBe(fileTree);
+    expect(screen.getByTestId("notepane")).toBe(notePane);
+    expect(screen.getByTestId("chatpane")).toBe(chatPane);
   });
 
   it("flips chat visibility from the titlebar toggle", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
     expect(captured.titlebar.chatOpen).toBe(true);
+    const chatPane = screen.getByTestId("chatpane");
+    const chatSlot = chatPane.parentElement;
 
     act(() => captured.titlebar.onToggleChat());
     expect(captured.titlebar.chatOpen).toBe(false);
+    expect(screen.getByTestId("chatpane")).toBe(chatPane);
+    expect(chatSlot).toHaveAttribute("data-visible", "false");
+    expect(chatSlot).toHaveAttribute("aria-hidden", "true");
+    expect(chatSlot).toHaveAttribute("inert");
+    expect(chatSlot).not.toHaveAttribute("hidden");
   });
 
   it("syncs titlebar chat visibility changes to the native menu checkmark", async () => {
@@ -1126,44 +1265,38 @@ describe("Workspace — titlebar + sidebar", () => {
     expect(captured.titlebar.chatOpen).toBe(false);
   });
 
-  it("re-opens a collapsed sidebar when New Note fires from the menu", () => {
+  it("switches to Files when New Note fires from the menu without changing navigation", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
 
     fireMenu({ action: "toggle-sidebar" });
-    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+    act(() => captured.ribbon.onShowSearch());
+    expect(screen.getByTestId("searchpanel")).toBeInTheDocument();
 
-    // Menu-driven New Note must force the sidebar back open onto Files, else its
-    // inline create row (the only place a create can happen) never appears.
     fireMenu({ action: "new-note" });
     expect(screen.getByTestId("filetree")).toBeInTheDocument();
+    expect(captured.titlebar.navigationExpanded).toBe(false);
     expect(
       (captured.fileTree as unknown as { pendingCreate: string }).pendingCreate,
     ).toBe("note");
   });
 
-  it("re-opens a collapsed sidebar when New Note fires from the titlebar", () => {
+  it("starts New Note from the navigation vault menu", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
 
-    act(() => captured.titlebar.onToggleSidebar());
-    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
-
-    act(() => captured.titlebar.onNewNote());
+    act(() => captured.ribbon.onNewNote());
     expect(screen.getByTestId("filetree")).toBeInTheDocument();
     expect(
       (captured.fileTree as unknown as { pendingCreate: string }).pendingCreate,
     ).toBe("note");
   });
 
-  it("re-opens a collapsed sidebar when New Folder fires from the titlebar", () => {
+  it("starts New Folder from the navigation vault menu", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
 
-    act(() => captured.titlebar.onToggleSidebar());
-    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
-
-    act(() => captured.titlebar.onNewFolder());
+    act(() => captured.ribbon.onNewFolder());
     expect(screen.getByTestId("filetree")).toBeInTheDocument();
     expect(
       (captured.fileTree as unknown as { pendingCreate: string }).pendingCreate,

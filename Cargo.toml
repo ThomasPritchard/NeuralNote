@@ -3,4 +3,4 @@
 # A shared target dir + single lockfile keeps the two in lockstep.
 [workspace]
 resolver = "2"
-members = ["crates/neuralnote-core", "app/desktop/src-tauri"]
+members = ["crates/neuralnote-core", "crates/neuralnote-release", "app/desktop/src-tauri"]

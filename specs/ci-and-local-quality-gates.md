@@ -80,7 +80,8 @@ request check plus:
 3. A production frontend build.
 4. Rust LCOV generation with the existing 90 percent line coverage threshold.
 5. A mandatory `cargo audit` run with network access.
-6. A mandatory high-severity npm dependency audit.
+6. A mandatory high-severity npm dependency audit across both the desktop and
+   native-WebDriver lockfiles.
 
 Native Tauri end-to-end tests remain in `.github/workflows/e2e.yml`. That workflow
 runs on pushes to `main` and by manual dispatch, using its existing Linux and Windows
@@ -91,13 +92,31 @@ end-to-end workflow succeed.
 
 ### Release verification
 
-`.github/workflows/release-alpha.yml` keeps its release-specific responsibilities:
-full verification, packaging, signing, notarisation where applicable, and publishing.
-Its hosted SonarQube step is removed because the local server is unreachable from the
-runner.
+`.github/workflows/release-alpha.yml` is manual-only. It accepts an existing release
+tag, a signing mode (`ad-hoc` or `developer-id`), and an explicit acknowledgement
+for an unnotarized ad-hoc build. It never creates or moves a tag, and it requires the
+tagged commit to equal the `main` commit selected for the dispatch.
+
+The workflow separates privilege across three jobs. A secret-free preflight rejects
+invalid refs and inputs. The build job is bound to the protected `release` environment,
+runs with `contents: read`, executes the full release gates, signs the updater archive,
+cryptographically verifies it against the configured updater public key, and uploads a fixed
+checksum-bound artifact set. The signing-secret-free publisher runs with `contents: write`
+but receives no signing environment secrets or variables and executes no repository code.
+It revalidates the remote tag before draft creation and publication, creates a draft, uploads the
+assets, publishes a non-latest prerelease, and updates the dedicated manifest branch last. An active
+tag ruleset must prevent release-tag updates and deletions, and repository release immutability must
+protect the published tag and assets.
+
+Updater credentials are always stored in the `release` environment. Apple identity,
+certificate, keychain, and notarisation credentials are required only for
+`developer-id`. Ad-hoc mode sets the Tauri macOS signing identity to `-`, verifies the
+result with `codesign`, skips Apple import and `spctl`, and labels the release
+unnotarized. Developer ID mode fails closed when any Apple credential is absent.
 
 Release tags repeat the full relevant quality gates. This duplication is intentional:
-a release must prove the exact tagged source before it publishes artifacts.
+a release must prove the exact tagged source before it publishes artifacts. Hosted
+SonarQube remains excluded because the local server is unreachable from the runner.
 
 ## Test and Lint Boundaries
 
@@ -117,6 +136,9 @@ preserving.
 ## Workflow Security and Reliability
 
 - Workflow permissions default to `contents: read`.
+- Release build and dependency scripts never receive a repository write token. Only the
+  signing-secret-free publisher receives `contents: write`, after validating the transferred
+  artifact allowlist and checksums.
 - Third-party actions are pinned to full commit SHAs.
 - Dependency installation uses lockfiles and frozen or locked modes.
 - Caches use the relevant lockfile as part of their key.
@@ -129,6 +151,9 @@ preserving.
 - Gitleaks checks out full history rather than a shallow snapshot.
 - Generated coverage reports and build outputs are ephemeral unless a failed job
   needs an explicitly non-sensitive diagnostic artifact.
+- Release publication is manual, existing-tag-only, always a non-latest prerelease, and
+  makes the updater manifest visible only after the signed assets are public. The publisher can
+  resume a failed manifest-last step only after byte-comparing an existing release's assets.
 
 ## Local SonarQube Environment
 

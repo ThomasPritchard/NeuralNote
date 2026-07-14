@@ -9,7 +9,7 @@ The source of truth is `app/desktop/src/styles.css`. Tailwind v4 maps the CSS va
 | Role | Token | Use |
 | --- | --- | --- |
 | Canvas | `--background` | Note and graph canvas |
-| Chrome | `--titlebar`, `--sidebar` | Window bar, ribbon, side panes, status bar |
+| Chrome | `--titlebar`, `--sidebar` | Window bar, navigation, side panes, status bar |
 | Depth | `--surface-sunken`, `--surface-raised`, `--surface-hover` | Fields, cards, hover states |
 | Selection | `--surface-selected` | Current rows, toggles, menu items |
 | AI identity | `--primary` | Focus, selection, links, AI marks |
@@ -25,16 +25,26 @@ Inter is used for UI and note reading. JetBrains Mono is reserved for paths, mod
 
 The workspace and title bar share these variables:
 
-- `--titlebar-height`: 52px
-- `--ribbon-width`: 56px
-- `--sidebar-width`: 296px
+- `--titlebar-height`: 48px
+- `--navigation-width`: 56px compact or 192px expanded
+- `--sidebar-width`: 296px preferred by default; 192px to 420px
 - `--chat-width`: 420px to 480px
 - `--note-toolbar-height`: 44px
 - `--statusbar-height`: 28px
 
-At 1280px and below the sidebar and chat pane compact. At 1050px secondary status metadata and optional labels disappear. At the 920px minimum the sidebar is 200px and chat is 288px. Neither secondary pane is automatically unmounted, so a live chat stream and its transcript survive width changes. User-controlled visibility still works.
+The navigation sidebar expands to show the vault identity, vault actions, and labelled quick links. Its compact mode retains the same actions as accessible icon buttons with visible tooltips. A fixed 56px CSS-pixel icon gutter stays in place at every font scale while the labels translate and fade, preventing controls from jumping during the width transition. Files and Search remain in a separate primary pane; changing the navigation mode never hides or remounts that pane.
 
-The title bar uses the same geometry variables. With the sidebar open, its first grid column matches the ribbon plus sidebar, so the note tab begins at the note column rather than the centre of the whole window. With the sidebar collapsed, the left title-bar cluster retains a 208px safety column so the traffic lights and vault controls cannot overlap the note tab. The 78px macOS traffic-light clearance and the dedicated Tauri drag layer remain intact.
+Navigation expansion and cited-recall chat visibility use a restrained 200ms ease-out slide. Navigation width and the title-bar editor offset animate together; chat collapses through an overflow-clipped slot while its mounted pane translates and fades. Splitter dragging remains immediate. Reduced-motion preferences make these transitions effectively instant.
+
+The Files/Search pane has an 8px splitter hit target around a quiet 1px divider. Dragging uses pointer capture. When the splitter has keyboard focus, Left and Right resize by 8px, Shift increases the step to 32px, Home and End select the bounds, and Enter toggles between the minimum and the previous width. Its separator semantics expose the controlled pane and the current, minimum, and maximum widths.
+
+The saved layout is global frontend state under the versioned `nn:workspace-layout:v1` local-storage key. It records the preferred navigation expansion and Files/Search width. Missing or malformed state falls back to expanded navigation and 296px; unavailable or failed storage affects persistence only.
+
+Effective geometry is derived from the measured workspace width plus the navigation and chat slots' current rendered widths, including intermediate animation frames. When chat opens, its full target width is reserved immediately so responsive navigation compaction starts alongside the chat transition; closing restores space from the rendered width. The layout preserves at least 192px for Files/Search and 240px for the editor. It temporarily clamps the Files/Search pane and, when necessary, temporarily compacts navigation without overwriting either preference. The preferred geometry returns when space does. Neither the Files/Search pane nor chat is automatically unmounted, so tree state, search state, a live chat stream, and its transcript survive responsive changes.
+
+At 1050px secondary status metadata and optional labels disappear. At the 920px minimum the responsive geometry still follows the measured-space rules above, including the current chat width. User-controlled chat visibility still works.
+
+The title bar consumes the same effective navigation, Files/Search, and chat geometry variables, including during splitter drags and responsive changes. The note tab therefore begins at the editor column rather than the centre of the whole window. The 78px macOS traffic-light clearance and the dedicated Tauri drag layer remain intact. The title-bar toggle changes the preferred navigation expansion only; it never hides Files/Search.
 
 At window heights below 700px, the welcome card compacts its padding and gaps. The outer welcome surface scrolls vertically as a final safeguard for long vault names, multiple recents, and inline errors.
 

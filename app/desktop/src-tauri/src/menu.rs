@@ -24,6 +24,8 @@ use crate::{config_dir, lock_state, AppState};
 /// Recent-vault item ids are `open-recent:<absolute path>`; the path is decoded
 /// back out in [`parse_menu_id`] and sent to the frontend to open.
 const RECENT_PREFIX: &str = "open-recent:";
+const NAVIGATION_TOGGLE_ACTION: &str = "toggle-sidebar";
+const NAVIGATION_TOGGLE_LABEL: &str = "Toggle Navigation Sidebar";
 
 /// Every custom (non-predefined) action id, in one place so the builder and
 /// [`parse_menu_id`] can't drift apart. Predefined natives (copy, quit, …) are
@@ -42,7 +44,7 @@ const CUSTOM_ACTIONS: &[&str] = &[
     "toggle-graph",
     "toggle-mode",
     "toggle-chat",
-    "toggle-sidebar",
+    NAVIGATION_TOGGLE_ACTION,
     "format-bold",
     "format-italic",
     "format-h1",
@@ -305,13 +307,13 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .checked(chat_visible)
         .enabled(vault_open)
         .build(app)?;
-    // Plain MenuItem, not a CheckMenuItem: the sidebar's visibility lives entirely
-    // in the webview and carries no menu checkmark, so there is no state to keep in
-    // sync here — the menu just emits the toggle and the webview owns the rest.
+    // Plain MenuItem, not a CheckMenuItem: the preferred navigation expansion lives
+    // entirely in the webview and carries no menu checkmark. Keep the historical
+    // action id so existing renderer event handling remains compatible.
     let toggle_sidebar = MenuItem::with_id(
         app,
-        "toggle-sidebar",
-        "Toggle Sidebar",
+        NAVIGATION_TOGGLE_ACTION,
+        NAVIGATION_TOGGLE_LABEL,
         vault_open,
         Some("CmdOrCtrl+\\"),
     )?;
@@ -412,6 +414,12 @@ mod tests {
             parse_menu_id("close-window").map(|payload| payload.action),
             Some("close-window".to_string())
         );
+    }
+
+    #[test]
+    fn navigation_toggle_keeps_legacy_action_id_with_explicit_label() {
+        assert_eq!(NAVIGATION_TOGGLE_ACTION, "toggle-sidebar");
+        assert_eq!(NAVIGATION_TOGGLE_LABEL, "Toggle Navigation Sidebar");
     }
 
     #[test]

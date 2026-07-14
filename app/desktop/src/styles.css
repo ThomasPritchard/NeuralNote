@@ -1,5 +1,11 @@
 @import "tailwindcss";
 
+@property --navigation-width {
+  syntax: "<length>";
+  inherits: true;
+  initial-value: 192px;
+}
+
 @theme inline {
   --font-sans: "Inter Variable", system-ui, sans-serif;
   --font-heading: "Inter Variable", system-ui, sans-serif;
@@ -99,9 +105,12 @@
   --radius: 0.625rem;
 
   --titlebar-height: 48px;
-  --ribbon-width: 3.5rem;
+  --navigation-width: 12rem;
   --sidebar-width: 18.5rem;
+  --splitter-width: 8px;
   --chat-width: clamp(26.25rem, 28vw, 30rem);
+  --panel-motion-duration: 200ms;
+  --panel-motion-easing: cubic-bezier(0.25, 1, 0.5, 1);
   --note-toolbar-height: 2.75rem;
   --statusbar-height: 1.75rem;
 }
@@ -272,16 +281,17 @@ html[data-font-family="sourceSerif4"] {
   font-feature-settings: "liga" 0;
 }
 
+.nn-app-shell {
+  transition: --navigation-width var(--panel-motion-duration)
+    var(--panel-motion-easing);
+}
+
 .nn-titlebar {
   grid-template-columns:
-    calc(var(--ribbon-width) + var(--sidebar-width))
+    calc(var(--navigation-width) + var(--sidebar-width) + var(--splitter-width))
     minmax(0, 1fr)
     max-content;
   align-items: center;
-}
-
-.nn-titlebar[data-sidebar-open="false"] {
-  grid-template-columns: 15rem minmax(0, 1fr) max-content;
 }
 
 .nn-tab-strip {
@@ -353,20 +363,90 @@ html[data-font-family="sourceSerif4"] {
   width: var(--sidebar-width);
 }
 
+.nn-primary-sidebar {
+  width: var(--sidebar-width);
+}
+
+.nn-primary-sidebar > .nn-sidebar {
+  width: 100%;
+}
+
 .nn-ribbon {
-  width: var(--ribbon-width);
+  overflow: hidden;
+  width: var(--navigation-width);
+}
+
+.nn-navigation-copy {
+  opacity: 1;
+  transform: translateX(0);
+  transition:
+    opacity 120ms ease-out,
+    transform var(--panel-motion-duration) var(--panel-motion-easing);
+}
+
+.nn-ribbon[data-navigation-expanded="false"] .nn-navigation-copy {
+  opacity: 0;
+  pointer-events: none;
+  transform: translateX(-0.25rem);
+}
+
+.nn-pane-splitter {
+  width: var(--splitter-width);
+}
+
+.nn-pane-splitter::before {
+  position: absolute;
+  inset-block: 0;
+  left: 50%;
+  width: 1px;
+  background: var(--border);
+  content: "";
+  transform: translateX(-50%);
+  transition: background-color 150ms ease;
+}
+
+.nn-pane-splitter:hover::before {
+  background: var(--muted-foreground);
+}
+
+.nn-pane-splitter:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--ring);
+}
+
+.nn-pane-splitter:focus-visible::before {
+  background: var(--ring);
 }
 
 .nn-chat-pane {
+  flex: 0 0 var(--chat-width);
   width: var(--chat-width);
+  transform: translateX(0);
+  transition: transform var(--panel-motion-duration) var(--panel-motion-easing);
 }
 
 .nn-chat-slot {
-  display: contents;
+  display: flex;
+  width: var(--chat-width);
+  flex: 0 0 auto;
+  overflow: hidden;
+  opacity: 1;
+  visibility: visible;
+  transition:
+    width var(--panel-motion-duration) var(--panel-motion-easing),
+    opacity 150ms ease-out,
+    visibility 0s linear;
 }
 
 .nn-chat-slot[data-visible="false"] {
-  display: none;
+  width: 0;
+  opacity: 0;
+  pointer-events: none;
+  visibility: hidden;
+  transition-delay: 0s, 0s, var(--panel-motion-duration);
+}
+
+.nn-chat-slot[data-visible="false"] > .nn-chat-pane {
+  transform: translateX(0.75rem);
 }
 
 .nn-welcome {
@@ -429,16 +509,12 @@ html[data-font-family="sourceSerif4"] {
 
 @media (max-width: 1280px) {
   :root {
-    --ribbon-width: 3.25rem;
-    --sidebar-width: 17.5rem;
     --chat-width: 25.5rem;
   }
 }
 
 @media (max-width: 1050px) {
   :root {
-    --ribbon-width: 3rem;
-    --sidebar-width: 14.5rem;
     --chat-width: 20.5rem;
   }
 
@@ -450,7 +526,6 @@ html[data-font-family="sourceSerif4"] {
 
 @media (max-width: 940px) {
   :root {
-    --sidebar-width: 12.5rem;
     --chat-width: 18rem;
   }
 

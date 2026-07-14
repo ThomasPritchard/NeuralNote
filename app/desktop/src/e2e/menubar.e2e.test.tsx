@@ -8,6 +8,7 @@
 import { describe, it, expect } from "vitest";
 import { act, screen } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
+import { MENU_ACTION } from "../lib/bindings/events";
 import { renderApp, type RenderAppResult } from "./renderApp";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
 
@@ -17,7 +18,7 @@ const SEED: SeedEntry[] = [{ kind: "file", relPath: "Note.md", content: "hello" 
 /** Emit a native-menu action through the real event bus, flushed under act. */
 async function fireMenu(action: string, extra: Record<string, unknown> = {}) {
   await act(async () => {
-    await emit("menu://action", { action, ...extra });
+    await emit(MENU_ACTION, { action, ...extra });
   });
 }
 
@@ -55,29 +56,47 @@ describe("Native menu → app actions", () => {
 
   it("Toggle Cited Recall hides and re-shows the chat panel without unmounting it", async () => {
     await openVault();
-    // The panel stays mounted across the toggle (so its transcript and any
-    // in-flight answer survive) — visibility, not DOM presence, is what changes.
-    expect(screen.getByText("Cited recall")).toBeVisible();
+    const heading = screen.getByText("Cited recall");
+    const slot = heading.closest(".nn-chat-slot");
+    expect(slot).toHaveAttribute("data-visible", "true");
+    expect(slot).toHaveAttribute("aria-hidden", "false");
 
     // The webview owns visibility now, so each action is a bare flip (no `checked`
     // payload); the menu item just requests a toggle.
     await fireMenu("toggle-chat");
-    expect(screen.getByText("Cited recall")).not.toBeVisible();
+    expect(screen.getByText("Cited recall")).toBe(heading);
+    expect(slot).toHaveAttribute("data-visible", "false");
+    expect(slot).toHaveAttribute("aria-hidden", "true");
+    expect(slot).toHaveAttribute("inert");
 
     await fireMenu("toggle-chat");
-    expect(screen.getByText("Cited recall")).toBeVisible();
+    expect(screen.getByText("Cited recall")).toBe(heading);
+    expect(slot).toHaveAttribute("data-visible", "true");
+    expect(slot).toHaveAttribute("aria-hidden", "false");
+    expect(slot).not.toHaveAttribute("inert");
   });
 
-  it("Toggle Sidebar hides and re-shows the file-tree sidebar", async () => {
-    await openVault();
-    expect(screen.getByLabelText("Filter files by name")).toBeInTheDocument();
-
-    // Collapsing the sidebar unmounts it (unlike the chat panel above) — the file
-    // tree's only in-memory state is folder folds, which persist to localStorage.
-    await fireMenu("toggle-sidebar");
-    expect(screen.queryByLabelText("Filter files by name")).not.toBeInTheDocument();
+  it("Toggle Navigation Sidebar compacts and expands navigation without resetting search", async () => {
+    const { user } = await openVault();
+    await fireMenu("view-search");
+    const input = await screen.findByLabelText("Search vault");
+    await user.type(input, "hello");
+    await screen.findByRole("list", { name: "Search results" });
 
     await fireMenu("toggle-sidebar");
-    expect(screen.getByLabelText("Filter files by name")).toBeInTheDocument();
+    expect(screen.getByLabelText("Search vault")).toBe(input);
+    expect(input).toHaveValue("hello");
+    expect(screen.getByRole("navigation", { name: "Workspace" })).toHaveAttribute(
+      "data-navigation-expanded",
+      "false",
+    );
+
+    await fireMenu("toggle-sidebar");
+    expect(screen.getByLabelText("Search vault")).toBe(input);
+    expect(input).toHaveValue("hello");
+    expect(screen.getByRole("navigation", { name: "Workspace" })).toHaveAttribute(
+      "data-navigation-expanded",
+      "true",
+    );
   });
 });

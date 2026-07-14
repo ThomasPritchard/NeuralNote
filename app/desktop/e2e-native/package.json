@@ -1,10 +1,13 @@
 {
   "name": "neuralnote-e2e-native",
   "private": true,
-  "version": "0.1.0",
+  "version": "0.1.1",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "description": "Tier-2 native WebDriver smoke tests (WebdriverIO + tauri-driver). Linux/Windows CI only — tauri-driver has no macOS support. Locally, use the Tier-1 mockIPC suite (app/desktop: npm run test:e2e).",
+  "engines": {
+    "node": "^22.12.0 || ^24.0.0"
+  },
   "scripts": {
     "test": "npm run typecheck && npm run test:config && wdio run ./wdio.conf.ts",
     "test:config": "tsx --test ./wdio.conf.test.ts",
@@ -22,5 +25,8 @@
     "expect-webdriverio": "^5.0.0",
     "tsx": "^4.22.4",
     "typescript": "~5.8.3"
+  },
+  "overrides": {
+    "serialize-javascript": "7.0.5"
   }
 }
