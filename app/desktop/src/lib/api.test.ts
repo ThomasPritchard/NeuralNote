@@ -37,6 +37,8 @@ import {
   onMenu,
   onTreeChanged,
   openVault,
+  openOpenRouterRankings,
+  openRouterModelMenu,
   openYoutubeTimestamp,
   pickNewVaultLocation,
   pickVaultFolder,
@@ -49,6 +51,7 @@ import {
   quitApp,
   saveWorkspaceState,
   searchVault,
+  selectOpenRouterModel,
   setSkillEnabled,
   setMenuEditing,
   undoSkillRun,
@@ -302,6 +305,49 @@ describe("skills-bank wrappers", () => {
     await cancelRequirementDownload();
 
     expect(mockInvoke).toHaveBeenCalledWith("cancel_requirement_download");
+  });
+});
+
+describe("OpenRouter model menu wrappers", () => {
+  it("loads the ranked model menu with the caller's refresh intent", async () => {
+    const menu = {
+      models: [],
+      asOf: "2026-07-13",
+      selectedModel: "openai/gpt-5",
+      pinnedSelectedModel: "openai/gpt-5",
+    };
+    mockInvoke.mockResolvedValueOnce(menu);
+
+    await expect(openRouterModelMenu(true)).resolves.toEqual(menu);
+    expect(mockInvoke).toHaveBeenCalledWith("openrouter_model_menu", {
+      forceRefresh: true,
+    });
+  });
+
+  it("defaults model-menu reads to the native daily cache", async () => {
+    await openRouterModelMenu();
+
+    expect(mockInvoke).toHaveBeenCalledWith("openrouter_model_menu", {
+      forceRefresh: false,
+    });
+  });
+
+  it("selects only the exact model offered by the native catalogue", async () => {
+    const status = { activeProvider: "openRouter" };
+    mockInvoke.mockResolvedValueOnce(status);
+
+    await expect(selectOpenRouterModel("anthropic/claude-sonnet-4")).resolves.toEqual(
+      status,
+    );
+    expect(mockInvoke).toHaveBeenCalledWith("select_openrouter_model", {
+      model: "anthropic/claude-sonnet-4",
+    });
+  });
+
+  it("opens the Rust-owned rankings URL without accepting a webview URL", async () => {
+    await openOpenRouterRankings();
+
+    expect(mockInvoke).toHaveBeenCalledWith("open_openrouter_rankings");
   });
 });
 

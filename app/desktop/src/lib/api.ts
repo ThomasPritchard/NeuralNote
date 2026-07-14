@@ -23,6 +23,7 @@ import type {
   InstalledModel,
   LinkGraph,
   NoteDoc,
+  OpenRouterModelMenu,
   ProviderKind,
   PullEvent,
   Recommendation,
@@ -329,6 +330,21 @@ export const setReasoning = (enabled: boolean) =>
  *  "unsupported". */
 export const refreshReasoningSupport = () =>
   invoke<AiStatus>("refresh_reasoning_support");
+
+/** Load today's native-validated OpenRouter ranking. The shell owns provider
+ *  traffic, response limits, validation, and the daily cache. */
+export const openRouterModelMenu = (forceRefresh = false) =>
+  invoke<OpenRouterModelMenu>("openrouter_model_menu", { forceRefresh });
+
+/** Persist one exact model from the last native-validated menu and return the
+ *  fresh provider status. */
+export const selectOpenRouterModel = (model: string) =>
+  invoke<AiStatus>("select_openrouter_model", { model });
+
+/** Open the fixed OpenRouter rankings attribution page through the native
+ *  external-navigation policy. The webview cannot supply a URL. */
+export const openOpenRouterRankings = () =>
+  invoke<void>("open_openrouter_rankings");
 
 /** Detect host hardware (RAM/CPU/arch/OS) for the local-model recommendation and
  *  the Settings hardware readout. Infallible on the Rust side. */

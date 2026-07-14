@@ -539,10 +539,6 @@ html[data-font-family="sourceSerif4"] {
     --chat-width: 18rem;
   }
 
-  .nn-chat-model-pill {
-    max-width: 7rem;
-    padding-inline: 0.5rem;
-  }
 }
 
 @media (max-height: 700px) {

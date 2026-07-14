@@ -5,6 +5,8 @@ import { cn } from "@/lib/cn";
 export const DropdownMenu = DropdownPrimitive.Root;
 export const DropdownMenuTrigger = DropdownPrimitive.Trigger;
 export const DropdownMenuGroup = DropdownPrimitive.Group;
+export const DropdownMenuRadioGroup = DropdownPrimitive.RadioGroup;
+export const DropdownMenuItemIndicator = DropdownPrimitive.ItemIndicator;
 
 export const DropdownMenuContent = forwardRef<
   ComponentRef<typeof DropdownPrimitive.Content>,
@@ -36,6 +38,22 @@ export const DropdownMenuItem = forwardRef<
       className={cn(
         "relative flex h-8 cursor-default select-none items-center gap-2 rounded-md px-2.5 text-[0.8125rem] outline-none data-[disabled]:pointer-events-none data-[highlighted]:bg-surface-selected data-[highlighted]:text-foreground data-[disabled]:opacity-45",
         danger && "text-destructive data-[highlighted]:bg-destructive/10 data-[highlighted]:text-destructive",
+        className,
+      )}
+      {...props}
+    />
+  );
+});
+
+export const DropdownMenuRadioItem = forwardRef<
+  ComponentRef<typeof DropdownPrimitive.RadioItem>,
+  ComponentPropsWithoutRef<typeof DropdownPrimitive.RadioItem>
+>(function DropdownMenuRadioItem({ className, ...props }, ref) {
+  return (
+    <DropdownPrimitive.RadioItem
+      ref={ref}
+      className={cn(
+        "relative flex min-h-9 cursor-default select-none items-center gap-2 rounded-md py-1.5 pl-8 pr-2.5 text-[0.8125rem] outline-none data-[disabled]:pointer-events-none data-[highlighted]:bg-surface-selected data-[highlighted]:text-foreground data-[disabled]:opacity-45",
         className,
       )}
       {...props}

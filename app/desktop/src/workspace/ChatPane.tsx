@@ -32,6 +32,7 @@ import type { AiStatus, ChatEvent, SkillListing } from "../lib/types";
 import { buttonVariants } from "@/components/ui/button";
 import { StatusPill as NeuralStatusPill } from "@/components/neural/patterns";
 import { ChatMessages } from "./ChatMessages";
+import { ChatModelMenu } from "./ChatModelMenu";
 import {
   emptyAssistant,
   reduceAssistant,
@@ -187,21 +188,9 @@ function reasoningProbeTarget(status: AiStatus | null): string | null {
   return null;
 }
 
-/** Header status pill: the connected model id while chatting, "Not connected"
- *  after a skip; hidden during the transient first-run states. */
-function ChatStatusPill({ view, model }: Readonly<{ view: View; model: string }>) {
-  if (view === "chat") {
-    return (
-      <NeuralStatusPill
-        status="neutral"
-        title={model}
-        className="nn-chat-model-pill ml-auto min-w-0 max-w-[9rem] shrink gap-1.5 px-2.5 py-1 text-[0.6875rem]"
-      >
-        <span className="size-1.5 rounded-full bg-healthy" aria-hidden />
-        <span className="nn-mono min-w-0 truncate">{model.split("/").pop()}</span>
-      </NeuralStatusPill>
-    );
-  }
+/** Header connection pill. The active model now belongs at the point of send
+ *  in the composer, leaving only the disconnected state in the header. */
+function ChatStatusPill({ view }: Readonly<{ view: View }>) {
   if (view === "disconnected") {
     return (
       <NeuralStatusPill status="neutral" className="ml-auto shrink-0 gap-1.5 px-2.5 py-1 text-[0.6875rem]">
@@ -648,7 +637,7 @@ export function ChatPane({
           <span className="nn-heading shrink-0 text-sm font-semibold">
             Neural Assistant AI
           </span>
-          <ChatStatusPill view={view} model={model} />
+          <ChatStatusPill view={view} />
         </div>
         <p className="mt-2 text-[0.6875rem] leading-snug text-muted-foreground">
           Ask questions across everything in your vault. Every claim is
@@ -805,7 +794,16 @@ export function ChatPane({
                 quiet chip — it changes what the next turn requests, so it lives
                 at the point of send), the keyboard hint on the right. */}
             <div className="mt-1.5 flex items-center justify-between gap-2 px-1">
-              <button
+              <div className="flex min-w-0 items-center gap-1">
+                {status && (
+                  <ChatModelMenu
+                    status={status}
+                    busy={busy}
+                    onStatusChange={applyStatus}
+                    onOpenSettings={onOpenSettings}
+                  />
+                )}
+                <button
                 type="button"
                 onClick={() => void toggleReasoning()}
                 // Two different inert states, split on purpose. A write in
@@ -829,10 +827,11 @@ export function ChatPane({
                     ? "cursor-not-allowed opacity-50"
                     : !reasoningOn && "hover:bg-muted hover:text-foreground",
                 )}
-              >
-                <Brain className="size-3 shrink-0" aria-hidden />
-                Reasoning
-              </button>
+                >
+                  <Brain className="size-3 shrink-0" aria-hidden />
+                  Reasoning
+                </button>
+              </div>
               <p className="nn-compact-label text-right text-[0.625rem] leading-none text-muted-foreground/60">
                 Enter to send · Shift+Enter for a new line
               </p>

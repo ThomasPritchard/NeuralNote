@@ -29,6 +29,9 @@ vi.mock("../lib/api", async (importActual) => {
     cancelChatRun: vi.fn(),
     setReasoning: vi.fn(),
     refreshReasoningSupport: vi.fn(),
+    openRouterModelMenu: vi.fn(),
+    selectOpenRouterModel: vi.fn(),
+    openOpenRouterRankings: vi.fn(),
     listSkills: vi.fn(),
   };
 });
@@ -165,6 +168,14 @@ beforeEach(() => {
   // The @ picker's catalogue load has its own suite (ChatPaneSkills.test.tsx);
   // here it resolves empty so no popup interferes with the chat flows.
   vi.mocked(api.listSkills).mockReset().mockResolvedValue([]);
+  vi.mocked(api.openRouterModelMenu).mockReset().mockResolvedValue({
+    models: [],
+    asOf: "2026-07-13",
+    selectedModel: DEFAULT_MODEL,
+    pinnedSelectedModel: DEFAULT_MODEL,
+  });
+  vi.mocked(api.selectOpenRouterModel).mockReset();
+  vi.mocked(api.openOpenRouterRankings).mockReset();
 });
 
 afterEach(() => {
@@ -219,8 +230,9 @@ describe("ChatPane — first-run provider branching", () => {
     setup();
 
     expect(await screen.findByLabelText("Ask across your vault")).toBeInTheDocument();
-    // The header status pill carries the local tag instead of a cloud model id.
-    expect(screen.getByText("qwen2.5:7b")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /choose ai model.*qwen2.5:7b/i }),
+    ).toBeInTheDocument();
   });
 
   it("hands off to settings when local is selected but no model is set up", async () => {
@@ -469,22 +481,28 @@ describe("ChatPane — chat view", () => {
     run.resolve("run-still-active");
   });
 
-  it("labels the header status pill with the echoed OpenRouter model (PA-013)", async () => {
+  it("places the echoed OpenRouter model in the composer and removes the header pill", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive("acme/echoed-default"));
     setup();
 
     await screen.findByLabelText("Ask across your vault");
-    // The pill shows the id's tail segment, straight from the status echo.
-    expect(screen.getByText("echoed-default")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /choose ai model.*echoed-default/i }),
+    ).toBeInTheDocument();
+    const header = screen.getByText("Neural Assistant AI").closest("header");
+    expect(header).not.toBeNull();
+    expect(within(header as HTMLElement).queryByText("echoed-default")).not.toBeInTheDocument();
   });
 
-  it("keeps a long model name bounded while exposing its full identifier", async () => {
+  it("keeps a long composer model name bounded behind an accessible full label", async () => {
     const model = "acme/a-very-long-model-name-that-must-not-widen-the-chat-pane";
     mockAiStatus.mockResolvedValue(openRouterActive(model));
     setup();
 
     await screen.findByLabelText("Ask across your vault");
-    expect(screen.getByTitle(model)).toHaveClass("nn-chat-model-pill");
+    expect(
+      screen.getByRole("button", { name: new RegExp(`choose ai model.*${model.split("/").pop()}`, "i") }),
+    ).toHaveClass("max-w-[11rem]");
   });
 
   it("collapses a finished cited run to a summary line that expands to the full trace", async () => {
