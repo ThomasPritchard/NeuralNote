@@ -90,7 +90,7 @@ export function NotePane({
       {/* Toolbar — breadcrumb + view controls. Its border-b separates it from
           the note body; the hairline above is the titlebar's own border-b. */}
       <div className="flex h-(--note-toolbar-height) shrink-0 items-center justify-between gap-3 border-b border-border px-5 text-[0.75rem] text-muted-foreground">
-        <div className="nn-mono min-w-0 truncate" title={note.relPath}>
+        <div className="min-w-0 truncate" title={note.relPath}>
           {note.relPath}
         </div>
         <div className="flex shrink-0 items-center gap-2">

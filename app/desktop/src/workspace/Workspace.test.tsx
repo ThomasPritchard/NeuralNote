@@ -28,7 +28,7 @@ const captured = vi.hoisted(() => ({
   ribbon: {} as {
     navigationExpanded: boolean;
     vaultName: string;
-    sidebarPanel: "files" | "search";
+    sidebarPanel: "files" | "search" | null;
     centerView: "note" | "graph";
     onShowFiles: () => void;
     onShowSearch: () => void;
@@ -749,19 +749,39 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     );
   });
 
-  it("swaps the sidebar between files and search via the ribbon", () => {
+  it("keeps both sidebar panels mounted while the ribbon swaps and collapses them", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
     expect(screen.getByTestId("filetree")).toBeInTheDocument();
-    expect(screen.queryByTestId("searchpanel")).not.toBeInTheDocument();
+    expect(screen.getByTestId("searchpanel")).toBeInTheDocument();
+    expect(screen.getByTestId("filetree").parentElement).not.toHaveAttribute(
+      "hidden",
+    );
+    expect(screen.getByTestId("searchpanel").parentElement).toHaveAttribute(
+      "hidden",
+    );
 
     act(() => captured.ribbon.onShowSearch());
-    expect(screen.getByTestId("searchpanel")).toBeInTheDocument();
-    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+    expect(captured.ribbon.sidebarPanel).toBe("search");
+    expect(screen.getByTestId("searchpanel").parentElement).not.toHaveAttribute(
+      "hidden",
+    );
+    expect(screen.getByTestId("filetree").parentElement).toHaveAttribute(
+      "hidden",
+    );
+
+    act(() => captured.ribbon.onShowSearch());
+    expect(captured.ribbon.sidebarPanel).toBeNull();
+    expect(screen.getByTestId("searchpanel").parentElement).toHaveAttribute(
+      "hidden",
+    );
+    expect(screen.queryByRole("separator")).not.toBeInTheDocument();
 
     act(() => captured.ribbon.onShowFiles());
-    expect(screen.getByTestId("filetree")).toBeInTheDocument();
-    expect(screen.queryByTestId("searchpanel")).not.toBeInTheDocument();
+    expect(captured.ribbon.sidebarPanel).toBe("files");
+    expect(screen.getByTestId("filetree").parentElement).not.toHaveAttribute(
+      "hidden",
+    );
   });
 
   it("toggles the center pane between note and graph via the ribbon", () => {
@@ -795,6 +815,7 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
       "data-focus-signal",
       "2",
     );
+    expect(captured.ribbon.sidebarPanel).toBe("search");
   });
 
   // Menu actions the e2e journey doesn't cover (open-recent, new-note,
@@ -919,7 +940,9 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
       fireEvent.keyDown(window, { key: "k" });
     });
     expect(screen.getByTestId("filetree")).toBeInTheDocument();
-    expect(screen.queryByTestId("searchpanel")).not.toBeInTheDocument();
+    expect(screen.getByTestId("searchpanel").parentElement).toHaveAttribute(
+      "hidden",
+    );
   });
 
   it("opens a search result through the guard and lands in note view", () => {
@@ -1112,7 +1135,9 @@ describe("Workspace — titlebar + sidebar", () => {
     render(<Workspace />);
 
     const panes = screen.getByTestId("workspace-panes");
-    const sidebar = screen.getByTestId("filetree").parentElement;
+    const sidebar = screen
+      .getByTestId("filetree")
+      .closest("#nn-primary-sidebar");
     expect(sidebar).toHaveAttribute("id", "nn-primary-sidebar");
     expect(screen.getByRole("separator")).toHaveAttribute(
       "aria-controls",
@@ -1121,6 +1146,31 @@ describe("Workspace — titlebar + sidebar", () => {
     expect(panes.parentElement).toHaveStyle({
       "--navigation-width": "192px",
       "--sidebar-width": "296px",
+      "--splitter-width": "8px",
+    });
+  });
+
+  it("collapses and restores the preferred sidebar width from Files", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowRight" });
+    expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
+      "--sidebar-width": "304px",
+    });
+
+    act(() => captured.ribbon.onShowFiles());
+    expect(captured.ribbon.sidebarPanel).toBeNull();
+    expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
+      "--sidebar-width": "0px",
+      "--splitter-width": "0px",
+    });
+    expect(screen.queryByRole("separator")).not.toBeInTheDocument();
+
+    act(() => captured.ribbon.onShowFiles());
+    expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
+      "--sidebar-width": "304px",
+      "--splitter-width": "8px",
     });
   });
 

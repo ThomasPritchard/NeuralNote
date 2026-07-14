@@ -172,6 +172,16 @@ afterEach(() => {
 });
 
 describe("ChatPane — first-run provider branching", () => {
+  it("uses the release name for the assistant pane", async () => {
+    mockAiStatus.mockResolvedValue(unconfigured());
+    setup();
+
+    expect(
+      await screen.findByText("Neural Assistant AI"),
+    ).toBeInTheDocument();
+    expect(screen.queryByText("Cited recall")).not.toBeInTheDocument();
+  });
+
   it("renders the provider picker when nothing is configured", async () => {
     mockAiStatus.mockResolvedValue(unconfigured());
     setup();

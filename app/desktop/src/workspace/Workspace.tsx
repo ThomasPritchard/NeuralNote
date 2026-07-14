@@ -30,7 +30,7 @@ import { GraphView } from "./GraphView";
 import { buildNoteIndex, type NoteIndexEntry } from "./linkResolve";
 import { NotePane } from "./NotePane";
 import { PaneSplitter } from "./PaneSplitter";
-import { Ribbon, type CenterView, type SidebarPanel } from "./Ribbon";
+import { Ribbon, type CenterView } from "./Ribbon";
 import { SearchPanel } from "./SearchPanel";
 import { SettingsModal, type SettingsSection } from "./SettingsModal";
 import { StatusBar } from "./StatusBar";
@@ -103,9 +103,9 @@ export function Workspace() {
   const open = noteTabs.active;
   const [pendingIntent, setPendingIntent] = useState<PendingIntent | null>(null);
   // Workspace-local view state (specs/search-and-graph-view.md §View model).
-  const [sidebarPanel, setSidebarPanel] = useState<SidebarPanel>("files");
   const [centerView, setCenterView] = useState<CenterView>("note");
   const [layoutPreference, setLayoutPreference] = useState(loadWorkspaceLayout);
+  const sidebarPanel = layoutPreference.sidebarPanel;
   const [workspaceMeasurements, setWorkspaceMeasurements] =
     useState<WorkspaceMeasurements>({
       workspaceWidth: 0,
@@ -466,12 +466,28 @@ export function Workspace() {
     bumpAiStatusVersion();
   }, []);
 
+  const selectFiles = useCallback(() => {
+    setLayoutPreference((current) => ({ ...current, sidebarPanel: "files" }));
+  }, []);
+  const selectSearch = useCallback(() => {
+    setLayoutPreference((current) => ({ ...current, sidebarPanel: "search" }));
+    bumpSearchFocus();
+  }, []);
   const handleShowFiles = useCallback(() => {
-    setSidebarPanel("files");
+    setLayoutPreference((current) => ({
+      ...current,
+      sidebarPanel: current.sidebarPanel === "files" ? null : "files",
+    }));
   }, []);
   const handleShowSearch = useCallback(() => {
-    setSidebarPanel("search");
-    bumpSearchFocus();
+    setLayoutPreference((current) => {
+      const opening = current.sidebarPanel !== "search";
+      if (opening) bumpSearchFocus();
+      return {
+        ...current,
+        sidebarPanel: opening ? "search" : null,
+      };
+    });
   }, []);
   const handleToggleGraph = useCallback(
     () => setCenterView((v) => (v === "graph" ? "note" : "graph")),
@@ -481,9 +497,9 @@ export function Workspace() {
 
   /** Arm an inline create in the FileTree and select its owning Files pane. */
   const startCreate = useCallback((kind: CreateKind) => {
-    setSidebarPanel("files");
+    selectFiles();
     setPendingCreate(kind);
-  }, []);
+  }, [selectFiles]);
 
   const handleRemap = useCallback((oldPath: string, newNode: TreeNode) => {
     noteTabsRef.current.remap(oldPath, newNode.path, newNode.relPath);
@@ -670,10 +686,10 @@ export function Workspace() {
             break;
           case "search":
           case "view-search":
-            handleShowSearch();
+            selectSearch();
             break;
           case "view-files":
-            handleShowFiles();
+            selectFiles();
             break;
           case "toggle-graph":
             setCenterView((v) => (v === "graph" ? "note" : "graph"));
@@ -713,8 +729,8 @@ export function Workspace() {
     reportError,
     requestIntent,
     startCreate,
-    handleShowFiles,
-    handleShowSearch,
+    selectFiles,
+    selectSearch,
     toggleNavigation,
   ]);
 
@@ -791,6 +807,7 @@ export function Workspace() {
   const layoutStyle = {
     "--navigation-width": `${effectiveLayout.navigationWidth}px`,
     "--sidebar-width": `${effectiveLayout.sidebarWidth}px`,
+    "--splitter-width": `${effectiveLayout.splitterWidth}px`,
   } as CSSProperties;
 
   return (
@@ -834,9 +851,15 @@ export function Workspace() {
         />
         <div
           id="nn-primary-sidebar"
+          aria-hidden={sidebarPanel === null}
+          inert={sidebarPanel === null ? true : undefined}
           className="nn-primary-sidebar flex min-h-0 shrink-0"
         >
-          {sidebarPanel === "files" ? (
+          <div
+            className="nn-primary-sidebar-panel"
+            hidden={sidebarPanel !== "files"}
+            inert={sidebarPanel === "files" ? undefined : true}
+          >
             <FileTree
               vaultPath={vault.path}
               tree={tree}
@@ -848,19 +871,26 @@ export function Workspace() {
               pendingCreate={pendingCreate}
               onCreateConsumed={consumeCreate}
             />
-          ) : (
+          </div>
+          <div
+            className="nn-primary-sidebar-panel"
+            hidden={sidebarPanel !== "search"}
+            inert={sidebarPanel === "search" ? undefined : true}
+          >
             <SearchPanel focusSignal={searchFocusSignal} onOpen={openNoteAt} />
-          )}
+          </div>
         </div>
-        <PaneSplitter
-          paneId="nn-primary-sidebar"
-          width={effectiveLayout.sidebarWidth}
-          minWidth={SIDEBAR_MIN_WIDTH}
-          maxWidth={effectiveLayout.sidebarMaxWidth}
-          onResize={(sidebarWidth) =>
-            setLayoutPreference((current) => ({ ...current, sidebarWidth }))
-          }
-        />
+        {sidebarPanel !== null && (
+          <PaneSplitter
+            paneId="nn-primary-sidebar"
+            width={effectiveLayout.sidebarWidth}
+            minWidth={SIDEBAR_MIN_WIDTH}
+            maxWidth={effectiveLayout.sidebarMaxWidth}
+            onResize={(sidebarWidth) =>
+              setLayoutPreference((current) => ({ ...current, sidebarWidth }))
+            }
+          />
+        )}
         {centerView === "graph" ? (
           <div
             id={GRAPH_PANEL_ID}

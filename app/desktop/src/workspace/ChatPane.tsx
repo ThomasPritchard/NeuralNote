@@ -1,4 +1,4 @@
-// The docked "Cited recall" pane — the real cited-chat UI. The provider-aware
+// The docked Neural Assistant AI pane — the real cited-chat UI. The provider-aware
 // states share one shell: the first-run picker (nothing configured), guided key
 // setup, a "local provider chosen but no model yet" hand-off into Settings, a
 // clearly-disabled "skipped" state, and the live chat view. The webview never
@@ -645,7 +645,9 @@ export function ChatPane({
           <span className="grid size-7 place-items-center rounded-lg border border-primary/25 bg-primary/12 text-primary">
             <Sparkles className="size-3.5" aria-hidden />
           </span>
-          <span className="nn-heading shrink-0 text-sm font-semibold">Cited recall</span>
+          <span className="nn-heading shrink-0 text-sm font-semibold">
+            Neural Assistant AI
+          </span>
           <ChatStatusPill view={view} model={model} />
         </div>
         <p className="mt-2 text-[0.6875rem] leading-snug text-muted-foreground">

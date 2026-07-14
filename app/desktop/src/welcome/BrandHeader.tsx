@@ -1,13 +1,15 @@
-import { Brain } from "lucide-react";
+import neuralNoteMark from "../../../../assets/brand/marks/neuralnote-mark-128.png";
 
 // The product identity block: restrained AI mark, wordmark, and an honest
 // one-line tagline. No fabricated stats or claims.
 export function BrandHeader() {
   return (
     <header className="flex flex-col items-center gap-4">
-      <div className="grid size-14 place-items-center rounded-2xl border border-primary/25 bg-primary/12 text-primary">
-        <Brain className="size-7" aria-hidden="true" />
-      </div>
+      <img
+        src={neuralNoteMark}
+        alt=""
+        className="size-14 object-contain"
+      />
       <div className="space-y-1.5">
         <h1 className="nn-heading text-3xl font-semibold tracking-[-0.04em]">
           NeuralNote

@@ -367,7 +367,17 @@ html[data-font-family="sourceSerif4"] {
   width: var(--sidebar-width);
 }
 
-.nn-primary-sidebar > .nn-sidebar {
+.nn-primary-sidebar-panel {
+  display: flex;
+  min-height: 0;
+  width: 100%;
+}
+
+.nn-primary-sidebar-panel[hidden] {
+  display: none;
+}
+
+.nn-primary-sidebar-panel > .nn-sidebar {
   width: 100%;
 }
 

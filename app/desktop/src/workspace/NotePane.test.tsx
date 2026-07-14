@@ -89,7 +89,7 @@ describe("NotePane — non-loaded states", () => {
 describe("NotePane — loaded read mode", () => {
   it("renders the reader, breadcrumb and no save button", () => {
     render(<NotePane open={openNote()} />);
-    expect(screen.getByText("folder/n.md")).toBeInTheDocument();
+    expect(screen.getByText("folder/n.md")).not.toHaveClass("nn-mono");
     expect(screen.getAllByText("My Note").length).toBeGreaterThan(0);
     expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
   });

@@ -47,6 +47,7 @@ describe("alpha release configuration", () => {
         "autostart:allow-is-enabled",
         "autostart:allow-enable",
         "autostart:allow-disable",
+        "core:window:allow-is-fullscreen",
       ]),
     );
     expect(permissions).not.toEqual(
