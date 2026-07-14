@@ -113,6 +113,15 @@ test("build and publication use separate least-privilege jobs", () => {
   assert.match(publish, /actions\/download-artifact@[a-f0-9]{40}/);
 });
 
+test("job-level environment expressions use contexts available during workflow validation", () => {
+  const publishJobHeader = publish.slice(0, publish.indexOf("\n    steps:"));
+  assert.doesNotMatch(
+    publishJobHeader,
+    /\$\{\{\s*runner\./,
+    "the runner context is unavailable in job-level env expressions",
+  );
+});
+
 test("a secret-free preflight rejects untrusted dispatches before signing", () => {
   assert.ok(preflight, "release workflow is missing the preflight job");
   assert.doesNotMatch(preflight, /environment:\s*release|\$\{\{\s*(?:secrets|vars)\./);

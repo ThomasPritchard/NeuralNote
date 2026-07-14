@@ -406,7 +406,6 @@ jobs:
       RELEASE_TAG: ${{ inputs.release_tag }}
       RELEASE_SHA: ${{ needs.build.outputs.release_sha }}
       SIGNING_MODE: ${{ inputs.signing_mode }}
-      RELEASE_ARTIFACT_DIR: ${{ runner.temp }}/release-artifacts
 
     steps:
       - name: Download validated release artifacts
@@ -416,6 +415,8 @@ jobs:
           path: ${{ runner.temp }}/release-artifacts
 
       - name: Validate downloaded release artifacts
+        env:
+          RELEASE_ARTIFACT_DIR: ${{ runner.temp }}/release-artifacts
         run: |
           set -euo pipefail
           EXPECTED_FILE_COUNT=5
