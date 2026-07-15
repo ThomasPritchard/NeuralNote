@@ -16,6 +16,12 @@ pub const TREE_CHANGED: &str = "vault://tree-changed";
 /// The single event carrying every custom native-menu action to the frontend.
 pub const MENU_ACTION: &str = "menu://action";
 
+/// Emitted once after a vault opens when crash-recovery reconciled one or more
+/// stranded note-quarantine records (an undo / cancelled-write interrupted by a
+/// process kill). Carries the `QuarantineRecoveryReport`; only fired when the
+/// report is non-empty, so a clean open stays silent.
+pub const QUARANTINE_RECOVERY: &str = "vault://quarantine-recovery";
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -40,7 +46,10 @@ mod tests {
              /** Emitted by the shell when the open vault changes on disk. */\n\
              export const TREE_CHANGED = \"{TREE_CHANGED}\";\n\
              /** Emitted by the native menu for every custom action. */\n\
-             export const MENU_ACTION = \"{MENU_ACTION}\";\n"
+             export const MENU_ACTION = \"{MENU_ACTION}\";\n\
+             /** Emitted after a vault opens when crash-recovery reconciled \
+             stranded note quarantines. */\n\
+             export const QUARANTINE_RECOVERY = \"{QUARANTINE_RECOVERY}\";\n"
         );
 
         std::fs::write(dir.join("events.ts"), contents).expect("write events.ts");

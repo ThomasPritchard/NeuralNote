@@ -5,3 +5,5 @@
 export const TREE_CHANGED = "vault://tree-changed";
 /** Emitted by the native menu for every custom action. */
 export const MENU_ACTION = "menu://action";
+/** Emitted after a vault opens when crash-recovery reconciled stranded note quarantines. */
+export const QUARANTINE_RECOVERY = "vault://quarantine-recovery";

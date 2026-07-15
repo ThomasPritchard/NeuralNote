@@ -5,6 +5,8 @@ mod elicitation;
 mod note_writer;
 #[cfg(not(unix))]
 mod note_writer_unsupported;
+#[cfg(unix)]
+mod quarantine_recovery;
 mod undo;
 
 use neuralnote_core::{ai::UndoLedger, CoreError};
@@ -20,7 +22,28 @@ pub(crate) use note_writer::FsNoteWriteBackend;
 pub(crate) use note_writer::RunNoteWriteBackend;
 #[cfg(not(unix))]
 pub(crate) use note_writer_unsupported::RunNoteWriteBackend;
+#[cfg(unix)]
+pub(crate) use quarantine_recovery::{reconcile_quarantine_recovery, QuarantineRecoveryReport};
 pub(crate) use undo::{undo_ledger, UndoReport, UndoRunStore};
+
+/// Non-Unix stub of the crash-recovery seam. The undo / cancelled-write quarantine
+/// window only exists on the descriptor-confined Unix note-writer, so on other
+/// platforms there is nothing to reconcile: recovery is a no-op returning an empty
+/// report, keeping `open_vault`'s call site portable (the payload type is generated
+/// from the Unix definition, so the frontend contract is identical either way).
+#[cfg(not(unix))]
+#[derive(Debug, Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct QuarantineRecoveryReport {
+    pub(crate) entries: Vec<serde_json::Value>,
+}
+
+#[cfg(not(unix))]
+pub(crate) fn reconcile_quarantine_recovery(
+    _canonical_root: &std::path::Path,
+) -> QuarantineRecoveryReport {
+    QuarantineRecoveryReport::default()
+}
 
 pub(crate) fn retain_chat_undo_ledger(
     state: &Mutex<crate::AppState>,

@@ -7,7 +7,18 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 // Event names are generated from the Rust `event_names.rs` constants (same
 // `cargo test` step as the type bindings), so the string is defined in exactly one
 // place and can't drift between the emit (Rust) and the listen (here).
-import { MENU_ACTION, TREE_CHANGED } from "./bindings/events";
+import {
+  MENU_ACTION,
+  QUARANTINE_RECOVERY,
+  TREE_CHANGED,
+} from "./bindings/events";
+// The menu-action vocabulary is generated from the Rust `CUSTOM_ACTIONS` list
+// (same `cargo test` step as the event names), so `MenuAction` below can't drift
+// from the native menu builder.
+import { MENU_ACTIONS } from "./bindings/menuActions";
+// Imported straight from the generated binding (not the `types` façade) to keep
+// this the only source file the wiring change touches.
+import type { QuarantineRecoveryReport } from "./bindings/QuarantineRecoveryReport";
 import type {
   AiStatus,
   AppPreferences,
@@ -209,39 +220,23 @@ export const createNoteFromTemplate = (
 export const onTreeChanged = (cb: () => void): Promise<UnlistenFn> =>
   listen(TREE_CHANGED, () => cb());
 
-/** Every action the native shell can emit. Kept in lockstep with the Rust menu's
- *  item ids (src-tauri/src/menu.rs `CUSTOM_ACTIONS`) except `open-recent` and
- *  `quit-app`: Rust synthesizes the former from the recent-path prefix and the
- *  latter when a predefined native Quit reaches `RunEvent::ExitRequested`.
+/** Subscribe to the crash-recovery report emitted once after a vault opens when
+ *  a stranded note quarantine (an interrupted undo / cancelled write) was
+ *  reconciled. Only fires when something was recovered. Returns an unlisten
+ *  function. */
+export const onQuarantineRecovery = (
+  cb: (report: QuarantineRecoveryReport) => void,
+): Promise<UnlistenFn> =>
+  listen<QuarantineRecoveryReport>(QUARANTINE_RECOVERY, (e) => cb(e.payload));
+
+/** Every action the native shell can emit. The core vocabulary is GENERATED from
+ *  the Rust menu's `CUSTOM_ACTIONS` (src-tauri/src/menu.rs) into
+ *  `bindings/menuActions.ts` by `cargo test`, so it can't drift from the menu
+ *  builder. The two actions Rust synthesizes outside that list are unioned in
+ *  explicitly: `open-recent` (built from the recent-path prefix) and `quit-app`
+ *  (emitted when a predefined native Quit reaches `RunEvent::ExitRequested`).
  *  Other predefined items (undo/copy/etc.) stay entirely native. */
-// TODO(menu-action-bindings): parity with Rust's `CUSTOM_ACTIONS` is
-// hand-maintained and unenforced while sibling event names are generated
-// (`event_names.rs` -> `bindings/events.ts`, gated by `rust-quality-gate.sh`).
-// Deferred until that generator can emit the action vocabulary too; a Rust-only
-// action falls through `switch (e.action)`'s `default: break` as a dead, silent
-// no-op menu item.
-export type MenuAction =
-  | "new-note"
-  | "new-folder"
-  | "open-vault"
-  | "open-recent"
-  | "close-tab"
-  | "close-window"
-  | "quit-app"
-  | "close-vault"
-  | "save"
-  | "search"
-  | "view-files"
-  | "view-search"
-  | "toggle-graph"
-  | "toggle-chat"
-  | "toggle-sidebar"
-  | "format-bold"
-  | "format-italic"
-  | "format-h1"
-  | "format-h2"
-  | "format-h3"
-  | "format-link";
+export type MenuAction = (typeof MENU_ACTIONS)[number] | "open-recent" | "quit-app";
 
 export interface MenuActionEvent {
   action: MenuAction;

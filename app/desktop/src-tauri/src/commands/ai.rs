@@ -60,13 +60,75 @@ pub(crate) fn save_api_key(
         model
     };
     let dir = config_dir(&app)?;
-    provider_config_mutation_gate(&state).run(&dir, || ai::save_api_key(&dir, key.trim(), model))
+    save_api_key_in(
+        &dir,
+        &provider_config_mutation_gate(&state),
+        key.trim(),
+        model,
+    )
+}
+
+/// Save an OpenRouter key: write the secret to the keychain FIRST, outside the
+/// config-mutation gate, then persist the non-secret model preference under the gate.
+/// The gate lock therefore never spans keychain I/O (issue #21 AC #2).
+///
+/// Failure ordering (pre-existing, preserved — only the lock boundary moved): an
+/// empty key is rejected before anything is written. If the keychain write fails, the
+/// config is never touched. If the config write fails *after* the keychain write
+/// committed, the key stays in the keychain and the in-session cache while the failure
+/// is surfaced — a half-applied save is reported, never silent. Deriving
+/// `key_configured` from keychain presence would close the crash window between the two
+/// writes entirely (PA-023); until then the flag is persisted.
+pub(crate) fn save_api_key_in(
+    config_dir: &Path,
+    mutation_gate: &ProviderConfigMutationGate,
+    key: &str,
+    model: &str,
+) -> Result<(), CoreError> {
+    ai::set_keychain_api_key(key)?;
+    mutation_gate
+        .update(config_dir, |cfg| {
+            cfg.model = model.to_string();
+            cfg.key_configured = true;
+            Ok(())
+        })
+        .map(|_| ())
+        .map_err(|e| {
+            CoreError::Io(format!(
+                "API key was stored in the keychain, but the AI preference file could not be updated: {}",
+                ai::error_detail(e)
+            ))
+        })
 }
 
 #[tauri::command]
 pub(crate) fn clear_api_key(app: AppHandle, state: SharedState<'_>) -> Result<(), CoreError> {
     let dir = config_dir(&app)?;
-    provider_config_mutation_gate(&state).run(&dir, || ai::clear_api_key(&dir))
+    clear_api_key_in(&dir, &provider_config_mutation_gate(&state))
+}
+
+/// Clear the OpenRouter key: delete the secret from the keychain FIRST, outside the
+/// config-mutation gate, then clear the non-secret `key_configured` flag under the
+/// gate — so the lock never spans keychain I/O (issue #21 AC #2). If the config write
+/// fails after the keychain delete succeeded, the failure is surfaced and the corrupt
+/// config is left untouched rather than clobbered to a default.
+pub(crate) fn clear_api_key_in(
+    config_dir: &Path,
+    mutation_gate: &ProviderConfigMutationGate,
+) -> Result<(), CoreError> {
+    ai::clear_keychain_api_key()?;
+    mutation_gate
+        .update(config_dir, |cfg| {
+            cfg.key_configured = false;
+            Ok(())
+        })
+        .map(|_| ())
+        .map_err(|e| {
+            CoreError::Io(format!(
+                "The keychain was cleared, but the AI preference file could not be updated: {}",
+                ai::error_detail(e)
+            ))
+        })
 }
 
 /// Provider-aware AI status for the settings UI and the chat pane's first-run
@@ -1266,6 +1328,55 @@ mod tests {
     const MATCHING_PROBE_CHILD_DIR: &str = "NEURALNOTE_MATCHING_PROBE_CHILD_DIR";
     const SAME_TARGET_PROBE_CHILD_DIR: &str = "NEURALNOTE_SAME_TARGET_PROBE_CHILD_DIR";
 
+    /// Drive two overlapping `ai-config.json` writers through the shared gate,
+    /// forcing the second into the gate *while the first still holds its snapshot*,
+    /// then releasing the first. Barriers replace every timing/scheduler assumption,
+    /// so the interleave is deterministic rather than flaky: the second command
+    /// provably runs in the exact stale-snapshot window that would lose an update
+    /// without serialization. `first` mutates the config the first writer holds;
+    /// `second` is any real gated operation (it must take this same gate so its
+    /// entry barrier fires). The caller asserts both fields survived.
+    fn overlapping_gated_writers(
+        dir: &Path,
+        first: impl FnOnce(&mut ProviderConfig) + Send,
+        second: impl FnOnce(&Path, &ProviderConfigMutationGate) -> CoreResult<()> + Send,
+    ) {
+        let gate = ProviderConfigMutationGate::default();
+        let first_loaded = Arc::new(Barrier::new(2));
+        let release_first = Arc::new(Barrier::new(2));
+        let second_entering_gate = Arc::new(Barrier::new(2));
+
+        std::thread::scope(|scope| {
+            let first_loaded_for_thread = Arc::clone(&first_loaded);
+            let release_first_for_thread = Arc::clone(&release_first);
+            let first_gate = gate.clone();
+            let first_dir = dir.to_path_buf();
+            let first_handle = scope.spawn(move || {
+                first_gate.update(&first_dir, |config| {
+                    first(config);
+                    first_loaded_for_thread.wait();
+                    release_first_for_thread.wait();
+                    Ok(())
+                })
+            });
+
+            // The first writer has read its snapshot but cannot write it yet. Start
+            // the real second command in that exact stale-snapshot window.
+            first_loaded.wait();
+            let second_gate = gate.clone_with_entry_barrier(Arc::clone(&second_entering_gate));
+            let second_dir = dir.to_path_buf();
+            let second_handle = scope.spawn(move || second(&second_dir, &second_gate));
+
+            // The second command has reached the shared gate while the first
+            // still owns it. Releasing the first now gives a deterministic
+            // serialized ordering without timing or scheduler assumptions.
+            second_entering_gate.wait();
+            release_first.wait();
+            first_handle.join().unwrap().unwrap();
+            second_handle.join().unwrap().unwrap();
+        });
+    }
+
     fn concurrent_provider_updates_preserve_both_fields(reasoning_starts_first: bool) {
         let dir = tempfile::tempdir().unwrap();
         write_provider_config(
@@ -1277,58 +1388,32 @@ mod tests {
             },
         )
         .unwrap();
-        let gate = ProviderConfigMutationGate::default();
         let offered: std::collections::HashSet<String> =
             ["vendor/new".to_string()].into_iter().collect();
-        let first_loaded = Arc::new(Barrier::new(2));
-        let release_first = Arc::new(Barrier::new(2));
-        let second_entering_gate = Arc::new(Barrier::new(2));
 
-        std::thread::scope(|scope| {
-            let first_loaded_for_thread = Arc::clone(&first_loaded);
-            let release_first_for_thread = Arc::clone(&release_first);
-            let first_gate = gate.clone();
-            let first_dir = dir.path().to_path_buf();
-            let first = scope.spawn(move || {
-                first_gate.update(&first_dir, |config| {
-                    if reasoning_starts_first {
-                        config.reasoning = false;
-                    } else {
-                        config.model = "vendor/new".into();
-                    }
-                    first_loaded_for_thread.wait();
-                    release_first_for_thread.wait();
-                    Ok(())
-                })
-            });
-
-            // The first writer has read its snapshot but cannot write it yet. Start
-            // the real second command in that exact stale-snapshot window.
-            first_loaded.wait();
-            let second_gate = gate.clone_with_entry_barrier(Arc::clone(&second_entering_gate));
-            let second_dir = dir.path().to_path_buf();
-            let second = scope.spawn(move || {
+        overlapping_gated_writers(
+            dir.path(),
+            |config| {
+                if reasoning_starts_first {
+                    config.reasoning = false;
+                } else {
+                    config.model = "vendor/new".into();
+                }
+            },
+            |second_dir, second_gate| {
                 if reasoning_starts_first {
                     openrouter_catalogue::persist_selected_model(
-                        &second_dir,
-                        &second_gate,
+                        second_dir,
+                        second_gate,
                         &offered,
                         "vendor/new",
                     )
                     .map(|_| ())
                 } else {
-                    set_reasoning_in(&second_dir, &second_gate, false).map(|_| ())
+                    set_reasoning_in(second_dir, second_gate, false).map(|_| ())
                 }
-            });
-
-            // The second command has reached the shared gate while the first
-            // still owns it. Releasing the first now gives a deterministic
-            // serialized ordering without timing or scheduler assumptions.
-            second_entering_gate.wait();
-            release_first.wait();
-            first.join().unwrap().unwrap();
-            second.join().unwrap().unwrap();
-        });
+            },
+        );
 
         let persisted = read_provider_config(dir.path()).unwrap();
         assert_eq!(persisted.model, "vendor/new");
@@ -1346,6 +1431,159 @@ mod tests {
     #[test]
     fn model_selection_then_reasoning_off_does_not_lose_either_update() {
         concurrent_provider_updates_preserve_both_fields(false);
+    }
+
+    /// The hazard the gate exists to remove: two writers that each read the *same*
+    /// snapshot and then write in turn. The later write restores the earlier
+    /// writer's field from its stale copy — a lost update. This is deliberately
+    /// *ungated* to prove the interleave the gated tests force is genuinely
+    /// dangerous, so a green gated test is meaningful and not vacuously passing.
+    #[test]
+    fn ungated_read_modify_write_interleave_loses_a_concurrent_field() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                model: "vendor/old".into(),
+                reasoning: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // Both writers snapshot the same starting config — the stale-read window.
+        let mut first = read_provider_config(dir.path()).unwrap();
+        let mut second = read_provider_config(dir.path()).unwrap();
+
+        // First opts reasoning OFF and commits.
+        first.reasoning = false;
+        write_provider_config(dir.path(), &first).unwrap();
+        // Second selects a new model from its stale snapshot and commits.
+        second.model = "vendor/new".into();
+        write_provider_config(dir.path(), &second).unwrap();
+
+        let persisted = read_provider_config(dir.path()).unwrap();
+        assert_eq!(persisted.model, "vendor/new");
+        assert!(
+            persisted.reasoning,
+            "without serialization the stale second write restores reasoning=true: the opt-out is lost"
+        );
+    }
+
+    #[test]
+    fn provider_switch_and_reasoning_opt_out_do_not_lose_either_update() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                active_provider: Some(ProviderKind::OpenRouter),
+                reasoning: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // First: the user opts reasoning OFF. Second (overlapping): the user switches
+        // the active provider to Local — the exact `set_active_provider` config write.
+        overlapping_gated_writers(
+            dir.path(),
+            |config| config.reasoning = false,
+            |second_dir, second_gate| {
+                second_gate
+                    .update(second_dir, |cfg| {
+                        cfg.active_provider = Some(ProviderKind::Local);
+                        cfg.local_model_tag = Some("vendor/local".into());
+                        Ok(())
+                    })
+                    .map(|_| ())
+            },
+        );
+
+        let persisted = read_provider_config(dir.path()).unwrap();
+        assert_eq!(
+            persisted.active_provider,
+            Some(ProviderKind::Local),
+            "the concurrent provider switch must survive"
+        );
+        assert!(
+            !persisted.reasoning,
+            "the provider switch must not restore reasoning from a stale snapshot"
+        );
+    }
+
+    #[test]
+    fn skill_toggle_and_model_selection_do_not_lose_either_update() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                model: "vendor/old".into(),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // First: select a new model. Second (overlapping): disable a built-in skill —
+        // the exact `set_skill_enabled` read-modify-write, run under the same gate.
+        overlapping_gated_writers(
+            dir.path(),
+            |config| config.model = "vendor/new".into(),
+            |second_dir, second_gate| {
+                second_gate.run(second_dir, || {
+                    set_built_in_skill_enabled_in(second_dir, FIXTURE_SKILL_ID, false).map(|_| ())
+                })
+            },
+        );
+
+        let persisted = read_provider_config(dir.path()).unwrap();
+        assert_eq!(
+            persisted.model, "vendor/new",
+            "the concurrent model selection must survive a skill toggle"
+        );
+        assert_eq!(
+            persisted.disabled_skills,
+            [FIXTURE_SKILL_ID],
+            "the concurrent skill toggle must survive"
+        );
+    }
+
+    #[test]
+    fn key_state_write_and_reasoning_opt_out_do_not_lose_either_update() {
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                reasoning: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // First: the user opts reasoning OFF. Second (overlapping): a key write flips
+        // `key_configured` on. This is `save_api_key`'s config half; the keychain
+        // write is separate and holds no config field, so it is not modelled here.
+        overlapping_gated_writers(
+            dir.path(),
+            |config| config.reasoning = false,
+            |second_dir, second_gate| {
+                second_gate
+                    .update(second_dir, |cfg| {
+                        cfg.key_configured = true;
+                        Ok(())
+                    })
+                    .map(|_| ())
+            },
+        );
+
+        let persisted = read_provider_config(dir.path()).unwrap();
+        assert!(
+            persisted.key_configured,
+            "the concurrent key-state write must survive"
+        );
+        assert!(
+            !persisted.reasoning,
+            "the key-state write must not restore reasoning from a stale snapshot"
+        );
     }
 
     #[test]

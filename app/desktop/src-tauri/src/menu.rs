@@ -31,6 +31,14 @@ const ASSISTANT_PANEL_LABEL: &str = "Neural Assistant AI Panel";
 /// Every custom (non-predefined) action id, in one place so the builder and
 /// [`parse_menu_id`] can't drift apart. Predefined natives (copy, quit, …) are
 /// deliberately absent — the OS handles them and they never reach our handler.
+///
+/// This is also the SINGLE source of truth for the frontend `MenuAction` union:
+/// the `#[cfg(test)]` generator below mirrors it into
+/// `app/desktop/src/lib/bindings/menuActions.ts` during `cargo test`, and
+/// `api.ts` derives its union from that list (plus the two synthesized actions
+/// Rust emits outside it — `open-recent` and `quit-app`). A Rust action added
+/// here without regenerating the binding fails the parity test and the drift
+/// check, so a menu item can never silently become a dead no-op in the client.
 const CUSTOM_ACTIONS: &[&str] = &[
     "new-note",
     "new-folder",
@@ -447,5 +455,77 @@ mod tests {
         assert_eq!(recent_label("/Users/me/My Vault"), "My Vault");
         assert_eq!(recent_label("/Users/me/My Vault/"), "My Vault");
         assert_eq!(recent_label("Vault"), "Vault");
+    }
+
+    /// Compile-time snapshot of the committed generated binding. `include_str!`
+    /// reads it at BUILD time, so [`generated_binding_matches_custom_actions`]
+    /// compares [`CUSTOM_ACTIONS`] against the *committed* `menuActions.ts` — a
+    /// Rust action added without regenerating fails `cargo test`, not only the
+    /// external drift check. Compile-time, so it never races the generator's
+    /// runtime write. Test-only, so the production build stays uncoupled.
+    const GENERATED_MENU_ACTIONS_TS: &str = include_str!("../../src/lib/bindings/menuActions.ts");
+
+    /// Render the frontend menu-action binding from `actions`. Pure and
+    /// deterministic — a fixed template with the ids interpolated — so the
+    /// generator and the parity test agree by construction and a clean checkout
+    /// plus `cargo test` yields zero diff, a changed constant exactly one.
+    fn render_menu_actions_binding(actions: &[&str]) -> String {
+        let items = actions
+            .iter()
+            .map(|action| format!("\"{action}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            "// This file was generated from the Rust `CUSTOM_ACTIONS` constant by \
+             `cargo test`\n// (app/desktop/src-tauri/src/menu.rs). Do not edit this \
+             file manually.\n\n\
+             /** The native menu's custom action ids — the Rust core is the single\n \
+             *  source of truth (`CUSTOM_ACTIONS`). `api.ts` derives the `MenuAction`\n \
+             *  union from this list and unions in the two synthesized actions Rust\n \
+             *  emits outside it (`open-recent`, `quit-app`), so the vocabulary can\n \
+             *  never drift from the menu builder. */\n\
+             export const MENU_ACTIONS = [{items}] as const;\n"
+        )
+    }
+
+    /// Mirror [`CUSTOM_ACTIONS`] into the frontend bindings dir as a runtime TS
+    /// array, so `api.ts` derives `MenuAction` from the SAME list the menu builder
+    /// uses. Named with `export` so it runs under `cargo test --workspace export`
+    /// alongside the ts-rs type exports and the event-name generator; the drift
+    /// check then fails the build if the committed mirror is stale. Targets the
+    /// same `../src/lib/bindings` dir as `event_names.rs`, resolved from this
+    /// crate's manifest so it is independent of the test cwd.
+    #[test]
+    fn export_menu_action_bindings() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../src/lib/bindings");
+        std::fs::create_dir_all(&dir).expect("create bindings dir");
+        std::fs::write(
+            dir.join("menuActions.ts"),
+            render_menu_actions_binding(CUSTOM_ACTIONS),
+        )
+        .expect("write menuActions.ts");
+    }
+
+    /// The committed `menuActions.ts` is exactly what [`CUSTOM_ACTIONS`] renders
+    /// to — adding a Rust action without running `gen:bindings` fails here.
+    #[test]
+    fn generated_binding_matches_custom_actions() {
+        assert_eq!(
+            GENERATED_MENU_ACTIONS_TS,
+            render_menu_actions_binding(CUSTOM_ACTIONS),
+            "bindings/menuActions.ts is stale — run \
+             `npm --prefix app/desktop run gen:bindings` and commit the result",
+        );
+    }
+
+    /// The two actions Rust synthesizes outside the menu builder are deliberately
+    /// absent from [`CUSTOM_ACTIONS`]: `open-recent` is built from `RECENT_PREFIX`
+    /// in [`parse_menu_id`], `quit-app` is emitted by [`emit_quit_requested`] on a
+    /// guarded native Quit. `api.ts` unions them into `MenuAction` explicitly; if
+    /// either leaked into `CUSTOM_ACTIONS` it would be double-counted in the union.
+    #[test]
+    fn synthesized_exceptions_are_excluded_from_custom_actions() {
+        assert!(!CUSTOM_ACTIONS.contains(&"open-recent"));
+        assert!(!CUSTOM_ACTIONS.contains(&"quit-app"));
     }
 }

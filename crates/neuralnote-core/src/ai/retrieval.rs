@@ -8,13 +8,14 @@
 
 use crate::ai::evidence::EvidenceSpan;
 use crate::error::CoreResult;
-use crate::model::{FileHit, TreeNode};
+use crate::model::{FileHit, NoteDoc, SearchResponse, TreeNode};
 use crate::note::{content_hash, read_note};
 use crate::search::search_vault_with_content;
 use crate::tree::{markdown_files, read_tree};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 /// Default byte cap for a single evidence span's `text` (keeps tool results and the
 /// model's context bounded). Callers may lower it per read.
@@ -112,13 +113,75 @@ pub trait RetrievalProvider: Send + Sync {
     ) -> CoreResult<EvidenceSpan>;
 }
 
-/// Keyword retrieval over the existing vault search. Holds the vault root.
+/// The raw result of a whole-vault search: the response plus the content of every
+/// hit file (keyed by absolute path), exactly as [`search_vault_with_content`]
+/// returns it. Folder scoping and the per-call result cap are applied to this
+/// AFTER it is cached, so the same cached raw data yields correctly-scoped,
+/// correctly-capped outcomes for any `(folder, max_results)` a later call passes.
+type SearchData = (SearchResponse, HashMap<String, String>);
+
+/// The disk-facing reads retrieval performs, behind a seam so a run-scoped cache
+/// can memoize them (and tests can count the calls that actually reach disk).
+/// Every method returns the EXACT value its underlying free function returns
+/// today — the cache changes *how often* a read happens, never *what* it yields.
+trait VaultReader: Send + Sync {
+    fn read_tree(&self, root: &Path) -> CoreResult<Vec<TreeNode>>;
+    fn read_note(&self, root: &Path, path: &Path) -> CoreResult<NoteDoc>;
+    fn search(&self, root: &Path, query: &str) -> CoreResult<SearchData>;
+}
+
+/// The production reader: each call goes straight to disk via the existing free
+/// functions, so an uncached retriever behaves byte-for-byte as before.
+struct DiskVaultReader;
+
+impl VaultReader for DiskVaultReader {
+    fn read_tree(&self, root: &Path) -> CoreResult<Vec<TreeNode>> {
+        read_tree(root)
+    }
+
+    fn read_note(&self, root: &Path, path: &Path) -> CoreResult<NoteDoc> {
+        read_note(root, path)
+    }
+
+    fn search(&self, root: &Path, query: &str) -> CoreResult<SearchData> {
+        search_vault_with_content(root, query)
+    }
+}
+
+/// Memoized reads for ONE chat run. Keyed by the exact input each read takes, so a
+/// hit returns the identical value the first read produced. Only SUCCESSES are
+/// stored (an `Err` is propagated and re-attempted next time) — the cache never
+/// turns a transient read failure into a sticky stale hit. Every entry is an `Arc`
+/// so a hit is a cheap pointer clone, not a copy of a note's full text.
+#[derive(Default)]
+struct RunCache {
+    tree: Option<Arc<Vec<TreeNode>>>,
+    notes: HashMap<PathBuf, Arc<NoteDoc>>,
+    searches: HashMap<String, Arc<SearchData>>,
+}
+
+/// Keyword retrieval over the existing vault search. Holds the vault root, the
+/// disk reader, and a run-scoped read cache. The cache lives exactly as long as
+/// this retriever: the shell builds a fresh [`KeywordRetriever`] per `run_chat`
+/// (see `commands/ai.rs`), so a new run starts with an empty cache and re-reads
+/// disk — while repeated reads *within* one run are served from memory.
 pub struct KeywordRetriever {
     root: PathBuf,
+    reader: Arc<dyn VaultReader>,
+    /// Run-scoped read memo. `Mutex` gives the interior mutability the `&self`
+    /// [`RetrievalProvider`] methods need; critical sections do no I/O (the disk
+    /// read happens with the lock released), so they stay tiny and can't deadlock.
+    cache: Mutex<RunCache>,
 }
 
 impl KeywordRetriever {
     pub fn new(root: impl Into<PathBuf>) -> Self {
+        Self::with_reader(root, Arc::new(DiskVaultReader))
+    }
+
+    /// Construct with an explicit reader. The default [`DiskVaultReader`] reads from
+    /// disk; tests inject a counting reader to prove within-run reads are deduped.
+    fn with_reader(root: impl Into<PathBuf>, reader: Arc<dyn VaultReader>) -> Self {
         // Canonicalize up front so `read_note`'s vault-relative path computation
         // matches the tree scan's (both then strip the same canonical prefix —
         // otherwise a symlinked root like macOS's `/var`→`/private/var` yields a
@@ -126,7 +189,53 @@ impl KeywordRetriever {
         // is unreadable; later reads then fail loudly rather than here.
         let root = root.into();
         let root = root.canonicalize().unwrap_or(root);
-        Self { root }
+        Self {
+            root,
+            reader,
+            cache: Mutex::new(RunCache::default()),
+        }
+    }
+
+    /// The vault tree, read once per run. Reused by `list_notes` and `list_folders`
+    /// so one run walks the directory tree a single time.
+    fn cached_tree(&self) -> CoreResult<Arc<Vec<TreeNode>>> {
+        if let Some(tree) = self.cache.lock().unwrap().tree.clone() {
+            return Ok(tree);
+        }
+        let tree = Arc::new(self.reader.read_tree(&self.root)?);
+        self.cache.lock().unwrap().tree = Some(Arc::clone(&tree));
+        Ok(tree)
+    }
+
+    /// One note's [`NoteDoc`], read once per run per path. Dedups the common
+    /// search-then-read and list-then-read patterns: a note pulled in by
+    /// `list_notes` and then quoted by `read_note_span` is loaded from disk once.
+    fn cached_note(&self, path: &Path) -> CoreResult<Arc<NoteDoc>> {
+        if let Some(doc) = self.cache.lock().unwrap().notes.get(path).cloned() {
+            return Ok(doc);
+        }
+        let doc = Arc::new(self.reader.read_note(&self.root, path)?);
+        self.cache
+            .lock()
+            .unwrap()
+            .notes
+            .insert(path.to_path_buf(), Arc::clone(&doc));
+        Ok(doc)
+    }
+
+    /// One query's raw whole-vault search result, read once per run per query, so
+    /// the model re-issuing a query it already ran costs no second vault rescan.
+    fn cached_search(&self, query: &str) -> CoreResult<Arc<SearchData>> {
+        if let Some(data) = self.cache.lock().unwrap().searches.get(query).cloned() {
+            return Ok(data);
+        }
+        let data = Arc::new(self.reader.search(&self.root, query)?);
+        self.cache
+            .lock()
+            .unwrap()
+            .searches
+            .insert(query.to_string(), Arc::clone(&data));
+        Ok(data)
     }
 
     /// Build single-line evidence spans for each content hit, REUSING the raw text
@@ -190,7 +299,7 @@ impl KeywordRetriever {
 
 impl RetrievalProvider for KeywordRetriever {
     fn list_notes(&self, folder: Option<&str>) -> CoreResult<ListOutcome> {
-        let tree = read_tree(&self.root)?;
+        let tree = self.cached_tree()?;
         let mut notes = Vec::new();
         let mut skipped = 0u32;
         let mut total = 0u32;
@@ -213,9 +322,9 @@ impl RetrievalProvider for KeywordRetriever {
             // read_note yields the canonical title (frontmatter → H1 → stem). One
             // unreadable note must not sink the whole listing — skip it loudly AND
             // count it, so the model knows the listing is partial.
-            match read_note(&self.root, Path::new(&node.path)) {
+            match self.cached_note(Path::new(&node.path)) {
                 Ok(doc) => notes.push(NoteMeta {
-                    title: doc.title,
+                    title: doc.title.clone(),
                     rel_path: node.rel_path.clone(),
                 }),
                 Err(e) => {
@@ -233,7 +342,7 @@ impl RetrievalProvider for KeywordRetriever {
     }
 
     fn list_folders(&self) -> CoreResult<Vec<FolderMeta>> {
-        let tree = read_tree(&self.root)?;
+        let tree = self.cached_tree()?;
         let mut folders = Vec::new();
         collect_folders(&tree, &mut folders);
         Ok(folders)
@@ -245,21 +354,23 @@ impl RetrievalProvider for KeywordRetriever {
         max_results: usize,
         folder: Option<&str>,
     ) -> CoreResult<SearchOutcome> {
-        // TODO(search-per-run-cache): each of the 3–8 searches per chat turn still
-        // re-scans the whole vault from disk here; a run-scoped path→content cache
-        // across searches within one run_chat is the remaining win, but it needs
-        // state threaded through RetrievalProvider — deferred (PA-007). This call
-        // eliminates only the *double*-read of each hit (search + a second read_note).
-        let (resp, content_by_path) = search_vault_with_content(&self.root, query)?;
+        // The whole-vault scan runs once per DISTINCT query per run: a repeat of a
+        // query already issued this run is served from the cache with no re-read (the
+        // 3–8 searches per turn no longer each rescan when the model revisits a term).
+        // Folder scoping and the result cap are applied to the cached raw result
+        // below, so the same cached data yields correct outcomes for any scope/cap.
+        let data = self.cached_search(query)?;
+        let (resp, content_by_path) = &*data;
         // Scope to the folder BEFORE the result cap, so a folder's own matches are
         // never lost to whole-vault hits that merely ranked ahead of them.
         let hits: Vec<FileHit> = resp
             .hits
-            .into_iter()
+            .iter()
             .filter(|h| in_scope(&h.rel_path, folder))
+            .cloned()
             .collect();
         let (spans, cap_clipped, skipped_readback) =
-            self.collect_spans(&hits, &content_by_path, max_results);
+            self.collect_spans(&hits, content_by_path, max_results);
         Ok(SearchOutcome {
             spans,
             // GENUINE coverage gap only — the vault search's own global cap. A routine
@@ -282,13 +393,13 @@ impl RetrievalProvider for KeywordRetriever {
         max_bytes: usize,
     ) -> CoreResult<EvidenceSpan> {
         // read_note runs ensure_within, so a `../` in rel_path is refused, not read.
-        let doc = read_note(&self.root, &self.root.join(rel_path))?;
+        let doc = self.cached_note(&self.root.join(rel_path))?;
         let lines: Vec<&str> = doc.raw.split_inclusive('\n').collect();
         let (start, end, text) = slice_lines(&lines, start_line, end_line, max_bytes);
         Ok(EvidenceSpan {
             id: String::new(),
-            rel_path: doc.rel_path,
-            content_hash: doc.content_hash,
+            rel_path: doc.rel_path.clone(),
+            content_hash: doc.content_hash.clone(),
             start_line: start,
             end_line: end,
             text,
@@ -687,6 +798,229 @@ mod tests {
         assert_eq!(by_path.get("Cooking"), Some(&2));
         assert_eq!(by_path.get("Cooking/Baking"), Some(&1));
         assert_eq!(by_path.get("Work"), Some(&1));
+    }
+
+    /// A [`VaultReader`] that counts how many calls actually reach disk, wrapping
+    /// the real [`DiskVaultReader`]. A cache hit skips the reader, so a count of 1
+    /// for N logical reads is the dedup proof.
+    struct CountingReader {
+        inner: DiskVaultReader,
+        note_reads: Mutex<usize>,
+        search_reads: Mutex<HashMap<String, usize>>,
+    }
+
+    impl CountingReader {
+        fn new() -> Self {
+            Self {
+                inner: DiskVaultReader,
+                note_reads: Mutex::new(0),
+                search_reads: Mutex::new(HashMap::new()),
+            }
+        }
+        fn total_note_reads(&self) -> usize {
+            *self.note_reads.lock().unwrap()
+        }
+        fn search_count(&self, query: &str) -> usize {
+            self.search_reads
+                .lock()
+                .unwrap()
+                .get(query)
+                .copied()
+                .unwrap_or(0)
+        }
+    }
+
+    impl VaultReader for CountingReader {
+        fn read_tree(&self, root: &Path) -> CoreResult<Vec<TreeNode>> {
+            self.inner.read_tree(root)
+        }
+        fn read_note(&self, root: &Path, path: &Path) -> CoreResult<NoteDoc> {
+            *self.note_reads.lock().unwrap() += 1;
+            self.inner.read_note(root, path)
+        }
+        fn search(&self, root: &Path, query: &str) -> CoreResult<SearchData> {
+            *self
+                .search_reads
+                .lock()
+                .unwrap()
+                .entry(query.to_string())
+                .or_default() += 1;
+            self.inner.search(root, query)
+        }
+    }
+
+    fn counting_retriever(root: &Path) -> (Arc<CountingReader>, KeywordRetriever) {
+        let reader = Arc::new(CountingReader::new());
+        let shared = Arc::clone(&reader);
+        let dyn_reader: Arc<dyn VaultReader> = shared;
+        (reader, KeywordRetriever::with_reader(root, dyn_reader))
+    }
+
+    #[test]
+    fn repeated_search_within_a_run_scans_the_vault_once() {
+        let v = vault();
+        let (reader, r) = counting_retriever(v.path());
+        let first = r.search_notes("components", 8, None).unwrap();
+        let again = r.search_notes("components", 8, None).unwrap();
+        // The whole-vault scan ran once for the query; the repeat hit the cache.
+        assert_eq!(reader.search_count("components"), 1);
+        // And the cached repeat is byte-identical — same spans, order, hashes.
+        assert_eq!(first.spans.len(), again.spans.len());
+        assert_eq!(first.spans[0].text, again.spans[0].text);
+        assert_eq!(first.spans[0].content_hash, again.spans[0].content_hash);
+        assert_eq!(first.spans[0].rel_path, again.spans[0].rel_path);
+    }
+
+    #[test]
+    fn repeated_note_reads_within_a_run_touch_disk_once_per_path() {
+        let v = vault();
+        let (reader, r) = counting_retriever(v.path());
+        // Two spans from different line ranges of the SAME note — one disk read.
+        let a = r.read_note_span("Research/widgets.md", 1, 2, 2000).unwrap();
+        let b = r.read_note_span("Research/widgets.md", 3, 3, 2000).unwrap();
+        assert_eq!(
+            reader.total_note_reads(),
+            1,
+            "the note is read from disk once"
+        );
+        // Both spans still reflect the note correctly (same hash, distinct ranges).
+        assert_eq!(a.content_hash, b.content_hash);
+        assert_eq!((a.start_line, a.end_line), (1, 2));
+        assert_eq!((b.start_line, b.end_line), (3, 3));
+    }
+
+    #[test]
+    fn a_cached_search_still_scopes_and_caps_per_call() {
+        // The load-bearing invariant: caching the RAW search result must not change
+        // scoping or caps. One vault scan feeds a whole-vault call AND a folder-scoped
+        // call AND a capped call, each returning exactly what the uncached path would.
+        let v = multi_folder_vault();
+        let (reader, r) = counting_retriever(v.path());
+        let all = r.search_notes("boil", 8, None).unwrap();
+        let scoped = r.search_notes("boil", 8, Some("Cooking")).unwrap();
+        let capped = r.search_notes("boil", 1, None).unwrap();
+        assert_eq!(
+            reader.search_count("boil"),
+            1,
+            "one scan feeds all three calls"
+        );
+        assert_eq!(all.spans.len(), 2, "whole vault sees both hits");
+        assert_eq!(
+            scoped.spans.len(),
+            1,
+            "folder scope keeps only the Cooking hit"
+        );
+        assert_eq!(scoped.spans[0].rel_path, "Cooking/pasta.md");
+        assert_eq!(capped.spans.len(), 1, "max_results=1 clips to one span");
+        assert!(capped.capped, "the per-call cap still flags `capped`");
+    }
+
+    #[test]
+    fn a_failed_read_is_not_cached_and_is_re_attempted() {
+        // A read that errors must not become a sticky hit — the reader is called each
+        // time, so a later legitimate read (or a fixed permission) is never masked by
+        // a stale error. A path escape errors deterministically.
+        let v = vault();
+        let (reader, r) = counting_retriever(v.path());
+        assert!(r.read_note_span("../../etc/passwd", 1, 1, 100).is_err());
+        assert!(r.read_note_span("../../etc/passwd", 1, 1, 100).is_err());
+        assert_eq!(
+            reader.total_note_reads(),
+            2,
+            "an errored read is retried, never served stale from the cache"
+        );
+    }
+
+    #[test]
+    fn the_cache_lives_for_one_run_and_a_fresh_run_sees_disk_changes() {
+        let v = vault();
+        // Run 1: capture the pre-edit view, then edit the note on disk mid-run.
+        let run1 = KeywordRetriever::new(v.path());
+        let before = run1.search_notes("components", 8, None).unwrap();
+        assert_eq!(before.spans.len(), 1);
+        fs::write(
+            v.path().join("Research/widgets.md"),
+            "# Widgets\n\nNothing relevant remains here.\n",
+        )
+        .unwrap();
+        // Same run: the cache holds the pre-edit view (cache lifetime == one run).
+        let same_run = run1.search_notes("components", 8, None).unwrap();
+        assert_eq!(
+            same_run.spans.len(),
+            1,
+            "within one run the cached search is stable"
+        );
+        // A FRESH run (new retriever) re-reads disk and sees the edit — the cache is
+        // never process-global. Citation fidelity is unaffected: CitationVerifier
+        // reads disk directly (see verify.rs), so a stale span never surfaces.
+        let run2 = KeywordRetriever::new(v.path());
+        let after = run2.search_notes("components", 8, None).unwrap();
+        assert_eq!(
+            after.spans.len(),
+            0,
+            "a new run sees the current disk state"
+        );
+    }
+
+    /// Representative-vault benchmark for the run-scoped cache (issue #20). Ignored
+    /// by default (timing is machine-dependent and not a correctness gate); run with
+    /// `cargo test -p neuralnote-core cache_benchmark -- --ignored --nocapture` to see
+    /// the measured before/after. "Before" = today's behaviour, a fresh retriever per
+    /// operation so every call re-reads disk; "after" = one run-scoped retriever.
+    #[test]
+    #[ignore = "timing benchmark, not a correctness gate — run with --ignored --nocapture"]
+    fn cache_benchmark_reports_before_after() {
+        use std::time::Instant;
+        // A large synthetic vault: 1,000 notes across 20 folders, ~40 lines each.
+        let dir = tempfile::tempdir().unwrap();
+        for folder in 0..20 {
+            let folder_path = dir.path().join(format!("topic_{folder:02}"));
+            fs::create_dir(&folder_path).unwrap();
+            for note in 0..50 {
+                let body: String = (0..40)
+                    .map(|line| format!("Line {line} about widgets and gadgets in note {note}.\n"))
+                    .collect();
+                fs::write(folder_path.join(format!("note_{note:02}.md")), body).unwrap();
+            }
+        }
+
+        // A turn's worth of activity: the model searches a term, then reads spans from
+        // hit notes, revisiting the term and notes a few times (the common pattern).
+        let searches = 6usize;
+        let reads = 12usize;
+
+        // BEFORE: a fresh retriever per operation — every search rescans the vault and
+        // every read re-opens the note (no cross-call reuse).
+        let before_start = Instant::now();
+        for _ in 0..searches {
+            let r = KeywordRetriever::new(dir.path());
+            let _ = r.search_notes("widgets", 20, None).unwrap();
+        }
+        for _ in 0..reads {
+            let r = KeywordRetriever::new(dir.path());
+            let _ = r.read_note_span("topic_00/note_00.md", 1, 5, 2000).unwrap();
+        }
+        let before = before_start.elapsed();
+
+        // AFTER: one run-scoped retriever — the repeated query is scanned once and the
+        // repeatedly-read note is opened once.
+        let after_start = Instant::now();
+        let r = KeywordRetriever::new(dir.path());
+        for _ in 0..searches {
+            let _ = r.search_notes("widgets", 20, None).unwrap();
+        }
+        for _ in 0..reads {
+            let _ = r.read_note_span("topic_00/note_00.md", 1, 5, 2000).unwrap();
+        }
+        let after = after_start.elapsed();
+
+        println!(
+            "issue #20 cache benchmark (1000 notes, {searches} repeated searches + {reads} repeated reads):\n  before (fresh retriever per op): {before:?}\n  after  (one run-scoped cache):   {after:?}"
+        );
+        assert!(
+            after < before,
+            "the run-scoped cache must not be slower than re-reading: before={before:?} after={after:?}"
+        );
     }
 
     #[test]

@@ -3,6 +3,7 @@ import { Welcome } from "./welcome/Welcome";
 import { Workspace } from "./workspace/Workspace";
 import type { AppPreferencesLoad } from "./lib/types";
 import { ToastProvider } from "./notifications";
+import { QuarantineRecoveryListener } from "./notifications/QuarantineRecoveryListener";
 import {
   DEFAULT_PREFERENCES,
   PreferencesProvider,
@@ -28,6 +29,7 @@ export default function App({
 }: Readonly<{ initialPreferences?: AppPreferencesLoad }>) {
   return (
     <ToastProvider>
+      <QuarantineRecoveryListener />
       <a className="nn-skip-link" href="#nn-main-content">Skip to content</a>
       <PreferencesProvider initial={initialPreferences}>
         <UpdateCoordinator>

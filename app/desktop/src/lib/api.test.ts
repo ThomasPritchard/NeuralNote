@@ -13,7 +13,6 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
-import type { Constructable, Procedure } from "@vitest/spy";
 import {
   answerElicitation,
   cancelChatRun,
@@ -62,25 +61,6 @@ import {
   writeNote,
 } from "./api";
 import type { AiStatus, ChatEvent, PullEvent } from "./types";
-
-type ChatCommand = typeof chat;
-
-declare module "@vitest/spy" {
-  interface MockInstance<
-    T extends Procedure | Constructable = Procedure,
-  > {
-    /**
-     * TODO(chat-run-id-test-mocks): update the out-of-scope ChatPane.tsx test
-     * implementations to resolve run ids, then remove this narrow compatibility
-     * overload. Production `ChatCommand` remains truthfully Promise<string>.
-     */
-    mockImplementation(
-      fn: T extends ChatCommand
-        ? (...args: Parameters<T>) => Promise<void>
-        : never,
-    ): this;
-  }
-}
 
 const mockInvoke = vi.mocked(invoke);
 const mockListen = vi.mocked(listen);

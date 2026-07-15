@@ -9,6 +9,7 @@ import { memo, useRef, useState } from "react";
 import {
   ChevronRight,
   Folder,
+  FolderInput,
   FolderOpen,
   FolderPlus,
   Loader2,
@@ -51,6 +52,9 @@ export interface TreeContext {
   onSelect: (path: string, openInNewTab: boolean) => void;
   onStartCreate: (parentPath: string, kind: CreateKind) => void;
   onStartRename: (path: string) => void;
+  /** Open the "Move to" destination picker for this entry — the visible,
+   *  labelled twin of the `m` keyboard shortcut (issue #24). */
+  onMove: (node: TreeNode) => void;
   onDelete: (node: TreeNode) => void;
   onSubmitCreate: (name: string) => void;
   onSubmitRename: (path: string, name: string) => void;
@@ -207,6 +211,15 @@ function FolderRow({
         </button>
         <button
           type="button"
+          aria-label={`Move ${node.name}`}
+          title="Move to… (m)"
+          onClick={() => ctx.onMove(node)}
+          className={ACTION_BTN}
+        >
+          <FolderInput className="size-3.5" aria-hidden />
+        </button>
+        <button
+          type="button"
           aria-label={`Delete ${node.name}`}
           title="Delete"
           onClick={() => ctx.onDelete(node)}
@@ -270,6 +283,15 @@ function FileRow({ node, ctx }: Readonly<{ node: TreeNode; ctx: TreeContext }>) 
           className={ACTION_BTN}
         >
           <Pencil className="size-3.5" aria-hidden />
+        </button>
+        <button
+          type="button"
+          aria-label={`Move ${node.name}`}
+          title="Move to… (m)"
+          onClick={() => ctx.onMove(node)}
+          className={ACTION_BTN}
+        >
+          <FolderInput className="size-3.5" aria-hidden />
         </button>
         <button
           type="button"
