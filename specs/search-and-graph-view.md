@@ -24,8 +24,9 @@ phase later layers semantic search and inferred links on top of both.
 - **Search UX:** **split.** The sidebar input filters the visible tree by filename (pure
   frontend). The ribbon Search icon opens a dedicated sidebar search panel with full-text
   results (VSCode activity-bar pattern).
-- **Search engine (v1):** on-demand async scan per query — no index, no new crates. AI-phase
-  embeddings supersede ranking later.
+- **Search engine (v1):** on-demand async scan per query — no index, no new crates. Ordinary
+  queries remain full-text; `tag:#name` and `tag:name` perform Obsidian-compatible tag
+  filtering. AI-phase embeddings supersede ranking later.
 - Sub-decisions (approved as judgment): ⌘K opens the search panel (not the tree filter);
   star node variant only is ported (orb + magnet-pick stay prototype-only); no
   scroll-to-match in v1 (clicking a result opens the note); graph data refetches on view
@@ -78,6 +79,11 @@ the `root_of()` idiom). Errors are `CoreError` (existing kinds suffice: `io`, `n
   char-boundary safe** — byte-offset panics are the known hazard; dedicated tests (emoji,
   CJK, combining marks, match at snippet clip boundary). Filename/title matches rank before
   content-only matches.
+  - `tag:#name` / `tag:name` switches to tag mode without changing the wire contract. Match
+    inline body tags and the canonical YAML `tags` property case-insensitively; a parent also
+    matches nested descendants (`#inbox` includes `#inbox/to-read`). Do not match prefixes,
+    code, links, escaped syntax, HTML syntax, or malformed frontmatter. Tag hits are content
+    hits, never filename/title hits, and retain line/range evidence for the existing results UI.
 - **`links.rs`** — `read_link_graph(root) -> LinkGraph`. Per note, extract:
   - wikilinks: `[[target]]`, `[[target|alias]]`, `[[target#heading]]`, `[[target#heading|alias]]`
     (target = part before `#`/`|`); embeds (`![[…]]`) count as links too. Path-qualified
@@ -110,6 +116,10 @@ the `root_of()` idiom). Errors are `CoreError` (existing kinds suffice: `io`, `n
   `guard()`ed open. States: idle hint, empty (`No notes match "q"`), truncated banner
   ("Showing first 200 matches"), error via the existing toast channel. ⌘K global handler
   opens panel + focuses input; Esc clears then returns focus.
+- **Inline tags:** the source editor marks valid Obsidian-compatible `#tag` tokens without
+  replacing source. Pointer activation or Mod-Enter at the caret opens the persistent Search
+  panel with the visible `tag:#name` query. A nonce-backed request means activating the same
+  tag again refocuses and reruns it without remounting either editor or sidebar.
 - **Galaxy port** → `app/desktop/src/workspace/galaxy/`: copy `NeuralGalaxy.tsx`, `graph.ts`
   (types + cluster palette only — mock data deleted), `nodeChrome.ts`, `starNode.ts`,
   `starfield.glsl.ts`, `nodeRegistry.ts`. Sever: `nav.ts` (→ props/state), URL flags, orb
@@ -146,6 +156,8 @@ no eval/WASM in the trio at these versions.
   mounts with data → open-in-reader returns to note). `react-force-graph-3d` is module-mocked
   in jsdom (no WebGL) — the mock records props and renders a stub so wiring is honestly
   tested.
+  Tag-search parity covers exact/nested matching, YAML properties, masked code/syntax, and the
+  inline-tag → Search sidebar → guarded-result-open journey.
 - **Security-adjacent gate**: both new Rust parsers consume untrusted note content →
   independent adversarial review (code-reviewer + silent-failure-hunter) required, not just
   green tests.
@@ -172,7 +184,7 @@ the AI phase's semantic clustering later).
 ## Known gaps / deferred
 
 Scroll-to-match in reader/editor; live graph refresh on `vault://tree-changed`; ghost nodes
-for unresolved links; inline `#tag` facets; search ranking beyond name-first; very large
+for unresolved links; a dedicated tag browser/count view; search ranking beyond name-first; very large
 vault perf (label bands were tuned at ~40 nodes; no node cap in v1 — revisit if >2k-note
 vaults stutter); orb variant + magnet picking (prototype-only experiments).
 

@@ -1,0 +1,6 @@
+Plain text fixture.
+
+# The shared source editor decorates this as a Markdown heading.
+[[Project Alpha]] uses the same resolved-wikilink behaviour as a `.md` note.
+
+Saving this fixture must retain the `.txt` extension and exact source.

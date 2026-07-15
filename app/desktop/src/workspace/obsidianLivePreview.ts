@@ -1,5 +1,5 @@
 import { syntaxTree } from "@codemirror/language";
-import { StateEffect, type EditorState, type Extension } from "@codemirror/state";
+import { Prec, StateEffect, type EditorState, type Extension } from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
@@ -12,16 +12,19 @@ import {
 import type { NoteIndexEntry } from "./linkResolve";
 import { resolveWikilink } from "./linkResolve";
 import type { PreviewDecoration, VisibleRange } from "./sourceEditorDecorations";
+import { sourceFrontmatterRange } from "./sourceFrontmatterPreview";
+import { inlineTagAt } from "./obsidianTag";
 
 export interface ObsidianPreviewDecoration extends PreviewDecoration {
   readonly target?: string | null;
+  readonly tag?: string;
 }
 
 export const refreshObsidianPreview = StateEffect.define<null>();
 
 function active(state: EditorState, from: number, to: number): boolean {
   return state.selection.ranges.some((range) =>
-    range.empty ? range.head >= from && range.head < to : range.from < to && range.to > from,
+    range.empty ? range.head >= from && range.head <= to : range.from < to && range.to > from,
   );
 }
 
@@ -49,9 +52,25 @@ function boundedScanRanges(
   return merged;
 }
 
-function codeRanges(
+const TAG_MASKED_NODES = new Set([
+  "Autolink",
+  "CodeBlock",
+  "Escape",
+  "FencedCode",
+  "HTMLTag",
+  "Image",
+  "InlineCode",
+  "Link",
+  "LinkLabel",
+  "LinkReference",
+  "URL",
+]);
+const PREVIEW_MASKED_NODES = new Set(["CodeBlock", "FencedCode", "InlineCode"]);
+
+function syntaxMaskedRanges(
   state: EditorState,
   scanRanges: readonly VisibleRange[],
+  nodeNames: ReadonlySet<string>,
 ): Array<{ from: number; to: number }> {
   const ranges: Array<{ from: number; to: number }> = [];
   for (const scan of scanRanges) {
@@ -59,14 +78,16 @@ function codeRanges(
       from: scan.from,
       to: scan.to,
       enter({ name, from, to }) {
-        if (name === "InlineCode" || name === "FencedCode") ranges.push({ from, to });
+        if (nodeNames.has(name)) ranges.push({ from, to });
       },
     });
   }
+  const frontmatter = sourceFrontmatterRange(state);
+  if (frontmatter) ranges.push({ from: frontmatter.from, to: frontmatter.to });
   return ranges;
 }
 
-function overlapsCode(from: number, to: number, ranges: readonly { from: number; to: number }[]): boolean {
+function overlapsMasked(from: number, to: number, ranges: readonly { from: number; to: number }[]): boolean {
   return ranges.some((range) => from < range.to && to > range.from);
 }
 
@@ -86,9 +107,11 @@ export function collectObsidianPreview(
   state: EditorState,
   index: readonly NoteIndexEntry[],
   visibleRanges: readonly VisibleRange[] = [{ from: 0, to: state.doc.length }],
+  selectionActive = true,
 ): ObsidianPreviewDecoration[] {
   const scanRanges = boundedScanRanges(state.doc.length, visibleRanges);
-  const masked = codeRanges(state, scanRanges);
+  const previewMasked = syntaxMaskedRanges(state, scanRanges, PREVIEW_MASKED_NODES);
+  const tagMasked = syntaxMaskedRanges(state, scanRanges, TAG_MASKED_NODES);
   const output: ObsidianPreviewDecoration[] = [];
   const wikilink = /(!)?\[\[([^\]\r\n]+)\]\]/g;
 
@@ -97,11 +120,12 @@ export function collectObsidianPreview(
     for (const match of source.matchAll(wikilink)) {
       const from = scan.from + match.index;
       const to = from + match[0].length;
-      if (!insideVisible(from, to, visibleRanges) || overlapsCode(from, to, masked)) continue;
+      tagMasked.push({ from, to });
+      if (!insideVisible(from, to, visibleRanges) || overlapsMasked(from, to, previewMasked)) continue;
       const embed = match[1] === "!";
       const rawTarget = match[2];
       const target = resolveWikilink(rawTarget, [...index]);
-      if (active(state, from, to)) {
+      if (selectionActive && active(state, from, to)) {
         output.push({ from, to, kind: "mark", className: "nn-lp-wikilink-active", target });
       } else {
         output.push({
@@ -124,7 +148,7 @@ export function collectObsidianPreview(
       const from = scan.from + callout.index;
       const to = from + callout[0].length;
       const realLineStart = from === 0 || state.sliceDoc(from - 1, from) === "\n";
-      if (realLineStart && insideVisible(from, to, visibleRanges) && !overlapsCode(from, to, masked)) {
+      if (realLineStart && insideVisible(from, to, visibleRanges) && !overlapsMasked(from, to, previewMasked)) {
         output.push({ from, to, kind: "mark", className: "nn-lp-callout" });
       }
     }
@@ -136,13 +160,43 @@ export function collectObsidianPreview(
       const to = from + block[1].length;
       const matchEnd = scan.from + block.index + block[0].length;
       const realLineEnd = matchEnd === state.doc.length || state.sliceDoc(matchEnd, matchEnd + 1) === "\n";
-      if (realLineEnd && insideVisible(from, to, visibleRanges) && !overlapsCode(from, to, masked)) {
+      if (realLineEnd && insideVisible(from, to, visibleRanges) && !overlapsMasked(from, to, previewMasked)) {
         output.push({ from, to, kind: "mark", className: "nn-lp-block-id" });
+      }
+    }
+
+    for (const hash of source.matchAll(/#/g)) {
+      const from = scan.from + hash.index;
+      const previous = from === 0 ? "" : state.sliceDoc(from - 1, from);
+      if (from !== 0 && !/\s/u.test(previous)) continue;
+      const tag = inlineTagAt(source, hash.index);
+      if (!tag) continue;
+      const to = from + tag.length;
+      if (
+        insideVisible(from, to, visibleRanges) &&
+        !overlapsMasked(from, to, tagMasked)
+      ) {
+        output.push({ from, to, kind: "mark", className: "nn-lp-tag", tag });
       }
     }
   }
 
   return output.sort((left, right) => left.from - right.from || left.to - right.to);
+}
+
+export function openTagSearchAtCaret(
+  onSearchTag: (tag: string) => void,
+): (view: EditorView) => boolean {
+  return (view) => {
+    const caret = view.state.selection.main.head;
+    const line = view.state.doc.lineAt(caret);
+    const item = collectObsidianPreview(view.state, [], [{ from: line.from, to: line.to }])
+      .find((candidate) => candidate.tag && caret >= candidate.from && caret <= candidate.to);
+    if (!item?.tag) return false;
+    view.dispatch({ effects: EditorView.announce.of(`Searching for ${item.tag}`) });
+    queueMicrotask(() => onSearchTag(item.tag!));
+    return true;
+  };
 }
 
 export function openResolvedWikilinkAtCaret(
@@ -173,7 +227,10 @@ class ObsidianWidget extends WidgetType {
     element.dataset.nnSourceFrom = String(this.item.from);
     if (this.item.target) {
       element.dataset.nnWikilinkTarget = this.item.target;
-      element.title = `Command/Control-click to open ${this.item.target}`;
+      element.title = `Open ${this.item.target}`;
+      element.setAttribute("role", "link");
+      element.tabIndex = 0;
+      element.setAttribute("aria-keyshortcuts", "Enter");
     }
     element.append(document.createTextNode(this.item.label ?? ""));
     return element;
@@ -185,10 +242,26 @@ class ObsidianWidget extends WidgetType {
 }
 
 function build(view: EditorView, index: readonly NoteIndexEntry[]): DecorationSet {
-  const ranges = collectObsidianPreview(view.state, index, view.visibleRanges).map((item) =>
+  const ranges = collectObsidianPreview(
+    view.state,
+    index,
+    view.visibleRanges,
+    view.hasFocus,
+  ).map((item) =>
     item.kind === "widget"
       ? Decoration.replace({ widget: new ObsidianWidget(item), inclusive: false }).range(item.from, item.to)
-      : Decoration.mark({ class: item.className }).range(item.from, item.to),
+      : Decoration.mark({
+          class: item.className,
+          attributes: item.tag
+            ? {
+              "data-nn-tag": item.tag,
+                role: "link",
+                "aria-label": `Search for ${item.tag}`,
+                "aria-keyshortcuts": "Meta+Enter Control+Enter",
+                title: `Search for ${item.tag}`,
+              }
+            : undefined,
+        }).range(item.from, item.to),
   );
   return Decoration.set(ranges, true);
 }
@@ -196,9 +269,29 @@ function build(view: EditorView, index: readonly NoteIndexEntry[]): DecorationSe
 export function obsidianLivePreview(
   index: readonly NoteIndexEntry[] | (() => readonly NoteIndexEntry[]),
   onOpenLink: (relPath: string) => void,
+  onSearchTag: (tag: string) => void,
 ): Extension {
   const currentIndex = () => typeof index === "function" ? index() : index;
-  return ViewPlugin.fromClass(
+  const keyboardLinkHandler = Prec.highest(EditorView.domEventHandlers({
+    keydown(event) {
+      if (
+        event.key !== "Enter"
+        || event.altKey
+        || event.ctrlKey
+        || event.metaKey
+        || event.shiftKey
+      ) return false;
+      const element = (event.target as Element | null)?.closest<HTMLElement>(
+        "[data-nn-wikilink-target]",
+      );
+      const target = element?.dataset.nnWikilinkTarget;
+      if (!target) return false;
+      event.preventDefault();
+      onOpenLink(target);
+      return true;
+    },
+  }));
+  const previewPlugin = ViewPlugin.fromClass(
     class {
       decorations: DecorationSet;
 
@@ -210,7 +303,13 @@ export function obsidianLivePreview(
         const indexChanged = update.transactions.some((transaction) =>
           transaction.effects.some((effect) => effect.is(refreshObsidianPreview))
         );
-        if (update.docChanged || update.viewportChanged || update.selectionSet || indexChanged) {
+        if (
+          update.docChanged
+          || update.viewportChanged
+          || update.selectionSet
+          || update.focusChanged
+          || indexChanged
+        ) {
           this.decorations = build(update.view, currentIndex());
         }
       }
@@ -219,11 +318,18 @@ export function obsidianLivePreview(
       decorations: (plugin) => plugin.decorations,
       eventHandlers: {
         mousedown(event, view) {
+          const tagElement = (event.target as Element | null)?.closest<HTMLElement>("[data-nn-tag]");
+          const tag = tagElement?.dataset.nnTag;
+          if (event.button === 0 && tag) {
+            event.preventDefault();
+            queueMicrotask(() => onSearchTag(tag));
+            return true;
+          }
           const element = (event.target as Element | null)?.closest<HTMLElement>("[data-nn-source-from]");
           if (!element) return false;
           const from = Number(element.dataset.nnSourceFrom);
           const target = element.dataset.nnWikilinkTarget;
-          if ((event.metaKey || event.ctrlKey) && target) {
+          if (event.button === 0 && target) {
             event.preventDefault();
             onOpenLink(target);
             return true;
@@ -236,7 +342,19 @@ export function obsidianLivePreview(
           }
           return false;
         },
+        click(event) {
+          if (event.detail !== 0) return false;
+          const element = (event.target as Element | null)?.closest<HTMLElement>(
+            "[data-nn-wikilink-target]",
+          );
+          const target = element?.dataset.nnWikilinkTarget;
+          if (!target) return false;
+          event.preventDefault();
+          onOpenLink(target);
+          return true;
+        },
       },
     },
   );
+  return [keyboardLinkHandler, previewPlugin];
 }

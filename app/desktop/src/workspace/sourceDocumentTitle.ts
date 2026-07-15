@@ -20,7 +20,7 @@ function bodyStart(source: string): number | null {
   cursor = first.next;
   while (cursor <= limit) {
     const line = nextLine(source, cursor, limit);
-    if (line.text === "---") return line.next;
+    if (line.text === "---" || line.text === "...") return line.next;
     if (line.next <= cursor) break;
     cursor = line.next;
   }

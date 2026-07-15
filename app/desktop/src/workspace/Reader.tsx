@@ -16,6 +16,7 @@ import {
 } from "./fileMeta";
 import type { NoteIndexEntry } from "./linkResolve";
 import { Markdown } from "./Markdown";
+import { FrontmatterProperties } from "./FrontmatterProperties";
 
 interface ReaderProps {
   note: NoteDoc;
@@ -23,13 +24,15 @@ interface ReaderProps {
   noteIndex?: NoteIndexEntry[];
   /** Open another vault note by relPath (the workspace's guarded open). */
   onOpenLink?: (relPath: string) => void;
+  /** Open Search for a canonical YAML tag. */
+  onSearchTag?: (tag: string) => void;
 }
 
-export function Reader({ note, noteIndex, onOpenLink }: Readonly<ReaderProps>) {
+export function Reader({ note, noteIndex, onOpenLink, onSearchTag }: Readonly<ReaderProps>) {
   const ext = extFromPath(note.path);
 
   return (
-    <NoteDocumentFrame note={note} onOpenLink={onOpenLink}>
+    <NoteDocumentFrame note={note} onOpenLink={onOpenLink} onSearchTag={onSearchTag}>
       <NoteBody
         note={note}
         ext={ext}
@@ -44,12 +47,16 @@ export function NoteDocumentFrame({
   note,
   children,
   onOpenLink,
+  onSearchTag,
   suppressTitle = false,
+  suppressProperties = false,
 }: Readonly<{
   note: NoteDoc;
   children: ReactNode;
   onOpenLink?: (relPath: string) => void;
+  onSearchTag?: (tag: string) => void;
   suppressTitle?: boolean;
+  suppressProperties?: boolean;
 }>) {
   const ext = extFromPath(note.path);
   return (
@@ -79,8 +86,8 @@ export function NoteDocumentFrame({
           </div>
         )}
 
-        {note.frontmatter && Object.keys(note.frontmatter).length > 0 && (
-          <Properties frontmatter={note.frontmatter} />
+        {!suppressProperties && note.frontmatter && Object.keys(note.frontmatter).length > 0 && (
+          <FrontmatterProperties frontmatter={note.frontmatter} onSearchTag={onSearchTag} />
         )}
 
         <div className="mt-7">
@@ -183,67 +190,4 @@ function UnsupportedNotice({
       )}
     </div>
   );
-}
-
-function Properties({ frontmatter }: Readonly<{ frontmatter: Record<string, unknown> }>) {
-  return (
-    <dl className="mt-5 flex flex-col divide-y divide-border/70 overflow-hidden rounded-lg border border-border bg-card/50">
-      {Object.entries(frontmatter).map(([key, value]) => (
-        <div key={key} className="flex items-start gap-3 px-4 py-2.5">
-          <dt className="nn-mono flex w-28 shrink-0 items-center pt-px text-[0.75rem] text-muted-foreground">
-            {key}
-          </dt>
-          <dd className="min-w-0 flex-1 text-[0.8125rem]">
-            <FrontmatterValue value={value} />
-          </dd>
-        </div>
-      ))}
-    </dl>
-  );
-}
-
-function FrontmatterValue({ value }: Readonly<{ value: unknown }>) {
-  if (Array.isArray(value)) {
-    return (
-      <div className="flex flex-wrap gap-1.5">
-        {value.map((item, i) => {
-          const label = stringifyScalar(item);
-          return (
-            <span
-              key={`${label}-${i}`}
-              className="nn-mono rounded-sm bg-primary/12 px-1.5 py-0.5 text-[0.75rem] text-primary ring-1 ring-inset ring-primary/15"
-            >
-              {label}
-            </span>
-          );
-        })}
-      </div>
-    );
-  }
-  if (value !== null && typeof value === "object") {
-    return <span className="nn-mono text-foreground/80">{stringifyScalar(value)}</span>;
-  }
-  return <span className="text-foreground/90">{stringifyScalar(value)}</span>;
-}
-
-/** Render a scalar (or unknown) frontmatter value as a short display string. */
-function stringifyScalar(value: unknown): string {
-  if (value === null || value === undefined) return "—";
-  if (typeof value === "object") {
-    try {
-      return JSON.stringify(value) ?? "—";
-    } catch {
-      return "—";
-    }
-  }
-  if (
-    typeof value === "string" ||
-    typeof value === "number" ||
-    typeof value === "bigint" ||
-    typeof value === "boolean" ||
-    typeof value === "symbol"
-  ) {
-    return value.toString();
-  }
-  return "—";
 }

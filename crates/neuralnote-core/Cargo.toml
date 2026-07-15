@@ -41,6 +41,9 @@ audioadapter-buffers = { version = "4.0.0", default-features = false, features =
 base64 = "0.22.1"
 # Complete HTML named/numeric entity decoding for untrusted caption text.
 html-escape = "0.2.14"
+# Unicode General_Category data shared with the frontend tag grammar. The
+# compiled-data provider is deterministic and already present in Cargo.lock.
+icu_properties = "2.2.0"
 # Decode the three accepted thumbnail formats before they cross the IPC boundary.
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 

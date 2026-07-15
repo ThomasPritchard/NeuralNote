@@ -198,6 +198,33 @@ describe("Reader — frontmatter", () => {
     expect(screen.getByText("—")).toBeInTheDocument();
   });
 
+  it("makes only valid canonical YAML tags searchable", async () => {
+    const onSearchTag = vi.fn();
+    const { rerender } = render(
+      <Reader
+        note={doc({
+          frontmatter: {
+            tags: "#solo",
+            aliases: ["solo"],
+          },
+        })}
+        onSearchTag={onSearchTag}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Search for #solo" }));
+    expect(onSearchTag).toHaveBeenCalledExactlyOnceWith("#solo");
+    expect(screen.getByText("solo")).not.toHaveAttribute("role", "button");
+
+    rerender(
+      <Reader
+        note={doc({ frontmatter: { tags: [1984, { nested: "tag" }] } })}
+        onSearchTag={onSearchTag}
+      />,
+    );
+    expect(screen.queryByRole("button", { name: /Search for/i })).toBeNull();
+  });
+
   it("hides the properties table when frontmatter is empty", () => {
     render(<Reader note={doc({ frontmatter: {} })} />);
     expect(screen.queryByRole("term")).not.toBeInTheDocument();

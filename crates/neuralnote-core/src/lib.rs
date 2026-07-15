@@ -1579,6 +1579,342 @@ mod tests {
         assert_eq!(slice_chars(&m.snippet, m.ranges[0]), "σεισμός");
     }
 
+    #[test]
+    fn tag_search_is_case_insensitive_and_matches_only_exact_or_nested_tags() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("tags.md"),
+            "#Inbox\n#INBOX/to-read\n#inbox-old\n#myjob/inbox\n#inboxes\n",
+        )
+        .unwrap();
+
+        let r = search::search_vault(dir.path(), "tag:#inbox").unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert!(!r.hits[0].name_match);
+        assert_eq!(r.hits[0].matches.len(), 2);
+        assert_eq!(r.hits[0].matches[0].line, 1);
+        assert_eq!(
+            slice_chars(
+                &r.hits[0].matches[0].snippet,
+                r.hits[0].matches[0].ranges[0]
+            ),
+            "#Inbox"
+        );
+        assert_eq!(r.hits[0].matches[1].line, 2);
+        assert_eq!(
+            slice_chars(
+                &r.hits[0].matches[1].snippet,
+                r.hits[0].matches[1].ranges[0]
+            ),
+            "#INBOX/to-read"
+        );
+
+        let without_hash = search::search_vault(dir.path(), "tag:Inbox").unwrap();
+        assert_eq!(without_hash.hits.len(), 1);
+        assert_eq!(without_hash.hits[0].matches.len(), 2);
+    }
+
+    #[test]
+    fn tag_search_applies_obsidian_boundaries_numeric_rule_and_unicode_grammar() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("tags.md"),
+            concat!(
+                "#1984 numeric only\n",
+                "word#project lacks leading whitespace\n",
+                "# project is a heading\n",
+                "# bare\n",
+                "valid #東京/調査 and #music🎵/live\n",
+                "punctuation #東京。 and decomposed #cafe\u{301}\n",
+                "joined #👩‍💻dev and Indic #हिन्दी\n",
+            ),
+        )
+        .unwrap();
+
+        assert!(search::search_vault(dir.path(), "tag:#1984")
+            .unwrap()
+            .hits
+            .is_empty());
+        assert!(search::search_vault(dir.path(), "tag:#project")
+            .unwrap()
+            .hits
+            .is_empty());
+        assert!(search::search_vault(dir.path(), "tag:#")
+            .unwrap()
+            .hits
+            .is_empty());
+        assert!(search::search_vault(dir.path(), "tag:")
+            .unwrap()
+            .hits
+            .is_empty());
+        assert!(search::search_vault(dir.path(), "tag:1984")
+            .unwrap()
+            .hits
+            .is_empty());
+
+        for query in ["tag:#東京", "tag:#music🎵"] {
+            let r = search::search_vault(dir.path(), query).unwrap();
+            assert_eq!(r.hits.len(), 1, "query {query:?}");
+            let expected_matches = if query == "tag:#東京" { 2 } else { 1 };
+            assert_eq!(r.hits[0].matches.len(), expected_matches, "query {query:?}");
+            assert_eq!(r.hits[0].matches[0].line, 5, "query {query:?}");
+        }
+        let r = search::search_vault(dir.path(), "tag:#cafe\u{301}").unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].matches[0].line, 6);
+        for query in ["tag:#👩‍💻dev", "tag:#हिन्दी"] {
+            let r = search::search_vault(dir.path(), query).unwrap();
+            assert_eq!(r.hits.len(), 1, "query {query:?}");
+            assert_eq!(r.hits[0].matches[0].line, 7, "query {query:?}");
+        }
+    }
+
+    #[test]
+    fn tag_search_reads_canonical_yaml_tags_and_ignores_malformed_frontmatter() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("canonical.md"),
+            "---\ntags:\n  - Project\n  - project/research\n  - other\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("flow.md"),
+            "---\ntags: [project/design, unrelated]\n---\nbody\n",
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join("malformed.md"),
+            "---\ntags: [project\n---\nbody #bodytag\n",
+        )
+        .unwrap();
+        let unterminated = dir.path().join("unterminated.md");
+        fs::write(&unterminated, "---\ntags: [project]\n#project\n").unwrap();
+        let doc = note::read_note(dir.path(), &unterminated).unwrap();
+        assert!(doc.frontmatter_error.is_some());
+
+        let r = search::search_vault(dir.path(), "tag:#PROJECT").unwrap();
+        let rels: Vec<&str> = r.hits.iter().map(|h| h.rel_path.as_str()).collect();
+        assert_eq!(rels, ["canonical.md", "flow.md"]);
+        assert_eq!(r.hits[0].matches.len(), 2);
+        assert_eq!(r.hits[0].matches[0].line, 3);
+        assert_eq!(r.hits[0].matches[1].line, 4);
+        assert_eq!(r.hits[1].matches.len(), 1);
+        assert_eq!(r.hits[1].matches[0].line, 2);
+
+        let body = search::search_vault(dir.path(), "tag:#bodytag").unwrap();
+        assert_eq!(body.hits.len(), 1);
+        assert_eq!(body.hits[0].rel_path, "malformed.md");
+        assert_eq!(body.hits[0].matches[0].line, 4);
+
+        fs::write(
+            dir.path().join("source-location.md"),
+            "---\ntitle: locationtag\ntags: [xlocationtag, locationtag]\n---\nbody\n",
+        )
+        .unwrap();
+        let r = search::search_vault(dir.path(), "tag:#locationtag").unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].matches.len(), 1);
+        assert_eq!(r.hits[0].matches[0].line, 3);
+        assert_eq!(r.hits[0].matches[0].ranges, vec![(21, 32)]);
+
+        fs::write(
+            dir.path().join("quoted-key.md"),
+            "---\n\"tags\": [quoted]\n---\nbody\n",
+        )
+        .unwrap();
+        let quoted = search::search_vault(dir.path(), "tag:#quoted").unwrap();
+        assert_eq!(quoted.hits.len(), 1);
+        assert_eq!(quoted.hits[0].rel_path, "quoted-key.md");
+        assert_eq!(quoted.hits[0].matches[0].line, 2);
+
+        fs::write(
+            dir.path().join("escaped-key.md"),
+            "---\n\"\\x74ags\": [\"\\x65scaped\"]\n---\nbody\n",
+        )
+        .unwrap();
+        let escaped = search::search_vault(dir.path(), "tag:#escaped").unwrap();
+        assert_eq!(escaped.hits.len(), 1);
+        assert_eq!(escaped.hits[0].rel_path, "escaped-key.md");
+        assert_eq!(escaped.hits[0].matches[0].line, 2);
+        assert_eq!(
+            slice_chars(
+                &escaped.hits[0].matches[0].snippet,
+                escaped.hits[0].matches[0].ranges[0],
+            ),
+            "\"\\x74ags\""
+        );
+
+        let duplicate = dir.path().join("duplicate-key.md");
+        fs::write(
+            &duplicate,
+            "---\ntags: [first]\n\"tags\": [second]\n---\nbody\n",
+        )
+        .unwrap();
+        let doc = note::read_note(dir.path(), &duplicate).unwrap();
+        assert!(doc
+            .frontmatter_error
+            .as_deref()
+            .is_some_and(|error| error.contains("duplicate")));
+        for query in ["tag:#first", "tag:#second"] {
+            assert!(search::search_vault(dir.path(), query)
+                .unwrap()
+                .hits
+                .iter()
+                .all(|hit| hit.rel_path != "duplicate-key.md"));
+        }
+
+        let escaped_duplicate = dir.path().join("escaped-duplicate-key.md");
+        fs::write(
+            &escaped_duplicate,
+            "---\ntags: [first]\n\"\\x74ags\": [second]\n---\nbody\n",
+        )
+        .unwrap();
+        let doc = note::read_note(dir.path(), &escaped_duplicate).unwrap();
+        assert!(doc
+            .frontmatter_error
+            .as_deref()
+            .is_some_and(|error| error.contains("duplicate")));
+        for query in ["tag:#first", "tag:#second"] {
+            assert!(search::search_vault(dir.path(), query)
+                .unwrap()
+                .hits
+                .iter()
+                .all(|hit| hit.rel_path != "escaped-duplicate-key.md"));
+        }
+    }
+
+    #[test]
+    fn tag_search_ignores_code_links_embeds_escapes_and_html_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("syntax.md"),
+            concat!(
+                "`#project`\n",
+                "    #project indented code\n",
+                "```md\n#project\n```\n",
+                "[#project](target.md)\n",
+                "[label #project](target.md)\n",
+                "![[note #project]]\n",
+                "[[note|alias #project]]\n",
+                "\\#project\n",
+                "<span data-tag=\"#project\">\n",
+                "<!-- #project -->\n",
+                "ordinary #project\n",
+            ),
+        )
+        .unwrap();
+
+        let r = search::search_vault(dir.path(), "tag:#project").unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].matches.len(), 1);
+        assert_eq!(r.hits[0].matches[0].line, 13);
+    }
+
+    #[test]
+    fn tag_search_preserves_original_boundaries_around_masked_syntax() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("boundaries.md"),
+            concat!(
+                "`code`#project\n",
+                "[[note]]#project\n",
+                "<span>#project\n",
+                "[label #project][ref]\n",
+                "[ref]:\n",
+                "  /url\n",
+                "  \"title #project\"\n",
+                "\n",
+                "[shortcut #project]\n",
+                "[shortcut #project]: target\n",
+                "valid #project\n",
+            ),
+        )
+        .unwrap();
+
+        let r = search::search_vault(dir.path(), "tag:#project").unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].matches.len(), 1);
+        assert_eq!(r.hits[0].matches[0].line, 11);
+    }
+
+    #[test]
+    fn ordinary_full_text_search_keeps_existing_tag_like_text_semantics() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("ordinary.md"),
+            "`#project` and word#project and #1984\n",
+        )
+        .unwrap();
+
+        let r = search::search_vault(dir.path(), "#project").unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].matches.len(), 1);
+        assert_eq!(r.hits[0].matches[0].ranges.len(), 2);
+    }
+
+    #[test]
+    fn tag_search_preserves_match_caps_and_lossy_utf8_behavior() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut body: Vec<u8> = (0..60)
+            .flat_map(|i| format!("#project line {i}\n").into_bytes())
+            .collect();
+        body.extend_from_slice(b"invalid: \xff then #project\n");
+        fs::write(dir.path().join("many.md"), body).unwrap();
+
+        let r = search::search_vault(dir.path(), "tag:#project").unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].matches.len(), search::MAX_MATCHES_PER_FILE);
+        assert!(r.truncated);
+        assert_eq!(r.skipped_files, 0);
+    }
+
+    #[test]
+    fn tag_search_bounds_dense_line_ranges_and_maximum_frontmatter_work() {
+        use std::time::{Duration, Instant};
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("dense.md"), "#project ".repeat(60_000)).unwrap();
+
+        let mut frontmatter = String::from("---\ntags:\n");
+        let mut index = 0usize;
+        while frontmatter.len() + 32 < (4 << 10) {
+            frontmatter.push_str(&format!("  - perf-{index}\n"));
+            index += 1;
+        }
+        let target = format!("perf-{}", index - 1);
+        frontmatter.push_str("---\nbody\n");
+        fs::write(dir.path().join("frontmatter.md"), frontmatter).unwrap();
+
+        let started = Instant::now();
+        let dense = search::search_vault(dir.path(), "tag:#project").unwrap();
+        assert!(started.elapsed() < Duration::from_secs(2));
+        assert_eq!(dense.hits.len(), 1);
+        assert!(dense.hits[0].matches[0].ranges.len() <= 32);
+
+        let metadata = search::search_vault(dir.path(), &format!("tag:#{target}")).unwrap();
+        assert_eq!(metadata.hits.len(), 1);
+        assert_eq!(metadata.hits[0].rel_path, "frontmatter.md");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn tag_search_counts_unreadable_markdown_files() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("locked.md"), "#project\n").unwrap();
+        fs::write(dir.path().join("open.md"), "#project\n").unwrap();
+        fs::set_permissions(
+            dir.path().join("locked.md"),
+            fs::Permissions::from_mode(0o000),
+        )
+        .unwrap();
+
+        let r = search::search_vault(dir.path(), "tag:#project").unwrap();
+        assert_eq!(r.hits.len(), 1);
+        assert_eq!(r.hits[0].rel_path, "open.md");
+        assert_eq!(r.skipped_files, 1);
+    }
+
     /* ──────────────────────────────  links  ────────────────────────────── */
 
     /// The edge between two notes regardless of direction (edges are deduped on

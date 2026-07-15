@@ -57,6 +57,22 @@ existing Properties treatment while inactive, but its exact source remains in
 the editor document and can be revealed for editing. NeuralNote must not parse
 and reserialize frontmatter as part of an ordinary note save.
 
+The Properties treatment is reversible. `Edit YAML` reveals the authoritative
+source and a `Done` action returns to Properties without changing the document.
+When the frontmatter source differs from the last parsed revision, Properties
+must not render stale values; it shows an explicit save-to-refresh state while
+keeping the edited YAML available through `Edit YAML`. If the delimiters no
+longer form a foldable frontmatter block, the source remains visible with an
+explicit explanation.
+
+String values belonging to the root `tags` property are interactive in the
+Properties treatment, whether the YAML value was a scalar or a sequence.
+Activating one routes through the same `tag:#name` vault-search path as an
+inline Obsidian tag. The chip preserves the parsed source spelling for display,
+adds exactly one leading `#` to the search value, and remains keyboard
+accessible. Values under other properties and non-string tag values stay
+inert.
+
 ### Live-preview decorations
 
 Use the maintained Markdown language parser and syntax tree for standard
@@ -88,6 +104,9 @@ Initial rendered constructs are:
 - Obsidian wikilinks, aliases, heading and block fragments, and embeds;
 - Obsidian callout markers and block IDs where a conservative decoration is
   possible without changing source.
+- Obsidian inline tags as exact source-preserving marks; pointer activation and
+  Mod-Enter at the caret route to `tag:#name` vault search, while tag-like text
+  in frontmatter, code, links, escapes, and HTML syntax stays undecorated.
 
 Unsupported extensions, Dataview, raw HTML, MDX, JSX, math, footnotes, or an
 unknown plugin grammar remain ordinary editable source until a dedicated
@@ -111,11 +130,16 @@ Typing `[[` starts a CodeMirror `CompletionSource`. The completion popup:
   display text;
 - keeps unresolved and partially typed links editable.
 
-An inactive resolved wikilink renders as a link label. Normal click positions
-the caret and reveals its source. Primary-modifier click (Command on macOS,
-Control on Windows and Linux) opens the resolved note through the existing
-guarded workspace path. Unresolved targets remain visibly distinct and do not
-navigate.
+An inactive resolved wikilink or internal Markdown link renders as a link
+label with a programmatic link role, accessible name, keyboard focus, and a
+visible focus indicator. Normal click, synthetic click, or Enter on that
+focused link opens the resolved note through the existing guarded workspace
+path. Placing the caret immediately before, inside, or after the link reveals
+its complete source and removes the inactive link control; while that source
+is active, pointer and keyboard input edit it normally instead of navigating.
+Mod-Enter at the caret remains the editor-level keyboard navigation shortcut.
+Unresolved, unsafe, and external targets remain visibly distinct or inert and
+do not navigate.
 
 Images and embeds begin as non-fetching, inert preview treatments. Rendering an
 attachment or note body is a separate capability that requires native
@@ -274,7 +298,7 @@ Every production change begins with a focused failing test.
 ### Pure editor logic
 
 - decoration ranges for headings, emphasis, lists, tasks, links, code, tables,
-  wikilinks, embeds, callouts, and block IDs;
+  wikilinks, embeds, callouts, block IDs, and inline tags;
 - active-construct marker reveal and multiple selections;
 - malformed and unknown syntax remaining undecorated and editable;
 - `[[` completion filtering, insertion, aliases, fragments, unresolved targets,
@@ -290,8 +314,10 @@ Every production change begins with a focused failing test.
 - one editor surface for every text note with no compatibility request or raw
   fallback banner;
 - Markdown pill removal;
-- heading and wikilink marker reveal away from and inside the active construct;
-- completion popup and guarded note navigation;
+- heading and link marker reveal away from, inside, and at the boundaries of
+  the active construct;
+- completion popup, normal-click, synthetic-click, focused-Enter guarded note
+  navigation, active-source editing, and Mod-Enter navigation;
 - Save, no-op, dirty state, tabs, history, reload, overwrite, and write errors;
 - malformed frontmatter, raw HTML, MDX, Dataview, math, tables, callouts,
   embeds, and unknown plugin syntax all remaining editable;

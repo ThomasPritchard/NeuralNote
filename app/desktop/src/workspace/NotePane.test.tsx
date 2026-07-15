@@ -139,6 +139,82 @@ describe("NotePane", () => {
     expect(await screen.findByRole("textbox", { name: "Note content" })).toBeInTheDocument();
   });
 
+  it("places valid frontmatter properties below the source title without a duplicate heading", async () => {
+    const source = [
+      "---",
+      "tags: [opsec, reference]",
+      "---",
+      "# Electronic and information warfare",
+      "",
+      "Body",
+    ].join("\n");
+    const open = openNote({
+      note: note({
+        title: "Electronic and information warfare",
+        raw: source,
+        body: "# Electronic and information warfare\n\nBody",
+        frontmatter: { tags: ["opsec", "reference"] },
+        frontmatterRaw: "tags: [opsec, reference]",
+      }),
+      draft: source,
+    });
+    const { container } = render(<NotePane open={open} />);
+
+    const editor = await screen.findByRole("textbox", { name: "Note content" });
+    const title = container.querySelector(".nn-lp-heading-1");
+    const properties = screen.getByRole("button", { name: "Edit note properties" });
+    expect(title).not.toBeNull();
+    expect(title!.compareDocumentPosition(properties) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.getAllByText("tags")).toHaveLength(1);
+    expect(screen.queryByRole("heading", { level: 2, name: /tags/i })).toBeNull();
+    expect(editor).not.toHaveTextContent("tags: [opsec, reference]");
+    expect(open.setDraft).not.toHaveBeenCalled();
+
+    await userEvent.click(properties);
+
+    await waitFor(() => expect(screen.queryByRole("button", { name: "Edit note properties" })).toBeNull());
+    expect(editor.textContent).toContain("tags: [opsec, reference]");
+    expect(screen.queryByRole("heading", { level: 2, name: /tags/i })).toBeNull();
+    expect(open.setDraft).not.toHaveBeenCalled();
+  });
+
+  it("folds valid empty frontmatter below the title while keeping it available to edit", async () => {
+    const source = "---\n---\n# My Note\n\nBody";
+    render(<NotePane open={openNote({
+      note: note({
+        raw: source,
+        body: "# My Note\n\nBody",
+        frontmatter: null,
+        frontmatterRaw: "",
+      }),
+      draft: source,
+    })} />);
+
+    const editor = await screen.findByRole("textbox", { name: "Note content" });
+    expect(editor).not.toHaveTextContent("---");
+    await userEvent.click(screen.getByRole("button", { name: "Edit note properties" }));
+    expect(editor).toHaveTextContent("---");
+  });
+
+  it("folds frontmatter closed by the YAML document-end marker", async () => {
+    const source = "---\ntags: [reference]\n...\n# My Note\n\nBody";
+    const { container } = render(<NotePane open={openNote({
+      note: note({
+        raw: source,
+        body: "# My Note\n\nBody",
+        frontmatter: { tags: ["reference"] },
+        frontmatterRaw: "tags: [reference]",
+      }),
+      draft: source,
+    })} />);
+
+    const editor = await screen.findByRole("textbox", { name: "Note content" });
+    expect(editor).not.toHaveTextContent("tags: [reference]");
+    expect(screen.getByText("reference")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Edit note properties" })).toBeInTheDocument();
+    expect(container.querySelector("h1.nn-heading")).toBeNull();
+  });
+
   it("keeps binary notes non-editable", () => {
     render(<NotePane open={openNote({ note: note({ binary: true, raw: "", body: "" }) })} />);
     expect(screen.queryByRole("textbox", { name: "Note content" })).not.toBeInTheDocument();

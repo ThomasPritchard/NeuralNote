@@ -46,6 +46,16 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
 - **Actually run it** in the app (`npm run tauri dev`, or the built `.app`). Walk the golden
   path and the key edge cases by hand. A clean diff and green tests are necessary, not
   sufficient — type-checks and unit tests verify *code* correctness, not *feature* correctness.
+- **Use the reusable note test vault for note-facing changes.** Run
+  `node scripts/prepare-note-test-vault.mjs`, open the generated ignored copy under `target/` in the
+  app, and work through the applicable checklist in `00 Test Index.md`. Keep the fixture and
+  its coverage map current when supported note behaviour changes. See
+  [Note test vault](note-test-vault.md).
+- **Give hands-on testing a separate app identity on macOS.** For maintainer handoff, create a
+  debug bundle named `NeuralNote-Dev.app` with the `com.neuralnote.desktop.dev` identifier, copy
+  it to `target/dev-builds/NeuralNote-Dev.app`, and exercise that exact bundle. This keeps the
+  test build visibly separate from the main NeuralNote app and prevents both builds sharing an
+  application identity by accident. The repeatable commands are listed below.
 
 ### Review
 - Every non-trivial change receives a focused review for correctness, silent failures, security,
@@ -120,7 +130,8 @@ Baseline (every feature)
 - [ ] Pull request CI green: lint, typecheck, unit tests, Rust checks, bindings, Gitleaks
 - [ ] Rust gate GREEN — ./scripts/rust-quality-gate.sh (all categories enforced)
 - [ ] typecheck + clippy + fmt clean
-- [ ] Ran it in the app — golden path + key edge cases by hand
+- [ ] Ran it in the app — golden path + key edge cases by hand; macOS maintainer handoff uses `target/dev-builds/NeuralNote-Dev.app`
+- [ ] Note-facing change: exercised the applicable `fixtures/note-test-vault` checklist against a disposable copy
 - [ ] Focused review complete; independent adversarial review when security-adjacent
 - [ ] Failures surfaced, never silent; no content lost/hidden
 - [ ] Obsidian markdown+YAML compatibility preserved
@@ -149,6 +160,15 @@ npm run test:unit         # unit + component; excludes src/e2e
 npm run test:run          # all tests, including jsdom + mockIPC journeys
 npm run coverage          # all tests + 90% line gate; writes coverage/lcov.info
 npm run build
+
+# macOS maintainer handoff (from the repository root; requires the pinned sidecars)
+npm --prefix app/desktop run tauri build -- --debug --bundles app \
+  --config '{"productName":"NeuralNote-Dev","identifier":"com.neuralnote.desktop.dev","bundle":{"createUpdaterArtifacts":false}}'
+mkdir -p target/dev-builds
+rm -rf target/dev-builds/NeuralNote-Dev.app # generated local handoff only
+ditto --rsrc --extattr --acl target/debug/bundle/macos/NeuralNote-Dev.app target/dev-builds/NeuralNote-Dev.app
+codesign --force --deep --sign - target/dev-builds/NeuralNote-Dev.app
+codesign --verify --deep --strict target/dev-builds/NeuralNote-Dev.app
 
 # Rust (from repo root)
 cargo test --workspace --locked

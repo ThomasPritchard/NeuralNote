@@ -32,25 +32,28 @@ async function openVault(seed: SeedEntry[]): Promise<RenderAppResult> {
 }
 
 describe("Journey 14: resolved wikilink preview", () => {
-  it("previews a resolved [[wikilink]] in the source editor without navigation", async () => {
+  it("opens a normally clicked resolved [[wikilink]] from the source editor", async () => {
     const { user } = await openVault(FEATURE_SEED);
 
     await user.click(await screen.findByRole("button", { name: "Link Hub.md" }));
     expect(await screen.findByRole("heading", { name: "Link Hub", level: 1 })).toBeInTheDocument();
 
     expect(await screen.findByRole("textbox", { name: "Note content" })).toHaveTextContent("Go to Target.");
-    expect(document.querySelector(".nn-lp-wikilink-resolved")).toHaveTextContent("Target");
-    expect(screen.queryByRole("link", { name: "Target" })).not.toBeInTheDocument();
+    const link = screen.getByRole("link", { name: "Target" });
+    expect(link).toHaveTextContent("Target");
+    fireEvent.mouseDown(link, { button: 0 });
+
+    expect(await screen.findByRole("heading", { name: "Target", level: 1 })).toBeInTheDocument();
   });
 });
 
 describe("Journey 14b: source-preview link navigation", () => {
-  it("opens a resolved internal Markdown link on modifier-click", async () => {
+  it("opens a resolved internal Markdown link on normal click", async () => {
     const { user } = await openVault(FEATURE_SEED);
 
     await user.click(await screen.findByRole("button", { name: "Source Md.md" }));
     await screen.findByRole("heading", { name: "Source Md", level: 1 });
-    fireEvent.mouseDown(document.querySelector(".nn-lp-link")!, { metaKey: true });
+    fireEvent.mouseDown(document.querySelector(".nn-lp-link")!, { button: 0 });
 
     expect(await screen.findByRole("heading", { name: "Target", level: 1 })).toBeInTheDocument();
   });
@@ -118,7 +121,7 @@ describe("Journey 17: editor wikilink autocomplete", () => {
     await user.click(target);
     const view = EditorView.findFromDOM(textarea)!;
     expect(view.state.doc.toString()).toBe("Refer to [[Target]]");
-    view.dispatch({ selection: { anchor: view.state.doc.length } });
+    view.dispatch({ selection: { anchor: 0 } });
     expect(textarea).toHaveTextContent("Refer to Target");
   });
 });

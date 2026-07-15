@@ -159,6 +159,151 @@ describe("mockVault search_vault", () => {
     expect(out.hits[0].matches[0].line).toBe(2);
   });
 
+  it("filters exact and nested inline tags without matching prefixes or code", async () => {
+    seedVault([
+      { kind: "file", relPath: "exact.md", content: "Uses #SaaS here" },
+      { kind: "file", relPath: "nested.md", content: "Uses #SaaS/cloud here" },
+      { kind: "file", relPath: "prefix.md", content: "Uses #SaaSExtra here" },
+      { kind: "file", relPath: "code.md", content: "`#SaaS`\n```md\n#SaaS\n```" },
+    ]);
+
+    const out = await searchVault("tag:#saas");
+    expect(out.hits.map((hit) => hit.relPath)).toEqual(["exact.md", "nested.md"]);
+    expect(out.hits.every((hit) => hit.nameMatch === false)).toBe(true);
+  });
+
+  it("keeps original tag boundaries and excludes reference-link syntax", async () => {
+    seedVault([
+      {
+        kind: "file",
+        relPath: "masked.md",
+        content: [
+          "`code`#project [[Note]]#project <span>#project",
+          "[label #project]: target.md",
+          "[visible #project][label]",
+        ].join("\n"),
+      },
+      { kind: "file", relPath: "real.md", content: "A real #project tag" },
+    ]);
+
+    expect((await searchVault("tag:#project")).hits.map((hit) => hit.relPath)).toEqual([
+      "real.md",
+    ]);
+  });
+
+  it("excludes multiline reference definitions and resolved shortcut references", async () => {
+    seedVault([
+      {
+        kind: "file",
+        relPath: "references.md",
+        content: [
+          "[ref]:",
+          "  /url",
+          "  \"title #project\"",
+          "[shortcut #project]",
+          "[shortcut #project]: /target",
+          "A real #project tag",
+        ].join("\n"),
+      },
+    ]);
+
+    const result = await searchVault("tag:#project");
+    expect(result.hits).toHaveLength(1);
+    expect(result.hits[0].matches).toEqual([
+      expect.objectContaining({ line: 6, snippet: "A real #project tag" }),
+    ]);
+  });
+
+  it("matches frontend-valid Unicode tags consistently", async () => {
+    seedVault([
+      { kind: "file", relPath: "unicode.md", content: "#👩‍💻dev #हिन्दी" },
+    ]);
+
+    expect((await searchVault("tag:#👩‍💻dev")).hits.map((hit) => hit.relPath)).toEqual([
+      "unicode.md",
+    ]);
+    expect((await searchVault("tag:#हिन्दी")).hits.map((hit) => hit.relPath)).toEqual([
+      "unicode.md",
+    ]);
+  });
+
+  it("includes canonical YAML tags and rejects malformed or numeric tag queries", async () => {
+    seedVault([
+      { kind: "file", relPath: "flow.md", content: "---\ntags: [SaaS, other]\n---\nBody" },
+      { kind: "file", relPath: "scalar.md", content: "---\ntags: SaaS\n---\nBody" },
+      { kind: "file", relPath: "block.md", content: "---\ntags:\n  - SaaS/cloud\n---\nBody" },
+      { kind: "file", relPath: "wrong.md", content: "---\ntopic: SaaS\n---\nBody" },
+    ]);
+
+    expect((await searchVault("tag:#SaaS")).hits.map((hit) => hit.relPath)).toEqual([
+      "block.md",
+      "flow.md",
+      "scalar.md",
+    ]);
+    expect((await searchVault("tag:SaaS")).hits.map((hit) => hit.relPath)).toEqual([
+      "block.md",
+      "flow.md",
+      "scalar.md",
+    ]);
+    expect((await searchVault("tag:#1984")).hits).toEqual([]);
+  });
+
+  it("supports quoted YAML tag keys and fails closed for duplicate or unterminated metadata", async () => {
+    seedVault([
+      { kind: "file", relPath: "quoted.md", content: "---\n\"tags\": [project]\n---\nBody" },
+      {
+        kind: "file",
+        relPath: "duplicate.md",
+        content: "---\ntags: [wrong]\ntags: [project]\n---\nBody",
+      },
+      { kind: "file", relPath: "unterminated.md", content: "---\ntags: [project]\n#project" },
+    ]);
+
+    expect((await searchVault("tag:#project")).hits.map((hit) => hit.relPath)).toEqual([
+      "quoted.md",
+    ]);
+  });
+
+  it("mirrors BOM metadata and scans a safely delimited body after closed malformed metadata", async () => {
+    seedVault([
+      {
+        kind: "file",
+        relPath: "bom.md",
+        content: "\ufeff---\ntags: [project]\n---\nBody",
+      },
+      {
+        kind: "file",
+        relPath: "closed-malformed.md",
+        content: "---\ntags: [broken\n---\nBody #project",
+      },
+    ]);
+
+    expect((await searchVault("tag:#project")).hits.map((hit) => hit.relPath)).toEqual([
+      "bom.md",
+      "closed-malformed.md",
+    ]);
+  });
+
+  it("decodes escaped YAML tag keys and scans the body after decoded duplicate keys", async () => {
+    seedVault([
+      {
+        kind: "file",
+        relPath: "escaped-key.md",
+        content: "---\n\"\\x74ags\": [project]\n---\nBody",
+      },
+      {
+        kind: "file",
+        relPath: "duplicate-body.md",
+        content: "---\ntags: [wrong]\n\"\\x74ags\": [project]\n---\nBody #project",
+      },
+    ]);
+
+    expect((await searchVault("tag:#project")).hits.map((hit) => hit.relPath)).toEqual([
+      "duplicate-body.md",
+      "escaped-key.md",
+    ]);
+  });
+
   it("flags stem matches as nameMatch with empty matches when content misses", async () => {
     seedVault([
       { kind: "file", relPath: "Neural Notes.md", content: "nothing relevant" },
