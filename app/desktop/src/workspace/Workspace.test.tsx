@@ -781,7 +781,7 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     expect(screen.getByTestId("searchpanel").parentElement).toHaveAttribute(
       "hidden",
     );
-    expect(screen.queryByRole("separator")).not.toBeInTheDocument();
+    expect(screen.queryByRole("slider")).not.toBeInTheDocument();
 
     act(() => captured.ribbon.onShowFiles());
     expect(captured.ribbon.sidebarPanel).toBe("files");
@@ -1132,7 +1132,7 @@ describe("Workspace — titlebar + sidebar", () => {
       .getByTestId("filetree")
       .closest("#nn-primary-sidebar");
     expect(sidebar).toHaveAttribute("id", "nn-primary-sidebar");
-    expect(screen.getByRole("separator")).toHaveAttribute(
+    expect(screen.getByRole("slider")).toHaveAttribute(
       "aria-controls",
       "nn-primary-sidebar",
     );
@@ -1147,7 +1147,7 @@ describe("Workspace — titlebar + sidebar", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
 
-    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowRight" });
+    fireEvent.keyDown(screen.getByRole("slider"), { key: "ArrowRight" });
     expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
       "--sidebar-width": "304px",
     });
@@ -1158,7 +1158,7 @@ describe("Workspace — titlebar + sidebar", () => {
       "--sidebar-width": "0px",
       "--splitter-width": "0px",
     });
-    expect(screen.queryByRole("separator")).not.toBeInTheDocument();
+    expect(screen.queryByRole("slider")).not.toBeInTheDocument();
 
     act(() => captured.ribbon.onShowFiles());
     expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
@@ -1173,7 +1173,7 @@ describe("Workspace — titlebar + sidebar", () => {
     const notePane = screen.getByTestId("notepane");
     const chatPane = screen.getByTestId("chatpane");
 
-    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowRight" });
+    fireEvent.keyDown(screen.getByRole("slider"), { key: "ArrowRight" });
 
     expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
       "--sidebar-width": "304px",
@@ -1188,7 +1188,7 @@ describe("Workspace — titlebar + sidebar", () => {
     act(() => captured.ribbon.onToggleGraph());
     const graph = screen.getByTestId("graphview");
 
-    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowRight" });
+    fireEvent.keyDown(screen.getByRole("slider"), { key: "ArrowRight" });
 
     expect(screen.getByTestId("graphview")).toBe(graph);
   });
