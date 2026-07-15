@@ -396,10 +396,10 @@ const PLAYFUL_PROGRESS_COPY = [
 /** Pick one voice for the whole turn. The prompt-derived hash makes the choice
  * stable across React renders and phase changes without persisting UI trivia or
  * introducing random, flaky behaviour. */
-function playfulProgressCopy(prompt: string) {
+export function playfulProgressCopy(prompt: string) {
   let hash = 2_166_136_261;
-  for (let index = 0; index < prompt.length; index += 1) {
-    hash ^= prompt.charCodeAt(index);
+  for (const codePoint of prompt) {
+    hash ^= codePoint.codePointAt(0) ?? 0;
     hash = Math.imul(hash, 16_777_619);
   }
   return PLAYFUL_PROGRESS_COPY[(hash >>> 0) % PLAYFUL_PROGRESS_COPY.length];
