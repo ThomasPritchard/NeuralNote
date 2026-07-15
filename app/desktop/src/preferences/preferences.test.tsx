@@ -5,14 +5,16 @@ import type { AppPreferencesLoad } from "../lib/types";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
-  return { ...actual, saveAppPreferences: vi.fn() };
+  return { ...actual, saveAppPreferences: vi.fn(), loadAppPreferences: vi.fn() };
 });
 
 import * as api from "../lib/api";
 import { ToastProvider } from "../notifications";
 import {
+  DEFAULT_PREFERENCES,
   PreferencesProvider,
   applyPreferences,
+  bootstrapPreferences,
   usePreferences,
 } from "./preferences";
 
@@ -70,6 +72,54 @@ describe("preferences", () => {
     expect(
       screen.getByRole("listitem", { name: "Settings saved notification" }),
     ).toBeInTheDocument();
+  });
+
+  it("bootstraps and applies persisted preferences before mount", async () => {
+    vi.mocked(api.loadAppPreferences).mockResolvedValue(LOADED);
+
+    const loaded = await bootstrapPreferences();
+
+    expect(loaded).toEqual(LOADED);
+    expect(document.documentElement).toHaveAttribute("data-theme", "forestLight");
+  });
+
+  it("recovers to safe defaults when preferences cannot be loaded", async () => {
+    vi.mocked(api.loadAppPreferences).mockRejectedValue({
+      kind: "io",
+      message: "preferences.json is unreadable",
+    });
+
+    const loaded = await bootstrapPreferences();
+
+    expect(loaded.recoveredFromCorrupt).toBe(true);
+    expect(loaded.preferences).toEqual(DEFAULT_PREFERENCES);
+    expect(loaded.recoveryMessage).toContain("preferences.json is unreadable");
+    expect(document.documentElement).toHaveAttribute(
+      "data-theme",
+      DEFAULT_PREFERENCES.theme,
+    );
+  });
+
+  it("keeps the prior preferences and reports failure when a save is rejected", async () => {
+    vi.mocked(api.saveAppPreferences).mockRejectedValue({
+      kind: "io",
+      message: "disk full",
+    });
+    const user = userEvent.setup();
+    render(
+      <ToastProvider>
+        <PreferencesProvider initial={LOADED}>
+          <Probe />
+        </PreferencesProvider>
+      </ToastProvider>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "change theme" }));
+
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Settings could not be saved. disk full",
+    );
+    expect(screen.getByText("forestLight")).toBeInTheDocument();
   });
 
   it("surfaces corrupt preference recovery as a persistent error", () => {
