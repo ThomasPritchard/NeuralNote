@@ -162,7 +162,7 @@ export function TemplateInsertDialog({
             }}
           >
             <label className="flex flex-col gap-1.5 text-[0.75rem] font-medium text-foreground">
-              Note name
+              <span>Note name</span>
               <input
                 aria-label="Note name"
                 value={name}
@@ -172,7 +172,7 @@ export function TemplateInsertDialog({
               />
             </label>
             <label className="flex flex-col gap-1.5 text-[0.75rem] font-medium text-foreground">
-              Destination folder
+              <span>Destination folder</span>
               <select
                 aria-label="Destination folder"
                 value={parentPath}
