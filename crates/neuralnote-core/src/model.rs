@@ -47,6 +47,23 @@ pub struct TreeNode {
     pub children: Option<Vec<TreeNode>>,
 }
 
+/// One directory's immediate children, for the lazy file-tree DISPLAY path only.
+/// Produced by [`crate::tree::list_dir`]; never consumed by search, the link
+/// graph, backlinks, or AI retrieval — those keep scanning the whole vault.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DirListing {
+    /// One level of children, folders-first then files (case-insensitive by
+    /// name). Folder entries carry `children: None`, meaning "not loaded yet" —
+    /// distinct from a file's `None`, disambiguated by `kind`.
+    pub entries: Vec<TreeNode>,
+    /// `Some(n)` = n further entries in THIS directory were omitted by the
+    /// per-directory cap; `None` = complete listing. Drives an explicit
+    /// "N more…" row so truncation is never silent.
+    pub truncated: Option<u32>,
+}
+
 /// A note opened in the reader/editor: parsed frontmatter + markdown body, with
 /// the full raw file always retained so nothing is ever lost or hidden.
 #[derive(Debug, Clone, Serialize, Deserialize, TS)]

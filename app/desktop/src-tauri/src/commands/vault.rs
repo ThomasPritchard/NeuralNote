@@ -8,7 +8,8 @@
 use std::path::{Path, PathBuf};
 
 use neuralnote_core::model::{
-    Backlinks, LinkGraph, NoteDoc, RecentVault, SearchResponse, TemplateInfo, TreeNode, Vault,
+    Backlinks, DirListing, LinkGraph, NoteDoc, RecentVault, SearchResponse, TemplateInfo, TreeNode,
+    Vault,
 };
 use neuralnote_core::CoreError;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
@@ -319,6 +320,30 @@ pub(crate) fn set_chat_visible(app: AppHandle, state: SharedState, visible: bool
 #[tauri::command]
 pub(crate) async fn read_tree(state: SharedState<'_>) -> Result<Vec<TreeNode>, CoreError> {
     neuralnote_core::tree::read_tree(&root_of(&state)?)
+}
+
+/// One directory's immediate children, for the lazy file-tree DISPLAY path.
+/// Follows the same recipe as `read_tree` (async → worker pool, sync body, the
+/// state guard never crosses an await) and the same path-safety recipe as
+/// `read_backlinks`: `path` is resolved against the vault root and run through
+/// `ensure_within`, so the webview can never list a directory outside the root.
+/// An empty or `"."` path lists the root itself.
+#[tauri::command]
+pub(crate) async fn list_dir(
+    state: SharedState<'_>,
+    path: String,
+) -> Result<DirListing, CoreError> {
+    let root = root_of(&state)?;
+    let requested = Path::new(&path);
+    let target = if path.is_empty() || path == "." {
+        root.clone()
+    } else if requested.is_absolute() {
+        requested.to_path_buf()
+    } else {
+        root.join(requested)
+    };
+    let dir = neuralnote_core::paths::ensure_within(&root, &target)?;
+    neuralnote_core::tree::list_dir(&root, &dir)
 }
 
 #[tauri::command]
