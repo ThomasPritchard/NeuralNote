@@ -8,8 +8,8 @@
 
 use futures_util::StreamExt;
 use neuralnote_core::ai::{
-    ollama_reasoning_support, parse_hf_metadata, parse_installed_models, parse_pull_line,
-    HardwareSpec, HfModelMeta, InstalledModel, PullEvent, PullSink, ReasoningSupport,
+    ollama_reasoning_support, parse_hf_metadata, parse_installed_models, HardwareSpec, HfModelMeta,
+    InstalledModel, PullEvent, PullProgress, PullSink, ReasoningSupport,
 };
 use neuralnote_core::{CoreError, CoreResult};
 use std::net::TcpListener;
@@ -518,6 +518,9 @@ pub(super) async fn pull_local_model(
         .await?
         .bytes_stream();
     let mut buf = Vec::new();
+    // One tally for the whole pull, so the reported percent aggregates across every
+    // digest (layer) instead of resetting per-frame as Ollama advances layers (#28).
+    let mut progress = PullProgress::default();
 
     while let Some(chunk) = stream.next().await {
         let chunk = chunk
@@ -526,13 +529,13 @@ pub(super) async fn pull_local_model(
 
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             let line = buf.drain(..=pos).collect::<Vec<_>>();
-            if handle_pull_line(&line, sink, cancel)? {
+            if handle_pull_line(&line, &mut progress, sink, cancel)? {
                 return Ok(());
             }
         }
     }
 
-    if !buf.is_empty() && handle_pull_line(&buf, sink, cancel)? {
+    if !buf.is_empty() && handle_pull_line(&buf, &mut progress, sink, cancel)? {
         return Ok(());
     }
 
@@ -701,7 +704,12 @@ async fn ensure_response_success(
     }))
 }
 
-fn handle_pull_line(line: &[u8], sink: &mut dyn PullSink, cancel: &AtomicBool) -> CoreResult<bool> {
+fn handle_pull_line(
+    line: &[u8],
+    progress: &mut PullProgress,
+    sink: &mut dyn PullSink,
+    cancel: &AtomicBool,
+) -> CoreResult<bool> {
     if cancel.load(Ordering::SeqCst) {
         return Err(CoreError::LocalAi("Download cancelled.".into()));
     }
@@ -709,7 +717,7 @@ fn handle_pull_line(line: &[u8], sink: &mut dyn PullSink, cancel: &AtomicBool) -
     let line = String::from_utf8(line.to_vec()).map_err(|e| {
         CoreError::LocalAi(format!("Local AI download emitted non-UTF-8 JSON: {e}"))
     })?;
-    if let Some(event) = parse_pull_line(&line) {
+    if let Some(event) = progress.ingest(&line) {
         // Terminal states are surfaced through the `Result`; the command owns
         // emitting exactly one terminal `PullEvent` (Success xor Error) so the UI
         // always resolves and a failure is never silent. Only progress streams here.
@@ -816,7 +824,8 @@ mod tests {
 
     fn handle_line(line: &str, cancel: &AtomicBool) -> (CoreResult<bool>, Vec<PullEvent>) {
         let mut sink = RecordingSink::default();
-        let result = handle_pull_line(line.as_bytes(), &mut sink, cancel);
+        let mut progress = PullProgress::default();
+        let result = handle_pull_line(line.as_bytes(), &mut progress, &mut sink, cancel);
         (result, sink.events)
     }
 
@@ -885,9 +894,53 @@ mod tests {
         // Non-UTF-8 bytes surface as an error rather than a panic or a silent skip.
         let cancel = AtomicBool::new(false);
         let mut sink = RecordingSink::default();
-        let result = handle_pull_line(&[0xff, 0xfe], &mut sink, &cancel);
+        let mut progress = PullProgress::default();
+        let result = handle_pull_line(&[0xff, 0xfe], &mut progress, &mut sink, &cancel);
         assert!(matches!(result, Err(CoreError::LocalAi(_))));
         assert!(sink.events.is_empty());
+    }
+
+    #[test]
+    fn handle_pull_line_aggregates_percent_across_digests() {
+        // The pull loop shares ONE PullProgress across frames (#28), so the reported
+        // percent aggregates across layers instead of resetting to each digest's own
+        // local ratio. Both digests are announced first (denominator = 200), then
+        // progress: digest A completes (100/100) and B reaches 50/100, so the overall
+        // is (100+50)/200 = 75% — NOT digest B's per-frame local 50% (the old bug).
+        let cancel = AtomicBool::new(false);
+        let mut progress = PullProgress::default();
+        let mut sink = RecordingSink::default();
+        let feed = |progress: &mut PullProgress, sink: &mut RecordingSink, frame: &[u8]| {
+            handle_pull_line(frame, progress, sink, &cancel).unwrap();
+        };
+        feed(
+            &mut progress,
+            &mut sink,
+            br#"{"status":"pulling","digest":"sha256:a","total":100,"completed":0}"#,
+        );
+        feed(
+            &mut progress,
+            &mut sink,
+            br#"{"status":"pulling","digest":"sha256:b","total":100,"completed":0}"#,
+        );
+        feed(
+            &mut progress,
+            &mut sink,
+            br#"{"status":"pulling","digest":"sha256:a","total":100,"completed":100}"#,
+        );
+        feed(
+            &mut progress,
+            &mut sink,
+            br#"{"status":"pulling","digest":"sha256:b","total":100,"completed":50}"#,
+        );
+        let Some(PullEvent::Progress { percent, .. }) = sink.events.last() else {
+            panic!("expected a forwarded progress event");
+        };
+        assert_eq!(
+            *percent,
+            Some(75),
+            "percent must aggregate across digests, not reset per-frame",
+        );
     }
 
     #[tokio::test]
