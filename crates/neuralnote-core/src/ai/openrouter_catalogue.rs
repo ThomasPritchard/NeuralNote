@@ -208,50 +208,77 @@ fn validate_catalogue(
         ));
     }
 
+    for model in &records {
+        validate_catalogue_model(model)?;
+    }
+
     let mut ids = HashSet::with_capacity(records.len());
-    let mut by_canonical_slug = HashMap::with_capacity(records.len());
+    let mut grouped_by_canonical_slug = HashMap::<String, Vec<RawCatalogueModel>>::new();
     for model in records {
-        validate_identifier(&model.id, "OpenRouter catalogue model id")?;
-        validate_identifier(&model.canonical_slug, "OpenRouter catalogue canonical slug")?;
-        validate_text(
-            &model.name,
-            MAX_MODEL_NAME_LENGTH,
-            "OpenRouter catalogue model name",
-        )?;
-        if model.context_length > MAX_JAVASCRIPT_SAFE_CONTEXT_LENGTH {
-            return Err(CoreError::Llm(
-                "OpenRouter catalogue context length exceeds the exact JavaScript integer range"
-                    .into(),
-            ));
-        }
-        if model.supported_parameters.len() > MAX_SUPPORTED_PARAMETERS {
-            return Err(CoreError::Llm(
-                "OpenRouter catalogue model listed too many supported parameters".into(),
-            ));
-        }
-        for parameter in &model.supported_parameters {
-            validate_text(
-                parameter,
-                MAX_PARAMETER_LENGTH,
-                "OpenRouter supported parameter",
-            )?;
-        }
         if !ids.insert(model.id.clone()) {
             return Err(CoreError::Llm(
                 "OpenRouter returned a duplicate catalogue model id".into(),
             ));
         }
-        if by_canonical_slug
-            .insert(model.canonical_slug.clone(), model)
-            .is_some()
-        {
-            return Err(CoreError::Llm(
-                "OpenRouter returned a duplicate catalogue canonical slug".into(),
-            ));
-        }
+        grouped_by_canonical_slug
+            .entry(model.canonical_slug.clone())
+            .or_default()
+            .push(model);
+    }
+
+    let mut by_canonical_slug = HashMap::with_capacity(grouped_by_canonical_slug.len());
+    for (canonical_slug, models) in grouped_by_canonical_slug {
+        let model = if models.len() == 1 {
+            models.into_iter().next().expect("one catalogue model")
+        } else {
+            // OpenRouter lists qualified variants such as `:free` and `:thinking`
+            // beside one base inference ID under the same permanent slug. Daily
+            // rankings use that shared slug, so select only the unique base.
+            let mut bases = models.into_iter().filter(|model| !model.id.contains(':'));
+            let Some(base) = bases.next() else {
+                return Err(CoreError::Llm(
+                    "OpenRouter returned a duplicate catalogue canonical slug".into(),
+                ));
+            };
+            if bases.next().is_some() {
+                return Err(CoreError::Llm(
+                    "OpenRouter returned a duplicate catalogue canonical slug".into(),
+                ));
+            }
+            base
+        };
+        by_canonical_slug.insert(canonical_slug, model);
     }
 
     Ok(by_canonical_slug)
+}
+
+fn validate_catalogue_model(model: &RawCatalogueModel) -> CoreResult<()> {
+    validate_identifier(&model.id, "OpenRouter catalogue model id")?;
+    validate_identifier(&model.canonical_slug, "OpenRouter catalogue canonical slug")?;
+    validate_text(
+        &model.name,
+        MAX_MODEL_NAME_LENGTH,
+        "OpenRouter catalogue model name",
+    )?;
+    if model.context_length > MAX_JAVASCRIPT_SAFE_CONTEXT_LENGTH {
+        return Err(CoreError::Llm(
+            "OpenRouter catalogue context length exceeds the exact JavaScript integer range".into(),
+        ));
+    }
+    if model.supported_parameters.len() > MAX_SUPPORTED_PARAMETERS {
+        return Err(CoreError::Llm(
+            "OpenRouter catalogue model listed too many supported parameters".into(),
+        ));
+    }
+    for parameter in &model.supported_parameters {
+        validate_text(
+            parameter,
+            MAX_PARAMETER_LENGTH,
+            "OpenRouter supported parameter",
+        )?;
+    }
+    Ok(())
 }
 
 fn parse_token_total(raw: &str) -> CoreResult<u128> {
@@ -478,6 +505,104 @@ mod tests {
     }
 
     #[test]
+    fn shared_canonical_slug_selects_the_unqualified_base_regardless_of_catalogue_order() {
+        let rankings = rankings_json(vec![ranking("tencent/hy3-20260706", "100")]);
+        let free_variant = catalogue_model(
+            "tencent/hy3:free",
+            "tencent/hy3-20260706",
+            "HY 3 Free",
+            65_536,
+            &["tools"],
+        );
+        let base = catalogue_model(
+            "tencent/hy3",
+            "tencent/hy3-20260706",
+            "HY 3",
+            65_536,
+            &["tools"],
+        );
+
+        for records in [
+            vec![free_variant.clone(), base.clone()],
+            vec![base.clone(), free_variant.clone()],
+        ] {
+            let result = rank_openrouter_models(&rankings, &catalogue_json(records), DATE).unwrap();
+
+            assert_eq!(result.models.len(), 1);
+            assert_eq!(result.models[0].id, "tencent/hy3");
+            assert_eq!(result.models[0].name, "HY 3");
+        }
+    }
+
+    #[test]
+    fn singleton_variant_catalogue_record_remains_selectable() {
+        let rankings = rankings_json(vec![ranking("vendor/model-permanent", "100")]);
+        let catalogue = catalogue_json(vec![catalogue_model(
+            "vendor/model:free",
+            "vendor/model-permanent",
+            "Model Free",
+            65_536,
+            &["tools"],
+        )]);
+
+        let result = rank_openrouter_models(&rankings, &catalogue, DATE).unwrap();
+
+        assert_eq!(result.models[0].id, "vendor/model:free");
+    }
+
+    #[test]
+    fn shared_canonical_slug_without_one_unqualified_base_fails_closed() {
+        let rankings = rankings_json(vec![ranking("vendor/model-permanent", "100")]);
+        let catalogue = catalogue_json(vec![
+            catalogue_model(
+                "vendor/model:free",
+                "vendor/model-permanent",
+                "Model Free",
+                65_536,
+                &["tools"],
+            ),
+            catalogue_model(
+                "vendor/model:thinking",
+                "vendor/model-permanent",
+                "Model Thinking",
+                65_536,
+                &["tools"],
+            ),
+        ]);
+
+        assert!(matches!(
+            rank_openrouter_models(&rankings, &catalogue, DATE),
+            Err(CoreError::Llm(message)) if message.contains("duplicate catalogue canonical slug")
+        ));
+    }
+
+    #[test]
+    fn malformed_variant_is_rejected_before_the_valid_base_is_selected() {
+        let rankings = rankings_json(vec![ranking("vendor/model-permanent", "100")]);
+        let catalogue = catalogue_json(vec![
+            catalogue_model(
+                "vendor/model",
+                "vendor/model-permanent",
+                "Model",
+                65_536,
+                &["tools"],
+            ),
+            catalogue_model(
+                "vendor/model:free",
+                "vendor/model-permanent",
+                "Model Free\nInjected",
+                65_536,
+                &["tools"],
+            ),
+        ]);
+
+        assert!(matches!(
+            rank_openrouter_models(&rankings, &catalogue, DATE),
+            Err(CoreError::Llm(message)) if message.contains("catalogue model name is invalid")
+        ));
+    }
+
+    #[test]
     fn requires_exact_tools_support_and_minimum_context() {
         let rankings = rankings_json(vec![
             ranking("vendor/uppercase", "50"),
@@ -583,7 +708,7 @@ mod tests {
         ));
 
         let rankings = rankings_json(vec![ranking("vendor/model", "100")]);
-        let duplicate_canonical = catalogue_json(vec![
+        let ambiguous_canonical = catalogue_json(vec![
             catalogue_model(
                 "vendor/model-a",
                 "vendor/model",
@@ -600,8 +725,8 @@ mod tests {
             ),
         ]);
         assert!(matches!(
-            rank_openrouter_models(&rankings, &duplicate_canonical, DATE),
-            Err(CoreError::Llm(message)) if message.contains("duplicate")
+            rank_openrouter_models(&rankings, &ambiguous_canonical, DATE),
+            Err(CoreError::Llm(message)) if message.contains("duplicate catalogue canonical slug")
         ));
     }
 
