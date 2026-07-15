@@ -16,7 +16,8 @@ use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter};
 use tauri_plugin_dialog::{DialogExt, FilePath};
 
-use crate::event_names::TREE_CHANGED;
+use crate::event_names::{QUARANTINE_RECOVERY, TREE_CHANGED};
+use crate::skills::{reconcile_quarantine_recovery, QuarantineRecoveryReport};
 use crate::{
     config_dir, lock_state, menu, root_of, vault_mutation_of, AppState, SharedState, VaultSession,
 };
@@ -186,6 +187,30 @@ pub(crate) async fn pick_new_vault_location(
     Ok(authorize_picked(&state, picked))
 }
 
+/// Reconcile any note quarantines stranded by a process kill in the undo /
+/// cancelled-write window for the just-opened vault. `root` is canonicalized first:
+/// the recovery engine compares each record's resolved parent against this root, so
+/// a vault reached through a symlinked path (e.g. macOS `/var` -> `/private/var`)
+/// would otherwise have every record refused as "outside the vault". Best-effort —
+/// a clean vault yields an empty report.
+fn quarantine_recovery_report(root: &Path) -> QuarantineRecoveryReport {
+    reconcile_quarantine_recovery(&canon_or_self(root))
+}
+
+/// Surface the vault-open crash-recovery outcome to the webview. Only emits when
+/// something was actually recovered, so a clean open stays silent. A failed emit
+/// only costs the recovery toast — recovery itself already happened on disk — so it
+/// is logged rather than surfaced, but never dropped silently.
+fn surface_quarantine_recovery(app: &AppHandle, root: &Path) {
+    let report = quarantine_recovery_report(root);
+    if report.entries.is_empty() {
+        return;
+    }
+    if let Err(e) = app.emit(QUARANTINE_RECOVERY, &report) {
+        log::warn!("could not surface the quarantine-recovery report to the webview: {e}");
+    }
+}
+
 #[tauri::command]
 pub(crate) fn open_vault(
     app: AppHandle,
@@ -206,6 +231,9 @@ pub(crate) fn open_vault(
     }
     let vault = neuralnote_core::vault::open_vault(&requested)?;
     let root = PathBuf::from(&vault.path);
+    // Reconcile before moving `root` into the session below; the report is emitted
+    // after the session is live so the webview sees a fully-open vault.
+    let recovery_root = root.clone();
     // Non-fatal: a watcher failure must not block opening the vault (PA-008).
     let watcher = try_start_watcher(&app, &root);
     {
@@ -228,6 +256,10 @@ pub(crate) fn open_vault(
     }
     record_recent(&app, &vault);
     refresh_menu(&app);
+    // Roll back any undo/cancelled-write left stranded by a prior crash, and surface
+    // what was recovered. `create_vault` needs no equivalent: it always makes a
+    // brand-new empty directory, so it can never hold a stranded quarantine.
+    surface_quarantine_recovery(&app, &recovery_root);
     Ok(vault)
 }
 
@@ -544,5 +576,55 @@ mod tests {
             matches!(result, Err(CoreError::Io(_))),
             "a conversion failure must be a typed Err, not Ok(None); got {result:?}"
         );
+    }
+
+    // The vault-open recovery seam runs the real crash-recovery engine (Unix-only,
+    // like the descriptor-confined note-writer). The blocking Tauri command needs an
+    // `AppHandle`, so these exercise `quarantine_recovery_report` — the seam
+    // `open_vault` calls before it emits — over an on-disk stranded quarantine.
+
+    /// The on-disk state a process kill leaves inside the undo quarantine window:
+    /// the note renamed to its hidden name plus a durable recovery record, with the
+    /// clearing guard never run. Written directly (no private helpers) so the test
+    /// stays within this file's boundary.
+    #[cfg(unix)]
+    fn strand_interrupted_undo(root: &Path, original: &str, body: &str) {
+        let quarantine = ".neuralnote-undo-test-1.tmp";
+        let recovery_dir = root.join(".neuralnote/undo-recovery");
+        std::fs::create_dir_all(&recovery_dir).unwrap();
+        std::fs::write(root.join(quarantine), body).unwrap();
+        std::fs::write(
+            recovery_dir.join("test-1.json"),
+            format!(
+                r#"{{"parentRel":"","originalLeaf":"{original}","quarantineLeaf":"{quarantine}","intent":"restoreOriginal"}}"#
+            ),
+        )
+        .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_a_vault_with_a_stranded_quarantine_yields_a_non_empty_recovery_report() {
+        let vault = tempfile::tempdir().unwrap();
+        strand_interrupted_undo(vault.path(), "Written.md", "original body");
+
+        // Pass the raw (on macOS, symlinked) path exactly as `open_vault` would, to
+        // prove the seam canonicalizes the root before reconciling.
+        let report = quarantine_recovery_report(vault.path());
+
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].rel_path, "Written.md");
+        assert_eq!(
+            std::fs::read_to_string(vault.path().join("Written.md")).unwrap(),
+            "original body",
+            "the interrupted undo was rolled back to its original name"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opening_a_clean_vault_yields_an_empty_recovery_report_and_no_event() {
+        let vault = tempfile::tempdir().unwrap();
+        assert!(quarantine_recovery_report(vault.path()).entries.is_empty());
     }
 }

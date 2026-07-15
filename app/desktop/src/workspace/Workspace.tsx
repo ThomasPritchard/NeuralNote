@@ -763,8 +763,24 @@ export function Workspace() {
           case "toggle-sidebar":
             toggleNavigation();
             break;
-          default:
+          case "format-bold":
+          case "format-italic":
+          case "format-h1":
+          case "format-h2":
+          case "format-h3":
+          case "format-link":
+            // Formatting actions are owned by the focused note editor's own menu
+            // subscription (markdownFormat.ts); they are intentional no-ops here.
             break;
+          default: {
+            // MenuAction is generated from Rust's CUSTOM_ACTIONS (#19), so this is
+            // exhaustive: a NEW native action that no consumer handles fails the
+            // build here instead of silently becoming a dead menu item. The runtime
+            // warn is belt-and-braces if an untyped id ever reaches the webview.
+            const unhandled: never = e.action;
+            console.warn("unhandled menu action:", unhandled);
+            break;
+          }
         }
       })
       .then((fn) => {

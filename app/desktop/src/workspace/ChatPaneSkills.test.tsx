@@ -293,4 +293,32 @@ describe("ChatPane — skills on send", () => {
     expect(await screen.findByText("1 note written")).toBeInTheDocument();
     expect(await screen.findByRole("button", { name: "Undo" })).toBeEnabled();
   });
+
+  it("withholds Undo when the native run echoes a run id that isn't the caller turn's", async () => {
+    // The caller UUID is the sole run identity: a run that resolves a *different*
+    // id (a mismatched native echo) is not this turn's run, so it earns no Undo
+    // handle even though its written-note ledger still lands.
+    const MISMATCHED_RUN_ID = "018f5f6c-8d5f-7c64-b8e7-ffffffffffff";
+    const events: ChatEvent[] = [
+      { type: "skillActivated", id: "fixture-note-workflow", name: "Fixture note workflow" },
+      { type: "noteWritten", relPath: "Literature/Talk.md", kind: "literature" },
+      { type: "done" },
+    ];
+    mockChat.mockImplementation(async (_turnId, _prompt, _history, onEvent) => {
+      for (const ev of events) onEvent(ev);
+      return MISMATCHED_RUN_ID;
+    });
+    const { user } = setup();
+    const box = await screen.findByLabelText("Ask across your vault");
+    await user.type(box, "run the fixture");
+    await user.keyboard("{Enter}");
+
+    // The report card still renders — the notes were written…
+    expect(await screen.findByText("1 note written")).toBeInTheDocument();
+    expect(
+      await screen.findByRole("button", { name: "Open Literature/Talk.md" }),
+    ).toBeInTheDocument();
+    // …but a mismatched run id never wires up Undo.
+    expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
+  });
 });

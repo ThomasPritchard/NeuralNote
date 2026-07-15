@@ -155,77 +155,38 @@ pub fn api_key_status(config_dir: &Path) -> Result<ApiKeyStatus, CoreError> {
     })
 }
 
-/// Store the API key in the keychain and the non-secret model preference in app
-/// config. A failure on either write surfaces.
-pub fn save_api_key(config_dir: &Path, key: &str, model: &str) -> Result<(), CoreError> {
+/// Store the API key in the OS keychain and refresh the in-session cache. This is
+/// the *keychain-only* half of saving a key: it performs no config I/O and takes no
+/// lock, so the caller can persist the non-secret model preference under the
+/// config-mutation gate WITHOUT that lock ever spanning this keychain write (issue
+/// #21 AC #2). An empty/whitespace key is rejected before anything is written, so a
+/// bad request never mutates the keychain or the config that follows it.
+pub fn set_keychain_api_key(key: &str) -> Result<(), CoreError> {
     let key = key.trim();
     if key.is_empty() {
         return Err(CoreError::InvalidName("API key cannot be empty".into()));
     }
-    // TODO(keychain-config-preflight): complete every fallible provider-config
-    // mutation/generation check before changing the keychain, or return and
-    // reconcile an explicit partial commit. Cover u64::MAX save and legacy-clear.
     entry(KEY_ACCOUNT)?
         .set_password(key)
         .map_err(|e| CoreError::Io(format!("could not store API key in the keychain: {e}")))?;
     set_api_key_cache(Some(key.to_string()));
-    // Mirror clear_api_key: a corrupt config must NOT be silently clobbered to
-    // default() — that would drop the user's active_provider/local_model_tag and
-    // silently flip them onto OpenRouter. The key is already safe in the keychain,
-    // so surface the config failure rather than guessing. (A *missing* file reads
-    // as Ok(default); only genuine corruption/IO errors reach this map_err.)
-    let mut config = provider_config::read_provider_config(config_dir).map_err(|e| {
-        CoreError::Io(format!(
-            "API key was stored in the keychain, but your AI settings file is unreadable and was left untouched: {}",
-            error_detail(e)
-        ))
-    })?;
-    config.mutate_with_reasoning_probe_invalidation(|config| {
-        config.model = model.to_string();
-        // TODO(key-configured-derive): derive key_configured from keychain presence on
-        // read (single source of truth), not a persisted flag; closes the crash window
-        // between keychain write and config write (PA-023).
-        config.key_configured = true;
-        Ok(())
-    })?;
-    provider_config::write_provider_config(config_dir, &config).map_err(|e| {
-        CoreError::Io(format!(
-            "API key was stored in the keychain, but the AI preference file could not be updated: {}",
-            error_detail(e)
-        ))
-    })?;
     Ok(())
 }
 
-/// Remove the stored key. Idempotent: deleting an already-absent entry is success,
-/// not an error (so a double-clear, or clearing before anything was ever set, is
-/// fine). The model id is left as a harmless non-secret preference.
-pub fn clear_api_key(config_dir: &Path) -> Result<(), CoreError> {
+/// Remove the stored key from the OS keychain and empty the in-session cache. The
+/// keychain-only half of clearing a key — no config I/O, no lock (see
+/// [`set_keychain_api_key`]). Idempotent: deleting an already-absent entry is
+/// success, so a double-clear, or a clear before anything was ever set, is fine. The
+/// cache is emptied *before* the delete so no concurrent reader can observe a key the
+/// delete is about to remove.
+pub fn clear_keychain_api_key() -> Result<(), CoreError> {
     clear_api_key_cache();
     match entry(KEY_ACCOUNT)?.delete_credential() {
-        Ok(()) | Err(keyring::Error::NoEntry) => {}
-        Err(e) => {
-            return Err(CoreError::Io(format!(
-                "could not remove API key from the keychain: {e}"
-            )))
-        }
+        Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
+        Err(e) => Err(CoreError::Io(format!(
+            "could not remove API key from the keychain: {e}"
+        ))),
     }
-    let mut config = provider_config::read_provider_config(config_dir).map_err(|e| {
-        CoreError::Io(format!(
-            "The keychain was cleared, but the AI preference file could not be updated: {}",
-            error_detail(e)
-        ))
-    })?;
-    config.mutate_with_reasoning_probe_invalidation(|config| {
-        config.key_configured = false;
-        Ok(())
-    })?;
-    provider_config::write_provider_config(config_dir, &config).map_err(|e| {
-        CoreError::Io(format!(
-            "The keychain was cleared, but the AI preference file could not be updated: {}",
-            error_detail(e)
-        ))
-    })
 }
 
 #[cfg(test)]
@@ -636,6 +597,8 @@ impl LlmClient for OpenAiChatClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::commands::ai::{clear_api_key_in, save_api_key_in};
+    use crate::provider_config_mutation::ProviderConfigMutationGate;
     use keyring::credential::{Credential, CredentialApi, CredentialBuilderApi};
     use keyring::{Error as KeyringError, Result as KeyringResult};
     use neuralnote_core::ai::provider_config::{
@@ -647,7 +610,7 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex as StdMutex, OnceLock};
+    use std::sync::{Arc, Barrier, Mutex as StdMutex, OnceLock};
 
     #[test]
     fn chat_turn_maps_roles_and_defaults_to_user() {
@@ -679,6 +642,7 @@ mod tests {
         writes: Arc<AtomicUsize>,
         deletes: Arc<AtomicUsize>,
         after_next_read: AfterReadHook,
+        after_next_write: AfterReadHook,
     }
 
     impl TestKeychain {
@@ -715,6 +679,17 @@ mod tests {
 
         fn take_after_read_hook(&self) -> Option<Box<dyn FnOnce() + Send + 'static>> {
             self.after_next_read.lock().unwrap().take()
+        }
+
+        fn after_next_write<F>(&self, hook: F)
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            *self.after_next_write.lock().unwrap() = Some(Box::new(hook));
+        }
+
+        fn take_after_write_hook(&self) -> Option<Box<dyn FnOnce() + Send + 'static>> {
+            self.after_next_write.lock().unwrap().take()
         }
 
         fn contains(&self, service: &str, user: &str) -> bool {
@@ -767,6 +742,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .insert((self.service.clone(), self.user.clone()), secret.to_vec());
+            if let Some(hook) = self.store.take_after_write_hook() {
+                hook();
+            }
             Ok(())
         }
 
@@ -963,7 +941,13 @@ mod tests {
         let config_dir = temp_config_dir("save-no-secret-in-config");
         let key = "sk-or-secret-should-never-hit-json";
 
-        save_api_key(&config_dir, key, "anthropic/claude-opus-4.1").unwrap();
+        save_api_key_in(
+            &config_dir,
+            &ProviderConfigMutationGate::default(),
+            key,
+            "anthropic/claude-opus-4.1",
+        )
+        .unwrap();
 
         assert_eq!(
             keychain.get(KEYCHAIN_SERVICE, KEY_ACCOUNT).as_deref(),
@@ -990,14 +974,16 @@ mod tests {
             .lock()
             .unwrap();
         let keychain = TestKeychain::install();
+        let gate = ProviderConfigMutationGate::default();
         let config_dir = temp_config_dir("reject-empty-key");
-        save_api_key(&config_dir, "sk-or-original", "openai/gpt-4.1").unwrap();
+        save_api_key_in(&config_dir, &gate, "sk-or-original", "openai/gpt-4.1").unwrap();
         let original_config = read_config_text(&config_dir);
         let original_writes = keychain.writes.load(Ordering::SeqCst);
         let original_reads = keychain.reads.load(Ordering::SeqCst);
 
         for blank in ["", "   "] {
-            let err = save_api_key(&config_dir, blank, "anthropic/claude-opus-4.1").unwrap_err();
+            let err = save_api_key_in(&config_dir, &gate, blank, "anthropic/claude-opus-4.1")
+                .unwrap_err();
 
             assert!(matches!(
                 err,
@@ -1031,17 +1017,23 @@ mod tests {
         let blocked_config_dir = parent.join("not-a-dir");
         fs::write(&blocked_config_dir, "blocks the config dir").unwrap();
 
-        let err = save_api_key(&blocked_config_dir, "sk-or-session", "openai/gpt-4.1")
-            .expect_err("config persistence should fail after the keychain write succeeds");
+        let err = save_api_key_in(
+            &blocked_config_dir,
+            &ProviderConfigMutationGate::default(),
+            "sk-or-session",
+            "openai/gpt-4.1",
+        )
+        .expect_err("config persistence should fail after the keychain write succeeds");
 
-        // Like clear_api_key, save refuses to clobber an unreadable config and
-        // surfaces the failure as Io — never silently, never a guessed default that
-        // would flip the user's provider.
+        // The keychain write already committed (outside the config gate); the gated
+        // config step then fails. Save surfaces that as Io — never silently, never a
+        // guessed default that would flip the user's provider — and leaves the key in
+        // the keychain (and the in-session cache).
         match err {
             CoreError::Io(msg) => {
                 assert!(
                     msg.starts_with(
-                        "API key was stored in the keychain, but your AI settings file is unreadable and was left untouched: "
+                        "API key was stored in the keychain, but the AI preference file could not be updated: "
                     ),
                     "unexpected message: {msg}"
                 );
@@ -1066,6 +1058,78 @@ mod tests {
         );
     }
 
+    /// Issue #21 AC #2: the config-mutation gate lock must NOT span keychain I/O.
+    /// Proven deterministically: a holder thread takes the shared gate and keeps it;
+    /// a saver thread then runs the full `save_api_key_in` and its keychain write
+    /// lands (asserted) WHILE the holder still owns the gate. If the keychain write
+    /// were inside the gate, it could not run until the holder released it. Barriers
+    /// replace every timing assumption, so the interleave is exact, not flaky.
+    #[test]
+    fn save_writes_keychain_before_taking_the_config_gate() {
+        let _guard = KEYCHAIN_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let keychain = TestKeychain::install();
+        let config_dir = temp_config_dir("save-keychain-outside-gate");
+        write_provider_config(&config_dir, &provider_config("vendor/old", false)).unwrap();
+        let gate = ProviderConfigMutationGate::default();
+
+        let gate_held = Arc::new(Barrier::new(2));
+        let keychain_written = Arc::new(Barrier::new(2));
+        let release_holder = Arc::new(Barrier::new(2));
+
+        // Fires the instant the keychain write lands. We assert it fires while the
+        // holder still owns the gate — impossible if the write were under the lock.
+        let keychain_written_hook = Arc::clone(&keychain_written);
+        keychain.after_next_write(move || {
+            keychain_written_hook.wait();
+        });
+
+        std::thread::scope(|scope| {
+            let holder_gate = gate.clone();
+            let holder_dir = config_dir.clone();
+            let gate_held_holder = Arc::clone(&gate_held);
+            let release_holder_holder = Arc::clone(&release_holder);
+            scope.spawn(move || {
+                holder_gate
+                    .run(&holder_dir, || {
+                        gate_held_holder.wait();
+                        release_holder_holder.wait();
+                        Ok(())
+                    })
+                    .unwrap();
+            });
+
+            // The holder now owns the gate; start the real save in that window.
+            gate_held.wait();
+            let saver_gate = gate.clone();
+            let saver_dir = config_dir.clone();
+            let saver = scope.spawn(move || {
+                save_api_key_in(&saver_dir, &saver_gate, "sk-or-unblocked", "vendor/new")
+            });
+
+            // The keychain write completed while the gate was held by another thread.
+            keychain_written.wait();
+            assert_eq!(
+                keychain.get(KEYCHAIN_SERVICE, KEY_ACCOUNT).as_deref(),
+                Some("sk-or-unblocked"),
+                "keychain write landed while the config gate was held elsewhere: the lock does not span keychain I/O"
+            );
+
+            // Release the holder; the saver's gated config step now proceeds.
+            release_holder.wait();
+            saver.join().unwrap().unwrap();
+        });
+
+        let persisted = provider_config::read_provider_config(&config_dir).unwrap();
+        assert!(
+            persisted.key_configured,
+            "the config step must still land once the gate is free"
+        );
+        assert_eq!(persisted.model, "vendor/new");
+    }
+
     #[test]
     fn clear_api_key_deletes_key_sets_flag_false_and_empties_cache() {
         let _guard = KEYCHAIN_TEST_LOCK
@@ -1073,10 +1137,11 @@ mod tests {
             .lock()
             .unwrap();
         let keychain = TestKeychain::install();
+        let gate = ProviderConfigMutationGate::default();
         let config_dir = temp_config_dir("clear-cache");
-        save_api_key(&config_dir, "sk-or-clear-me", "openai/gpt-4.1").unwrap();
+        save_api_key_in(&config_dir, &gate, "sk-or-clear-me", "openai/gpt-4.1").unwrap();
 
-        clear_api_key(&config_dir).unwrap();
+        clear_api_key_in(&config_dir, &gate).unwrap();
 
         assert!(!keychain.contains(KEYCHAIN_SERVICE, KEY_ACCOUNT));
         let status = api_key_status(&config_dir).unwrap();
@@ -1104,12 +1169,13 @@ mod tests {
             .lock()
             .unwrap();
         let keychain = TestKeychain::install();
+        let gate = ProviderConfigMutationGate::default();
         let config_dir = temp_config_dir("clear-corrupt-config");
-        save_api_key(&config_dir, "sk-or-clear-corrupt", "openai/gpt-4.1").unwrap();
+        save_api_key_in(&config_dir, &gate, "sk-or-clear-corrupt", "openai/gpt-4.1").unwrap();
         let corrupt_config = "{not json";
         fs::write(config_file(&config_dir), corrupt_config).unwrap();
 
-        let err = clear_api_key(&config_dir)
+        let err = clear_api_key_in(&config_dir, &gate)
             .expect_err("clearing a key must not overwrite a corrupt model config");
 
         match err {
@@ -1144,8 +1210,9 @@ mod tests {
         write_provider_config(&config_dir, &provider_config("openai/gpt-4.1", true)).unwrap();
         keychain.set(KEYCHAIN_SERVICE, KEY_ACCOUNT, "sk-or-old");
         let clear_config_dir = config_dir.clone();
+        let clear_gate = ProviderConfigMutationGate::default();
         keychain.after_next_read(move || {
-            clear_api_key(&clear_config_dir).unwrap();
+            clear_api_key_in(&clear_config_dir, &clear_gate).unwrap();
         });
 
         assert_eq!(read_api_key().unwrap().as_deref(), Some("sk-or-old"));

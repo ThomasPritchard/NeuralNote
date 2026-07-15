@@ -9,7 +9,7 @@
 
 use crate::ai::events::{ChatEvent, EventSink};
 use crate::ai::evidence::EvidenceRegistry;
-use crate::ai::llm::{LlmClient, LlmMessage, LlmRequest, Role, ToolCall, UserPrompt};
+use crate::ai::llm::{Completion, LlmClient, LlmMessage, LlmRequest, Role, ToolCall, UserPrompt};
 use crate::ai::retrieval::RetrievalProvider;
 use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
 use crate::ai::tools::{self, dispatch, ToolOutcome};
@@ -20,7 +20,7 @@ use crate::ai::youtube::{
     UNAVAILABLE_YOUTUBE_IO,
 };
 use crate::capture::{PricingInput, UnavailableVaultProfileIo, VaultProfileIo};
-use crate::error::CoreResult;
+use crate::error::{CoreError, CoreResult};
 use std::path::Path;
 
 const MAX_PLAYLIST_TURNS_PER_ITEM: usize = 8;
@@ -396,13 +396,17 @@ impl ChatSession<'_> {
         // cost of keeping tool-parsing non-streamed while the answer streams live.
         // No tools are advertised on this turn: it is unambiguously an answer, so the
         // model can't emit a tool call that streaming would silently swallow.
+        // The answer turn carries all accumulated evidence, so it is the send most
+        // likely to overflow a small local window — budget it before streaming.
+        let budgeted = fit_prompt_to_window(&messages, self.model);
+        coverage.truncated |= budgeted.lost;
         let (answer, thinking_count) = {
             let mut counting_sink = ThinkingCounter {
                 inner: sink,
                 count: 0,
             };
             let answer = self
-                .stream_final_answer(&messages, &mut counting_sink)
+                .stream_final_answer(&budgeted.messages, &mut counting_sink)
                 .await?;
             (answer, counting_sink.count)
         };
@@ -474,10 +478,17 @@ impl ChatSession<'_> {
             // calls `use_skill` then `write_note`, the write was not advertised in
             // this request and cannot consume the newly granted capability early.
             let authorized_tools = tools::advertised_tool_names(&tools);
-            // TODO(llm-retry): add one bounded backoff retry for idempotent
-            // tool-deciding `complete` turns on transient 429/5xx/dropped connection
-            // (not the streaming answer, PA-029).
-            let completion = self.llm.complete(&self.request(messages, &tools)).await?;
+            // Budget the fully assembled prompt to the model's context window before
+            // send, so a dense-script vault can't push the grounding out of a small
+            // local window (see `fit_prompt_to_window`). Only the request is trimmed;
+            // the persistent `messages` accumulator is left intact for the loop.
+            let budgeted = fit_prompt_to_window(messages, self.model);
+            coverage.truncated |= budgeted.lost;
+            // This tool-DECIDING turn is idempotent (no tool has run yet), so a single
+            // transient transport failure is retried once rather than aborting the run.
+            let completion = self
+                .complete_tool_turn(&self.request(&budgeted.messages, &tools))
+                .await?;
             consumed += 1;
             if completion.tool_calls.is_empty() {
                 match handle_empty_tool_turn(messages, youtube_session, sink, &mut playlist) {
@@ -646,6 +657,40 @@ impl ChatSession<'_> {
         self.llm
             .complete_streaming(&self.request(messages, &[]), sink)
             .await
+    }
+
+    /// Run one idempotent tool-DECIDING `complete` turn with a single bounded retry on a
+    /// transient transport failure. The call only decides tool calls — no tool has
+    /// executed yet at this point in the loop (dispatch happens after this returns) — so
+    /// a retry can never double-execute a tool. A non-transient failure or a user-stopped
+    /// run is never retried, and this is the non-streamed path, so the streamed answer
+    /// turn is untouched.
+    async fn complete_tool_turn(&self, request: &LlmRequest) -> CoreResult<Completion> {
+        let mut retries = MAX_COMPLETE_RETRIES;
+        loop {
+            match self.llm.complete(request).await {
+                Ok(completion) => return Ok(completion),
+                Err(error) => {
+                    let retryable =
+                        retries > 0 && is_transient_llm_error(&error) && !self.run_cancelled();
+                    if !retryable {
+                        return Err(error);
+                    }
+                    retries -= 1;
+                    // Bounded backoff is intentionally the host transport's job: the core
+                    // is runtime-agnostic and never sleeps (every timer in the app lives
+                    // in the host), and the retried `complete` re-enters the host's
+                    // cancellable wrapper, which surfaces a mid-flight stop as a
+                    // non-transient `Conflict` — so we never spin past a cancellation.
+                }
+            }
+        }
+    }
+
+    /// Whether the run has been cancelled through the shared capture-cancellation token
+    /// (the host cancels it when the vault/window closes or the user stops the run).
+    fn run_cancelled(&self) -> bool {
+        self.skill_services.capture_cancellation.is_cancelled()
     }
 
     /// Dispatch one tool call, emitting the live step events and folding its result
@@ -1052,13 +1097,11 @@ fn is_evidence_prefix(bytes: &[u8], pos: usize) -> bool {
 /// per-turn token cost. Keeps the most recent turns; older ones drop (each turn
 /// re-runs retrieval and re-grounds, so dropping old context never corrupts citations).
 //
-// TODO(token-aware-context-budget): all budgets here are in CHARS with an implicit
-// ~4-chars/token assumption. A CJK/symbol-dense vault tokenises closer to ~2 chars/token,
-// so a near-max source-heavy turn (currently up to 96k) could still exceed a small local
-// `num_ctx` and be silently front-truncated. The robust fix is a token-aware (or
-// provider-aware) budget that counts the *assembled* prompt against the active window
-// before send — deferred because it couples to the model's RAM sizing. The English/Latin
-// common case has ample headroom after this cap (H1), so the residual is a narrow edge.
+// This char cap is a COARSE first pass: it bounds cloud token *cost* and keeps history
+// sane, but it can't see that CJK/symbol-dense text tokenises ~4× denser than the ~4
+// chars/token it implicitly assumes. The authoritative window-fit is the token-aware
+// second pass in `fit_prompt_to_window` (PA-029), applied to the fully assembled prompt
+// right before each send.
 const MAX_HISTORY_CHARS: usize = 12_000;
 
 /// Remove every `[eN]` citation marker (and a single leading space) from prior-turn
@@ -1120,6 +1163,331 @@ fn prepare_history(history: &[LlmMessage]) -> Vec<LlmMessage> {
     kept.reverse();
     kept
 }
+
+// ── Token-aware context budgeting (PA-029) ──────────────────────────────────
+//
+// The char guards above (MAX_HISTORY_CHARS, Guards::max_context_chars) bound cloud
+// token *cost* and keep the assembled prompt sane, but they measure CHARS. A CJK- or
+// symbol-dense vault tokenises far denser than the ~4 chars/token those budgets assume,
+// so the SUM of system + history + evidence can still blow past a small local window
+// even with every char budget respected — at which point Ollama silently truncates from
+// the FRONT, dropping the grounding rules (sent first) and breaking cited recall (the
+// moat). `fit_prompt_to_window` is the authoritative second pass: it budgets the fully
+// assembled prompt against the active model's window in *tokens* right before each send,
+// deterministically dropping the OLDEST evidence/history while always preserving the
+// grounding prefix and the newest evidence, and reporting any loss so it is never silent.
+
+/// The local (Ollama) context window in tokens. Mirrors the shell's `OLLAMA_NUM_CTX`
+/// (app/desktop/src-tauri/src/local.rs) — the value the sidecar is told to size its
+/// window to. The core can't import it (host crate), so it is duplicated here with this
+/// cross-reference; every curated local model supports it.
+const LOCAL_CONTEXT_WINDOW_TOKENS: usize = 32_768;
+
+/// Tokens held back from the window for the streamed answer, which shares the same
+/// `num_ctx`. Mirrors [`crate::ai::openai::ANSWER_MAX_TOKENS`].
+const ANSWER_RESERVE_TOKENS: usize = crate::ai::openai::ANSWER_MAX_TOKENS as usize;
+
+/// Fixed headroom for chat-template special tokens plus the residual imprecision of a
+/// char-classified estimate (rare multi-token CJK scalars / emoji that exceed 1 token).
+/// Over-reserving only trims slightly early; under-reserving risks the silent
+/// front-truncation this whole pass exists to prevent — so we err high.
+const PROMPT_OVERHEAD_TOKENS: usize = 1_024;
+
+/// Per-message framing overhead (the role marker and delimiters the chat template adds
+/// around every message).
+const PER_MESSAGE_OVERHEAD_TOKENS: usize = 8;
+
+/// Chars of ASCII alphanumeric/whitespace text per token — the easy ~4:1 case.
+const ASCII_CHARS_PER_TOKEN: usize = 4;
+
+/// Appended to any single message head-truncated to fit the window, so the loss is
+/// visible in-band as well as in the Coverage footer.
+const TRUNCATION_MARKER: &str = "\n\n[older content trimmed to fit the model's context window]";
+
+/// A conservative, script-aware UPPER-BOUND estimate of the BPE token count of `text`.
+/// ASCII letters/digits/whitespace tokenise at ~4 chars/token; every other scalar —
+/// ASCII punctuation/symbols AND all non-ASCII (CJK, etc.) — is counted as a whole
+/// token, because dense scripts and symbol runs tokenise close to 1 token/char, far
+/// above the flat ~4:1 the char budgets assume. We deliberately OVER-count so the budget
+/// errs toward trimming a little early rather than letting Ollama silently front-truncate
+/// the grounding (the moat). Accumulated in quarter-tokens to keep the 4:1 ratio without
+/// floats, then rounded up.
+fn estimate_tokens(text: &str) -> usize {
+    let sub_tokens: usize = text.chars().map(char_sub_tokens).sum();
+    sub_tokens.div_ceil(ASCII_CHARS_PER_TOKEN)
+}
+
+/// Sub-token weight of one scalar, in units of 1/[`ASCII_CHARS_PER_TOKEN`] of a token
+/// (see [`estimate_tokens`]): 1 sub-token for easy ASCII (so `ASCII_CHARS_PER_TOKEN` of
+/// them make a token), a whole token's worth for everything denser.
+fn char_sub_tokens(ch: char) -> usize {
+    if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
+        1
+    } else {
+        ASCII_CHARS_PER_TOKEN
+    }
+}
+
+/// Estimated tokens of one assembled message: its framing overhead plus its content,
+/// tool-call names/arguments, and tool-result name — everything that reaches the wire.
+fn message_tokens(message: &LlmMessage) -> usize {
+    let mut tokens = PER_MESSAGE_OVERHEAD_TOKENS;
+    if let Some(content) = &message.content {
+        tokens += estimate_tokens(content);
+    }
+    for call in &message.tool_calls {
+        tokens += estimate_tokens(&call.name) + estimate_tokens(&call.arguments);
+    }
+    if let Some(name) = &message.name {
+        tokens += estimate_tokens(name);
+    }
+    tokens
+}
+
+fn total_tokens(messages: &[LlmMessage]) -> usize {
+    messages.iter().map(message_tokens).sum()
+}
+
+/// The active model's context window in tokens, or `None` when this layer can't (and
+/// needn't) clamp it. Only the local (Ollama) provider has the small fixed window that
+/// silently front-truncates, and the shell refuses any non-curated local tag — so a
+/// curated tag here IS the local path. Cloud (OpenRouter) ids never match the curated
+/// list; their window is large, lives in the OpenRouter catalogue (unreachable from this
+/// network-free core), and their cost is already bounded by the char guards — so cloud
+/// returns `None` and is left to those guards.
+fn context_window_tokens(model: &str) -> Option<usize> {
+    crate::ai::local::is_curated_model(model).then_some(LOCAL_CONTEXT_WINDOW_TOKENS)
+}
+
+/// The assembled prompt after budgeting to the window, plus whether any content was
+/// dropped or truncated (a coverage loss the caller must surface).
+struct BudgetOutcome {
+    messages: Vec<LlmMessage>,
+    lost: bool,
+}
+
+/// Budget the fully assembled prompt to the active model's context window (see the
+/// section comment above [`LOCAL_CONTEXT_WINDOW_TOKENS`]). Grounding (the leading system
+/// prefix) and the newest evidence are always preserved; the oldest history/evidence is
+/// dropped deterministically as whole protocol units; a lone evidence span larger than
+/// the whole window is head-truncated with an explicit marker rather than allowed to push
+/// grounding out. Cloud models are returned unchanged. The persistent `messages`
+/// accumulator is never mutated — this returns the trimmed copy for one request.
+fn fit_prompt_to_window(messages: &[LlmMessage], model: &str) -> BudgetOutcome {
+    let Some(window) = context_window_tokens(model) else {
+        return BudgetOutcome {
+            messages: messages.to_vec(),
+            lost: false,
+        };
+    };
+    let budget = window
+        .saturating_sub(ANSWER_RESERVE_TOKENS)
+        .saturating_sub(PROMPT_OVERHEAD_TOKENS);
+    if total_tokens(messages) <= budget {
+        return BudgetOutcome {
+            messages: messages.to_vec(),
+            lost: false,
+        };
+    }
+    trim_to_budget(messages, budget)
+}
+
+fn trim_to_budget(messages: &[LlmMessage], budget: usize) -> BudgetOutcome {
+    let prefix_len = messages
+        .iter()
+        .take_while(|m| m.role == Role::System)
+        .count();
+    let (prefix, rest) = messages.split_at(prefix_len);
+    let units = group_units(rest);
+    let unit_tokens: Vec<usize> = units
+        .iter()
+        .map(|u| rest[u.clone()].iter().map(message_tokens).sum())
+        .collect();
+    // The current user question — the newest User-role unit — anchors the model's
+    // intent and is pinned like the grounding prefix.
+    let pinned_question = units.iter().rposition(|u| rest[u.start].role == Role::User);
+
+    let mut keep = vec![false; units.len()];
+    let mut used: usize = prefix.iter().map(message_tokens).sum();
+
+    // The newest unit (freshest evidence, or the question itself on a conversational
+    // turn) and the question are force-kept even if they alone overflow — a single
+    // oversized span is head-truncated below, never dropped in favour of older evidence.
+    for forced in [units.len().checked_sub(1), pinned_question]
+        .into_iter()
+        .flatten()
+    {
+        if !keep[forced] {
+            keep[forced] = true;
+            used += unit_tokens[forced];
+        }
+    }
+    // Fill the remaining budget with the newest still-fitting history/evidence.
+    for i in (0..units.len()).rev() {
+        if !keep[i] && used + unit_tokens[i] <= budget {
+            used += unit_tokens[i];
+            keep[i] = true;
+        }
+    }
+
+    let mut out = prefix.to_vec();
+    let mut lost = false;
+    for (i, unit) in units.iter().enumerate() {
+        if keep[i] {
+            out.extend_from_slice(&rest[unit.clone()]);
+        } else {
+            lost = true;
+        }
+    }
+    // A single message larger than the whole window still overflows after unit
+    // selection. Grounding is the hard invariant, so head-truncate the largest
+    // non-system message instead of letting it push grounding out of the window.
+    if total_tokens(&out) > budget {
+        lost |= truncate_largest_to_fit(&mut out, budget);
+    }
+    BudgetOutcome {
+        messages: out,
+        lost,
+    }
+}
+
+/// Group messages into protocol units so an assistant tool-call turn is never split
+/// from its tool results: a unit starts at any non-`Tool` message; `Tool` results
+/// attach to the unit before them. Returns index ranges into `messages`.
+fn group_units(messages: &[LlmMessage]) -> Vec<std::ops::Range<usize>> {
+    let mut units: Vec<std::ops::Range<usize>> = Vec::new();
+    for (i, message) in messages.iter().enumerate() {
+        if message.role == Role::Tool {
+            if let Some(last) = units.last_mut() {
+                last.end = i + 1;
+                continue;
+            }
+        }
+        units.push(i..i + 1);
+    }
+    units
+}
+
+/// Head-truncate the largest non-system message until the whole prompt fits `budget`,
+/// appending [`TRUNCATION_MARKER`]. Returns whether it truncated anything. Never touches
+/// a system (grounding) message — grounding is the invariant the whole pass protects.
+fn truncate_largest_to_fit(messages: &mut [LlmMessage], budget: usize) -> bool {
+    let total = total_tokens(messages);
+    if total <= budget {
+        return false;
+    }
+    let Some(idx) = largest_droppable(messages) else {
+        return false;
+    };
+    let content = messages[idx].content.as_deref().unwrap_or_default();
+    let current = estimate_tokens(content);
+    let overflow = total - budget;
+    let marker_tokens = estimate_tokens(TRUNCATION_MARKER);
+    let keep_tokens = current
+        .saturating_sub(overflow)
+        .saturating_sub(marker_tokens);
+    messages[idx].content = Some(truncate_content_to_tokens(content, keep_tokens));
+    true
+}
+
+fn largest_droppable(messages: &[LlmMessage]) -> Option<usize> {
+    messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role != Role::System && m.content.is_some())
+        .max_by_key(|(_, m)| estimate_tokens(m.content.as_deref().unwrap_or_default()))
+        .map(|(i, _)| i)
+}
+
+/// Keep the longest head of `content` whose estimate stays within `max_tokens`, then
+/// append [`TRUNCATION_MARKER`]. UTF-8-safe: the cut always lands on a char boundary.
+fn truncate_content_to_tokens(content: &str, max_tokens: usize) -> String {
+    let cap = max_tokens.saturating_mul(ASCII_CHARS_PER_TOKEN);
+    let mut sub_tokens = 0usize;
+    let mut cut = 0usize;
+    for (offset, ch) in content.char_indices() {
+        let weight = char_sub_tokens(ch);
+        if sub_tokens + weight > cap {
+            break;
+        }
+        sub_tokens += weight;
+        cut = offset + ch.len_utf8();
+    }
+    let mut out = String::with_capacity(cut + TRUNCATION_MARKER.len());
+    out.push_str(&content[..cut]);
+    out.push_str(TRUNCATION_MARKER);
+    out
+}
+
+// ── Bounded retry for idempotent tool-decision turns (PA-029) ────────────────
+//
+// A tool-DECIDING `complete` turn only asks the model which tools to call — no tool has
+// executed yet at that point in the loop (dispatch runs after `complete` returns), so
+// the call is idempotent and safe to retry: a retry re-decides, it never re-executes a
+// tool. A single transient transport failure (a 429, a 5xx, or a dropped connection)
+// would otherwise abort the whole run. The streamed answer turn is deliberately NOT
+// retried (regenerating a partially-streamed answer is not idempotent).
+
+/// The number of extra attempts after the first for a tool-decision `complete` turn.
+const MAX_COMPLETE_RETRIES: usize = 1;
+
+/// Whether a `complete`-turn transport error is TRANSIENT (worth one retry: a
+/// rate-limit, a server 5xx, or a dropped/failed connection) rather than PERMANENT
+/// (auth, bad request, an unparseable body — a retry would only repeat it).
+///
+/// Classification is by message because [`CoreError`] carries no structured HTTP status
+/// (it crosses the Tauri boundary as `{kind, message}`). This couples to the host
+/// transport's wording (app/desktop/src-tauri/src/ai.rs): HTTP failures format as
+/// `"<provider> returned <status> ..."`, a pre-response send failure as
+/// `"request to <provider> failed: ..."`. Only the transport error kinds
+/// (`Llm` / `LocalAi`) can be transient; a `Conflict` (the cancellation error) or any
+/// domain error never is, so a user-stopped turn is never retried.
+fn is_transient_llm_error(error: &CoreError) -> bool {
+    let message = match error {
+        CoreError::Llm(m) | CoreError::LocalAi(m) => m.as_str(),
+        _ => return false,
+    };
+    match http_status_in(message) {
+        Some(status) => is_transient_status(status),
+        // No HTTP status was received — the connection failed, dropped, or timed out
+        // before a response. That is exactly the retryable transient class.
+        None => is_dropped_connection(message),
+    }
+}
+
+/// 408 Request Timeout and 425 Too Early are retryable per RFC 9110; 429 is rate-limit;
+/// every 5xx is a server-side transient. All other 4xx are the caller's fault (permanent).
+fn is_transient_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500..=599)
+}
+
+/// The HTTP status the transport embedded as `"... returned <status> ..."`, if any.
+fn http_status_in(message: &str) -> Option<u16> {
+    let after = message.split("returned ").nth(1)?;
+    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
+    let status = digits.parse::<u16>().ok()?;
+    (100..=599).contains(&status).then_some(status)
+}
+
+/// A pre-response transport failure — no HTTP status because the connection failed,
+/// dropped, or timed out. The retryable transient class.
+fn is_dropped_connection(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("request to") && lower.contains("failed"))
+        || TRANSPORT_DROP_SIGNALS
+            .iter()
+            .any(|signal| lower.contains(signal))
+}
+
+const TRANSPORT_DROP_SIGNALS: &[&str] = &[
+    "error sending request",
+    "connection closed",
+    "closed before",
+    "connection reset",
+    "broken pipe",
+    "timed out",
+    "timeout",
+];
 
 #[cfg(test)]
 mod tests {
@@ -1241,6 +1609,13 @@ mod tests {
         max_request_chars: std::sync::atomic::AtomicUsize,
         completion_requests: Mutex<Vec<Vec<LlmMessage>>>,
         streaming_messages: Mutex<Vec<LlmMessage>>,
+        /// Errors returned by successive `complete` calls before normal scripting takes
+        /// over — lets a test script a transient failure then a success.
+        pending_complete_errors: Mutex<VecDeque<CoreError>>,
+        /// If set, every `complete_streaming` call returns this error (to prove the
+        /// streamed answer turn is never retried).
+        streaming_error: Mutex<Option<CoreError>>,
+        streaming_attempts: std::sync::atomic::AtomicUsize,
     }
 
     impl MockLlmClient {
@@ -1255,6 +1630,9 @@ mod tests {
                 max_request_chars: std::sync::atomic::AtomicUsize::new(0),
                 completion_requests: Mutex::new(Vec::new()),
                 streaming_messages: Mutex::new(Vec::new()),
+                pending_complete_errors: Mutex::new(VecDeque::new()),
+                streaming_error: Mutex::new(None),
+                streaming_attempts: std::sync::atomic::AtomicUsize::new(0),
             }
         }
 
@@ -1269,7 +1647,28 @@ mod tests {
                 max_request_chars: std::sync::atomic::AtomicUsize::new(0),
                 completion_requests: Mutex::new(Vec::new()),
                 streaming_messages: Mutex::new(Vec::new()),
+                pending_complete_errors: Mutex::new(VecDeque::new()),
+                streaming_error: Mutex::new(None),
+                streaming_attempts: std::sync::atomic::AtomicUsize::new(0),
             }
+        }
+
+        /// Script the first N `complete` calls to fail with these errors (in order),
+        /// then fall through to the normal completion queue.
+        fn with_complete_failures(self, errors: Vec<CoreError>) -> Self {
+            *self.pending_complete_errors.lock().unwrap() = errors.into();
+            self
+        }
+
+        /// Make every `complete_streaming` call fail with this error.
+        fn with_streaming_failure(self, error: CoreError) -> Self {
+            *self.streaming_error.lock().unwrap() = Some(error);
+            self
+        }
+
+        fn streaming_attempts(&self) -> usize {
+            self.streaming_attempts
+                .load(std::sync::atomic::Ordering::SeqCst)
         }
 
         fn with_hook(mut self, f: impl Fn() + Send + Sync + 'static) -> Self {
@@ -1306,6 +1705,9 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(req.messages.clone());
+            if let Some(error) = self.pending_complete_errors.lock().unwrap().pop_front() {
+                return Err(error);
+            }
             if self.fail {
                 return Err(CoreError::Llm("mock transport failure: boom".into()));
             }
@@ -1326,8 +1728,13 @@ mod tests {
             req: &LlmRequest,
             sink: &mut dyn EventSink,
         ) -> CoreResult<String> {
+            self.streaming_attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             *self.streaming_tools_len.lock().unwrap() = Some(req.tools.len());
             *self.streaming_messages.lock().unwrap() = req.messages.clone();
+            if let Some(error) = self.streaming_error.lock().unwrap().clone() {
+                return Err(error);
+            }
             if let Some(hook) = &self.before_answer {
                 hook();
             }
@@ -2981,5 +3388,460 @@ mod tests {
             ChatEvent::Citation { rel_path, .. } if rel_path == "Research/widgets.md"
         )));
         assert!(matches!(events.last(), Some(ChatEvent::Done)));
+    }
+
+    // ── §4 token-aware context budgeting (PA-029) ───────────────────────────
+    // The char guards can't see that CJK/symbol-dense text tokenises ~4× denser
+    // than Latin, so the assembled prompt can overflow a small local window and be
+    // silently front-truncated — dropping the grounding, breaking cited recall.
+    // `fit_prompt_to_window` budgets the assembled prompt in *tokens* before send.
+
+    fn input_budget() -> usize {
+        LOCAL_CONTEXT_WINDOW_TOKENS - ANSWER_RESERVE_TOKENS - PROMPT_OVERHEAD_TOKENS
+    }
+
+    fn evidence_round(round: usize, body: String) -> [LlmMessage; 2] {
+        [
+            LlmMessage::assistant_tool_calls(vec![ToolCall {
+                id: format!("c{round}"),
+                name: "search_notes".into(),
+                arguments: "{}".into(),
+            }]),
+            LlmMessage::tool_result(format!("c{round}"), "search_notes", body),
+        ]
+    }
+
+    #[test]
+    fn estimate_tokens_counts_dense_scripts_far_heavier_than_latin() {
+        // Latin ~4 chars/token; CJK and symbol runs ~1 token/char. The old flat 4:1
+        // char assumption undercounted the latter by ~4× — the overflow this fixes.
+        assert_eq!(estimate_tokens(&"a".repeat(100)), 25);
+        assert_eq!(estimate_tokens(&"配".repeat(100)), 100);
+        assert_eq!(estimate_tokens(&"#".repeat(100)), 100);
+    }
+
+    #[test]
+    fn context_window_tokens_clamps_local_models_only() {
+        assert_eq!(
+            context_window_tokens(crate::ai::DEFAULT_LOCAL_MODEL),
+            Some(LOCAL_CONTEXT_WINDOW_TOKENS)
+        );
+        assert_eq!(context_window_tokens("anthropic/claude-sonnet-4.5"), None);
+    }
+
+    #[test]
+    fn fit_prompt_to_window_is_inert_for_cloud_models() {
+        // Cloud windows are large and bounded by the char guards; this layer leaves
+        // them untouched so cloud cost ceilings stay intact.
+        let messages = vec![
+            LlmMessage::system("grounding"),
+            LlmMessage::user("配".repeat(1_000_000)),
+        ];
+        let out = fit_prompt_to_window(&messages, "anthropic/claude-sonnet-4.5");
+        assert!(!out.lost);
+        assert_eq!(out.messages, messages);
+    }
+
+    #[test]
+    fn fit_prompt_to_window_drops_oldest_keeping_grounding_and_newest() {
+        let mut messages = vec![
+            LlmMessage::system(SYSTEM_PROMPT),
+            LlmMessage::user("question"),
+        ];
+        for round in 0..6 {
+            messages.extend(evidence_round(
+                round,
+                format!("round{round} {}", "配".repeat(8_000)),
+            ));
+        }
+        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL);
+
+        assert!(out.lost, "an over-window prompt must report coverage loss");
+        assert_eq!(out.messages[0].role, Role::System);
+        assert_eq!(out.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
+        assert!(out
+            .messages
+            .iter()
+            .any(|m| m.content.as_deref() == Some("question")));
+        let joined: String = out
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert!(
+            joined.contains("round5"),
+            "the newest evidence must survive"
+        );
+        assert!(!joined.contains("round0"), "the oldest evidence must drop");
+        assert!(total_tokens(&out.messages) <= input_budget());
+    }
+
+    #[test]
+    fn fit_prompt_to_window_head_truncates_a_single_oversized_evidence() {
+        // One span larger than the whole window: grounding is the hard invariant, so
+        // the span is head-truncated with an explicit marker, never grounding.
+        let mut messages = vec![
+            LlmMessage::system(SYSTEM_PROMPT),
+            LlmMessage::user("question"),
+        ];
+        messages.extend(evidence_round(0, "配".repeat(60_000)));
+
+        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL);
+
+        assert!(out.lost);
+        assert_eq!(out.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
+        let evidence = out
+            .messages
+            .iter()
+            .rev()
+            .find(|m| m.role == Role::Tool)
+            .unwrap();
+        assert!(evidence
+            .content
+            .as_deref()
+            .unwrap()
+            .contains("trimmed to fit"));
+        assert!(total_tokens(&out.messages) <= input_budget());
+    }
+
+    #[test]
+    fn fit_prompt_to_window_trims_symbol_dense_content() {
+        // Symbol-dense ASCII tokenises ~1 token/char, so it overflows even though its
+        // char count sits comfortably under the char guards.
+        let mut messages = vec![
+            LlmMessage::system(SYSTEM_PROMPT),
+            LlmMessage::user("question"),
+        ];
+        messages.extend(evidence_round(0, "#".repeat(40_000)));
+
+        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL);
+
+        assert!(out.lost);
+        assert_eq!(out.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
+        assert!(total_tokens(&out.messages) <= input_budget());
+    }
+
+    #[test]
+    fn fit_prompt_to_window_preserves_tool_call_result_pairing() {
+        let mut messages = vec![LlmMessage::system(SYSTEM_PROMPT), LlmMessage::user("q")];
+        for round in 0..6 {
+            messages.extend(evidence_round(round, "配".repeat(8_000)));
+        }
+        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL).messages;
+
+        for (i, message) in out.iter().enumerate() {
+            if message.role == Role::Tool {
+                let prev = &out[i - 1];
+                let paired = prev.role == Role::Tool
+                    || (prev.role == Role::Assistant && !prev.tool_calls.is_empty());
+                assert!(paired, "orphaned tool result at index {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn local_run_reports_budget_loss_and_never_front_truncates_grounding() {
+        let vault = tempfile::tempdir().unwrap();
+        let provider = KeywordRetriever::new(vault.path());
+        let skills = SkillRegistry::built_in(&[]).unwrap();
+        let environment = SkillEnvironment {
+            hardware: HardwareSpec {
+                total_ram_bytes: 16_000_000_000,
+                cpu_cores: 8,
+                cpu_brand: "test".into(),
+                gpu_label: None,
+                arch: "aarch64".into(),
+                os: "macos".into(),
+                free_disk_bytes: 10_000_000_000,
+            },
+            app_data_bin_dir: PathBuf::from("/app-data/bin"),
+            available_binaries: BTreeSet::new(),
+        };
+        let services = SkillServices::new(
+            &skills,
+            &environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        );
+        let llm = MockLlmClient::new(vec![final_turn()], "answer");
+        let guards = Guards::default();
+        let session = ChatSession {
+            root: vault.path(),
+            model: crate::ai::DEFAULT_LOCAL_MODEL,
+            provider: &provider,
+            llm: &llm,
+            skill_services: &services,
+            guards: &guards,
+        };
+        let mut messages = vec![
+            LlmMessage::system(SYSTEM_PROMPT),
+            LlmMessage::user("question"),
+        ];
+        messages.extend(evidence_round(0, "配".repeat(50_000)));
+        let mut active_skills = ActiveSkills::new(guards.max_iterations);
+        let mut writes = WriteSession::new(1).unwrap();
+        let mut youtube_session = YoutubeToolSession::new_with_update_session(
+            services.capture_cancellation.clone(),
+            services.extractor_updates.clone(),
+        );
+        let mut registry = EvidenceRegistry::new();
+        let mut coverage = CoverageAcc::default();
+        let mut sink = VecSink::default();
+
+        block_on(session.collect_evidence(
+            &mut messages,
+            &mut active_skills,
+            &mut writes,
+            &mut youtube_session,
+            &mut registry,
+            &mut coverage,
+            &mut sink,
+        ))
+        .unwrap();
+
+        assert!(
+            coverage.truncated,
+            "budget loss must be recorded so the Coverage footer surfaces it"
+        );
+        let sent = &llm.completion_requests()[0];
+        assert_eq!(
+            sent[0].role,
+            Role::System,
+            "grounding must stay first, never front-truncated"
+        );
+        assert_eq!(sent[0].content.as_deref(), Some(SYSTEM_PROMPT));
+        assert!(total_tokens(sent) <= input_budget());
+    }
+
+    // ── §4 bounded retry for idempotent tool-decision turns (PA-029) ────────
+    // A single transient 429/5xx/dropped connection during an idempotent tool-DECIDING
+    // `complete` turn must not abort the whole run. Exactly one bounded retry; never a
+    // non-transient failure, a user-stopped turn, or the streamed answer turn. The retry
+    // sits before tool dispatch, so it can never double-execute a tool.
+
+    struct RetryEnv {
+        _vault: tempfile::TempDir,
+        provider: KeywordRetriever,
+        skills: SkillRegistry,
+        environment: SkillEnvironment,
+        guards: Guards,
+    }
+
+    fn retry_env() -> RetryEnv {
+        let vault = tempfile::tempdir().unwrap();
+        let provider = KeywordRetriever::new(vault.path());
+        let skills = SkillRegistry::built_in(&[]).unwrap();
+        let environment = SkillEnvironment {
+            hardware: HardwareSpec {
+                total_ram_bytes: 16_000_000_000,
+                cpu_cores: 8,
+                cpu_brand: "test".into(),
+                gpu_label: None,
+                arch: "aarch64".into(),
+                os: "macos".into(),
+                free_disk_bytes: 10_000_000_000,
+            },
+            app_data_bin_dir: PathBuf::from("/app-data/bin"),
+            available_binaries: BTreeSet::new(),
+        };
+        RetryEnv {
+            _vault: vault,
+            provider,
+            skills,
+            environment,
+            guards: Guards::default(),
+        }
+    }
+
+    fn tool_decision_request() -> LlmRequest {
+        LlmRequest {
+            model: "test-model".into(),
+            messages: vec![LlmMessage::system("system"), LlmMessage::user("q")],
+            tools: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn transient_classifier_retries_only_transient_transport_failures() {
+        for message in [
+            "openrouter returned 429 Too Many Requests: slow down",
+            "openrouter returned 500 Internal Server Error",
+            "openrouter returned 503 Service Unavailable",
+            "openrouter returned 408 Request Timeout",
+            "request to openrouter failed: error sending request for url (x): connection closed before message completed",
+            "request to ollama failed: operation timed out",
+        ] {
+            assert!(
+                is_transient_llm_error(&CoreError::Llm(message.into())),
+                "{message} should be transient"
+            );
+        }
+        for message in [
+            "openrouter returned 400 Bad Request: bad model",
+            "openrouter returned 401 Unauthorized",
+            "openrouter returned 403 Forbidden",
+            "openrouter returned 404 Not Found",
+            "could not parse openrouter response: expected value at line 1",
+        ] {
+            assert!(
+                !is_transient_llm_error(&CoreError::Llm(message.into())),
+                "{message} should NOT be transient"
+            );
+        }
+        // A user-stop surfaces as Conflict, and domain errors are never transport
+        // faults — neither is ever retried.
+        assert!(!is_transient_llm_error(&CoreError::Conflict(
+            "chat run stopped by the user".into()
+        )));
+        assert!(!is_transient_llm_error(&CoreError::InvalidName("x".into())));
+    }
+
+    #[test]
+    fn tool_turn_retries_a_single_transient_failure_then_succeeds() {
+        let env = retry_env();
+        let services = SkillServices::new(
+            &env.skills,
+            &env.environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        );
+        let llm = MockLlmClient::new(vec![final_turn()], "answer").with_complete_failures(vec![
+            CoreError::Llm("openrouter returned 429 Too Many Requests".into()),
+        ]);
+        let session = ChatSession {
+            root: env._vault.path(),
+            model: "test-model",
+            provider: &env.provider,
+            llm: &llm,
+            skill_services: &services,
+            guards: &env.guards,
+        };
+
+        let completion = block_on(session.complete_tool_turn(&tool_decision_request())).unwrap();
+
+        assert!(completion.content.is_some());
+        assert_eq!(
+            llm.completion_requests().len(),
+            2,
+            "one transient failure is retried exactly once"
+        );
+    }
+
+    #[test]
+    fn tool_turn_retries_a_dropped_connection() {
+        let env = retry_env();
+        let services = SkillServices::new(
+            &env.skills,
+            &env.environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        );
+        let llm = MockLlmClient::new(vec![final_turn()], "answer").with_complete_failures(vec![
+            CoreError::Llm(
+                "request to openrouter failed: error sending request: connection reset by peer"
+                    .into(),
+            ),
+        ]);
+        let session = ChatSession {
+            root: env._vault.path(),
+            model: "test-model",
+            provider: &env.provider,
+            llm: &llm,
+            skill_services: &services,
+            guards: &env.guards,
+        };
+
+        block_on(session.complete_tool_turn(&tool_decision_request())).unwrap();
+
+        assert_eq!(llm.completion_requests().len(), 2);
+    }
+
+    #[test]
+    fn tool_turn_does_not_retry_a_non_transient_failure() {
+        let env = retry_env();
+        let services = SkillServices::new(
+            &env.skills,
+            &env.environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        );
+        let llm = MockLlmClient::new(vec![final_turn()], "answer").with_complete_failures(vec![
+            CoreError::Llm("openrouter returned 400 Bad Request: bad model".into()),
+        ]);
+        let session = ChatSession {
+            root: env._vault.path(),
+            model: "test-model",
+            provider: &env.provider,
+            llm: &llm,
+            skill_services: &services,
+            guards: &env.guards,
+        };
+
+        let result = block_on(session.complete_tool_turn(&tool_decision_request()));
+
+        assert!(result.is_err(), "a 400 is permanent — no retry");
+        assert_eq!(llm.completion_requests().len(), 1);
+    }
+
+    #[test]
+    fn tool_turn_does_not_retry_when_the_run_is_cancelled() {
+        let env = retry_env();
+        let cancellation = CaptureCancellation::default();
+        cancellation.cancel();
+        let services = SkillServices::new(
+            &env.skills,
+            &env.environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        )
+        .with_capture_cancellation(cancellation);
+        let llm = MockLlmClient::new(vec![final_turn()], "answer").with_complete_failures(vec![
+            CoreError::Llm("openrouter returned 503 Service Unavailable".into()),
+        ]);
+        let session = ChatSession {
+            root: env._vault.path(),
+            model: "test-model",
+            provider: &env.provider,
+            llm: &llm,
+            skill_services: &services,
+            guards: &env.guards,
+        };
+
+        let result = block_on(session.complete_tool_turn(&tool_decision_request()));
+
+        assert!(result.is_err(), "a cancelled run must not retry");
+        assert_eq!(
+            llm.completion_requests().len(),
+            1,
+            "cancellation short-circuits the retry"
+        );
+    }
+
+    #[test]
+    fn streamed_answer_turn_is_never_retried() {
+        // The first `complete` returns no tool calls, so the loop proceeds straight to
+        // the streamed answer, which fails transiently. Streaming is outside the retry
+        // path, so it is attempted exactly once and surfaces a terminal error.
+        let vault = vault();
+        let mock = MockLlmClient::new(vec![final_turn()], "answer").with_streaming_failure(
+            CoreError::Llm("openrouter returned 503 Service Unavailable".into()),
+        );
+
+        let events = run(vault.path(), &mock, &Guards::default());
+
+        assert_eq!(
+            mock.streaming_attempts(),
+            1,
+            "the streamed answer turn must not be retried"
+        );
+        assert!(events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::Error { .. })));
+        assert_eq!(count(&events, |event| matches!(event, ChatEvent::Done)), 0);
     }
 }

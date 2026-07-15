@@ -10,7 +10,16 @@
 // honest. Rows flatten (flattenTree.ts) and window through
 // @tanstack/react-virtual so only the visible slice mounts (PA-005).
 
-import { memo, useEffect, useRef, useState, type ReactNode } from "react";
+import {
+  memo,
+  useCallback,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type ReactNode,
+} from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { FilePlus2, Search, X } from "lucide-react";
 import { IconButton } from "@/components/ui/icon-button";
@@ -32,6 +41,7 @@ import {
   type CreatingState,
   type TreeContext,
 } from "./TreeRow";
+import { MoveToDialog, isValidMoveTarget, type MoveDestination } from "./MoveToDialog";
 
 // ── Virtualization (PA-005) ────────────────────────────────────────────────
 // A large expanded vault can still flatten to thousands of rows; above this
@@ -47,11 +57,53 @@ const ROW_ESTIMATE = 26;
  *  status rows (loading / error / "N more…"), each wrapped in one indent-guide
  *  layer per ancestor level. Stacked flush rows join their `border-l` hairlines
  *  into the same continuous guide lines the old recursive nesting drew. */
-function FlatTreeRow({ row, ctx }: Readonly<{ row: FlatRow; ctx: TreeContext }>) {
+/** The keyboard "Move to" shortcut (issue #24): `m` (no modifier) on a focused
+ *  row opens the destination picker for that entry. Ignored while an inline
+ *  input holds focus so typing a name that contains "m" never opens the dialog. */
+function handleMoveShortcut(
+  event: KeyboardEvent<HTMLDivElement>,
+  node: TreeNode,
+  onMove: (node: TreeNode) => void,
+) {
+  if (event.defaultPrevented) return;
+  if (event.key !== "m" && event.key !== "M") return;
+  if (event.metaKey || event.ctrlKey || event.altKey) return;
+  const target = event.target as HTMLElement;
+  if (
+    target.isContentEditable ||
+    target.tagName === "INPUT" ||
+    target.tagName === "TEXTAREA" ||
+    target.tagName === "SELECT"
+  ) {
+    return;
+  }
+  event.preventDefault();
+  onMove(node);
+}
+
+function FlatTreeRow({
+  row,
+  ctx,
+  onMove,
+}: Readonly<{
+  row: FlatRow;
+  ctx: TreeContext;
+  onMove: (node: TreeNode) => void;
+}>) {
   let content: ReactNode;
   switch (row.kind) {
     case "node":
-      content = <TreeRow node={row.node} ctx={ctx} />;
+      content = (
+        // Wrapper carries this row's "Move to" shortcut; keydowns bubble up from
+        // the row's focused button. TreeRow itself is untouched, so its
+        // React.memo boundary (issue #25) is preserved exactly.
+        <div
+          role="presentation"
+          onKeyDown={(event) => handleMoveShortcut(event, row.node, onMove)}
+        >
+          <TreeRow node={row.node} ctx={ctx} />
+        </div>
+      );
       break;
     case "create":
       content = <CreateRow kind={row.createKind} ctx={ctx} />;
@@ -119,33 +171,45 @@ export const FileTree = memo(function FileTree({
   const [creating, setCreating] = useState<CreatingState | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
   const [dragPath, setDragPath] = useState<string | null>(null);
+  const [moving, setMoving] = useState<TreeNode | null>(null);
   const [opError, setOpError] = useState<string | null>(null);
 
-  const surfaceOperationError = (error: unknown, allowInlineValidation = false) => {
-    const kind =
-      error && typeof error === "object" && "kind" in error
-        ? String(error.kind)
-        : null;
-    if (allowInlineValidation && (kind === "invalidName" || kind === "alreadyExists")) {
-      setOpError(errorMessage(error));
-    } else {
-      toast.error(errorMessage(error));
-    }
-  };
+  // Callbacks below are memoized (useCallback) so the row context object built
+  // from them stays referentially stable across FileTree re-renders that don't
+  // touch a row's inputs — that is what lets TreeRow's React.memo actually skip
+  // unchanged rows (issue #25). Each dep list carries exactly the state/props the
+  // handler reads, so no closure ever goes stale.
+  const surfaceOperationError = useCallback(
+    (error: unknown, allowInlineValidation = false) => {
+      const kind =
+        error && typeof error === "object" && "kind" in error
+          ? String(error.kind)
+          : null;
+      if (allowInlineValidation && (kind === "invalidName" || kind === "alreadyExists")) {
+        setOpError(errorMessage(error));
+      } else {
+        toast.error(errorMessage(error));
+      }
+    },
+    [toast],
+  );
 
-  const startCreate = (parentPath: string, kind: CreateKind) => {
-    setRenaming(null);
-    setOpError(null);
-    // Ensure the target folder is expanded (and its children fetched) so the
-    // inline create row is reachable under it. The row itself shows immediately
-    // via the force-open below even before this expand round-trips; expanding
-    // also loads the folder's existing siblings. The root needs no expansion.
-    if (parentPath !== vaultPath) {
-      const rel = vaultRelPath(parentPath, vaultPath);
-      if (!expanded.has(rel)) onToggle(rel);
-    }
-    setCreating({ parentPath, kind });
-  };
+  const startCreate = useCallback(
+    (parentPath: string, kind: CreateKind) => {
+      setRenaming(null);
+      setOpError(null);
+      // Ensure the target folder is expanded (and its children fetched) so the
+      // inline create row is reachable under it. The row itself shows immediately
+      // via the force-open below even before this expand round-trips; expanding
+      // also loads the folder's existing siblings. The root needs no expansion.
+      if (parentPath !== vaultPath) {
+        const rel = vaultRelPath(parentPath, vaultPath);
+        if (!expanded.has(rel)) onToggle(rel);
+      }
+      setCreating({ parentPath, kind });
+    },
+    [vaultPath, expanded, onToggle],
+  );
 
   // Open the inline create row when the native menu (File → New Note/Folder)
   // requests one at the vault root. A ref keeps startCreate current without
@@ -159,74 +223,125 @@ export const FileTree = memo(function FileTree({
     onCreateConsumed();
   }, [pendingCreate, vaultPath, onCreateConsumed]);
 
-  const startRename = (path: string) => {
+  const startRename = useCallback((path: string) => {
     setCreating(null);
     setOpError(null);
     setRenaming(path);
-  };
+  }, []);
 
-  const cancelEdit = () => {
+  const cancelEdit = useCallback(() => {
     setCreating(null);
     setRenaming(null);
-  };
+  }, []);
 
   // CRUD ops re-list just the affected folder(s) so the sidebar updates
   // immediately without depending on the filesystem watcher being alive (a dead
   // watcher must not leave the tree silently stale). The watcher (store.tsx) is
   // the backstop for *external* changes.
-  const submitCreate = async (name: string) => {
-    if (!creating) return;
-    const { parentPath, kind } = creating;
-    try {
-      let node: TreeNode;
-      if (kind === "folder") {
-        node = await api.createFolder(parentPath, name);
-      } else {
-        node = await api.createNote(parentPath, name);
+  const submitCreate = useCallback(
+    async (name: string) => {
+      if (!creating) return;
+      const { parentPath, kind } = creating;
+      try {
+        let node: TreeNode;
+        if (kind === "folder") {
+          node = await api.createFolder(parentPath, name);
+        } else {
+          node = await api.createNote(parentPath, name);
+        }
+        setCreating(null);
+        await onRefreshDir(vaultRelPath(parentPath, vaultPath));
+        if (kind === "note") onSelect(node.path, false);
+      } catch (e) {
+        // Keep the input open (and the chosen template) so the user can correct
+        // the name.
+        surfaceOperationError(e, true);
       }
-      setCreating(null);
-      await onRefreshDir(vaultRelPath(parentPath, vaultPath));
-      if (kind === "note") onSelect(node.path, false);
-    } catch (e) {
-      // Keep the input open (and the chosen template) so the user can correct
-      // the name.
-      surfaceOperationError(e, true);
-    }
-  };
+    },
+    [creating, vaultPath, onRefreshDir, onSelect, surfaceOperationError],
+  );
 
-  const submitRename = async (path: string, name: string) => {
-    try {
-      const node = await api.renameEntry(path, name);
-      setRenaming(null);
-      // The name and its sort position changed, so re-list the parent folder.
-      await onRefreshDir(parentRelPath(vaultRelPath(path, vaultPath)));
-      onRemap(path, node);
-    } catch (e) {
-      surfaceOperationError(e, true);
-    }
-  };
+  const submitRename = useCallback(
+    async (path: string, name: string) => {
+      try {
+        const node = await api.renameEntry(path, name);
+        setRenaming(null);
+        // The name and its sort position changed, so re-list the parent folder.
+        await onRefreshDir(parentRelPath(vaultRelPath(path, vaultPath)));
+        onRemap(path, node);
+      } catch (e) {
+        surfaceOperationError(e, true);
+      }
+    },
+    [vaultPath, onRefreshDir, onRemap, surfaceOperationError],
+  );
 
-  const moveTo = async (destFolderPath: string) => {
-    const src = dragPath;
-    setDragPath(null);
-    if (!src) return;
-    const srcNorm = normSep(src);
-    const currentParent = srcNorm.slice(0, srcNorm.lastIndexOf("/"));
-    if (currentParent === normSep(destFolderPath)) return; // no-op
-    try {
-      const node = await api.moveEntry(src, destFolderPath);
-      const srcParentRel = parentRelPath(vaultRelPath(src, vaultPath));
-      const destRel = vaultRelPath(destFolderPath, vaultPath);
-      await onRefreshDir(srcParentRel);
-      // Only re-list the destination if it is currently loaded (on screen); a
-      // collapsed/unloaded destination fetches fresh on its next expand, so
-      // there is nothing on screen to update.
-      if (loaded.has(destRel)) await onRefreshDir(destRel);
-      onRemap(src, node);
-    } catch (e) {
-      surfaceOperationError(e);
+  // The single move path: both drag-and-drop and the keyboard "Move to" flow
+  // call this, so the validation rule and the refresh/remap/error handling can
+  // never diverge between the two. Validation reuses isValidMoveTarget (the same
+  // rule MoveToDialog filters its destinations with), which rejects no-ops,
+  // moving an entry into itself, and moving a folder into a descendant.
+  const performMove = useCallback(
+    async (srcPath: string, destFolderPath: string) => {
+      if (!isValidMoveTarget(srcPath, destFolderPath)) return;
+      try {
+        const node = await api.moveEntry(srcPath, destFolderPath);
+        const srcParentRel = parentRelPath(vaultRelPath(srcPath, vaultPath));
+        const destRel = vaultRelPath(destFolderPath, vaultPath);
+        await onRefreshDir(srcParentRel);
+        // Only re-list the destination if it is currently loaded (on screen); a
+        // collapsed/unloaded destination fetches fresh on its next expand, so
+        // there is nothing on screen to update.
+        if (loaded.has(destRel)) await onRefreshDir(destRel);
+        onRemap(srcPath, node);
+      } catch (e) {
+        surfaceOperationError(e);
+      }
+    },
+    [vaultPath, loaded, onRefreshDir, onRemap, surfaceOperationError],
+  );
+
+  const moveTo = useCallback(
+    async (destFolderPath: string) => {
+      const src = dragPath;
+      setDragPath(null);
+      if (!src) return;
+      await performMove(src, destFolderPath);
+    },
+    [dragPath, performMove],
+  );
+
+  const openMove = useCallback((node: TreeNode) => setMoving(node), []);
+  const closeMove = useCallback(() => setMoving(null), []);
+  const confirmMove = useCallback(
+    async (destFolderPath: string) => {
+      const target = moving;
+      setMoving(null); // close first so focus returns to the invoking row
+      if (target) await performMove(target.path, destFolderPath);
+    },
+    [moving, performMove],
+  );
+
+  // Candidate destinations for the keyboard picker: every folder currently in
+  // the lazy store, plus the vault root. A lazy vault only lists folders it has
+  // loaded, so this offers the loaded folder set (MoveToDialog filters out the
+  // ones that would be illegal for the specific entry).
+  const moveDestinations = useMemo<MoveDestination[]>(() => {
+    const seen = new Set<string>([normSep(vaultPath)]);
+    const folders: MoveDestination[] = [];
+    for (const dir of loaded.values()) {
+      if (dir.status !== "loaded") continue;
+      for (const child of dir.children) {
+        if (child.kind !== "folder") continue;
+        const key = normSep(child.path);
+        if (seen.has(key)) continue;
+        seen.add(key);
+        folders.push({ path: child.path, label: child.relPath });
+      }
     }
-  };
+    folders.sort((a, b) => a.label.localeCompare(b.label));
+    return [{ path: vaultPath, label: "Vault root" }, ...folders];
+  }, [loaded, vaultPath]);
 
   const filterActive = filter.trim() !== "";
   // While filtering, render over the LOADED portion filtered to matches +
@@ -243,10 +358,16 @@ export const FileTree = memo(function FileTree({
       ? vaultRelPath(creating.parentPath, vaultPath)
       : null;
   const baseExpanded = filtered ? filtered.expanded : expanded;
-  const flattenExpanded =
-    creatingRel !== null && !baseExpanded.has(creatingRel)
-      ? new Set(baseExpanded).add(creatingRel)
-      : baseExpanded;
+  // Memoized so its identity only changes with the real expand state — otherwise
+  // the create force-open branch would mint a fresh Set every render and churn
+  // the row context (issue #25). In the steady state it is exactly `expanded`.
+  const flattenExpanded = useMemo(
+    () =>
+      creatingRel !== null && !baseExpanded.has(creatingRel)
+        ? new Set(baseExpanded).add(creatingRel)
+        : baseExpanded,
+    [baseExpanded, creatingRel],
+  );
 
   // The flat, ordered list of rows actually visible — the model the windowed
   // body renders from.
@@ -265,36 +386,76 @@ export const FileTree = memo(function FileTree({
     getItemKey: (index) => rowKey(flatRows[index]),
   });
 
-  const ctx: TreeContext = {
-    activePath,
-    // Same set the flatten used, so the chevron/aria-expanded state and the row
-    // list can never disagree (covers filter force-open + create force-open).
-    expanded: flattenExpanded,
-    creating,
-    renaming,
-    dragPath,
-    toggle: (relPath) => {
+  const toggle = useCallback(
+    (relPath: string) => {
       // A toggle while filtering would mutate the real expand state with no
       // visible effect (everything renders open) — ignore it instead.
       if (filterActive) return;
       onToggle(relPath);
     },
-    childCount: (relPath) => {
+    [filterActive, onToggle],
+  );
+
+  const childCount = useCallback(
+    (relPath: string) => {
       const listing = loaded.get(relPath);
       return listing?.status === "loaded" ? listing.children.length : null;
     },
-    onRetry: (relPath) => void onListDir(relPath),
-    onSelect,
-    onStartCreate: startCreate,
-    onStartRename: startRename,
-    onDelete: onDeleteRequest,
-    onSubmitCreate: submitCreate,
-    onSubmitRename: submitRename,
-    onCancelEdit: cancelEdit,
-    onDragStart: setDragPath,
-    onDragEnd: () => setDragPath(null),
-    onDrop: moveTo,
-  };
+    [loaded],
+  );
+
+  const handleRetry = useCallback((relPath: string) => void onListDir(relPath), [onListDir]);
+  const handleDragEnd = useCallback(() => setDragPath(null), []);
+
+  // Memoized so an unrelated FileTree re-render hands every row the SAME context
+  // object — the referential stability TreeRow's React.memo needs to skip
+  // unchanged rows (issue #25). Its identity turns over only when a value or
+  // handler a row actually reads changes.
+  const ctx: TreeContext = useMemo(
+    () => ({
+      activePath,
+      // Same set the flatten used, so the chevron/aria-expanded state and the row
+      // list can never disagree (covers filter force-open + create force-open).
+      expanded: flattenExpanded,
+      creating,
+      renaming,
+      dragPath,
+      toggle,
+      childCount,
+      onRetry: handleRetry,
+      onSelect,
+      onStartCreate: startCreate,
+      onStartRename: startRename,
+      onMove: openMove,
+      onDelete: onDeleteRequest,
+      onSubmitCreate: submitCreate,
+      onSubmitRename: submitRename,
+      onCancelEdit: cancelEdit,
+      onDragStart: setDragPath,
+      onDragEnd: handleDragEnd,
+      onDrop: moveTo,
+    }),
+    [
+      activePath,
+      flattenExpanded,
+      creating,
+      renaming,
+      dragPath,
+      toggle,
+      childCount,
+      handleRetry,
+      onSelect,
+      startCreate,
+      startRename,
+      openMove,
+      onDeleteRequest,
+      submitCreate,
+      submitRename,
+      cancelEdit,
+      handleDragEnd,
+      moveTo,
+    ],
+  );
 
   const rootListing = loaded.get("");
   const rootReady = rootListing?.status === "loaded";
@@ -389,14 +550,25 @@ export const FileTree = memo(function FileTree({
                 className="absolute left-0 top-0 w-full"
                 style={{ transform: `translateY(${item.start}px)` }}
               >
-                <FlatTreeRow row={flatRows[item.index]} ctx={ctx} />
+                <FlatTreeRow row={flatRows[item.index]} ctx={ctx} onMove={openMove} />
               </div>
             ))}
           </div>
         ) : (
-          flatRows.map((row) => <FlatTreeRow key={rowKey(row)} row={row} ctx={ctx} />)
+          flatRows.map((row) => (
+            <FlatTreeRow key={rowKey(row)} row={row} ctx={ctx} onMove={openMove} />
+          ))
         )}
       </div>
+
+      {moving && (
+        <MoveToDialog
+          node={moving}
+          destinations={moveDestinations}
+          onMove={confirmMove}
+          onClose={closeMove}
+        />
+      )}
 
       {opError && (
         <div className="shrink-0 border-t border-destructive/30 bg-destructive/10 px-3 py-2">

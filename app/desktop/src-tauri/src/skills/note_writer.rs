@@ -1,5 +1,9 @@
+use super::quarantine_recovery::{
+    record_quarantine, QuarantineGuard, QuarantineHandle, QuarantineIntent,
+};
 use neuralnote_core::ai::{NotePathState, NoteWriteBackend, NoteWriteParent, OpenedNoteParent};
 use neuralnote_core::{CoreError, CoreResult};
+use sha2::{Digest, Sha256};
 use std::ffi::{CStr, CString, OsStr};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -8,9 +12,48 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 static UNDO_QUARANTINE_SEQUENCE: AtomicU64 = AtomicU64::new(1);
+
+/// A random prefix generated once per process *instance*. Combined with the
+/// monotonic per-process sequence, it makes every quarantine name and recovery
+/// record id unique across process lifetimes, so a reused pid can never let a new
+/// process's record overwrite (and strand) a killed process's still-live record.
+/// Not security-sensitive: any unpredictable-enough per-instance value suffices.
+fn process_instance_nonce() -> &'static str {
+    static NONCE: OnceLock<String> = OnceLock::new();
+    NONCE.get_or_init(|| {
+        let mut seed = [0_u8; 8];
+        if let Err(error) = read_urandom(&mut seed) {
+            // Surface the degradation rather than swallowing it: the nonce is not
+            // security-sensitive (NOREPLACE catches any id collision), but a
+            // silent fallback would hide a broken /dev/urandom.
+            log::warn!(
+                "could not read /dev/urandom for the quarantine nonce; \
+                 using a degraded per-instance fallback: {error}"
+            );
+            // Fallback if /dev/urandom is unavailable: mix the pid, a
+            // high-resolution timestamp, and an ASLR'd stack address so two
+            // same-pid instances still differ.
+            let stack_marker = (&seed as *const [u8; 8]) as usize;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|elapsed| elapsed.as_nanos())
+                .unwrap_or_default();
+            let mut hasher = Sha256::new();
+            hasher.update(std::process::id().to_le_bytes());
+            hasher.update(now.to_le_bytes());
+            hasher.update(stack_marker.to_le_bytes());
+            seed.copy_from_slice(&hasher.finalize()[..8]);
+        }
+        seed.iter().map(|byte| format!("{byte:02x}")).collect()
+    })
+}
+
+fn read_urandom(buffer: &mut [u8]) -> std::io::Result<()> {
+    File::open("/dev/urandom")?.read_exact(buffer)
+}
 
 #[derive(Debug, Default)]
 pub(crate) struct FsNoteWriteBackend;
@@ -132,7 +175,23 @@ enum SnapshotLeaf {
 pub(crate) struct StableDirectory {
     fd: OwnedFd,
     pub(crate) canonical_path: PathBuf,
+    /// The canonical vault root this directory was confined against. Retained so
+    /// quarantine recovery records can be located and named relative to it.
+    canonical_root: PathBuf,
     close_signal: Option<Arc<crate::ai::ChatRunCloseSignal>>,
+}
+
+/// State of a quarantine leaf as seen by quarantine recovery on vault open.
+pub(crate) enum QuarantineLeafState {
+    Missing,
+    Regular,
+    NonRegular,
+}
+
+/// Outcome of restoring a quarantined leaf to its original, no-overwrite name.
+pub(crate) enum RestoreLeafOutcome {
+    Restored,
+    DestinationOccupied,
 }
 
 impl StableDirectory {
@@ -164,8 +223,43 @@ impl StableDirectory {
         Ok(Self {
             fd,
             canonical_path,
+            canonical_root: canonical_root.to_path_buf(),
             close_signal,
         })
+    }
+
+    /// The note's parent directory as a vault-relative, `/`-joined path. An empty
+    /// string means the confined directory *is* the vault root. Fails closed
+    /// rather than lossily encoding a non-round-trippable path, because a recovery
+    /// record whose `parent_rel` does not round-trip would mis-target or strand
+    /// the note on reconcile.
+    fn parent_rel(&self) -> CoreResult<String> {
+        let relative = self
+            .canonical_path
+            .strip_prefix(&self.canonical_root)
+            .map_err(|_| {
+                // The confined parent is always verified to sit within the root,
+                // so this is a broken invariant, not user input. Refuse rather
+                // than defaulting to "" (the vault root), which would silently
+                // point recovery at the wrong directory.
+                debug_assert!(false, "confined note parent escaped its canonical root");
+                CoreError::Io(format!(
+                    "note parent '{}' is not within vault '{}'",
+                    self.canonical_path.display(),
+                    self.canonical_root.display()
+                ))
+            })?;
+        let mut segments = Vec::new();
+        for component in relative.components() {
+            let segment = component.as_os_str().to_str().ok_or_else(|| {
+                CoreError::InvalidName(format!(
+                    "note parent '{}' has a non-UTF-8 component that cannot be recorded for recovery",
+                    self.canonical_path.display()
+                ))
+            })?;
+            segments.push(segment);
+        }
+        Ok(segments.join("/"))
     }
 
     fn ensure_active(&self) -> CoreResult<()> {
@@ -175,15 +269,34 @@ impl StableDirectory {
         }
     }
 
-    fn fail_created_leaf(
+    /// Quarantine the just-created leaf, identity-check it against the descriptor
+    /// this run created, and clean it up. The syscall ops and the post-quarantine
+    /// hook are injectable so tests can force each failure branch and prove the
+    /// recovery record it leaves is the correct one.
+    #[allow(clippy::too_many_arguments)]
+    fn fail_created_leaf_with_ops<SC, SQ, DQ, AQ>(
         &self,
         leaf: &str,
         leaf_c: &CStr,
         file: File,
         primary: CoreError,
-    ) -> CoreResult<()> {
-        let quarantine = match self.quarantine_leaf(leaf_c, leaf) {
-            Ok(Some(quarantine)) => quarantine,
+        stat_created: SC,
+        stat_quarantine: SQ,
+        delete_quarantine: DQ,
+        after_quarantine: AQ,
+    ) -> CoreResult<()>
+    where
+        SC: FnOnce(RawFd) -> std::io::Result<libc::stat>,
+        SQ: FnOnce(RawFd, &CStr) -> std::io::Result<libc::stat>,
+        DQ: FnOnce(RawFd, &CStr) -> std::io::Result<()>,
+        AQ: FnOnce(&str),
+    {
+        let QuarantineHandle {
+            quarantine,
+            quarantine_c,
+            guard,
+        } = match self.quarantine_leaf(leaf_c, leaf, QuarantineIntent::DiscardQuarantine) {
+            Ok(Some(handle)) => handle,
             Ok(None) => return Err(primary),
             Err(error) => {
                 return Err(CoreError::Io(format!(
@@ -192,15 +305,24 @@ impl StableDirectory {
                 )))
             }
         };
+        // Hold the recovery record across the cleanup window. A path that resolves
+        // the leaf (restores it to its original name, or deletes the quarantine)
+        // clears the record on drop; a path that returns with the leaf still
+        // quarantined calls `guard.retain()` so reconcile-on-open can discard it
+        // (or `guard.preserve_as` when the bytes are a proven-foreign replacement),
+        // and a process kill leaves it for reconcile regardless.
+        let mut guard = guard;
+        after_quarantine(&quarantine);
         // Keep the created descriptor alive until after the renamed path is
         // identified. If the original name was unlinked concurrently, the live FD
         // prevents its inode from being recycled into a replacement that could
         // otherwise impersonate our file by dev/inode alone.
-        let created = match fstat_fd(file.as_raw_fd()) {
+        let created = match stat_created(file.as_raw_fd()) {
             Ok(stat) => stat,
             Err(error) => {
                 if let Err(restore_error) = self.restore_quarantined_leaf(&quarantine, leaf_c, leaf)
                 {
+                    guard.retain();
                     return Err(CoreError::Io(format!(
                         "{primary}; could not identify the created note leaf after \
                          quarantine: {error}; {restore_error}"
@@ -212,8 +334,7 @@ impl StableDirectory {
                 )));
             }
         };
-        let quarantine_c = leaf_cstring(&quarantine)?;
-        let quarantined = match statat_nofollow(self.fd.as_raw_fd(), &quarantine_c) {
+        let quarantined = match stat_quarantine(self.fd.as_raw_fd(), &quarantine_c) {
             Ok(stat) => stat,
             Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
                 return Err(CoreError::Io(format!(
@@ -223,6 +344,7 @@ impl StableDirectory {
             Err(error) => {
                 if let Err(restore_error) = self.restore_quarantined_leaf(&quarantine, leaf_c, leaf)
                 {
+                    guard.retain();
                     return Err(CoreError::Io(format!(
                         "{primary}; could not verify cleanup recovery leaf \
                          '{quarantine}': {error}; {restore_error}"
@@ -235,18 +357,38 @@ impl StableDirectory {
             }
         };
         if !same_file_identity(&created, &quarantined) {
+            // The quarantined bytes are NOT this run's created inode: a concurrent
+            // writer replaced the leaf, so these are a real user file. Restore them
+            // to the original name.
             if let Err(error) = self.restore_quarantined_leaf(&quarantine, leaf_c, leaf) {
+                // The original path was reoccupied, so the proven-foreign bytes are
+                // still under the hidden name. A `DiscardQuarantine` record here
+                // would let reconcile blind-delete them (`remove_leaf` never
+                // re-checks identity). Convert the record to a preserve-replacement
+                // outcome so reconcile restores the bytes or surfaces a conflict,
+                // and NEVER deletes a file we have proven is foreign.
+                if let Err(convert_error) = guard.preserve_as(QuarantineIntent::PreserveReplacement)
+                {
+                    return Err(CoreError::Io(format!(
+                        "{primary}; {error}; additionally could not preserve the \
+                         concurrent replacement for recovery: {convert_error}"
+                    )));
+                }
                 return Err(CoreError::Io(format!("{primary}; {error}")));
             }
             return Err(primary);
         }
 
-        unlinkat(self.fd.as_raw_fd(), &quarantine_c).map_err(|error| {
-            CoreError::Io(format!(
+        if let Err(error) = delete_quarantine(self.fd.as_raw_fd(), &quarantine_c) {
+            // The quarantine leaf could not be removed, so this run's own bytes are
+            // still under the hidden name. Retain the record so reconcile discards
+            // them later (they are proven to be this run's output, not a user file).
+            guard.retain();
+            return Err(CoreError::Io(format!(
                 "{primary}; additionally could not remove cleanup recovery leaf \
                  '{quarantine}': {error}"
-            ))
-        })?;
+            )));
+        }
         Err(primary)
     }
 
@@ -257,6 +399,30 @@ impl StableDirectory {
     fn create_with<F>(&self, leaf: &str, write: F) -> CoreResult<()>
     where
         F: FnOnce(&mut File) -> std::io::Result<()>,
+    {
+        self.create_with_ops(leaf, write, fstat_fd, statat_nofollow, unlinkat, |_| {})
+    }
+
+    /// [`create_with`] with the cleanup syscalls and post-quarantine hook exposed
+    /// for tests, so the cancelled-write cleanup's every failure branch — and the
+    /// recovery record each one leaves — can be exercised through the real create
+    /// path rather than being unreachable.
+    #[allow(clippy::too_many_arguments)]
+    fn create_with_ops<F, SC, SQ, DQ, AQ>(
+        &self,
+        leaf: &str,
+        write: F,
+        stat_created: SC,
+        stat_quarantine: SQ,
+        delete_quarantine: DQ,
+        after_quarantine: AQ,
+    ) -> CoreResult<()>
+    where
+        F: FnOnce(&mut File) -> std::io::Result<()>,
+        SC: FnOnce(RawFd) -> std::io::Result<libc::stat>,
+        SQ: FnOnce(RawFd, &CStr) -> std::io::Result<libc::stat>,
+        DQ: FnOnce(RawFd, &CStr) -> std::io::Result<()>,
+        AQ: FnOnce(&str),
     {
         self.ensure_active()?;
         let leaf_c = leaf_cstring(leaf)?;
@@ -287,25 +453,27 @@ impl StableDirectory {
         };
         let mut file = File::from(fd);
 
-        if let Err(error) = self.ensure_active() {
-            return self.fail_created_leaf(leaf, &leaf_c, file, error);
-        }
-
-        if let Err(write_error) = write(&mut file) {
-            return self.fail_created_leaf(
-                leaf,
-                &leaf_c,
-                file,
-                CoreError::Io(format!(
-                    "could not completely write note leaf '{leaf}': {write_error}"
-                )),
-            );
-        }
-        if let Err(error) = self.ensure_active() {
-            return self.fail_created_leaf(leaf, &leaf_c, file, error);
-        }
-
-        Ok(())
+        let primary = if let Err(error) = self.ensure_active() {
+            error
+        } else if let Err(write_error) = write(&mut file) {
+            CoreError::Io(format!(
+                "could not completely write note leaf '{leaf}': {write_error}"
+            ))
+        } else if let Err(error) = self.ensure_active() {
+            error
+        } else {
+            return Ok(());
+        };
+        self.fail_created_leaf_with_ops(
+            leaf,
+            &leaf_c,
+            file,
+            primary,
+            stat_created,
+            stat_quarantine,
+            delete_quarantine,
+            after_quarantine,
+        )
     }
 
     /// Read one regular leaf through this already-confined directory descriptor.
@@ -394,15 +562,28 @@ impl StableDirectory {
         }
 
         after_identity_check();
-        let Some(quarantine) = self.quarantine_leaf(&leaf_c, leaf)? else {
+        let Some(QuarantineHandle {
+            quarantine,
+            quarantine_c,
+            guard,
+        }) = self.quarantine_leaf(&leaf_c, leaf, QuarantineIntent::RestoreOriginal)?
+        else {
             return Ok(CheckedUnlink::Missing);
         };
+        // Hold the recovery record across the quarantine window. A path that
+        // resolves the leaf (restores it to its original name, or deletes the
+        // quarantine) clears the record on drop; a path that returns with the leaf
+        // still quarantined calls `guard.retain()` (inside
+        // `restore_for_retry_or_finish`) so reconcile-on-open can recover it, and a
+        // process kill leaves it for reconcile regardless.
+        let mut guard = guard;
         after_quarantine(&quarantine);
         let quarantined = match self.read_leaf_snapshot(&quarantine) {
             Err(error) => {
                 let context =
                     format!("could not verify quarantined undo leaf '{quarantine}': {error}");
                 return self.restore_for_retry_or_finish(
+                    &mut guard,
                     &quarantine,
                     &leaf_c,
                     leaf,
@@ -422,6 +603,7 @@ impl StableDirectory {
             }
             Ok(SnapshotLeaf::Other) => {
                 return self.restore_for_retry_or_finish(
+                    &mut guard,
                     &quarantine,
                     &leaf_c,
                     leaf,
@@ -443,6 +625,7 @@ impl StableDirectory {
                 CheckedUnlink::Recreated
             };
             return self.restore_for_retry_or_finish(
+                &mut guard,
                 &quarantine,
                 &leaf_c,
                 leaf,
@@ -452,11 +635,11 @@ impl StableDirectory {
             );
         }
 
-        let quarantine_c = leaf_cstring(&quarantine)?;
         if let Err(error) = delete_quarantine(self.fd.as_raw_fd(), &quarantine_c) {
             let primary =
                 format!("could not delete verified undo recovery leaf '{quarantine}': {error}");
             return self.restore_for_retry_or_finish(
+                &mut guard,
                 &quarantine,
                 &leaf_c,
                 leaf,
@@ -506,8 +689,10 @@ impl StableDirectory {
         Ok(None)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn restore_for_retry_or_finish(
         &self,
+        guard: &mut QuarantineGuard,
         quarantine: &str,
         original: &CStr,
         display_leaf: &str,
@@ -516,6 +701,8 @@ impl StableDirectory {
         context: String,
     ) -> CoreResult<CheckedUnlink> {
         match self.restore_quarantined_leaf(quarantine, original, display_leaf) {
+            // The leaf is back at its original name, so it is resolved: the guard
+            // stays armed and clears the record on drop.
             Ok(()) => match restored {
                 Ok(outcome) => Ok(outcome),
                 Err(retry_error) => match self.read_leaf_snapshot(display_leaf) {
@@ -534,23 +721,46 @@ impl StableDirectory {
                     ))),
                 },
             },
-            Err(restore_error) => Ok(CheckedUnlink::RetryReleased(format!(
-                "{context}; the note remains preserved as '{quarantine}' and retry authority was released because its original path could not be restored: {restore_error}"
-            ))),
+            // The restore failed, so the note is STILL under its quarantine name.
+            // Retain the recovery record so reconcile-on-open can recover it;
+            // clearing it here would strand the note as an invisible dotfile.
+            Err(restore_error) => {
+                guard.retain();
+                Ok(CheckedUnlink::RetryReleased(format!(
+                    "{context}; the note remains preserved as '{quarantine}' and retry authority was released because its original path could not be restored: {restore_error}"
+                )))
+            }
         }
     }
 
-    fn quarantine_leaf(&self, leaf: &CStr, display_leaf: &str) -> CoreResult<Option<String>> {
-        // TODO(undo-quarantine-recovery): persist the original/recovery-name
-        // mapping and reconcile it when a vault opens if Undo or canceled-write
-        // cleanup must survive an OS-level process kill in this synchronous
-        // rename/recheck window. Normal errors restore or explicitly name the
-        // preserved file, but SIGKILL cannot run either branch and may leave the
-        // bytes under this hidden name.
+    /// Rename `leaf` to a private recovery name, persisting a recovery record
+    /// *before* the rename so a process kill in the rename/recheck window always
+    /// leaves a discoverable mapping. The returned guard clears that record only
+    /// once the leaf is resolved (restored or the quarantine deleted); a SIGKILL
+    /// in the window, OR any live outcome that leaves the leaf quarantined (via
+    /// [`QuarantineGuard::retain`]/[`QuarantineGuard::preserve_as`]), keeps it for
+    /// [`super::quarantine_recovery::reconcile_quarantine_recovery`] to recover.
+    fn quarantine_leaf(
+        &self,
+        leaf: &CStr,
+        display_leaf: &str,
+        intent: QuarantineIntent,
+    ) -> CoreResult<Option<QuarantineHandle>> {
+        let parent_rel = self.parent_rel()?;
+        let nonce = process_instance_nonce();
         for _ in 0..16 {
             let sequence = UNDO_QUARANTINE_SEQUENCE.fetch_add(1, Ordering::Relaxed);
-            let quarantine = format!(".neuralnote-undo-{}-{sequence}.tmp", std::process::id());
+            let quarantine = format!(".neuralnote-undo-{nonce}-{sequence}.tmp");
             let quarantine_c = leaf_cstring(&quarantine)?;
+            let sequence_id = format!("{nonce}-{sequence}");
+            let guard = record_quarantine(
+                &self.canonical_root,
+                &parent_rel,
+                display_leaf,
+                &quarantine,
+                &sequence_id,
+                intent,
+            )?;
             match rustix::fs::renameat_with(
                 &self.fd,
                 leaf,
@@ -558,19 +768,84 @@ impl StableDirectory {
                 &quarantine_c,
                 rustix::fs::RenameFlags::NOREPLACE,
             ) {
-                Ok(()) => return Ok(Some(quarantine)),
-                Err(rustix::io::Errno::NOENT) => return Ok(None),
-                Err(rustix::io::Errno::EXIST) => continue,
+                Ok(()) => {
+                    return Ok(Some(QuarantineHandle {
+                        quarantine,
+                        quarantine_c,
+                        guard,
+                    }))
+                }
+                // The rename never happened, so the record describes nothing;
+                // dropping the guard clears it before we return.
+                Err(rustix::io::Errno::NOENT) => {
+                    drop(guard);
+                    return Ok(None);
+                }
+                Err(rustix::io::Errno::EXIST) => {
+                    drop(guard);
+                    continue;
+                }
                 Err(error) => {
+                    drop(guard);
                     return Err(CoreError::Io(format!(
                         "could not quarantine note leaf '{display_leaf}': {error}"
-                    )))
+                    )));
                 }
             }
         }
         Err(CoreError::Conflict(format!(
             "could not allocate a private recovery name for note leaf '{display_leaf}'"
         )))
+    }
+
+    /// Classify a leaf for recovery: absent, a plain file, or something else that
+    /// must not be moved or deleted blindly. Never follows a final symlink.
+    pub(crate) fn quarantine_leaf_state(&self, leaf: &str) -> CoreResult<QuarantineLeafState> {
+        let leaf_c = leaf_cstring(leaf)?;
+        match statat_nofollow(self.fd.as_raw_fd(), &leaf_c) {
+            Ok(stat) if is_regular_file(&stat) => Ok(QuarantineLeafState::Regular),
+            Ok(_) => Ok(QuarantineLeafState::NonRegular),
+            Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {
+                Ok(QuarantineLeafState::Missing)
+            }
+            Err(error) => Err(CoreError::Io(format!(
+                "could not inspect recovery leaf '{leaf}': {error}"
+            ))),
+        }
+    }
+
+    /// Remove a leaf through the confined directory descriptor. Removes the
+    /// directory entry itself and never follows a symlink.
+    pub(crate) fn remove_leaf(&self, leaf: &str) -> CoreResult<()> {
+        let leaf_c = leaf_cstring(leaf)?;
+        unlinkat(self.fd.as_raw_fd(), &leaf_c).map_err(|error| {
+            CoreError::Io(format!("could not remove recovery leaf '{leaf}': {error}"))
+        })
+    }
+
+    /// Rename `from` to `to` refusing to overwrite an existing destination. A
+    /// destination of any type (including a symlink) blocks the rename rather
+    /// than being clobbered or followed.
+    pub(crate) fn restore_leaf_noreplace(
+        &self,
+        from: &str,
+        to: &str,
+    ) -> CoreResult<RestoreLeafOutcome> {
+        let from_c = leaf_cstring(from)?;
+        let to_c = leaf_cstring(to)?;
+        match rustix::fs::renameat_with(
+            &self.fd,
+            &from_c,
+            &self.fd,
+            &to_c,
+            rustix::fs::RenameFlags::NOREPLACE,
+        ) {
+            Ok(()) => Ok(RestoreLeafOutcome::Restored),
+            Err(rustix::io::Errno::EXIST) => Ok(RestoreLeafOutcome::DestinationOccupied),
+            Err(error) => Err(CoreError::Io(format!(
+                "could not restore recovery leaf '{from}' to '{to}': {error}"
+            ))),
+        }
     }
 
     fn restore_quarantined_leaf(
@@ -1587,5 +1862,337 @@ mod tests {
 
         assert!(matches!(result, CheckedUnlink::DeletedUnverified(_)));
         assert!(!path.exists());
+    }
+
+    fn recovery_record_count(root: &Path) -> usize {
+        match fs::read_dir(root.join(".neuralnote").join("undo-recovery")) {
+            Ok(read_dir) => read_dir
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| {
+                    let name = entry.file_name();
+                    let name = name.to_string_lossy();
+                    !name.starts_with('.') && name.ends_with(".json")
+                })
+                .count(),
+            Err(_) => 0,
+        }
+    }
+
+    #[test]
+    fn undo_holds_a_recovery_record_only_across_the_quarantine_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path());
+        fs::write(root.join("Written.md"), "original").unwrap();
+        let stable = StableDirectory::open_confined(&root, &root).unwrap();
+        let expected = neuralnote_core::ai::note_content_hash("original");
+        let observed_during = std::cell::Cell::new(0);
+
+        let result = stable
+            .unlink_if_hash_with_hooks(
+                "Written.md",
+                &expected,
+                || {},
+                |_| observed_during.set(recovery_record_count(&root)),
+            )
+            .unwrap();
+
+        assert_eq!(result, CheckedUnlink::Deleted);
+        assert_eq!(
+            observed_during.get(),
+            1,
+            "a recovery record must exist while the note is quarantined"
+        );
+        assert_eq!(
+            recovery_record_count(&root),
+            0,
+            "the record must be cleared once the undo completes"
+        );
+    }
+
+    fn quarantined_leaves(root: &Path) -> Vec<String> {
+        fs::read_dir(root)
+            .unwrap()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with(".neuralnote-undo-"))
+            .collect()
+    }
+
+    #[test]
+    fn a_stranded_undo_retains_its_recovery_record_for_reconcile() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path());
+        fs::write(root.join("Written.md"), "original").unwrap();
+        let stable = StableDirectory::open_confined(&root, &root).unwrap();
+        let expected = neuralnote_core::ai::note_content_hash("original");
+
+        // Force the note to remain quarantined: after the quarantine rename,
+        // reoccupy the original path so the retry-restore fails with EXIST, and
+        // inject a delete failure so the quarantine leaf is never removed.
+        let result = stable
+            .unlink_if_hash_with_ops(
+                "Written.md",
+                &expected,
+                || {},
+                |_| fs::write(root.join("Written.md"), "reoccupied").unwrap(),
+                |_, _| Err(io::Error::other("forced quarantine delete failure")),
+                statat_nofollow,
+            )
+            .unwrap();
+
+        assert!(matches!(result, CheckedUnlink::RetryReleased(_)));
+        assert_eq!(
+            quarantined_leaves(&root).len(),
+            1,
+            "the note remains preserved under its hidden quarantine name"
+        );
+        assert_eq!(
+            recovery_record_count(&root),
+            1,
+            "a note left quarantined MUST keep its recovery record so reconcile can find it"
+        );
+
+        // Free the original path, then reconcile-on-open must recover the note.
+        fs::remove_file(root.join("Written.md")).unwrap();
+        let report = crate::skills::quarantine_recovery::reconcile_quarantine_recovery(&root);
+
+        assert_eq!(
+            fs::read_to_string(root.join("Written.md")).unwrap(),
+            "original"
+        );
+        assert!(quarantined_leaves(&root).is_empty());
+        assert_eq!(
+            report.entries[0].status,
+            crate::skills::quarantine_recovery::QuarantineRecoveryStatus::Recovered
+        );
+    }
+
+    #[test]
+    fn concurrent_strands_keep_distinct_recovery_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path());
+        fs::write(root.join("A.md"), "a").unwrap();
+        fs::write(root.join("B.md"), "b").unwrap();
+        let stable = StableDirectory::open_confined(&root, &root).unwrap();
+
+        // Strand two notes in the same process. If their record ids collided (the
+        // old pid+reset-counter scheme), the second record commit would be refused
+        // and its undo would error instead of preserving the note.
+        for (leaf, content) in [("A.md", "a"), ("B.md", "b")] {
+            let expected = neuralnote_core::ai::note_content_hash(content);
+            let result = stable
+                .unlink_if_hash_with_ops(
+                    leaf,
+                    &expected,
+                    || {},
+                    |_| fs::write(root.join(leaf), "reoccupied").unwrap(),
+                    |_, _| Err(io::Error::other("forced quarantine delete failure")),
+                    statat_nofollow,
+                )
+                .unwrap();
+            assert!(matches!(result, CheckedUnlink::RetryReleased(_)));
+        }
+
+        assert_eq!(
+            recovery_record_count(&root),
+            2,
+            "each stranded note keeps its own distinct recovery record"
+        );
+        assert_eq!(quarantined_leaves(&root).len(), 2);
+    }
+
+    #[test]
+    fn cancelled_write_cleanup_leaves_no_recovery_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path());
+        let signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let stable =
+            StableDirectory::open_confined_for_run(&root, &root, Arc::clone(&signal)).unwrap();
+
+        let result = stable.create_with("Cancelled.md", |file| {
+            file.write_all(b"must not survive")?;
+            signal.close();
+            Ok(())
+        });
+
+        assert!(matches!(result, Err(CoreError::Conflict(_))));
+        assert!(!root.join("Cancelled.md").exists());
+        assert_eq!(
+            recovery_record_count(&root),
+            0,
+            "a completed cleanup must leave no recovery record"
+        );
+    }
+
+    #[test]
+    fn cancelled_write_preserves_a_foreign_replacement_it_cannot_restore() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path());
+        let path = root.join("Cancelled.md");
+        let stable = StableDirectory::open_confined(&root, &root).unwrap();
+
+        // The run creates Cancelled.md; a concurrent writer replaces it with a real
+        // user file; the write then fails. During cleanup a THIRD file reoccupies
+        // the original path, so the foreign replacement cannot be restored there.
+        let result = stable.create_with_ops(
+            "Cancelled.md",
+            |file| {
+                file.write_all(b"run output")?;
+                fs::remove_file(&path)?;
+                fs::write(&path, "user replacement")?;
+                Err(io::Error::other("forced write failure"))
+            },
+            fstat_fd,
+            statat_nofollow,
+            unlinkat,
+            |_quarantine| fs::write(&path, "third file").unwrap(),
+        );
+
+        assert!(matches!(result, Err(CoreError::Io(_))));
+        // The proven-foreign bytes must be preserved, not discarded: exactly one
+        // recovery record survives and the user's file is intact under the hidden
+        // name.
+        assert_eq!(
+            recovery_record_count(&root),
+            1,
+            "a proven-foreign replacement must keep a recovery record"
+        );
+        let hidden = quarantined_leaves(&root);
+        assert_eq!(hidden.len(), 1);
+        assert_eq!(
+            fs::read_to_string(root.join(&hidden[0])).unwrap(),
+            "user replacement"
+        );
+
+        // Reconcile-on-open must surface a Conflict (original still occupied) and
+        // must NOT delete the foreign bytes — the pre-fix bug deleted them here.
+        let report = crate::skills::quarantine_recovery::reconcile_quarantine_recovery(&root);
+        assert_eq!(
+            report.entries[0].status,
+            crate::skills::quarantine_recovery::QuarantineRecoveryStatus::Conflict
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "third file");
+        assert_eq!(
+            fs::read_to_string(root.join(&hidden[0])).unwrap(),
+            "user replacement",
+            "reconcile must never delete bytes proven to be a foreign file"
+        );
+
+        // Once the original path frees up, reconcile restores the preserved file.
+        fs::remove_file(&path).unwrap();
+        let report = crate::skills::quarantine_recovery::reconcile_quarantine_recovery(&root);
+        assert_eq!(
+            report.entries[0].status,
+            crate::skills::quarantine_recovery::QuarantineRecoveryStatus::Recovered
+        );
+        assert_eq!(fs::read_to_string(&path).unwrap(), "user replacement");
+        assert_eq!(recovery_record_count(&root), 0);
+    }
+
+    #[test]
+    fn cancelled_write_that_cannot_delete_its_own_leaf_retains_a_discard_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path());
+        let stable = StableDirectory::open_confined(&root, &root).unwrap();
+
+        // No concurrent replacement: the quarantined bytes ARE this run's output.
+        // Force the quarantine delete to fail so the leaf stays hidden.
+        let result = stable.create_with_ops(
+            "Cancelled.md",
+            |file| {
+                file.write_all(b"run output")?;
+                Err(io::Error::other("forced write failure"))
+            },
+            fstat_fd,
+            statat_nofollow,
+            |_, _| Err(io::Error::other("forced quarantine delete failure")),
+            |_| {},
+        );
+
+        assert!(matches!(
+            result,
+            Err(CoreError::Io(message)) if message.contains("forced quarantine delete failure")
+        ));
+        assert_eq!(
+            recovery_record_count(&root),
+            1,
+            "this run's own undeleted bytes keep their discard record"
+        );
+        assert_eq!(quarantined_leaves(&root).len(), 1);
+
+        // Reconcile discards them, as they were this run's aborted output.
+        let report = crate::skills::quarantine_recovery::reconcile_quarantine_recovery(&root);
+        assert_eq!(
+            report.entries[0].status,
+            crate::skills::quarantine_recovery::QuarantineRecoveryStatus::RemovedInterruptedWrite
+        );
+        assert!(quarantined_leaves(&root).is_empty());
+        assert_eq!(recovery_record_count(&root), 0);
+    }
+
+    #[test]
+    fn cancelled_write_retains_a_record_when_it_cannot_identify_its_leaf() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path());
+        let path = root.join("Cancelled.md");
+        let stable = StableDirectory::open_confined(&root, &root).unwrap();
+
+        // fstat of the created leaf fails and the original path is reoccupied, so
+        // the restore fails too: the record must be retained for reconcile.
+        let result = stable.create_with_ops(
+            "Cancelled.md",
+            |file| {
+                file.write_all(b"run output")?;
+                Err(io::Error::other("forced write failure"))
+            },
+            |_| Err(io::Error::other("forced identify failure")),
+            statat_nofollow,
+            unlinkat,
+            |_| fs::write(&path, "reoccupied").unwrap(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(CoreError::Io(message)) if message.contains("forced identify failure")
+        ));
+        assert_eq!(
+            recovery_record_count(&root),
+            1,
+            "an unidentifiable leaf that could not be restored keeps its record"
+        );
+        assert_eq!(quarantined_leaves(&root).len(), 1);
+    }
+
+    #[test]
+    fn cancelled_write_retains_a_record_when_it_cannot_verify_the_quarantine() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = canonical(dir.path());
+        let path = root.join("Cancelled.md");
+        let stable = StableDirectory::open_confined(&root, &root).unwrap();
+
+        // Verifying the quarantine leaf fails (non-ENOENT) and the original path is
+        // reoccupied, so the restore fails too: the record must be retained.
+        let result = stable.create_with_ops(
+            "Cancelled.md",
+            |file| {
+                file.write_all(b"run output")?;
+                Err(io::Error::other("forced write failure"))
+            },
+            fstat_fd,
+            |_, _| Err(io::Error::other("forced verify failure")),
+            unlinkat,
+            |_| fs::write(&path, "reoccupied").unwrap(),
+        );
+
+        assert!(matches!(
+            result,
+            Err(CoreError::Io(message)) if message.contains("forced verify failure")
+        ));
+        assert_eq!(
+            recovery_record_count(&root),
+            1,
+            "an unverifiable quarantine that could not be restored keeps its record"
+        );
+        assert_eq!(quarantined_leaves(&root).len(), 1);
     }
 }

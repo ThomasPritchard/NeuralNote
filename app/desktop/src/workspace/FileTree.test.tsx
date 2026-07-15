@@ -1,4 +1,4 @@
-import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { useCallback, useRef, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -492,6 +492,149 @@ describe("FileTree — drag and drop", () => {
     await waitFor(() =>
       expect(mockApi.moveEntry).toHaveBeenCalledWith("/v/Notes/a.md", "/v"),
     );
+  });
+});
+
+describe("FileTree — keyboard Move to (issue #24)", () => {
+  it("moves a focused entry via the keyboard without drag-and-drop", async () => {
+    const moved = { ...fileNode("a.md"), path: "/v/Notes/a.md", relPath: "Notes/a.md" };
+    mockApi.moveEntry.mockResolvedValueOnce(moved);
+    const p = setup([folderNode("Notes", []), fileNode("a.md")]);
+    const user = userEvent.setup();
+
+    const fileBtn = screen.getByText("a.md").closest("button")!;
+    fileBtn.focus();
+    await user.keyboard("m");
+
+    const dialog = await screen.findByRole("dialog");
+    // Notes is the only valid destination — root is a.md's current parent.
+    await user.click(within(dialog).getByRole("button", { name: /Notes/ }));
+
+    await waitFor(() =>
+      expect(mockApi.moveEntry).toHaveBeenCalledWith("/v/a.md", "/v/Notes"),
+    );
+    expect(p.onRemap).toHaveBeenCalledWith("/v/a.md", moved);
+    expect(p.onRefreshDir).toHaveBeenCalledWith(""); // source parent (root)
+  });
+
+  it("does not offer the entry itself or its descendants as destinations", async () => {
+    setup(
+      [
+        folderNode("Notes", [folderNode("Sub", [], "Notes/Sub")]),
+        folderNode("Other", []),
+      ],
+      { expanded: new Set(["Notes"]) },
+    );
+    const user = userEvent.setup();
+
+    screen.getByText("Notes").closest("button")!.focus();
+    await user.keyboard("m");
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByRole("button", { name: /Other/ })).toBeInTheDocument();
+    expect(within(dialog).queryByRole("button", { name: /Sub/ })).not.toBeInTheDocument();
+    expect(
+      within(dialog).queryByRole("button", { name: /^Notes$/ }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("shows an empty state and moves nothing when there is no valid destination", async () => {
+    setup([folderNode("Notes", [folderNode("Sub", [], "Notes/Sub")])], {
+      expanded: new Set(["Notes"]),
+    });
+    const user = userEvent.setup();
+
+    screen.getByText("Notes").closest("button")!.focus();
+    await user.keyboard("m");
+
+    const dialog = await screen.findByRole("dialog");
+    expect(within(dialog).getByText(/no available destinations/i)).toBeInTheDocument();
+    expect(mockApi.moveEntry).not.toHaveBeenCalled();
+  });
+
+  it("does not trigger a move while typing a rename that contains 'm'", async () => {
+    setup([fileNode("a.md")]);
+    const user = userEvent.setup();
+
+    await user.dblClick(screen.getByText("a.md").closest("button")!);
+    await user.type(screen.getByLabelText("Rename a.md"), "memo");
+
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
+  });
+
+  it("returns focus to the invoking row when the move is cancelled", async () => {
+    setup([folderNode("Notes", []), fileNode("a.md")]);
+    const user = userEvent.setup();
+
+    const fileBtn = screen.getByText("a.md").closest("button")!;
+    fileBtn.focus();
+    await user.keyboard("m");
+
+    await screen.findByRole("dialog");
+    await user.click(screen.getByRole("button", { name: /cancel move/i }));
+
+    await waitFor(() => expect(screen.queryByRole("dialog")).not.toBeInTheDocument());
+    expect(fileBtn).toHaveFocus();
+  });
+
+  it("surfaces a move failure as a toast", async () => {
+    mockApi.moveEntry.mockRejectedValueOnce({ kind: "io", message: "disk full" });
+    setup([folderNode("Notes", []), fileNode("a.md")]);
+    const user = userEvent.setup();
+
+    screen.getByText("a.md").closest("button")!.focus();
+    await user.keyboard("m");
+    const dialog = await screen.findByRole("dialog");
+    await user.click(within(dialog).getByRole("button", { name: /Notes/ }));
+
+    await waitFor(() => expect(toastError).toHaveBeenCalled());
+  });
+});
+
+describe("FileTree — visible Move affordance (issue #24)", () => {
+  it("renders a labelled, tab-order Move button on both file and folder rows", () => {
+    setup([folderNode("Notes", []), fileNode("a.md")]);
+
+    const fileMove = screen.getByRole("button", { name: "Move a.md" });
+    const folderMove = screen.getByRole("button", { name: "Move Notes" });
+
+    expect(fileMove).toBeEnabled();
+    expect(folderMove).toBeEnabled();
+    // Reachable by keyboard on the same footing as Delete — neither opts out of
+    // the tab order.
+    expect(fileMove).not.toHaveAttribute("tabindex");
+    expect(screen.getByRole("button", { name: "Delete a.md" })).not.toHaveAttribute("tabindex");
+    // The tooltip surfaces the `m` shortcut so the hidden affordance is discoverable.
+    expect(fileMove).toHaveAttribute("title", "Move to… (m)");
+  });
+
+  it("opens the destination picker and moves via the visible Move button (mouse)", async () => {
+    const moved = { ...fileNode("a.md"), path: "/v/Notes/a.md", relPath: "Notes/a.md" };
+    mockApi.moveEntry.mockResolvedValueOnce(moved);
+    const p = setup([folderNode("Notes", []), fileNode("a.md")]);
+    const user = userEvent.setup();
+
+    await user.click(screen.getByRole("button", { name: "Move a.md" }));
+
+    const dialog = await screen.findByRole("dialog");
+    // Same flow the `m` shortcut drives — Notes is the only valid destination.
+    await user.click(within(dialog).getByRole("button", { name: /Notes/ }));
+
+    await waitFor(() =>
+      expect(mockApi.moveEntry).toHaveBeenCalledWith("/v/a.md", "/v/Notes"),
+    );
+    expect(p.onRemap).toHaveBeenCalledWith("/v/a.md", moved);
+  });
+
+  it("opens the destination picker via keyboard activation of the Move button", async () => {
+    setup([folderNode("Notes", []), fileNode("a.md")]);
+    const user = userEvent.setup();
+
+    const moveBtn = screen.getByRole("button", { name: "Move a.md" });
+    moveBtn.focus();
+    await user.keyboard("{Enter}");
+
+    expect(await screen.findByRole("dialog")).toBeInTheDocument();
   });
 });
 
