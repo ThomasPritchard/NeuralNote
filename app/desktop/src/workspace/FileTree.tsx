@@ -102,7 +102,7 @@ export const FileTree = memo(function FileTree({
   const surfaceOperationError = (error: unknown, allowInlineValidation = false) => {
     const kind =
       error && typeof error === "object" && "kind" in error
-        ? String((error as { kind: unknown }).kind)
+        ? String(error.kind)
         : null;
     if (allowInlineValidation && (kind === "invalidName" || kind === "alreadyExists")) {
       setOpError(errorMessage(error));
