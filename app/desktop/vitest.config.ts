@@ -19,8 +19,10 @@ export default defineConfig({
     setupFiles: ["./src/test/setup.ts"],
     css: false,
     // The Tier-2 native WebDriver specs (e2e-native/**/*.spec.ts) are run by
-    // WebdriverIO, not Vitest — keep this runner from collecting them.
-    exclude: [...configDefaults.exclude, "e2e-native/**"],
+    // WebdriverIO, not Vitest — keep this runner from collecting them. The
+    // Tier-1.5 real-browser specs (*.browser.test.tsx) run under the separate
+    // vitest.browser.config.ts (headless Chromium), not this jsdom runner.
+    exclude: [...configDefaults.exclude, "e2e-native/**", "src/**/*.browser.test.{ts,tsx}"],
     coverage: {
       provider: "v8",
       reporter: ["text", "lcov"],

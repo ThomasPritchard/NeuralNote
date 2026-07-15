@@ -377,12 +377,13 @@ describe("TitleBar — drag region", () => {
     const layer = view.container.querySelector("[data-tauri-drag-region]");
     expect(layer).not.toBeNull();
     expect(layer).toHaveAttribute("aria-hidden", "true");
-    // The drag layer itself carries no interactive children.
-    // TODO(titlebar-drag-hit-test): this proves buttons are not DOM descendants
-    // of the drag layer, not that they stack above it — jsdom has no layout or
-    // hit-testing. A dropped `relative z-10` would let the inset-0 layer swallow
-    // every titlebar click and still pass here; when a Playwright harness exists,
-    // add a click-a-titlebar-button smoke test.
+    // The drag layer itself carries no interactive children. This proves the
+    // buttons are not DOM *descendants* of the drag layer — a structural check.
+    // It cannot prove they stack ABOVE it (jsdom has no layout or hit-testing): a
+    // dropped `relative z-10` would let the inset-0 layer swallow every titlebar
+    // click and still pass here. The real-layout complement is the headless-Chromium
+    // hit test in TitleBar.browser.test.tsx (issue #30), which fails on exactly that
+    // regression via elementFromPoint + a Playwright actionability click.
     expect(layer?.childElementCount).toBe(0);
   });
 });

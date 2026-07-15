@@ -75,9 +75,28 @@ jobs:
         working-directory: app/desktop
         run: npm run typecheck
 
+      - name: Type check real-browser specs
+        working-directory: app/desktop
+        run: npm run typecheck:browser
+
       - name: Unit and component tests
         working-directory: app/desktop
         run: npm run test:unit
+
+      # Tier-1.5 real-browser hit test (issue #30): runs the titlebar in headless
+      # Chromium so CSS stacking / pointer interception is exercised for real —
+      # the drag-layer regression jsdom can't see. Node 24 only (one Chromium
+      # download); runs on PRs too, since its job is to block the regression
+      # before merge, not just on main.
+      - name: Install Playwright Chromium
+        if: matrix.node == 24
+        working-directory: app/desktop
+        run: npx playwright install --with-deps chromium
+
+      - name: Real-browser titlebar hit test
+        if: matrix.node == 24
+        working-directory: app/desktop
+        run: npm run test:browser
 
       - name: Full test suite and 90 percent line coverage
         if: github.event_name != 'pull_request' && matrix.node == 24
