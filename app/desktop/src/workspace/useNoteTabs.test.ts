@@ -1,16 +1,37 @@
 // @vitest-environment jsdom
 
 import { act, renderHook, waitFor } from "@testing-library/react";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
+import { listen } from "@tauri-apps/api/event";
 import type { NoteDoc } from "../lib/types";
 import { normalizeRequestedPath, useNoteTabs } from "./useNoteTabs";
 
 const mockInvoke = vi.mocked(invoke);
+const mockListen = vi.mocked(listen);
+
+/** The raw handler `useNoteTabs` registered with the on-disk change event, used
+ *  by the external-reload tests to fire the watcher directly. */
+function treeChangedHandler(): () => void {
+  const call = mockListen.mock.calls.find(
+    ([event]) => event === "vault://tree-changed",
+  );
+  if (!call) throw new Error("useNoteTabs did not subscribe to tree-changed");
+  return call[1] as () => void;
+}
+
+/** Flush the microtasks behind a mocked `read_note` / `write_note` so the tab
+ *  state settles, without depending on real timers. */
+async function drainMicrotasks(): Promise<void> {
+  await act(async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  });
+}
 
 function doc(path: string, raw = `# ${path}`): NoteDoc {
   return {
@@ -38,7 +59,15 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-beforeEach(() => mockInvoke.mockReset());
+beforeEach(() => {
+  mockInvoke.mockReset();
+  mockListen.mockReset();
+  // Default: a resolvable subscription so mounting the hook's external-reload
+  // watcher never throws. Individual tests grab the handler or an unlisten spy.
+  mockListen.mockResolvedValue(vi.fn());
+});
+
+afterEach(() => vi.useRealTimers());
 
 describe("normalizeRequestedPath", () => {
   it("normalizes separators and dot segments without escaping relative parents", () => {
@@ -344,5 +373,144 @@ describe("useNoteTabs single-source state", () => {
     });
     expect(result.current.active.path).toBe("/v/b.md");
     expect(result.current.tabs.find((tab) => tab.path === "/v/a.md")?.dirty).toBe(false);
+  });
+});
+
+describe("useNoteTabs external-change reload", () => {
+  /** A fake vault keyed by path; `read_note` returns the current bytes, a missing
+   *  path rejects as not-found, and `write_note` mutates the store — so an in-app
+   *  save and a later external read agree, exactly like the real backend. */
+  function mockDisk(initial: Record<string, string>) {
+    const files: Record<string, string> = { ...initial };
+    mockInvoke.mockImplementation((command, args) => {
+      if (command === "read_note") {
+        const path = (args as { path: string }).path;
+        if (!(path in files)) {
+          return Promise.reject({ kind: "notFound", message: "gone" }) as never;
+        }
+        return Promise.resolve(doc(path, files[path])) as never;
+      }
+      if (command === "write_note") {
+        const call = args as { path: string; content: string };
+        files[call.path] = call.content;
+        return Promise.resolve(doc(call.path, call.content)) as never;
+      }
+      return Promise.resolve(undefined) as never;
+    });
+    return files;
+  }
+
+  async function fireWatcher(): Promise<void> {
+    const handler = treeChangedHandler();
+    await act(async () => {
+      handler();
+      await vi.advanceTimersByTimeAsync(300);
+    });
+  }
+
+  it("reloads a clean open note when its file changes externally (debounced once)", async () => {
+    vi.useFakeTimers();
+    const files = mockDisk({ "/v/a.md": "A" });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await drainMicrotasks();
+    expect(result.current.active.draft).toBe("A");
+
+    files["/v/a.md"] = "edited elsewhere";
+    const readsBefore = mockInvoke.mock.calls.filter(([c]) => c === "read_note").length;
+    const handler = treeChangedHandler();
+    await act(async () => {
+      handler();
+      handler();
+      handler(); // a burst must collapse into a single reconcile read
+      await vi.advanceTimersByTimeAsync(300);
+    });
+
+    expect(result.current.active.draft).toBe("edited elsewhere");
+    expect(result.current.active.dirty).toBe(false);
+    expect(result.current.active.note?.raw).toBe("edited elsewhere");
+    const readsAfter = mockInvoke.mock.calls.filter(([c]) => c === "read_note").length;
+    expect(readsAfter - readsBefore).toBe(1);
+  });
+
+  it("preserves a dirty draft and surfaces a conflict instead of replacing it", async () => {
+    vi.useFakeTimers();
+    const files = mockDisk({ "/v/a.md": "A" });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await drainMicrotasks();
+    act(() => result.current.active.setDraft("my unsaved work"));
+
+    files["/v/a.md"] = "changed under me";
+    await fireWatcher();
+
+    expect(result.current.active.conflict).toBe(true);
+    expect(result.current.active.draft).toBe("my unsaved work"); // never clobbered
+    expect(result.current.active.dirty).toBe(true);
+    expect(result.current.active.note?.raw).toBe("A"); // base unchanged
+  });
+
+  it("surfaces an external deletion while keeping the note and draft", async () => {
+    vi.useFakeTimers();
+    const files = mockDisk({ "/v/a.md": "A" });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await drainMicrotasks();
+    act(() => result.current.active.setDraft("still here"));
+
+    delete files["/v/a.md"]; // removed on disk
+    await fireWatcher();
+
+    expect(result.current.active.externalDeleted).toBe(true);
+    expect(result.current.active.note).not.toBeNull(); // not dropped
+    expect(result.current.active.draft).toBe("still here"); // recoverable
+  });
+
+  it("follows an in-app rename: an external edit reloads the note at its new path", async () => {
+    vi.useFakeTimers();
+    const files = mockDisk({ "/v/a.md": "A" });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await drainMicrotasks();
+
+    act(() => result.current.remap("/v/a.md", "/v/b.md", "b.md"));
+    expect(result.current.active.path).toBe("/v/b.md");
+    files["/v/b.md"] = "edited at new path"; // external edit lands at the new path
+    await fireWatcher();
+
+    expect(result.current.active.path).toBe("/v/b.md");
+    expect(result.current.active.draft).toBe("edited at new path");
+    expect(result.current.active.dirty).toBe(false);
+  });
+
+  it("does not reload or conflict after an in-app save fires the watcher (self-write guard)", async () => {
+    vi.useFakeTimers();
+    mockDisk({ "/v/a.md": "A" });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await drainMicrotasks();
+    act(() => result.current.active.setDraft("A changed"));
+    await act(async () => {
+      await result.current.active.save();
+    });
+    expect(result.current.active.dirty).toBe(false);
+
+    await fireWatcher(); // the save wrote the file, which fires the watcher
+
+    expect(result.current.active.conflict).toBe(false);
+    expect(result.current.active.externalDeleted).toBe(false);
+    expect(result.current.active.draft).toBe("A changed"); // unchanged, no spurious reload
+    expect(result.current.active.dirty).toBe(false);
+  });
+
+  it("tears down the watcher subscription on unmount", async () => {
+    const unlisten = vi.fn();
+    mockListen.mockResolvedValue(unlisten);
+    mockDisk({ "/v/a.md": "A" });
+    const { unmount } = renderHook(() => useNoteTabs());
+    await drainMicrotasks(); // let the subscription promise assign the unlisten fn
+
+    unmount();
+    expect(unlisten).toHaveBeenCalled();
   });
 });

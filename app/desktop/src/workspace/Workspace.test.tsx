@@ -225,6 +225,7 @@ function makeOpen(over: Partial<OpenNote> = {}): OpenNote {
     saveError: null,
     preservationError: null,
     conflict: false,
+    externalDeleted: false,
     open: vi.fn(),
     reload: vi.fn(),
     overwrite: vi.fn(),
@@ -254,6 +255,7 @@ function makeTabs(over: Partial<NoteTabsController> = {}): NoteTabsController {
           saveError: active.saveError,
           preservationError: active.preservationError,
           conflict: active.conflict,
+          externalDeleted: active.externalDeleted,
           loadRevision: 1,
           saveRevision: 0,
         }
@@ -314,6 +316,7 @@ function makeTab(path: string, over: Partial<NoteTab> = {}): NoteTab {
     saveError: null,
     preservationError: null,
     conflict: false,
+    externalDeleted: false,
     loadRevision: 1,
     saveRevision: 0,
     ...over,

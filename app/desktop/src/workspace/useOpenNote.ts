@@ -13,6 +13,10 @@ export interface OpenNote {
   saveError: string | null;
   preservationError: string | null;
   conflict: boolean;
+  /** True when the open note's file was removed on disk externally (deleted, or
+   *  renamed out from under the tab). The note + draft are preserved; the reader
+   *  surfaces this so an open note is never silently stale after a deletion. */
+  externalDeleted: boolean;
   open: (path: string) => void;
   reload: () => void;
   overwrite: () => Promise<void>;

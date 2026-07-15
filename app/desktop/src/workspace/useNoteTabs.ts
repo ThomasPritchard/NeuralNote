@@ -1,7 +1,8 @@
-import { useCallback, useMemo, useReducer, useRef } from "react";
+import { useCallback, useEffect, useMemo, useReducer, useRef } from "react";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 
 import * as api from "../lib/api";
-import { errorMessage, isConflict } from "../lib/api";
+import { errorMessage, isConflict, isNotFound } from "../lib/api";
 import type { NoteDoc } from "../lib/types";
 import { isPathInside, normSep, remapPath } from "./fileMeta";
 import {
@@ -23,6 +24,11 @@ export interface NoteTab {
   saveError: string | null;
   preservationError: string | null;
   conflict: boolean;
+  /** True when the note's file was removed on disk while the tab is open (an
+   *  external deletion, or a rename that moved it out from under the tab). The
+   *  note + draft are kept — never dropped — so the user can re-save to recover;
+   *  the reader surfaces the deletion so the open note is never silently stale. */
+  externalDeleted: boolean;
   loadRevision: number;
   saveRevision: number;
 }
@@ -63,9 +69,15 @@ type Action =
   | { type: "save-start"; id: string; revision: number }
   | { type: "save-success"; id: string; revision: number; pathAtStart: string; doc: NoteDoc }
   | { type: "save-error"; id: string; revision: number; message: string; conflict: boolean }
+  | { type: "external-update"; id: string; doc: NoteDoc }
+  | { type: "external-delete"; id: string }
   | { type: "remap"; oldPath: string; newPath: string; newRelPath?: string }
   | { type: "remove-descendants"; path: string }
   | { type: "clear" };
+
+/** Debounce window for coalescing a burst of external-change events (a git pull
+ *  or Obsidian sync fires many at once) before reconciling the open notes. */
+const EXTERNAL_RELOAD_DEBOUNCE_MS = 300;
 
 const EMPTY_STATE: TabsState = { tabs: [], activeTabId: null };
 
@@ -103,6 +115,7 @@ function applyLoad(tab: NoteTab, path: string, loadedDoc: NoteDoc): NoteTab {
     draft: loadedDoc.raw,
     dirty: false,
     preservationError: null,
+    externalDeleted: false,
   };
 }
 
@@ -205,6 +218,7 @@ export function noteTabsReducer(state: TabsState, action: Action): TabsState {
         saveError: null,
         preservationError: null,
         conflict: false,
+        externalDeleted: false,
         loadRevision: action.revision,
         saveRevision: tab.saveRevision + 1,
       }));
@@ -256,6 +270,7 @@ export function noteTabsReducer(state: TabsState, action: Action): TabsState {
           saving: false,
           saveError: null,
           conflict: false,
+          externalDeleted: false,
           dirty: tab.draft !== savedDoc.raw,
         };
       });
@@ -269,6 +284,33 @@ export function noteTabsReducer(state: TabsState, action: Action): TabsState {
               conflict: action.conflict,
             }
           : tab,
+      );
+    case "external-update":
+      return replaceTab(state, action.id, (tab) => {
+        if (!tab.note) return tab;
+        if (tab.dirty) {
+          // Unsaved edits are present: never clobber the draft. Raise the same
+          // conflict the save path raises so the user resolves it explicitly
+          // (reload to take disk, or overwrite to keep the draft).
+          return { ...tab, conflict: true, externalDeleted: false };
+        }
+        // Clean tab: adopt the on-disk version. Keep the tab's own path/relPath —
+        // the file's identity is unchanged (we read the tab's current path).
+        const reloaded = { ...action.doc, path: tab.path, relPath: tab.note.relPath };
+        return {
+          ...tab,
+          note: reloaded,
+          sessionHash: reloaded.contentHash,
+          draft: reloaded.raw,
+          dirty: false,
+          conflict: false,
+          externalDeleted: false,
+          error: null,
+        };
+      });
+    case "external-delete":
+      return replaceTab(state, action.id, (tab) =>
+        tab.note ? { ...tab, externalDeleted: true } : tab,
       );
     case "remap":
       return {
@@ -314,6 +356,7 @@ function loadingTab(id: string, path: string): NoteTab {
     saveError: null,
     preservationError: null,
     conflict: false,
+    externalDeleted: false,
     loadRevision: 1,
     saveRevision: 0,
   };
@@ -377,6 +420,47 @@ export function useNoteTabs(): NoteTabsController {
     runLoad(tab.id, tab.path, revision);
   }, [dispatch, runLoad]);
 
+  // Reconcile one open tab against its file on disk after an external change.
+  // A save-in-flight tab is skipped (its own write is reconciled by save-success,
+  // never treated as an external edit); an unchanged hash is skipped (this is how
+  // a completed in-app save avoids a spurious reload). A genuine change reloads a
+  // clean tab or, to protect unsaved work, raises a conflict on a dirty one; a
+  // vanished file is surfaced as an external deletion.
+  const reconcileOpenTab = useCallback(async (id: string) => {
+    const tab = stateRef.current.tabs.find((item) => item.id === id);
+    if (
+      !tab ||
+      !tab.note ||
+      tab.loading ||
+      tab.saving ||
+      savingTabIds.current.has(id)
+    ) {
+      return;
+    }
+    const knownHash = tab.note.contentHash;
+    const path = tab.path;
+    try {
+      const disk = await api.readNote(path);
+      // The tab may have closed, been remapped, or begun saving during the read.
+      const current = stateRef.current.tabs.find((item) => item.id === id);
+      if (!current || current.saving || savingTabIds.current.has(id)) return;
+      if (current.path !== path) return;
+      if (disk.contentHash === knownHash) return;
+      if (!current.dirty) destroySourceEditorSession(id);
+      dispatch({ type: "external-update", id, doc: disk });
+    } catch (error) {
+      if (isNotFound(error)) {
+        dispatch({ type: "external-delete", id });
+        return;
+      }
+      // A transient read failure during external churn (e.g. mid-rename) leaves
+      // the last-known-good note on screen; the user's next save hits the real
+      // conflict/not-found backstop. Logged, not surfaced on every sync burst —
+      // the store's tree watcher owns the shared user-facing error channel.
+      console.error("external note reconcile failed:", error);
+    }
+  }, [dispatch]);
+
   const persist = useCallback(async (overwrite: boolean) => {
     const tab = stateRef.current.tabs.find((item) => item.id === stateRef.current.activeTabId);
     if (!tab?.note || tab.saving || savingTabIds.current.has(tab.id)) return;
@@ -435,6 +519,40 @@ export function useNoteTabs(): NoteTabsController {
     [],
   );
 
+  // Keep open notes fresh when the vault changes on disk (external edits from
+  // Obsidian, a git pull, a sync). Debounced to coalesce bursts and to avoid a
+  // self-write loop: an in-app save fires the watcher too, but the saved tab is
+  // either still saving or already matches disk, so it never spuriously reloads.
+  // Subscribed once (stable deps); the live tab set is read through `stateRef`.
+  useEffect(() => {
+    let cancelled = false;
+    let unlisten: UnlistenFn | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const reconcileAll = () => {
+      for (const tab of stateRef.current.tabs) void reconcileOpenTab(tab.id);
+    };
+    void api
+      .onTreeChanged(() => {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(reconcileAll, EXTERNAL_RELOAD_DEBOUNCE_MS);
+      })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch((error) => {
+        // Degrades only live reader reloads; the store's tree watcher subscribes
+        // to the same event and owns the user-facing surface, so log rather than
+        // double-report the failure.
+        console.error("failed to subscribe to external note reloads:", error);
+      });
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      unlisten?.();
+    };
+  }, [reconcileOpenTab]);
+
   const activeTab = state.tabs.find((tab) => tab.id === state.activeTabId) ?? null;
   const owningTabId = activeTab?.id ?? null;
   const active = useMemo<OpenNote>(() => ({
@@ -450,6 +568,7 @@ export function useNoteTabs(): NoteTabsController {
     saveError: activeTab?.saveError ?? null,
     preservationError: activeTab?.preservationError ?? null,
     conflict: activeTab?.conflict ?? false,
+    externalDeleted: activeTab?.externalDeleted ?? false,
     open: (path) => { open(path); },
     reload,
     overwrite: () => persist(true),

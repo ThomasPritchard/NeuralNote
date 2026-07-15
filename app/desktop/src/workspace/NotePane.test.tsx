@@ -42,6 +42,7 @@ function openNote(overrides: Partial<OpenNote> = {}): OpenNote {
     draft: "# My Note\n\nbody",
     dirty: false,
     saving: false,
+    externalDeleted: false,
     saveError: null,
     preservationError: null,
     conflict: false,
@@ -165,6 +166,22 @@ describe("NotePane", () => {
     await userEvent.click(screen.getByRole("button", { name: /Reload/i }));
     expect(open.overwrite).toHaveBeenCalled();
     expect(open.reload).toHaveBeenCalled();
+  });
+
+  it("surfaces a deletion notice when the open note was deleted on disk", () => {
+    render(<NotePane open={openNote({ externalDeleted: true })} />);
+    expect(screen.getByText(/was deleted on disk/i)).toBeInTheDocument();
+  });
+
+  it("shows no deletion notice when the note is still present on disk", () => {
+    render(<NotePane open={openNote({ externalDeleted: false })} />);
+    expect(screen.queryByText(/was deleted on disk/i)).not.toBeInTheDocument();
+  });
+
+  it("lets the deletion notice take precedence over the on-disk conflict notice", () => {
+    render(<NotePane open={openNote({ externalDeleted: true, conflict: true })} />);
+    expect(screen.getByText(/was deleted on disk/i)).toBeInTheDocument();
+    expect(screen.queryByText(/changed on disk/i)).not.toBeInTheDocument();
   });
 
   it("disables saving while exact-source preservation is blocked", () => {
