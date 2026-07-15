@@ -24,6 +24,18 @@ import {
 } from "@/components/ui/dialog";
 import { buttonVariants } from "@/components/ui/button";
 
+function installProgressAnnouncement(status: UpdateState["status"]): string {
+  if (status === "installing") return "Installing update.";
+  if (status === "relaunching") return "Update installed. Relaunching NeuralNote.";
+  return "";
+}
+
+function installButtonLabel(status: UpdateState["status"]): string {
+  if (status === "installing") return "Installing…";
+  if (status === "relaunching") return "Relaunching…";
+  return "Install and relaunch";
+}
+
 interface UpdateContextValue {
   state: UpdateState;
   lastAutomaticError: string | null;
@@ -129,11 +141,7 @@ function UpdateDialog({ state, open, onOpenChange }: Readonly<{
           <p role="alert" className="text-sm text-destructive">{state.message}</p>
         )}
         <p role="status" aria-live="polite" className="sr-only">
-          {state.status === "installing"
-            ? "Installing update."
-            : state.status === "relaunching"
-              ? "Update installed. Relaunching NeuralNote."
-              : ""}
+          {installProgressAnnouncement(state.status)}
         </p>
         <div className="flex justify-end gap-2">
           <button type="button" disabled={installing} onClick={() => onOpenChange(false)} className={buttonVariants({ tone: "quiet" })}>Later</button>
@@ -148,7 +156,7 @@ function UpdateDialog({ state, open, onOpenChange }: Readonly<{
             className={buttonVariants({ tone: "primary" })}
           >
             {installing ? <Loader2 className="size-4 animate-spin" aria-hidden /> : <Download className="size-4" aria-hidden />}
-            {state.status === "installing" ? "Installing…" : state.status === "relaunching" ? "Relaunching…" : "Install and relaunch"}
+            {installButtonLabel(state.status)}
           </button>
         </div>
       </DialogContent>
