@@ -247,6 +247,79 @@ describe("useNoteTabs single-source state", () => {
     expect(result.current.tabs.map((tab) => tab.path)).toEqual(["/v/other.md"]);
   });
 
+  it("lands an in-flight save on the renamed path without restoring the old one", async () => {
+    const write = deferred<NoteDoc>();
+    mockInvoke.mockImplementation((command) => {
+      if (command === "read_note") return Promise.resolve(doc("/v/a.md", "A")) as never;
+      if (command === "write_note") return write.promise as never;
+      return Promise.resolve(undefined) as never;
+    });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.draft).toBe("A"));
+    act(() => result.current.active.setDraft("edited"));
+
+    let save!: Promise<void>;
+    act(() => { save = result.current.active.save(); });
+    // Rename the note while its save is still in flight.
+    act(() => result.current.active.repath("/v/renamed.md", "renamed.md"));
+
+    await act(async () => {
+      // The backend echoes the path it actually wrote — the old one, still on
+      // disk when the save began — which must NOT overwrite the renamed path.
+      write.resolve(doc("/v/a.md", "edited"));
+      await save;
+    });
+
+    expect(result.current.active.path).toBe("/v/renamed.md");
+    expect(result.current.active.note?.path).toBe("/v/renamed.md");
+    expect(result.current.active.note?.relPath).toBe("renamed.md");
+    expect(result.current.active.note?.raw).toBe("edited"); // landed content preserved
+    expect(result.current.active.note?.contentHash).toBe("hash:edited");
+    expect(result.current.active.dirty).toBe(false);
+    expect(result.current.active.saving).toBe(false);
+  });
+
+  it("routes a post-move save to the new location with the saved hash", async () => {
+    const firstWrite = deferred<NoteDoc>();
+    const writeCalls: Array<{ path: string; expectedHash: string | null }> = [];
+    mockInvoke.mockImplementation((command, args) => {
+      if (command === "read_note") return Promise.resolve(doc("/v/a.md", "A")) as never;
+      if (command === "write_note") {
+        const call = args as { path: string; content: string; expectedHash: string | null };
+        writeCalls.push({ path: call.path, expectedHash: call.expectedHash });
+        if (writeCalls.length === 1) return firstWrite.promise as never;
+        return Promise.resolve(doc("/v/sub/a.md", call.content)) as never;
+      }
+      return Promise.resolve(undefined) as never;
+    });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.draft).toBe("A"));
+    act(() => result.current.active.setDraft("moved edit"));
+
+    let save!: Promise<void>;
+    act(() => { save = result.current.active.save(); });
+    // Move the note into a subfolder while its save is still in flight.
+    act(() => result.current.active.repath("/v/sub/a.md", "sub/a.md"));
+    await act(async () => {
+      firstWrite.resolve(doc("/v/a.md", "moved edit"));
+      await save;
+    });
+
+    expect(result.current.active.path).toBe("/v/sub/a.md");
+    expect(result.current.active.note?.relPath).toBe("sub/a.md");
+    expect(result.current.active.note?.raw).toBe("moved edit"); // landed content preserved
+    // The in-flight write targeted the path/hash the note carried when it began.
+    expect(writeCalls[0]).toEqual({ path: "/v/a.md", expectedHash: "hash:A" });
+
+    // A follow-up save must target the NEW path with the hash the last save
+    // landed — optimistic concurrency continues from the moved location.
+    act(() => result.current.active.setDraft("moved edit again"));
+    await act(() => result.current.active.save());
+    expect(writeCalls[1]).toEqual({ path: "/v/sub/a.md", expectedHash: "hash:moved edit" });
+  });
+
   it("keeps a save owned by its tab when another tab becomes active", async () => {
     const write = deferred<NoteDoc>();
     mockInvoke.mockImplementation((command, args) => {
