@@ -60,7 +60,7 @@ export function AppearanceSettingsPage() {
       </fieldset>
 
       <label className="flex flex-col gap-1.5 text-xs font-medium">
-        Font family
+        <span>Font family</span>
         <select
           value={preferences.fontFamily}
           disabled={saving}
