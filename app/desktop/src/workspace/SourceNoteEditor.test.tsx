@@ -21,6 +21,7 @@ import {
   clearSourceEditorSessions,
   updateSourceEditorSession,
 } from "./sourceEditorSession";
+import { refreshSourceEditorDecorations } from "./sourceEditorDecorations";
 
 afterEach(() => {
   menu.handler = null;
@@ -189,7 +190,12 @@ describe("SourceNoteEditor", () => {
     checkbox.focus();
     await userEvent.keyboard(" ");
     await waitFor(() => expect(onChange).toHaveBeenLastCalledWith("- [x] open"));
-    (await screen.findByRole("checkbox", { name: "Mark task incomplete" })).focus();
+    const checkedCheckbox = await screen.findByRole("checkbox", { name: "Mark task incomplete" });
+    checkedCheckbox.focus();
+    const view = EditorView.findFromDOM(screen.getByRole("textbox", { name: "Note content" }));
+    expect(view).not.toBeNull();
+    act(() => view?.dispatch({ effects: refreshSourceEditorDecorations.of(null) }));
+    expect(document.activeElement).toBe(checkedCheckbox);
     await userEvent.keyboard("{Enter}");
     await waitFor(() => expect(onChange).toHaveBeenLastCalledWith("- [ ] open"));
   });

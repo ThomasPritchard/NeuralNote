@@ -244,6 +244,15 @@ class TaskWidget extends WidgetType {
     super();
   }
 
+  eq(other: WidgetType): boolean {
+    return other instanceof TaskWidget
+      && other.item.from === this.item.from
+      && other.item.to === this.item.to
+      && other.item.className === this.item.className
+      && other.item.label === this.item.label
+      && other.item.checked === this.item.checked;
+  }
+
   toDOM(view: EditorView): HTMLElement {
     const element = document.createElement("button");
     element.type = "button";
