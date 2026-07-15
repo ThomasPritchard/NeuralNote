@@ -10,12 +10,20 @@ import { GraphView } from "./GraphView";
 const mocks = vi.hoisted(() => ({
   readLinkGraph: vi.fn(),
   useVault: vi.fn(),
+  onTreeChanged: vi.fn(),
 }));
 
-// Real errorMessage/toGalaxy stay live; only the Tauri call is faked.
+// Captures the live tree-changed callback so tests can fire a vault change.
+const treeChanged = vi.hoisted(() => ({
+  cb: null as null | (() => void),
+  unlisten: vi.fn(),
+}));
+
+// Real errorMessage/toGalaxy stay live; only the Tauri calls are faked.
 vi.mock("../lib/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../lib/api")>()),
   readLinkGraph: mocks.readLinkGraph,
+  onTreeChanged: mocks.onTreeChanged,
 }));
 vi.mock("../lib/store", () => ({ useVault: mocks.useVault }));
 
@@ -76,6 +84,13 @@ beforeEach(() => {
   harness.props = null;
   mocks.readLinkGraph.mockReset();
   mocks.useVault.mockReturnValue({ vault: { name: "My Vault", path: "/v" } });
+  treeChanged.cb = null;
+  treeChanged.unlisten.mockReset();
+  mocks.onTreeChanged.mockReset();
+  mocks.onTreeChanged.mockImplementation((cb: () => void) => {
+    treeChanged.cb = cb;
+    return Promise.resolve(treeChanged.unlisten);
+  });
 });
 
 describe("GraphView", () => {
@@ -84,6 +99,96 @@ describe("GraphView", () => {
     render(<GraphView onOpenNote={vi.fn()} />);
     expect(screen.getByLabelText("Loading graph")).toBeInTheDocument();
     expect(screen.queryByTestId("force-graph-3d")).not.toBeInTheDocument();
+  });
+
+  it("reloads the graph in place (debounced) when the vault changes while mounted (#34)", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.readLinkGraph.mockResolvedValueOnce(linkGraph()); // 2 nodes
+      render(<GraphView onOpenNote={vi.fn()} />);
+      await act(async () => {});
+      fireResize(800, 600);
+      expect(harness.props.graphData.nodes).toHaveLength(2);
+
+      const bigger = linkGraph({
+        nodes: [
+          { id: "alpha.md", title: "Alpha", cluster: "" },
+          { id: "notes/beta.md", title: "Beta", cluster: "notes" },
+          { id: "gamma.md", title: "Gamma", cluster: "" },
+        ],
+        links: [{ source: "alpha.md", target: "notes/beta.md", bridge: true }],
+      });
+      mocks.readLinkGraph.mockResolvedValueOnce(bigger);
+
+      expect(treeChanged.cb).toBeTypeOf("function");
+      await act(async () => {
+        treeChanged.cb!();
+        await vi.advanceTimersByTimeAsync(300);
+      });
+
+      // Background reload: no spinner flashed, and the galaxy now has 3 nodes.
+      expect(screen.queryByLabelText("Loading graph")).not.toBeInTheDocument();
+      expect(harness.props.graphData.nodes).toHaveLength(3);
+      expect(mocks.readLinkGraph).toHaveBeenCalledTimes(2);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("unsubscribes from tree changes on unmount (#34)", async () => {
+    mocks.readLinkGraph.mockResolvedValue(linkGraph());
+    const { unmount } = render(<GraphView onOpenNote={vi.fn()} />);
+    await act(async () => {});
+    unmount();
+    expect(treeChanged.unlisten).toHaveBeenCalled();
+  });
+
+  it("drops a superseded slow reload so an older result can't overwrite a newer one (#34)", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.readLinkGraph.mockResolvedValueOnce(linkGraph()); // initial 2 nodes
+      render(<GraphView onOpenNote={vi.fn()} />);
+      await act(async () => {});
+      fireResize(800, 600);
+
+      let resolveSlow!: (g: LinkGraph) => void;
+      const slow = new Promise<LinkGraph>((r) => {
+        resolveSlow = r;
+      });
+      const finalGraph = linkGraph({
+        nodes: [
+          { id: "a.md", title: "A", cluster: "" },
+          { id: "b.md", title: "B", cluster: "" },
+          { id: "c.md", title: "C", cluster: "" },
+        ],
+        links: [],
+      });
+      const staleGraph = linkGraph({
+        nodes: [{ id: "stale.md", title: "Stale", cluster: "" }],
+        links: [],
+      });
+      mocks.readLinkGraph.mockReturnValueOnce(slow).mockResolvedValueOnce(finalGraph);
+
+      // First change kicks the slow reload; the second kicks the final reload.
+      await act(async () => {
+        treeChanged.cb!();
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      await act(async () => {
+        treeChanged.cb!();
+        await vi.advanceTimersByTimeAsync(300);
+      });
+      expect(harness.props.graphData.nodes).toHaveLength(3); // final won
+
+      // The slow (now stale) reload resolves late — it must be dropped, not win.
+      await act(async () => {
+        resolveSlow(staleGraph);
+        await slow;
+      });
+      expect(harness.props.graphData.nodes).toHaveLength(3);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("mounts the galaxy with transformed props once loaded AND sized", async () => {

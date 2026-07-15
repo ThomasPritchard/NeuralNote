@@ -3,10 +3,14 @@
 // reader, and status bar.
 
 import { File, FileText, type LucideIcon } from "lucide-react";
+import { MARKDOWN_EXTENSIONS } from "../lib/bindings/markdownExtensions";
 import type { TreeNode } from "../lib/types";
 
-/** Extensions we can usefully render as markdown. */
-const MARKDOWN_EXTS = new Set(["md", "markdown", "mdx"]);
+/** Extensions we can usefully render as markdown. Sourced from the generated
+ *  Rust mirror ([`MARKDOWN_EXTENSIONS`]) so this set can never drift from the
+ *  core's `is_markdown_ext`. Extensions are lowercased (see `extFromPath`), so
+ *  membership stays case-insensitive in step with the Rust side. */
+const MARKDOWN_EXTS = new Set<string>(MARKDOWN_EXTENSIONS);
 
 /** Extensions whose raw bytes are worth showing as plain text in a fallback. */
 const TEXT_LIKE_EXTS = new Set([

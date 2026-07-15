@@ -15,7 +15,7 @@ use caseless::Caseless;
 use crate::error::CoreResult;
 use crate::links::mask_code;
 use crate::model::{FileHit, SearchMatch, SearchResponse, TreeNode};
-use crate::note::{parse_frontmatter, title_and_body, title_from, Parsed};
+use crate::note::{decode_note_text, parse_frontmatter, title_and_body, title_from, Parsed};
 use crate::tree::{markdown_files, read_tree};
 use icu_properties::{props::GeneralCategory, CodePointMapData, CodePointMapDataBorrowed};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -93,10 +93,14 @@ fn search_vault_inner(
     let mut skipped_files: u32 = 0;
 
     for node in markdown_files(&tree) {
-        // Lossy read: a Latin-1 note must not error the whole search; an
+        // Decode via the ONE shared policy [`decode_note_text`], so the text search
+        // indexes is byte-identical to what the reader ([`read_note`]) presents for
+        // the same file — a Latin-1 note is searchable exactly as shown, and the
+        // citation moat (retrieval reusing this content, then hashing it to match
+        // the reader's) holds by construction, not coincidence (issue #33). An
         // unreadable file is skipped loudly (logged AND counted), never fatal.
         let raw = match std::fs::read(&node.path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+            Ok(bytes) => decode_note_text(bytes).0,
             Err(e) => {
                 log::warn!("search: skipping unreadable file {}: {e}", node.path);
                 skipped_files = skipped_files.saturating_add(1);

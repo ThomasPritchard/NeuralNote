@@ -1,0 +1,17 @@
+{
+  // Type-checks the Tier-1.5 real-browser specs (*.browser.test.tsx) in isolation.
+  // Kept separate from tsconfig.json because @vitest/browser's global matcher
+  // augmentation (a stricter `toHaveStyle`) must not leak into the jsdom program.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    // The specs import `page`/`userEvent` from "vitest/browser" explicitly, which
+    // carries its own types; no global browser-provider types entry is needed.
+    // vite/client declares the ambient `*.css` side-effect module the spec imports.
+    "types": ["vitest/globals", "vite/client"]
+  },
+  // Only the specs (tsconfig globs don't support brace expansion). The vite
+  // config isn't type-checked here — the main program doesn't check vitest.config.ts
+  // either, and it pulls node:url which needs @types/node this project omits.
+  "include": ["src/**/*.browser.test.ts", "src/**/*.browser.test.tsx"],
+  "exclude": []
+}

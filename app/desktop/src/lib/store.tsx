@@ -314,11 +314,11 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
     let timer: ReturnType<typeof setTimeout> | undefined;
     void api
       .onTreeChanged(() => {
-        // TODO(reader-stale-on-external-edit): this refreshes the tree only, so the
-        // open reader can show stale content after an external edit/delete. Not a
-        // loss — a save then hits the content-hash Conflict (or NotFound) backstop.
-        // Deferred — round-10; fix by also reloading the open note when its file
-        // changes on disk (debounced, draft-preserving).
+        // This refreshes the file TREE only. Reloading the open READER on an
+        // external edit/delete is a separate concern owned by `useNoteTabs`, which
+        // holds the tab/draft/conflict state and subscribes to this same event with
+        // its own debounced, draft-preserving reconcile (issue #31). Keeping the two
+        // subscriptions apart avoids coupling this frozen lifecycle glue to tab state.
         if (timer) clearTimeout(timer);
         timer = setTimeout(() => void refreshAllLoaded(), 300);
       })

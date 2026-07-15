@@ -17,6 +17,13 @@
 # Deps:   rustup component add clippy rustfmt llvm-tools-preview
 #         cargo install cargo-llvm-cov cargo-audit
 #
+# Exit code (the contract automation reads):
+#   0  GREEN       every category ran and passed.
+#   1  RED         a category produced real findings/failures (a code verdict).
+#   2  INCOMPLETE  a required category could not run (tool absent or advisory DB
+#                  unreachable/offline). Not a pass, not a code verdict — re-run
+#                  with the tooling installed and network before trusting the gate.
+#
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
@@ -79,23 +86,34 @@ if command -v cargo-audit >/dev/null 2>&1; then
   elif printf '%s' "$audit_out" | grep -qiE "couldn't fetch advisory database|talking to the server|error sending request|failed to fetch"; then
     # Network couldn't reach the RUSTSEC git DB — an availability problem, not a
     # code verdict. Don't fail the gate; a networked CI run will exercise it.
-    skip "cargo-audit: advisory DB unreachable (offline) — not a verdict. SonarQube covers vulns server-side."
+    skip "cargo-audit: advisory DB unreachable (offline) — not a verdict, category INCOMPLETE. Re-run with network (SonarQube also covers vulns server-side)."
   else
     redx "cargo-audit: vulnerable dependency reported"
     printf '%s\n' "$audit_out" | grep -iE "ID:|Crate:|Title:|Solution:" | head -20
   fi
 else
-  skip "cargo-audit not installed (install: cargo install cargo-audit). SonarQube covers this category server-side."
+  skip "cargo-audit not installed — category INCOMPLETE (install: cargo install cargo-audit). SonarQube also covers this category server-side."
 fi
+
+# Three-state verdict — the exit code is the contract automation reads:
+#   0  GREEN       every category ran and passed.
+#   1  RED         a category produced real findings/failures (a code verdict).
+#   2  INCOMPLETE  a required category could not run (tool absent or advisory DB
+#                  unreachable). NOT a pass and NOT a code verdict — the DoD says
+#                  a skipped required category is not green, so this must never
+#                  exit 0 or print "GREEN". A real finding (RED) outranks a skip.
+EXIT_GREEN=0
+EXIT_RED=1
+EXIT_INCOMPLETE=2
 
 echo
 if [ "$fail" -ne 0 ]; then
-  printf '\033[1;31m══ RUST QUALITY GATE: RED ══\033[0m\n'
+  printf '\033[1;31m══ RUST QUALITY GATE: RED (findings — see above) ══\033[0m\n'
+  exit "$EXIT_RED"
 elif [ "$skipped" -ne 0 ]; then
-  # All enforced categories passed, but at least one was skipped (e.g. cargo-audit
-  # offline/absent), so GREEN must not be read as "every category enforced".
-  printf '\033[1;33m══ RUST QUALITY GATE: GREEN (a category was SKIPPED — not fully enforced; see above) ══\033[0m\n'
+  printf '\033[1;33m══ RUST QUALITY GATE: INCOMPLETE — a required category was SKIPPED (could not run; not a pass — re-run with the tool installed and network) ══\033[0m\n'
+  exit "$EXIT_INCOMPLETE"
 else
   printf '\033[1;32m══ RUST QUALITY GATE: GREEN (all categories enforced) ══\033[0m\n'
+  exit "$EXIT_GREEN"
 fi
-exit "$fail"

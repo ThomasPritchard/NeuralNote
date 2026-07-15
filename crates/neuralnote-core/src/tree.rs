@@ -191,13 +191,22 @@ pub fn node_for(root: &Path, path: &Path) -> CoreResult<TreeNode> {
     }
 }
 
-/// Markdown file extensions the reader renders natively.
-// TODO(PA-029): this predicate (and the `.md`/`.markdown`/`.mdx` set) is mirrored
-// independently in the TS client (`app/desktop/src/lib/fileMeta.ts`). They agree
-// today but can silently diverge. Deferred: expose this set from the core as the
-// single source of truth (e.g. a generated shared constant) when next touched.
+/// The file extensions the reader renders natively as Markdown, lowercased.
+///
+/// This is the SINGLE source of truth for the markdown-extension vocabulary. The
+/// `#[cfg(test)]` generator below mirrors it into
+/// `app/desktop/src/lib/bindings/markdownExtensions.ts`, which the TS client
+/// (`app/desktop/src/workspace/fileMeta.ts`) consumes directly — so the tree,
+/// reader, and client classification cannot silently diverge (the drift check in
+/// `scripts/rust-quality-gate.sh` fails the build if the mirror goes stale).
+pub const MARKDOWN_EXTENSIONS: [&str; 3] = ["md", "markdown", "mdx"];
+
+/// True when `ext` is one of [`MARKDOWN_EXTENSIONS`]. The comparison is exact, so
+/// `ext` MUST already be lowercased — every caller in this module builds it via
+/// `to_lowercase()`, and the TS mirror lowercases identically, keeping the two
+/// sides case-insensitive in lock-step.
 pub fn is_markdown_ext(ext: Option<&str>) -> bool {
-    matches!(ext, Some("md") | Some("markdown") | Some("mdx"))
+    ext.is_some_and(|e| MARKDOWN_EXTENSIONS.contains(&e))
 }
 
 /// Flatten every markdown file out of a scanned tree, in tree-walk order
@@ -220,5 +229,62 @@ fn collect_markdown<'a>(nodes: &'a [TreeNode], out: &mut Vec<&'a TreeNode>) {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod markdown_extension_tests {
+    use super::*;
+
+    /// The predicate accepts exactly the shared set — nothing more, nothing less.
+    /// A change to [`MARKDOWN_EXTENSIONS`] that this predicate stops honouring
+    /// (or vice versa) fails here, on the Rust side of the contract.
+    #[test]
+    fn is_markdown_ext_accepts_exactly_the_shared_set() {
+        for ext in MARKDOWN_EXTENSIONS {
+            assert!(is_markdown_ext(Some(ext)), "expected {ext} to be markdown");
+        }
+        for other in ["txt", "png", "pdf", "MD", "markdownx", ""] {
+            assert!(
+                !is_markdown_ext(Some(other)),
+                "{other} must not be markdown"
+            );
+        }
+        assert!(!is_markdown_ext(None));
+    }
+
+    /// Mirror [`MARKDOWN_EXTENSIONS`] into the frontend bindings dir as a runtime
+    /// TS array, so `fileMeta.ts` consumes the SAME list the Rust core does. Named
+    /// with `export` so it runs under `cargo test --workspace export` alongside the
+    /// ts-rs type exports and the event-name generator; the drift check then fails
+    /// the build if the committed mirror is stale — never a silent Rust↔TS split.
+    ///
+    /// Deterministic: a fixed template with the constant values interpolated, so a
+    /// clean checkout + `cargo test` yields zero diff and a changed constant yields
+    /// exactly one. Targets the same `../src/lib/bindings` dir as `event_names.rs`,
+    /// resolved from this crate's manifest so it is independent of the test cwd.
+    #[test]
+    fn export_markdown_extension_bindings() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../app/desktop/src/lib/bindings");
+        std::fs::create_dir_all(&dir).expect("create bindings dir");
+
+        let items = MARKDOWN_EXTENSIONS
+            .iter()
+            .map(|e| format!("\"{e}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let contents = format!(
+            "// This file was generated from the Rust `MARKDOWN_EXTENSIONS` constant \
+             by `cargo test`\n// (crates/neuralnote-core/src/tree.rs). Do not edit \
+             this file manually.\n\n\
+             /** File extensions the reader renders natively as Markdown, lowercased.\n \
+             *  The Rust core is the single source of truth; both sides consume this\n \
+             *  list so the tree, reader, and client classification cannot diverge. */\n\
+             export const MARKDOWN_EXTENSIONS = [{items}] as const;\n"
+        );
+
+        std::fs::write(dir.join("markdownExtensions.ts"), contents)
+            .expect("write markdownExtensions.ts");
     }
 }

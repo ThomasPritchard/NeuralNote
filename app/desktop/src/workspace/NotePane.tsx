@@ -92,7 +92,21 @@ function SaveAnnouncements({
 function SaveNotices({ open }: Readonly<{ open: OpenNote }>) {
   return (
     <>
-      {open.conflict && (
+      {/* Deletion outranks the on-disk conflict notice: once the file is gone
+          there's no newer disk version to reconcile, so the "changed on disk"
+          alert would be contradictory. Show the deletion notice instead. */}
+      {open.externalDeleted && (
+        <div
+          role="alert"
+          className="mb-4 flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[0.75rem] text-warning"
+        >
+          <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
+          <span className="leading-snug">
+            This note was deleted on disk. Your copy is kept here — save to restore it.
+          </span>
+        </div>
+      )}
+      {!open.externalDeleted && open.conflict && (
         <div
           role="alert"
           className="mb-4 flex flex-wrap items-center gap-x-3 gap-y-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[0.75rem] text-warning"

@@ -14,7 +14,7 @@ use neuralnote_core::model::{
 use neuralnote_core::CoreError;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter};
-use tauri_plugin_dialog::DialogExt;
+use tauri_plugin_dialog::{DialogExt, FilePath};
 
 use crate::event_names::TREE_CHANGED;
 use crate::{
@@ -130,6 +130,24 @@ pub(crate) fn list_recent_vaults(app: AppHandle) -> Result<Vec<RecentVault>, Cor
     neuralnote_core::recents::list_recent_vaults(&config_dir(&app)?)
 }
 
+/// Resolve a folder-picker outcome into a path, keeping user cancellation and a
+/// genuine conversion failure distinct. `blocking_pick_folder` returns `None` only
+/// when the user dismissed the dialog (→ `Ok(None)`); a returned `FilePath` that
+/// can't become a filesystem path — a non-file URL — is a real failure (→ `Err`),
+/// not a cancel. The previous `into_path().ok()` collapsed that failure into
+/// `None`, so it was indistinguishable from cancelling *and* silently skipped the
+/// PA-004 authorization step, surfacing no error at all.
+fn resolve_picked_folder(picked: Option<FilePath>) -> Result<Option<PathBuf>, CoreError> {
+    match picked {
+        None => Ok(None),
+        Some(file_path) => file_path.into_path().map(Some).map_err(|e| {
+            CoreError::Io(format!(
+                "selected folder is not a usable filesystem path: {e}"
+            ))
+        }),
+    }
+}
+
 /// Record a user-picked folder as authorized (PA-004) and return it as a string.
 /// The blocking dialog runs before the lock is taken, so the guard never crosses
 /// an await point.
@@ -148,12 +166,10 @@ fn authorize_picked(state: &SharedState, picked: Option<PathBuf>) -> Option<Stri
 pub(crate) async fn pick_vault_folder(
     app: AppHandle,
     state: SharedState<'_>,
-) -> Result<Option<String>, ()> {
-    let picked = app
-        .dialog()
-        .file()
-        .blocking_pick_folder()
-        .and_then(|fp| fp.into_path().ok());
+) -> Result<Option<String>, CoreError> {
+    // `?` short-circuits a conversion failure before `authorize_picked`, so a path
+    // that failed to convert is never recorded as authorized.
+    let picked = resolve_picked_folder(app.dialog().file().blocking_pick_folder())?;
     Ok(authorize_picked(&state, picked))
 }
 
@@ -163,12 +179,10 @@ pub(crate) async fn pick_vault_folder(
 pub(crate) async fn pick_new_vault_location(
     app: AppHandle,
     state: SharedState<'_>,
-) -> Result<Option<String>, ()> {
-    let picked = app
-        .dialog()
-        .file()
-        .blocking_pick_folder()
-        .and_then(|fp| fp.into_path().ok());
+) -> Result<Option<String>, CoreError> {
+    // `?` short-circuits a conversion failure before `authorize_picked`, so a path
+    // that failed to convert is never recorded as authorized.
+    let picked = resolve_picked_folder(app.dialog().file().blocking_pick_folder())?;
     Ok(authorize_picked(&state, picked))
 }
 
@@ -489,4 +503,46 @@ pub(crate) async fn move_entry(
             )
         })
         .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Both native folder pickers (`pick_vault_folder`, `pick_new_vault_location`)
+    // funnel their `blocking_pick_folder()` result through the same conversion
+    // seam, `resolve_picked_folder`. The blocking native dialog can't run headless
+    // in a unit test, so we exercise that seam directly; because both pickers use
+    // it unchanged, these cases cover both. Each picker then feeds the result to
+    // `authorize_picked` only via `?`, so an `Err` short-circuits before any path
+    // is recorded as authorized.
+
+    #[test]
+    fn cancellation_yields_ok_none() {
+        // The user dismissed the dialog: `blocking_pick_folder` returns `None`.
+        assert!(matches!(resolve_picked_folder(None), Ok(None)));
+    }
+
+    #[test]
+    fn a_real_folder_path_is_carried_through_for_authorization() {
+        let picked = Some(FilePath::from(PathBuf::from("/tmp/some-vault")));
+        let resolved = resolve_picked_folder(picked).expect("a real path must convert");
+        assert_eq!(resolved, Some(PathBuf::from("/tmp/some-vault")));
+    }
+
+    #[test]
+    fn an_unconvertible_path_is_a_typed_error_not_a_cancellation() {
+        // The dialog returned a `FilePath`, but it's a non-file URL that can't
+        // become a filesystem path. The old `into_path().ok()` collapsed this to
+        // `None`, making a genuine failure indistinguishable from cancelling — and
+        // silently skipped authorization. It must surface as a distinct typed Err.
+        let picked: FilePath = "https://example.com/not-a-file"
+            .parse()
+            .expect("FilePath::from_str is infallible");
+        let result = resolve_picked_folder(Some(picked));
+        assert!(
+            matches!(result, Err(CoreError::Io(_))),
+            "a conversion failure must be a typed Err, not Ok(None); got {result:?}"
+        );
+    }
 }

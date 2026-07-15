@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import { MARKDOWN_EXTENSIONS } from "../lib/bindings/markdownExtensions";
 import type { TreeNode } from "../lib/types";
 import {
   countTree,
@@ -35,6 +36,17 @@ describe("markdown predicates", () => {
     expect(isMarkdownExt("markdown")).toBe(true);
     expect(isMarkdownExt("mdx")).toBe(true);
     expect(isMarkdownExt("txt")).toBe(false);
+    expect(isMarkdownExt(null)).toBe(false);
+  });
+  it("isMarkdownExt accepts exactly the shared generated set, and nothing else", () => {
+    // Parity guard: the accepted extensions must equal the Rust-generated mirror,
+    // so a divergence between fileMeta and the core's `is_markdown_ext` fails here.
+    for (const ext of MARKDOWN_EXTENSIONS) {
+      expect(isMarkdownExt(ext)).toBe(true);
+    }
+    for (const other of ["txt", "png", "pdf", "MD", "markdownx", ""]) {
+      expect(isMarkdownExt(other)).toBe(false);
+    }
     expect(isMarkdownExt(null)).toBe(false);
   });
   it("isMarkdownRenderable also accepts extensionless text (README/LICENSE)", () => {

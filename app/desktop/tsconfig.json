@@ -25,5 +25,11 @@
     "noFallthroughCasesInSwitch": true
   },
   "include": ["src"],
+  // Real-browser specs are type-checked by their own program (tsconfig.browser.json).
+  // @vitest/browser ships a stricter `toHaveStyle` matcher augmentation; importing it
+  // here would merge that signature program-wide and break jsdom tests' custom-property
+  // style assertions. Keep its types out of this (jsdom) program.
+  // NB: tsconfig globs do NOT support brace expansion — list each extension.
+  "exclude": ["src/**/*.browser.test.ts", "src/**/*.browser.test.tsx"],
   "references": [{ "path": "./tsconfig.node.json" }]
 }

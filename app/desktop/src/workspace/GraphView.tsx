@@ -16,7 +16,8 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { AlertTriangle, Loader2, RotateCw } from "lucide-react";
-import { errorMessage, readLinkGraph } from "../lib/api";
+import type { UnlistenFn } from "@tauri-apps/api/event";
+import { errorMessage, onTreeChanged, readLinkGraph } from "../lib/api";
 import type { LinkGraph } from "../lib/types";
 import { useVault } from "../lib/store";
 import {
@@ -41,23 +42,56 @@ export function GraphView({
   const [size, setSize] = useState({ width: 0, height: 0 });
   const [focusTrail, setFocusTrail] = useState<string[]>([]);
   const containerRef = useRef<HTMLElement | null>(null);
+  // Monotonic request token. Once we refetch while mounted (the live tree-change
+  // refresh below), a slow response can land after a newer one — so the newest
+  // request wins and an older one is dropped rather than overwriting it (#34).
+  const requestRef = useRef(0);
 
-  // No stale-fetch token on purpose: leaving graph view (or swapping vaults)
-  // unmounts this component, and setState after unmount is a React 18/19
-  // no-op — there's no overlapping-fetch path to guard.
-  const load = useCallback(async () => {
-    setState({ phase: "loading" });
+  // `background` reloads (the live refresh) keep the current galaxy on screen
+  // instead of flashing the spinner, and keep the last-good view on a transient
+  // failure (stale-while-revalidate). The foreground load (mount / vault swap)
+  // still shows loading and surfaces a read failure so it's never silent.
+  const load = useCallback(async (background = false) => {
+    const token = ++requestRef.current;
+    if (!background) setState({ phase: "loading" });
     try {
-      setState({ phase: "ready", graph: await readLinkGraph() });
+      const graph = await readLinkGraph();
+      if (token === requestRef.current) setState({ phase: "ready", graph });
     } catch (e) {
-      // Never silently render an empty galaxy on failure.
-      setState({ phase: "error", message: errorMessage(e) });
+      if (token === requestRef.current && !background) {
+        setState({ phase: "error", message: errorMessage(e) });
+      }
     }
   }, []);
 
   useEffect(() => {
     void load();
   }, [load, vaultName]);
+
+  // Live refresh: while the graph is open, reload it when the vault changes on
+  // disk — external edits (Obsidian sync, git pull) and in-app mutations alike —
+  // debounced to coalesce bursts. Background, so the galaxy updates in place; the
+  // request-token guard in `load` prevents an older fetch from winning. A dead
+  // subscription only loses live refresh (re-entering graph view still refetches).
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let cancelled = false;
+    void onTreeChanged(() => {
+      if (timer) clearTimeout(timer);
+      timer = setTimeout(() => void load(true), 300);
+    })
+      .then((fn) => {
+        if (cancelled) fn();
+        else unlisten = fn;
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+      if (timer) clearTimeout(timer);
+      unlisten?.();
+    };
+  }, [load]);
 
   // The rendered level: the fetched graph transformed at the focus trail. A
   // trail can go stale (a refetch dropped the folder) — fall back to root in

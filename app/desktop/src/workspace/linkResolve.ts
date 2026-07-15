@@ -1,11 +1,14 @@
 import type { TreeNode } from "../lib/types";
+import { MARKDOWN_EXTENSIONS } from "../lib/bindings/markdownExtensions";
 
 export interface NoteIndexEntry {
   relPath: string;
   stem: string;
 }
 
-const MARKDOWN_EXTS = new Set(["md", "markdown", "mdx"]);
+// Shared with Rust ([`MARKDOWN_EXTENSIONS`], generated from the core) so wikilink
+// resolution can't drift from the tree/reader's markdown vocabulary (#29).
+const MARKDOWN_EXTS = new Set<string>(MARKDOWN_EXTENSIONS);
 const URL_SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 const textEncoder = new TextEncoder();
 

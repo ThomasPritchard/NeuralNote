@@ -50,7 +50,7 @@ pub use llm::{
     Completion, LlmClient, LlmMessage, LlmRequest, NoUserPrompt, Role, ToolCall, UserPrompt,
 };
 pub use local::hf::{parse_hf_metadata, HfModelMeta};
-pub use local::pull::{parse_pull_line, PullEvent, PullSink};
+pub use local::pull::{parse_pull_line, PullEvent, PullProgress, PullSink};
 pub use local::tags::{parse_installed_models, InstalledModel};
 pub use local::{
     curated_candidates, is_curated_model, model_installed, recommend_model, CandidateModel,
