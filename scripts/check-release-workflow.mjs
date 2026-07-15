@@ -233,6 +233,41 @@ test("the publisher stages a draft prerelease and exposes the manifest last", ()
   );
 });
 
+test("the immutable GitHub release description includes the complete v0.2.0 changelog", async () => {
+  const releaseNotes = await readRepositoryFile("docs/releases/v0.2.0.md");
+  const bundledReleaseNotes = await readRepositoryFile("app/desktop/src/whats-new/releaseNotes.ts");
+  const validate = stepBody(publish, "Validate downloaded release artifacts");
+  const draft = stepBody(publish, "Create draft GitHub prerelease");
+
+  assert.match(releaseNotes, /^# NeuralNote 0\.2\.0 ALPHA$/m);
+  for (const heading of [
+    "Source-native editing",
+    "Neural Assistant AI",
+    "Workspace and presentation",
+    "Reliability and release readiness",
+  ]) {
+    assert.match(releaseNotes, new RegExp(`^## ${heading}$`, "m"));
+  }
+  assert.match(releaseNotes, /leading H1 title/);
+  assert.match(releaseNotes, /Standard links and resolved Obsidian wikilinks/);
+  assert.match(releaseNotes, /Stop response/);
+  assert.match(releaseNotes, /8 MiB editable-note limit/);
+  const bundledItems = [...bundledReleaseNotes.matchAll(/items:\s*\[([\s\S]*?)\]/g)].flatMap(
+    ([, items]) => [...items.matchAll(/"(?:[^"\\]|\\.)*"/g)].map(([item]) => JSON.parse(item)),
+  );
+  const publishedItems = releaseNotes
+    .split("\n")
+    .filter((line) => line.startsWith("- "))
+    .map((line) => line.slice(2).replaceAll("`", ""));
+  assert.deepEqual(publishedItems, bundledItems);
+  assert.match(build, /docs\/releases\/v0\.2\.0\.md/);
+  assert.match(build, /ad-hoc signed and unnotarized/);
+  assert.match(build, /Developer ID signed and notarized/);
+  assert.match(validate, /RELEASE_NOTES/);
+  assert.match(draft, /--notes-file "\$RELEASE_NOTES"/);
+  assert.doesNotMatch(draft, /--notes "\$RELEASE_NOTES"/);
+});
+
 test("the publisher can safely resume after release or manifest publication", () => {
   const draft = stepBody(publish, "Create draft GitHub prerelease");
   const publishRelease = stepBody(publish, "Publish GitHub prerelease");
@@ -244,7 +279,8 @@ test("the publisher can safely resume after release or manifest publication", ()
   assert.match(draft, /--json name/);
   assert.match(draft, /--json body/);
   assert.match(draft, /"\$RELEASE_NAME"\s*!=\s*"\$RELEASE_TITLE"/);
-  assert.match(draft, /"\$RELEASE_BODY"\s*!=\s*"\$RELEASE_NOTES"/);
+  assert.match(draft, /EXPECTED_RELEASE_BODY="\$\(cat "\$RELEASE_NOTES"\)"/);
+  assert.match(draft, /"\$RELEASE_BODY"\s*!=\s*"\$EXPECTED_RELEASE_BODY"/);
   assert.match(draft, /RELEASE_ALREADY_PUBLISHED=true/);
   assert.match(publishRelease, /RELEASE_ALREADY_PUBLISHED/);
   assert.match(publishRelease, /--json isImmutable/);
@@ -270,7 +306,8 @@ test("release artifacts are allowlisted and integrity-checked between jobs", () 
   assert.match(upload, /retention-days:\s*1/);
   assert.match(validate, /SHA256SUMS/);
   assert.match(validate, /sha256sum --check/);
-  assert.match(validate, /EXPECTED_FILE_COUNT=5/);
+  assert.match(validate, /EXPECTED_FILE_COUNT=6/);
+  assert.match(validate, /RELEASE_NOTES="\$RELEASE_ARTIFACT_DIR\/RELEASE_NOTES\.md"/);
   assert.match(validate, /\.app\.tar\.gz/);
   assert.match(validate, /\.dmg/);
   assert.match(validate, /latest-alpha\.json/);

@@ -371,9 +371,25 @@ jobs:
           cp "$UPDATE_BUNDLE" "$RELEASE_ARTIFACT_DIR/"
           cp "$UPDATE_SIGNATURE" "$RELEASE_ARTIFACT_DIR/"
           cp "$RELEASE_MANIFEST" "$RELEASE_ARTIFACT_DIR/latest-alpha.json"
+          cp docs/releases/v0.2.0.md "$RELEASE_ARTIFACT_DIR/RELEASE_NOTES.md"
+          if [ "$SIGNING_MODE" = "ad-hoc" ]; then
+            cat >> "$RELEASE_ARTIFACT_DIR/RELEASE_NOTES.md" <<'NOTES'
+
+          ## Installation note
+
+          This Apple Silicon build is ad-hoc signed and unnotarized. macOS may block it until you allow it in System Settings > Privacy & Security. The Tauri updater signature authenticates update archives independently and does not satisfy Gatekeeper.
+          NOTES
+          else
+            cat >> "$RELEASE_ARTIFACT_DIR/RELEASE_NOTES.md" <<'NOTES'
+
+          ## Installation note
+
+          This Apple Silicon build is Developer ID signed and notarized.
+          NOTES
+          fi
           (
             cd "$RELEASE_ARTIFACT_DIR"
-            shasum -a 256 *.dmg *.app.tar.gz *.app.tar.gz.sig latest-alpha.json > SHA256SUMS
+            shasum -a 256 *.dmg *.app.tar.gz *.app.tar.gz.sig latest-alpha.json RELEASE_NOTES.md > SHA256SUMS
           )
 
       - name: Upload validated release artifacts
@@ -419,7 +435,7 @@ jobs:
           RELEASE_ARTIFACT_DIR: ${{ runner.temp }}/release-artifacts
         run: |
           set -euo pipefail
-          EXPECTED_FILE_COUNT=5
+          EXPECTED_FILE_COUNT=6
           ACTUAL_FILE_COUNT="$(find "$RELEASE_ARTIFACT_DIR" -maxdepth 1 -type f | wc -l | tr -d ' ')"
           if [ "$ACTUAL_FILE_COUNT" != "$EXPECTED_FILE_COUNT" ]; then
             echo "::error::Release artifact set contains missing or unexpected files"
@@ -439,9 +455,11 @@ jobs:
           UPDATE_SIGNATURE="$UPDATE_BUNDLE.sig"
           DMG_BUNDLE="$(find "$RELEASE_ARTIFACT_DIR" -maxdepth 1 -name '*.dmg' -type f -print -quit)"
           RELEASE_MANIFEST="$RELEASE_ARTIFACT_DIR/latest-alpha.json"
+          RELEASE_NOTES="$RELEASE_ARTIFACT_DIR/RELEASE_NOTES.md"
           test -f "$UPDATE_SIGNATURE"
           test -f "$RELEASE_MANIFEST"
-          export UPDATE_BUNDLE UPDATE_SIGNATURE DMG_BUNDLE RELEASE_MANIFEST
+          test -f "$RELEASE_NOTES"
+          export UPDATE_BUNDLE UPDATE_SIGNATURE DMG_BUNDLE RELEASE_MANIFEST RELEASE_NOTES
           node <<'NODE'
           const fs = require('node:fs');
           const path = require('node:path');
@@ -465,6 +483,7 @@ jobs:
             echo "UPDATE_SIGNATURE=$UPDATE_SIGNATURE"
             echo "DMG_BUNDLE=$DMG_BUNDLE"
             echo "RELEASE_MANIFEST=$RELEASE_MANIFEST"
+            echo "RELEASE_NOTES=$RELEASE_NOTES"
           } >> "$GITHUB_ENV"
 
       - name: Create draft GitHub prerelease
@@ -497,10 +516,8 @@ jobs:
           fi
           if [ "$SIGNING_MODE" = "ad-hoc" ]; then
             RELEASE_TITLE="0.2.0 ALPHA (ad-hoc signed, unnotarized)"
-            RELEASE_NOTES="NeuralNote 0.2.0 ALPHA for Apple Silicon. This build is ad-hoc signed and unnotarized. macOS may block it until the user allows it in System Settings > Privacy & Security. The Tauri updater signature authenticates update archives independently and does not satisfy Gatekeeper."
           else
             RELEASE_TITLE="0.2.0 ALPHA"
-            RELEASE_NOTES="NeuralNote 0.2.0 ALPHA for Apple Silicon. This build is Developer ID signed and notarized."
           fi
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             read -r RELEASE_IS_DRAFT RELEASE_IS_PRERELEASE < <(
@@ -525,11 +542,12 @@ jobs:
                 --json body \
                 --jq '.body'
             )"
+            EXPECTED_RELEASE_BODY="$(cat "$RELEASE_NOTES")"
             if [ "$RELEASE_NAME" != "$RELEASE_TITLE" ]; then
               echo "::error::Existing release title does not match the selected signing mode"
               exit 1
             fi
-            if [ "$RELEASE_BODY" != "$RELEASE_NOTES" ]; then
+            if [ "$RELEASE_BODY" != "$EXPECTED_RELEASE_BODY" ]; then
               echo "::error::Existing release notes do not match the selected signing mode"
               exit 1
             fi
@@ -562,7 +580,7 @@ jobs:
               --verify-tag \
               --target "$RELEASE_SHA" \
               --title "$RELEASE_TITLE" \
-              --notes "$RELEASE_NOTES" \
+              --notes-file "$RELEASE_NOTES" \
               --draft \
               --prerelease \
               --latest=false
