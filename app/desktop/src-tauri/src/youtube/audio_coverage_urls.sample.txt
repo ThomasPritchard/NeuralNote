@@ -1,0 +1,10 @@
+# Seed URL list for the YouTube audio-coverage harness (issue #38).
+#
+# This is a SEED, not a representative sample. A representative measurement needs
+# >= 50 captionless videos spanning the target content classes (see the threshold
+# in specs/youtube-distil-skill.md). Supply that list at run time instead of
+# editing this file, via the NN_AUDIO_COVERAGE_URLS environment variable
+# (whitespace- or comma-separated), which overrides this seed entirely.
+#
+# Lines beginning with '#' and blank lines are ignored. One video URL per line.
+https://www.youtube.com/watch?v=jNQXAC9IVRw

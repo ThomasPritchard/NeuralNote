@@ -2,6 +2,7 @@
 
 #[cfg(feature = "youtube-audio")]
 pub mod audio;
+pub mod audio_coverage;
 pub mod cost;
 pub mod error;
 pub mod filename;
@@ -16,6 +17,11 @@ mod youtube_ids;
 
 #[cfg(feature = "youtube-audio")]
 pub use audio::{decode_m4a_to_wav, decode_m4a_to_wav_cancellable, youtube_audio_format_selector};
+pub use audio_coverage::{
+    classify_audio_coverage, classify_ytdlp_video_audio, parse_ytdlp_formats, AudioCoverage,
+    AudioFormat, CoverageTally, MAX_FORMAT_LISTING_BYTES, MIN_REPRESENTATIVE_SAMPLE,
+    SINGLE_CLASS_THRESHOLD, UNDECODABLE_COMBINED_THRESHOLD,
+};
 pub use cost::{estimate_transcript_cost, CostEstimate, ModelPricing, PricingInput};
 pub use error::{CaptureAction, CaptureError, ExtractorUpdatePolicy};
 pub use filename::{
