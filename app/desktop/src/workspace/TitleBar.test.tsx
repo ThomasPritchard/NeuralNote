@@ -243,6 +243,15 @@ describe("TitleBar — note tabs", () => {
     expect(inactive).toHaveAttribute("tabindex", "-1");
   });
 
+  it("keeps the layout wrapper between tablist and tabs free of ARIA semantics", () => {
+    renderTitleBar({ tabs: [ideas], activeTabId: ideas.id });
+    const wrapper = screen.getByRole("tab", { name: "Ideas" }).closest(".nn-note-tab");
+    expect(wrapper).not.toBeNull();
+    // A plain div is generic scaffolding; re-adding a role here (including
+    // "presentation") either trips S6819 or hides the tab from its tablist.
+    expect(wrapper).not.toHaveAttribute("role");
+  });
+
   it("renders clean, dirty, loading, and error states without hiding full titles", () => {
     const dirty = makeTab({ id: "dirty", title: "Dirty note", dirty: true });
     const loading = makeTab({ id: "loading", title: "Loading note", loading: true });
