@@ -298,3 +298,120 @@ fn canon_root(root: &Path) -> CoreResult<PathBuf> {
     root.canonicalize()
         .map_err(|e| CoreError::Io(format!("vault root unreadable: {e}")))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    /// True when the filesystem actually enforces the `0o000`/`0o555` permission
+    /// bits the permission tests rely on. Running as root (as some CI images do)
+    /// bypasses them, so those tests would see an unexpected success — skip there.
+    #[cfg(unix)]
+    fn permission_restrictions_apply() -> bool {
+        use std::os::unix::fs::PermissionsExt;
+        let file = tempfile::NamedTempFile::new().unwrap();
+        fs::set_permissions(file.path(), fs::Permissions::from_mode(0o000)).unwrap();
+        fs::read(file.path()).is_err()
+    }
+
+    #[test]
+    fn remove_helper_deletes_an_existing_note_and_ignores_a_missing_one() {
+        let vault = tempfile::tempdir().unwrap();
+        let present = vault.path().join("half-written.md");
+        fs::write(&present, "partial").unwrap();
+
+        remove_created_note_after_template_write_failure(&present);
+        // Second call proves the missing-file branch is silent (idempotent cleanup).
+        remove_created_note_after_template_write_failure(&present);
+
+        assert!(!present.exists());
+    }
+
+    #[test]
+    fn remove_helper_survives_a_path_it_cannot_delete() {
+        let vault = tempfile::tempdir().unwrap();
+        // A non-empty directory cannot be removed with `remove_file`, exercising the
+        // "could not clean up" warn branch without ever panicking.
+        let dir = vault.path().join("not-a-file");
+        fs::create_dir(&dir).unwrap();
+        fs::write(dir.join("child.md"), "x").unwrap();
+
+        remove_created_note_after_template_write_failure(&dir);
+
+        assert!(
+            dir.exists(),
+            "the directory must be left intact, not removed"
+        );
+    }
+
+    #[test]
+    fn malformed_obsidian_template_config_is_ignored_and_falls_back_to_default() {
+        // Invalid JSON, a non-object document, and a config that is a directory all
+        // reach a distinct guard in `read_obsidian_template_config`; every one must
+        // be refused so the settings fall back to the built-in default folder.
+        let invalid_json = |vault: &Path| {
+            fs::write(vault.join(".obsidian/templates.json"), "{ not json").unwrap();
+        };
+        let non_object = |vault: &Path| {
+            fs::write(vault.join(".obsidian/templates.json"), "[\"array\"]").unwrap();
+        };
+        let config_is_a_directory = |vault: &Path| {
+            fs::create_dir(vault.join(".obsidian/templates.json")).unwrap();
+        };
+        let cases: [&dyn Fn(&Path); 3] = [&invalid_json, &non_object, &config_is_a_directory];
+
+        for prepare in cases {
+            let vault = tempfile::tempdir().unwrap();
+            fs::create_dir(vault.path().join(".obsidian")).unwrap();
+            prepare(vault.path());
+
+            let loaded = load_template_settings(vault.path()).unwrap();
+
+            assert_eq!(loaded.source, TemplateSettingsSource::Default);
+            assert_eq!(loaded.settings.folder, DEFAULT_TEMPLATE_FOLDER);
+            assert!(list_templates(vault.path()).unwrap().is_empty());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn obsidian_template_config_symlinked_outside_the_vault_is_refused() {
+        use std::os::unix::fs::symlink;
+
+        let vault = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), r#"{"folder":"Escaped"}"#).unwrap();
+        fs::create_dir(vault.path().join(".obsidian")).unwrap();
+        symlink(
+            outside.path(),
+            vault.path().join(".obsidian/templates.json"),
+        )
+        .unwrap();
+
+        let loaded = load_template_settings(vault.path()).unwrap();
+
+        assert_eq!(loaded.source, TemplateSettingsSource::Default);
+        assert_eq!(loaded.settings.folder, DEFAULT_TEMPLATE_FOLDER);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_unreadable_vault_root_yields_no_templates_without_panicking() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !permission_restrictions_apply() {
+            return;
+        }
+        let vault = tempfile::tempdir().unwrap();
+        // Execute-but-not-read: `canonicalize` still resolves the path, but the
+        // template-folder scan's `read_dir` is denied, hitting the warn-and-continue
+        // guard rather than propagating an error.
+        fs::set_permissions(vault.path(), fs::Permissions::from_mode(0o111)).unwrap();
+
+        let result = list_templates(vault.path());
+
+        fs::set_permissions(vault.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.unwrap().is_empty());
+    }
+}

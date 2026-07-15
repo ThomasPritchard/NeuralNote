@@ -1444,4 +1444,352 @@ describe("Workspace — OS close guard", () => {
     await userEvent.click(screen.getByRole("button", { name: "Discard" }));
     expect(win.destroy).toHaveBeenCalled();
   });
+
+  it("surfaces a failure to install the close guard through the app", async () => {
+    win.onCloseRequested.mockReturnValueOnce(
+      Promise.reject(new Error("no window bus")),
+    );
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const ctx = vaultCtx();
+    mockUseVault.mockReturnValue(ctx);
+    render(<Workspace />);
+
+    await waitFor(() =>
+      expect(ctx.reportError).toHaveBeenCalledWith(
+        expect.stringContaining("unsaved-changes guard"),
+      ),
+    );
+  });
+});
+
+describe("Workspace — workspace-state persistence failures", () => {
+  it("surfaces a workspace-state save failure without losing edits", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: false });
+    mockInvoke.mockImplementation((command) => {
+      if (command === "save_workspace_state") {
+        return Promise.reject(new Error("disk full"));
+      }
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    await waitFor(() =>
+      expect(notification.error).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ dedupKey: "workspace-state-save" }),
+      ),
+    );
+  });
+
+  it("restores previously open tabs by relative path on load", async () => {
+    mockInvoke.mockImplementation((command) => {
+      if (command === "load_workspace_state") {
+        return Promise.resolve({
+          state: { openPaths: ["Note.md"], activePath: "Note.md" },
+          recoveredFromCorrupt: false,
+          recoveryMessage: null,
+        });
+      }
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    await waitFor(() =>
+      expect(tabsState.current.open).toHaveBeenCalledWith("/v/Note.md", {
+        forceNew: true,
+      }),
+    );
+  });
+
+  it("resets corrupt tab state and re-persists when the recovery action is taken", async () => {
+    mockInvoke.mockImplementation((command) => {
+      if (command === "load_workspace_state") {
+        return Promise.resolve({
+          state: { openPaths: [], activePath: null },
+          recoveredFromCorrupt: true,
+          recoveryMessage: "tab state unreadable",
+        });
+      }
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    await waitFor(() =>
+      expect(notification.error).toHaveBeenCalledWith(
+        "tab state unreadable",
+        expect.objectContaining({ dedupKey: "workspace-state-recovery" }),
+      ),
+    );
+    const options = notification.error.mock.calls.at(-1)?.[1] as {
+      action: { onClick: () => void };
+    };
+    await act(async () => options.action.onClick());
+
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("reset_workspace_state"),
+    );
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "save_workspace_state",
+        expect.any(Object),
+      ),
+    );
+  });
+
+  it("reports a failed recovery reset", async () => {
+    mockInvoke.mockImplementation((command) => {
+      if (command === "load_workspace_state") {
+        return Promise.resolve({
+          state: { openPaths: [], activePath: null },
+          recoveredFromCorrupt: true,
+          recoveryMessage: "tab state unreadable",
+        });
+      }
+      if (command === "reset_workspace_state") {
+        return Promise.reject(new Error("still unreadable"));
+      }
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    await waitFor(() =>
+      expect(notification.error).toHaveBeenCalledWith(
+        "tab state unreadable",
+        expect.objectContaining({ dedupKey: "workspace-state-recovery" }),
+      ),
+    );
+    const options = notification.error.mock.calls.at(-1)?.[1] as {
+      action: { onClick: () => void };
+    };
+    await act(async () => options.action.onClick());
+
+    await waitFor(() =>
+      expect(notification.error).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ dedupKey: "workspace-state-reset" }),
+      ),
+    );
+  });
+});
+
+describe("Workspace — menu action + intent failures", () => {
+  it("reports a failure to subscribe to native menu actions", async () => {
+    mockListen.mockReturnValueOnce(Promise.reject(new Error("no menu bus")));
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    const ctx = vaultCtx();
+    mockUseVault.mockReturnValue(ctx);
+    render(<Workspace />);
+
+    await waitFor(() =>
+      expect(ctx.reportError).toHaveBeenCalledWith(
+        expect.stringContaining("Menu actions are unavailable"),
+      ),
+    );
+  });
+
+  it("logs but tolerates a failed editor-state menu sync", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockInvoke.mockImplementation((command) => {
+      if (command === "set_menu_editing") {
+        return Promise.reject(new Error("menu offline"));
+      }
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    await waitFor(() =>
+      expect(consoleError).toHaveBeenCalledWith(
+        expect.stringContaining("editor state"),
+        expect.any(Error),
+      ),
+    );
+  });
+
+  it("logs but tolerates a failed chat-visibility menu sync", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    mockInvoke.mockImplementation((command) => {
+      if (command === "set_chat_visible") {
+        return Promise.reject(new Error("menu offline"));
+      }
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    await waitFor(() =>
+      expect(consoleError).toHaveBeenCalledWith(
+        expect.stringContaining("chat visibility"),
+        expect.any(Error),
+      ),
+    );
+  });
+
+  it("starts a new folder from the menu", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "new-folder" });
+    expect(
+      (captured.fileTree as unknown as { pendingCreate: string }).pendingCreate,
+    ).toBe("folder");
+  });
+
+  it("closes the active tab from the menu when clean", async () => {
+    const tab = makeTab("/v/a.md");
+    tabsState.current = makeTabs({
+      tabs: [tab],
+      activeTabId: tab.id,
+      activeTab: tab,
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "close-tab" });
+    await waitFor(() =>
+      expect(tabsState.current.close).toHaveBeenCalledWith(tab.id),
+    );
+  });
+
+  it("closes the window from the menu and logs a rejected destroy", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => {});
+    win.destroy.mockRejectedValueOnce(new Error("cannot destroy"));
+    openState.current = makeOpen({ dirty: false });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "close-window" });
+    await waitFor(() => expect(win.destroy).toHaveBeenCalled());
+    await waitFor(() =>
+      expect(consoleError).toHaveBeenCalledWith(
+        expect.stringContaining("window destroy failed"),
+        expect.any(Error),
+      ),
+    );
+  });
+
+  it("opens a recent vault from the menu when clean", async () => {
+    const ctx = vaultCtx();
+    openState.current = makeOpen({ dirty: false });
+    mockUseVault.mockReturnValue(ctx);
+    render(<Workspace />);
+
+    fireMenu({ action: "open-recent", path: "/other/vault" });
+    await waitFor(() =>
+      expect(ctx.openByPath).toHaveBeenCalledWith("/other/vault"),
+    );
+  });
+
+  it("ignores an unrecognised menu action", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "definitely-not-a-real-action" });
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+  });
+
+  it("reports a failure to quit the app", async () => {
+    openState.current = makeOpen({ dirty: false });
+    mockInvoke.mockImplementation((command) => {
+      if (command === "quit_app") return Promise.reject(new Error("quit blocked"));
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireMenu({ action: "quit-app" });
+    await waitFor(() =>
+      expect(notification.error).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ dedupKey: "quit-app-failed" }),
+      ),
+    );
+  });
+
+  it("reports a failed deletion after confirmation", async () => {
+    mockInvoke.mockImplementation((command) => {
+      if (command === "delete_entry") return Promise.reject(new Error("locked"));
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    act(() => captured.fileTree.onDeleteRequest(node("/v/Notes") as never));
+    await userEvent.click(screen.getByRole("button", { name: "Move to Trash" }));
+
+    await waitFor(() =>
+      expect(notification.error).toHaveBeenCalledWith(expect.stringMatching(/locked/i)),
+    );
+    expect(tabsState.current.removeDescendants).not.toHaveBeenCalled();
+  });
+
+  it("refreshes the tree from the navigation vault menu", async () => {
+    const ctx = vaultCtx();
+    mockUseVault.mockReturnValue(ctx);
+    render(<Workspace />);
+
+    await act(async () => captured.ribbon.onRefresh());
+    expect(ctx.refreshTree).toHaveBeenCalled();
+  });
+
+  it("reports a failure to list templates for insertion", async () => {
+    mockInvoke.mockImplementation((command) => {
+      if (command === "list_templates") return Promise.reject(new Error("no templates dir"));
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    await act(async () => captured.ribbon.onInsertTemplate());
+    expect(notification.error).toHaveBeenCalledWith(
+      expect.stringMatching(/no templates dir/i),
+    );
+  });
+
+  it("reports and does not open when template creation fails", async () => {
+    const ctx = vaultCtx();
+    mockInvoke.mockImplementation((command) => {
+      if (command === "list_templates") {
+        return Promise.resolve([{ relPath: "Templates/Daily.md", name: "Daily" }]);
+      }
+      if (command === "create_note_from_template") {
+        return Promise.reject(new Error("template invalid"));
+      }
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(ctx);
+    render(<Workspace />);
+
+    await act(async () => captured.ribbon.onInsertTemplate());
+    await act(async () =>
+      captured.templateDialog.onCreate("Templates/Daily.md", "Journal.md", "/v"),
+    );
+
+    await waitFor(() =>
+      expect(ctx.reportError).toHaveBeenCalledWith(
+        expect.stringMatching(/template invalid/i),
+      ),
+    );
+    expect(tabsState.current.open).not.toHaveBeenCalled();
+  });
+
+  it("dismisses the template insert dialog on request", async () => {
+    mockInvoke.mockImplementation((command) => {
+      if (command === "list_templates") {
+        return Promise.resolve([{ relPath: "Templates/Daily.md", name: "Daily" }]);
+      }
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    await act(async () => captured.ribbon.onInsertTemplate());
+    expect(screen.getByTestId("template-insert-dialog")).toBeInTheDocument();
+
+    act(() => captured.templateDialog.onClose());
+    expect(screen.queryByTestId("template-insert-dialog")).not.toBeInTheDocument();
+  });
 });

@@ -83,8 +83,7 @@ export function Ribbon({
         onCloseVault={onCloseVault}
       />
 
-      <div
-        role="group"
+      <nav
         aria-labelledby="nn-quick-links-label"
         className="flex flex-col gap-1"
       >
@@ -117,7 +116,7 @@ export function Ribbon({
           active={centerView === "graph"}
           onClick={onToggleGraph}
         />
-      </div>
+      </nav>
     </nav>
   );
 }

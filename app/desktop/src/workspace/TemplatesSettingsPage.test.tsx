@@ -84,4 +84,99 @@ describe("TemplatesSettingsPage", () => {
     await user.click(screen.getByRole("button", { name: "Reset to defaults" }));
     expect(api.resetTemplateSettings).toHaveBeenCalledOnce();
   });
+
+  it("adopts a picked folder into the draft", async () => {
+    vi.mocked(api.pickTemplateFolder).mockResolvedValue("Daily/Templates");
+    const user = renderPage();
+    await screen.findByDisplayValue("Templates");
+
+    await user.click(screen.getByRole("button", { name: "Choose template folder" }));
+
+    expect(await screen.findByDisplayValue("Daily/Templates")).toBeInTheDocument();
+  });
+
+  it("reports a folder-picker failure without changing the draft", async () => {
+    vi.mocked(api.pickTemplateFolder).mockRejectedValue({
+      kind: "io",
+      message: "dialog unavailable",
+    });
+    const user = renderPage();
+    await screen.findByDisplayValue("Templates");
+
+    await user.click(screen.getByRole("button", { name: "Choose template folder" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Template folder could not be selected. dialog unavailable",
+    );
+    expect(screen.getByLabelText("Template folder")).toHaveValue("Templates");
+  });
+
+  it("persists valid settings and confirms the save", async () => {
+    const user = renderPage();
+    await screen.findByLabelText("Date format");
+
+    await user.click(screen.getByRole("button", { name: "Save template settings" }));
+
+    expect(api.saveTemplateSettings).toHaveBeenCalledWith({
+      folder: "Templates",
+      dateFormat: "YYYY-MM-DD",
+      timeFormat: "HH:mm",
+    });
+    expect(
+      await screen.findByRole("listitem", { name: "Template settings saved notification" }),
+    ).toBeInTheDocument();
+  });
+
+  it("surfaces a save failure as an error toast", async () => {
+    vi.mocked(api.saveTemplateSettings).mockRejectedValue({
+      kind: "io",
+      message: "disk full",
+    });
+    const user = renderPage();
+    await screen.findByLabelText("Date format");
+
+    await user.click(screen.getByRole("button", { name: "Save template settings" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Template settings could not be saved. disk full",
+    );
+  });
+
+  it("resets to defaults from the main form action", async () => {
+    const user = renderPage();
+    await screen.findByLabelText("Date format");
+
+    await user.click(screen.getByRole("button", { name: "Reset to defaults" }));
+
+    expect(api.resetTemplateSettings).toHaveBeenCalledOnce();
+    expect(
+      await screen.findByRole("listitem", { name: "Template settings reset notification" }),
+    ).toBeInTheDocument();
+  });
+
+  it("surfaces a reset failure as an error toast", async () => {
+    vi.mocked(api.resetTemplateSettings).mockRejectedValue({
+      kind: "io",
+      message: "read-only vault",
+    });
+    const user = renderPage();
+    await screen.findByLabelText("Date format");
+
+    await user.click(screen.getByRole("button", { name: "Reset to defaults" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Template settings could not be reset. read-only vault",
+    );
+  });
+
+  it("previews an edited time format live", async () => {
+    renderPage();
+    const time = await screen.findByLabelText("Time format");
+    fireEvent.change(time, { target: { value: "HH:mm:ss" } });
+
+    expect(time).toHaveValue("HH:mm:ss");
+    expect(screen.getByLabelText("Time preview")).toHaveTextContent(
+      /\d{2}:\d{2}:\d{2}/,
+    );
+  });
 });

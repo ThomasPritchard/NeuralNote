@@ -100,7 +100,7 @@ export function TemplatesSettingsPage() {
   }
 
   if (status === null) {
-    return <p role="status" className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="size-3.5 animate-spin" aria-hidden />Loading template settings…</p>;
+    return <output className="flex items-center gap-2 text-xs text-muted-foreground"><Loader2 className="size-3.5 animate-spin" aria-hidden />Loading template settings…</output>;
   }
 
   const folderMissing = !status.folderExists && draft.folder === status.settings.folder;
