@@ -21,7 +21,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import * as api from "../lib/api";
 import { useVault } from "../lib/store";
 import { useToast } from "../notifications";
-import type { TreeNode, WorkspaceState } from "../lib/types";
+import type { NoteDoc, TreeNode, WorkspaceState } from "../lib/types";
 import { ChatPane } from "./ChatPane";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { FileTree } from "./FileTree";
@@ -84,6 +84,39 @@ function persistedWorkspaceState(
     openPaths: [...paths.values()],
     activePath: activeTabId ? (paths.get(activeTabId) ?? null) : null,
   };
+}
+
+function confirmDialogTitle(intent: PendingIntent): string {
+  if (intent.kind !== "delete-entry") return "Discard unsaved changes?";
+  const entityLabel = intent.node.kind === "folder" ? "folder" : "note";
+  return `Delete ${entityLabel}?`;
+}
+
+/** A compatible text note is open and directly editable (binary notes are not). */
+function isEditableTextNote(note: NoteDoc | null): boolean {
+  return note !== null && !note.binary;
+}
+
+function confirmDialogLabel(intent: PendingIntent): string {
+  return intent.kind === "delete-entry" ? "Move to Trash" : "Discard";
+}
+
+/** The body of the discard-confirmation dialog for a pending destructive intent.
+ *  `dirtyTabCount` is only consulted for the whole-vault/window discard case. */
+function describeDiscard(intent: PendingIntent, dirtyTabCount: number): string {
+  if (intent.kind === "delete-entry") {
+    const tabNoun = intent.dirtyCount === 1 ? "tab has" : "tabs have";
+    const dirtyWarning =
+      intent.dirtyCount > 0
+        ? ` ${intent.dirtyCount} open ${tabNoun} unsaved changes that will be lost.`
+        : "";
+    return `“${intent.node.name}” will be moved to the Trash.${dirtyWarning}`;
+  }
+  if (intent.kind === "close-tab") {
+    return "This note has edits that haven't been saved. If you continue, they'll be lost.";
+  }
+  const tabNoun = dirtyTabCount === 1 ? "note has" : "notes have";
+  return `${dirtyTabCount} open ${tabNoun} unsaved changes. If you continue, they'll be lost.`;
 }
 
 export function Workspace() {
@@ -163,20 +196,17 @@ export function Workspace() {
     const measure = () => {
       const chatWidth = chatSlot?.getBoundingClientRect().width ?? 0;
       const chatTargetWidth = chatPane?.getBoundingClientRect().width ?? 0;
+      // Reserve the chat's target width as soon as it starts opening. This
+      // starts navigation compaction at the same time as the chat transition,
+      // rather than waiting until the editor has nearly run out of space.
+      const openReservedWidth = chatTargetWidth > 0 ? chatTargetWidth : chatWidth;
       const next = {
         workspaceWidth: workspace.getBoundingClientRect().width,
         // Read the slot's current rendered width so responsive clamping follows
         // the chat animation instead of jumping to its final state.
         chatWidth,
         navigationWidth: navigation?.getBoundingClientRect().width ?? 0,
-        // Reserve the chat's target width as soon as it starts opening. This
-        // starts navigation compaction at the same time as the chat transition,
-        // rather than waiting until the editor has nearly run out of space.
-        reservedChatWidth: showChat
-          ? chatTargetWidth > 0
-            ? chatTargetWidth
-            : chatWidth
-          : chatWidth,
+        reservedChatWidth: showChat ? openReservedWidth : chatWidth,
       };
       setWorkspaceMeasurements((current) =>
         current.workspaceWidth === next.workspaceWidth &&
@@ -213,15 +243,13 @@ export function Workspace() {
   const workspaceWriterRef = useRef<ReturnType<
     typeof createWorkspaceStateWriter
   > | null>(null);
-  if (workspaceWriterRef.current === null) {
-    workspaceWriterRef.current = createWorkspaceStateWriter(
-      api.saveWorkspaceState,
-      (writeError) =>
-        toast.error(api.errorMessage(writeError), {
-          dedupKey: "workspace-state-save",
-        }),
-    );
-  }
+  workspaceWriterRef.current ??= createWorkspaceStateWriter(
+    api.saveWorkspaceState,
+    (writeError) =>
+      toast.error(api.errorMessage(writeError), {
+        dedupKey: "workspace-state-save",
+      }),
+  );
 
   /** Force-close the window past the close-request guard. If destroy() rejects the
    *  window is merely left open (safe — no data lost), so log rather than swallow. */
@@ -263,6 +291,30 @@ export function Workspace() {
     setWorkspaceStateBlocked(false);
     restorePlanRef.current = null;
 
+    // Hoisted out of the recovery-toast action so the reset promise chain sits
+    // near the top of the effect rather than nested five callbacks deep.
+    const applyReset = () => {
+      if (cancelled || activeVaultPathRef.current !== vaultPath) return;
+      void api
+        .resetWorkspaceState()
+        .then(() => {
+          if (cancelled) return;
+          setWorkspaceStateBlocked(false);
+          workspaceWriterRef.current?.schedule(
+            persistedWorkspaceState(
+              vaultPath,
+              noteTabsRef.current.tabs,
+              noteTabsRef.current.activeTabId,
+            ),
+          );
+        })
+        .catch((resetError) =>
+          toast.error(api.errorMessage(resetError), {
+            dedupKey: "workspace-state-reset",
+          }),
+        );
+    };
+
     void api
       .loadWorkspaceState()
       .then((loaded) => {
@@ -276,32 +328,7 @@ export function Workspace() {
               dedupKey: "workspace-state-recovery",
               action: {
                 label: "Reset tab state",
-                onClick: () => {
-                  if (
-                    cancelled ||
-                    activeVaultPathRef.current !== vaultPath
-                  ) {
-                    return;
-                  }
-                  void api
-                    .resetWorkspaceState()
-                    .then(() => {
-                      if (cancelled) return;
-                      setWorkspaceStateBlocked(false);
-                      workspaceWriterRef.current?.schedule(
-                        persistedWorkspaceState(
-                          vaultPath,
-                          noteTabsRef.current.tabs,
-                          noteTabsRef.current.activeTabId,
-                        ),
-                      );
-                    })
-                    .catch((resetError) =>
-                      toast.error(api.errorMessage(resetError), {
-                        dedupKey: "workspace-state-reset",
-                      }),
-                    );
-                },
+                onClick: applyReset,
               },
             },
           );
@@ -731,7 +758,7 @@ export function Workspace() {
 
   // Every compatible text note is directly editable. Keep Format enabled while
   // a text note is open; the focused rich/raw editor still owns the command.
-  const editing = !!open.note && !open.note.binary;
+  const editing = isEditableTextNote(open.note);
   useEffect(() => {
     void api
       .setMenuEditing(editing)
@@ -779,21 +806,13 @@ export function Workspace() {
 
   const handleCloseGraph = useCallback(() => setCenterView("note"), []);
 
-  const discardMessage = useMemo(() => {
-    if (!pendingIntent) return "";
-    if (pendingIntent.kind === "delete-entry") {
-      const dirtyWarning =
-        pendingIntent.dirtyCount > 0
-          ? ` ${pendingIntent.dirtyCount} open ${pendingIntent.dirtyCount === 1 ? "tab has" : "tabs have"} unsaved changes that will be lost.`
-          : "";
-      return `“${pendingIntent.node.name}” will be moved to the Trash.${dirtyWarning}`;
-    }
-    if (pendingIntent.kind === "close-tab") {
-      return "This note has edits that haven't been saved. If you continue, they'll be lost.";
-    }
-    const count = noteTabs.dirtyTabs.length;
-    return `${count} open ${count === 1 ? "note has" : "notes have"} unsaved changes. If you continue, they'll be lost.`;
-  }, [noteTabs.dirtyTabs.length, pendingIntent]);
+  const discardMessage = useMemo(
+    () =>
+      pendingIntent
+        ? describeDiscard(pendingIntent, noteTabs.dirtyTabs.length)
+        : "",
+    [noteTabs.dirtyTabs.length, pendingIntent],
+  );
 
   if (!vault) return null;
 
@@ -901,7 +920,7 @@ export function Workspace() {
                 ? noteTabPanelId(noteTabs.activeTabId)
                 : "nn-empty-note-panel"
             }
-            role={noteTabs.activeTabId ? "tabpanel" : undefined}
+            role="tabpanel"
             aria-labelledby={
               noteTabs.activeTabId
                 ? noteTabTriggerId(noteTabs.activeTabId)
@@ -953,15 +972,9 @@ export function Workspace() {
 
       {pendingIntent && (
         <ConfirmDialog
-          title={
-            pendingIntent.kind === "delete-entry"
-              ? `Delete ${pendingIntent.node.kind === "folder" ? "folder" : "note"}?`
-              : "Discard unsaved changes?"
-          }
+          title={confirmDialogTitle(pendingIntent)}
           message={discardMessage}
-          confirmLabel={
-            pendingIntent.kind === "delete-entry" ? "Move to Trash" : "Discard"
-          }
+          confirmLabel={confirmDialogLabel(pendingIntent)}
           tone="danger"
           onConfirm={() => {
             const intent = pendingIntent;
