@@ -176,9 +176,11 @@ for unresolved links; inline `#tag` facets; search ranking beyond name-first; ve
 vault perf (label bands were tuned at ~40 nodes; no node cap in v1 — revisit if >2k-note
 vaults stutter); orb variant + magnet picking (prototype-only experiments).
 
-Documented v1 search limitations (review round 1): case-insensitivity is char-wise
-`to_lowercase` + final-sigma (ς→σ) — full Unicode case folding (ß↔ss) is deliberately NOT
-hand-rolled (house cautionary tale; revisit only via a vetted library). Non-UTF-8 notes are
+Documented v1 search behaviour (review round 1, revised by issue #37): case-insensitivity is
+char-wise Unicode **full** case folding (`ß↔ss`, `ﬀ↔ff`, `İ`, final sigma `ς→σ`) via the
+vetted `caseless` crate (Unicode 16.0.0), never hand-rolled tables. The per-char fold keeps
+the folded→original byte-range map exact, so a `ß` matched by an `ss` query still cites the
+`ß`'s precise source span. Non-UTF-8 notes are
 searched lossily (U+FFFD), so a search can miss text the reader shows — the reader flags such
 notes via `lossyText`. Fold-map memory is O(largest line) transiently; acceptable for local
 markdown, revisit in the capture phase.

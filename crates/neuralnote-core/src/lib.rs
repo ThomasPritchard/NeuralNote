@@ -1579,6 +1579,72 @@ mod tests {
         assert_eq!(slice_chars(&m.snippet, m.ranges[0]), "σεισμός");
     }
 
+    #[test]
+    fn search_folds_eszett_ss_content_side() {
+        // Full Unicode case folding: content 'ß' folds to "ss", so an ASCII
+        // "ss" query matches it — and the highlight maps back to the ORIGINAL
+        // 'ß' span, never the folded expansion.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("n.md"), "die Straße dort\n").unwrap();
+        let r = search::search_vault(dir.path(), "strasse").unwrap();
+        assert_eq!(r.hits.len(), 1);
+        let m = &r.hits[0].matches[0];
+        assert_eq!(slice_chars(&m.snippet, m.ranges[0]), "Straße");
+    }
+
+    #[test]
+    fn search_folds_eszett_ss_query_side() {
+        // The other direction: a 'ß' in the QUERY folds to "ss" and matches
+        // plain "ss" content.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("n.md"), "ein grosses Haus\n").unwrap();
+        let r = search::search_vault(dir.path(), "großes").unwrap();
+        assert_eq!(r.hits.len(), 1);
+        let m = &r.hits[0].matches[0];
+        assert_eq!(slice_chars(&m.snippet, m.ranges[0]), "grosses");
+    }
+
+    #[test]
+    fn search_folds_ff_ligature() {
+        // The 'ﬀ' ligature (U+FB00) full-case-folds to "ff"; an ASCII query
+        // finds it and the highlight covers the original single ligature char.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("n.md"), "the o\u{FB00}ice memo\n").unwrap();
+        let r = search::search_vault(dir.path(), "office").unwrap();
+        assert_eq!(r.hits.len(), 1);
+        let m = &r.hits[0].matches[0];
+        assert_eq!(slice_chars(&m.snippet, m.ranges[0]), "o\u{FB00}ice");
+    }
+
+    #[test]
+    fn fold_maps_multichar_expansion_to_exact_source_byte_range() {
+        // THE MOAT. A folded "ss" match on a 'ß' must map back to the EXACT
+        // byte span the 'ß' occupies in the ORIGINAL line. A wrong citation
+        // byte range is worse than no answer, so this asserts the mapping to
+        // the byte — not merely the char — with no off-by-one.
+        let line = "a ß b"; // bytes: 'a'(1) ' '(1) 'ß'(2) ' '(1) 'b'(1)
+        let fl = search::fold_line(line);
+        assert_eq!(fl.folded.iter().collect::<String>(), "a ss b");
+
+        let query = search::fold("ss");
+        let pos = fl
+            .folded
+            .windows(query.len())
+            .position(|w| w == query.as_slice())
+            .expect("folded line must contain the folded query");
+
+        // Both folded 's' chars trace back to the SAME original char: the 'ß'.
+        let first_char = fl.fold_origin[pos];
+        let last_char = fl.fold_origin[pos + query.len() - 1];
+        assert_eq!(first_char, last_char);
+
+        // …and that original char occupies exactly bytes [2, 4) — the 'ß'.
+        let byte_start = fl.char_starts[first_char];
+        let byte_end = fl.char_starts[last_char + 1];
+        assert_eq!((byte_start, byte_end), (2, 4));
+        assert_eq!(&line[byte_start..byte_end], "ß");
+    }
+
     /* ──────────────────────────────  links  ────────────────────────────── */
 
     /// The edge between two notes regardless of direction (edges are deduped on
