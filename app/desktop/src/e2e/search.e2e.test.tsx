@@ -10,7 +10,7 @@
 // findBy* queries, exactly as a user would wait.
 
 import { describe, it, expect } from "vitest";
-import { act, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
 import { renderApp, type RenderAppResult } from "./renderApp";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
@@ -26,6 +26,51 @@ async function openVault(seed: SeedEntry[]): Promise<RenderAppResult> {
 }
 
 describe("Journey 10: full-text vault search", () => {
+  it("clicks an inline tag into an exact, hierarchical tag search", async () => {
+    const { user } = await openVault([
+      { kind: "file", relPath: "Source.md", content: "#SaaS overview" },
+      { kind: "file", relPath: "Exact.md", content: "Uses #SaaS" },
+      { kind: "file", relPath: "Nested.md", content: "Uses #SaaS/cloud" },
+      { kind: "file", relPath: "Prefix.md", content: "Uses #SaaSExtra" },
+      { kind: "file", relPath: "Code.md", content: "`#SaaS`" },
+      { kind: "file", relPath: "Property.md", content: "---\ntags: [SaaS]\n---\nBody" },
+    ]);
+
+    await user.click(screen.getByRole("button", { name: "Source.md" }));
+    await screen.findByRole("textbox", { name: "Note content" });
+    fireEvent.mouseDown(document.querySelector(".nn-lp-tag")!);
+
+    const input = await screen.findByLabelText("Search vault");
+    await waitFor(() => expect(input).toHaveValue("tag:#SaaS"));
+    const results = await screen.findByRole("list", { name: "Search results" });
+    expect(within(results).getByText("Source.md")).toBeInTheDocument();
+    expect(within(results).getByText("Exact.md")).toBeInTheDocument();
+    expect(within(results).getByText("Nested.md")).toBeInTheDocument();
+    expect(within(results).getByText("Property.md")).toBeInTheDocument();
+    expect(within(results).queryByText("Prefix.md")).toBeNull();
+    expect(within(results).queryByText("Code.md")).toBeNull();
+  });
+
+  it("clicks a YAML property tag into the same filtered search", async () => {
+    const { user } = await openVault([
+      { kind: "file", relPath: "Property source.md", content: "---\ntags: [SaaS]\n---\nBody" },
+      { kind: "file", relPath: "Exact.md", content: "Uses #SaaS" },
+      { kind: "file", relPath: "Nested.md", content: "---\ntags: [SaaS/cloud]\n---\nBody" },
+      { kind: "file", relPath: "Prefix.md", content: "Uses #SaaSExtra" },
+    ]);
+
+    await user.click(screen.getByRole("button", { name: "Property source.md" }));
+    await user.click(await screen.findByRole("button", { name: "Search for #SaaS" }));
+
+    const input = await screen.findByLabelText("Search vault");
+    await waitFor(() => expect(input).toHaveValue("tag:#SaaS"));
+    const results = await screen.findByRole("list", { name: "Search results" });
+    expect(within(results).getByText("Property source.md")).toBeInTheDocument();
+    expect(within(results).getByText("Exact.md")).toBeInTheDocument();
+    expect(within(results).getByText("Nested.md")).toBeInTheDocument();
+    expect(within(results).queryByText("Prefix.md")).toBeNull();
+  });
+
   it("opens via the ribbon, shows grouped highlighted results, and opens a match in the reader", async () => {
     const { user } = await openVault([
       // Name-only hit: stem matches "recipe", content does not.

@@ -1,5 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { undo } from "@codemirror/commands";
 import { EditorSelection } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -175,6 +176,408 @@ describe("SourceNoteEditor", () => {
     await waitFor(() => expect(onChange).toHaveBeenLastCalledWith("- [x] open"));
   });
 
+  it("renders an inactive Markdown table semantically and reveals its exact source for editing", async () => {
+    const source = [
+      "# Commitments",
+      "",
+      "| Start date | Commitment |",
+      "| --- | --- |",
+      "| 2026-04-03 | DJ gig |",
+    ].join("\n");
+    const { container } = render(
+      <SourceNoteEditor
+        sessionKey="tab-table"
+        loadedHash="hash-table"
+        value={source}
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+      />,
+    );
+
+    const table = screen.getByRole("table", { name: "Markdown table" });
+    expect(screen.getAllByRole("columnheader").map((cell) => cell.textContent)).toEqual([
+      "Start date",
+      "Commitment",
+    ]);
+    expect(screen.getAllByRole("cell").map((cell) => cell.textContent)).toEqual([
+      "2026-04-03",
+      "DJ gig",
+    ]);
+    expect(container.querySelector(".cm-content")).not.toHaveTextContent("| --- | --- |");
+
+    await userEvent.click(table);
+
+    await waitFor(() => expect(screen.queryByRole("table", { name: "Markdown table" })).toBeNull());
+    expect(container.querySelector(".cm-content")).toHaveTextContent("| --- | --- |");
+  });
+
+  it("renders inline Markdown as table cell text instead of exposing its source markers", () => {
+    const source = [
+      "# Commitments",
+      "",
+      "| Status | Note |",
+      "| --- | --- |",
+      "| **Urgent** | [Details](Details.md) |",
+    ].join("\n");
+    render(
+      <SourceNoteEditor
+        sessionKey="tab-table-inline"
+        loadedHash="hash-table-inline"
+        value={source}
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByRole("cell").map((cell) => cell.textContent)).toEqual([
+      "Urgent",
+      "Details",
+    ]);
+  });
+
+  it("preserves bare URLs and autolinks rendered inside table cells", () => {
+    const source = [
+      "# Links",
+      "",
+      "| Bare URL | Autolink |",
+      "| --- | --- |",
+      "| https://example.com | <https://example.org> |",
+    ].join("\n");
+    render(
+      <SourceNoteEditor
+        sessionKey="tab-table-urls"
+        loadedHash="hash-table-urls"
+        value={source}
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+      />,
+    );
+
+    expect(screen.getAllByRole("cell").map((cell) => cell.textContent)).toEqual([
+      "https://example.com",
+      "https://example.org",
+    ]);
+  });
+
+  it("returns unchanged YAML source to the visual properties view", async () => {
+    const source = "---\ntags: [old]\n---\n# My Note\n\nBody";
+    render(
+      <SourceNoteEditor
+        sessionKey="tab-frontmatter-round-trip"
+        loadedHash="hash-frontmatter-round-trip"
+        value={source}
+        frontmatter={{ tags: ["old"] }}
+        frontmatterRaw="tags: [old]"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onSearchTag={vi.fn()}
+      />,
+    );
+
+    const editor = screen.getByRole("textbox", { name: "Note content" });
+    const view = EditorView.findFromDOM(editor)!;
+    await userEvent.click(screen.getByRole("button", { name: "Edit note properties" }));
+    expect(editor).toHaveTextContent("tags: [old]");
+
+    await userEvent.click(screen.getByRole("button", { name: "Done editing note properties" }));
+
+    expect(screen.getByRole("button", { name: "Edit note properties" })).toBeInTheDocument();
+    expect(editor).not.toHaveTextContent("tags: [old]");
+    expect(screen.getByRole("button", { name: "Search for #old" })).toBeInTheDocument();
+    expect(view.state.selection.main.head).toBeGreaterThanOrEqual(source.indexOf("# My Note"));
+  });
+
+  it("folds edited YAML without showing stale properties until a parsed revision reloads", async () => {
+    const source = "---\ntags: [old]\n---\n# My Note\n\nBody";
+    const { rerender } = render(
+      <SourceNoteEditor
+        sessionKey="tab-frontmatter-edit"
+        loadedHash="hash-before-save"
+        value={source}
+        frontmatter={{ tags: ["old"] }}
+        frontmatterRaw="tags: [old]"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onSearchTag={vi.fn()}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit note properties" }));
+    const editor = screen.getByRole("textbox", { name: "Note content" });
+    const view = EditorView.findFromDOM(editor)!;
+    act(() => view.dispatch({
+      changes: { from: source.indexOf("old"), to: source.indexOf("old") + 3, insert: "new" },
+      selection: { anchor: view.state.doc.length },
+    }));
+
+    expect(editor).toHaveTextContent("tags: [new]");
+    expect(editor).not.toHaveTextContent("tags: [old]");
+
+    await userEvent.click(screen.getByRole("button", { name: "Done editing note properties" }));
+
+    expect(editor).not.toHaveTextContent("tags: [new]");
+    expect(screen.queryByRole("button", { name: "Search for #old" })).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Properties changed. Save the note to refresh this preview.",
+    );
+    expect(screen.getByRole("button", { name: "Edit note properties" })).toBeInTheDocument();
+
+    const saved = source.replace("old", "new");
+    rerender(
+      <SourceNoteEditor
+        sessionKey="tab-frontmatter-edit"
+        loadedHash="hash-before-save"
+        value={saved}
+        frontmatter={{ tags: ["new"] }}
+        frontmatterRaw="tags: [new]"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onSearchTag={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole("button", { name: "Edit note properties" })).toBeInTheDocument();
+    }, { timeout: 5_000 });
+    expect(screen.getByRole("textbox", { name: "Note content" })).not.toHaveTextContent("tags: [new]");
+    expect(screen.getByRole("button", { name: "Search for #new" })).toBeInTheDocument();
+  });
+
+  it("routes visual YAML tag chips through the inline-tag search callback", async () => {
+    const onSearchTag = vi.fn();
+    render(
+      <SourceNoteEditor
+        sessionKey="tab-frontmatter-tags"
+        loadedHash="hash-frontmatter-tags"
+        value={"---\ntags: [reference, '#ops/nested', 7]\naliases: [reference]\n---\nBody"}
+        frontmatter={{
+          tags: ["reference", "#ops/nested", 7],
+          aliases: ["reference"],
+        }}
+        frontmatterRaw={"tags: [reference, '#ops/nested', 7]\naliases: [reference]"}
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onSearchTag={onSearchTag}
+      />,
+    );
+
+    const reference = screen.getByRole("button", { name: "Search for #reference" });
+    const nested = screen.getByRole("button", { name: "Search for #ops/nested" });
+    expect(screen.queryByRole("button", { name: "Search for #7" })).toBeNull();
+
+    await userEvent.click(reference);
+    await userEvent.click(nested);
+
+    expect(onSearchTag).toHaveBeenNthCalledWith(1, "#reference");
+    expect(onSearchTag).toHaveBeenNthCalledWith(2, "#ops/nested");
+  });
+
+  it("keeps malformed edited YAML visible when it can no longer be folded", async () => {
+    const source = "---\ntags: [old]\n---\nBody";
+    render(
+      <SourceNoteEditor
+        sessionKey="tab-frontmatter-invalid-edit"
+        loadedHash="hash-frontmatter-invalid-edit"
+        value={source}
+        frontmatter={{ tags: ["old"] }}
+        frontmatterRaw="tags: [old]"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit note properties" }));
+    const editor = screen.getByRole("textbox", { name: "Note content" });
+    const view = EditorView.findFromDOM(editor)!;
+    const closingDelimiter = source.indexOf("---", 3);
+    act(() => view.dispatch({
+      changes: { from: closingDelimiter, to: closingDelimiter + 3, insert: "" },
+    }));
+
+    await userEvent.click(screen.getByRole("button", { name: "Done editing note properties" }));
+
+    expect(view.state.doc.toString()).toContain("tags: [old]");
+    expect(editor).toHaveTextContent("tags: old");
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Restore the frontmatter delimiters before returning to Properties.",
+    );
+    expect(screen.queryByRole("button", { name: "Search for #old" })).toBeNull();
+  });
+
+  it("does not fold newer YAML when an older save response is parsed", async () => {
+    const source = "---\ntags: [old]\n---\nBody";
+    const { rerender } = render(
+      <SourceNoteEditor
+        sessionKey="tab-frontmatter-save-race"
+        loadedHash="hash-frontmatter-save-race"
+        value={source}
+        frontmatter={{ tags: ["old"] }}
+        frontmatterRaw="tags: [old]"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onSearchTag={vi.fn()}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit note properties" }));
+    const editor = screen.getByRole("textbox", { name: "Note content" });
+    const view = EditorView.findFromDOM(editor)!;
+    const oldFrom = source.indexOf("old");
+    act(() => view.dispatch({
+      changes: { from: oldFrom, to: oldFrom + 3, insert: "saved" },
+    }));
+    act(() => view.dispatch({
+      changes: { from: oldFrom, to: oldFrom + 5, insert: "latest" },
+    }));
+
+    rerender(
+      <SourceNoteEditor
+        sessionKey="tab-frontmatter-save-race"
+        loadedHash="hash-frontmatter-save-race"
+        value={source.replace("old", "latest")}
+        frontmatter={{ tags: ["saved"] }}
+        frontmatterRaw="tags: [saved]"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onSearchTag={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole(
+        "button",
+        { name: "Done editing note properties" },
+      )).toBeInTheDocument();
+    }, { timeout: 5_000 });
+    expect(view.state.doc.toString()).toContain("tags: [latest]");
+    expect(screen.queryByRole("button", { name: "Search for #saved" })).toBeNull();
+  });
+
+  it("keeps synchronized saved YAML visible until the user finishes editing properties", async () => {
+    const source = "---\ntags: [old]\n---\nBody";
+    const { rerender } = render(
+      <SourceNoteEditor
+        sessionKey="tab-frontmatter-save-while-open"
+        loadedHash="hash-frontmatter-save-while-open"
+        value={source}
+        frontmatter={{ tags: ["old"] }}
+        frontmatterRaw="tags: [old]"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onSearchTag={vi.fn()}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit note properties" }));
+    const editor = screen.getByRole("textbox", { name: "Note content" });
+    const view = EditorView.findFromDOM(editor)!;
+    const oldFrom = source.indexOf("old");
+    act(() => view.dispatch({
+      changes: { from: oldFrom, to: oldFrom + 3, insert: "saved" },
+    }));
+
+    rerender(
+      <SourceNoteEditor
+        sessionKey="tab-frontmatter-save-while-open"
+        loadedHash="hash-frontmatter-save-while-open"
+        value={source.replace("old", "saved")}
+        frontmatter={{ tags: ["saved"] }}
+        frontmatterRaw="tags: [saved]"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onSearchTag={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole(
+        "button",
+        { name: "Done editing note properties" },
+      )).toBeInTheDocument();
+    });
+    expect(editor).toHaveTextContent("tags: [saved]");
+    expect(screen.queryByRole("button", { name: "Search for #saved" })).toBeNull();
+
+    act(() => view.dispatch({
+      changes: { from: oldFrom + 5, insert: "-latest" },
+    }));
+    expect(view.state.doc.toString()).toContain("tags: [saved-latest]");
+    expect(editor).toHaveTextContent("tags: [saved-latest]");
+  });
+
+  it("marks a visual properties preview stale when undo changes hidden YAML", async () => {
+    const source = "---\ntags: [old]\n---\nBody";
+    const { rerender } = render(
+      <SourceNoteEditor
+        sessionKey="tab-frontmatter-hidden-undo"
+        loadedHash="hash-frontmatter-hidden-undo"
+        value={source}
+        frontmatter={{ tags: ["old"] }}
+        frontmatterRaw="tags: [old]"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onSearchTag={vi.fn()}
+      />,
+    );
+
+    await userEvent.click(screen.getByRole("button", { name: "Edit note properties" }));
+    const editor = screen.getByRole("textbox", { name: "Note content" });
+    const view = EditorView.findFromDOM(editor)!;
+    const oldFrom = source.indexOf("old");
+    act(() => view.dispatch({
+      changes: { from: oldFrom, to: oldFrom + 3, insert: "new" },
+    }));
+
+    rerender(
+      <SourceNoteEditor
+        sessionKey="tab-frontmatter-hidden-undo"
+        loadedHash="hash-frontmatter-hidden-undo"
+        value={source.replace("old", "new")}
+        frontmatter={{ tags: ["new"] }}
+        frontmatterRaw="tags: [new]"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onSearchTag={vi.fn()}
+      />,
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole(
+        "button",
+        { name: "Done editing note properties" },
+      )).toBeInTheDocument();
+    });
+    await userEvent.click(screen.getByRole("button", { name: "Done editing note properties" }));
+    expect(screen.getByRole("button", { name: "Search for #new" })).toBeInTheDocument();
+
+    act(() => {
+      expect(undo(view)).toBe(true);
+    });
+
+    expect(view.state.doc.toString()).toContain("tags: [old]");
+    expect(screen.queryByRole("button", { name: "Search for #new" })).toBeNull();
+    expect(screen.getByRole("status")).toHaveTextContent(
+      "Properties changed. Save the note to refresh this preview.",
+    );
+  });
+
+  it("keeps YAML tag values inert when no search callback is available", () => {
+    render(
+      <SourceNoteEditor
+        sessionKey="tab-frontmatter-tags-inert"
+        loadedHash="hash-frontmatter-tags-inert"
+        value={"---\ntags: [reference]\n---\nBody"}
+        frontmatter={{ tags: ["reference"] }}
+        frontmatterRaw="tags: [reference]"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+      />,
+    );
+
+    expect(screen.queryByRole("button", { name: "Search for #reference" })).toBeNull();
+    expect(screen.getByText("reference")).toBeInTheDocument();
+  });
+
   it("toggles task source with Space and Enter", async () => {
     const onChange = vi.fn();
     render(
@@ -286,7 +689,7 @@ describe("SourceNoteEditor", () => {
     expect(second.container.querySelector<HTMLElement>(".cm-scroller")?.scrollTop).toBe(420);
   });
 
-  it("navigates only modifier-clicked wikilinks resolved by the vault index", () => {
+  it("navigates normally clicked wikilinks resolved by the vault index", () => {
     const onOpenLink = vi.fn();
     const { container } = render(
       <SourceNoteEditor
@@ -300,14 +703,38 @@ describe("SourceNoteEditor", () => {
       />,
     );
 
-    fireEvent.mouseDown(container.querySelector(".nn-lp-wikilink-resolved")!, { metaKey: true });
+    const resolved = container.querySelector(".nn-lp-wikilink-resolved")!;
+    expect(resolved).toHaveAttribute("title", "Open Daily.md");
+    expect(resolved).toHaveAttribute("role", "link");
+    expect(resolved).toHaveAttribute("tabindex", "0");
+    fireEvent.mouseDown(resolved, { button: 0 });
     expect(onOpenLink).toHaveBeenCalledWith("Daily.md");
-    fireEvent.mouseDown(container.querySelector(".nn-lp-wikilink-unresolved")!, { metaKey: true });
-    expect(onOpenLink).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(container.querySelector(".nn-lp-wikilink-resolved")!, { key: "Enter" });
+    expect(onOpenLink).toHaveBeenCalledTimes(2);
+    fireEvent.click(container.querySelector(".nn-lp-wikilink-resolved")!);
+    expect(onOpenLink).toHaveBeenCalledTimes(3);
+    fireEvent.mouseDown(container.querySelector(".nn-lp-wikilink-unresolved")!, { button: 0 });
+    expect(onOpenLink).toHaveBeenCalledTimes(3);
     expect(container.querySelector("a")).toBeNull();
   });
 
-  it("navigates modifier-clicked internal Markdown links through the guarded vault resolver", () => {
+  it("keeps a boundary-selected wikilink clickable while the editor is unfocused", () => {
+    const { container } = render(
+      <SourceNoteEditor
+        sessionKey="tab-unfocused-boundary-link"
+        loadedHash="hash-unfocused-boundary-link"
+        value="[[Daily]]"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        noteIndex={[{ relPath: "Daily.md", stem: "daily" }]}
+        onOpenLink={vi.fn()}
+      />,
+    );
+
+    expect(container.querySelector(".nn-lp-wikilink-resolved")).not.toBeNull();
+  });
+
+  it("navigates normally clicked internal Markdown links through the guarded vault resolver", () => {
     const onOpenLink = vi.fn();
     const { container } = render(
       <SourceNoteEditor
@@ -323,10 +750,47 @@ describe("SourceNoteEditor", () => {
     );
 
     const links = container.querySelectorAll(".nn-lp-link");
-    fireEvent.mouseDown(links[0]!, { metaKey: true });
+    expect(links[0]).toHaveAttribute("title", "Open folder/Azure Account.md");
+    expect(links[0]).toHaveAttribute("role", "link");
+    expect(links[0]).toHaveAttribute("tabindex", "0");
+    fireEvent.mouseDown(links[0]!, { button: 0 });
     expect(onOpenLink).toHaveBeenCalledExactlyOnceWith("folder/Azure Account.md");
-    fireEvent.mouseDown(links[1]!, { metaKey: true });
-    expect(onOpenLink).toHaveBeenCalledTimes(1);
+    fireEvent.keyDown(container.querySelector(".nn-lp-link")!, { key: "Enter" });
+    expect(onOpenLink).toHaveBeenCalledTimes(2);
+    fireEvent.click(container.querySelector(".nn-lp-link")!);
+    expect(onOpenLink).toHaveBeenCalledTimes(3);
+    fireEvent.mouseDown(links[1]!, { button: 0 });
+    expect(onOpenLink).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps an active Markdown link editable instead of navigating it", () => {
+    const onOpenLink = vi.fn();
+    const { container } = render(
+      <SourceNoteEditor
+        sessionKey="tab-active-markdown-link"
+        loadedHash="hash-active-markdown-link"
+        value="before [Daily](Daily.md) after"
+        sourceRelPath="Overview.md"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        noteIndex={[{ relPath: "Daily.md", stem: "daily" }]}
+        onOpenLink={onOpenLink}
+      />,
+    );
+
+    const editor = screen.getByRole("textbox", { name: "Note content" });
+    const view = EditorView.findFromDOM(editor)!;
+    act(() => {
+      view.focus();
+      view.dispatch({ selection: { anchor: 10 } });
+    });
+    const activeLink = container.querySelector(".nn-lp-link")!;
+
+    expect(activeLink).not.toHaveAttribute("data-nn-markdown-target");
+    expect(activeLink).not.toHaveAttribute("role");
+    expect(activeLink).not.toHaveAttribute("tabindex");
+    fireEvent.mouseDown(activeLink, { button: 0 });
+    expect(onOpenLink).not.toHaveBeenCalled();
   });
 
   it("refreshes mounted wikilink decorations when the vault index changes", async () => {
@@ -363,7 +827,9 @@ describe("SourceNoteEditor", () => {
       onOpenLink,
     };
     const rendered = render(<SourceNoteEditor {...props} noteIndex={[]} />);
-    fireEvent.mouseDown(rendered.container.querySelector(".nn-lp-link")!, { metaKey: true });
+    expect(
+      rendered.container.querySelector(".nn-lp-link[data-nn-markdown-target]"),
+    ).toBeNull();
     expect(onOpenLink).not.toHaveBeenCalled();
 
     rendered.rerender(
@@ -421,5 +887,53 @@ describe("SourceNoteEditor", () => {
       ctrlKey: true,
     });
     expect(onOpenLink).toHaveBeenCalledExactlyOnceWith("Daily.md");
+  });
+
+  it("renders an inline tag as preserved source and activates it with a pointer", async () => {
+    const onSearchTag = vi.fn();
+    const { container } = render(
+      <SourceNoteEditor
+        sessionKey="tab-inline-tag"
+        loadedHash="hash-inline-tag"
+        value="#SaaS Software As A Service:"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onSearchTag={onSearchTag}
+      />,
+    );
+
+    const tag = container.querySelector(".nn-lp-tag");
+    expect(tag).toHaveTextContent("#SaaS");
+    expect(tag).toHaveAttribute("data-nn-tag", "#SaaS");
+    expect(tag).toHaveAttribute("role", "link");
+    expect(tag).toHaveAttribute("aria-label", "Search for #SaaS");
+    expect(tag).toHaveAttribute("aria-keyshortcuts", "Meta+Enter Control+Enter");
+    expect(screen.queryByRole("heading", { name: /SaaS/i })).toBeNull();
+    expect(screen.getByRole("textbox", { name: "Note content" })).toHaveTextContent(
+      "#SaaS Software As A Service:",
+    );
+
+    fireEvent.mouseDown(tag!);
+    await waitFor(() => expect(onSearchTag).toHaveBeenCalledExactlyOnceWith("#SaaS"));
+  });
+
+  it("activates the inline tag at the caret with Mod-Enter", async () => {
+    const onSearchTag = vi.fn();
+    render(
+      <SourceNoteEditor
+        sessionKey="tab-inline-tag-keyboard"
+        loadedHash="hash-inline-tag-keyboard"
+        value="before #SaaS after"
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onSearchTag={onSearchTag}
+      />,
+    );
+
+    const editor = screen.getByRole("textbox", { name: "Note content" });
+    EditorView.findFromDOM(editor)!.dispatch({ selection: { anchor: 10 } });
+    fireEvent.keyDown(editor, { key: "Enter", ctrlKey: true });
+
+    await waitFor(() => expect(onSearchTag).toHaveBeenCalledExactlyOnceWith("#SaaS"));
   });
 });

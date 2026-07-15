@@ -49,10 +49,17 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function setup(over: { focusSignal?: number } = {}) {
+function setup(over: {
+  focusSignal?: number;
+  queryRequest?: { id: number; query: string } | null;
+} = {}) {
   const onOpen = vi.fn();
   const view = render(
-    <SearchPanel focusSignal={over.focusSignal ?? 0} onOpen={onOpen} />,
+    <SearchPanel
+      focusSignal={over.focusSignal ?? 0}
+      queryRequest={over.queryRequest ?? null}
+      onOpen={onOpen}
+    />,
   );
   return { onOpen, ...view };
 }
@@ -219,6 +226,32 @@ describe("SearchPanel — states", () => {
 });
 
 describe("SearchPanel — stale-token race", () => {
+  it("invalidates an in-flight response as soon as a replacement query enters debounce", async () => {
+    const older = deferred<SearchResponse>();
+    const newer = deferred<SearchResponse>();
+    mockSearch
+      .mockReturnValueOnce(older.promise)
+      .mockReturnValueOnce(newer.promise);
+    setup();
+
+    type("alpha");
+    await settle();
+    type("beta");
+
+    older.resolve(
+      response({ hits: [fileHit({ title: "Older", relPath: "o.md", path: "/v/o.md" })] }),
+    );
+    await flush();
+    expect(screen.queryByText("Older")).not.toBeInTheDocument();
+
+    await settle();
+    newer.resolve(
+      response({ hits: [fileHit({ title: "Newer", relPath: "n.md", path: "/v/n.md" })] }),
+    );
+    await flush();
+    expect(screen.getByText("Newer")).toBeInTheDocument();
+  });
+
   it("discards an older slow response that resolves after a newer one", async () => {
     const d1 = deferred<SearchResponse>();
     const d2 = deferred<SearchResponse>();
@@ -292,6 +325,43 @@ describe("SearchPanel — interaction", () => {
     expect(input()).not.toHaveFocus();
     rerender(<SearchPanel focusSignal={1} onOpen={onOpen} />);
     expect(input()).toHaveFocus();
+  });
+
+  it("accepts and focuses an external tag query request", async () => {
+    mockSearch.mockResolvedValue(response());
+    setup({ queryRequest: { id: 1, query: "tag:#SaaS" } });
+
+    expect(input()).toHaveValue("tag:#SaaS");
+    expect(input()).toHaveFocus();
+    await settle();
+    expect(mockSearch).toHaveBeenCalledExactlyOnceWith("tag:#SaaS");
+  });
+
+  it("re-runs and refocuses when the same tag arrives with a new request id", async () => {
+    mockSearch.mockResolvedValue(response());
+    const onOpen = vi.fn();
+    const { rerender } = render(
+      <SearchPanel
+        focusSignal={0}
+        queryRequest={{ id: 1, query: "tag:#SaaS" }}
+        onOpen={onOpen}
+      />,
+    );
+    await settle();
+    input().blur();
+
+    rerender(
+      <SearchPanel
+        focusSignal={0}
+        queryRequest={{ id: 2, query: "tag:#SaaS" }}
+        onOpen={onOpen}
+      />,
+    );
+    await settle();
+
+    expect(input()).toHaveFocus();
+    expect(mockSearch).toHaveBeenCalledTimes(2);
+    expect(mockSearch).toHaveBeenNthCalledWith(2, "tag:#SaaS");
   });
 });
 

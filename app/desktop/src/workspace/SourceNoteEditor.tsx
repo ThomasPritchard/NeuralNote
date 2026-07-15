@@ -27,6 +27,7 @@ import { resolveMarkdownLink, type NoteIndexEntry } from "./linkResolve";
 import {
   obsidianLivePreview,
   openResolvedWikilinkAtCaret,
+  openTagSearchAtCaret,
   refreshObsidianPreview,
 } from "./obsidianLivePreview";
 import { createWikilinkCompletionSource } from "./wikilinkCompletion";
@@ -36,6 +37,10 @@ import {
   refreshSourceTitlePlaceholder,
   sourceTitlePlaceholder,
 } from "./sourceTitlePlaceholder";
+import {
+  refreshSourceFrontmatterPreview,
+  sourceFrontmatterPreview,
+} from "./sourceFrontmatterPreview";
 
 export interface SourceNoteEditorProps {
   sessionKey: string;
@@ -47,8 +52,12 @@ export interface SourceNoteEditorProps {
   reportError?: (message: string) => void;
   noteIndex?: readonly NoteIndexEntry[];
   onOpenLink?: (relPath: string) => void;
+  onSearchTag?: (tag: string) => void;
   sourceRelPath?: string;
   derivedTitle?: string;
+  frontmatter?: Record<string, unknown> | null;
+  frontmatterRaw?: string | null;
+  frontmatterError?: string | null;
 }
 
 const EMPTY_NOTE_INDEX: readonly NoteIndexEntry[] = [];
@@ -63,8 +72,12 @@ export function SourceNoteEditor({
   reportError,
   noteIndex = EMPTY_NOTE_INDEX,
   onOpenLink,
+  onSearchTag,
   sourceRelPath = "",
   derivedTitle,
+  frontmatter = null,
+  frontmatterRaw = null,
+  frontmatterError = null,
 }: SourceNoteEditorProps) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
@@ -80,16 +93,24 @@ export function SourceNoteEditor({
   const valueRef = useRef(value);
   const noteIndexRef = useRef(noteIndex);
   const openLinkRef = useRef(onOpenLink);
+  const searchTagRef = useRef(onSearchTag);
   const sourceRelPathRef = useRef(sourceRelPath);
   const derivedTitleRef = useRef(derivedTitle);
   const reportErrorRef = useRef(reportError);
+  const frontmatterRef = useRef(frontmatter);
+  const frontmatterRawRef = useRef(frontmatterRaw);
+  const frontmatterErrorRef = useRef(frontmatterError);
   previewErrorRef.current = onPreviewError;
   valueRef.current = value;
   noteIndexRef.current = noteIndex;
   openLinkRef.current = onOpenLink;
+  searchTagRef.current = onSearchTag;
   sourceRelPathRef.current = sourceRelPath;
   derivedTitleRef.current = derivedTitle;
   reportErrorRef.current = reportError;
+  frontmatterRef.current = frontmatter;
+  frontmatterRawRef.current = frontmatterRaw;
+  frontmatterErrorRef.current = frontmatterError;
 
   useEffect(() => {
     const host = hostRef.current;
@@ -101,6 +122,12 @@ export function SourceNoteEditor({
       EditorState.allowMultipleSelections.of(true),
       foldGutter(),
       markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+      sourceFrontmatterPreview(
+        () => frontmatterRef.current,
+        () => frontmatterRawRef.current !== null && frontmatterErrorRef.current === null,
+        () => frontmatterRawRef.current,
+        () => searchTagRef.current,
+      ),
       sourceEditorDecorations(
         (message) => previewErrorRef.current?.(message),
         {
@@ -120,8 +147,16 @@ export function SourceNoteEditor({
         activateOnTyping: true,
         selectOnOpen: true,
       }),
-      obsidianLivePreview(() => noteIndexRef.current, (relPath) => openLinkRef.current?.(relPath)),
+      obsidianLivePreview(
+        () => noteIndexRef.current,
+        (relPath) => openLinkRef.current?.(relPath),
+        (tag) => searchTagRef.current?.(tag),
+      ),
       keymap.of([
+        {
+          key: "Mod-Enter",
+          run: openTagSearchAtCaret((tag) => searchTagRef.current?.(tag)),
+        },
         {
           key: "Mod-Enter",
           run: openResolvedWikilinkAtCaret(
@@ -237,6 +272,10 @@ export function SourceNoteEditor({
   useEffect(() => {
     viewRef.current?.dispatch({ effects: refreshSourceTitlePlaceholder.of(null) });
   }, [derivedTitle]);
+
+  useEffect(() => {
+    viewRef.current?.dispatch({ effects: refreshSourceFrontmatterPreview.of(null) });
+  }, [frontmatter, frontmatterError, frontmatterRaw]);
 
   return <div ref={hostRef} className="nn-source-editor" />;
 }

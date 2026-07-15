@@ -92,20 +92,101 @@ describe("sourceEditorDecorations", () => {
     expect(strongMarker?.kind).toBe("mark");
   });
 
+  it("keeps heading markers visible while typing at the end of the active line", () => {
+    const doc = "##";
+    const preview = collectMarkdownPreview(state(doc, [{ anchor: doc.length }]));
+
+    expect(preview).toContainEqual({
+      from: 0,
+      to: 2,
+      kind: "mark",
+      className: "nn-lp-marker-active",
+    });
+  });
+
+  it("plans a semantic table widget while inactive and reveals exact source while active", () => {
+    const doc = [
+      "| Start date | Commitment |",
+      "| --- | --- |",
+      "| 2026-04-03 | DJ gig |",
+    ].join("\n");
+
+    expect(collectMarkdownPreview(state(doc))).toContainEqual(expect.objectContaining({
+      from: 0,
+      to: doc.length,
+      kind: "widget",
+      className: "nn-lp-table",
+      table: {
+        headers: ["Start date", "Commitment"],
+        rows: [["2026-04-03", "DJ gig"]],
+      },
+    }));
+
+    expect(collectMarkdownPreview(state(doc, [{ anchor: doc.indexOf("DJ gig") + 2 }]))).toContainEqual(
+      expect.objectContaining({
+        from: 0,
+        to: doc.length,
+        kind: "mark",
+        className: "nn-lp-table-source",
+      }),
+    );
+  });
+
+  it("limits table preview work to the requested visible range", () => {
+    const first = "| First | Value |\n| --- | --- |\n| one | 1 |";
+    const second = "| Second | Value |\n| --- | --- |\n| two | 2 |";
+    const doc = `${first}\n\n${"plain\n".repeat(2_000)}${second}`;
+    const editor = state(doc);
+    vi.spyOn(editor.doc, "toString").mockImplementation(() => {
+      throw new Error("complete document copied");
+    });
+
+    const preview = collectMarkdownPreview(editor, [{ from: 0, to: first.length }]);
+    const tables = preview.filter((item) => item.table);
+    expect(tables).toHaveLength(1);
+    expect(tables[0]?.table?.headers).toEqual(["First", "Value"]);
+  });
+
+  it("keeps an oversized table as editable source instead of building an unbounded widget", () => {
+    const doc = [
+      "| Key | Value |",
+      "| --- | --- |",
+      ...Array.from({ length: 250 }, (_, index) => `| ${index} | ${"x".repeat(160)} |`),
+    ].join("\n");
+    const preview = collectMarkdownPreview(state(doc), [{ from: 0, to: 100 }]);
+
+    expect(preview.some((item) => item.table)).toBe(false);
+    expect(preview).toContainEqual(expect.objectContaining({
+      from: 0,
+      to: doc.length,
+      kind: "mark",
+      className: "nn-lp-table-source",
+    }));
+  });
+
   it("hides an inactive Markdown destination and reveals it for source editing", () => {
-    const doc = "[Azure Account](Azure%20Account.md)";
-    const inactive = collectMarkdownPreview(state(doc));
+    const doc = "before [Azure Account](Azure%20Account.md) after";
+    const linkTo = doc.indexOf(")") + 1;
+    const inactive = collectMarkdownPreview(state(doc, [{ anchor: 0 }]));
     const urlFrom = doc.indexOf("Azure%20");
     expect(inactive).toContainEqual(expect.objectContaining({
       from: urlFrom,
-      to: doc.length - 1,
+      to: linkTo - 1,
       kind: "replace",
     }));
 
     const active = collectMarkdownPreview(state(doc, [{ anchor: urlFrom + 2 }]));
     expect(active).toContainEqual(expect.objectContaining({
       from: urlFrom,
-      to: doc.length - 1,
+      to: linkTo - 1,
+      kind: "mark",
+      className: "nn-lp-marker-active",
+    }));
+
+    const adjacent = collectMarkdownPreview(state(doc, [{ anchor: linkTo }]));
+    expect(adjacent).toContainEqual(expect.objectContaining({
+      from: urlFrom,
+      to: linkTo - 1,
       kind: "mark",
       className: "nn-lp-marker-active",
     }));

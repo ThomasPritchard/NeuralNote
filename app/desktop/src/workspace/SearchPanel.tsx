@@ -1,5 +1,5 @@
-// Sidebar full-text search panel. The prop contract is FROZEN (see
-// specs/search-and-graph-view.md §Frontend) so Workspace never changes:
+// Sidebar full-text search panel. Workspace can also inject a nonce-backed
+// query request when an editor tag is activated:
 // `focusSignal` bumps when ⌘K / the navigation Search action wants the field focused;
 // `onOpen` routes result clicks through Workspace's guarded open (absolute path).
 //
@@ -37,6 +37,11 @@ type SearchState =
   | { kind: "loading" }
   | { kind: "results"; query: string; response: SearchResponse }
   | { kind: "error" };
+
+export interface SearchQueryRequest {
+  readonly id: number;
+  readonly query: string;
+}
 
 /** Wrap the matched `ranges` of a snippet in <mark>. Ranges are Unicode
  *  CODE-POINT offsets (the Rust side counts `char`s), so slicing goes through
@@ -171,18 +176,29 @@ function SearchResults({
 
 export function SearchPanel({
   focusSignal,
+  queryRequest = null,
   onOpen,
 }: Readonly<{
   focusSignal: number;
+  queryRequest?: SearchQueryRequest | null;
   onOpen: (absPath: string) => void;
 }>) {
   const { reportError } = useVault();
   const [query, setQuery] = useState("");
+  const [externalRequestVersion, setExternalRequestVersion] = useState(0);
   const [state, setState] = useState<SearchState>({ kind: "idle" });
   const inputRef = useRef<HTMLInputElement>(null);
+  const appliedRequestId = useRef<number | null>(null);
   // Monotonic token so a slow response can't overwrite a newer one (the
   // useOpenNote loadId idiom).
   const searchId = useRef(0);
+
+  const updateQuery = useCallback((value: string) => {
+    // Invalidate immediately, before the replacement query's debounce window.
+    // Otherwise an older request can briefly render beneath the new input.
+    searchId.current++;
+    setQuery(value);
+  }, []);
 
   const runSearch = useCallback(
     async (q: string) => {
@@ -215,7 +231,15 @@ export function SearchPanel({
     }
     const timer = setTimeout(() => void runSearch(q), DEBOUNCE_MS);
     return () => clearTimeout(timer);
-  }, [query, runSearch]);
+  }, [externalRequestVersion, query, runSearch]);
+
+  useEffect(() => {
+    if (!queryRequest || appliedRequestId.current === queryRequest.id) return;
+    appliedRequestId.current = queryRequest.id;
+    updateQuery(queryRequest.query);
+    setExternalRequestVersion((version) => version + 1);
+    inputRef.current?.focus();
+  }, [queryRequest, updateQuery]);
 
   // ⌘K / navigation Search: Workspace bumps focusSignal to request focus.
   // 0 is the mount value — never steal focus for it.
@@ -226,7 +250,7 @@ export function SearchPanel({
   const onKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key !== "Escape") return;
     if (query === "") e.currentTarget.blur();
-    else setQuery("");
+    else updateQuery("");
   };
 
   let body: ReactNode;
@@ -284,7 +308,7 @@ export function SearchPanel({
           <input
             ref={inputRef}
             value={query}
-            onChange={(e) => setQuery(e.target.value)}
+            onChange={(e) => updateQuery(e.target.value)}
             onKeyDown={onKeyDown}
             aria-label="Search vault"
             placeholder="Search vault…"

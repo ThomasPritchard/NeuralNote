@@ -42,6 +42,45 @@ describe("Journey 3: create and open a note", () => {
 });
 
 describe("Journey 4: edit and save", () => {
+  it("renders source-backed properties and tables without changing the note", async () => {
+    const content = [
+      "---",
+      "tags: [opsec, reference]",
+      "---",
+      "# Commitments",
+      "",
+      "| Start date | Commitment |",
+      "| --- | --- |",
+      "| 2026-04-03 | DJ gig |",
+    ].join("\n");
+    const { user } = await openVault([
+      { kind: "file", relPath: "Commitments.md", content },
+    ]);
+
+    await user.click(await screen.findByRole("button", { name: "Commitments.md" }));
+    const editor = await screen.findByRole("textbox", { name: "Note content" });
+    const title = await screen.findByRole("heading", { level: 1, name: "Commitments" });
+    const properties = screen.getByRole("button", { name: "Edit note properties" });
+    expect(title.compareDocumentPosition(properties) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    expect(screen.queryByRole("heading", { level: 2, name: /tags/i })).toBeNull();
+    expect(screen.getByRole("table", { name: "Markdown table" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+
+    await user.click(properties);
+    expect(editor.textContent).toContain("tags: [opsec, reference]");
+    expect(screen.getByRole("button", { name: "Done editing note properties" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+
+    await user.click(screen.getByRole("button", { name: "Done editing note properties" }));
+    expect(editor.textContent).not.toContain("tags: [opsec, reference]");
+    expect(screen.getByRole("button", { name: "Search for #opsec" })).toBeInTheDocument();
+
+    await user.click(screen.getByRole("table", { name: "Markdown table" }));
+    expect(editor.textContent).toContain("| --- | --- |");
+    expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
+    await expect(readNote(`${VAULT_ROOT}/Commitments.md`)).resolves.toMatchObject({ raw: content });
+  });
+
   it("turns the displayed title into editable source and saves it", async () => {
     const { user } = await openVault([
       { kind: "file", relPath: "Azure Hierarchy.md", content: "The hierarchy follows a basic model." },

@@ -34,7 +34,9 @@ const tabsState = vi.hoisted(() => ({
 }));
 const captured = vi.hoisted(() => ({
   fileTree: {} as Record<string, (...a: never[]) => void>,
-  notePane: {} as Record<string, (...a: never[]) => void>,
+  notePane: {} as {
+    onSearchTag: (tag: string) => void;
+  },
   ribbon: {} as {
     navigationExpanded: boolean;
     vaultName: string;
@@ -62,7 +64,11 @@ const captured = vi.hoisted(() => ({
     onCloseTab: (id: string) => void;
     onCloseGraph: () => void;
   },
-  searchPanel: {} as { focusSignal: number; onOpen: (absPath: string) => void },
+  searchPanel: {} as {
+    focusSignal: number;
+    queryRequest: { id: number; query: string } | null;
+    onOpen: (absPath: string) => void;
+  },
   graphView: {} as { onOpenNote: (relPath: string) => void },
   chatPane: {} as {
     openNoteAt: (absPath: string) => void;
@@ -128,7 +134,7 @@ vi.mock("./FileTree", () => ({
   },
 }));
 vi.mock("./NotePane", () => ({
-  NotePane: (props: Record<string, (...a: never[]) => void>) => {
+  NotePane: (props: { onSearchTag: (tag: string) => void }) => {
     captured.notePane = props;
     return <div data-testid="notepane" />;
   },
@@ -183,9 +189,20 @@ vi.mock("./TitleBar", () => ({
   },
 }));
 vi.mock("./SearchPanel", () => ({
-  SearchPanel: (props: { focusSignal: number; onOpen: (absPath: string) => void }) => {
+  SearchPanel: (props: {
+    focusSignal: number;
+    queryRequest: { id: number; query: string } | null;
+    onOpen: (absPath: string) => void;
+  }) => {
     captured.searchPanel = props;
-    return <div data-testid="searchpanel" data-focus-signal={props.focusSignal} />;
+    return (
+      <div
+        data-testid="searchpanel"
+        data-focus-signal={props.focusSignal}
+        data-query={props.queryRequest?.query ?? ""}
+        data-query-request-id={props.queryRequest?.id ?? ""}
+      />
+    );
   },
 }));
 vi.mock("./GraphView", () => ({
@@ -844,6 +861,28 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
       "2",
     );
     expect(captured.ribbon.sidebarPanel).toBe("search");
+  });
+
+  it("opens a nonce-backed tag query when the editor activates an inline tag", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    act(() => captured.notePane.onSearchTag("#SaaS"));
+    expect(captured.ribbon.sidebarPanel).toBe("search");
+    expect(screen.getByTestId("searchpanel")).toHaveAttribute(
+      "data-query",
+      "tag:#SaaS",
+    );
+    expect(screen.getByTestId("searchpanel")).toHaveAttribute(
+      "data-query-request-id",
+      "1",
+    );
+
+    act(() => captured.notePane.onSearchTag("#SaaS"));
+    expect(screen.getByTestId("searchpanel")).toHaveAttribute(
+      "data-query-request-id",
+      "2",
+    );
   });
 
   // Menu actions the e2e journey doesn't cover (open-recent, new-note,

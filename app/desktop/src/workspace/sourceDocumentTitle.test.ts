@@ -8,6 +8,7 @@ describe("sourceDocumentTitle", () => {
     ["# Different\nbody", "source"],
     ["\uFEFF#   My Note  \r\nbody", "source"],
     ["---\r\ntags: [one]\r\n---\r\n\r\n# My Note\r\nbody", "source"],
+    ["---\ntags: [one]\n...\n# My Note\nbody", "source"],
     ["---\rtitle: x\r---\r# My Note\rbody", "source"],
     ["   # Indented title\nbody", "source"],
     ["Setext title\n============\nbody", "source"],
