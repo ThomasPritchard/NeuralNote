@@ -28,6 +28,10 @@ vi.mock("./TemplatesSettingsPage", () => ({
   TemplatesSettingsPage: () => <div data-testid="templates-settings-page" />,
 }));
 
+vi.mock("../whats-new/ReleaseNotesArticle", () => ({
+  ReleaseNotesArticle: () => <article data-testid="release-notes-page" />,
+}));
+
 import { SettingsModal } from "./SettingsModal";
 
 function setup(props: Partial<Parameters<typeof SettingsModal>[0]> = {}) {
@@ -43,13 +47,14 @@ describe("SettingsModal — shell", () => {
     expect(screen.queryByRole("dialog")).not.toBeInTheDocument();
   });
 
-  it("opens as a labelled modal dialog, defaulting to General", () => {
+  it("opens as a labelled modal dialog, defaulting to What's new", () => {
     setup();
     const dialog = screen.getByRole("dialog", { name: "Settings" });
     expect(dialog).toHaveAttribute("aria-modal", "true");
-    expect(screen.getByTestId("general-settings-page")).toBeInTheDocument();
+    expect(screen.getByTestId("release-notes-page")).toBeInTheDocument();
     // The section nav lists every shipped section.
     const nav = screen.getByRole("navigation", { name: "Settings sections" });
+    expect(nav).toContainElement(screen.getByRole("button", { name: "What's new" }));
     expect(nav).toContainElement(screen.getByRole("button", { name: "General" }));
     expect(nav).toContainElement(screen.getByRole("button", { name: "Appearance" }));
     expect(nav).toContainElement(screen.getByRole("button", { name: "Templates" }));
@@ -60,8 +65,37 @@ describe("SettingsModal — shell", () => {
     expect(nav).toContainElement(screen.getByRole("button", { name: "About" }));
   });
 
+  it("stacks its navigation and reduces content padding at narrow widths", () => {
+    setup();
+    const dialog = screen.getByRole("dialog", { name: "Settings" });
+    const nav = screen.getByRole("navigation", { name: "Settings sections" });
+    const releaseNotes = screen.getByTestId("release-notes-page");
+    const content = releaseNotes.parentElement;
+
+    expect(dialog).toHaveClass("flex-col", "sm:flex-row");
+    expect(nav).toHaveClass("hidden", "sm:flex", "sm:w-48");
+    const mobileSelector = screen.getByRole("combobox", { name: "Settings section" });
+    expect(mobileSelector.parentElement).toHaveClass("sm:hidden");
+    expect(content).toHaveClass("px-4", "sm:px-6");
+  });
+
+  it("switches sections from the compact mobile selector", async () => {
+    const { user } = setup();
+
+    await user.selectOptions(
+      screen.getByRole("combobox", { name: "Settings section" }),
+      "general",
+    );
+
+    expect(screen.getByTestId("general-settings-page")).toBeInTheDocument();
+    expect(screen.queryByTestId("release-notes-page")).not.toBeInTheDocument();
+  });
+
   it("switches sections from the left nav", async () => {
     const { user } = setup();
+
+    await user.click(screen.getByRole("button", { name: "General" }));
+    expect(screen.getByTestId("general-settings-page")).toBeInTheDocument();
 
     await user.click(screen.getByRole("button", { name: "Appearance" }));
     expect(screen.getByTestId("appearance-settings-page")).toBeInTheDocument();
@@ -83,7 +117,7 @@ describe("SettingsModal — shell", () => {
   });
 
   it("ships a real General section without placeholder copy", () => {
-    setup();
+    setup({ initialSection: "general" });
     expect(screen.getByRole("button", { name: "General" })).toBeInTheDocument();
     expect(screen.getByTestId("general-settings-page")).toBeInTheDocument();
     expect(screen.queryByText(/coming soon/i)).not.toBeInTheDocument();
@@ -93,6 +127,12 @@ describe("SettingsModal — shell", () => {
     setup({ initialSection: "about" });
     expect(screen.getByText("NeuralNote")).toBeInTheDocument();
     expect(screen.queryByTestId("ai-settings-page")).not.toBeInTheDocument();
+  });
+
+  it("honours an explicit General route without showing release notes", () => {
+    setup({ initialSection: "general" });
+    expect(screen.getByTestId("general-settings-page")).toBeInTheDocument();
+    expect(screen.queryByTestId("release-notes-page")).not.toBeInTheDocument();
   });
 
   it("describes only shipped capabilities in the About copy (PA-004)", () => {

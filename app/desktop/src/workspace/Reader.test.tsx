@@ -51,10 +51,10 @@ describe("Reader — body rendering", () => {
     expect(withoutRepeatedLeadingTitle(body, "My Note")).toBe(body);
   });
 
-  it("renders markdown for a .md note with a type chip and title", () => {
+  it("renders markdown for a .md note with a title and no file-type pill", () => {
     render(<Reader note={doc()} />);
     expect(screen.getByText("My Note")).toBeInTheDocument();
-    expect(screen.getByText("Markdown")).toBeInTheDocument();
+    expect(screen.queryByText("Markdown")).not.toBeInTheDocument();
     expect(
       screen.getByRole("heading", { level: 1, name: "Heading" }),
     ).toBeInTheDocument();
@@ -97,7 +97,7 @@ describe("Reader — body rendering", () => {
       />,
     );
     expect(screen.getByText("plain readme")).toBeInTheDocument();
-    expect(screen.getByText("File")).toBeInTheDocument();
+    expect(screen.queryByText("File")).not.toBeInTheDocument();
   });
 
   it("shows the binary notice with no raw dump even when raw is present", () => {
@@ -128,7 +128,7 @@ describe("Reader — body rendering", () => {
     );
     expect(screen.getByText(/Preview not available for \.json/i)).toBeInTheDocument();
     expect(container.querySelector("pre")?.textContent).toBe('{"a":1}');
-    expect(screen.getByText(".JSON")).toBeInTheDocument();
+    expect(screen.queryByText(".JSON")).not.toBeInTheDocument();
   });
 
   it("shows no raw dump for non-text, non-markdown files", () => {

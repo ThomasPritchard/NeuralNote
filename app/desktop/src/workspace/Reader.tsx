@@ -10,8 +10,6 @@ import type { NoteDoc } from "../lib/types";
 import { BacklinksPanel } from "./BacklinksPanel";
 import {
   extFromPath,
-  extLabel,
-  iconForFile,
   isMarkdownExt,
   isMarkdownRenderable,
   isTextLikeExt,
@@ -54,16 +52,11 @@ export function NoteDocumentFrame({
   suppressTitle?: boolean;
 }>) {
   const ext = extFromPath(note.path);
-  const TypeIcon = iconForFile(ext);
   return (
     <article className="relative flex-1 overflow-y-auto px-8 py-10">
       <div className="relative mx-auto w-full max-w-[72ch]">
-        <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/12 px-2.5 py-1 text-[0.6875rem] font-medium text-primary ring-1 ring-inset ring-primary/20">
-          <TypeIcon className="size-3" aria-hidden /> {extLabel(ext)}
-        </span>
-
         {!suppressTitle && (
-          <h1 className="nn-heading mt-4 text-[1.75rem] font-semibold leading-tight tracking-tight">
+          <h1 className="nn-heading text-[1.75rem] font-semibold leading-tight tracking-tight">
             {note.title}
           </h1>
         )}

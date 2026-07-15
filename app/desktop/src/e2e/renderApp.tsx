@@ -13,6 +13,8 @@ import { cleanup, render } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { clearMocks } from "@tauri-apps/api/mocks";
 import App from "../App";
+import { DEFAULT_PREFERENCES } from "../preferences/preferences";
+import { CURRENT_RELEASE_NOTES } from "../whats-new/releaseNotes";
 import { createMockVault, type CreateMockVaultOptions, type MockVault } from "./mockVault";
 
 afterEach(() => {
@@ -30,6 +32,17 @@ export function renderApp(opts?: CreateMockVaultOptions): RenderAppResult {
   const backend = createMockVault(opts);
   backend.install();
   const user = userEvent.setup();
-  render(<App />);
+  render(
+    <App
+      initialPreferences={{
+        preferences: {
+          ...DEFAULT_PREFERENCES,
+          lastSeenWhatsNewVersion: CURRENT_RELEASE_NOTES.version,
+        },
+        recoveredFromCorrupt: false,
+        recoveryMessage: null,
+      }}
+    />,
+  );
   return { user, backend };
 }

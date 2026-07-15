@@ -19,7 +19,6 @@ import {
   readBacklinks,
   readLinkGraph,
   readNote,
-  readRichNote,
   resetWorkspaceState,
   saveWorkspaceState,
   searchVault,
@@ -35,20 +34,6 @@ afterEach(() => {
 const seedVault = (seed: SeedEntry[]): void => {
   createMockVault({ seed }).install();
 };
-
-describe("mockVault rich-edit compatibility", () => {
-  it("mirrors the native raw fallback for wikilinks", async () => {
-    seedVault([{ kind: "file", relPath: "wiki.md", content: "Go to [[Target]]." }]);
-
-    await expect(readRichNote(`${VAULT_ROOT}/wiki.md`)).resolves.toMatchObject({
-      disposition: {
-        kind: "raw",
-        reason: { code: "unsupported_syntax" },
-      },
-      body: "Go to [[Target]].",
-    });
-  });
-});
 
 describe("mockVault exact-turn chat cancellation", () => {
   const turnId = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e31";

@@ -10,7 +10,6 @@ use std::path::{Path, PathBuf};
 use neuralnote_core::model::{
     Backlinks, LinkGraph, NoteDoc, RecentVault, SearchResponse, TemplateInfo, TreeNode, Vault,
 };
-use neuralnote_core::rich_edit::{RichEditDocument, RichEditPatch};
 use neuralnote_core::CoreError;
 use notify::{RecommendedWatcher, RecursiveMode, Watcher};
 use tauri::{AppHandle, Emitter};
@@ -271,7 +270,7 @@ pub(crate) fn close_vault(app: AppHandle, state: SharedState) {
     refresh_menu(&app);
 }
 
-/// Pushed from the webview whenever a text note enters or leaves edit mode. The
+/// Pushed from the webview whenever an editable text note opens or closes. The
 /// native Format menu items only do anything while the editor is mounted, so they
 /// track this flag rather than mere vault-open — an enabled Format item that did
 /// nothing would be a silent no-op. Skips the rebuild when the flag is unchanged.
@@ -339,26 +338,6 @@ pub(crate) async fn write_note(
         .run(|root| {
             neuralnote_core::note::write_note(root, Path::new(&path), &content, expected_hash)
         })
-        .await
-}
-
-#[tauri::command]
-pub(crate) async fn read_rich_note(
-    state: SharedState<'_>,
-    path: String,
-) -> Result<RichEditDocument, CoreError> {
-    neuralnote_core::note::read_rich_note(&root_of(&state)?, Path::new(&path))
-}
-
-#[tauri::command]
-pub(crate) async fn write_rich_note(
-    state: SharedState<'_>,
-    path: String,
-    patch: RichEditPatch,
-) -> Result<NoteDoc, CoreError> {
-    let mutation = vault_mutation_of(&state)?;
-    mutation
-        .run(|root| neuralnote_core::note::write_rich_note(root, Path::new(&path), &patch))
         .await
 }
 

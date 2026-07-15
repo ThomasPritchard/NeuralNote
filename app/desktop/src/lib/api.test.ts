@@ -45,7 +45,6 @@ import {
   readBacklinks,
   readLinkGraph,
   readNote,
-  readRichNote,
   readTree,
   refreshReasoningSupport,
   renameEntry,
@@ -60,7 +59,6 @@ import {
   setMenuEditing,
   undoSkillRun,
   writeNote,
-  writeRichNote,
 } from "./api";
 import type { AiStatus, ChatEvent, PullEvent } from "./types";
 
@@ -210,31 +208,6 @@ describe("AI config mutation sequencing", () => {
       await mutation;
     }
     if (failure) throw failure;
-  });
-});
-
-describe("rich note wrappers", () => {
-  it("reads the guarded rich document without exposing source offsets", async () => {
-    await readRichNote("/vault/note.md");
-
-    expect(mockInvoke).toHaveBeenCalledWith("read_rich_note", {
-      path: "/vault/note.md",
-    });
-  });
-
-  it("writes only the opaque source-range patch", async () => {
-    const patch = {
-      expectedRevision: "rev-1",
-      changedBlockIds: ["block-a"],
-      replacementMarkdown: "Changed\n",
-    };
-
-    await writeRichNote("/vault/note.md", patch);
-
-    expect(mockInvoke).toHaveBeenCalledWith("write_rich_note", {
-      path: "/vault/note.md",
-      patch,
-    });
   });
 });
 

@@ -29,8 +29,6 @@ import type {
   PullEvent,
   Recommendation,
   RecentVault,
-  RichEditDocument,
-  RichEditPatch,
   SearchResponse,
   SkillListing,
   TemplateInfo,
@@ -123,9 +121,9 @@ export const resetWorkspaceState = () =>
   invoke<WorkspaceStateLoad>("reset_workspace_state");
 
 /**
- * Tell the native menu whether a note is open in edit mode, so it can enable the
- * Format items only when they'd actually do something (the Editor that handles
- * them is mounted only in edit mode). Best-effort — the enabled state is cosmetic.
+ * Tell the native menu whether an editable text note is open, so it can enable
+ * Format items only while the source editor can handle them. Best-effort — the
+ * enabled state is cosmetic.
  */
 export const setMenuEditing = (editing: boolean) =>
   invoke<void>("set_menu_editing", { editing });
@@ -143,9 +141,6 @@ export const readTree = () => invoke<TreeNode[]>("read_tree");
 
 export const readNote = (path: string) => invoke<NoteDoc>("read_note", { path });
 
-export const readRichNote = (path: string) =>
-  invoke<RichEditDocument>("read_rich_note", { path });
-
 /** Save a note. Pass the NoteDoc.contentHash as `expectedHash` for optimistic
  *  concurrency (rejects with a conflict if the file changed on disk); pass null
  *  to force the overwrite. Returns the fresh NoteDoc built from the saved bytes. */
@@ -154,9 +149,6 @@ export const writeNote = (
   content: string,
   expectedHash: string | null = null,
 ) => invoke<NoteDoc>("write_note", { path, content, expectedHash });
-
-export const writeRichNote = (path: string, patch: RichEditPatch) =>
-  invoke<NoteDoc>("write_rich_note", { path, patch });
 
 // ── File / folder operations ─────────────────────────────────────────────────
 export const createFolder = (parentPath: string, name: string) =>

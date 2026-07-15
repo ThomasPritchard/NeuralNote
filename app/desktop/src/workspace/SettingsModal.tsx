@@ -9,6 +9,7 @@ import { useRef, useState } from "react";
 import {
   Info,
   LayoutTemplate,
+  Megaphone,
   Palette,
   SlidersHorizontal,
   Sparkles,
@@ -30,8 +31,10 @@ import { SkillsSettingsPage } from "./SkillsSettingsPage";
 import { GeneralSettingsPage } from "./GeneralSettingsPage";
 import { AppearanceSettingsPage } from "./AppearanceSettingsPage";
 import { TemplatesSettingsPage } from "./TemplatesSettingsPage";
+import { ReleaseNotesArticle } from "../whats-new/ReleaseNotesArticle";
 
 export type SettingsSection =
+  | "whatsNew"
   | "general"
   | "appearance"
   | "templates"
@@ -44,6 +47,7 @@ const SECTIONS: ReadonlyArray<{
   label: string;
   icon: LucideIcon;
 }> = [
+  { id: "whatsNew", label: "What's new", icon: Megaphone },
   { id: "general", label: "General", icon: SlidersHorizontal },
   { id: "appearance", label: "Appearance", icon: Palette },
   { id: "templates", label: "Templates", icon: LayoutTemplate },
@@ -90,7 +94,7 @@ function SettingsDialog({
       <DialogContent
         ref={dialogRef}
         hideClose
-        className="flex h-[min(82vh,42rem)] max-w-4xl overflow-hidden p-0"
+        className="flex h-[min(82vh,42rem)] max-w-4xl flex-col overflow-hidden p-0 sm:flex-row"
         onOpenAutoFocus={(event) => {
           event.preventDefault();
           dialogRef.current?.focus();
@@ -105,14 +109,31 @@ function SettingsDialog({
       />
       <DialogTitle className="sr-only">Settings</DialogTitle>
       <DialogDescription className="sr-only">
-        Configure general behaviour, appearance, templates, AI, skills, and
-        application information.
+        Review what's new and configure general behaviour, appearance,
+        templates, AI, skills, and application information.
       </DialogDescription>
+        <div className="flex shrink-0 items-center gap-3 border-b border-border bg-sidebar/60 p-3 sm:hidden">
+          <span className="nn-heading text-sm font-semibold text-foreground">
+            Settings
+          </span>
+          <select
+            aria-label="Settings section"
+            value={section}
+            onChange={(event) => setSection(event.currentTarget.value as SettingsSection)}
+            className="h-9 min-w-0 flex-1 rounded-md border border-input bg-background px-3 text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {SECTIONS.map((settingsSection) => (
+              <option key={settingsSection.id} value={settingsSection.id}>
+                {settingsSection.label}
+              </option>
+            ))}
+          </select>
+        </div>
         <nav
           aria-label="Settings sections"
-          className="flex w-48 shrink-0 flex-col gap-1 border-r border-border bg-sidebar/60 p-3"
+          className="hidden w-48 shrink-0 flex-col gap-1 border-r border-border bg-sidebar/60 p-3 sm:flex sm:w-48"
         >
-          <h2 className="nn-heading px-2.5 pb-2 pt-1 text-sm font-semibold text-foreground">
+          <h2 className="nn-heading w-full px-2.5 pb-2 pt-1 text-sm font-semibold text-foreground">
             Settings
           </h2>
           {SECTIONS.map((s) => (
@@ -142,7 +163,8 @@ function SettingsDialog({
           >
             <X className="size-4" aria-hidden />
           </IconButton>
-          <div className="min-h-0 flex-1 overflow-y-auto px-6 py-5">
+          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-5 sm:px-6">
+            {section === "whatsNew" && <ReleaseNotesArticle />}
             {section === "general" && <GeneralSettingsPage />}
             {section === "appearance" && <AppearanceSettingsPage />}
             {section === "templates" && <TemplatesSettingsPage />}
@@ -159,7 +181,7 @@ function SettingsDialog({
 export function SettingsModal({
   open,
   onClose,
-  initialSection = "general",
+  initialSection = "whatsNew",
 }: Readonly<{
   open: boolean;
   onClose: () => void;

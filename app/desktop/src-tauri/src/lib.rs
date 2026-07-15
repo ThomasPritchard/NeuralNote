@@ -92,8 +92,8 @@ pub(crate) struct AppState {
     /// per-write logging/validation must cover those reset sites too, not just
     /// `set_chat_visible`.
     pub(crate) chat_visible: bool,
-    /// Whether a text note is currently open in edit mode. The Format menu items
-    /// only do anything when the editor is mounted (edit mode), so they're enabled
+    /// Whether an editable text note is currently open. The Format menu items
+    /// only do anything when the source editor is mounted, so they're enabled
     /// only when this is true — an enabled-but-inert Format item would be a silent
     /// no-op. Pushed from the webview via `set_menu_editing`; reset on vault change.
     pub(crate) editing: bool,
@@ -270,8 +270,6 @@ pub fn run() {
             commands::vault::read_tree,
             commands::vault::read_note,
             commands::vault::write_note,
-            commands::vault::read_rich_note,
-            commands::vault::write_rich_note,
             commands::vault::search_vault,
             commands::vault::read_link_graph,
             commands::vault::read_backlinks,

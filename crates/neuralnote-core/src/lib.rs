@@ -16,7 +16,6 @@ pub mod note;
 pub mod paths;
 pub mod preferences;
 pub mod recents;
-pub mod rich_edit;
 pub mod search;
 pub mod templates;
 pub mod tree;
@@ -127,6 +126,40 @@ mod tests {
         assert_eq!(fs::read_to_string(&f).unwrap(), "new content");
         // write_note returns the fresh doc — no separate re-read needed.
         assert_eq!(saved.raw, "new content");
+    }
+
+    #[test]
+    fn full_document_write_enforces_the_editable_note_byte_limit_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("n.md");
+        fs::write(&f, "original").unwrap();
+
+        let exact = "a".repeat(note::MAX_EDITABLE_NOTE_BYTES);
+        assert!(note::write_note(dir.path(), &f, &exact, None).is_ok());
+        assert_eq!(
+            fs::metadata(&f).unwrap().len() as usize,
+            note::MAX_EDITABLE_NOTE_BYTES
+        );
+
+        let oversized = "界".repeat(note::MAX_EDITABLE_NOTE_BYTES / 3 + 1);
+        let error = note::write_note(dir.path(), &f, &oversized, None).unwrap_err();
+        assert!(matches!(error, CoreError::InvalidContent(_)));
+        assert_eq!(
+            fs::metadata(&f).unwrap().len() as usize,
+            note::MAX_EDITABLE_NOTE_BYTES
+        );
+    }
+
+    #[test]
+    fn full_document_write_preserves_bom_mixed_endings_tabs_and_trailing_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("n.md");
+        fs::write(&f, "seed").unwrap();
+        let exact = "\u{feff}# title\r\n\tCR line  \rLF line \nUnicode: café 界\r\n";
+
+        note::write_note(dir.path(), &f, exact, None).unwrap();
+
+        assert_eq!(fs::read(&f).unwrap(), exact.as_bytes());
     }
 
     #[test]

@@ -3,10 +3,6 @@
 use crate::error::{CoreError, CoreResult};
 use crate::model::NoteDoc;
 use crate::paths::{ensure_within, rel_path};
-use crate::rich_edit::{
-    analyze_note_for_rich_edit, apply_rich_edit_patch, RichEditDocument, RichEditError,
-    RichEditPatch,
-};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -14,6 +10,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// Per-process counter making each write's temp sibling unique, so two concurrent
 /// writers of the same note never collide on the temp path (PA-016).
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Maximum complete UTF-8 source document accepted by the editable note write
+/// boundary. Checked before conflict reads or filesystem mutation.
+pub const MAX_EDITABLE_NOTE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Stable content fingerprint for optimistic-concurrency conflict detection.
 /// `DefaultHasher::new()` uses fixed keys, so the digest is stable across runs.
@@ -106,43 +106,6 @@ pub fn read_note(root: &Path, target: &Path) -> CoreResult<NoteDoc> {
     }
 }
 
-/// Read a note for guarded rich editing without ever lossily decoding bytes.
-/// The core owns path authorization and Markdown compatibility analysis; hosts
-/// only forward the resulting source-preserving DTO.
-pub fn read_rich_note(root: &Path, target: &Path) -> CoreResult<RichEditDocument> {
-    let path = ensure_within(root, target)?;
-    if !path.is_file() {
-        return Err(CoreError::NotFound(path.display().to_string()));
-    }
-    let bytes = std::fs::read(path)?;
-    analyze_note_for_rich_edit(&bytes).map_err(rich_edit_error_to_core)
-}
-
-/// Apply a validated source-range patch and atomically persist the exact result.
-/// A second optimistic-concurrency check in [`write_note`] closes the ordinary
-/// external-edit window between analysis and the atomic replace.
-pub fn write_rich_note(root: &Path, target: &Path, patch: &RichEditPatch) -> CoreResult<NoteDoc> {
-    let path = ensure_within(root, target)?;
-    if !path.is_file() {
-        return Err(CoreError::NotFound(path.display().to_string()));
-    }
-    let current = std::fs::read(&path)?;
-    let applied = apply_rich_edit_patch(&current, patch).map_err(rich_edit_error_to_core)?;
-    write_note(
-        root,
-        &path,
-        &applied.content,
-        Some(patch.expected_revision.clone()),
-    )
-}
-
-fn rich_edit_error_to_core(error: RichEditError) -> CoreError {
-    match error {
-        RichEditError::StaleRevision => CoreError::Conflict(error.to_string()),
-        other => CoreError::InvalidContent(other.to_string()),
-    }
-}
-
 /// Whether a path is a text note we should always try to show as text (decoding
 /// lossily if needed) rather than treat as a binary attachment.
 fn is_text_note(path: &Path) -> bool {
@@ -176,6 +139,13 @@ pub fn write_note(
     content: &str,
     expected_hash: Option<String>,
 ) -> CoreResult<NoteDoc> {
+    if content.len() > MAX_EDITABLE_NOTE_BYTES {
+        return Err(CoreError::InvalidContent(format!(
+            "note is {} bytes; editable notes are limited to {} bytes",
+            content.len(),
+            MAX_EDITABLE_NOTE_BYTES,
+        )));
+    }
     let path = ensure_within(root, target)?;
     if !path.is_file() {
         return Err(CoreError::NotFound(path.display().to_string()));

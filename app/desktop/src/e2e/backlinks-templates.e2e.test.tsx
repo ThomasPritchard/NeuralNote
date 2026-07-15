@@ -1,5 +1,5 @@
 // Journeys 14-19: backlinks, wikilinks, autocomplete, and templates.
-//   14–15. Wikilinks use the source-preserving raw fallback in 0.2.0.
+//   14–15. Wikilinks remain source-backed while previewing in place.
 //   16. The backlinks panel shows linked + unlinked mentions, and a linked row
 //       opens its source note.
 //   17. The editor's [[ autocomplete lists matching notes and inserts a link.
@@ -7,7 +7,8 @@
 //   19. Ordinary New note stays blank-note-simple and never loads templates.
 
 import { describe, it, expect } from "vitest";
-import { screen, within } from "@testing-library/react";
+import { fireEvent, screen, within } from "@testing-library/react";
+import { EditorView } from "@codemirror/view";
 import { renderApp, type RenderAppResult } from "./renderApp";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
 
@@ -30,32 +31,40 @@ async function openVault(seed: SeedEntry[]): Promise<RenderAppResult> {
   return result;
 }
 
-describe("Journey 14: resolved wikilink fallback", () => {
-  it("keeps a resolved [[wikilink]] exact in the raw editor", async () => {
+describe("Journey 14: resolved wikilink preview", () => {
+  it("previews a resolved [[wikilink]] in the source editor without navigation", async () => {
     const { user } = await openVault(FEATURE_SEED);
 
     await user.click(await screen.findByRole("button", { name: "Link Hub.md" }));
     expect(await screen.findByRole("heading", { name: "Link Hub", level: 1 })).toBeInTheDocument();
 
-    expect(await screen.findByText(/Wikilinks are open as raw Markdown/)).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "Note source" })).toHaveValue(
-      "Go to [[Target]].",
-    );
+    expect(await screen.findByRole("textbox", { name: "Note content" })).toHaveTextContent("Go to Target.");
+    expect(document.querySelector(".nn-lp-wikilink-resolved")).toHaveTextContent("Target");
     expect(screen.queryByRole("link", { name: "Target" })).not.toBeInTheDocument();
   });
 });
 
-describe("Journey 15: unresolved wikilink fallback", () => {
+describe("Journey 14b: source-preview link navigation", () => {
+  it("opens a resolved internal Markdown link on modifier-click", async () => {
+    const { user } = await openVault(FEATURE_SEED);
+
+    await user.click(await screen.findByRole("button", { name: "Source Md.md" }));
+    await screen.findByRole("heading", { name: "Source Md", level: 1 });
+    fireEvent.mouseDown(document.querySelector(".nn-lp-link")!, { metaKey: true });
+
+    expect(await screen.findByRole("heading", { name: "Target", level: 1 })).toBeInTheDocument();
+  });
+});
+
+describe("Journey 15: unresolved wikilink preview", () => {
   it("keeps an unresolved [[wikilink]] exact and editable as Markdown", async () => {
     const { user } = await openVault(FEATURE_SEED);
 
     await user.click(await screen.findByRole("button", { name: "Unresolved.md" }));
     expect(await screen.findByRole("heading", { name: "Unresolved", level: 1 })).toBeInTheDocument();
 
-    expect(await screen.findByText(/Wikilinks are open as raw Markdown/)).toBeInTheDocument();
-    expect(screen.getByRole("textbox", { name: "Note source" })).toHaveValue(
-      "This points at [[Missing Note]].",
-    );
+    expect(await screen.findByRole("textbox", { name: "Note content" })).toHaveTextContent("This points at Missing Note.");
+    expect(document.querySelector(".nn-lp-wikilink-unresolved")).toHaveTextContent("Missing Note");
   });
 });
 
@@ -97,15 +106,20 @@ describe("Journey 17: editor wikilink autocomplete", () => {
 
     await user.click(await screen.findByRole("button", { name: "Draft.md" }));
     expect(await screen.findByRole("heading", { name: "Draft", level: 1 })).toBeInTheDocument();
-    const textarea = screen.getByRole("textbox", { name: "Note source" });
-    await user.clear(textarea);
+    const textarea = screen.getByRole("textbox", { name: "Note content" });
+    await user.click(textarea);
+    await user.keyboard("{Control>}a{/Control}{Backspace}");
     await user.type(textarea, "Refer to [[[[Ta");
 
-    const listbox = await screen.findByRole("listbox", { name: "Link to note" });
-    expect(within(listbox).getByRole("option", { name: /Target/ })).toBeInTheDocument();
+    const listbox = await screen.findByRole("listbox");
+    const target = within(listbox).getByRole("option", { name: /Target/ });
+    expect(target).toBeInTheDocument();
 
-    await user.keyboard("{Enter}");
-    expect(textarea).toHaveValue("Refer to [[Target]]");
+    await user.click(target);
+    const view = EditorView.findFromDOM(textarea)!;
+    expect(view.state.doc.toString()).toBe("Refer to [[Target]]");
+    view.dispatch({ selection: { anchor: view.state.doc.length } });
+    expect(textarea).toHaveTextContent("Refer to Target");
   });
 });
 
@@ -143,7 +157,8 @@ describe("Journey 19: create without templates", () => {
     await user.type(screen.getByLabelText("New note name"), "Scratch{Enter}");
 
     expect(await screen.findByRole("heading", { name: "Scratch", level: 1 })).toBeInTheDocument();
-    expect(await screen.findByRole("textbox", { name: "Note content" })).toHaveTextContent("");
+    const editor = await screen.findByRole("textbox", { name: "Note content" });
+    expect(EditorView.findFromDOM(editor)?.state.doc.toString()).toBe("");
     expect(backend.calls).toContain("create_note");
     expect(backend.calls).not.toContain("list_templates");
     expect(backend.calls).not.toContain("create_note_from_template");

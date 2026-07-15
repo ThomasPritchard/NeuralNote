@@ -1,4 +1,4 @@
-import { render, screen, waitFor } from "@testing-library/react";
+import { render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "../lib/api";
@@ -11,7 +11,6 @@ vi.mock("../lib/api", async (importOriginal) => {
     ...actual,
     openRouterModelMenu: vi.fn(),
     selectOpenRouterModel: vi.fn(),
-    openOpenRouterRankings: vi.fn(),
   };
 });
 
@@ -41,7 +40,6 @@ const menu: OpenRouterModelMenu = {
 
 const mockMenu = vi.mocked(api.openRouterModelMenu);
 const mockSelect = vi.mocked(api.selectOpenRouterModel);
-const mockOpenRankings = vi.mocked(api.openOpenRouterRankings);
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -74,26 +72,24 @@ describe("ChatModelMenu", () => {
     vi.clearAllMocks();
     mockMenu.mockResolvedValue(menu);
     mockSelect.mockResolvedValue(openRouterStatus("anthropic/claude-sonnet-4"));
-    mockOpenRankings.mockResolvedValue(undefined);
   });
 
-  it("loads the OpenRouter ranking lazily and pins the unranked current model", async () => {
+  it("loads lazily and renders only model display names with selected state", async () => {
     setup();
     expect(mockMenu).not.toHaveBeenCalled();
 
     await openMenu();
 
-    expect(await screen.findByRole("menuitemradio", { name: /current.*openai\/gpt-5/i })).toBeChecked();
-    expect(
-      screen.getByRole("menuitemradio", {
-        name: /#1.*claude sonnet 4.*anthropic\/claude-sonnet-4.*200k context/i,
-      }),
-    ).toBeInTheDocument();
-    expect(screen.getByText("anthropic/claude-sonnet-4 · 200k context")).toHaveClass("nn-mono");
+    const modelMenu = screen.getByRole("menu");
+    expect(await within(modelMenu).findByRole("menuitemradio", { name: "gpt-5" })).toBeChecked();
+    expect(within(modelMenu).getByRole("menuitemradio", { name: "Claude Sonnet 4" })).toBeInTheDocument();
+    expect(within(modelMenu).getByRole("menuitemradio", { name: "Gemini 2.5 Pro" })).toBeInTheDocument();
+    expect(within(modelMenu).queryByText("Current")).not.toBeInTheDocument();
+    expect(within(modelMenu).queryByText(/#1/)).not.toBeInTheDocument();
+    expect(within(modelMenu).queryByText("anthropic/claude-sonnet-4")).not.toBeInTheDocument();
+    expect(within(modelMenu).queryByText(/200k context/i)).not.toBeInTheDocument();
+    expect(within(modelMenu).queryByText(/source: openrouter/i)).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: /choose ai model/i, hidden: true })).toHaveClass("nn-mono");
-    expect(
-      screen.getByText("Source: OpenRouter (openrouter.ai/rankings), as of 2026-07-13"),
-    ).toHaveClass("nn-mono");
     expect(mockMenu).toHaveBeenCalledExactlyOnceWith(false);
   });
 
@@ -135,18 +131,12 @@ describe("ChatModelMenu", () => {
     const { onStatusChange } = setup();
     await openMenu();
 
-    await userEvent.click(
-      await screen.findByRole("menuitemradio", { name: /anthropic\/claude-sonnet-4/i }),
-    );
+    await userEvent.click(await screen.findByRole("menuitemradio", { name: "Claude Sonnet 4" }));
     await waitFor(() => expect(onStatusChange).toHaveBeenCalledOnce());
 
     await openMenu();
-    expect(
-      await screen.findByRole("menuitemradio", { name: /anthropic\/claude-sonnet-4/i }),
-    ).toBeInTheDocument();
-    expect(
-      screen.queryByRole("menuitemradio", { name: /current model openai\/gpt-5/i }),
-    ).not.toBeInTheDocument();
+    expect(await screen.findByRole("menuitemradio", { name: "Claude Sonnet 4" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitemradio", { name: "gpt-5" })).not.toBeInTheDocument();
     expect(mockMenu).toHaveBeenCalledTimes(2);
     expect(mockMenu).toHaveBeenNthCalledWith(2, false);
   });
@@ -169,26 +159,6 @@ describe("ChatModelMenu", () => {
     ).toBeInTheDocument();
   });
 
-  it("opens the native-owned attribution target", async () => {
-    setup();
-    await openMenu();
-
-    await userEvent.click(await screen.findByRole("menuitem", { name: /source: openrouter/i }));
-
-    expect(mockOpenRankings).toHaveBeenCalledOnce();
-  });
-
-  it("surfaces a native attribution failure without closing the menu", async () => {
-    mockOpenRankings.mockRejectedValueOnce(new Error("browser unavailable"));
-    setup();
-    await openMenu();
-
-    await userEvent.click(await screen.findByRole("menuitem", { name: /source: openrouter/i }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("browser unavailable");
-    expect(screen.getByRole("menu")).toBeInTheDocument();
-  });
-
   it("supports keyboard opening, arrow navigation, Escape, and focus return", async () => {
     const user = userEvent.setup();
     setup();
@@ -196,8 +166,8 @@ describe("ChatModelMenu", () => {
     trigger.focus();
 
     await user.keyboard("{Enter}");
-    const current = await screen.findByRole("menuitemradio", { name: /current.*gpt-5/i });
-    const ranked = screen.getByRole("menuitemradio", { name: /claude sonnet 4/i });
+    const current = await screen.findByRole("menuitemradio", { name: "gpt-5" });
+    const ranked = screen.getByRole("menuitemradio", { name: "Claude Sonnet 4" });
     await user.keyboard("{ArrowDown}");
     expect([current, ranked]).toContain(document.activeElement);
 

@@ -3,7 +3,7 @@
 // the active note. State lives in the useOpenNote hook passed down from
 // Workspace; the active-note tab itself lives in the window titlebar.
 
-import { lazy, Suspense, useCallback, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   FileText,
@@ -11,16 +11,15 @@ import {
   RotateCw,
   Save,
 } from "lucide-react";
-import * as api from "../lib/api";
 import { cn } from "../lib/cn";
-import { Editor } from "./Editor";
 import type { NoteIndexEntry } from "./linkResolve";
-import { NoteDocumentFrame, Reader, withoutRepeatedLeadingTitle } from "./Reader";
+import { NoteDocumentFrame, Reader } from "./Reader";
+import { sourceTitleMode } from "./sourceDocumentTitle";
 import type { OpenNote } from "./useOpenNote";
 
-const RichNoteEditor = lazy(() =>
-  import("./RichNoteEditor").then((module) => ({
-    default: module.RichNoteEditor,
+const SourceNoteEditor = lazy(() =>
+  import("./SourceNoteEditor").then((module) => ({
+    default: module.SourceNoteEditor,
   })),
 );
 
@@ -88,7 +87,7 @@ function SaveAnnouncements({
   );
 }
 
-function RichSaveNotices({ open }: Readonly<{ open: OpenNote }>) {
+function SaveNotices({ open }: Readonly<{ open: OpenNote }>) {
   return (
     <>
       {open.conflict && (
@@ -135,98 +134,54 @@ function TextNoteBody({
   reportError,
 }: Readonly<Required<Pick<NotePaneProps, "open">> & Omit<NotePaneProps, "open">>) {
   const note = open.note!;
-  const rich = open.richDocument;
-  const loadKeyRef = useRef<string | null>(null);
-  const openRef = useRef(open);
-  openRef.current = open;
-  const fallbackReason =
-    open.richError ??
-    (rich?.disposition.kind === "raw" ? rich.disposition.reason.message : null);
-  const richReady = rich?.disposition.kind === "rich";
-  const visibleBody = richReady ? open.richBody : open.draft;
-  const richBodyOwnsDerivedTitle =
-    richReady &&
-    withoutRepeatedLeadingTitle(visibleBody, note.title) !== visibleBody;
-
-  useEffect(() => {
-    if (rich || open.richError) return;
-    const loadKey = `${note.path}:${note.contentHash}`;
-    if (loadKeyRef.current === loadKey) return;
-    loadKeyRef.current = loadKey;
-    let cancelled = false;
-    void api.readRichNote(note.path).then(
-      (document) => {
-        if (!cancelled) openRef.current.setRichDocument(document);
-      },
-      (error: unknown) => {
-        if (!cancelled) openRef.current.setRichError(api.errorMessage(error));
-      },
-    );
-    return () => {
-      cancelled = true;
-    };
-  }, [note.contentHash, note.path, open.richError, rich]);
-
-  const continueRaw = useCallback(
-    (message: string) => openRef.current.setRichError(message),
-    [],
-  );
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const titleMode = sourceTitleMode(open.draft, {
+    frontmatterError: Boolean(note.frontmatterError),
+  });
 
   return (
     <NoteDocumentFrame
       note={note}
       onOpenLink={onOpenLink}
-      suppressTitle={richBodyOwnsDerivedTitle}
+      suppressTitle={titleMode !== "external"}
     >
-      {fallbackReason && (
+      <SaveNotices open={open} />
+      {open.preservationError && (
         <div
-          role="status"
-          className="mb-4 flex items-start gap-2 rounded-lg border border-warning/30 bg-warning/10 px-3 py-2 text-[0.75rem] text-warning"
+          role="alert"
+          className="mb-4 flex items-start gap-2 rounded-lg border border-destructive/30 bg-destructive/10 px-3 py-2 text-[0.75rem] text-destructive"
         >
           <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
-          <span>{fallbackReason} Continue in raw Markdown; your source is unchanged.</span>
+          <span>{open.preservationError}</span>
         </div>
       )}
-      {richReady && <RichSaveNotices open={open} />}
+      {previewError && (
+        <div role="status" className="mb-4 text-[0.75rem] text-muted-foreground">
+          Live preview is temporarily unavailable: {previewError}
+        </div>
+      )}
       <div className="flex min-h-[50vh] flex-col">
-        {richReady ? (
-          <Suspense
-            fallback={
-              <p role="status" className="text-sm text-muted-foreground">
-                Loading rich editor…
-              </p>
-            }
-          >
-            <RichNoteEditor
-              document={rich}
-              body={open.richBody}
-              sourceRelPath={note.relPath}
-              onBodyChange={open.setRichBody}
-              onFallback={continueRaw}
-              onUndo={open.undoRich}
-              onRedo={open.redoRich}
-              noteIndex={noteIndex}
-              onOpenLink={onOpenLink}
-              reportError={reportError}
-            />
-          </Suspense>
-        ) : rich === null && fallbackReason === null ? (
-          <p role="status" className="text-sm text-muted-foreground">
-            Checking Markdown compatibility…
-          </p>
-        ) : (
-          <Editor
-            key={note.path}
+        <Suspense
+          fallback={
+            <p role="status" className="text-sm text-muted-foreground">
+              Loading source editor…
+            </p>
+          }
+        >
+          <SourceNoteEditor
+            sessionKey={open.sessionKey ?? note.path}
+            loadedHash={open.sessionHash ?? note.contentHash}
             value={open.draft}
             onChange={open.setDraft}
-            saveError={open.saveError}
-            conflict={open.conflict}
-            onOverwrite={() => void open.overwrite()}
-            onReload={open.reload}
-            noteIndex={noteIndex}
+            onPreservationError={open.setPreservationError}
+            onPreviewError={setPreviewError}
             reportError={reportError}
+            noteIndex={noteIndex}
+            onOpenLink={onOpenLink}
+            sourceRelPath={note.relPath}
+            derivedTitle={titleMode === "placeholder" ? note.title : undefined}
           />
-        )}
+        </Suspense>
       </div>
     </NoteDocumentFrame>
   );
@@ -299,16 +254,13 @@ export function NotePane({
         </div>
         <div className="flex shrink-0 items-center gap-2">
           {!note.binary && (
-            /* TODO(conflict-save-affordance): disable toolbar Save while
-               open.conflict is true; Reload and Overwrite must be the only
-               resolution actions. Add a focused regression. */
             <button
               type="button"
               onClick={() => void open.save()}
-              disabled={!open.dirty || open.saving}
+              disabled={!open.dirty || open.saving || open.conflict || Boolean(open.preservationError)}
               className={cn(
                 "inline-flex items-center gap-1.5 rounded-md px-2.5 py-1 text-[0.75rem] font-medium transition-colors focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
-                !open.dirty || open.saving
+                !open.dirty || open.saving || open.conflict || Boolean(open.preservationError)
                   ? "cursor-not-allowed bg-muted/50 text-muted-foreground"
                   : "bg-primary text-primary-foreground hover:opacity-90",
               )}
@@ -324,8 +276,7 @@ export function NotePane({
         </div>
       </div>
 
-      {/* Encoding warning — pane-level so it shows in BOTH read and edit mode.
-          It matters most in edit mode, where saving would bake in replacement characters. */}
+      {/* Saving a lossily decoded note bakes replacement characters into source. */}
       {note.lossyText && (
         <div className="flex shrink-0 items-start gap-2 border-b border-warning/30 bg-warning/10 px-5 py-2 text-[0.75rem] text-warning">
           <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />

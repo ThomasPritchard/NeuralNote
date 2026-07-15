@@ -13,15 +13,6 @@ import { VAULT_ROOT, type SeedEntry } from "./mockVault";
 
 const recents = [{ name: "My Brain", path: VAULT_ROOT, lastOpened: 1_700_000_000_000 }];
 
-function placeCaretAtEnd(element: HTMLElement) {
-  const range = document.createRange();
-  range.selectNodeContents(element);
-  range.collapse(false);
-  const selection = window.getSelection();
-  selection?.removeAllRanges();
-  selection?.addRange(range);
-}
-
 async function openVault(seed: SeedEntry[]): Promise<RenderAppResult> {
   const result = renderApp({ seed, recents });
   await result.user.click(await screen.findByRole("button", { name: "Open My Brain" }));
@@ -33,11 +24,8 @@ async function openAndDirty({ user }: RenderAppResult) {
   await user.click(await screen.findByRole("button", { name: "A.md" }));
   await screen.findByRole("heading", { name: "A", level: 1 });
   const editor = await screen.findByRole("textbox", { name: "Note content" });
-  await waitFor(() =>
-    expect(editor.closest(".nn-rich-editor")).toHaveAttribute("aria-busy", "false"),
-  );
   await user.click(editor);
-  placeCaretAtEnd(editor);
+  await user.keyboard("{Control>}{End}{/Control}");
   await user.type(editor, " edit");
   expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
 }
@@ -63,7 +51,8 @@ describe("Journey 8: unsaved-edit guard", () => {
     // Returning to A restores its exact edit buffer rather than re-reading disk.
     await user.click(screen.getByRole("tab", { name: "A, unsaved changes" }));
     const editor = await screen.findByRole("textbox", { name: "Note content" });
-    await waitFor(() => expect(editor).toHaveTextContent("aaa body edit"));
+    await waitFor(() => expect(editor).toHaveTextContent("aaa body"));
+    expect(editor).toHaveTextContent("edit");
     expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
   });
 

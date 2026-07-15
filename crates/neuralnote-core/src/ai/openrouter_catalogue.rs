@@ -200,7 +200,7 @@ struct ValidatedRanking {
 }
 
 fn validate_catalogue(
-    records: Vec<RawCatalogueModel>,
+    mut records: Vec<RawCatalogueModel>,
 ) -> CoreResult<HashMap<String, RawCatalogueModel>> {
     if records.len() > MAX_CATALOGUE_RECORDS {
         return Err(CoreError::Llm(
@@ -208,7 +208,7 @@ fn validate_catalogue(
         ));
     }
 
-    for model in &records {
+    for model in &mut records {
         validate_catalogue_model(model)?;
     }
 
@@ -253,14 +253,10 @@ fn validate_catalogue(
     Ok(by_canonical_slug)
 }
 
-fn validate_catalogue_model(model: &RawCatalogueModel) -> CoreResult<()> {
+fn validate_catalogue_model(model: &mut RawCatalogueModel) -> CoreResult<()> {
     validate_identifier(&model.id, "OpenRouter catalogue model id")?;
     validate_identifier(&model.canonical_slug, "OpenRouter catalogue canonical slug")?;
-    validate_text(
-        &model.name,
-        MAX_MODEL_NAME_LENGTH,
-        "OpenRouter catalogue model name",
-    )?;
+    model.name = normalize_catalogue_name(&model.name)?;
     if model.context_length > MAX_JAVASCRIPT_SAFE_CONTEXT_LENGTH {
         return Err(CoreError::Llm(
             "OpenRouter catalogue context length exceeds the exact JavaScript integer range".into(),
@@ -279,6 +275,19 @@ fn validate_catalogue_model(model: &RawCatalogueModel) -> CoreResult<()> {
         )?;
     }
     Ok(())
+}
+
+fn normalize_catalogue_name(value: &str) -> CoreResult<String> {
+    let normalized = value.trim();
+    if value.len() > MAX_MODEL_NAME_LENGTH
+        || normalized.is_empty()
+        || value.chars().any(char::is_control)
+    {
+        return Err(CoreError::Llm(
+            "OpenRouter catalogue model name is invalid".into(),
+        ));
+    }
+    Ok(normalized.to_owned())
 }
 
 fn parse_token_total(raw: &str) -> CoreResult<u128> {
@@ -502,6 +511,60 @@ mod tests {
         assert_eq!(result.models[0].name, "Current Model Name");
         assert_eq!(result.models[0].context_length, 65_536);
         assert_eq!(result.models[0].rank, 1);
+    }
+
+    #[test]
+    fn trailing_space_in_catalogue_display_name_is_normalized_in_output() {
+        let canonical_slug = "google/gemma-4-26b-a4b-it-20260403";
+        let rankings = rankings_json(vec![ranking(canonical_slug, "100")]);
+        let catalogue = catalogue_json(vec![catalogue_model(
+            "google/gemma-4-26b-a4b-it",
+            canonical_slug,
+            "Google: Gemma 4 26B A4B ",
+            65_536,
+            &["tools"],
+        )]);
+
+        let result = rank_openrouter_models(&rankings, &catalogue, DATE).unwrap();
+
+        assert_eq!(result.models.len(), 1);
+        assert_eq!(result.models[0].name, "Google: Gemma 4 26B A4B");
+        assert_eq!(result.models[0].name, result.models[0].name.trim());
+    }
+
+    #[test]
+    fn catalogue_display_names_remain_raw_byte_bounded_and_non_empty() {
+        let rankings = rankings_json(vec![ranking("vendor/model", "100")]);
+        let oversized_before_trimming = format!("{} ", "x".repeat(256));
+
+        for invalid_name in ["", "   ", "\u{2003}", &oversized_before_trimming] {
+            let catalogue = catalogue_json(vec![catalogue_model(
+                "vendor/model",
+                "vendor/model",
+                invalid_name,
+                65_536,
+                &["tools"],
+            )]);
+
+            assert!(matches!(
+                rank_openrouter_models(&rankings, &catalogue, DATE),
+                Err(CoreError::Llm(message)) if message.contains("catalogue model name is invalid")
+            ));
+        }
+    }
+
+    #[test]
+    fn catalogue_identifiers_remain_strict_when_display_names_are_normalized() {
+        let rankings = rankings_json(vec![ranking("vendor/model", "100")]);
+
+        for field in ["id", "canonical_slug"] {
+            let mut model = compatible_model("vendor/model");
+            model[field] = Value::String("vendor/model ".into());
+
+            assert!(
+                rank_openrouter_models(&rankings, &catalogue_json(vec![model]), DATE,).is_err()
+            );
+        }
     }
 
     #[test]

@@ -42,6 +42,21 @@ describe("Journey 3: create and open a note", () => {
 });
 
 describe("Journey 4: edit and save", () => {
+  it("turns the displayed title into editable source and saves it", async () => {
+    const { user } = await openVault([
+      { kind: "file", relPath: "Azure Hierarchy.md", content: "The hierarchy follows a basic model." },
+    ]);
+
+    await user.click(await screen.findByRole("button", { name: "Azure Hierarchy.md" }));
+    await user.click(await screen.findByRole("button", { name: "Edit title: Azure Hierarchy" }));
+    await waitFor(() => expect(screen.getByRole("button", { name: "Save" })).toBeEnabled());
+    await user.click(screen.getByRole("button", { name: "Save" }));
+
+    await expect(readNote(`${VAULT_ROOT}/Azure Hierarchy.md`)).resolves.toMatchObject({
+      raw: "# Azure Hierarchy\n\nThe hierarchy follows a basic model.",
+    });
+  });
+
   it("reflects the saved state and clears the unsaved indicator", async () => {
     const { user, backend } = await openVault([
       { kind: "file", relPath: "Edit.md", content: "original draft" },
@@ -51,11 +66,9 @@ describe("Journey 4: edit and save", () => {
     await screen.findByRole("heading", { name: "Edit", level: 1 }); // stem-derived title
 
     const textarea = await screen.findByRole("textbox", { name: "Note content" });
-    await waitFor(() =>
-      expect(textarea.closest(".nn-rich-editor")).toHaveAttribute("aria-busy", "false"),
-    );
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled(); // clean buffer
-    await user.clear(textarea);
+    await user.click(textarea);
+    await user.keyboard("{Control>}a{/Control}{Backspace}");
     await user.type(textarea, "updated body");
 
     // Dirty: the unsaved dot shows and Save enables.
@@ -72,9 +85,7 @@ describe("Journey 4: edit and save", () => {
     );
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
 
-    // Persisted through the guarded source-range path; no whole-file write was used.
-    expect(backend.calls).toContain("write_rich_note");
-    expect(backend.calls).not.toContain("write_note");
+    expect(backend.calls).toContain("write_note");
   });
 
   it("isolates dirty raw-fallback drafts while switching A → B → A and saving", async () => {
@@ -84,20 +95,22 @@ describe("Journey 4: edit and save", () => {
     ]);
 
     await user.click(await screen.findByRole("button", { name: "A.md" }));
-    const aEditor = await screen.findByRole("textbox", { name: "Note source" });
-    await user.clear(aEditor);
+    const aEditor = await screen.findByRole("textbox", { name: "Note content" });
+    await user.click(aEditor);
+    await user.keyboard("{Control>}a{/Control}{Backspace}");
     await user.type(aEditor, "A private draft [[[[Target]].");
 
     await user.click(screen.getByRole("button", { name: "B.md" }));
-    const bEditor = await screen.findByRole("textbox", { name: "Note source" });
-    expect(bEditor).toHaveValue("B links [[Target]].");
-    await user.clear(bEditor);
+    const bEditor = await screen.findByRole("textbox", { name: "Note content" });
+    expect(bEditor).toHaveTextContent("B links Target.");
+    await user.click(bEditor);
+    await user.keyboard("{Control>}a{/Control}{Backspace}");
     await user.type(bEditor, "B private draft [[[[Target]].");
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     await user.click(screen.getByRole("tab", { name: /A, unsaved changes/i }));
-    const restoredA = await screen.findByRole("textbox", { name: "Note source" });
-    expect(restoredA).toHaveValue("A private draft [[Target]].");
+    const restoredA = await screen.findByRole("textbox", { name: "Note content" });
+    expect(restoredA).toHaveTextContent("A private draft Target.");
     await user.click(screen.getByRole("button", { name: "Save" }));
 
     await expect(readNote(`${VAULT_ROOT}/A.md`)).resolves.toMatchObject({

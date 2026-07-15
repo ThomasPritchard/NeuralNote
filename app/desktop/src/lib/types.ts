@@ -24,12 +24,6 @@ export type { LinkGraph } from "./bindings/LinkGraph";
 export type { Backlink } from "./bindings/Backlink";
 export type { UnlinkedMention } from "./bindings/UnlinkedMention";
 export type { Backlinks } from "./bindings/Backlinks";
-export type { RichEditBlock } from "./bindings/RichEditBlock";
-export type { RichEditDisposition } from "./bindings/RichEditDisposition";
-export type { RichEditDocument } from "./bindings/RichEditDocument";
-export type { RichEditFallback } from "./bindings/RichEditFallback";
-export type { RichEditFallbackCode } from "./bindings/RichEditFallbackCode";
-export type { RichEditPatch } from "./bindings/RichEditPatch";
 
 // ── Generated: global preferences + vault template settings ────────────────
 export type { AppPreferences } from "./bindings/AppPreferences";

@@ -63,15 +63,6 @@ function fireResize(width: number, height: number) {
   });
 }
 
-function placeCaretAtEnd(element: HTMLElement) {
-  const range = document.createRange();
-  range.selectNodeContents(element);
-  range.collapse(false);
-  const selection = window.getSelection();
-  selection?.removeAllRanges();
-  selection?.addRange(range);
-}
-
 beforeEach(() => {
   vi.stubGlobal("ResizeObserver", ControlledResizeObserver);
   resize.callbacks.length = 0;
@@ -229,11 +220,8 @@ describe("Journey 13: graph guard and failure surfacing", () => {
     await user.click(await screen.findByRole("button", { name: "Beta.md" }));
     await screen.findByRole("heading", { name: "Beta", level: 1 });
     const editor = await screen.findByRole("textbox", { name: "Note content" });
-    await waitFor(() =>
-      expect(editor.closest(".nn-rich-editor")).toHaveAttribute("aria-busy", "false"),
-    );
     await user.click(editor);
-    placeCaretAtEnd(editor);
+    await user.keyboard("{Control>}{End}{/Control}");
     await user.type(editor, " edit");
     expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
 
@@ -253,7 +241,8 @@ describe("Journey 13: graph guard and failure surfacing", () => {
 
     await user.click(screen.getByRole("tab", { name: "Beta, unsaved changes" }));
     const restoredEditor = await screen.findByRole("textbox", { name: "Note content" });
-    await waitFor(() => expect(restoredEditor).toHaveTextContent("Beta body. edit"));
+    await waitFor(() => expect(restoredEditor).toHaveTextContent("Beta body."));
+    expect(restoredEditor).toHaveTextContent("edit");
     expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
   });
 

@@ -1,5 +1,5 @@
 import { useCallback, useState } from "react";
-import { Check, ChevronDown, ExternalLink, Loader2, Settings2, Zap } from "lucide-react";
+import { Check, ChevronDown, Loader2, Settings2, Zap } from "lucide-react";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -7,7 +7,6 @@ import {
   DropdownMenuItemIndicator,
   DropdownMenuRadioGroup,
   DropdownMenuRadioItem,
-  DropdownMenuSeparator,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import * as api from "../lib/api";
@@ -20,12 +19,16 @@ type CatalogueState =
   | { kind: "ready"; menu: OpenRouterModelMenu }
   | { kind: "error"; message: string };
 
+function modelDisplayName(model: string): string {
+  return model.split("/").pop() ?? model;
+}
+
 function modelLabel(status: AiStatus): string {
   const model =
     status.activeProvider === "local"
       ? status.local.activeModelTag
       : status.openrouter.model;
-  return model?.split("/").pop() ?? "Choose model";
+  return model ? modelDisplayName(model) : "Choose model";
 }
 
 export function ChatModelMenu({
@@ -81,15 +84,6 @@ export function ChatModelMenu({
     }
   };
 
-  const openRankings = async () => {
-    setWriteError(null);
-    try {
-      await api.openOpenRouterRankings();
-    } catch (error) {
-      setWriteError(errorMessage(error));
-    }
-  };
-
   return (
     <DropdownMenu open={open} onOpenChange={handleOpenChange}>
       <DropdownMenuTrigger asChild>
@@ -129,7 +123,6 @@ export function ChatModelMenu({
             writing={writing}
             onRetry={() => void load(true)}
             onSelect={(model) => void selectModel(model)}
-            onOpenRankings={() => void openRankings()}
           />
         )}
       </DropdownMenuContent>
@@ -144,7 +137,6 @@ function OpenRouterMenuBody({
   writing,
   onRetry,
   onSelect,
-  onOpenRankings,
 }: Readonly<{
   state: CatalogueState;
   selectedModel: string;
@@ -152,7 +144,6 @@ function OpenRouterMenuBody({
   writing: boolean;
   onRetry: () => void;
   onSelect: (model: string) => void;
-  onOpenRankings: () => void;
 }>) {
   if (state.kind === "idle" || state.kind === "loading") {
     return (
@@ -180,9 +171,9 @@ function OpenRouterMenuBody({
     );
   }
 
-  const choices: Array<OpenRouterModelChoice & { pinned?: boolean }> = [
+  const choices: OpenRouterModelChoice[] = [
     ...(state.menu.pinnedSelectedModel
-      ? [{ id: state.menu.pinnedSelectedModel, name: state.menu.pinnedSelectedModel, contextLength: 0, rank: 0, pinned: true }]
+      ? [{ id: state.menu.pinnedSelectedModel, name: modelDisplayName(state.menu.pinnedSelectedModel), contextLength: 0, rank: 0 }]
       : []),
     ...state.menu.models,
   ];
@@ -200,16 +191,8 @@ function OpenRouterMenuBody({
             key={choice.id}
             value={choice.id}
             disabled={writing}
-            textValue={
-              choice.pinned
-                ? `Current model ${choice.name}`
-                : `#${choice.rank} ${choice.name}, ${choice.id}, ${Math.round(choice.contextLength / 1_000)}k context`
-            }
-            aria-label={
-              choice.pinned
-                ? `Current model ${choice.name}`
-                : `#${choice.rank} ${choice.name}, ${choice.id}, ${Math.round(choice.contextLength / 1_000)}k context`
-            }
+            textValue={choice.name}
+            aria-label={choice.name}
             onSelect={(event) => {
               event.preventDefault();
               onSelect(choice.id);
@@ -218,31 +201,10 @@ function OpenRouterMenuBody({
             <DropdownMenuItemIndicator className="absolute left-2.5">
               <Check className="size-3.5" aria-hidden />
             </DropdownMenuItemIndicator>
-            <span className="min-w-0 flex-1">
-              <span className="block truncate font-medium">
-                {choice.pinned ? "Current" : `#${choice.rank}`} · {choice.name}
-              </span>
-              {!choice.pinned && (
-                <span className="nn-mono block truncate text-[0.625rem] text-muted-foreground">
-                  {choice.id} · {Math.round(choice.contextLength / 1_000)}k context
-                </span>
-              )}
-            </span>
+            <span className="min-w-0 flex-1 truncate font-medium">{choice.name}</span>
           </DropdownMenuRadioItem>
         ))}
       </DropdownMenuRadioGroup>
-      <DropdownMenuSeparator />
-      <DropdownMenuItem
-        onSelect={(event) => {
-          event.preventDefault();
-          onOpenRankings();
-        }}
-      >
-        <ExternalLink className="size-3.5" aria-hidden />
-        <span className="nn-mono text-[0.625rem] text-muted-foreground">
-          Source: OpenRouter (openrouter.ai/rankings), as of {state.menu.asOf}
-        </span>
-      </DropdownMenuItem>
     </>
   );
 }

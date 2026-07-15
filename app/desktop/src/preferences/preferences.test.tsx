@@ -22,6 +22,7 @@ const LOADED: AppPreferencesLoad = {
     theme: "forestLight",
     fontScale: "large",
     fontFamily: "sourceSerif4",
+    lastSeenWhatsNewVersion: "0.1.1",
   },
   recoveredFromCorrupt: false,
   recoveryMessage: null,

@@ -6,7 +6,6 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { listen } from "@tauri-apps/api/event";
 import { invoke } from "@tauri-apps/api/core";
 import { MENU_ACTION } from "../lib/bindings/events";
-import type { MenuAction } from "../lib/api";
 import type { TreeNode } from "../lib/types";
 import type { OpenNote } from "./useOpenNote";
 import type { NoteTab, NoteTabsController } from "./useNoteTabs";
@@ -203,30 +202,24 @@ const node = (path: string): TreeNode => ({
 
 function makeOpen(over: Partial<OpenNote> = {}): OpenNote {
   return {
+    sessionKey: null,
+    sessionHash: null,
     path: null,
     note: null,
     loading: false,
     error: null,
-    mode: "read",
-    richDocument: null,
-    richBody: "",
-    richError: null,
     draft: "",
     dirty: false,
     saving: false,
     saveError: null,
+    preservationError: null,
     conflict: false,
     open: vi.fn(),
     reload: vi.fn(),
     overwrite: vi.fn(),
     repath: vi.fn(),
-    setMode: vi.fn(),
     setDraft: vi.fn(),
-    setRichDocument: vi.fn(),
-    setRichError: vi.fn(),
-    setRichBody: vi.fn(),
-    undoRich: vi.fn(),
-    redoRich: vi.fn(),
+    setPreservationError: vi.fn(),
     save: vi.fn(),
     clear: vi.fn(),
     ...over,
@@ -241,18 +234,14 @@ function makeTabs(over: Partial<NoteTabsController> = {}): NoteTabsController {
           id: "tab-1",
           path: active.path,
           note: active.note,
+          sessionHash: active.sessionHash,
           loading: active.loading,
           error: active.error,
-          mode: active.mode,
-          richDocument: active.richDocument,
-          richBody: active.richBody,
-          richError: active.richError,
-          richPast: [],
-          richFuture: [],
           draft: active.draft,
           dirty: active.dirty,
           saving: active.saving,
           saveError: active.saveError,
+          preservationError: active.preservationError,
           conflict: active.conflict,
           loadRevision: 1,
           saveRevision: 0,
@@ -305,18 +294,14 @@ function makeTab(path: string, over: Partial<NoteTab> = {}): NoteTab {
       binary: false,
       lossyText: false,
     },
+    sessionHash: "hash",
     loading: false,
     error: null,
-    mode: "read",
-    richDocument: null,
-    richBody: "",
-    richError: null,
-    richPast: [],
-    richFuture: [],
     draft: "body",
     dirty: false,
     saving: false,
     saveError: null,
+    preservationError: null,
     conflict: false,
     loadRevision: 1,
     saveRevision: 0,
@@ -868,19 +853,6 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     expect(openState.current.save).not.toHaveBeenCalled();
   });
 
-  it("ignores the retired toggle-mode action because notes are always editable", () => {
-    openState.current = makeOpen({
-      path: "/v/a.md",
-      note: { binary: false } as unknown as OpenNote["note"],
-      mode: "read",
-    });
-    mockUseVault.mockReturnValue(vaultCtx());
-    render(<Workspace />);
-
-    fireMenu({ action: "toggle-mode" as MenuAction });
-    expect(openState.current.setMode).not.toHaveBeenCalled();
-  });
-
   it("tells the native menu to enable Format whenever a text note is open", async () => {
     mockUseVault.mockReturnValue(vaultCtx());
     // Read mode (no note): Format disabled.
@@ -895,7 +867,6 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     openState.current = makeOpen({
       path: "/v/a.md",
       note: { binary: false } as unknown as OpenNote["note"],
-      mode: "read",
     });
     rerender(<Workspace />);
     await waitFor(() =>
@@ -907,7 +878,6 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     openState.current = makeOpen({
       path: "/v/img.png",
       note: { binary: true } as unknown as OpenNote["note"],
-      mode: "edit",
     });
     rerender(<Workspace />);
     await waitFor(() =>
@@ -1036,6 +1006,7 @@ describe("Workspace — settings modal", () => {
     // Settings moved off the ribbon onto the titlebar in the overlay-titlebar cut.
     act(() => captured.titlebar.onOpenSettings());
     expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
+    expect(captured.settingsModal.initialSection).toBe("whatsNew");
 
     act(() => captured.settingsModal.onClose());
     expect(screen.queryByTestId("settings-modal")).not.toBeInTheDocument();
@@ -1048,6 +1019,7 @@ describe("Workspace — settings modal", () => {
 
     act(() => captured.chatPane.onOpenSettings());
     expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
+    expect(captured.settingsModal.initialSection).toBe("ai");
 
     // Closing settings must poke the chat pane to re-read the AI status — a
     // provider configured in the modal has to reach the docked pane.

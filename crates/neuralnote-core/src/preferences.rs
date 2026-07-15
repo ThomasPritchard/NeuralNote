@@ -9,6 +9,7 @@ use crate::config_io::write_json_atomic;
 use crate::error::{CoreError, CoreResult};
 
 const PREFERENCES_FILE: &str = "preferences.json";
+const MAX_WHATS_NEW_VERSION_BYTES: usize = 64;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -48,6 +49,8 @@ pub struct AppPreferences {
     pub theme: ThemeId,
     pub font_scale: FontScale,
     pub font_family: FontFamily,
+    #[serde(default)]
+    pub last_seen_whats_new_version: Option<String>,
 }
 
 impl Default for AppPreferences {
@@ -57,6 +60,7 @@ impl Default for AppPreferences {
             theme: ThemeId::NeuralVioletDark,
             font_scale: FontScale::Default,
             font_family: FontFamily::Inter,
+            last_seen_whats_new_version: None,
         }
     }
 }
@@ -96,7 +100,14 @@ pub fn load_app_preferences(config_dir: &Path) -> CoreResult<AppPreferencesLoad>
         }
     };
 
-    match serde_json::from_str(&raw) {
+    let parsed: Result<AppPreferences, String> = serde_json::from_str::<AppPreferences>(&raw)
+        .map_err(|error| error.to_string())
+        .and_then(|preferences| {
+            validate_whats_new_version(preferences.last_seen_whats_new_version.as_deref())?;
+            Ok(preferences)
+        });
+
+    match parsed {
         Ok(preferences) => Ok(AppPreferencesLoad {
             preferences,
             recovered_from_corrupt: false,
@@ -114,9 +125,31 @@ pub fn load_app_preferences(config_dir: &Path) -> CoreResult<AppPreferencesLoad>
 }
 
 pub fn save_app_preferences(config_dir: &Path, preferences: &AppPreferences) -> CoreResult<()> {
+    validate_whats_new_version(preferences.last_seen_whats_new_version.as_deref())
+        .map_err(CoreError::InvalidContent)?;
     write_json_atomic(
         &preferences_file(config_dir),
         preferences,
         "app preferences",
     )
+}
+
+fn validate_whats_new_version(version: Option<&str>) -> Result<(), String> {
+    let Some(version) = version else {
+        return Ok(());
+    };
+    let valid = !version.is_empty()
+        && version.len() <= MAX_WHATS_NEW_VERSION_BYTES
+        && version.as_bytes()[0].is_ascii_digit()
+        && version.contains('.')
+        && version
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'));
+    if valid {
+        Ok(())
+    } else {
+        Err(format!(
+            "What's new version must be a bounded version identifier of at most {MAX_WHATS_NEW_VERSION_BYTES} ASCII bytes"
+        ))
+    }
 }

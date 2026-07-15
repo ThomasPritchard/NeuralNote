@@ -10,6 +10,7 @@ vi.mock("../preferences/preferences", () => ({
       theme: "neuralVioletDark",
       fontScale: "default",
       fontFamily: "inter",
+      lastSeenWhatsNewVersion: "0.2.0",
     },
     saving: false,
     update,

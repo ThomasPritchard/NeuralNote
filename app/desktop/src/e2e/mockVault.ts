@@ -45,8 +45,6 @@ import type {
   RecentVault,
   SearchMatch,
   SearchResponse,
-  RichEditDocument,
-  RichEditPatch,
   SkillListing,
   TemplateInfo,
   TreeNode,
@@ -1646,32 +1644,6 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     };
   };
 
-  const buildRichDoc = (raw: string): RichEditDocument => {
-    const parsed = parseFrontmatter(raw);
-    const revision = hashContent(raw);
-    const wikilinkFallback = parsed.body.includes("[[")
-      ? {
-          kind: "raw" as const,
-          reason: {
-            code: "unsupported_syntax" as const,
-            message: "Wikilinks are open as raw Markdown in this release.",
-          },
-        }
-      : { kind: "rich" as const };
-    return {
-      revision,
-      frontmatterPrefix: raw.slice(0, raw.length - parsed.body.length),
-      body: parsed.body,
-      disposition: wikilinkFallback,
-      blocks: parsed.body === "" ? [] : [{
-        id: `mock-block:${revision}`,
-        leadingSeparator: "",
-        markdown: parsed.body,
-        trailingSeparator: "",
-      }],
-    };
-  };
-
   /** Re-key `from` (and, for a folder, every descendant) to `to`, content intact. */
   const rekey = (from: string, to: string): void => {
     for (const key of [...entries.keys()]) {
@@ -1909,10 +1881,6 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         const path = a.path as string;
         return buildDoc(path, requireFile(path).content);
       }
-      case "read_rich_note": {
-        const path = a.path as string;
-        return buildRichDoc(requireFile(path).content);
-      }
       case "write_note": {
         const path = a.path as string;
         const content = a.content as string;
@@ -1923,24 +1891,6 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         }
         file.content = content;
         return buildDoc(path, content);
-      }
-      case "write_rich_note": {
-        const path = a.path as string;
-        const patch = a.patch as RichEditPatch;
-        const file = requireFile(path);
-        const current = buildRichDoc(file.content);
-        if (patch.expectedRevision !== current.revision) {
-          fail("conflict", "this note changed on disk since you opened it");
-        }
-        const validIds = new Set(current.blocks.map((block) => block.id));
-        if (
-          patch.changedBlockIds.some((id) => !validIds.has(id)) ||
-          (current.blocks.length > 0 && patch.changedBlockIds.length !== 1)
-        ) {
-          fail("conflict", "the rich edit source range is stale");
-        }
-        file.content = `${current.frontmatterPrefix}${patch.replacementMarkdown}`;
-        return buildDoc(path, file.content);
       }
       case "create_folder": {
         const target = `${a.parentPath as string}/${(a.name as string).trim()}`;

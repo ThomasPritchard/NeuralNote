@@ -127,7 +127,7 @@ export function Workspace() {
   // pane re-reads the AI status (a provider configured in Settings must reach
   // the pane without remounting it and wiping the transcript).
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("whatsNew");
   const [templateInsertOpen, setTemplateInsertOpen] = useState(false);
   const [templates, setTemplates] = useState<Awaited<ReturnType<typeof api.listTemplates>>>([]);
   const [aiStatusVersion, bumpAiStatusVersion] = useReducer((n: number) => n + 1, 0);
@@ -411,7 +411,7 @@ export function Workspace() {
     [openNoteAt],
   );
 
-  const handleOpenSettings = useCallback((section: SettingsSection = "general") => {
+  const handleOpenSettings = useCallback((section: SettingsSection = "whatsNew") => {
     setSettingsSection(section);
     setSettingsOpen(true);
   }, []);

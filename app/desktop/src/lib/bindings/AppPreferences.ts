@@ -3,4 +3,4 @@ import type { FontFamily } from "./FontFamily";
 import type { FontScale } from "./FontScale";
 import type { ThemeId } from "./ThemeId";
 
-export type AppPreferences = { automaticUpdateChecks: boolean, theme: ThemeId, fontScale: FontScale, fontFamily: FontFamily, };
+export type AppPreferences = { automaticUpdateChecks: boolean, theme: ThemeId, fontScale: FontScale, fontFamily: FontFamily, lastSeenWhatsNewVersion: string | null, };
