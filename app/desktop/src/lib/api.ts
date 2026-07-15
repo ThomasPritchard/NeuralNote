@@ -304,9 +304,11 @@ export const chat = (
 export const cancelChatRun = (turnId: string) =>
   invoke<CancelChatRunOutcome>("cancel_chat_run", { turnId });
 
-/** Resolve one live elicitation with option ids validated by the Rust shell. */
-export const answerElicitation = (id: string, choices: string[]) =>
-  invoke<void>("answer_elicitation", { id, choices });
+/** Resolve one live elicitation with option ids validated by the Rust shell.
+ *  `turnId` scopes the answer to its own run, so a model-authored id reused by a
+ *  sibling run is never resolved by mistake. */
+export const answerElicitation = (turnId: string, id: string, choices: string[]) =>
+  invoke<void>("answer_elicitation", { turnId, id, choices });
 
 /** Open a core-validated YouTube timestamp through the native shell. External
  *  navigation never bypasses the shell's URL policy from the webview. */

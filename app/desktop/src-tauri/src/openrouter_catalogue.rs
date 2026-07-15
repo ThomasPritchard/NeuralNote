@@ -256,6 +256,7 @@ pub(crate) async fn fetch_validated_catalogue<T: CatalogueTransport + ?Sized>(
 pub(crate) fn persist_selected_model(
     config_dir: &Path,
     mutation_gate: &ProviderConfigMutationGate,
+    key_present: bool,
     offered: &HashSet<String>,
     model: &str,
 ) -> Result<ProviderConfig, CoreError> {
@@ -266,7 +267,7 @@ pub(crate) fn persist_selected_model(
         ));
     }
 
-    mutation_gate.update(config_dir, |config| {
+    mutation_gate.update(config_dir, key_present, |config| {
         config.model = model.to_string();
         Ok(())
     })

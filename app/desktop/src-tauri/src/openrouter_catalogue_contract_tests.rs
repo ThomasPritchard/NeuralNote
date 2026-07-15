@@ -183,11 +183,12 @@ fn model_selection_changes_only_the_model_and_rejects_unoffered_values() {
     let original = ProviderConfig {
         active_provider: Some(neuralnote_core::ai::ProviderKind::Local),
         model: "vendor/old".into(),
-        key_configured: true,
         local_model_tag: Some("qwen2.5:7b".into()),
         reasoning: true,
-        reasoning_support: Some(neuralnote_core::ai::ReasoningSupport::Supported),
-        reasoning_probed_model: Some("vendor/old".into()),
+        reasoning_probe: Some(neuralnote_core::ai::ProbedReasoning {
+            model: "vendor/old".into(),
+            support: neuralnote_core::ai::ReasoningSupport::Supported,
+        }),
         reasoning_probe_generation: 7,
         disabled_skills: vec!["youtube-distil".into()],
     };
@@ -195,21 +196,20 @@ fn model_selection_changes_only_the_model_and_rejects_unoffered_values() {
     let offered = ["vendor/new".to_string()].into_iter().collect();
 
     let gate = ProviderConfigMutationGate::default();
-    let persisted = persist_selected_model(dir.path(), &gate, &offered, "vendor/new").unwrap();
+    // Selecting a model is a preference change; the OpenRouter key presence is
+    // unchanged, so pass it as a constant. Here the provider is explicitly Local, so
+    // the value doesn't affect the effective target — the model change is dormant.
+    let persisted =
+        persist_selected_model(dir.path(), &gate, true, &offered, "vendor/new").unwrap();
 
     assert_eq!(persisted.model, "vendor/new");
     assert_eq!(persisted.active_provider, original.active_provider);
     assert_eq!(persisted.local_model_tag, original.local_model_tag);
-    assert_eq!(persisted.key_configured, original.key_configured);
     assert_eq!(persisted.reasoning, original.reasoning);
-    assert_eq!(persisted.reasoning_support, original.reasoning_support);
+    assert_eq!(persisted.reasoning_probe, original.reasoning_probe);
     assert_eq!(
         persisted.reasoning_probe_generation,
         original.reasoning_probe_generation
-    );
-    assert_eq!(
-        persisted.reasoning_probed_model,
-        original.reasoning_probed_model
     );
     assert_eq!(persisted.disabled_skills, original.disabled_skills);
 
@@ -217,7 +217,9 @@ fn model_selection_changes_only_the_model_and_rejects_unoffered_values() {
         dir.path(),
     ))
     .unwrap();
-    assert!(persist_selected_model(dir.path(), &gate, &offered, "vendor/not-offered").is_err());
+    assert!(
+        persist_selected_model(dir.path(), &gate, true, &offered, "vendor/not-offered").is_err()
+    );
     let after = std::fs::read_to_string(neuralnote_core::ai::provider_config::config_file(
         dir.path(),
     ))
@@ -233,9 +235,10 @@ fn active_openrouter_model_selection_invalidates_probe_ownership_and_cache() {
         &ProviderConfig {
             active_provider: Some(neuralnote_core::ai::ProviderKind::OpenRouter),
             model: "vendor/old".into(),
-            key_configured: true,
-            reasoning_support: Some(neuralnote_core::ai::ReasoningSupport::Supported),
-            reasoning_probed_model: Some("vendor/old".into()),
+            reasoning_probe: Some(neuralnote_core::ai::ProbedReasoning {
+                model: "vendor/old".into(),
+                support: neuralnote_core::ai::ReasoningSupport::Supported,
+            }),
             reasoning_probe_generation: 7,
             ..Default::default()
         },
@@ -246,14 +249,14 @@ fn active_openrouter_model_selection_invalidates_probe_ownership_and_cache() {
     let persisted = persist_selected_model(
         dir.path(),
         &ProviderConfigMutationGate::default(),
+        true,
         &offered,
         "vendor/new",
     )
     .unwrap();
 
     assert_eq!(persisted.reasoning_probe_generation, 8);
-    assert_eq!(persisted.reasoning_support, None);
-    assert_eq!(persisted.reasoning_probed_model, None);
+    assert_eq!(persisted.reasoning_probe, None);
 }
 
 #[test]

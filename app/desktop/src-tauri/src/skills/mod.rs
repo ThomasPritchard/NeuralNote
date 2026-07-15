@@ -58,11 +58,14 @@ pub(crate) fn retain_chat_undo_ledger(
     }
 }
 
-/// Resolve a live structured prompt. Validation is performed against the parked
-/// server-side option set; invalid choices leave the prompt live for a retry.
+/// Resolve a live structured prompt owned by `turn_id`. Validation is performed
+/// against the parked server-side option set; invalid choices leave the prompt
+/// live for a retry. The turn id scopes the answer to its own run so a reused
+/// model-authored elicitation id in a sibling run is never resolved by mistake.
 #[tauri::command]
 pub(crate) fn answer_elicitation(
     state: crate::SharedState<'_>,
+    turn_id: String,
     id: String,
     choices: Vec<String>,
 ) -> Result<(), neuralnote_core::CoreError> {
@@ -70,7 +73,7 @@ pub(crate) fn answer_elicitation(
         let state = crate::lock_state(&state);
         std::sync::Arc::clone(&state.pending_elicitations)
     };
-    pending.answer(&id, choices)
+    pending.answer(&turn_id, &id, choices)
 }
 
 /// Consume one run ledger once every file reaches a terminal result. A vault

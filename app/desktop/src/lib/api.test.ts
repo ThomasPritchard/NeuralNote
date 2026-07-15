@@ -279,10 +279,11 @@ describe("skills-bank wrappers", () => {
     });
   });
 
-  it("answers a live elicitation with the selected option ids", async () => {
-    await answerElicitation("consent-1", ["yes"]);
+  it("answers a live elicitation with the selected option ids scoped to its run", async () => {
+    await answerElicitation(TURN_ID, "consent-1", ["yes"]);
 
     expect(mockInvoke).toHaveBeenCalledWith("answer_elicitation", {
+      turnId: TURN_ID,
       id: "consent-1",
       choices: ["yes"],
     });

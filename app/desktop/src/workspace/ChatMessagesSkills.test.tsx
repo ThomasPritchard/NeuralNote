@@ -95,6 +95,34 @@ describe("ChatMessages — skill turns", () => {
     expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
+  it("surfaces a calm truncation notice when the answer was cut off", () => {
+    renderMessages(
+      skillTurn({
+        done: true,
+        answer: "The answer stops mid-thought",
+        truncated: true,
+      }),
+    );
+
+    // The partial answer stays visible…
+    expect(screen.getByText("The answer stops mid-thought")).toBeInTheDocument();
+    // …alongside a visible, informational notice — never the alert register.
+    expect(screen.getByText(/Response was cut off/i)).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("shows no truncation notice for a complete answer", () => {
+    renderMessages(
+      skillTurn({
+        done: true,
+        answer: "The complete answer",
+      }),
+    );
+
+    expect(screen.getByText("The complete answer")).toBeInTheDocument();
+    expect(screen.queryByText(/Response was cut off/i)).not.toBeInTheDocument();
+  });
+
   it("labels provider failure context as Failed rather than Stopped", () => {
     renderMessages(
       skillTurn({
@@ -461,6 +489,7 @@ describe("ChatMessages — skill turns", () => {
   it("pins an answered elicitation through the transcript's own state", async () => {
     const { user } = renderMessages(
       skillTurn({
+        turnId: "turn-1",
         pendingElicitation: {
           id: "q1",
           question: "Write the note?",
@@ -473,7 +502,7 @@ describe("ChatMessages — skill turns", () => {
       }),
     );
     await user.click(screen.getByRole("button", { name: /Yes, write it/ }));
-    expect(mockAnswer).toHaveBeenCalledExactlyOnceWith("q1", ["yes"]);
+    expect(mockAnswer).toHaveBeenCalledExactlyOnceWith("turn-1", "q1", ["yes"]);
     // The answered state lives in ChatMessages (there is no resolution
     // ChatEvent), so the card pins and disables without any new event.
     expect(await screen.findByText("Answered.")).toBeInTheDocument();
@@ -483,6 +512,7 @@ describe("ChatMessages — skill turns", () => {
   it("routes a dormant elicitation's late click into an ordinary chat turn", async () => {
     const { user, onSendFollowUp } = renderMessages(
       skillTurn({
+        turnId: "turn-1",
         done: true,
         pendingElicitation: {
           id: "q1",

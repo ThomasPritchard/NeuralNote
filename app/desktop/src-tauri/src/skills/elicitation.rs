@@ -45,12 +45,12 @@ impl CancelChatRunOutcome {
 /// The offered ids and selection mode are copied from the core-authored
 /// [`Elicitation`] before control reaches the webview. `answer_elicitation` can
 /// therefore validate the untrusted command arguments against this record rather
-/// than accepting a caller-supplied option set.
+/// than accepting a caller-supplied option set. The owning run is the outer map
+/// key, so it is not repeated here.
 struct PendingElicitation {
     sender: oneshot::Sender<Option<Vec<String>>>,
     offered_ids: BTreeSet<String>,
     multi_select: bool,
-    run_id: String,
     registration: u64,
 }
 
@@ -62,10 +62,17 @@ pub(crate) struct ParkedResponse {
     receiver: oneshot::Receiver<Option<Vec<String>>>,
 }
 
+/// Live questions belonging to one run, keyed by the model-authored elicitation
+/// id. Two runs may independently use the same id, so the id alone is scoped
+/// under its run in [`RegistryState::entries`].
+type RunElicitations = HashMap<String, PendingElicitation>;
+
 #[derive(Default)]
 struct RegistryState {
-    // TODO(elicit-run-scope): key PendingElicitations by (run_id, id) to close cross-run id collision.
-    entries: HashMap<String, PendingElicitation>,
+    // Keyed by run id, then by elicitation id: a composite key that keeps one
+    // run's answer, timeout, and purge from ever reaching a sibling run that
+    // reused the same model-authored id.
+    entries: HashMap<String, RunElicitations>,
     run_signals: HashMap<Uuid, Arc<crate::ai::ChatRunCloseSignal>>,
     pending_stops: VecDeque<Uuid>,
     completed_runs: VecDeque<Uuid>,
@@ -125,7 +132,11 @@ impl PendingElicitations {
 
         let (sender, receiver) = oneshot::channel();
         let mut state = self.lock();
-        if state.entries.contains_key(&elicitation.id) {
+        if state
+            .entries
+            .get(run_id)
+            .is_some_and(|run_entries| run_entries.contains_key(&elicitation.id))
+        {
             return Err(CoreError::Conflict(format!(
                 "elicitation '{}' is already awaiting an answer",
                 elicitation.id
@@ -135,13 +146,12 @@ impl PendingElicitations {
         state.next_registration = state.next_registration.checked_add(1).ok_or_else(|| {
             CoreError::Conflict("pending elicitation registration counter overflowed".into())
         })?;
-        state.entries.insert(
+        state.entries.entry(run_id.to_string()).or_default().insert(
             elicitation.id,
             PendingElicitation {
                 sender,
                 offered_ids,
                 multi_select: elicitation.multi_select,
-                run_id: run_id.to_string(),
                 registration,
             },
         );
@@ -152,17 +162,17 @@ impl PendingElicitations {
         })
     }
 
-    /// Validate and deliver an IPC answer. Choice-validation failures deliberately
-    /// leave the sender parked so a stale/double UI click cannot destroy the live
-    /// question and the user may immediately choose again.
-    pub(crate) fn answer(&self, id: &str, choices: Vec<String>) -> CoreResult<()> {
+    /// Validate and deliver an IPC answer to the question owned by `run_id`.
+    /// Routing on the composite `(run_id, id)` key keeps an answer from ever
+    /// resolving a sibling run that reused the same model-authored id. Choice
+    /// -validation failures deliberately leave the sender parked so a stale
+    /// /double UI click cannot destroy the live question and the user may
+    /// immediately choose again.
+    pub(crate) fn answer(&self, run_id: &str, id: &str, choices: Vec<String>) -> CoreResult<()> {
         let pending = {
             let mut state = self.lock();
-            let entry = state.entries.get(id).ok_or_else(|| {
-                CoreError::NotFound(format!(
-                    "elicitation '{id}' is not live (it may have timed out or ended)"
-                ))
-            })?;
+            let run_entries = state.entries.get_mut(run_id).ok_or_else(|| not_live(id))?;
+            let entry = run_entries.get(id).ok_or_else(|| not_live(id))?;
 
             if !entry.multi_select && choices.len() != 1 {
                 return Err(CoreError::InvalidName(format!(
@@ -183,10 +193,11 @@ impl PendingElicitations {
                 }
             }
 
-            state
-                .entries
+            let pending = run_entries
                 .remove(id)
-                .expect("a validated live elicitation remains present under the lock")
+                .expect("a validated live elicitation remains present under the lock");
+            drop_empty_run(&mut state, run_id);
+            pending
         };
 
         pending.sender.send(Some(choices)).map_err(|_| {
@@ -201,19 +212,8 @@ impl PendingElicitations {
     /// asynchronous task behind a response the UI can no longer send.
     #[cfg(test)]
     pub(crate) fn purge_run(&self, run_id: &str) -> usize {
-        let removed = {
-            let mut state = self.lock();
-            let ids = state
-                .entries
-                .iter()
-                .filter(|(_, pending)| pending.run_id == run_id)
-                .map(|(id, _)| id.clone())
-                .collect::<Vec<_>>();
-            ids.into_iter()
-                .filter_map(|id| state.entries.remove(&id))
-                .collect::<Vec<_>>()
-        };
-        let count = removed.len();
+        let removed = self.lock().entries.remove(run_id);
+        let count = removed.as_ref().map_or(0, HashMap::len);
         drop(removed);
         count
     }
@@ -274,7 +274,7 @@ impl PendingElicitations {
             let parked = state
                 .entries
                 .drain()
-                .map(|(_, pending)| pending)
+                .flat_map(|(_, run_entries)| run_entries.into_values())
                 .collect::<Vec<_>>();
             (signals, parked)
         };
@@ -309,16 +309,7 @@ impl PendingElicitations {
                 CancelChatRunStatus::AlreadyCompleted
             };
             remember_completed(&mut state, turn_id);
-            let run_id = turn_id.to_string();
-            let ids = state
-                .entries
-                .iter()
-                .filter_map(|(id, pending)| (pending.run_id == run_id).then_some(id.clone()))
-                .collect::<Vec<_>>();
-            let parked = ids
-                .into_iter()
-                .filter_map(|id| state.entries.remove(&id))
-                .collect::<Vec<_>>();
+            let parked = state.entries.remove(&turn_id.to_string());
             (status, parked)
         };
         drop(parked);
@@ -344,40 +335,34 @@ impl PendingElicitations {
             }
             state.run_signals.remove(&run_id);
             remember_completed(&mut state, run_id);
-            let run_id = run_id.to_string();
-            let ids = state
-                .entries
-                .iter()
-                .filter_map(|(id, pending)| (pending.run_id == run_id).then_some(id.clone()))
-                .collect::<Vec<_>>();
-            ids.into_iter()
-                .filter_map(|id| state.entries.remove(&id))
-                .collect::<Vec<_>>()
+            state.entries.remove(&run_id.to_string())
         };
         drop(removed);
     }
 
-    /// Win timeout ownership only if `id` still names the exact registration this
-    /// waiter parked. A successful answer may remove it and a subsequent run may
-    /// reuse the id before the timer branch gets the mutex; generation matching
-    /// keeps that newer sender alive.
-    fn remove_if_registration(&self, id: &str, registration: u64) -> bool {
-        let removed = {
-            let mut state = self.lock();
-            let owns_registration = state
-                .entries
-                .get(id)
-                .is_some_and(|pending| pending.registration == registration);
-            owns_registration
-                .then(|| state.entries.remove(id))
-                .flatten()
+    /// Win timeout ownership only if `(run_id, id)` still names the exact
+    /// registration this waiter parked. A successful answer may remove it and the
+    /// same run may reuse the id before the timer branch gets the mutex;
+    /// registration matching keeps that newer sender alive.
+    fn remove_if_registration(&self, run_id: &str, id: &str, registration: u64) -> bool {
+        let mut state = self.lock();
+        let Some(run_entries) = state.entries.get_mut(run_id) else {
+            return false;
         };
+        let owns_registration = run_entries
+            .get(id)
+            .is_some_and(|pending| pending.registration == registration);
+        if !owns_registration {
+            return false;
+        }
+        let removed = run_entries.remove(id);
+        drop_empty_run(&mut state, run_id);
         removed.is_some()
     }
 
     #[cfg(test)]
     fn len(&self) -> usize {
-        self.lock().entries.len()
+        self.lock().entries.values().map(HashMap::len).sum()
     }
 
     #[cfg(test)]
@@ -389,6 +374,27 @@ impl PendingElicitations {
         self.state
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// The stale/expired-answer rejection: an id that names no live question under
+/// its run. Shared by both lookup misses in [`PendingElicitations::answer`] so
+/// a missing run and a missing id read identically to the UI.
+fn not_live(id: &str) -> CoreError {
+    CoreError::NotFound(format!(
+        "elicitation '{id}' is not live (it may have timed out or ended)"
+    ))
+}
+
+/// Drop a run's bucket once its last question leaves, so answered-but-unfinished
+/// runs cannot accumulate empty maps until their guard drops.
+fn drop_empty_run(state: &mut RegistryState, run_id: &str) {
+    if state
+        .entries
+        .get(run_id)
+        .is_some_and(RunElicitations::is_empty)
+    {
+        state.entries.remove(run_id);
     }
 }
 
@@ -478,7 +484,10 @@ impl ShellUserPrompt {
         registration: u64,
         receiver: &mut oneshot::Receiver<Option<Vec<String>>>,
     ) -> Option<Vec<String>> {
-        if self.pending.remove_if_registration(id, registration) {
+        if self
+            .pending
+            .remove_if_registration(&self.run_id, id, registration)
+        {
             return None;
         }
 
@@ -594,7 +603,7 @@ mod tests {
         let answer = tokio::spawn(async move { prompt.ask(elicitation("q-1", false)).await });
         tokio::task::yield_now().await;
 
-        pending.answer("q-1", vec!["yes".into()]).unwrap();
+        pending.answer("run-1", "q-1", vec!["yes".into()]).unwrap();
 
         assert_eq!(answer.await.unwrap().unwrap(), Some(vec!["yes".into()]));
         assert_eq!(pending.len(), 0);
@@ -615,13 +624,13 @@ mod tests {
             vec!["yes".into(), "yes".into()],
         ] {
             assert!(matches!(
-                pending.answer("q-1", choices),
+                pending.answer("run-1", "q-1", choices),
                 Err(CoreError::InvalidName(_))
             ));
             assert_eq!(pending.len(), 1, "validation must not consume the prompt");
         }
 
-        pending.answer("q-1", vec!["no".into()]).unwrap();
+        pending.answer("run-1", "q-1", vec!["no".into()]).unwrap();
         assert_eq!(answer.await.unwrap().unwrap(), Some(vec!["no".into()]));
     }
 
@@ -634,7 +643,7 @@ mod tests {
         tokio::task::yield_now().await;
 
         pending
-            .answer("q-1", vec!["yes".into(), "no".into()])
+            .answer("run-1", "q-1", vec!["yes".into(), "no".into()])
             .unwrap();
 
         assert_eq!(
@@ -643,16 +652,16 @@ mod tests {
         );
 
         let parked = pending.park("run-1", elicitation("q-2", true)).unwrap();
-        pending.answer("q-2", vec![]).unwrap();
+        pending.answer("run-1", "q-2", vec![]).unwrap();
         assert_eq!(parked.receiver.await.unwrap(), Some(vec![]));
 
         let duplicate = pending.park("run-1", elicitation("q-3", true)).unwrap();
         assert!(matches!(
-            pending.answer("q-3", vec!["yes".into(), "yes".into()]),
+            pending.answer("run-1", "q-3", vec!["yes".into(), "yes".into()]),
             Err(CoreError::InvalidName(_))
         ));
         assert_eq!(pending.len(), 1);
-        pending.answer("q-3", vec!["yes".into()]).unwrap();
+        pending.answer("run-1", "q-3", vec!["yes".into()]).unwrap();
         assert_eq!(duplicate.receiver.await.unwrap(), Some(vec!["yes".into()]));
     }
 
@@ -661,25 +670,9 @@ mod tests {
         let pending = PendingElicitations::default();
 
         assert!(matches!(
-            pending.answer("missing", vec!["yes".into()]),
+            pending.answer("run-1", "missing", vec!["yes".into()]),
             Err(CoreError::NotFound(message)) if message.contains("missing")
         ));
-    }
-
-    #[tokio::test]
-    async fn duplicate_live_id_is_rejected_without_replacing_the_first_sender() {
-        let pending = PendingElicitations::default();
-        let first = pending
-            .park("run-1", elicitation("same-id", false))
-            .unwrap();
-
-        assert!(matches!(
-            pending.park("run-2", elicitation("same-id", false)),
-            Err(CoreError::Conflict(_))
-        ));
-
-        pending.answer("same-id", vec!["yes".into()]).unwrap();
-        assert_eq!(first.receiver.await.unwrap(), Some(vec!["yes".into()]));
     }
 
     #[tokio::test]
@@ -690,21 +683,23 @@ mod tests {
         assert_eq!(prompt.ask(elicitation("q-1", false)).await.unwrap(), None);
         assert_eq!(pending.len(), 0);
         assert!(matches!(
-            pending.answer("q-1", vec!["yes".into()]),
+            pending.answer("run-1", "q-1", vec!["yes".into()]),
             Err(CoreError::NotFound(_))
         ));
     }
 
     #[tokio::test]
-    async fn timeout_cleanup_cannot_remove_a_newer_registration_with_the_same_id() {
+    async fn timeout_cleanup_cannot_remove_a_newer_registration_reusing_the_id_in_its_run() {
         let pending = PendingElicitations::default();
-        let old = pending.park("old-run", elicitation("q-1", false)).unwrap();
-        pending.answer("q-1", vec!["yes".into()]).unwrap();
+        let old = pending.park("run-1", elicitation("q-1", false)).unwrap();
+        pending.answer("run-1", "q-1", vec!["yes".into()]).unwrap();
         assert_eq!(old.receiver.await.unwrap(), Some(vec!["yes".into()]));
-        let newer = pending.park("new-run", elicitation("q-1", false)).unwrap();
+        // The same run reuses the id for a fresh question; the timed-out old
+        // waiter must not delete it.
+        let newer = pending.park("run-1", elicitation("q-1", false)).unwrap();
 
-        assert!(!pending.remove_if_registration("q-1", old.registration));
-        pending.answer("q-1", vec!["no".into()]).unwrap();
+        assert!(!pending.remove_if_registration("run-1", "q-1", old.registration));
+        pending.answer("run-1", "q-1", vec!["no".into()]).unwrap();
         assert_eq!(newer.receiver.await.unwrap(), Some(vec!["no".into()]));
     }
 
@@ -718,7 +713,7 @@ mod tests {
         assert!(first.receiver.await.is_err());
         assert_eq!(pending.len(), 1);
 
-        pending.answer("q-2", vec!["no".into()]).unwrap();
+        pending.answer("run-2", "q-2", vec!["no".into()]).unwrap();
         assert_eq!(second.receiver.await.unwrap(), Some(vec!["no".into()]));
     }
 
@@ -767,7 +762,7 @@ mod tests {
         assert_eq!(answer.await.unwrap().unwrap(), None);
         assert_eq!(pending.len(), 0);
         assert!(matches!(
-            pending.answer("q-1", vec!["yes".into()]),
+            pending.answer("run-1", "q-1", vec!["yes".into()]),
             Err(CoreError::NotFound(_))
         ));
     }
@@ -1239,7 +1234,9 @@ mod tests {
         );
         assert!(stopped_prompt.receiver.await.is_err());
         assert_eq!(pending.len(), 1);
-        pending.answer("retained-q", vec!["yes".into()]).unwrap();
+        pending
+            .answer(&retained.to_string(), "retained-q", vec!["yes".into()])
+            .unwrap();
         assert_eq!(
             retained_prompt.receiver.await.unwrap(),
             Some(vec!["yes".into()])
@@ -1269,5 +1266,106 @@ mod tests {
                 .status,
             CancelChatRunStatus::AlreadyCompleted
         );
+    }
+
+    #[tokio::test]
+    async fn two_runs_sharing_an_elicitation_id_both_park_and_answer_to_their_own_run() {
+        let pending = PendingElicitations::default();
+        let run_a = pending
+            .park("run-a", elicitation("confirm", false))
+            .unwrap();
+        // The same model tool id under a distinct run is no longer a collision:
+        // both questions are live at once, each owned by its run.
+        let run_b = pending
+            .park("run-b", elicitation("confirm", false))
+            .unwrap();
+        assert_eq!(pending.len(), 2);
+
+        pending
+            .answer("run-a", "confirm", vec!["yes".into()])
+            .unwrap();
+        pending
+            .answer("run-b", "confirm", vec!["no".into()])
+            .unwrap();
+
+        assert_eq!(run_a.receiver.await.unwrap(), Some(vec!["yes".into()]));
+        assert_eq!(run_b.receiver.await.unwrap(), Some(vec!["no".into()]));
+        assert_eq!(pending.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn answering_one_run_never_resolves_a_siblings_same_id_entry() {
+        let pending = PendingElicitations::default();
+        let run_a = pending
+            .park("run-a", elicitation("confirm", false))
+            .unwrap();
+        let run_b = pending
+            .park("run-b", elicitation("confirm", false))
+            .unwrap();
+
+        pending
+            .answer("run-a", "confirm", vec!["yes".into()])
+            .unwrap();
+
+        // Run B's identically-keyed question is untouched by Run A's answer.
+        assert_eq!(run_a.receiver.await.unwrap(), Some(vec!["yes".into()]));
+        assert_eq!(pending.len(), 1);
+        pending
+            .answer("run-b", "confirm", vec!["no".into()])
+            .unwrap();
+        assert_eq!(run_b.receiver.await.unwrap(), Some(vec!["no".into()]));
+    }
+
+    #[tokio::test]
+    async fn purging_one_run_leaves_a_sibling_sharing_the_elicitation_id() {
+        let pending = PendingElicitations::default();
+        let run_a = pending
+            .park("run-a", elicitation("confirm", false))
+            .unwrap();
+        let run_b = pending
+            .park("run-b", elicitation("confirm", false))
+            .unwrap();
+
+        assert_eq!(pending.purge_run("run-a"), 1);
+
+        assert!(run_a.receiver.await.is_err());
+        assert_eq!(pending.len(), 1);
+        pending
+            .answer("run-b", "confirm", vec!["no".into()])
+            .unwrap();
+        assert_eq!(run_b.receiver.await.unwrap(), Some(vec!["no".into()]));
+    }
+
+    #[test]
+    fn answering_an_unregistered_run_is_rejected_even_when_the_id_lives_elsewhere() {
+        let pending = PendingElicitations::default();
+        let _live = pending
+            .park("run-a", elicitation("confirm", false))
+            .unwrap();
+
+        // A stale/foreign run id must not borrow another run's live entry.
+        assert!(matches!(
+            pending.answer("ghost-run", "confirm", vec!["yes".into()]),
+            Err(CoreError::NotFound(_))
+        ));
+        assert_eq!(pending.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn same_run_reusing_a_live_id_is_rejected_without_replacing_the_first_sender() {
+        let pending = PendingElicitations::default();
+        let first = pending
+            .park("run-1", elicitation("same-id", false))
+            .unwrap();
+
+        assert!(matches!(
+            pending.park("run-1", elicitation("same-id", false)),
+            Err(CoreError::Conflict(_))
+        ));
+
+        pending
+            .answer("run-1", "same-id", vec!["yes".into()])
+            .unwrap();
+        assert_eq!(first.receiver.await.unwrap(), Some(vec!["yes".into()]));
     }
 }

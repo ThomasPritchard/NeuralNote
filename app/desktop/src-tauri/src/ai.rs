@@ -145,12 +145,17 @@ pub(crate) fn error_detail(error: CoreError) -> String {
     }
 }
 
-/// What the frontend can know without touching the keychain: whether a key was
-/// configured and the model preference. The key itself is never returned.
+/// What the frontend can know about the key: whether one is actually stored and the
+/// model preference. `has_key` is read from the OS keychain — the authoritative
+/// source — never from a persisted bool, so a crash between the keychain write and
+/// the config write can't make the UI disagree with the real secret state (issue
+/// #14). The key itself is never returned; a keychain failure is surfaced as an
+/// error rather than silently read as "not configured". The config is read first so
+/// a corrupt config still fails without a keychain read.
 pub fn api_key_status(config_dir: &Path) -> Result<ApiKeyStatus, CoreError> {
     let config = provider_config::read_provider_config(config_dir)?;
     Ok(ApiKeyStatus {
-        has_key: config.key_configured,
+        has_key: read_api_key()?.is_some(),
         model: config.model,
     })
 }
@@ -643,6 +648,10 @@ mod tests {
         deletes: Arc<AtomicUsize>,
         after_next_read: AfterReadHook,
         after_next_write: AfterReadHook,
+        /// When set, `get_secret` returns a hard keychain failure (not `NoEntry`), so
+        /// tests can prove a genuine keychain error is surfaced honestly rather than
+        /// read as "no key".
+        fail_reads: Arc<std::sync::atomic::AtomicBool>,
     }
 
     impl TestKeychain {
@@ -698,6 +707,10 @@ mod tests {
                 .unwrap()
                 .contains_key(&(service.to_string(), user.to_string()))
         }
+
+        fn fail_reads(&self) {
+            self.fail_reads.store(true, Ordering::SeqCst);
+        }
     }
 
     #[derive(Clone)]
@@ -750,6 +763,12 @@ mod tests {
 
         fn get_secret(&self) -> KeyringResult<Vec<u8>> {
             self.store.reads.fetch_add(1, Ordering::SeqCst);
+            if self.store.fail_reads.load(Ordering::SeqCst) {
+                return Err(KeyringError::Invalid(
+                    "keychain".into(),
+                    "simulated keychain failure".into(),
+                ));
+            }
             let secret = self
                 .store
                 .secrets
@@ -793,17 +812,10 @@ mod tests {
         fs::read_to_string(config_file(config_dir)).unwrap()
     }
 
-    fn provider_config(model: &str, key_configured: bool) -> ProviderConfig {
+    fn provider_config(model: &str) -> ProviderConfig {
         ProviderConfig {
-            active_provider: None,
             model: model.into(),
-            key_configured,
-            local_model_tag: None,
-            reasoning: false,
-            reasoning_support: None,
-            reasoning_probed_model: None,
-            reasoning_probe_generation: 0,
-            disabled_skills: Vec::new(),
+            ..ProviderConfig::default()
         }
     }
 
@@ -890,12 +902,14 @@ mod tests {
     }
 
     #[test]
-    fn api_key_status_returns_no_key_when_config_is_absent_without_touching_keychain() {
+    fn api_key_status_reports_no_key_when_config_absent_and_keychain_empty() {
+        // Missing config + empty keychain: first run reads as "no key" and still
+        // reports the default model, without needing a persisted config file.
         let _guard = KEYCHAIN_TEST_LOCK
             .get_or_init(|| StdMutex::new(()))
             .lock()
             .unwrap();
-        let keychain = TestKeychain::install();
+        let _keychain = TestKeychain::install();
         let config_dir = temp_config_dir("status-absent-config");
 
         let status = api_key_status(&config_dir).unwrap();
@@ -903,32 +917,74 @@ mod tests {
         assert!(!status.has_key);
         assert_eq!(status.model, DEFAULT_MODEL);
         assert!(!config_file(&config_dir).exists());
-        assert_eq!(
-            keychain.reads.load(Ordering::SeqCst),
-            0,
-            "status must not perform a keychain read on first run"
-        );
     }
 
     #[test]
-    fn api_key_status_reads_config_without_touching_keychain() {
+    fn api_key_status_reports_present_from_keychain_ignoring_a_stale_false_flag() {
+        // Issue #14: a stale `keyConfigured:false` in the config must NOT hide a key
+        // that is actually present in the keychain — presence is authoritative.
         let _guard = KEYCHAIN_TEST_LOCK
             .get_or_init(|| StdMutex::new(()))
             .lock()
             .unwrap();
         let keychain = TestKeychain::install();
-        let config_dir = temp_config_dir("status-no-keychain");
-        write_provider_config(&config_dir, &provider_config("openai/gpt-4.1", true)).unwrap();
+        let config_dir = temp_config_dir("status-stale-false");
+        fs::write(
+            config_file(&config_dir),
+            r#"{"model":"openai/gpt-4.1","keyConfigured":false}"#,
+        )
+        .unwrap();
+        keychain.set(KEYCHAIN_SERVICE, KEY_ACCOUNT, "sk-or-present");
 
         let status = api_key_status(&config_dir).unwrap();
 
-        assert!(status.has_key);
-        assert_eq!(status.model, "openai/gpt-4.1");
-        assert_eq!(
-            keychain.reads.load(Ordering::SeqCst),
-            0,
-            "status must not perform a keychain read"
+        assert!(
+            status.has_key,
+            "a present key must not be hidden by a stale flag"
         );
+        assert_eq!(status.model, "openai/gpt-4.1");
+    }
+
+    #[test]
+    fn api_key_status_reports_absent_from_keychain_ignoring_a_stale_true_flag() {
+        // Issue #14: a stale `keyConfigured:true` (e.g. a crash after a clear wrote
+        // the keychain delete but not the config) must read as "no key" because the
+        // keychain is empty.
+        let _guard = KEYCHAIN_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let _keychain = TestKeychain::install();
+        let config_dir = temp_config_dir("status-stale-true");
+        fs::write(
+            config_file(&config_dir),
+            r#"{"model":"openai/gpt-4.1","keyConfigured":true}"#,
+        )
+        .unwrap();
+
+        let status = api_key_status(&config_dir).unwrap();
+
+        assert!(!status.has_key, "an empty keychain must read as no key");
+        assert_eq!(status.model, "openai/gpt-4.1");
+    }
+
+    #[test]
+    fn api_key_status_surfaces_a_keychain_failure_instead_of_reading_no_key() {
+        // A genuine keychain failure must be surfaced honestly, never silently
+        // collapsed to has_key:false.
+        let _guard = KEYCHAIN_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let keychain = TestKeychain::install();
+        let config_dir = temp_config_dir("status-keychain-failure");
+        write_provider_config(&config_dir, &provider_config("openai/gpt-4.1")).unwrap();
+        keychain.fail_reads();
+
+        match api_key_status(&config_dir).unwrap_err() {
+            CoreError::Io(msg) => assert!(msg.contains("keychain read failed")),
+            other => panic!("expected a keychain failure to surface as Io, got {other:?}"),
+        }
     }
 
     #[test]
@@ -955,8 +1011,11 @@ mod tests {
         );
         let raw = read_config_text(&config_dir);
         assert!(raw.contains(r#""model""#));
-        assert!(raw.contains(r#""keyConfigured": true"#));
         assert!(raw.contains("anthropic/claude-opus-4.1"));
+        assert!(
+            !raw.contains("keyConfigured"),
+            "key state is derived from the keychain and must never be persisted (issue #14)"
+        );
         assert!(!raw.contains(key), "the API key must never be serialized");
         assert_eq!(
             provider_config::read_provider_config(&config_dir)
@@ -1072,7 +1131,7 @@ mod tests {
             .unwrap();
         let keychain = TestKeychain::install();
         let config_dir = temp_config_dir("save-keychain-outside-gate");
-        write_provider_config(&config_dir, &provider_config("vendor/old", false)).unwrap();
+        write_provider_config(&config_dir, &provider_config("vendor/old")).unwrap();
         let gate = ProviderConfigMutationGate::default();
 
         let gate_held = Arc::new(Barrier::new(2));
@@ -1123,11 +1182,15 @@ mod tests {
         });
 
         let persisted = provider_config::read_provider_config(&config_dir).unwrap();
-        assert!(
-            persisted.key_configured,
+        assert_eq!(
+            persisted.model, "vendor/new",
             "the config step must still land once the gate is free"
         );
-        assert_eq!(persisted.model, "vendor/new");
+        assert_eq!(
+            keychain.get(KEYCHAIN_SERVICE, KEY_ACCOUNT).as_deref(),
+            Some("sk-or-unblocked"),
+            "the key stays in the keychain — the authoritative key-configured source"
+        );
     }
 
     #[test]
@@ -1207,7 +1270,7 @@ mod tests {
             .unwrap();
         let keychain = TestKeychain::install();
         let config_dir = temp_config_dir("cache-clear-race");
-        write_provider_config(&config_dir, &provider_config("openai/gpt-4.1", true)).unwrap();
+        write_provider_config(&config_dir, &provider_config("openai/gpt-4.1")).unwrap();
         keychain.set(KEYCHAIN_SERVICE, KEY_ACCOUNT, "sk-or-old");
         let clear_config_dir = config_dir.clone();
         let clear_gate = ProviderConfigMutationGate::default();

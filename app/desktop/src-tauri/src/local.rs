@@ -47,6 +47,11 @@ const OLLAMA_NUM_CTX: u32 = 32_768;
 /// last N KiB and drop older bytes, bounding what would otherwise grow for the
 /// sidecar's whole lifetime as `ollama serve` logs request/INFO lines (PA-009).
 const MAX_STDERR_BYTES: usize = 16 * 1024;
+/// Free bytes we insist on keeping ON TOP of the model's own download size before a
+/// pull. Ollama streams the blob then verifies/renames it, and filling a volume to
+/// its last byte is a hazard for every other app on it; 1 GiB is a conservative floor
+/// that's negligible against the multi-GB models in the curated catalogue.
+const PULL_DISK_HEADROOM_BYTES: u64 = 1 << 30;
 
 pub(super) struct OllamaSidecar {
     child: CommandChild,
@@ -498,15 +503,104 @@ pub(super) async fn list_local_models(port: u16) -> CoreResult<Vec<InstalledMode
     parse_installed_models(&body)
 }
 
+/// Decimal size string (GB, base-1000) matching the catalogue's decimal
+/// `download_bytes` — a curated `3_400_000_000` reads back as "3.4 GB".
+fn format_gb(bytes: u64) -> String {
+    format!("{:.1} GB", bytes as f64 / 1_000_000_000.0)
+}
+
+/// Why a preflight couldn't fully verify, built only from the inputs that were
+/// actually missing so it can never claim a value it had.
+fn unverified_preflight_reason(expected_bytes: Option<u64>, free_bytes: Option<u64>) -> String {
+    let mut missing = Vec::new();
+    if expected_bytes.is_none() {
+        missing.push("the model's download size");
+    }
+    if free_bytes.is_none() {
+        missing.push("free space on the models volume");
+    }
+    format!("{} could not be determined", missing.join(" and "))
+}
+
+/// Pure disk-space decision, split out so the boundary and overflow rules are
+/// testable without touching a real disk. `expected_bytes = None` means the model's
+/// size is unknown; `free_bytes = None` means the volume probe failed.
+///
+/// Honesty rule for missing inputs: we only ever REFUSE on POSITIVE evidence of
+/// insufficiency — a known requirement that exceeds known free space. A missing input
+/// is *not* evidence a pull won't fit, so turning it into a refusal would be a lie in
+/// the other direction that silently denies a download that may be perfectly fine.
+/// Instead we PROCEED but hand back a warning for the caller to log (never silent —
+/// mirrors `detect_hardware`'s warn-and-fall-back pattern), and Ollama's own pull
+/// stream still surfaces a genuine out-of-space mid-download as an in-band error.
+///
+/// Boundary rule: the required figure is `expected + headroom`, and the pull is
+/// refused iff `free < required` — so exactly `free == required` is treated as
+/// sufficient and proceeds. `saturating_add` keeps a bogus/huge `expected` from
+/// wrapping the headroom back down to a small `required` that would wave a pull
+/// through; on overflow it pins to `u64::MAX`, which no real volume can satisfy.
+///
+/// `Ok(None)` = verified sufficient, `Ok(Some(reason))` = proceed but log the reason,
+/// `Err` = refuse before any request is sent.
+fn evaluate_pull_disk_space(
+    expected_bytes: Option<u64>,
+    free_bytes: Option<u64>,
+) -> CoreResult<Option<String>> {
+    let (Some(expected), Some(free)) = (expected_bytes, free_bytes) else {
+        return Ok(Some(unverified_preflight_reason(
+            expected_bytes,
+            free_bytes,
+        )));
+    };
+
+    let required = expected.saturating_add(PULL_DISK_HEADROOM_BYTES);
+    if free < required {
+        return Err(CoreError::LocalAi(format!(
+            "Not enough disk space to download this model: it needs about {} \
+             (including a safety margin) but only {} is free on the models volume. \
+             Free up space and try again.",
+            format_gb(required),
+            format_gb(free),
+        )));
+    }
+    Ok(None)
+}
+
+/// Real-disk wrapper around [`evaluate_pull_disk_space`]: probe the volume that
+/// actually holds `models_dir` — `statvfs` follows symlinks and reports the
+/// containing filesystem, so this is the true destination mount, not an assumed
+/// `$HOME` — then apply the pure decision. A probe failure is logged and mapped to
+/// "unknown free space" rather than swallowed, so it proceeds-with-warning instead of
+/// masquerading as a verified pass.
+fn preflight_pull_disk_space(models_dir: &Path, expected_bytes: Option<u64>) -> CoreResult<()> {
+    let free_bytes = match free_disk_bytes(Some(models_dir)) {
+        Ok(bytes) => Some(bytes),
+        Err(error) => {
+            log::warn!("could not probe free space before a model download: {error}");
+            None
+        }
+    };
+    if let Some(reason) = evaluate_pull_disk_space(expected_bytes, free_bytes)? {
+        log::warn!(
+            "proceeding with a model download despite an unverified disk preflight: {reason}"
+        );
+    }
+    Ok(())
+}
+
 pub(super) async fn pull_local_model(
     port: u16,
     tag: &str,
+    models_dir: &Path,
+    expected_bytes: Option<u64>,
     sink: &mut dyn PullSink,
     cancel: &AtomicBool,
 ) -> CoreResult<()> {
-    // TODO(pull-disk-precheck): thread the chosen `CandidateModel` or models dir
-    // through Phase 3 so this can compare available bytes on the exact volume
-    // before starting a multi-GB download.
+    // Refuse a known-too-big pull on the EXACT destination volume before opening the
+    // download, so a multi-GB stream never starts only to die mid-flight with a
+    // half-written blob. Surfaced through the returned `Err` (the command turns it
+    // into the one terminal `PullEvent::Error`).
+    preflight_pull_disk_space(models_dir, expected_bytes)?;
     let client = pull_client()?;
     let resp = client
         .post(api_url(port, "/api/pull"))
@@ -576,7 +670,7 @@ fn pick_loopback_port() -> CoreResult<u16> {
     Ok(port)
 }
 
-fn ollama_models_dir(app: &AppHandle) -> CoreResult<PathBuf> {
+pub(super) fn ollama_models_dir(app: &AppHandle) -> CoreResult<PathBuf> {
     app.path()
         .app_data_dir()
         .map(|dir| dir.join(OLLAMA_MODELS_DIR))
@@ -781,6 +875,119 @@ mod tests {
 
         assert!(free_disk_bytes(Some(&missing)).is_err());
         assert!(free_disk_bytes(None).is_err());
+    }
+
+    const MODEL_BYTES: u64 = 6_600_000_000; // qwen3.5:9b, a real catalogue size.
+
+    #[test]
+    fn pull_preflight_allows_a_pull_that_fits() {
+        // Ample headroom over required (model + margin) → verified sufficient, no warn.
+        let free = MODEL_BYTES + PULL_DISK_HEADROOM_BYTES + 10_000_000_000;
+        assert_eq!(
+            evaluate_pull_disk_space(Some(MODEL_BYTES), Some(free)).unwrap(),
+            None,
+        );
+    }
+
+    #[test]
+    fn pull_preflight_refuses_a_pull_that_cannot_fit() {
+        // Free space below required is positive evidence of insufficiency → refuse,
+        // with a message that names both figures so the failure isn't opaque.
+        let result = evaluate_pull_disk_space(Some(MODEL_BYTES), Some(1_000_000_000));
+        let Err(CoreError::LocalAi(message)) = result else {
+            panic!("an undersized volume must be refused, got {result:?}");
+        };
+        assert!(message.contains("Not enough disk space"), "{message}");
+        assert!(
+            message.contains("1.0 GB"),
+            "must report the free figure: {message}"
+        );
+    }
+
+    #[test]
+    fn pull_preflight_treats_exact_required_as_sufficient() {
+        // Boundary rule: refuse iff `free < required`, so `free == required` proceeds.
+        let required = MODEL_BYTES + PULL_DISK_HEADROOM_BYTES;
+        assert_eq!(
+            evaluate_pull_disk_space(Some(MODEL_BYTES), Some(required)).unwrap(),
+            None,
+            "free == required is sufficient (inclusive lower bound)",
+        );
+        assert!(
+            evaluate_pull_disk_space(Some(MODEL_BYTES), Some(required - 1)).is_err(),
+            "one byte under required must be refused",
+        );
+    }
+
+    #[test]
+    fn pull_preflight_does_not_overflow_on_a_huge_size() {
+        // A bogus/huge expected size must not wrap the headroom addition back to a
+        // small required figure and wave the pull through; saturating_add pins it to
+        // u64::MAX, which no real volume satisfies → refuse, no panic.
+        assert!(
+            evaluate_pull_disk_space(Some(u64::MAX), Some(500_000_000_000)).is_err(),
+            "u64::MAX + headroom must saturate and refuse, not wrap",
+        );
+    }
+
+    #[test]
+    fn pull_preflight_warns_but_proceeds_when_size_is_unknown() {
+        // Unknown size is not evidence of insufficiency → proceed with a surfaced
+        // reason naming the missing input, never a silent pass.
+        let reason = evaluate_pull_disk_space(None, Some(50_000_000_000))
+            .unwrap()
+            .expect("unknown size must yield a warning, not a silent pass");
+        assert!(reason.contains("download size"), "{reason}");
+    }
+
+    #[test]
+    fn pull_preflight_warns_but_proceeds_when_probe_failed() {
+        // A failed free-space probe is likewise surfaced-and-proceed, not swallowed.
+        let reason = evaluate_pull_disk_space(Some(MODEL_BYTES), None)
+            .unwrap()
+            .expect("a failed probe must yield a warning, not a silent pass");
+        assert!(reason.contains("free space"), "{reason}");
+    }
+
+    #[test]
+    fn pull_preflight_names_both_missing_inputs() {
+        let reason = evaluate_pull_disk_space(None, None).unwrap().unwrap();
+        assert!(
+            reason.contains("download size") && reason.contains("free space"),
+            "{reason}"
+        );
+    }
+
+    #[test]
+    fn format_gb_reads_decimal_catalogue_sizes() {
+        assert_eq!(format_gb(3_400_000_000), "3.4 GB");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_wrapper_refuses_when_the_model_dwarfs_a_real_volume() {
+        // End-to-end through the real statvfs probe: an exabyte-scale model can't fit
+        // any real test volume, so the wrapper refuses before any request.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(preflight_pull_disk_space(dir.path(), Some(u64::MAX / 2)).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_wrapper_allows_a_tiny_model_on_a_real_volume() {
+        // A kilobyte "model" fits any working volume that has room for the headroom.
+        let dir = tempfile::tempdir().unwrap();
+        assert!(preflight_pull_disk_space(dir.path(), Some(1024)).is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn preflight_wrapper_proceeds_when_the_probe_path_is_missing() {
+        // A probe failure (missing path) is surfaced as a warning and proceeds — it is
+        // not treated as zero free space, which would wrongly block a valid pull.
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("does-not-exist");
+        assert!(preflight_pull_disk_space(&missing, Some(MODEL_BYTES)).is_ok());
     }
 
     #[test]

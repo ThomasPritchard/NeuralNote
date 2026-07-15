@@ -3289,6 +3289,21 @@ mod tests {
         assert!(extract_cited_ids("no citations here").is_empty());
     }
 
+    #[test]
+    fn extract_cited_ids_drops_a_marker_severed_by_truncation() {
+        // The moat guarantee under a `length` cut: when the answer is truncated mid
+        // marker, the complete markers survive and the severed one — missing its closing
+        // `]` — is never emitted as a citation. A wrong citation is worse than no answer.
+        assert_eq!(
+            extract_cited_ids("Sugar is sweet [e1] and salt [e2"),
+            vec!["e1".to_string()]
+        );
+        // Cut at the bracket, at the prefix, and mid-digits — none of these parse.
+        assert!(extract_cited_ids("cut at the bracket [").is_empty());
+        assert!(extract_cited_ids("cut at the prefix [e").is_empty());
+        assert!(extract_cited_ids("cut mid-digits [e12").is_empty());
+    }
+
     fn assistant_msg(content: &str) -> LlmMessage {
         LlmMessage {
             role: crate::ai::llm::Role::Assistant,

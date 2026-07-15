@@ -96,6 +96,10 @@ describe("emptyAssistant", () => {
     expect(turn.pendingElicitation).toBeNull();
     expect(turn.writtenNotes).toEqual([]);
   });
+
+  it("starts un-truncated", () => {
+    expect(emptyAssistant().truncated).toBe(false);
+  });
 });
 
 describe("turn-specific event and stop routing", () => {
@@ -368,6 +372,22 @@ describe("reduceAssistant — activity log", () => {
       { kind: "verifying" },
       { kind: "dropped", reason: "quote not found" },
     ]);
+  });
+});
+
+describe("reduceAssistant — answer truncation", () => {
+  it("flags a truncated answer without discarding the streamed text or citations", () => {
+    // `answerTruncated` lands right after the final answer delta: the partial
+    // answer and any citations already collected are still valid and must
+    // survive untouched — the event only marks the answer incomplete.
+    const turn = run([
+      { type: "answer", delta: "Spaced repetition improves recall" },
+      { type: "citation", id: "e1", relPath: "A.md", startLine: 1, endLine: 2, text: "alpha" },
+      { type: "answerTruncated" },
+    ]);
+    expect(turn.truncated).toBe(true);
+    expect(turn.answer).toBe("Spaced repetition improves recall");
+    expect(turn.citations.map((c) => c.id)).toEqual(["e1"]);
   });
 });
 

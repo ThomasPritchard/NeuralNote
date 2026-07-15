@@ -49,6 +49,7 @@ function OptionBody({ option }: Readonly<{ option: ElicitOption }>) {
 
 export function ElicitCard({
   elicitation,
+  turnId,
   dormant,
   busy,
   answer,
@@ -56,6 +57,9 @@ export function ElicitCard({
   onSendFollowUp,
 }: Readonly<{
   elicitation: PendingElicitation;
+  /** The owning run's id, sent with the answer so the Rust shell resolves this
+   *  run's question and never a sibling run that reused the same elicitation id. */
+  turnId: string;
   /** The run ended with this question unanswered (timeout / error) — render
    *  the quiet register and route clicks into chat. Never PERMANENTLY
    *  disabled: dormant stays clickable per spec §3.4, inert only transiently
@@ -109,7 +113,7 @@ export function ElicitCard({
     setSubmitting(true);
     setError(null);
     try {
-      await api.answerElicitation(id, choices);
+      await api.answerElicitation(turnId, id, choices);
       // The clicked control is about to disable — park focus on the card
       // first so keyboard users aren't dropped to the document body.
       containerRef.current?.focus();

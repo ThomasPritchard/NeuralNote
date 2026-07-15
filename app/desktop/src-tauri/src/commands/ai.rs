@@ -76,9 +76,15 @@ pub(crate) fn save_api_key(
 /// empty key is rejected before anything is written. If the keychain write fails, the
 /// config is never touched. If the config write fails *after* the keychain write
 /// committed, the key stays in the keychain and the in-session cache while the failure
-/// is surfaced — a half-applied save is reported, never silent. Deriving
-/// `key_configured` from keychain presence would close the crash window between the two
-/// writes entirely (PA-023); until then the flag is persisted.
+/// is surfaced — a half-applied save is reported, never silent. Key-configured state
+/// is no longer persisted at all: it is derived from keychain presence (issue #14), so
+/// this crash window can no longer make the UI or routing disagree with the real
+/// secret state. The only config change here is the non-secret model preference.
+///
+/// The reasoning-probe invalidation is driven by the key transition absent → present:
+/// after a save the effective OpenRouter target exists, so any stale verdict is
+/// dropped. `false` for the "before" side is fail-safe — it can only over-invalidate
+/// (a harmless re-probe), never keep a stale verdict — and needs no keychain read.
 pub(crate) fn save_api_key_in(
     config_dir: &Path,
     mutation_gate: &ProviderConfigMutationGate,
@@ -87,9 +93,8 @@ pub(crate) fn save_api_key_in(
 ) -> Result<(), CoreError> {
     ai::set_keychain_api_key(key)?;
     mutation_gate
-        .update(config_dir, |cfg| {
+        .update_with_key_transition(config_dir, false, true, |cfg| {
             cfg.model = model.to_string();
-            cfg.key_configured = true;
             Ok(())
         })
         .map(|_| ())
@@ -108,20 +113,21 @@ pub(crate) fn clear_api_key(app: AppHandle, state: SharedState<'_>) -> Result<()
 }
 
 /// Clear the OpenRouter key: delete the secret from the keychain FIRST, outside the
-/// config-mutation gate, then clear the non-secret `key_configured` flag under the
-/// gate — so the lock never spans keychain I/O (issue #21 AC #2). If the config write
-/// fails after the keychain delete succeeded, the failure is surfaced and the corrupt
-/// config is left untouched rather than clobbered to a default.
+/// config-mutation gate, then persist the reasoning-probe invalidation under the gate
+/// — so the lock never spans keychain I/O (issue #21 AC #2). Key-configured state is
+/// derived from keychain presence (issue #14), so there is no persisted flag to clear;
+/// the only config effect is dropping the now-stale reasoning verdict via the key
+/// transition present → absent. If the config write fails after the keychain delete
+/// succeeded, the failure is surfaced and a corrupt config is left untouched rather
+/// than clobbered to a default. `true` for the "before" side is fail-safe — it can
+/// only over-invalidate — and needs no keychain read.
 pub(crate) fn clear_api_key_in(
     config_dir: &Path,
     mutation_gate: &ProviderConfigMutationGate,
 ) -> Result<(), CoreError> {
     ai::clear_keychain_api_key()?;
     mutation_gate
-        .update(config_dir, |cfg| {
-            cfg.key_configured = false;
-            Ok(())
-        })
+        .update_with_key_transition(config_dir, true, false, |_cfg| Ok(()))
         .map(|_| ())
         .map_err(|e| {
             CoreError::Io(format!(
@@ -167,9 +173,8 @@ pub(crate) struct LocalStatus {
 
 #[tauri::command]
 pub(crate) fn ai_status(app: AppHandle) -> Result<AiStatus, CoreError> {
-    Ok(build_ai_status(neuralnote_core::ai::read_provider_config(
-        &config_dir(&app)?,
-    )?))
+    let cfg = neuralnote_core::ai::read_provider_config(&config_dir(&app)?)?;
+    Ok(build_ai_status(cfg, ai::read_api_key()?.is_some()))
 }
 
 /// Return today's validated OpenRouter model choices. A successful result,
@@ -230,13 +235,15 @@ pub(crate) fn select_openrouter_model(
         let app_state = lock_state(&state);
         openrouter_selection_context(&app_state)
     };
+    let key_present = ai::read_api_key()?.is_some();
     let config = openrouter_catalogue::persist_selected_model(
         &config_dir(&app)?,
         &mutation_gate,
+        key_present,
         &offered,
         &model,
     )?;
-    Ok(build_ai_status(config))
+    Ok(build_ai_status(config, key_present))
 }
 
 /// Open OpenRouter's rankings attribution page. The target is compiled into
@@ -258,13 +265,13 @@ pub(crate) fn open_openrouter_rankings(app: AppHandle) -> Result<(), CoreError> 
 /// command (which owns only the config read) so the config → status mapping — notably
 /// that `reasoning` surfaces on the OpenRouter status — is unit-testable without an
 /// `AppHandle`.
-fn build_ai_status(cfg: neuralnote_core::ai::ProviderConfig) -> AiStatus {
-    let reasoning_supported = cfg.cached_reasoning_support();
+fn build_ai_status(cfg: neuralnote_core::ai::ProviderConfig, key_present: bool) -> AiStatus {
+    let reasoning_supported = cfg.cached_reasoning_support(key_present);
     AiStatus {
-        active_provider: cfg.effective_provider(),
+        active_provider: cfg.effective_provider(key_present),
         reasoning_supported,
         openrouter: OpenRouterStatus {
-            has_key: cfg.key_configured,
+            has_key: key_present,
             model: cfg.model,
             reasoning: cfg.reasoning,
         },
@@ -306,8 +313,9 @@ pub(crate) fn set_active_provider(
         }
     }
     let dir = config_dir(&app)?;
+    let key_present = ai::read_api_key()?.is_some();
     provider_config_mutation_gate(&state)
-        .update(&dir, move |cfg| {
+        .update(&dir, key_present, move |cfg| {
             cfg.active_provider = Some(provider);
             if let Some(tag) = local_model_tag {
                 cfg.local_model_tag = Some(tag);
@@ -333,19 +341,26 @@ pub(crate) fn set_reasoning(
     enabled: bool,
 ) -> Result<AiStatus, CoreError> {
     let dir = config_dir(&app)?;
-    set_reasoning_in(&dir, &provider_config_mutation_gate(&state), enabled)
+    let key_present = ai::read_api_key()?.is_some();
+    set_reasoning_in(
+        &dir,
+        &provider_config_mutation_gate(&state),
+        key_present,
+        enabled,
+    )
 }
 
 fn set_reasoning_in(
     config_dir: &Path,
     mutation_gate: &ProviderConfigMutationGate,
+    key_present: bool,
     enabled: bool,
 ) -> Result<AiStatus, CoreError> {
-    let cfg = mutation_gate.update(config_dir, |cfg| {
+    let cfg = mutation_gate.update(config_dir, key_present, |cfg| {
         cfg.reasoning = enabled;
         Ok(())
     })?;
-    Ok(build_ai_status(cfg))
+    Ok(build_ai_status(cfg, key_present))
 }
 
 /// Probe the effective provider's selected model for reasoning/thinking support,
@@ -358,14 +373,15 @@ pub(crate) async fn refresh_reasoning_support(
 ) -> Result<AiStatus, CoreError> {
     let dir = config_dir(&app)?;
     let mutation_gate = provider_config_mutation_gate(&state);
-    let (cfg, target) = begin_reasoning_probe(&dir, &mutation_gate)?;
+    let key_present = ai::read_api_key()?.is_some();
+    let (cfg, target) = begin_reasoning_probe(&dir, &mutation_gate, key_present)?;
 
     match target {
         Some(target) => {
             let support = probed_verdict(&app, &state, &target).await;
-            persist_reasoning_verdict(&dir, &mutation_gate, support, target)
+            persist_reasoning_verdict(&dir, &mutation_gate, key_present, support, target)
         }
-        None => Ok(build_ai_status(cfg)),
+        None => Ok(build_ai_status(cfg, key_present)),
     }
 }
 
@@ -374,6 +390,7 @@ pub(crate) async fn refresh_reasoning_support(
 fn begin_reasoning_probe(
     dir: &Path,
     mutation_gate: &ProviderConfigMutationGate,
+    key_present: bool,
 ) -> Result<
     (
         neuralnote_core::ai::ProviderConfig,
@@ -383,7 +400,7 @@ fn begin_reasoning_probe(
 > {
     mutation_gate.run(dir, || {
         let mut cfg = neuralnote_core::ai::read_provider_config(dir)?;
-        let target = cfg.start_reasoning_probe()?;
+        let target = cfg.start_reasoning_probe(key_present)?;
         if target.is_some() {
             neuralnote_core::ai::write_provider_config(dir, &cfg)?;
         }
@@ -398,15 +415,16 @@ fn begin_reasoning_probe(
 fn persist_reasoning_verdict(
     dir: &Path,
     mutation_gate: &ProviderConfigMutationGate,
+    key_present: bool,
     support: ReasoningSupport,
     target: ReasoningProbeTarget,
 ) -> Result<AiStatus, CoreError> {
     mutation_gate.run(dir, || {
         let mut cfg = neuralnote_core::ai::read_provider_config(dir)?;
-        if cfg.apply_reasoning_probe(&target, support) {
+        if cfg.apply_reasoning_probe(key_present, &target, support) {
             neuralnote_core::ai::write_provider_config(dir, &cfg)?;
         }
-        Ok(build_ai_status(cfg))
+        Ok(build_ai_status(cfg, key_present))
     })
 }
 
@@ -533,6 +551,24 @@ pub(crate) async fn pull_local_model(
     // startup — losing the cancel). The lock is released at the end of this stmt.
     let cancel = lock_state(&state).local_ai.install_pull_cancel();
 
+    // The exact destination volume and this model's expected size, threaded into the
+    // pull's disk preflight. The tag is curated (checked above), so the size is
+    // normally known; an unexpected lookup miss surfaces as `None` (unknown size),
+    // which the preflight handles honestly rather than assuming zero.
+    let models_dir = match local::ollama_models_dir(&app) {
+        Ok(dir) => dir,
+        Err(e) => {
+            sink.send(PullEvent::Error {
+                message: ai::error_detail(e),
+            });
+            return Ok(());
+        }
+    };
+    let expected_bytes = neuralnote_core::ai::curated_candidates()
+        .into_iter()
+        .find(|candidate| candidate.tag == tag)
+        .map(|candidate| candidate.download_bytes);
+
     let port = match local::ensure_ollama_started(&app, &state).await {
         Ok(p) => p,
         Err(e) => {
@@ -552,7 +588,8 @@ pub(crate) async fn pull_local_model(
         return Ok(());
     }
 
-    match local::pull_local_model(port, &tag, &mut sink, &cancel).await {
+    match local::pull_local_model(port, &tag, &models_dir, expected_bytes, &mut sink, &cancel).await
+    {
         Ok(()) => sink.send(PullEvent::Success),
         Err(e) => sink.send(PullEvent::Error {
             message: ai::error_detail(e),
@@ -780,6 +817,18 @@ pub(crate) async fn chat(
             return Ok(run_id);
         }
     };
+    // Key presence (the keychain — the authoritative source, issue #14) resolves the
+    // effective OpenRouter provider for a legacy install with no explicit choice. A
+    // keychain failure here is surfaced, never silently routed as "no provider".
+    let key_present = match ai::read_api_key() {
+        Ok(key) => key.is_some(),
+        Err(e) => {
+            sink.send(ChatEvent::Error {
+                message: format!("Couldn't read the API key: {e}"),
+            });
+            return Ok(run_id);
+        }
+    };
 
     let history: Vec<LlmMessage> = history.into_iter().map(Into::into).collect();
     let retriever = KeywordRetriever::new(root.clone());
@@ -865,7 +914,7 @@ pub(crate) async fn chat(
         close_signal: &close_signal,
         cancellation_observed,
     };
-    let ledger = match cfg.effective_provider() {
+    let ledger = match cfg.effective_provider(key_present) {
         None => {
             run.sink.send(ChatEvent::Error {
                 message: "No AI provider is set up yet. Choose one in Settings.".into(),
@@ -875,7 +924,7 @@ pub(crate) async fn chat(
         Some(ProviderKind::OpenRouter) => {
             let effective = neuralnote_core::ai::effective_reasoning(
                 cfg.reasoning,
-                cfg.cached_reasoning_support(),
+                cfg.cached_reasoning_support(key_present),
             );
             chat_via_openrouter(&mut run, &cfg.model, effective).await
         }
@@ -1313,9 +1362,9 @@ mod tests {
     use neuralnote_core::ai::{
         read_provider_config, run_chat, write_provider_config, ChatEvent, Completion, EventSink,
         Guards, HardwareSpec, KeywordRetriever, LlmClient, LlmRequest, NoUserPrompt,
-        ProviderConfig, ProviderKind, ReasoningProbeTarget, ReasoningSupport, SkillEnvironment,
-        SkillLookupError, SkillRegistry, SkillServices, ToolCall, FIXTURE_SKILL_ID,
-        YOUTUBE_DISTIL_SKILL_ID,
+        ProbedReasoning, ProviderConfig, ProviderKind, ReasoningProbeTarget, ReasoningSupport,
+        SkillEnvironment, SkillLookupError, SkillRegistry, SkillServices, ToolCall,
+        FIXTURE_SKILL_ID, YOUTUBE_DISTIL_SKILL_ID,
     };
     use neuralnote_core::CoreResult;
     use std::collections::BTreeSet;
@@ -1323,6 +1372,14 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier};
     use std::time::{Duration, Instant};
+
+    /// A paired reasoning verdict for building test configs.
+    fn probed(model: &str, support: ReasoningSupport) -> Option<ProbedReasoning> {
+        Some(ProbedReasoning {
+            model: model.into(),
+            support,
+        })
+    }
 
     const STALE_PROBE_CHILD_DIR: &str = "NEURALNOTE_STALE_PROBE_CHILD_DIR";
     const MATCHING_PROBE_CHILD_DIR: &str = "NEURALNOTE_MATCHING_PROBE_CHILD_DIR";
@@ -1352,7 +1409,7 @@ mod tests {
             let first_gate = gate.clone();
             let first_dir = dir.to_path_buf();
             let first_handle = scope.spawn(move || {
-                first_gate.update(&first_dir, |config| {
+                first_gate.update(&first_dir, false, |config| {
                     first(config);
                     first_loaded_for_thread.wait();
                     release_first_for_thread.wait();
@@ -1405,12 +1462,13 @@ mod tests {
                     openrouter_catalogue::persist_selected_model(
                         second_dir,
                         second_gate,
+                        false,
                         &offered,
                         "vendor/new",
                     )
                     .map(|_| ())
                 } else {
-                    set_reasoning_in(second_dir, second_gate, false).map(|_| ())
+                    set_reasoning_in(second_dir, second_gate, false, false).map(|_| ())
                 }
             },
         );
@@ -1490,7 +1548,7 @@ mod tests {
             |config| config.reasoning = false,
             |second_dir, second_gate| {
                 second_gate
-                    .update(second_dir, |cfg| {
+                    .update(second_dir, false, |cfg| {
                         cfg.active_provider = Some(ProviderKind::Local);
                         cfg.local_model_tag = Some("vendor/local".into());
                         Ok(())
@@ -1548,27 +1606,29 @@ mod tests {
     }
 
     #[test]
-    fn key_state_write_and_reasoning_opt_out_do_not_lose_either_update() {
+    fn model_write_and_reasoning_opt_out_do_not_lose_either_update() {
         let dir = tempfile::tempdir().unwrap();
         write_provider_config(
             dir.path(),
             &ProviderConfig {
+                model: "vendor/old".into(),
                 reasoning: true,
                 ..Default::default()
             },
         )
         .unwrap();
 
-        // First: the user opts reasoning OFF. Second (overlapping): a key write flips
-        // `key_configured` on. This is `save_api_key`'s config half; the keychain
-        // write is separate and holds no config field, so it is not modelled here.
+        // First: the user opts reasoning OFF. Second (overlapping): a model write.
+        // Neither gated read-modify-write may lose the other's field. (Key state is no
+        // longer a config field — it lives in the keychain, issue #14 — so the save's
+        // config half is modelled here by the model write it actually performs.)
         overlapping_gated_writers(
             dir.path(),
             |config| config.reasoning = false,
             |second_dir, second_gate| {
                 second_gate
-                    .update(second_dir, |cfg| {
-                        cfg.key_configured = true;
+                    .update(second_dir, false, |cfg| {
+                        cfg.model = "vendor/new".into();
                         Ok(())
                     })
                     .map(|_| ())
@@ -1576,13 +1636,13 @@ mod tests {
         );
 
         let persisted = read_provider_config(dir.path()).unwrap();
-        assert!(
-            persisted.key_configured,
-            "the concurrent key-state write must survive"
+        assert_eq!(
+            persisted.model, "vendor/new",
+            "the concurrent model write must survive"
         );
         assert!(
             !persisted.reasoning,
-            "the key-state write must not restore reasoning from a stale snapshot"
+            "the model write must not restore reasoning from a stale snapshot"
         );
     }
 
@@ -1723,7 +1783,8 @@ mod tests {
 
         let persisted = read_provider_config(dir.path()).unwrap();
         assert_eq!(persisted.model, "legacy/model");
-        assert!(persisted.key_configured);
+        // The legacy `keyConfigured` field is ignored on read (issue #14); the model
+        // preference beside it survives untouched.
         // Legacy configs without the field pick up the compiled-in enabled default.
         assert!(persisted.disabled_skills.is_empty());
         let raw: serde_json::Value = serde_json::from_str(
@@ -1743,10 +1804,8 @@ mod tests {
         let concurrent = ProviderConfig {
             active_provider: Some(ProviderKind::OpenRouter),
             model: "user/switched-to-this".into(),
-            key_configured: true,
             reasoning: false, // the user toggled reasoning OFF mid-probe
-            reasoning_support: Some(ReasoningSupport::Unsupported),
-            reasoning_probed_model: Some("user/switched-to-this".into()),
+            reasoning_probe: probed("user/switched-to-this", ReasoningSupport::Unsupported),
             ..Default::default()
         };
         write_provider_config(dir.path(), &concurrent).unwrap();
@@ -1755,6 +1814,7 @@ mod tests {
         let status = persist_reasoning_verdict(
             dir.path(),
             &ProviderConfigMutationGate::default(),
+            true,
             ReasoningSupport::Supported,
             ReasoningProbeTarget {
                 provider: ProviderKind::OpenRouter,
@@ -1767,12 +1827,8 @@ mod tests {
         let persisted = read_provider_config(dir.path()).unwrap();
         // The obsolete A probe must not replace the newer B verdict.
         assert_eq!(
-            persisted.reasoning_support,
-            Some(ReasoningSupport::Unsupported)
-        );
-        assert_eq!(
-            persisted.reasoning_probed_model.as_deref(),
-            Some("user/switched-to-this")
+            persisted.reasoning_probe,
+            probed("user/switched-to-this", ReasoningSupport::Unsupported)
         );
         assert!(
             !persisted.reasoning,
@@ -1793,8 +1849,7 @@ mod tests {
                 active_provider: Some(ProviderKind::Local),
                 model: "shared/model".into(),
                 local_model_tag: Some("shared/model".into()),
-                reasoning_support: Some(ReasoningSupport::Unsupported),
-                reasoning_probed_model: Some("shared/model".into()),
+                reasoning_probe: probed("shared/model", ReasoningSupport::Unsupported),
                 ..Default::default()
             },
         )
@@ -1803,6 +1858,7 @@ mod tests {
         let status = persist_reasoning_verdict(
             dir.path(),
             &ProviderConfigMutationGate::default(),
+            true,
             ReasoningSupport::Supported,
             ReasoningProbeTarget {
                 provider: ProviderKind::OpenRouter,
@@ -1815,7 +1871,7 @@ mod tests {
         let persisted = read_provider_config(dir.path()).unwrap();
         assert_eq!(persisted.active_provider, Some(ProviderKind::Local));
         assert_eq!(
-            persisted.reasoning_support,
+            persisted.reasoning_probe.as_ref().map(|p| p.support),
             Some(ReasoningSupport::Unsupported)
         );
         assert_eq!(status.reasoning_supported, ReasoningSupport::Unsupported);
@@ -1829,7 +1885,6 @@ mod tests {
             &ProviderConfig {
                 active_provider: Some(ProviderKind::OpenRouter),
                 model: "vendor/current".into(),
-                key_configured: true,
                 reasoning_probe_generation: 1,
                 ..Default::default()
             },
@@ -1839,6 +1894,7 @@ mod tests {
         let status = persist_reasoning_verdict(
             dir.path(),
             &ProviderConfigMutationGate::default(),
+            true,
             ReasoningSupport::Supported,
             ReasoningProbeTarget {
                 provider: ProviderKind::OpenRouter,
@@ -1850,12 +1906,8 @@ mod tests {
 
         let persisted = read_provider_config(dir.path()).unwrap();
         assert_eq!(
-            persisted.reasoning_support,
-            Some(ReasoningSupport::Supported)
-        );
-        assert_eq!(
-            persisted.reasoning_probed_model.as_deref(),
-            Some("vendor/current")
+            persisted.reasoning_probe,
+            probed("vendor/current", ReasoningSupport::Supported)
         );
         assert_eq!(status.reasoning_supported, ReasoningSupport::Supported);
     }
@@ -1905,7 +1957,7 @@ mod tests {
             .clone_with_entry_barrier(Arc::clone(&entering_gate));
         let dir_path = dir.path().to_path_buf();
         let status = std::thread::spawn(move || {
-            persist_reasoning_verdict(&dir_path, &gate, support, target)
+            persist_reasoning_verdict(&dir_path, &gate, true, support, target)
         });
         entering_gate.wait();
         std::fs::write(dir.path().join("release-probe-child"), b"release").unwrap();
@@ -1921,9 +1973,7 @@ mod tests {
         let newer = ProviderConfig {
             active_provider: Some(ProviderKind::OpenRouter),
             model: "vendor/new".into(),
-            key_configured: true,
-            reasoning_support: Some(ReasoningSupport::Unsupported),
-            reasoning_probed_model: Some("vendor/new".into()),
+            reasoning_probe: probed("vendor/new", ReasoningSupport::Unsupported),
             reasoning_probe_generation: 2,
             ..Default::default()
         };
@@ -1937,7 +1987,6 @@ mod tests {
             ProviderConfig {
                 active_provider: Some(ProviderKind::OpenRouter),
                 model: "vendor/old".into(),
-                key_configured: true,
                 ..Default::default()
             },
             ReasoningSupport::Supported,
@@ -1958,7 +2007,6 @@ mod tests {
         let current = ProviderConfig {
             active_provider: Some(ProviderKind::OpenRouter),
             model: "vendor/current".into(),
-            key_configured: true,
             reasoning_probe_generation: 1,
             ..Default::default()
         };
@@ -1979,12 +2027,8 @@ mod tests {
         );
 
         assert_eq!(
-            persisted.reasoning_support,
-            Some(ReasoningSupport::Supported)
-        );
-        assert_eq!(
-            persisted.reasoning_probed_model.as_deref(),
-            Some("vendor/current")
+            persisted.reasoning_probe,
+            probed("vendor/current", ReasoningSupport::Supported)
         );
         assert_eq!(status.reasoning_supported, ReasoningSupport::Supported);
     }
@@ -1997,25 +2041,35 @@ mod tests {
             &ProviderConfig {
                 active_provider: Some(ProviderKind::OpenRouter),
                 model: "vendor/current".into(),
-                key_configured: true,
                 ..Default::default()
             },
         )
         .unwrap();
         let gate = ProviderConfigMutationGate::default();
-        let (_, older) = begin_reasoning_probe(dir.path(), &gate).unwrap();
-        let (_, newer) = begin_reasoning_probe(dir.path(), &gate).unwrap();
+        let (_, older) = begin_reasoning_probe(dir.path(), &gate, true).unwrap();
+        let (_, newer) = begin_reasoning_probe(dir.path(), &gate, true).unwrap();
         let older = older.unwrap();
         let newer = newer.unwrap();
 
-        persist_reasoning_verdict(dir.path(), &gate, ReasoningSupport::Unsupported, newer).unwrap();
+        persist_reasoning_verdict(
+            dir.path(),
+            &gate,
+            true,
+            ReasoningSupport::Unsupported,
+            newer,
+        )
+        .unwrap();
         let status =
-            persist_reasoning_verdict(dir.path(), &gate, ReasoningSupport::Supported, older)
+            persist_reasoning_verdict(dir.path(), &gate, true, ReasoningSupport::Supported, older)
                 .unwrap();
 
         assert_eq!(status.reasoning_supported, ReasoningSupport::Unsupported);
         assert_eq!(
-            read_provider_config(dir.path()).unwrap().reasoning_support,
+            read_provider_config(dir.path())
+                .unwrap()
+                .reasoning_probe
+                .as_ref()
+                .map(|p| p.support),
             Some(ReasoningSupport::Unsupported)
         );
     }
@@ -2028,29 +2082,29 @@ mod tests {
             &ProviderConfig {
                 active_provider: Some(ProviderKind::OpenRouter),
                 model: "vendor/a".into(),
-                key_configured: true,
                 ..Default::default()
             },
         )
         .unwrap();
         let gate = ProviderConfigMutationGate::default();
-        let (_, old_a) = begin_reasoning_probe(dir.path(), &gate).unwrap();
-        gate.update(dir.path(), |cfg| {
+        let (_, old_a) = begin_reasoning_probe(dir.path(), &gate, true).unwrap();
+        gate.update(dir.path(), true, |cfg| {
             cfg.model = "vendor/b".into();
             Ok(())
         })
         .unwrap();
-        let _ = begin_reasoning_probe(dir.path(), &gate).unwrap();
-        gate.update(dir.path(), |cfg| {
+        let _ = begin_reasoning_probe(dir.path(), &gate, true).unwrap();
+        gate.update(dir.path(), true, |cfg| {
             cfg.model = "vendor/a".into();
             Ok(())
         })
         .unwrap();
-        let (_, new_a) = begin_reasoning_probe(dir.path(), &gate).unwrap();
+        let (_, new_a) = begin_reasoning_probe(dir.path(), &gate, true).unwrap();
 
         persist_reasoning_verdict(
             dir.path(),
             &gate,
+            true,
             ReasoningSupport::Unsupported,
             new_a.unwrap(),
         )
@@ -2058,6 +2112,7 @@ mod tests {
         let status = persist_reasoning_verdict(
             dir.path(),
             &gate,
+            true,
             ReasoningSupport::Supported,
             old_a.unwrap(),
         )
@@ -2080,20 +2135,19 @@ mod tests {
             &ProviderConfig {
                 active_provider: Some(ProviderKind::OpenRouter),
                 model: "vendor/a".into(),
-                key_configured: true,
                 ..Default::default()
             },
         )
         .unwrap();
         let gate = ProviderConfigMutationGate::default();
-        let (_, old_a) = begin_reasoning_probe(dir.path(), &gate).unwrap();
+        let (_, old_a) = begin_reasoning_probe(dir.path(), &gate, true).unwrap();
 
-        gate.update(dir.path(), |cfg| {
+        gate.update(dir.path(), true, |cfg| {
             cfg.model = "vendor/b".into();
             Ok(())
         })
         .unwrap();
-        gate.update(dir.path(), |cfg| {
+        gate.update(dir.path(), true, |cfg| {
             cfg.model = "vendor/a".into();
             Ok(())
         })
@@ -2102,6 +2156,7 @@ mod tests {
         let status = persist_reasoning_verdict(
             dir.path(),
             &gate,
+            true,
             ReasoningSupport::Supported,
             old_a.unwrap(),
         )
@@ -2110,8 +2165,7 @@ mod tests {
         assert_eq!(status.reasoning_supported, ReasoningSupport::Unknown);
         let persisted = read_provider_config(dir.path()).unwrap();
         assert_eq!(persisted.reasoning_probe_generation, 3);
-        assert_eq!(persisted.reasoning_support, None);
-        assert_eq!(persisted.reasoning_probed_model, None);
+        assert_eq!(persisted.reasoning_probe, None);
     }
 
     #[test]
@@ -2119,10 +2173,11 @@ mod tests {
         if let Ok(directory) = std::env::var(SAME_TARGET_PROBE_CHILD_DIR) {
             let directory = std::path::PathBuf::from(directory);
             let gate = ProviderConfigMutationGate::default();
-            let (_, target) = begin_reasoning_probe(&directory, &gate).unwrap();
+            let (_, target) = begin_reasoning_probe(&directory, &gate, true).unwrap();
             persist_reasoning_verdict(
                 &directory,
                 &gate,
+                true,
                 ReasoningSupport::Unsupported,
                 target.unwrap(),
             )
@@ -2144,13 +2199,12 @@ mod tests {
             &ProviderConfig {
                 active_provider: Some(ProviderKind::OpenRouter),
                 model: "vendor/current".into(),
-                key_configured: true,
                 ..Default::default()
             },
         )
         .unwrap();
         let gate = ProviderConfigMutationGate::default();
-        let (_, older) = begin_reasoning_probe(dir.path(), &gate).unwrap();
+        let (_, older) = begin_reasoning_probe(dir.path(), &gate, true).unwrap();
         let mut child = Command::new(std::env::current_exe().unwrap())
             .arg("--exact")
             .arg("commands::ai::tests::separate_process_newer_same_target_probe_wins")
@@ -2172,6 +2226,7 @@ mod tests {
             persist_reasoning_verdict(
                 &dir_path,
                 &stale_gate,
+                true,
                 ReasoningSupport::Supported,
                 older.unwrap(),
             )
@@ -2184,7 +2239,7 @@ mod tests {
         let persisted = read_provider_config(dir.path()).unwrap();
         assert_eq!(persisted.reasoning_probe_generation, 2);
         assert_eq!(
-            persisted.reasoning_support,
+            persisted.reasoning_probe.as_ref().map(|p| p.support),
             Some(ReasoningSupport::Unsupported)
         );
         assert_eq!(status.reasoning_supported, ReasoningSupport::Unsupported);
@@ -2195,39 +2250,45 @@ mod tests {
         // The opt-in must reach the UI on the OpenRouter status specifically — the one
         // place a reasoning toggle is meaningful. A wrong source (hardcode, or the
         // local/key field) would be caught here.
-        let on = build_ai_status(ProviderConfig {
-            key_configured: true,
-            reasoning: true,
-            ..Default::default()
-        });
+        let on = build_ai_status(
+            ProviderConfig {
+                reasoning: true,
+                ..Default::default()
+            },
+            true,
+        );
         assert!(on.openrouter.reasoning);
 
-        let off = build_ai_status(ProviderConfig {
-            key_configured: true,
-            reasoning: false,
-            ..Default::default()
-        });
+        let off = build_ai_status(
+            ProviderConfig {
+                reasoning: false,
+                ..Default::default()
+            },
+            true,
+        );
         assert!(!off.openrouter.reasoning);
     }
 
     #[test]
     fn ai_status_validates_reasoning_cache_against_selected_model() {
-        let valid = build_ai_status(ProviderConfig {
-            model: "openai/gpt-4.1".into(),
-            key_configured: true,
-            reasoning_support: Some(ReasoningSupport::Supported),
-            reasoning_probed_model: Some("openai/gpt-4.1".into()),
-            ..Default::default()
-        });
+        let valid = build_ai_status(
+            ProviderConfig {
+                model: "openai/gpt-4.1".into(),
+                reasoning_probe: probed("openai/gpt-4.1", ReasoningSupport::Supported),
+                ..Default::default()
+            },
+            true,
+        );
         assert_eq!(valid.reasoning_supported, ReasoningSupport::Supported);
 
-        let stale = build_ai_status(ProviderConfig {
-            model: "new/model".into(),
-            key_configured: true,
-            reasoning_support: Some(ReasoningSupport::Unsupported),
-            reasoning_probed_model: Some("old/model".into()),
-            ..Default::default()
-        });
+        let stale = build_ai_status(
+            ProviderConfig {
+                model: "new/model".into(),
+                reasoning_probe: probed("old/model", ReasoningSupport::Unsupported),
+                ..Default::default()
+            },
+            true,
+        );
         assert_eq!(stale.reasoning_supported, ReasoningSupport::Unknown);
     }
 

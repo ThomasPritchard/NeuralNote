@@ -19,6 +19,8 @@ import { ElicitCard } from "./ElicitCard";
 
 const mockAnswer = vi.mocked(api.answerElicitation);
 
+const TURN_ID = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e21";
+
 const PIXEL =
   "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNkYPhfDwAChwGA60e6kgAAAABJRU5ErkJggg==";
 
@@ -53,6 +55,7 @@ function renderCard(
   const view = render(
     <ElicitCard
       elicitation={elicitation}
+      turnId={TURN_ID}
       dormant={false}
       busy={false}
       answer={undefined}
@@ -95,7 +98,7 @@ describe("ElicitCard — single-select", () => {
   it("answers once with the clicked option id and reports the choice up", async () => {
     const { user, onAnswered } = renderCard();
     await user.click(screen.getByRole("button", { name: /Yes, write it/ }));
-    expect(mockAnswer).toHaveBeenCalledExactlyOnceWith("q1", ["yes"]);
+    expect(mockAnswer).toHaveBeenCalledExactlyOnceWith(TURN_ID, "q1", ["yes"]);
     await waitFor(() => expect(onAnswered).toHaveBeenCalledExactlyOnceWith("q1", ["yes"]));
   });
 
@@ -197,7 +200,7 @@ describe("ElicitCard — multi-select", () => {
     await user.click(screen.getByRole("checkbox", { name: /Vault tour/ }));
     await user.click(screen.getByRole("button", { name: "Confirm selection" }));
 
-    expect(mockAnswer).toHaveBeenCalledExactlyOnceWith("q2", ["v1", "v3"]);
+    expect(mockAnswer).toHaveBeenCalledExactlyOnceWith(TURN_ID, "q2", ["v1", "v3"]);
     await waitFor(() =>
       expect(onAnswered).toHaveBeenCalledExactlyOnceWith("q2", ["v1", "v3"]),
     );

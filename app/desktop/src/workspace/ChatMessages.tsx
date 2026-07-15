@@ -915,12 +915,13 @@ function AssistantTurn({
         </p>
       )}
       <Reasoning text={turn.thinking} />
-      {turn.pendingElicitation !== null && (
+      {turn.pendingElicitation !== null && turn.turnId !== null && (
         // Keyed by elicitation id: a follow-up question in the same turn is a
         // fresh card (fresh focus, fresh state), never a half-answered reuse.
         <ElicitCard
           key={turn.pendingElicitation.id}
           elicitation={turn.pendingElicitation}
+          turnId={turn.turnId}
           dormant={turn.done && elicitAnswer === undefined}
           busy={busy}
           answer={elicitAnswer}
@@ -937,6 +938,15 @@ function AssistantTurn({
         >
           <Markdown body={answer} />
         </div>
+      )}
+      {turn.truncated && (
+        // The answer hit the model's length ceiling. Calm, token-only notice
+        // (mirrors the coverage footer's truncation banner): informational and
+        // visible, never the destructive/alert register — the partial answer
+        // and its citations above are still valid, just incomplete.
+        <p className="rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-[0.6875rem] leading-snug text-muted-foreground">
+          Response was cut off at the model&apos;s length limit.
+        </p>
       )}
       {showsNothingFoundCard(turn) && turn.coverage && (
         <NothingFoundCard terms={turn.coverage.searchedTerms} />
