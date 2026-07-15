@@ -44,6 +44,14 @@ html-escape = "0.2.14"
 # Unicode General_Category data shared with the frontend tag grammar. The
 # compiled-data provider is deterministic and already present in Cargo.lock.
 icu_properties = "2.2.0"
+# Unicode *full* case folding (CaseFolding.txt C+F mappings) for vault search.
+# Chosen over icu_casemap because `default_case_fold` yields a per-`char`
+# iterator — the exact zero-alloc shape the folded→original byte-range mapping
+# in search.rs depends on (icu_casemap exposes full folding only at the string
+# level; its `simple_fold(char)` would not expand ß→ss). Ships Unicode 16.0.0
+# tables (see `caseless::UNICODE_VERSION`); the fold surface tracks Unicode
+# releases, not code churn.
+caseless = "0.2.2"
 # Decode the three accepted thumbnail formats before they cross the IPC boundary.
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "webp"] }
 

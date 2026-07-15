@@ -1,7 +1,7 @@
 //! Vault file-tree scanning.
 
 use crate::error::CoreResult;
-use crate::model::{EntryKind, TreeNode};
+use crate::model::{DirListing, EntryKind, TreeNode};
 use crate::paths::rel_path;
 use std::path::Path;
 
@@ -70,6 +70,90 @@ fn scan_dir(root: &Path, dir: &Path, depth: usize) -> CoreResult<Vec<TreeNode>> 
     });
 
     Ok(nodes)
+}
+
+/// Per-directory breadth cap for the DISPLAY path only. A single folder with
+/// more than this many visible entries returns the first CAP (sorted) plus a
+/// truncation count. Search / graph / retrieval are uncapped — a truncated file
+/// is still fully indexed and citable.
+const DIR_LISTING_CAP: usize = 5_000;
+
+/// One directory's immediate children, non-recursively — the lazy file-tree
+/// DISPLAY primitive. Applies the SAME hidden-skip ([`is_hidden`]) and
+/// symlink-skip (`file_type.is_symlink()`) protections as [`scan_dir`], and the
+/// SAME folders-first, case-insensitive sort. Folders in the result carry
+/// `children: None` (unloaded — a later expand fetches them). No recursion, so
+/// `MAX_DEPTH` is irrelevant here.
+///
+/// Over [`DIR_LISTING_CAP`] visible entries: returns the first CAP (in sort
+/// order) with `truncated = Some(remaining)`; otherwise `truncated = None`. An
+/// unreadable directory surfaces as [`crate::error::CoreError::Io`] — never a
+/// panic, never a silent empty listing.
+pub fn list_dir(root: &Path, dir: &Path) -> CoreResult<DirListing> {
+    let root_c = root
+        .canonicalize()
+        .map_err(|e| crate::error::CoreError::Io(format!("vault root unreadable: {e}")))?;
+
+    let mut nodes: Vec<TreeNode> = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        if file_type.is_symlink() {
+            continue; // don't follow symlinks — prevents escapes and cycles
+        }
+
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if is_hidden(&name) {
+            continue;
+        }
+        let path = entry.path();
+
+        if file_type.is_dir() {
+            nodes.push(TreeNode {
+                kind: EntryKind::Folder,
+                name,
+                path: path.to_string_lossy().into_owned(),
+                rel_path: rel_path(&root_c, &path),
+                ext: None,
+                children: None, // unloaded — one level only, no recursion
+            });
+        } else if file_type.is_file() {
+            let ext = path.extension().map(|e| e.to_string_lossy().to_lowercase());
+            nodes.push(TreeNode {
+                kind: EntryKind::File,
+                name,
+                path: path.to_string_lossy().into_owned(),
+                rel_path: rel_path(&root_c, &path),
+                ext,
+                children: None,
+            });
+        }
+    }
+
+    sort_tree_nodes(&mut nodes);
+
+    let truncated = if nodes.len() > DIR_LISTING_CAP {
+        let omitted = (nodes.len() - DIR_LISTING_CAP) as u32;
+        nodes.truncate(DIR_LISTING_CAP);
+        Some(omitted)
+    } else {
+        None
+    };
+
+    Ok(DirListing {
+        entries: nodes,
+        truncated,
+    })
+}
+
+/// Folders-first, then case-insensitive by name — the [`read_tree`] ordering,
+/// reused by [`list_dir`] so both paths present a folder's children identically.
+fn sort_tree_nodes(nodes: &mut [TreeNode]) {
+    nodes.sort_by(|a, b| match (a.kind, b.kind) {
+        (EntryKind::Folder, EntryKind::File) => std::cmp::Ordering::Less,
+        (EntryKind::File, EntryKind::Folder) => std::cmp::Ordering::Greater,
+        _ => a.name.to_lowercase().cmp(&b.name.to_lowercase()),
+    });
 }
 
 /// Hidden = starts with `.` (covers `.obsidian`, `.git`, `.neuralnote`, etc.).

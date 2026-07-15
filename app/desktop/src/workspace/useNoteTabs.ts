@@ -72,7 +72,7 @@ const EMPTY_STATE: TabsState = { tabs: [], activeTabId: null };
 export function normalizeRequestedPath(path: string): string {
   const normalized = normSep(path);
   const absolute = normalized.startsWith("/");
-  const drive = normalized.match(/^[A-Za-z]:/)?.[0] ?? "";
+  const drive = /^[A-Za-z]:/.exec(normalized)?.[0] ?? "";
   const tail = drive ? normalized.slice(drive.length) : normalized;
   const parts: string[] = [];
   for (const part of tail.split("/")) {
@@ -80,7 +80,8 @@ export function normalizeRequestedPath(path: string): string {
     if (part === ".." && parts.length > 0 && parts.at(-1) !== "..") parts.pop();
     else if (part !== ".." || !absolute) parts.push(part);
   }
-  const prefix = drive ? `${drive}/` : absolute ? "/" : "";
+  const rootPrefix = absolute ? "/" : "";
+  const prefix = drive ? `${drive}/` : rootPrefix;
   return `${prefix}${parts.join("/")}` || (absolute ? "/" : ".");
 }
 
@@ -88,79 +89,102 @@ function replaceTab(state: TabsState, id: string, update: (tab: NoteTab) => Note
   return { ...state, tabs: state.tabs.map((tab) => (tab.id === id ? update(tab) : tab)) };
 }
 
-function reconciledLoad(
-  state: TabsState,
-  action: Extract<Action, { type: "load-success" }>,
-): TabsState {
-  const target = state.tabs.find((tab) => tab.id === action.id);
-  if (!target || target.loadRevision !== action.revision) return state;
+/** Apply a freshly loaded document to a tab, unless the tab has unsaved edits —
+ *  in which case only the loading flags clear so the draft is never clobbered. */
+function applyLoad(tab: NoteTab, path: string, loadedDoc: NoteDoc): NoteTab {
+  if (tab.dirty && tab.note) return { ...tab, loading: false, error: null };
+  return {
+    ...tab,
+    path,
+    note: loadedDoc,
+    sessionHash: loadedDoc.contentHash,
+    loading: false,
+    error: null,
+    draft: loadedDoc.raw,
+    dirty: false,
+    preservationError: null,
+  };
+}
 
-  const wasRemapped = normalizeRequestedPath(target.path) !== normalizeRequestedPath(action.requestedPath);
-  const path = wasRemapped ? target.path : action.doc.path;
+/** The relPath to record for a loaded doc. When the tab was remapped underneath
+ *  the in-flight read, preserve the tab's own relPath (falling back to one derived
+ *  from the request's vault prefix); otherwise trust the loaded doc. */
+function resolveLoadedRelPath(
+  action: Extract<Action, { type: "load-success" }>,
+  target: NoteTab,
+  wasRemapped: boolean,
+): string {
+  if (!wasRemapped) return action.doc.relPath;
   const requestedPath = normSep(action.requestedPath);
   const requestedRelPath = normSep(action.doc.relPath).replace(/^\/+/, "");
   const vaultPrefix = requestedPath.endsWith(requestedRelPath)
     ? requestedPath.slice(0, -requestedRelPath.length)
     : null;
   const remappedPath = normSep(target.path);
-  const remappedRelPath = vaultPrefix !== null && remappedPath.startsWith(vaultPrefix)
-    ? remappedPath.slice(vaultPrefix.length).replace(/^\/+/, "")
-    : null;
-  const relPath = wasRemapped
-    ? (target.note?.relPath ?? remappedRelPath ?? action.doc.relPath)
-    : action.doc.relPath;
+  const remappedRelPath =
+    vaultPrefix !== null && remappedPath.startsWith(vaultPrefix)
+      ? remappedPath.slice(vaultPrefix.length).replace(/^\/+/, "")
+      : null;
+  return target.note?.relPath ?? remappedRelPath ?? action.doc.relPath;
+}
+
+/** When a load resolves onto a path already held by another tab, pick which tab
+ *  survives the merge: a dirty tab always wins; otherwise the earlier tab. */
+function pickSurvivor(
+  target: NoteTab,
+  alias: NoteTab,
+  targetIndex: number,
+  aliasIndex: number,
+): NoteTab {
+  if (alias.dirty) return alias;
+  if (target.dirty) return target;
+  return targetIndex < aliasIndex ? target : alias;
+}
+
+/** Collapse the target and its alias into a single surviving tab, dropping the
+ *  other and re-pointing the active tab if it was the one removed. */
+function mergeAliasedTabs(
+  state: TabsState,
+  target: NoteTab,
+  alias: NoteTab,
+  path: string,
+  loadedDoc: NoteDoc,
+): TabsState {
+  const targetIndex = state.tabs.findIndex((tab) => tab.id === target.id);
+  const aliasIndex = state.tabs.findIndex((tab) => tab.id === alias.id);
+  const survivor = pickSurvivor(target, alias, targetIndex, aliasIndex);
+  const removedId = survivor.id === target.id ? alias.id : target.id;
+  const merged = applyLoad(survivor, path, loadedDoc);
+  return {
+    tabs: state.tabs
+      .filter((tab) => tab.id !== removedId)
+      .map((tab) => (tab.id === survivor.id ? merged : tab)),
+    activeTabId: state.activeTabId === removedId ? survivor.id : state.activeTabId,
+  };
+}
+
+function reconciledLoad(
+  state: TabsState,
+  action: Extract<Action, { type: "load-success" }>,
+): TabsState {
+  const target = state.tabs.find((tab) => tab.id === action.id);
+  if (!target) return state;
+  if (target.loadRevision !== action.revision) return state;
+
+  const wasRemapped =
+    normalizeRequestedPath(target.path) !==
+    normalizeRequestedPath(action.requestedPath);
+  const path = wasRemapped ? target.path : action.doc.path;
+  const relPath = resolveLoadedRelPath(action, target, wasRemapped);
   const loadedDoc = { ...action.doc, path, relPath };
   const alias = state.tabs.find(
-    (tab) => tab.id !== action.id && normalizeRequestedPath(tab.path) === normalizeRequestedPath(path),
+    (tab) =>
+      tab.id !== action.id &&
+      normalizeRequestedPath(tab.path) === normalizeRequestedPath(path),
   );
 
-  if (alias) {
-    const targetIndex = state.tabs.findIndex((tab) => tab.id === target.id);
-    const aliasIndex = state.tabs.findIndex((tab) => tab.id === alias.id);
-    const survivor = alias.dirty
-      ? alias
-      : target.dirty
-        ? target
-        : targetIndex < aliasIndex
-          ? target
-          : alias;
-    const removedId = survivor.id === target.id ? alias.id : target.id;
-    const merged: NoteTab = survivor.dirty && survivor.note
-      ? { ...survivor, loading: false, error: null }
-      : {
-          ...survivor,
-          path,
-          note: loadedDoc,
-          sessionHash: loadedDoc.contentHash,
-          loading: false,
-          error: null,
-          draft: loadedDoc.raw,
-          dirty: false,
-          preservationError: null,
-        };
-    return {
-      tabs: state.tabs
-        .filter((tab) => tab.id !== removedId)
-        .map((tab) => (tab.id === survivor.id ? merged : tab)),
-      activeTabId: state.activeTabId === removedId ? survivor.id : state.activeTabId,
-    };
-  }
-
-  return replaceTab(state, action.id, (tab) =>
-    tab.dirty && tab.note
-      ? { ...tab, loading: false, error: null }
-      : {
-          ...tab,
-          path,
-          note: loadedDoc,
-          sessionHash: loadedDoc.contentHash,
-          loading: false,
-          error: null,
-          draft: loadedDoc.raw,
-          dirty: false,
-          preservationError: null,
-        },
-  );
+  if (alias) return mergeAliasedTabs(state, target, alias, path, loadedDoc);
+  return replaceTab(state, action.id, (tab) => applyLoad(tab, path, loadedDoc));
 }
 
 export function noteTabsReducer(state: TabsState, action: Action): TabsState {

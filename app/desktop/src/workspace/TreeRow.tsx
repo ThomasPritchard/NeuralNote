@@ -11,9 +11,13 @@ import {
   Folder,
   FolderOpen,
   FolderPlus,
+  Loader2,
+  MoreHorizontal,
   Pencil,
   Plus,
+  RotateCw,
   Trash2,
+  TriangleAlert,
 } from "lucide-react";
 import { cn } from "../lib/cn";
 import type { TreeNode } from "../lib/types";
@@ -27,14 +31,23 @@ export interface CreatingState {
   kind: CreateKind;
 }
 
-/** Shared callbacks + transient state threaded through the recursive tree. */
+/** Shared callbacks + transient state threaded through the flattened tree. */
 export interface TreeContext {
   activePath: string | null;
-  collapsed: Set<string>;
+  /** Folder relPaths currently expanded (lazy store state). A folder not in the
+   *  set is collapsed and its children are not rendered. */
+  expanded: ReadonlySet<string>;
   creating: CreatingState | null;
   renaming: string | null;
   dragPath: string | null;
   toggle: (relPath: string) => void;
+  /** Immediate child count for a loaded folder (for its row badge), or null when
+   *  the folder isn't loaded yet — so a collapsed, never-opened folder shows no
+   *  count rather than a misleading zero. */
+  childCount: (relPath: string) => number | null;
+  /** Re-attempt the lazy listing of a folder whose fetch errored (error row's
+   *  Retry). */
+  onRetry: (relPath: string) => void;
   onSelect: (path: string, openInNewTab: boolean) => void;
   onStartCreate: (parentPath: string, kind: CreateKind) => void;
   onStartRename: (path: string) => void;
@@ -91,7 +104,10 @@ function FolderRow({
   const [dropActive, setDropActive] = useState(false);
   const creatingHere = ctx.creating?.parentPath === node.path;
   // Mirrors flattenTree's open rule — the chevron and the row list must agree.
-  const isOpen = creatingHere || !ctx.collapsed.has(node.relPath);
+  // Creating inside a folder forces it open even before the store has expanded
+  // it, so the inline create row is visible immediately.
+  const isOpen = creatingHere || ctx.expanded.has(node.relPath);
+  const childCount = ctx.childCount(node.relPath);
   // A folder cannot be dropped into itself or one of its descendants.
   const canDrop =
     ctx.dragPath !== null &&
@@ -154,9 +170,11 @@ function FolderRow({
           <Folder className="size-3.5 shrink-0 text-muted-foreground" aria-hidden />
         )}
         <span className="truncate">{node.name}</span>
-        <span className="nn-mono ml-auto pr-1 text-[0.625rem] text-muted-foreground/60">
-          {node.children?.length ?? 0}
-        </span>
+        {childCount !== null && (
+          <span className="nn-mono ml-auto pr-1 text-[0.625rem] text-muted-foreground/60">
+            {childCount}
+          </span>
+        )}
       </button>
 
       <div className={ACTIONS_WRAP}>
@@ -289,6 +307,90 @@ export function CreateRow({
           blurWithin={rowRef}
         />
       </div>
+    </div>
+  );
+}
+
+/** Human label for a folder relPath, used in the retry control's aria-label. */
+function folderLabel(relPath: string): string {
+  return relPath === "" ? "the vault root" : (relPath.split("/").pop() ?? relPath);
+}
+
+/** Shown under an expanded folder while its lazy `list_dir` fetch is in flight
+ *  (issue #40). A quiet spinner so a large or slow folder never looks empty or
+ *  stuck — it reads as "loading", not "no files". */
+export function LoadingRow() {
+  return (
+    <div
+      role="treeitem"
+      aria-selected={false}
+      aria-busy
+      tabIndex={-1}
+      className="flex items-center gap-1.5 rounded-md py-[5px] pl-1.5 pr-2 text-[0.8125rem] text-muted-foreground/70"
+    >
+      <Loader2
+        className="size-3.5 shrink-0 animate-spin opacity-70 motion-reduce:animate-none"
+        aria-hidden
+      />
+      <span className="italic opacity-90">Loading…</span>
+    </div>
+  );
+}
+
+/** Shown when a folder's lazy listing FAILED (e.g. an unreadable directory).
+ *  Scoped to that one folder — siblings and the rest of the tree stay usable —
+ *  and never auto-retries: the user drives recovery with the Retry control, which
+ *  re-runs `list_dir` for this folder only. The failure is surfaced, not
+ *  swallowed. */
+export function ErrorRow({
+  parentPath,
+  message,
+  onRetry,
+}: Readonly<{
+  parentPath: string;
+  message: string;
+  onRetry: (relPath: string) => void;
+}>) {
+  return (
+    <div
+      role="treeitem"
+      aria-selected={false}
+      tabIndex={-1}
+      className="flex items-center gap-1.5 rounded-md py-[5px] pl-1.5 pr-1 text-[0.8125rem] text-destructive/90"
+    >
+      <TriangleAlert className="size-3.5 shrink-0 opacity-80" aria-hidden />
+      <span className="min-w-0 flex-1 truncate" title={message}>
+        {message}
+      </span>
+      <button
+        type="button"
+        onClick={() => onRetry(parentPath)}
+        aria-label={`Retry loading ${folderLabel(parentPath)}`}
+        className="flex shrink-0 items-center gap-1 rounded px-1.5 py-0.5 text-[0.6875rem] font-medium text-destructive transition-colors hover:bg-destructive/15 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-destructive"
+      >
+        <RotateCw className="size-3" aria-hidden />
+        Retry
+      </button>
+    </div>
+  );
+}
+
+/** The explicit truncation row for a folder wider than the per-directory cap
+ *  (issue #40) — the extra entries are never hidden silently. It is deliberately
+ *  NON-interactive: these files are still fully indexed, so full-vault search
+ *  (⌘K) reaches them even though the tree doesn't list them here. */
+export function MoreRow({ count }: Readonly<{ count: number }>) {
+  return (
+    <div
+      role="treeitem"
+      aria-selected={false}
+      aria-disabled
+      tabIndex={-1}
+      title="Hidden here to keep the tree fast — full-vault search (⌘K) still finds these files."
+      className="flex items-center gap-1.5 rounded-md py-[5px] pl-1.5 pr-2 text-[0.8125rem] text-muted-foreground/60"
+    >
+      <MoreHorizontal className="size-3.5 shrink-0 opacity-70" aria-hidden />
+      <span className="italic">{count.toLocaleString()} more…</span>
     </div>
   );
 }

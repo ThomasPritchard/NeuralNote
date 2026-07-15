@@ -354,6 +354,10 @@ const MAX_TOTAL_MATCHES = 200;
 const MAX_MATCHES_PER_FILE = 50;
 const SNIPPET_MAX_CHARS = 200;
 const MAX_QUERY_CHARS = 256;
+/** Mirror of core `tree.rs` DIR_LISTING_CAP (issue #40): the per-directory
+ *  breadth cap for the DISPLAY `list_dir` path only. A folder with more than this
+ *  many entries returns the first CAP plus a truncation count. */
+const DIR_LISTING_CAP = 5_000;
 
 /** Mirror of core `fold_char`: full per-char Unicode lowercasing (which may
  *  EXPAND, e.g. İ → i + combining dot) plus Greek final-sigma normalisation
@@ -1920,6 +1924,14 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     return nodes;
   };
 
+  /** Mirror of core `list_dir` (issue #40): one directory's immediate children,
+   *  non-recursively — folders come back with `children: null` (unloaded), same
+   *  folders-first case-insensitive sort as `childrenOf`. */
+  const shallowChildrenOf = (parent: string): TreeNode[] =>
+    childrenOf(parent).map((node) =>
+      node.kind === "folder" ? { ...node, children: null } : node,
+    );
+
   const buildDoc = (path: string, raw: string): NoteDoc => {
     const parsed = parseFrontmatter(raw);
     return {
@@ -2170,6 +2182,17 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         return undefined;
       case "read_tree":
         return childrenOf(root);
+      case "list_dir": {
+        // The lazy DISPLAY path (issue #40): one directory's immediate children,
+        // capped, with a truncation count — never a recursive walk. `path` is the
+        // vault-relative folder ("" = root).
+        const target = resolveVaultPath((a.path as string) ?? "");
+        const all = shallowChildrenOf(target);
+        return {
+          entries: all.slice(0, DIR_LISTING_CAP),
+          truncated: all.length > DIR_LISTING_CAP ? all.length - DIR_LISTING_CAP : null,
+        };
+      }
       case "read_note": {
         const path = a.path as string;
         return buildDoc(path, requireFile(path).content);

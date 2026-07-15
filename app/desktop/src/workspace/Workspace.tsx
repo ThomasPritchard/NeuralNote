@@ -21,11 +21,12 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import * as api from "../lib/api";
 import { useVault } from "../lib/store";
 import { useToast } from "../notifications";
-import type { TreeNode, WorkspaceState } from "../lib/types";
+import type { NoteDoc, TreeNode, WorkspaceState } from "../lib/types";
 import { ChatPane } from "./ChatPane";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { FileTree } from "./FileTree";
-import { normSep } from "./fileMeta";
+import { normSep, parentRelPath, vaultRelPath } from "./fileMeta";
+import { useVaultTree } from "./useVaultTree";
 import { GraphView } from "./GraphView";
 import { buildNoteIndex, type NoteIndexEntry } from "./linkResolve";
 import { NotePane } from "./NotePane";
@@ -86,11 +87,47 @@ function persistedWorkspaceState(
   };
 }
 
+function confirmDialogTitle(intent: PendingIntent): string {
+  if (intent.kind !== "delete-entry") return "Discard unsaved changes?";
+  const entityLabel = intent.node.kind === "folder" ? "folder" : "note";
+  return `Delete ${entityLabel}?`;
+}
+
+/** A compatible text note is open and directly editable (binary notes are not). */
+function isEditableTextNote(note: NoteDoc | null): boolean {
+  return note !== null && !note.binary;
+}
+
+function confirmDialogLabel(intent: PendingIntent): string {
+  return intent.kind === "delete-entry" ? "Move to Trash" : "Discard";
+}
+
+/** The body of the discard-confirmation dialog for a pending destructive intent.
+ *  `dirtyTabCount` is only consulted for the whole-vault/window discard case. */
+function describeDiscard(intent: PendingIntent, dirtyTabCount: number): string {
+  if (intent.kind === "delete-entry") {
+    const tabNoun = intent.dirtyCount === 1 ? "tab has" : "tabs have";
+    const dirtyWarning =
+      intent.dirtyCount > 0
+        ? ` ${intent.dirtyCount} open ${tabNoun} unsaved changes that will be lost.`
+        : "";
+    return `“${intent.node.name}” will be moved to the Trash.${dirtyWarning}`;
+  }
+  if (intent.kind === "close-tab") {
+    return "This note has edits that haven't been saved. If you continue, they'll be lost.";
+  }
+  const tabNoun = dirtyTabCount === 1 ? "note has" : "notes have";
+  return `${dirtyTabCount} open ${tabNoun} unsaved changes. If you continue, they'll be lost.`;
+}
+
 export function Workspace() {
   const {
     vault,
-    tree,
-    refreshTree,
+    loaded,
+    expanded,
+    listDir,
+    toggle,
+    refreshDir,
     close,
     openExisting,
     openByPath,
@@ -98,6 +135,17 @@ export function Workspace() {
     clearError,
     reportError,
   } = useVault();
+  // The lazy store (issue #40) no longer holds the whole tree — it loads
+  // directories on demand for the FileTree DISPLAY. But wikilink/`[[` resolution
+  // (buildNoteIndex), the status-bar counts, and the template folder picker all
+  // need the WHOLE vault (a link into an unexpanded folder must still resolve —
+  // moat-adjacent). This keeps a full read_tree for those consumers only, while
+  // the sidebar tree stays lazy. `reportError` is a stable useCallback, so this
+  // doesn't re-read every render.
+  const { tree: fullTree, refresh: refreshFullTree } = useVaultTree(
+    vault?.path,
+    reportError,
+  );
   const toast = useToast();
   const noteTabs = useNoteTabs();
   const open = noteTabs.active;
@@ -166,20 +214,17 @@ export function Workspace() {
     const measure = () => {
       const chatWidth = chatSlot?.getBoundingClientRect().width ?? 0;
       const chatTargetWidth = chatPane?.getBoundingClientRect().width ?? 0;
+      // Reserve the chat's target width as soon as it starts opening. This
+      // starts navigation compaction at the same time as the chat transition,
+      // rather than waiting until the editor has nearly run out of space.
+      const openReservedWidth = chatTargetWidth > 0 ? chatTargetWidth : chatWidth;
       const next = {
         workspaceWidth: workspace.getBoundingClientRect().width,
         // Read the slot's current rendered width so responsive clamping follows
         // the chat animation instead of jumping to its final state.
         chatWidth,
         navigationWidth: navigation?.getBoundingClientRect().width ?? 0,
-        // Reserve the chat's target width as soon as it starts opening. This
-        // starts navigation compaction at the same time as the chat transition,
-        // rather than waiting until the editor has nearly run out of space.
-        reservedChatWidth: showChat
-          ? chatTargetWidth > 0
-            ? chatTargetWidth
-            : chatWidth
-          : chatWidth,
+        reservedChatWidth: showChat ? openReservedWidth : chatWidth,
       };
       setWorkspaceMeasurements((current) =>
         current.workspaceWidth === next.workspaceWidth &&
@@ -216,15 +261,13 @@ export function Workspace() {
   const workspaceWriterRef = useRef<ReturnType<
     typeof createWorkspaceStateWriter
   > | null>(null);
-  if (workspaceWriterRef.current === null) {
-    workspaceWriterRef.current = createWorkspaceStateWriter(
-      api.saveWorkspaceState,
-      (writeError) =>
-        toast.error(api.errorMessage(writeError), {
-          dedupKey: "workspace-state-save",
-        }),
-    );
-  }
+  workspaceWriterRef.current ??= createWorkspaceStateWriter(
+    api.saveWorkspaceState,
+    (writeError) =>
+      toast.error(api.errorMessage(writeError), {
+        dedupKey: "workspace-state-save",
+      }),
+  );
 
   /** Force-close the window past the close-request guard. If destroy() rejects the
    *  window is merely left open (safe — no data lost), so log rather than swallow. */
@@ -266,6 +309,30 @@ export function Workspace() {
     setWorkspaceStateBlocked(false);
     restorePlanRef.current = null;
 
+    // Hoisted out of the recovery-toast action so the reset promise chain sits
+    // near the top of the effect rather than nested five callbacks deep.
+    const applyReset = () => {
+      if (cancelled || activeVaultPathRef.current !== vaultPath) return;
+      void api
+        .resetWorkspaceState()
+        .then(() => {
+          if (cancelled) return;
+          setWorkspaceStateBlocked(false);
+          workspaceWriterRef.current?.schedule(
+            persistedWorkspaceState(
+              vaultPath,
+              noteTabsRef.current.tabs,
+              noteTabsRef.current.activeTabId,
+            ),
+          );
+        })
+        .catch((resetError) =>
+          toast.error(api.errorMessage(resetError), {
+            dedupKey: "workspace-state-reset",
+          }),
+        );
+    };
+
     void api
       .loadWorkspaceState()
       .then((loaded) => {
@@ -279,32 +346,7 @@ export function Workspace() {
               dedupKey: "workspace-state-recovery",
               action: {
                 label: "Reset tab state",
-                onClick: () => {
-                  if (
-                    cancelled ||
-                    activeVaultPathRef.current !== vaultPath
-                  ) {
-                    return;
-                  }
-                  void api
-                    .resetWorkspaceState()
-                    .then(() => {
-                      if (cancelled) return;
-                      setWorkspaceStateBlocked(false);
-                      workspaceWriterRef.current?.schedule(
-                        persistedWorkspaceState(
-                          vaultPath,
-                          noteTabsRef.current.tabs,
-                          noteTabsRef.current.activeTabId,
-                        ),
-                      );
-                    })
-                    .catch((resetError) =>
-                      toast.error(api.errorMessage(resetError), {
-                        dedupKey: "workspace-state-reset",
-                      }),
-                    );
-                },
+                onClick: applyReset,
               },
             },
           );
@@ -391,7 +433,7 @@ export function Workspace() {
     [openNoteAt, vaultPath],
   );
 
-  /** Wikilink/markdown-link resolution index over the loaded tree, shared by
+  /** Wikilink/markdown-link resolution index over the full vault tree, shared by
    *  the reader (clickable links) and editor (`[[` autocomplete). Memoized on
    *  the tree — it only rebuilds when the vault actually rescans. */
   const noteIndex = useMemo<NoteIndexEntry[]>(() => {
@@ -402,9 +444,9 @@ export function Workspace() {
       path: vault.path,
       relPath: "",
       ext: null,
-      children: tree,
+      children: fullTree,
     });
-  }, [vault, tree]);
+  }, [vault, fullTree]);
 
   const handleSelect = useCallback(
     (path: string, forceNew: boolean) => {
@@ -454,7 +496,8 @@ export function Workspace() {
             name,
             template,
           );
-          await refreshTree();
+          // Re-list just the destination folder (targeted, per spec §CRUD).
+          if (vaultPath) await refreshDir(vaultRelPath(parentPath, vaultPath));
           setTemplateInsertOpen(false);
           openNoteAt(created.path);
         } catch (error) {
@@ -462,7 +505,7 @@ export function Workspace() {
         }
       })();
     },
-    [openNoteAt, refreshTree, reportError],
+    [openNoteAt, refreshDir, reportError, vaultPath],
   );
   const handleCloseSettings = useCallback(() => {
     setSettingsOpen(false);
@@ -505,6 +548,17 @@ export function Workspace() {
     [],
   );
   const consumeCreate = useCallback(() => setPendingCreate(null), []);
+
+  // Manual "Refresh" (Ribbon): re-list every currently-loaded directory in
+  // place. Unexpanded folders aren't loaded, so there's nothing to refresh for
+  // them — they fetch fresh on their next expand. Also re-read the whole-vault
+  // tree that feeds the wikilink index, counts, and template picker — the manual
+  // refresh must NOT depend on the disk watcher (working around a dead watcher is
+  // exactly why this button exists), or those consumers would stay silently stale.
+  const handleRefreshTree = useCallback(() => {
+    for (const relPath of loaded.keys()) void refreshDir(relPath);
+    refreshFullTree();
+  }, [loaded, refreshDir, refreshFullTree]);
 
   /** Arm an inline create in the FileTree and select its owning Files pane. */
   const startCreate = useCallback((kind: CreateKind) => {
@@ -567,14 +621,15 @@ export function Workspace() {
         case "delete-entry":
           try {
             await api.deleteEntry(intent.node.path);
-            await refreshTree();
+            // Re-list just the deleted entry's parent folder (per spec §CRUD).
+            await refreshDir(parentRelPath(intent.node.relPath));
             noteTabsRef.current.removeDescendants(intent.node.path);
           } catch (deleteError) {
             toast.error(api.errorMessage(deleteError));
           }
       }
     },
-    [close, closeWindow, openByPath, openExisting, refreshTree, toast],
+    [close, closeWindow, openByPath, openExisting, refreshDir, toast],
   );
 
   const requestIntent = useCallback(
@@ -742,7 +797,7 @@ export function Workspace() {
 
   // Every compatible text note is directly editable. Keep Format enabled while
   // a text note is open; the focused rich/raw editor still owns the command.
-  const editing = !!open.note && !open.note.binary;
+  const editing = isEditableTextNote(open.note);
   useEffect(() => {
     void api
       .setMenuEditing(editing)
@@ -790,21 +845,13 @@ export function Workspace() {
 
   const handleCloseGraph = useCallback(() => setCenterView("note"), []);
 
-  const discardMessage = useMemo(() => {
-    if (!pendingIntent) return "";
-    if (pendingIntent.kind === "delete-entry") {
-      const dirtyWarning =
-        pendingIntent.dirtyCount > 0
-          ? ` ${pendingIntent.dirtyCount} open ${pendingIntent.dirtyCount === 1 ? "tab has" : "tabs have"} unsaved changes that will be lost.`
-          : "";
-      return `“${pendingIntent.node.name}” will be moved to the Trash.${dirtyWarning}`;
-    }
-    if (pendingIntent.kind === "close-tab") {
-      return "This note has edits that haven't been saved. If you continue, they'll be lost.";
-    }
-    const count = noteTabs.dirtyTabs.length;
-    return `${count} open ${count === 1 ? "note has" : "notes have"} unsaved changes. If you continue, they'll be lost.`;
-  }, [noteTabs.dirtyTabs.length, pendingIntent]);
+  const discardMessage = useMemo(
+    () =>
+      pendingIntent
+        ? describeDiscard(pendingIntent, noteTabs.dirtyTabs.length)
+        : "",
+    [noteTabs.dirtyTabs.length, pendingIntent],
+  );
 
   if (!vault) return null;
 
@@ -850,7 +897,7 @@ export function Workspace() {
           onToggleGraph={handleToggleGraph}
           onNewNote={() => startCreate("note")}
           onNewFolder={() => startCreate("folder")}
-          onRefresh={() => void refreshTree()}
+          onRefresh={handleRefreshTree}
           onCloseVault={handleCloseVault}
         />
         <div
@@ -866,9 +913,12 @@ export function Workspace() {
           >
             <FileTree
               vaultPath={vault.path}
-              tree={tree}
               activePath={open.path}
-              refreshTree={refreshTree}
+              loaded={loaded}
+              expanded={expanded}
+              onToggle={toggle}
+              onListDir={listDir}
+              onRefreshDir={refreshDir}
               onSelect={handleSelect}
               onDeleteRequest={handleDeleteRequest}
               onRemap={handleRemap}
@@ -916,7 +966,7 @@ export function Workspace() {
                 ? noteTabPanelId(noteTabs.activeTabId)
                 : "nn-empty-note-panel"
             }
-            role={noteTabs.activeTabId ? "tabpanel" : undefined}
+            role="tabpanel"
             aria-labelledby={
               noteTabs.activeTabId
                 ? noteTabTriggerId(noteTabs.activeTabId)
@@ -951,7 +1001,7 @@ export function Workspace() {
         </div>
       </div>
 
-      <StatusBar vaultName={vault.name} tree={tree} note={open.note} />
+      <StatusBar vaultName={vault.name} tree={fullTree} note={open.note} />
 
       <SettingsModal
         open={settingsOpen}
@@ -962,22 +1012,16 @@ export function Workspace() {
         open={templateInsertOpen}
         templates={templates}
         vaultPath={vault.path}
-        tree={tree}
+        tree={fullTree}
         onCreate={handleCreateFromTemplate}
         onClose={() => setTemplateInsertOpen(false)}
       />
 
       {pendingIntent && (
         <ConfirmDialog
-          title={
-            pendingIntent.kind === "delete-entry"
-              ? `Delete ${pendingIntent.node.kind === "folder" ? "folder" : "note"}?`
-              : "Discard unsaved changes?"
-          }
+          title={confirmDialogTitle(pendingIntent)}
           message={discardMessage}
-          confirmLabel={
-            pendingIntent.kind === "delete-entry" ? "Move to Trash" : "Discard"
-          }
+          confirmLabel={confirmDialogLabel(pendingIntent)}
           tone="danger"
           onConfirm={() => {
             const intent = pendingIntent;

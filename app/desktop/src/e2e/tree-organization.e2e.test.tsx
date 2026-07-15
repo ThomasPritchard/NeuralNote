@@ -45,17 +45,19 @@ describe("Journey 7: create a folder and move a note into it", () => {
     });
     await user.type(await screen.findByLabelText("New folder name"), "Archive{Enter}");
 
-    // Empty folder badge reads 0.
+    // Folders start collapsed and load lazily, so the child-count badge only
+    // appears once the folder is expanded. Expand the (empty) Archive → badge 0.
     expect(await screen.findByText("Archive")).toBeInTheDocument();
-    expect(within(archiveRow()).getByText("0")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^Archive/ }));
+    await waitFor(() => expect(within(archiveRow()).getByText("0")).toBeInTheDocument());
 
     // Drag the note onto the folder and drop.
     const dataTransfer = makeDataTransfer();
     fireEvent.dragStart(screen.getByRole("button", { name: "Note.md" }), { dataTransfer });
     fireEvent.drop(archiveRow(), { dataTransfer });
 
-    // The folder's child badge goes 0 → 1, and the note is still listed (now
-    // nested under Archive) …
+    // The folder's child badge goes 0 → 1, and the note is now listed nested
+    // under the (expanded) Archive …
     await waitFor(() => expect(within(archiveRow()).getByText("1")).toBeInTheDocument());
     expect(screen.getByText("Note.md")).toBeInTheDocument();
     // … and the open-note breadcrumb followed it to "Archive/Note.md".
@@ -74,13 +76,19 @@ describe("Journey 11: sidebar filename filter", () => {
     await user.click(await screen.findByRole("button", { name: "Open My Brain" }));
     await screen.findByText("Todo.md");
 
-    // Collapse "Projects" — its child leaves the tree. (The toggle's accessible
-    // name is "Projects 1": folder name + child-count badge.)
-    await user.click(screen.getByRole("button", { name: /^Projects/ }));
+    // Folders start collapsed and lazily loaded. Expand Archive (it stays open),
+    // and expand → then collapse Projects so its child is CACHED behind a
+    // collapsed folder: the filter matches loaded nodes, so a folder must have
+    // been opened once for the filter to reach into it.
+    await user.click(screen.getByRole("button", { name: /^Archive/ }));
+    expect(await screen.findByText("Old ideas.md")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^Projects/ })); // expand → loads Rocket.md
+    expect(await screen.findByText("Rocket.md")).toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: /^Projects/ })); // collapse → cached, hidden
     expect(screen.queryByText("Rocket.md")).not.toBeInTheDocument();
 
     // Filter: non-matching rows disappear; the collapsed folder holding the
-    // match auto-expands so the hit is visible.
+    // (cached) match auto-expands so the hit is visible.
     const filter = screen.getByLabelText("Filter files by name");
     await user.type(filter, "rocket");
     expect(await screen.findByText("Rocket.md")).toBeInTheDocument();
@@ -88,8 +96,8 @@ describe("Journey 11: sidebar filename filter", () => {
     expect(screen.queryByText("Archive")).not.toBeInTheDocument();
     expect(screen.queryByText("Old ideas.md")).not.toBeInTheDocument();
 
-    // Escape clears the filter; the full tree returns with collapse state
-    // intact — Projects stays collapsed, Archive stays expanded.
+    // Escape clears the filter; the full tree returns with expand state intact —
+    // Projects stays collapsed, Archive stays expanded.
     await user.keyboard("{Escape}");
     expect(filter).toHaveValue("");
     expect(await screen.findByText("Todo.md")).toBeInTheDocument();

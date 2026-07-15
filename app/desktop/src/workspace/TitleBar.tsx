@@ -264,11 +264,7 @@ function NoteTab({
   onActivate,
   onClose,
 }: Readonly<NoteTabProps>) {
-  const TabIcon = tab.loading
-    ? LoaderCircle
-    : tab.error
-      ? AlertTriangle
-      : iconForFile(extFromPath(tab.path));
+  const TabIcon = noteTabIcon(tab);
   const status = [
     tab.dirty ? "unsaved changes" : null,
     tab.loading ? "loading" : null,
@@ -292,6 +288,13 @@ function NoteTab({
       onClose={onClose}
     />
   );
+}
+
+/** Loading and failure states override the file-type icon, in that order. */
+function noteTabIcon(tab: TitleBarTabSummary): LucideIcon {
+  if (tab.loading) return LoaderCircle;
+  if (tab.error) return AlertTriangle;
+  return iconForFile(extFromPath(tab.path));
 }
 
 interface DocumentTabProps {
@@ -324,8 +327,10 @@ function DocumentTab({
   onClose,
 }: Readonly<DocumentTabProps>) {
   return (
+    // Layout-only wrapper: the positioning context for the absolute close
+    // action. Keep it role-free — a plain div adds no semantics between the
+    // tablist and its tabs, which is what role="presentation" was spelling out.
     <div
-      role="presentation"
       className="nn-note-tab relative flex h-[36px] min-w-[144px] max-w-[256px] shrink-0 items-center"
       data-selected={selected}
       data-error={error || undefined}

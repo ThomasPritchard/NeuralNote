@@ -29,6 +29,7 @@ import {
   errorMessage,
   isConflict,
   isNotFound,
+  listDir,
   listRecentVaults,
   listSkills,
   listTemplates,
@@ -534,6 +535,32 @@ describe("tree + note wrappers", () => {
     mockInvoke.mockResolvedValueOnce([]);
     await readTree();
     expect(mockInvoke).toHaveBeenCalledWith("read_tree");
+  });
+
+  it("listDir lists the vault root with an empty path", async () => {
+    const listing = { entries: [], truncated: null };
+    mockInvoke.mockResolvedValueOnce(listing);
+    await expect(listDir("")).resolves.toEqual(listing);
+    expect(mockInvoke).toHaveBeenCalledWith("list_dir", { path: "" });
+  });
+
+  it("listDir passes a nested folder's relPath and returns its listing", async () => {
+    const listing = {
+      entries: [
+        {
+          kind: "file",
+          name: "note.md",
+          path: "/v/Work/note.md",
+          relPath: "Work/note.md",
+          ext: "md",
+          children: null,
+        },
+      ],
+      truncated: 3,
+    };
+    mockInvoke.mockResolvedValueOnce(listing);
+    await expect(listDir("Work")).resolves.toEqual(listing);
+    expect(mockInvoke).toHaveBeenCalledWith("list_dir", { path: "Work" });
   });
 
   it("readNote passes the path", async () => {

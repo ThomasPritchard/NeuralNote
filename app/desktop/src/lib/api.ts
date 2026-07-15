@@ -19,6 +19,7 @@ import type {
   ChatEvent,
   ChatTurn,
   CoreError,
+  DirListing,
   HardwareSpec,
   HfModelMeta,
   InstalledModel,
@@ -138,6 +139,15 @@ export const setChatVisible = (visible: boolean) =>
 
 // ── Tree + notes ────────────────────────────────────────────────────────────
 export const readTree = () => invoke<TreeNode[]>("read_tree");
+
+/** One directory's immediate children, for the lazy file-tree DISPLAY path only
+ *  (issue #40). `relPath` is the vault-root-relative folder path — `""` lists the
+ *  root. Folders come back with `children: null` (unloaded); expand one to fetch
+ *  it. This never feeds search, the link graph, backlinks, or AI retrieval —
+ *  those keep scanning the whole vault, so a file hidden behind a truncation or an
+ *  unexpanded folder is still found and still cited. */
+export const listDir = (relPath: string) =>
+  invoke<DirListing>("list_dir", { path: relPath });
 
 export const readNote = (path: string) => invoke<NoteDoc>("read_note", { path });
 

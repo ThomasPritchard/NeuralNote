@@ -13,6 +13,14 @@ import type { NoteTab, NoteTabsController } from "./useNoteTabs";
 // Controllable store + open-note state, captured child props, and a fake Tauri
 // window so the close-guard and navigation guards can be driven directly.
 const { mockUseVault } = vi.hoisted(() => ({ mockUseVault: vi.fn() }));
+// The full-tree hook (useVaultTree) is its own concern with its own tests; stub
+// it here so Workspace's note index / status counts / template picker read a
+// controllable tree and the hook's own read_tree + tree-changed subscription
+// don't run inside these Workspace unit tests.
+const { fullTreeRef, refreshFullTreeMock } = vi.hoisted(() => ({
+  fullTreeRef: { current: [] as TreeNode[] },
+  refreshFullTreeMock: vi.fn(),
+}));
 const notification = vi.hoisted(() => ({
   error: vi.fn(),
   warning: vi.fn(),
@@ -88,6 +96,9 @@ const win = vi.hoisted(() => {
 });
 
 vi.mock("../lib/store", () => ({ useVault: mockUseVault }));
+vi.mock("./useVaultTree", () => ({
+  useVaultTree: () => ({ tree: fullTreeRef.current, refresh: refreshFullTreeMock }),
+}));
 vi.mock("../notifications", () => ({ useToast: () => notification }));
 vi.mock("./useNoteTabs", () => ({ useNoteTabs: () => tabsState.current }));
 // The Workspace subscribes to MENU_ACTION; mock the event bus so listen()
@@ -340,8 +351,13 @@ function defaultInvoke(command: string) {
 function vaultCtx(over: Record<string, unknown> = {}) {
   return {
     vault: { name: "MyVault", path: "/v" },
-    tree: [] as TreeNode[],
-    refreshTree: vi.fn().mockResolvedValue(undefined),
+    // Lazy file-tree store surface (issue #40). Root is loaded (empty) so the
+    // manual-refresh handler has a directory to re-list.
+    loaded: new Map([["", { status: "loaded", children: [], truncated: null }]]),
+    expanded: new Set<string>(),
+    listDir: vi.fn().mockResolvedValue(undefined),
+    toggle: vi.fn(),
+    refreshDir: vi.fn().mockResolvedValue(undefined),
     close: vi.fn().mockResolvedValue(undefined),
     openExisting: vi.fn().mockResolvedValue(undefined),
     openByPath: vi.fn().mockResolvedValue(undefined),
@@ -354,6 +370,8 @@ function vaultCtx(over: Record<string, unknown> = {}) {
 
 beforeEach(() => {
   mockUseVault.mockReset();
+  fullTreeRef.current = [];
+  refreshFullTreeMock.mockReset();
   Object.values(notification).forEach((mock) => mock.mockReset());
   mockInvoke.mockReset();
   mockInvoke.mockImplementation((command) => defaultInvoke(String(command)));
@@ -448,7 +466,10 @@ describe("Workspace — shell", () => {
 
 describe("Workspace — note index + rel-path opener threading", () => {
   it("builds the note index from the tree and passes it to the note pane", () => {
-    mockUseVault.mockReturnValue(vaultCtx({ tree: [node("/v/Target.md")] }));
+    // The note index is built from the FULL vault tree (useVaultTree), not the
+    // lazy display subset.
+    fullTreeRef.current = [node("/v/Target.md")];
+    mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
     expect((captured.notePane as { noteIndex?: unknown }).noteIndex).toEqual([
       { relPath: "Target.md", stem: "target" },
@@ -544,7 +565,8 @@ describe("Workspace — deletion sync", () => {
     await waitFor(() =>
       expect(mockInvoke).toHaveBeenCalledWith("delete_entry", { path: "/v/Notes" }),
     );
-    expect(ctx.refreshTree).toHaveBeenCalled();
+    // The deleted entry's parent folder is re-listed (relPath "Notes" → parent "").
+    expect(ctx.refreshDir).toHaveBeenCalledWith("");
     expect(tabsState.current.removeDescendants).toHaveBeenCalledWith("/v/Notes");
   });
 
@@ -730,7 +752,7 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
         template: "Templates/Daily.md",
       }),
     );
-    expect(ctx.refreshTree).toHaveBeenCalled();
+    expect(ctx.refreshDir).toHaveBeenCalledWith(""); // destination folder re-listed
     expect(tabsState.current.open).toHaveBeenCalledWith("/v/Journal.md", {
       forceNew: false,
     });
@@ -798,7 +820,7 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     expect(screen.getByTestId("searchpanel").parentElement).toHaveAttribute(
       "hidden",
     );
-    expect(screen.queryByRole("separator")).not.toBeInTheDocument();
+    expect(screen.queryByRole("slider")).not.toBeInTheDocument();
 
     act(() => captured.ribbon.onShowFiles());
     expect(captured.ribbon.sidebarPanel).toBe("files");
@@ -1171,7 +1193,7 @@ describe("Workspace — titlebar + sidebar", () => {
       .getByTestId("filetree")
       .closest("#nn-primary-sidebar");
     expect(sidebar).toHaveAttribute("id", "nn-primary-sidebar");
-    expect(screen.getByRole("separator")).toHaveAttribute(
+    expect(screen.getByRole("slider")).toHaveAttribute(
       "aria-controls",
       "nn-primary-sidebar",
     );
@@ -1186,7 +1208,7 @@ describe("Workspace — titlebar + sidebar", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
 
-    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowRight" });
+    fireEvent.keyDown(screen.getByRole("slider"), { key: "ArrowRight" });
     expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
       "--sidebar-width": "304px",
     });
@@ -1197,7 +1219,7 @@ describe("Workspace — titlebar + sidebar", () => {
       "--sidebar-width": "0px",
       "--splitter-width": "0px",
     });
-    expect(screen.queryByRole("separator")).not.toBeInTheDocument();
+    expect(screen.queryByRole("slider")).not.toBeInTheDocument();
 
     act(() => captured.ribbon.onShowFiles());
     expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
@@ -1212,7 +1234,7 @@ describe("Workspace — titlebar + sidebar", () => {
     const notePane = screen.getByTestId("notepane");
     const chatPane = screen.getByTestId("chatpane");
 
-    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowRight" });
+    fireEvent.keyDown(screen.getByRole("slider"), { key: "ArrowRight" });
 
     expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
       "--sidebar-width": "304px",
@@ -1227,7 +1249,7 @@ describe("Workspace — titlebar + sidebar", () => {
     act(() => captured.ribbon.onToggleGraph());
     const graph = screen.getByTestId("graphview");
 
-    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowRight" });
+    fireEvent.keyDown(screen.getByRole("slider"), { key: "ArrowRight" });
 
     expect(screen.getByTestId("graphview")).toBe(graph);
   });
@@ -1771,7 +1793,11 @@ describe("Workspace — menu action + intent failures", () => {
     render(<Workspace />);
 
     await act(async () => captured.ribbon.onRefresh());
-    expect(ctx.refreshTree).toHaveBeenCalled();
+    // Manual refresh re-lists every loaded directory (here just the root)…
+    expect(ctx.refreshDir).toHaveBeenCalledWith("");
+    // …and re-reads the whole-vault tree, so the wikilink index / counts / picker
+    // don't stay stale when the disk watcher is the very thing that's broken.
+    expect(refreshFullTreeMock).toHaveBeenCalled();
   });
 
   it("reports a failure to list templates for insertion", async () => {

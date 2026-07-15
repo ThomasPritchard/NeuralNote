@@ -52,13 +52,13 @@ export function PaneSplitter({
 
   const handlePointerMove = (event: PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (drag?.pointerId !== event.pointerId) return;
     resize(drag.startWidth + event.clientX - drag.startX);
   };
 
   const finishPointerDrag = (event: PointerEvent<HTMLDivElement>) => {
     const drag = dragRef.current;
-    if (!drag || drag.pointerId !== event.pointerId) return;
+    if (drag?.pointerId !== event.pointerId) return;
     dragRef.current = null;
     event.currentTarget.releasePointerCapture(event.pointerId);
   };
@@ -100,10 +100,13 @@ export function PaneSplitter({
   };
 
   return (
+    // ARIA slider pattern: a focusable resize control selecting the pane width
+    // within [min, max]. Arrow keys move along the horizontal value axis, so
+    // the slider is horizontal even though the bar it drags is vertical.
     <div
-      role="separator"
+      role="slider"
       aria-label="Resize files and search pane"
-      aria-orientation="vertical"
+      aria-orientation="horizontal"
       aria-controls={paneId}
       aria-valuemin={minWidth}
       aria-valuenow={width}
