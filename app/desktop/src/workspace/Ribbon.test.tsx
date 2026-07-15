@@ -1,4 +1,4 @@
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { Ribbon } from "./Ribbon";
@@ -36,6 +36,15 @@ describe("Ribbon — navigation modes", () => {
     expect(screen.getByText("Search")).not.toHaveClass("sr-only");
     expect(screen.getByText("Insert from template")).not.toHaveClass("sr-only");
     expect(screen.getByText("Graph view")).not.toHaveClass("sr-only");
+  });
+
+  it("exposes the quick links as a labelled navigation landmark", () => {
+    renderRibbon({ navigationExpanded: true });
+
+    const quickLinks = screen.getByRole("navigation", { name: "Quick links" });
+    for (const name of ["Files", "Search", "Insert from template", "Graph view"]) {
+      expect(within(quickLinks).getByRole("button", { name })).toBeInTheDocument();
+    }
   });
 
   it("renders compact controls with accessible names and hidden labels", () => {
