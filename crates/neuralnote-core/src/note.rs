@@ -77,6 +77,29 @@ fn build_binary_doc(root: &Path, path: &Path) -> NoteDoc {
     }
 }
 
+/// The ONE decoding policy for note *text*, shared verbatim by the reader
+/// ([`read_note`]) and by full-text search ([`crate::search::search_vault`]) so the
+/// string search indexes is byte-identical to the string the reader presents.
+/// This is the single source of truth for issue #33: two independent decode call
+/// sites (a strict path here, a lossy path in search) previously agreed only by
+/// coincidence, and any drift is a citation-fidelity hole — retrieval reuses
+/// search's decoded bytes but hashes them expecting the reader's ([`content_hash`]),
+/// so both MUST decode identically.
+///
+/// Policy: valid UTF-8 is taken verbatim (zero-copy); anything else is decoded
+/// with [`String::from_utf8_lossy`] — each invalid byte-sequence becomes U+FFFD —
+/// and the returned flag is `true` so the reader can warn that some characters may
+/// be wrong. The bytes on disk are never mutated; only how they render as text is
+/// decided here. `from_utf8_lossy(e.as_bytes())` decodes the *whole* original
+/// input (`as_bytes` is the entire slice, not just the valid prefix), so no
+/// trailing content is dropped.
+pub(crate) fn decode_note_text(bytes: Vec<u8>) -> (String, bool) {
+    match String::from_utf8(bytes) {
+        Ok(text) => (text, false),
+        Err(e) => (String::from_utf8_lossy(e.as_bytes()).into_owned(), true),
+    }
+}
+
 /// Read a note: split frontmatter from body, parse the YAML leniently, and keep
 /// the full raw file regardless. The path is vault-scoped first.
 pub fn read_note(root: &Path, target: &Path) -> CoreResult<NoteDoc> {
@@ -88,22 +111,18 @@ pub fn read_note(root: &Path, target: &Path) -> CoreResult<NoteDoc> {
     // images/PDFs, and `read_to_string` would fail on them, dead-ending the
     // reader's graceful binary branch.
     let bytes = std::fs::read(&path)?;
-    match String::from_utf8(bytes) {
-        Ok(raw) => Ok(build_doc(root, &path, raw, false)),
-        Err(e) => {
-            // Not valid UTF-8. A note file (`.md`/`.txt`) is text in some other
-            // encoding (e.g. Windows-1252/Latin-1 from a migrated vault) — decode
-            // it lossily so the content is SHOWN, never hidden, and flag it so the
-            // reader can warn that some characters may be wrong. Anything else
-            // (image/PDF/binary) stays a no-preview attachment.
-            if is_text_note(&path) {
-                let raw = String::from_utf8_lossy(e.as_bytes()).into_owned();
-                Ok(build_doc(root, &path, raw, true))
-            } else {
-                Ok(build_binary_doc(root, &path))
-            }
-        }
+    // An attachment (image/PDF/…) that isn't valid UTF-8 stays a no-preview
+    // binary doc — never lossy-decoded, which would bloat a multi-MB image into
+    // megabytes of U+FFFD. `is_text_note` short-circuits, so a text note (the hot
+    // path) skips this validation scan and decodes exactly once below.
+    if !is_text_note(&path) && std::str::from_utf8(&bytes).is_err() {
+        return Ok(build_binary_doc(root, &path));
     }
+    // A text note (`.md`/`.txt`) in some other encoding (Windows-1252/Latin-1 from
+    // a migrated vault) is decoded lossily so its content is SHOWN, never hidden,
+    // and flagged so the reader can warn. Same policy search uses, by construction.
+    let (raw, lossy) = decode_note_text(bytes);
+    Ok(build_doc(root, &path, raw, lossy))
 }
 
 /// Whether a path is a text note we should always try to show as text (decoding
@@ -121,7 +140,7 @@ fn is_text_note(path: &Path) -> bool {
 /// the write-path conflict check. Strict `read_to_string` here would error on such
 /// a file and make every save of an editable note fail.
 fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
-    Ok(String::from_utf8_lossy(&std::fs::read(path)?).into_owned())
+    Ok(decode_note_text(std::fs::read(path)?).0)
 }
 
 /// Overwrite a note's full content, atomically (write to a temp sibling, then
