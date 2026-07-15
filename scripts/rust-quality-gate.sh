@@ -72,7 +72,10 @@ section "Security / Vulnerabilities — cargo-audit (RUSTSEC)"
 if command -v cargo-audit >/dev/null 2>&1; then
   audit_out=$(cargo audit 2>&1); audit_rc=$?
   if [ "$audit_rc" -eq 0 ]; then
-    pass "cargo-audit: no known advisories"
+    # Exit 0 = no vulnerabilities. The allowed unmaintained/unsound warnings
+    # (Tauri's Linux GTK3 stack + urlpattern's unic-*) are accounted for in
+    # docs/security/dependency-advisories.md — no ignore-list needed.
+    pass "cargo-audit: no vulnerabilities (allowed warnings: docs/security/dependency-advisories.md)"
   elif printf '%s' "$audit_out" | grep -qiE "couldn't fetch advisory database|talking to the server|error sending request|failed to fetch"; then
     # Network couldn't reach the RUSTSEC git DB — an availability problem, not a
     # code verdict. Don't fail the gate; a networked CI run will exercise it.
