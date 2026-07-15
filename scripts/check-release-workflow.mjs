@@ -220,7 +220,7 @@ test("the publisher stages a draft prerelease and exposes the manifest last", ()
   assert.match(publishRelease, /--draft=false/);
   assert.match(publishRelease, /--prerelease/);
   assert.match(publishRelease, /--latest=false/);
-  assert.match(publishManifest, /HEAD:release-manifests/);
+  assert.match(publishManifest, /HEAD:refs\/heads\/release-manifests/);
 
   const draftIndex = publish.indexOf("      - name: Create draft GitHub prerelease");
   const releaseIndex = publish.indexOf("      - name: Publish GitHub prerelease");
@@ -285,6 +285,14 @@ test("the publisher can safely resume after release or manifest publication", ()
   assert.match(publishRelease, /RELEASE_ALREADY_PUBLISHED/);
   assert.match(publishRelease, /--json isImmutable/);
   assert.match(publishRelease, /"\$RELEASE_IS_IMMUTABLE"\s*!=\s*"true"/);
+  assert.match(
+    publishManifest,
+    /git ls-remote --exit-code --heads origin refs\/heads\/release-manifests/,
+  );
+  assert.doesNotMatch(
+    publishManifest,
+    /git ls-remote --exit-code --heads origin release-manifests(?:\s|>)/,
+  );
   assert.match(publishManifest, /release-manifests already contains this manifest/);
   assert.doesNotMatch(publishManifest, /already contains this manifest[\s\S]*?exit 1/);
 });

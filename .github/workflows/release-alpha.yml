@@ -645,8 +645,8 @@ jobs:
           git init "$MANIFEST_WORKTREE"
           git -C "$MANIFEST_WORKTREE" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
           gh auth setup-git
-          if git ls-remote --exit-code --heads origin release-manifests >/dev/null 2>&1; then
-            git -C "$MANIFEST_WORKTREE" fetch --depth=1 origin release-manifests
+          if git ls-remote --exit-code --heads origin refs/heads/release-manifests >/dev/null 2>&1; then
+            git -C "$MANIFEST_WORKTREE" fetch --depth=1 origin refs/heads/release-manifests
             git -C "$MANIFEST_WORKTREE" checkout -b release-manifests FETCH_HEAD
           else
             git -C "$MANIFEST_WORKTREE" checkout --orphan release-manifests
@@ -660,4 +660,4 @@ jobs:
             exit 0
           fi
           git -C "$MANIFEST_WORKTREE" commit -m "release: publish NeuralNote 0.2.0 alpha manifest"
-          git -C "$MANIFEST_WORKTREE" push origin HEAD:release-manifests
+          git -C "$MANIFEST_WORKTREE" push origin HEAD:refs/heads/release-manifests
