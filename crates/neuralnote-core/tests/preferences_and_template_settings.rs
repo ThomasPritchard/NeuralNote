@@ -17,6 +17,23 @@ fn app_preferences_default_to_the_dark_neural_theme() {
     assert_eq!(preferences.theme, ThemeId::NeuralVioletDark);
     assert_eq!(preferences.font_scale, FontScale::Default);
     assert_eq!(preferences.font_family, FontFamily::Inter);
+    assert_eq!(preferences.last_seen_whats_new_version, None);
+}
+
+#[test]
+fn preferences_migrate_a_pre_0_2_file_without_hiding_whats_new() {
+    let config = tempfile::tempdir().unwrap();
+    fs::write(
+        config.path().join("preferences.json"),
+        r#"{"automaticUpdateChecks":false,"theme":"forestDark","fontScale":"small","fontFamily":"inter"}"#,
+    )
+    .unwrap();
+
+    let loaded = load_app_preferences(config.path()).unwrap();
+
+    assert!(!loaded.recovered_from_corrupt);
+    assert_eq!(loaded.preferences.theme, ThemeId::ForestDark);
+    assert_eq!(loaded.preferences.last_seen_whats_new_version, None);
 }
 
 #[test]
@@ -70,6 +87,7 @@ fn preferences_round_trip_atomically_without_leaking_temp_files() {
         theme: ThemeId::OceanBlueLight,
         font_scale: FontScale::Large,
         font_family: FontFamily::AtkinsonHyperlegible,
+        last_seen_whats_new_version: Some("0.2.0".into()),
     };
 
     save_app_preferences(config.path(), &preferences).unwrap();
@@ -82,6 +100,44 @@ fn preferences_round_trip_atomically_without_leaking_temp_files() {
         .file_name()
         .to_string_lossy()
         .ends_with(".nn-tmp")));
+}
+
+#[test]
+fn whats_new_version_rejects_oversized_or_non_version_input_before_persistence() {
+    let config = tempfile::tempdir().unwrap();
+    let mut preferences = AppPreferences {
+        last_seen_whats_new_version: Some("x".repeat(65)),
+        ..AppPreferences::default()
+    };
+
+    let oversized = save_app_preferences(config.path(), &preferences).unwrap_err();
+    assert!(oversized.to_string().contains("What's new version"));
+
+    preferences.last_seen_whats_new_version = Some("0.2.0\nforged".into());
+    let malformed = save_app_preferences(config.path(), &preferences).unwrap_err();
+    assert!(malformed.to_string().contains("What's new version"));
+
+    assert!(!config.path().join("preferences.json").exists());
+}
+
+#[test]
+fn invalid_persisted_whats_new_version_recovers_explicitly_without_rewriting() {
+    let config = tempfile::tempdir().unwrap();
+    let raw = r#"{"automaticUpdateChecks":true,"theme":"forestDark","fontScale":"small","fontFamily":"inter","lastSeenWhatsNewVersion":"not a version"}"#;
+    fs::write(config.path().join("preferences.json"), raw).unwrap();
+
+    let loaded = load_app_preferences(config.path()).unwrap();
+
+    assert!(loaded.recovered_from_corrupt);
+    assert_eq!(loaded.preferences, AppPreferences::default());
+    assert!(loaded
+        .recovery_message
+        .as_deref()
+        .is_some_and(|message| message.contains("What's new version")));
+    assert_eq!(
+        fs::read_to_string(config.path().join("preferences.json")).unwrap(),
+        raw
+    );
 }
 
 #[test]

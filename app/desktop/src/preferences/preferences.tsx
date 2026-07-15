@@ -17,6 +17,7 @@ export const DEFAULT_PREFERENCES: AppPreferences = {
   theme: "neuralVioletDark",
   fontScale: "default",
   fontFamily: "inter",
+  lastSeenWhatsNewVersion: null,
 };
 
 const FONT_SCALE_PERCENT: Record<FontScale, string> = {

@@ -230,9 +230,7 @@ export function LocalAiCard({
         setPullErrors(withPullError(tag, ev.message));
       } else {
         // Terminal success: the fresh model immediately becomes the provider.
-        void api
-          .setActiveProvider("local", tag)
-          .then(refreshStatus)
+        void onActivate(tag)
           .catch((e) => setPullErrors(withPullError(tag, errorMessage(e))));
         void refreshInstalled();
       }

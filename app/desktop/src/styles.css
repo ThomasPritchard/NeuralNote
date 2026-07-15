@@ -287,11 +287,23 @@ html[data-font-family="sourceSerif4"] {
 }
 
 .nn-titlebar {
+  --titlebar-toggle-clearance: 122px;
   grid-template-columns:
-    calc(var(--navigation-width) + var(--sidebar-width) + var(--splitter-width))
+    max(
+      calc(var(--navigation-width) + var(--sidebar-width) + var(--splitter-width)),
+      var(--titlebar-toggle-clearance)
+    )
     minmax(0, 1fr)
     max-content;
   align-items: center;
+}
+
+.nn-titlebar-toggle-clearance-windowed {
+  --titlebar-toggle-clearance: 122px;
+}
+
+.nn-titlebar-toggle-clearance-fullscreen {
+  --titlebar-toggle-clearance: 60px;
 }
 
 .nn-tab-strip {
@@ -367,7 +379,17 @@ html[data-font-family="sourceSerif4"] {
   width: var(--sidebar-width);
 }
 
-.nn-primary-sidebar > .nn-sidebar {
+.nn-primary-sidebar-panel {
+  display: flex;
+  min-height: 0;
+  width: 100%;
+}
+
+.nn-primary-sidebar-panel[hidden] {
+  display: none;
+}
+
+.nn-primary-sidebar-panel > .nn-sidebar {
   width: 100%;
 }
 
@@ -458,6 +480,224 @@ html[data-font-family="sourceSerif4"] {
   text-wrap: pretty;
 }
 
+/* The CodeMirror document is the source and the preview. Keep its chrome
+   invisible so it shares the reader's typography without hiding editability. */
+.nn-source-editor,
+.nn-source-editor .cm-editor {
+  min-height: 50vh;
+}
+
+.nn-source-editor .cm-editor {
+  background: transparent;
+  color: color-mix(in oklab, var(--foreground) 90%, transparent);
+  font-family: var(--font-sans);
+  font-size: 1rem;
+  line-height: 1.8;
+  caret-color: var(--primary);
+  height: calc(100vh - var(--titlebar-height) - var(--note-toolbar-height) - var(--statusbar-height) - 8rem);
+  max-height: 72vh;
+}
+
+.nn-source-editor .cm-editor.cm-focused {
+  outline: 2px solid transparent;
+  outline-offset: 3px;
+  box-shadow: 0 0 0 2px color-mix(in oklab, var(--primary) 55%, transparent);
+}
+
+.nn-source-editor .cm-scroller {
+  overflow: auto;
+  font-family: inherit;
+}
+
+.nn-source-editor :where(.cm-cursor, .cm-dropCursor) {
+  border-left-color: var(--primary) !important;
+}
+
+.nn-source-editor .cm-content {
+  padding: 0;
+  caret-color: var(--primary);
+}
+
+.nn-source-editor .cm-gutters {
+  border: 0;
+  background: transparent;
+  color: var(--muted-foreground);
+}
+
+.nn-source-editor .cm-foldGutter .cm-gutterElement {
+  padding-inline: 0 0.4rem;
+}
+
+.nn-source-editor .cm-line {
+  padding: 0;
+}
+
+.nn-source-editor .cm-selectionBackground,
+.nn-source-editor .cm-content ::selection {
+  background: color-mix(in oklab, var(--primary) 24%, transparent) !important;
+}
+
+.nn-source-editor :where(.nn-lp-heading-1, .nn-lp-heading-2, .nn-lp-heading-3,
+  .nn-lp-heading-4, .nn-lp-heading-5, .nn-lp-heading-6) {
+  color: var(--foreground);
+  font-family: var(--font-heading);
+  font-weight: 600;
+  letter-spacing: -0.025em;
+  line-height: 1.15;
+}
+
+.nn-source-editor .nn-lp-heading-1 {
+  font-size: 1.75rem;
+}
+
+.nn-source-editor .nn-lp-heading-2 {
+  font-size: 1.5rem;
+}
+
+.nn-source-editor .nn-lp-heading-3 {
+  font-size: 1.125rem;
+}
+
+.nn-source-editor .nn-lp-emphasis {
+  font-style: italic;
+}
+
+.nn-source-editor .nn-lp-strong {
+  font-weight: 700;
+}
+
+.nn-source-editor .nn-lp-strikethrough {
+  text-decoration: line-through;
+}
+
+.nn-source-editor :where(.nn-lp-inline-code, .nn-lp-fenced-code, .nn-lp-marker-active,
+  .nn-lp-task-active, .nn-lp-block-id) {
+  font-family: var(--font-mono);
+}
+
+.nn-source-editor .nn-lp-inline-code {
+  border-radius: 0.25rem;
+  background: var(--surface-sunken);
+  padding-inline: 0.2em;
+}
+
+.nn-source-editor .nn-lp-fenced-code {
+  background: var(--surface-sunken);
+  font-family: var(--font-mono);
+  box-decoration-break: clone;
+  -webkit-box-decoration-break: clone;
+}
+
+.nn-source-editor .nn-lp-list-marker {
+  color: color-mix(in oklab, var(--primary) 80%, var(--foreground));
+  font-weight: 700;
+}
+
+.nn-source-editor .nn-lp-thematic-break {
+  color: var(--muted-foreground);
+  text-decoration: line-through;
+  text-decoration-thickness: 1px;
+}
+
+.nn-source-editor .nn-lp-table {
+  border-radius: 0.25rem;
+  background: color-mix(in oklab, var(--surface-sunken) 82%, transparent);
+  font-variant-numeric: tabular-nums;
+}
+
+.nn-source-editor :where(.nn-lp-link, .nn-lp-wikilink-resolved) {
+  color: var(--primary);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in oklab, var(--primary) 40%, transparent);
+  text-underline-offset: 0.2em;
+}
+
+.nn-source-title-placeholder-heading {
+  margin: 0;
+}
+
+.nn-source-title-placeholder {
+  display: block;
+  width: 100%;
+  margin: 0;
+  border: 0;
+  background: transparent;
+  padding: 0 0 1.5rem;
+  color: var(--foreground);
+  font: 600 1.75rem/1.15 var(--font-heading);
+  letter-spacing: -0.025em;
+  text-align: left;
+  cursor: text;
+}
+
+.nn-source-title-placeholder:focus-visible {
+  border-radius: 0.25rem;
+  outline: 2px solid var(--primary);
+  outline-offset: 0.25rem;
+}
+
+.nn-source-editor .nn-lp-wikilink-unresolved {
+  color: var(--muted-foreground);
+  text-decoration: underline dotted;
+  text-underline-offset: 0.2em;
+}
+
+.nn-source-editor :where(.nn-lp-image, .nn-lp-embed) {
+  display: inline-flex;
+  border: 1px solid var(--border);
+  border-radius: 0.375rem;
+  background: var(--surface-sunken);
+  padding: 0.1rem 0.45rem;
+  color: var(--muted-foreground);
+  font-size: 0.8125rem;
+}
+
+.nn-source-editor .nn-lp-task {
+  display: inline-grid;
+  width: 1.5rem;
+  height: 1.5rem;
+  place-items: center;
+  border: 1px solid var(--input);
+  border-radius: 0.25rem;
+  background: var(--background);
+  color: var(--primary-foreground);
+  font: 700 0.75rem/1 var(--font-sans);
+  vertical-align: -0.1em;
+}
+
+.nn-source-editor .nn-lp-task-checked {
+  border-color: var(--primary);
+  background: var(--primary);
+}
+
+.nn-source-editor .nn-lp-task:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.nn-source-editor :where(.nn-lp-callout, .nn-lp-blockquote) {
+  color: color-mix(in oklab, var(--primary) 80%, var(--foreground));
+}
+
+.nn-source-editor .cm-tooltip-autocomplete {
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: 0.5rem;
+  background: var(--popover);
+  box-shadow: 0 14px 35px color-mix(in oklab, black 20%, transparent);
+  color: var(--popover-foreground);
+  font-family: var(--font-sans);
+}
+
+.nn-source-editor .cm-tooltip-autocomplete > ul > li {
+  padding: 0.35rem 0.65rem;
+}
+
+.nn-source-editor .cm-tooltip-autocomplete > ul > li[aria-selected="true"] {
+  background: var(--accent);
+  color: var(--accent-foreground);
+}
+
 .nn-skip-link {
   position: fixed;
   left: 1rem;
@@ -529,10 +769,6 @@ html[data-font-family="sourceSerif4"] {
     --chat-width: 18rem;
   }
 
-  .nn-chat-model-pill {
-    max-width: 7rem;
-    padding-inline: 0.5rem;
-  }
 }
 
 @media (max-height: 700px) {

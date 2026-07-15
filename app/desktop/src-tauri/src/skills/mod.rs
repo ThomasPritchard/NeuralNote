@@ -11,14 +11,16 @@ use neuralnote_core::{ai::UndoLedger, CoreError};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
-pub(crate) use elicitation::{PendingElicitations, RunElicitationGuard, ShellUserPrompt};
+pub(crate) use elicitation::{
+    CancelChatRunOutcome, PendingElicitations, RunElicitationGuard, ShellUserPrompt,
+};
 #[cfg(all(unix, test))]
 pub(crate) use note_writer::FsNoteWriteBackend;
 #[cfg(unix)]
 pub(crate) use note_writer::RunNoteWriteBackend;
 #[cfg(not(unix))]
 pub(crate) use note_writer_unsupported::RunNoteWriteBackend;
-pub(crate) use undo::{next_chat_run_id, undo_ledger, UndoReport, UndoRunStore};
+pub(crate) use undo::{undo_ledger, UndoReport, UndoRunStore};
 
 pub(crate) fn retain_chat_undo_ledger(
     state: &Mutex<crate::AppState>,

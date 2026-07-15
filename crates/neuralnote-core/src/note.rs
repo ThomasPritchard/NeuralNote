@@ -11,6 +11,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 /// writers of the same note never collide on the temp path (PA-016).
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
+/// Maximum complete UTF-8 source document accepted by the editable note write
+/// boundary. Checked before conflict reads or filesystem mutation.
+pub const MAX_EDITABLE_NOTE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Stable content fingerprint for optimistic-concurrency conflict detection.
 /// `DefaultHasher::new()` uses fixed keys, so the digest is stable across runs.
 /// Returned as a decimal string to survive the JS number-precision boundary.
@@ -135,6 +139,13 @@ pub fn write_note(
     content: &str,
     expected_hash: Option<String>,
 ) -> CoreResult<NoteDoc> {
+    if content.len() > MAX_EDITABLE_NOTE_BYTES {
+        return Err(CoreError::InvalidContent(format!(
+            "note is {} bytes; editable notes are limited to {} bytes",
+            content.len(),
+            MAX_EDITABLE_NOTE_BYTES,
+        )));
+    }
     let path = ensure_within(root, target)?;
     if !path.is_file() {
         return Err(CoreError::NotFound(path.display().to_string()));

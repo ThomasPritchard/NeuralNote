@@ -46,6 +46,8 @@ export interface UserMessage {
 
 export interface AssistantMessage {
   role: "assistant";
+  /** Caller-generated identity used to route events and cancellation outcomes. */
+  turnId: string | null;
   /** The last progress phase backed by an actual transport/backend event. */
   phase: "sending" | "thinking" | "searching" | "reading" | "verifying";
   skillActivations: Array<{ id: string; name: string }>;
@@ -67,6 +69,8 @@ export interface AssistantMessage {
   error: string | null;
   /** True once the run ended (a `done` or `error` event). */
   done: boolean;
+  /** A matching user stop won before normal completion. */
+  stopped: boolean;
 }
 
 export type ChatMessage = UserMessage | AssistantMessage;
@@ -76,9 +80,13 @@ export function userMessage(content: string): UserMessage {
 }
 
 /** A fresh assistant turn, before any event has landed. */
-export function emptyAssistant(reasoningRequested = false): AssistantMessage {
+export function emptyAssistant(
+  reasoningRequested = false,
+  turnId: string | null = null,
+): AssistantMessage {
   return {
     role: "assistant",
+    turnId,
     phase: "sending",
     skillActivations: [],
     skillSteps: [],
@@ -92,6 +100,7 @@ export function emptyAssistant(reasoningRequested = false): AssistantMessage {
     coverage: null,
     error: null,
     done: false,
+    stopped: false,
   };
 }
 
@@ -116,6 +125,7 @@ export function isPartialSkillRun(turn: AssistantMessage): boolean {
   ) {
     return false;
   }
+  if (turn.stopped) return true;
   const narrative = [...turn.skillSteps, turn.answer, turn.error ?? ""].join("\n");
   return /\b(?:cancelled|canceled|stopped(?:\s+early)?|partial)\b/i.test(narrative);
 }
@@ -131,6 +141,7 @@ export function isPartialSkillRun(turn: AssistantMessage): boolean {
 export function showsNothingFoundCard(turn: AssistantMessage): boolean {
   return (
     turn.done &&
+    !turn.stopped &&
     turn.error === null &&
     turn.coverage !== null &&
     turn.coverage.searchedTerms.length > 0 &&
@@ -138,6 +149,51 @@ export function showsNothingFoundCard(turn: AssistantMessage): boolean {
     turn.citations.length === 0 &&
     !turn.activity.some((step) => step.kind === "dropped")
   );
+}
+
+/** Fold one transport event into the assistant turn that owns its caller ID. */
+export function reduceAssistantForTurn(
+  messages: ChatMessage[],
+  turnId: string,
+  event: ChatEvent,
+): ChatMessage[] {
+  const index = messages.findIndex(
+    (message) =>
+      message.role === "assistant" &&
+      message.turnId === turnId,
+  );
+  if (index < 0) return messages;
+  const turn = messages[index] as AssistantMessage;
+  if (turn.done && (!turn.stopped || event.type !== "noteWritten")) {
+    return messages;
+  }
+  const next = messages.slice();
+  next[index] = reduceAssistant(turn, event);
+  return next;
+}
+
+/** Set the neutral stopped terminal state only on the matching active turn. */
+export function markAssistantStopped(
+  messages: ChatMessage[],
+  turnId: string,
+): ChatMessage[] {
+  const index = messages.findIndex(
+    (message) =>
+      message.role === "assistant" &&
+      message.turnId === turnId &&
+      !message.done,
+  );
+  if (index < 0) return messages;
+  const turn = messages[index] as AssistantMessage;
+  const next = messages.slice();
+  next[index] = {
+    ...turn,
+    pendingElicitation: null,
+    error: null,
+    done: true,
+    stopped: true,
+  };
+  return next;
 }
 
 /** Fold a `retrieved` event into the matching `searching` row (→ "searching X →

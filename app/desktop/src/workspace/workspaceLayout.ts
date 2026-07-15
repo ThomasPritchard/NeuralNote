@@ -1,6 +1,9 @@
+export type SidebarPanel = "files" | "search" | null;
+
 export interface WorkspaceLayoutState {
   navigationExpanded: boolean;
   sidebarWidth: number;
+  sidebarPanel: SidebarPanel;
 }
 
 export interface WorkspaceMeasurements {
@@ -15,9 +18,11 @@ export interface WorkspaceMeasurements {
 export interface EffectiveWorkspaceLayout extends WorkspaceLayoutState {
   navigationWidth: number;
   sidebarMaxWidth: number;
+  splitterWidth: number;
 }
 
-export const WORKSPACE_LAYOUT_STORAGE_KEY = "nn:workspace-layout:v1";
+export const WORKSPACE_LAYOUT_STORAGE_KEY = "nn:workspace-layout:v2";
+const LEGACY_WORKSPACE_LAYOUT_STORAGE_KEY = "nn:workspace-layout:v1";
 export const NAVIGATION_COMPACT_WIDTH = 56;
 export const NAVIGATION_EXPANDED_WIDTH = 192;
 export const SIDEBAR_MIN_WIDTH = 192;
@@ -27,6 +32,7 @@ export const SPLITTER_WIDTH = 8;
 export const DEFAULT_WORKSPACE_LAYOUT: WorkspaceLayoutState = {
   navigationExpanded: true,
   sidebarWidth: 296,
+  sidebarPanel: "files",
 };
 
 interface LayoutStorage {
@@ -46,6 +52,39 @@ function defaultStorage(): LayoutStorage | undefined {
   }
 }
 
+function isSidebarPanel(value: unknown): value is SidebarPanel {
+  return value === "files" || value === "search" || value === null;
+}
+
+function parseLegacyWorkspaceLayout(raw: string | null): WorkspaceLayoutState | null {
+  if (raw === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      return null;
+    }
+    const candidate = parsed as Record<string, unknown>;
+    if (
+      typeof candidate.navigationExpanded !== "boolean" ||
+      typeof candidate.sidebarWidth !== "number" ||
+      !Number.isFinite(candidate.sidebarWidth)
+    ) {
+      return null;
+    }
+    return {
+      navigationExpanded: candidate.navigationExpanded,
+      sidebarWidth: clamp(
+        candidate.sidebarWidth,
+        SIDEBAR_MIN_WIDTH,
+        SIDEBAR_MAX_WIDTH,
+      ),
+      sidebarPanel: "files",
+    };
+  } catch {
+    return null;
+  }
+}
+
 export function parseWorkspaceLayout(raw: string | null): WorkspaceLayoutState {
   if (raw === null) return { ...DEFAULT_WORKSPACE_LAYOUT };
   try {
@@ -57,7 +96,8 @@ export function parseWorkspaceLayout(raw: string | null): WorkspaceLayoutState {
     if (
       typeof candidate.navigationExpanded !== "boolean" ||
       typeof candidate.sidebarWidth !== "number" ||
-      !Number.isFinite(candidate.sidebarWidth)
+      !Number.isFinite(candidate.sidebarWidth) ||
+      !isSidebarPanel(candidate.sidebarPanel)
     ) {
       return { ...DEFAULT_WORKSPACE_LAYOUT };
     }
@@ -68,6 +108,7 @@ export function parseWorkspaceLayout(raw: string | null): WorkspaceLayoutState {
         SIDEBAR_MIN_WIDTH,
         SIDEBAR_MAX_WIDTH,
       ),
+      sidebarPanel: candidate.sidebarPanel,
     };
   } catch {
     return { ...DEFAULT_WORKSPACE_LAYOUT };
@@ -77,7 +118,15 @@ export function parseWorkspaceLayout(raw: string | null): WorkspaceLayoutState {
 export function loadWorkspaceLayout(storage = defaultStorage()): WorkspaceLayoutState {
   if (!storage) return { ...DEFAULT_WORKSPACE_LAYOUT };
   try {
-    return parseWorkspaceLayout(storage.getItem(WORKSPACE_LAYOUT_STORAGE_KEY));
+    const current = storage.getItem(WORKSPACE_LAYOUT_STORAGE_KEY);
+    if (current !== null) return parseWorkspaceLayout(current);
+
+    const legacy = parseLegacyWorkspaceLayout(
+      storage.getItem(LEGACY_WORKSPACE_LAYOUT_STORAGE_KEY),
+    );
+    if (!legacy) return { ...DEFAULT_WORKSPACE_LAYOUT };
+    saveWorkspaceLayout(legacy, storage);
+    return legacy;
   } catch {
     return { ...DEFAULT_WORKSPACE_LAYOUT };
   }
@@ -100,13 +149,17 @@ export function deriveEffectiveWorkspaceLayout(
   preferred: WorkspaceLayoutState,
   measurements: WorkspaceMeasurements,
 ): EffectiveWorkspaceLayout {
+  const panelOpen = preferred.sidebarPanel !== null;
+  const splitterWidth = panelOpen ? SPLITTER_WIDTH : 0;
   if (measurements.workspaceWidth <= 0) {
     return {
       ...preferred,
+      sidebarWidth: panelOpen ? preferred.sidebarWidth : 0,
       navigationWidth: preferred.navigationExpanded
         ? NAVIGATION_EXPANDED_WIDTH
         : NAVIGATION_COMPACT_WIDTH,
       sidebarMaxWidth: SIDEBAR_MAX_WIDTH,
+      splitterWidth,
     };
   }
 
@@ -120,10 +173,11 @@ export function deriveEffectiveWorkspaceLayout(
     workspaceWidth -
     NAVIGATION_EXPANDED_WIDTH -
     reservedChatWidth -
-    SPLITTER_WIDTH -
+    splitterWidth -
     EDITOR_MIN_WIDTH;
   const navigationExpanded =
-    preferred.navigationExpanded && expandedSidebarSpace >= SIDEBAR_MIN_WIDTH;
+    preferred.navigationExpanded &&
+    expandedSidebarSpace >= (panelOpen ? SIDEBAR_MIN_WIDTH : 0);
   const navigationWidth = navigationExpanded
     ? NAVIGATION_EXPANDED_WIDTH
     : NAVIGATION_COMPACT_WIDTH;
@@ -136,7 +190,7 @@ export function deriveEffectiveWorkspaceLayout(
     workspaceWidth -
     renderedNavigationWidth -
     chatWidth -
-    SPLITTER_WIDTH -
+    splitterWidth -
     EDITOR_MIN_WIDTH;
   const sidebarMaxWidth = clamp(
     sidebarSpace,
@@ -147,11 +201,11 @@ export function deriveEffectiveWorkspaceLayout(
   return {
     navigationExpanded,
     navigationWidth,
-    sidebarWidth: clamp(
-      preferred.sidebarWidth,
-      SIDEBAR_MIN_WIDTH,
-      sidebarMaxWidth,
-    ),
+    sidebarPanel: preferred.sidebarPanel,
+    sidebarWidth: panelOpen
+      ? clamp(preferred.sidebarWidth, SIDEBAR_MIN_WIDTH, sidebarMaxWidth)
+      : 0,
     sidebarMaxWidth,
+    splitterWidth,
   };
 }

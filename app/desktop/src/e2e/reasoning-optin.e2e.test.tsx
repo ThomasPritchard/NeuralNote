@@ -30,7 +30,7 @@ const TOGGLE = { name: /show model reasoning/i };
 async function openWorkspace(opts: CreateMockVaultOptions = {}) {
   const result = renderApp({ recents, ...opts });
   await result.user.click(await screen.findByRole("button", { name: "Open My Brain" }));
-  await screen.findByText("Cited recall"); // the chat pane header, in every view
+  await screen.findByText("Neural Assistant AI"); // the chat pane header, in every view
   return result;
 }
 

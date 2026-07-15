@@ -15,6 +15,7 @@ import type {
   ApiKeyStatus,
   Backlinks,
   CandidateModel,
+  CancelChatRunOutcome,
   ChatEvent,
   ChatTurn,
   CoreError,
@@ -23,6 +24,7 @@ import type {
   InstalledModel,
   LinkGraph,
   NoteDoc,
+  OpenRouterModelMenu,
   ProviderKind,
   PullEvent,
   Recommendation,
@@ -119,15 +121,15 @@ export const resetWorkspaceState = () =>
   invoke<WorkspaceStateLoad>("reset_workspace_state");
 
 /**
- * Tell the native menu whether a note is open in edit mode, so it can enable the
- * Format items only when they'd actually do something (the Editor that handles
- * them is mounted only in edit mode). Best-effort — the enabled state is cosmetic.
+ * Tell the native menu whether an editable text note is open, so it can enable
+ * Format items only while the source editor can handle them. Best-effort — the
+ * enabled state is cosmetic.
  */
 export const setMenuEditing = (editing: boolean) =>
   invoke<void>("set_menu_editing", { editing });
 
 /**
- * Tell the native menu whether the cited-recall chat panel is shown, so it can
+ * Tell the native menu whether the Neural Assistant AI panel is shown, so it can
  * paint the View-menu checkmark. The webview owns this state; this call only keeps
  * the menu's checkmark in agreement. Best-effort — the checkmark is cosmetic.
  */
@@ -222,7 +224,6 @@ export type MenuAction =
   | "view-files"
   | "view-search"
   | "toggle-graph"
-  | "toggle-mode"
   | "toggle-chat"
   | "toggle-sidebar"
   | "format-bold"
@@ -251,11 +252,23 @@ export const onMenu = (
 export const apiKeyStatus = () => invoke<ApiKeyStatus>("api_key_status");
 
 /** Store the OpenRouter API key (OS keychain, Rust-side) and the chosen model. */
+let aiConfigMutationTail: Promise<void> = Promise.resolve();
+
+function sequenceAiConfigMutation<T>(operation: () => Promise<T>): Promise<T> {
+  const result = aiConfigMutationTail.then(operation, operation);
+  aiConfigMutationTail = result.then(
+    () => undefined,
+    () => undefined,
+  );
+  return result;
+}
+
 export const saveApiKey = (key: string, model: string) =>
-  invoke<void>("save_api_key", { key, model });
+  sequenceAiConfigMutation(() => invoke<void>("save_api_key", { key, model }));
 
 /** Remove the stored API key. */
-export const clearApiKey = () => invoke<void>("clear_api_key");
+export const clearApiKey = () =>
+  sequenceAiConfigMutation(() => invoke<void>("clear_api_key"));
 
 /** Run one cited-chat turn. `onEvent` fires for each streamed `ChatEvent`
  *  (searching / reading / verifying / answer / citation / coverage) as it
@@ -264,6 +277,7 @@ export const clearApiKey = () => invoke<void>("clear_api_key");
  *  only the prompt, prior turns, and explicitly selected skills cross the
  *  boundary. */
 export const chat = (
+  turnId: string,
   prompt: string,
   history: ChatTurn[],
   onEvent: (event: ChatEvent) => void,
@@ -272,6 +286,7 @@ export const chat = (
   const channel = new Channel<ChatEvent>();
   channel.onmessage = onEvent;
   return invoke<string>("chat", {
+    turnId,
     prompt,
     history,
     onEvent: channel,
@@ -279,9 +294,10 @@ export const chat = (
   });
 };
 
-/** Cancel the sole active chat run. Completed playlist work remains in the
- *  run ledger and is reported by the normal streamed wind-down. */
-export const cancelChatRun = () => invoke<void>("cancel_chat_run");
+/** Stop only the exact caller-owned turn. The typed outcome distinguishes a
+ *  stop that won from a run that had already settled or was never current. */
+export const cancelChatRun = (turnId: string) =>
+  invoke<CancelChatRunOutcome>("cancel_chat_run", { turnId });
 
 /** Resolve one live elicitation with option ids validated by the Rust shell. */
 export const answerElicitation = (id: string, choices: string[]) =>
@@ -311,7 +327,11 @@ export const aiStatus = () => invoke<AiStatus>("ai_status");
 export const setActiveProvider = (
   provider: ProviderKind,
   localModelTag?: string,
-) => invoke<void>("set_active_provider", { provider, localModelTag });
+) =>
+  sequenceAiConfigMutation(async () => {
+    await invoke<void>("set_active_provider", { provider, localModelTag });
+    return aiStatus();
+  });
 
 /** Opt into (or out of) OpenRouter's billed reasoning tokens on the answer turn.
  *  Persisted to the non-secret AI config; OpenRouter-only (the local path never
@@ -319,16 +339,32 @@ export const setActiveProvider = (
  *  than following up with `aiStatus()`: a read that failed after the write landed
  *  would show "off" while the config says "on", billing the user silently. */
 export const setReasoning = (enabled: boolean) =>
-  invoke<AiStatus>("set_reasoning", { enabled });
+  sequenceAiConfigMutation(() => invoke<AiStatus>("set_reasoning", { enabled }));
 
 /** Probe the selected model over the network or loopback for reasoning support.
  *  This is async I/O, not a cheap config read like `aiStatus()`, so never call it
- *  on every render. Returns the freshly persisted status — render it directly
- *  rather than following up with `aiStatus()`. An un-probed or failed model stays
- *  "unknown", keeping the toggle enabled (fail open); failure never reports
- *  "unsupported". */
+ *  on every render. It deliberately does not occupy the config-mutation queue:
+ *  the native persistence gate resolves write races, while callers use their
+ *  status generation to ignore an obsolete response. An un-probed or failed
+ *  model stays "unknown", keeping the toggle enabled (fail open); failure never
+ *  reports "unsupported". */
 export const refreshReasoningSupport = () =>
   invoke<AiStatus>("refresh_reasoning_support");
+
+/** Load today's native-validated OpenRouter ranking. The shell owns provider
+ *  traffic, response limits, validation, and the daily cache. */
+export const openRouterModelMenu = (forceRefresh = false) =>
+  invoke<OpenRouterModelMenu>("openrouter_model_menu", { forceRefresh });
+
+/** Persist one exact model from the last native-validated menu and return the
+ *  fresh provider status. */
+export const selectOpenRouterModel = (model: string) =>
+  sequenceAiConfigMutation(() => invoke<AiStatus>("select_openrouter_model", { model }));
+
+/** Open the fixed OpenRouter rankings attribution page through the native
+ *  external-navigation policy. The webview cannot supply a URL. */
+export const openOpenRouterRankings = () =>
+  invoke<void>("open_openrouter_rankings");
 
 /** Detect host hardware (RAM/CPU/arch/OS) for the local-model recommendation and
  *  the Settings hardware readout. Infallible on the Rust side. */
@@ -399,4 +435,4 @@ export const listSkills = () => invoke<SkillListing[]>("list_skills");
  *  state, so callers render what landed on disk rather than assuming the write
  *  succeeded. */
 export const setSkillEnabled = (id: string, enabled: boolean) =>
-  invoke<boolean>("set_skill_enabled", { id, enabled });
+  sequenceAiConfigMutation(() => invoke<boolean>("set_skill_enabled", { id, enabled }));

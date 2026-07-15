@@ -19,6 +19,8 @@ pub enum CoreError {
     OutsideVault(String),
     /// An empty, reserved, or separator-bearing name was supplied.
     InvalidName(String),
+    /// Untrusted note or patch content failed validation and was not written.
+    InvalidContent(String),
     /// The file changed on disk since it was read — saving would clobber an
     /// external edit. The UI offers reload-or-overwrite (optimistic concurrency).
     Conflict(String),
@@ -40,6 +42,7 @@ impl std::fmt::Display for CoreError {
             CoreError::AlreadyExists(m) => write!(f, "already exists: {m}"),
             CoreError::OutsideVault(m) => write!(f, "outside vault: {m}"),
             CoreError::InvalidName(m) => write!(f, "invalid name: {m}"),
+            CoreError::InvalidContent(m) => write!(f, "invalid content: {m}"),
             CoreError::Conflict(m) => write!(f, "conflict: {m}"),
             CoreError::Io(m) => write!(f, "io error: {m}"),
             CoreError::Frontmatter(m) => write!(f, "frontmatter error: {m}"),

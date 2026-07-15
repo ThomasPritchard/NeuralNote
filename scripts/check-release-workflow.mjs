@@ -63,7 +63,7 @@ const build = jobBody("build");
 const publish = jobBody("publish");
 
 test("all production manifests use the release version", async () => {
-  const releaseVersion = "0.1.1";
+  const releaseVersion = "0.2.0";
   const [desktopPackage, nativeE2ePackage, tauriConfig] = await Promise.all([
     readRepositoryFile("app/desktop/package.json"),
     readRepositoryFile("app/desktop/e2e-native/package.json"),
@@ -86,7 +86,7 @@ test("all production manifests use the release version", async () => {
 test("release publication is manual-only and requires an explicit signing choice", () => {
   assert.match(trigger, /\n  workflow_dispatch:\s*$/m);
   assert.doesNotMatch(trigger, /^  (?:push|pull_request|schedule|release|workflow_run|workflow_call):/m);
-  assert.match(trigger, /release_tag:[\s\S]*?required:\s*true[\s\S]*?default:\s*v0\.1\.1/);
+  assert.match(trigger, /release_tag:[\s\S]*?required:\s*true[\s\S]*?default:\s*v0\.2\.0/);
   assert.match(
     trigger,
     /signing_mode:[\s\S]*?type:\s*choice[\s\S]*?required:\s*true[\s\S]*?default:\s*ad-hoc[\s\S]*?options:[\s\S]*?- ad-hoc[\s\S]*?- developer-id/,

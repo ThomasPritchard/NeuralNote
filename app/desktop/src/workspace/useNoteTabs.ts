@@ -1,28 +1,33 @@
 import { useCallback, useMemo, useReducer, useRef } from "react";
+
 import * as api from "../lib/api";
 import { errorMessage, isConflict } from "../lib/api";
 import type { NoteDoc } from "../lib/types";
 import { isPathInside, normSep, remapPath } from "./fileMeta";
-import type { NoteMode, OpenNote } from "./useOpenNote";
+import {
+  clearSourceEditorSessions,
+  destroySourceEditorSession,
+} from "./sourceEditorSession";
+import type { OpenNote } from "./useOpenNote";
 
 export interface NoteTab {
   id: string;
   path: string;
   note: NoteDoc | null;
+  sessionHash: string | null;
   loading: boolean;
   error: string | null;
-  mode: NoteMode;
   draft: string;
   dirty: boolean;
   saving: boolean;
   saveError: string | null;
+  preservationError: string | null;
   conflict: boolean;
   loadRevision: number;
   saveRevision: number;
 }
 
 export interface OpenTabOptions {
-  /** Command-click semantics: preserve a clean active tab instead of reusing it. */
   forceNew?: boolean;
 }
 
@@ -30,18 +35,12 @@ export interface NoteTabsController {
   tabs: NoteTab[];
   activeTabId: string | null;
   activeTab: NoteTab | null;
-  /** OpenNote-compatible view over the active tab. */
   active: OpenNote;
   dirtyTabs: NoteTab[];
   open: (path: string, options?: OpenTabOptions) => string;
   activate: (tabId: string) => void;
   close: (tabId: string) => void;
-  remap: (
-    oldPath: string,
-    newPath: string,
-    newRelPath?: string,
-  ) => void;
-  /** Remove tabs at path, or beneath path when it is a folder. */
+  remap: (oldPath: string, newPath: string, newRelPath?: string) => void;
   removeDescendants: (path: string) => void;
   tabsInside: (path: string) => NoteTab[];
   clear: () => void;
@@ -55,45 +54,21 @@ interface TabsState {
 type Action =
   | { type: "add-loading"; tab: NoteTab }
   | { type: "load-start"; id: string; path: string; revision: number }
-  | {
-      type: "load-success";
-      id: string;
-      requestedPath: string;
-      revision: number;
-      doc: NoteDoc;
-    }
+  | { type: "load-success"; id: string; requestedPath: string; revision: number; doc: NoteDoc }
   | { type: "load-error"; id: string; revision: number; message: string }
   | { type: "activate"; id: string }
   | { type: "close"; id: string }
-  | { type: "set-mode"; id: string; mode: NoteMode }
   | { type: "set-draft"; id: string; draft: string }
+  | { type: "set-preservation-error"; id: string; message: string | null }
   | { type: "save-start"; id: string; revision: number }
-  | {
-      type: "save-success";
-      id: string;
-      revision: number;
-      pathAtStart: string;
-      doc: NoteDoc;
-    }
-  | {
-      type: "save-error";
-      id: string;
-      revision: number;
-      message: string;
-      conflict: boolean;
-    }
-  | {
-      type: "remap";
-      oldPath: string;
-      newPath: string;
-      newRelPath?: string;
-    }
+  | { type: "save-success"; id: string; revision: number; pathAtStart: string; doc: NoteDoc }
+  | { type: "save-error"; id: string; revision: number; message: string; conflict: boolean }
+  | { type: "remap"; oldPath: string; newPath: string; newRelPath?: string }
   | { type: "remove-descendants"; path: string }
   | { type: "clear" };
 
 const EMPTY_STATE: TabsState = { tabs: [], activeTabId: null };
 
-/** Syntactic identity used only while Rust resolves the canonical path. */
 export function normalizeRequestedPath(path: string): string {
   const normalized = normSep(path);
   const absolute = normalized.startsWith("/");
@@ -109,15 +84,8 @@ export function normalizeRequestedPath(path: string): string {
   return `${prefix}${parts.join("/")}` || (absolute ? "/" : ".");
 }
 
-function replaceTab(
-  state: TabsState,
-  id: string,
-  update: (tab: NoteTab) => NoteTab,
-): TabsState {
-  return {
-    ...state,
-    tabs: state.tabs.map((tab) => (tab.id === id ? update(tab) : tab)),
-  };
+function replaceTab(state: TabsState, id: string, update: (tab: NoteTab) => NoteTab): TabsState {
+  return { ...state, tabs: state.tabs.map((tab) => (tab.id === id ? update(tab) : tab)) };
 }
 
 function reconciledLoad(
@@ -127,7 +95,6 @@ function reconciledLoad(
   const target = state.tabs.find((tab) => tab.id === action.id);
   if (!target || target.loadRevision !== action.revision) return state;
 
-  // A rename/move that happened during the read remains authoritative.
   const wasRemapped = normalizeRequestedPath(target.path) !== normalizeRequestedPath(action.requestedPath);
   const path = wasRemapped ? target.path : action.doc.path;
   const requestedPath = normSep(action.requestedPath);
@@ -136,17 +103,15 @@ function reconciledLoad(
     ? requestedPath.slice(0, -requestedRelPath.length)
     : null;
   const remappedPath = normSep(target.path);
-  const remappedRelPath =
-    vaultPrefix !== null && remappedPath.startsWith(vaultPrefix)
-      ? remappedPath.slice(vaultPrefix.length).replace(/^\/+/, "")
-      : null;
+  const remappedRelPath = vaultPrefix !== null && remappedPath.startsWith(vaultPrefix)
+    ? remappedPath.slice(vaultPrefix.length).replace(/^\/+/, "")
+    : null;
   const relPath = wasRemapped
     ? (target.note?.relPath ?? remappedRelPath ?? action.doc.relPath)
     : action.doc.relPath;
   const loadedDoc = { ...action.doc, path, relPath };
-  const canonicalKey = normalizeRequestedPath(path);
   const alias = state.tabs.find(
-    (tab) => tab.id !== action.id && normalizeRequestedPath(tab.path) === canonicalKey,
+    (tab) => tab.id !== action.id && normalizeRequestedPath(tab.path) === normalizeRequestedPath(path),
   );
 
   if (alias) {
@@ -166,10 +131,12 @@ function reconciledLoad(
           ...survivor,
           path,
           note: loadedDoc,
+          sessionHash: loadedDoc.contentHash,
           loading: false,
           error: null,
           draft: loadedDoc.raw,
           dirty: false,
+          preservationError: null,
         };
     return {
       tabs: state.tabs
@@ -179,19 +146,21 @@ function reconciledLoad(
     };
   }
 
-  return replaceTab(state, action.id, (tab) => ({
-    ...(tab.dirty && tab.note
+  return replaceTab(state, action.id, (tab) =>
+    tab.dirty && tab.note
       ? { ...tab, loading: false, error: null }
       : {
           ...tab,
           path,
           note: loadedDoc,
+          sessionHash: loadedDoc.contentHash,
           loading: false,
           error: null,
           draft: loadedDoc.raw,
           dirty: false,
-        }),
-  }));
+          preservationError: null,
+        },
+  );
 }
 
 export function noteTabsReducer(state: TabsState, action: Action): TabsState {
@@ -203,18 +172,16 @@ export function noteTabsReducer(state: TabsState, action: Action): TabsState {
         ...tab,
         path: action.path,
         note: null,
+        sessionHash: null,
         loading: true,
         error: null,
-        mode: "read",
         draft: "",
         dirty: false,
         saving: false,
         saveError: null,
+        preservationError: null,
         conflict: false,
         loadRevision: action.revision,
-        // Reusing this stable tab gives it a new async owner. Any save that
-        // started for the previous path may still land on disk, but its UI
-        // completion must not overwrite the newly loaded note.
         saveRevision: tab.saveRevision + 1,
       }));
     case "load-success":
@@ -222,31 +189,27 @@ export function noteTabsReducer(state: TabsState, action: Action): TabsState {
     case "load-error":
       return replaceTab(state, action.id, (tab) =>
         tab.loadRevision === action.revision
-          ? { ...tab, loading: false, error: action.message, note: null, draft: "", dirty: false }
+          ? { ...tab, loading: false, error: action.message, note: null, sessionHash: null, draft: "", dirty: false }
           : tab,
       );
     case "activate":
-      return state.tabs.some((tab) => tab.id === action.id)
-        ? { ...state, activeTabId: action.id }
-        : state;
+      return state.tabs.some((tab) => tab.id === action.id) ? { ...state, activeTabId: action.id } : state;
     case "close": {
       const index = state.tabs.findIndex((tab) => tab.id === action.id);
       if (index < 0) return state;
       const tabs = state.tabs.filter((tab) => tab.id !== action.id);
-      if (state.activeTabId !== action.id) return { ...state, tabs };
-      return {
-        tabs,
-        activeTabId: tabs[index]?.id ?? tabs[index - 1]?.id ?? null,
-      };
+      return state.activeTabId === action.id
+        ? { tabs, activeTabId: tabs[index]?.id ?? tabs[index - 1]?.id ?? null }
+        : { ...state, tabs };
     }
-    case "set-mode":
-      return replaceTab(state, action.id, (tab) => ({ ...tab, mode: action.mode }));
     case "set-draft":
       return replaceTab(state, action.id, (tab) => ({
         ...tab,
         draft: action.draft,
         dirty: tab.note !== null && action.draft !== tab.note.raw,
       }));
+    case "set-preservation-error":
+      return replaceTab(state, action.id, (tab) => ({ ...tab, preservationError: action.message }));
     case "save-start":
       return replaceTab(state, action.id, (tab) => ({
         ...tab,
@@ -290,9 +253,7 @@ export function noteTabsReducer(state: TabsState, action: Action): TabsState {
           const path = remapPath(tab.path, action.oldPath, action.newPath);
           if (!path) return tab;
           const suffix = normSep(tab.path).slice(normSep(action.oldPath).length);
-          const relPath = action.newRelPath
-            ? `${action.newRelPath}${suffix}`
-            : tab.note?.relPath;
+          const relPath = action.newRelPath ? `${action.newRelPath}${suffix}` : tab.note?.relPath;
           return {
             ...tab,
             path,
@@ -301,9 +262,7 @@ export function noteTabsReducer(state: TabsState, action: Action): TabsState {
         }),
       };
     case "remove-descendants": {
-      const removed = new Set(
-        state.tabs.filter((tab) => isPathInside(tab.path, action.path)).map((tab) => tab.id),
-      );
+      const removed = new Set(state.tabs.filter((tab) => isPathInside(tab.path, action.path)).map((tab) => tab.id));
       if (removed.size === 0) return state;
       const activeIndex = state.tabs.findIndex((tab) => tab.id === state.activeTabId);
       const tabs = state.tabs.filter((tab) => !removed.has(tab.id));
@@ -322,13 +281,14 @@ function loadingTab(id: string, path: string): NoteTab {
     id,
     path,
     note: null,
+    sessionHash: null,
     loading: true,
     error: null,
-    mode: "read",
     draft: "",
     dirty: false,
     saving: false,
     saveError: null,
+    preservationError: null,
     conflict: false,
     loadRevision: 1,
     saveRevision: 0,
@@ -340,6 +300,7 @@ export function useNoteTabs(): NoteTabsController {
   const stateRef = useRef(state);
   stateRef.current = state;
   const nextId = useRef(0);
+  const savingTabIds = useRef(new Set<string>());
 
   const dispatch = useCallback((action: Action) => {
     stateRef.current = noteTabsReducer(stateRef.current, action);
@@ -355,18 +316,15 @@ export function useNoteTabs(): NoteTabsController {
 
   const open = useCallback((target: string, options: OpenTabOptions = {}) => {
     const path = normalizeRequestedPath(target);
-    const existing = stateRef.current.tabs.find(
-      (tab) => normalizeRequestedPath(tab.path) === path,
-    );
+    const existing = stateRef.current.tabs.find((tab) => normalizeRequestedPath(tab.path) === path);
     if (existing) {
       dispatch({ type: "activate", id: existing.id });
       return existing.id;
     }
 
-    const active = stateRef.current.tabs.find(
-      (tab) => tab.id === stateRef.current.activeTabId,
-    );
+    const active = stateRef.current.tabs.find((tab) => tab.id === stateRef.current.activeTabId);
     if (active && !active.dirty && !options.forceNew) {
+      destroySourceEditorSession(active.id);
       const revision = active.loadRevision + 1;
       dispatch({ type: "load-start", id: active.id, path, revision });
       dispatch({ type: "activate", id: active.id });
@@ -381,18 +339,15 @@ export function useNoteTabs(): NoteTabsController {
   }, [dispatch, runLoad]);
 
   const activate = useCallback((id: string) => dispatch({ type: "activate", id }), [dispatch]);
-  const close = useCallback((id: string) => dispatch({ type: "close", id }), [dispatch]);
-
-  const activeOperation = useCallback((action:
-    | { type: "set-mode"; mode: NoteMode }
-    | { type: "set-draft"; draft: string }) => {
-    const id = stateRef.current.activeTabId;
-    if (id) dispatch({ ...action, id } as Action);
+  const close = useCallback((id: string) => {
+    destroySourceEditorSession(id);
+    dispatch({ type: "close", id });
   }, [dispatch]);
 
   const reload = useCallback(() => {
     const tab = stateRef.current.tabs.find((item) => item.id === stateRef.current.activeTabId);
     if (!tab) return;
+    destroySourceEditorSession(tab.id);
     const revision = tab.loadRevision + 1;
     dispatch({ type: "load-start", id: tab.id, path: tab.path, revision });
     runLoad(tab.id, tab.path, revision);
@@ -400,7 +355,20 @@ export function useNoteTabs(): NoteTabsController {
 
   const persist = useCallback(async (overwrite: boolean) => {
     const tab = stateRef.current.tabs.find((item) => item.id === stateRef.current.activeTabId);
-    if (!tab?.note) return;
+    if (!tab?.note || tab.saving || savingTabIds.current.has(tab.id)) return;
+    if (tab.preservationError) {
+      const revision = tab.saveRevision + 1;
+      dispatch({ type: "save-start", id: tab.id, revision });
+      dispatch({
+        type: "save-error",
+        id: tab.id,
+        revision,
+        message: tab.preservationError,
+        conflict: false,
+      });
+      return;
+    }
+    savingTabIds.current.add(tab.id);
     const revision = tab.saveRevision + 1;
     const pathAtStart = tab.path;
     const draftAtStart = tab.draft;
@@ -420,6 +388,8 @@ export function useNoteTabs(): NoteTabsController {
         message: errorMessage(error),
         conflict: isConflict(error),
       });
+    } finally {
+      savingTabIds.current.delete(tab.id);
     }
   }, [dispatch]);
 
@@ -427,25 +397,34 @@ export function useNoteTabs(): NoteTabsController {
     dispatch({ type: "remap", oldPath, newPath, newRelPath });
   }, [dispatch]);
   const removeDescendants = useCallback((path: string) => {
+    for (const tab of stateRef.current.tabs) {
+      if (isPathInside(tab.path, path)) destroySourceEditorSession(tab.id);
+    }
     dispatch({ type: "remove-descendants", path });
   }, [dispatch]);
-  const clear = useCallback(() => dispatch({ type: "clear" }), [dispatch]);
+  const clear = useCallback(() => {
+    clearSourceEditorSessions();
+    dispatch({ type: "clear" });
+  }, [dispatch]);
   const tabsInside = useCallback(
     (path: string) => stateRef.current.tabs.filter((tab) => isPathInside(tab.path, path)),
     [],
   );
 
   const activeTab = state.tabs.find((tab) => tab.id === state.activeTabId) ?? null;
+  const owningTabId = activeTab?.id ?? null;
   const active = useMemo<OpenNote>(() => ({
+    sessionKey: activeTab?.id ?? null,
+    sessionHash: activeTab?.sessionHash ?? null,
     path: activeTab?.path ?? null,
     note: activeTab?.note ?? null,
     loading: activeTab?.loading ?? false,
     error: activeTab?.error ?? null,
-    mode: activeTab?.mode ?? "read",
     draft: activeTab?.draft ?? "",
     dirty: activeTab?.dirty ?? false,
     saving: activeTab?.saving ?? false,
     saveError: activeTab?.saveError ?? null,
+    preservationError: activeTab?.preservationError ?? null,
     conflict: activeTab?.conflict ?? false,
     open: (path) => { open(path); },
     reload,
@@ -453,13 +432,17 @@ export function useNoteTabs(): NoteTabsController {
     repath: (newPath, newRelPath) => {
       if (activeTab) remap(activeTab.path, newPath, newRelPath);
     },
-    setMode: (mode) => activeOperation({ type: "set-mode", mode }),
-    setDraft: (draft) => activeOperation({ type: "set-draft", draft }),
+    setDraft: (draft) => {
+      if (owningTabId) dispatch({ type: "set-draft", id: owningTabId, draft });
+    },
+    setPreservationError: (message) => {
+      if (owningTabId) dispatch({ type: "set-preservation-error", id: owningTabId, message });
+    },
     save: () => persist(false),
     clear: () => {
       if (activeTab) close(activeTab.id);
     },
-  }), [activeOperation, activeTab, close, open, persist, reload, remap]);
+  }), [activeTab, close, dispatch, open, owningTabId, persist, reload, remap]);
 
   return {
     tabs: state.tabs,

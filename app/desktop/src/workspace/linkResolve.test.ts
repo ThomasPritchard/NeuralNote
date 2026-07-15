@@ -114,6 +114,47 @@ describe("resolveMarkdownLink", () => {
     );
   });
 
+  it("resolves sibling leaf and subpath links from the source note folder", () => {
+    const nestedIndex: NoteIndexEntry[] = [
+      { relPath: "Areas/Peer.md", stem: "peer" },
+      { relPath: "Areas/Sibling/Peer.md", stem: "peer" },
+    ];
+
+    expect(
+      resolveMarkdownLink("Peer.md", nestedIndex, "Areas/Current.md"),
+    ).toBe("Areas/Peer.md");
+    expect(
+      resolveMarkdownLink("Sibling/Peer.md", nestedIndex, "Areas/Current.md"),
+    ).toBe("Areas/Sibling/Peer.md");
+  });
+
+  it("rejects root-relative, absolute, escaping and external targets from a nested source", () => {
+    const nestedIndex: NoteIndexEntry[] = [
+      { relPath: "Areas/Peer.md", stem: "peer" },
+      { relPath: "Peer.md", stem: "peer" },
+    ];
+
+    expect(
+      resolveMarkdownLink("/Peer.md", nestedIndex, "Areas/Current.md"),
+    ).toBeNull();
+    expect(
+      resolveMarkdownLink("C:/Peer.md", nestedIndex, "Areas/Current.md"),
+    ).toBeNull();
+    expect(
+      resolveMarkdownLink("../Peer.md", nestedIndex, "Areas/Current.md"),
+    ).toBeNull();
+    expect(
+      resolveMarkdownLink("../../Peer.md", nestedIndex, "Areas/Current.md"),
+    ).toBeNull();
+    expect(
+      resolveMarkdownLink(
+        "https://example.com/Peer.md",
+        nestedIndex,
+        "Areas/Current.md",
+      ),
+    ).toBeNull();
+  });
+
   it("returns null for external, absolute, escaping, non-note and empty hrefs", () => {
     expect(resolveMarkdownLink("https://example.com/Daily.md", index)).toBeNull();
     expect(resolveMarkdownLink("/Daily.md", index)).toBeNull();

@@ -54,9 +54,9 @@ describe("Native menu → app actions", () => {
     expect(await screen.findByLabelText("Search vault")).toBeInTheDocument();
   });
 
-  it("Toggle Cited Recall hides and re-shows the chat panel without unmounting it", async () => {
+  it("Toggle Neural Assistant AI hides and re-shows the chat panel without unmounting it", async () => {
     await openVault();
-    const heading = screen.getByText("Cited recall");
+    const heading = screen.getByText("Neural Assistant AI");
     const slot = heading.closest(".nn-chat-slot");
     expect(slot).toHaveAttribute("data-visible", "true");
     expect(slot).toHaveAttribute("aria-hidden", "false");
@@ -64,13 +64,13 @@ describe("Native menu → app actions", () => {
     // The webview owns visibility now, so each action is a bare flip (no `checked`
     // payload); the menu item just requests a toggle.
     await fireMenu("toggle-chat");
-    expect(screen.getByText("Cited recall")).toBe(heading);
+    expect(screen.getByText("Neural Assistant AI")).toBe(heading);
     expect(slot).toHaveAttribute("data-visible", "false");
     expect(slot).toHaveAttribute("aria-hidden", "true");
     expect(slot).toHaveAttribute("inert");
 
     await fireMenu("toggle-chat");
-    expect(screen.getByText("Cited recall")).toBe(heading);
+    expect(screen.getByText("Neural Assistant AI")).toBe(heading);
     expect(slot).toHaveAttribute("data-visible", "true");
     expect(slot).toHaveAttribute("aria-hidden", "false");
     expect(slot).not.toHaveAttribute("inert");

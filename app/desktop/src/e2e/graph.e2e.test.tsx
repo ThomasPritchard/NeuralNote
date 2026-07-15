@@ -17,7 +17,7 @@
 // the >0 rendering is unit-tested in GraphView.test.tsx.
 
 import { beforeEach, describe, it, expect, vi } from "vitest";
-import { act, screen, within } from "@testing-library/react";
+import { act, screen, waitFor, within } from "@testing-library/react";
 import { createFakeForceGraph, type FakeForceGraph } from "../test/fakeForceGraph";
 import { renderApp, type RenderAppResult } from "./renderApp";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
@@ -219,8 +219,10 @@ describe("Journey 13: graph guard and failure surfacing", () => {
     // Open Beta and dirty its buffer.
     await user.click(await screen.findByRole("button", { name: "Beta.md" }));
     await screen.findByRole("heading", { name: "Beta", level: 1 });
-    await user.click(screen.getByRole("button", { name: "Edit" }));
-    await user.type(screen.getByRole("textbox", { name: "Note source" }), " edit");
+    const editor = await screen.findByRole("textbox", { name: "Note content" });
+    await user.click(editor);
+    await user.keyboard("{Control>}{End}{/Control}");
+    await user.type(editor, " edit");
     expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
 
     // Switching to the graph is not destructive — no dialog, buffer preserved.
@@ -238,9 +240,9 @@ describe("Journey 13: graph guard and failure surfacing", () => {
     expect(screen.getByRole("tab", { name: "Gamma" })).toHaveAttribute("aria-selected", "true");
 
     await user.click(screen.getByRole("tab", { name: "Beta, unsaved changes" }));
-    expect(screen.getByRole("textbox", { name: "Note source" })).toHaveValue(
-      "Beta body. edit",
-    );
+    const restoredEditor = await screen.findByRole("textbox", { name: "Note content" });
+    await waitFor(() => expect(restoredEditor).toHaveTextContent("Beta body."));
+    expect(restoredEditor).toHaveTextContent("edit");
     expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
   });
 

@@ -1,6 +1,17 @@
-import { render, screen } from "@testing-library/react";
+import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+
+const nativeWindow = vi.hoisted(() => ({
+  isFullscreen: vi.fn<() => Promise<boolean>>(),
+  onResized: vi.fn(),
+  resizeHandler: undefined as undefined | (() => void),
+  unlisten: vi.fn(),
+}));
+
+vi.mock("@tauri-apps/api/window", () => ({
+  getCurrentWindow: () => nativeWindow,
+}));
 import {
   noteTabPanelId,
   noteTabTriggerId,
@@ -26,10 +37,27 @@ const scrollIntoView = vi.fn();
 
 beforeEach(() => {
   scrollIntoView.mockReset();
+  nativeWindow.isFullscreen.mockReset();
+  nativeWindow.isFullscreen.mockResolvedValue(false);
+  nativeWindow.unlisten.mockReset();
+  nativeWindow.resizeHandler = undefined;
+  nativeWindow.onResized.mockReset();
+  nativeWindow.onResized.mockImplementation((handler: () => void) => {
+    nativeWindow.resizeHandler = handler;
+    return Promise.resolve(nativeWindow.unlisten);
+  });
+  Object.defineProperty(window.navigator, "userAgent", {
+    configurable: true,
+    value: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7)",
+  });
   Object.defineProperty(HTMLElement.prototype, "scrollIntoView", {
     configurable: true,
     value: scrollIntoView,
   });
+});
+
+afterEach(() => {
+  delete (window.navigator as { userAgent?: string }).userAgent;
 });
 
 function renderTitleBar(over: Partial<TitleBarProps> = {}) {
@@ -113,6 +141,74 @@ describe("TitleBar — navigation ownership", () => {
       "data-navigation-expanded",
       "false",
     );
+  });
+});
+
+describe("TitleBar — native fullscreen geometry", () => {
+  it("uses 74px on macOS windowed, then 12px after a fullscreen resize", async () => {
+    nativeWindow.isFullscreen
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true);
+    renderTitleBar();
+    const leftCluster = screen.getByRole("button", {
+      name: "Toggle navigation sidebar",
+    }).parentElement;
+
+    await waitFor(() => expect(nativeWindow.isFullscreen).toHaveBeenCalledOnce());
+    expect(leftCluster).toHaveClass("pl-[74px]");
+    expect(leftCluster?.closest(".nn-titlebar")).toHaveClass(
+      "nn-titlebar-toggle-clearance-windowed",
+    );
+
+    act(() => nativeWindow.resizeHandler?.());
+    await waitFor(() => expect(leftCluster).toHaveClass("pl-[12px]"));
+    expect(leftCluster?.closest(".nn-titlebar")).toHaveClass(
+      "nn-titlebar-toggle-clearance-fullscreen",
+    );
+    expect(nativeWindow.isFullscreen).toHaveBeenCalledTimes(2);
+  });
+
+  it("ignores a stale mount query that resolves after the resize query", async () => {
+    let resolveMount!: (value: boolean) => void;
+    nativeWindow.isFullscreen
+      .mockReturnValueOnce(new Promise((resolve) => { resolveMount = resolve; }))
+      .mockResolvedValueOnce(true);
+    renderTitleBar();
+    const leftCluster = screen.getByRole("button", {
+      name: "Toggle navigation sidebar",
+    }).parentElement;
+
+    await waitFor(() => expect(nativeWindow.onResized).toHaveBeenCalledOnce());
+    act(() => nativeWindow.resizeHandler?.());
+    await waitFor(() => expect(leftCluster).toHaveClass("pl-[12px]"));
+    resolveMount(false);
+    await act(async () => Promise.resolve());
+
+    expect(leftCluster).toHaveClass("pl-[12px]");
+  });
+
+  it("retains 74px and avoids native fullscreen IPC on other platforms", async () => {
+    Object.defineProperty(window.navigator, "userAgent", {
+      configurable: true,
+      value: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    });
+    renderTitleBar();
+
+    expect(screen.getByRole("button", {
+      name: "Toggle navigation sidebar",
+    }).parentElement).toHaveClass("pl-[74px]");
+    await act(async () => Promise.resolve());
+    expect(nativeWindow.isFullscreen).not.toHaveBeenCalled();
+    expect(nativeWindow.onResized).not.toHaveBeenCalled();
+  });
+
+  it("unsubscribes from native resize when the titlebar unmounts", async () => {
+    const { view } = renderTitleBar();
+    await waitFor(() => expect(nativeWindow.onResized).toHaveBeenCalledOnce());
+
+    view.unmount();
+
+    expect(nativeWindow.unlisten).toHaveBeenCalledOnce();
   });
 });
 

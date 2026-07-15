@@ -36,6 +36,15 @@ describe("Ribbon — navigation modes", () => {
     expect(screen.getByText("Search")).not.toHaveClass("sr-only");
     expect(screen.getByText("Insert from template")).not.toHaveClass("sr-only");
     expect(screen.getByText("Graph view")).not.toHaveClass("sr-only");
+    expect(screen.getByText("Quick links")).toHaveClass("text-xs");
+    expect(screen.getByText("Files")).toHaveClass("text-[0.8125rem]");
+  });
+
+  it("uses a vault control without the decorative brain mark", () => {
+    renderRibbon();
+    const vaultControl = screen.getByRole("button", { name: "MyVault" });
+    expect(vaultControl.querySelector(".lucide-brain")).toBeNull();
+    expect(vaultControl.querySelector(".lucide-folder-open")).not.toBeNull();
   });
 
   it("renders compact controls with accessible names and hidden labels", () => {
@@ -208,6 +217,18 @@ describe("Ribbon — active states", () => {
       "true",
     );
     expect(screen.getByRole("button", { name: "Files" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+  });
+
+  it("marks neither sidebar button pressed when the panel is collapsed", () => {
+    renderRibbon({ sidebarPanel: null });
+    expect(screen.getByRole("button", { name: "Files" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    );
+    expect(screen.getByRole("button", { name: "Search" })).toHaveAttribute(
       "aria-pressed",
       "false",
     );

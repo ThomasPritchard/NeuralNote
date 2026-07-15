@@ -1,6 +1,6 @@
 [package]
 name = "desktop"
-version = "0.1.1"
+version = "0.2.0"
 license = "AGPL-3.0-or-later"
 description = "NeuralNote desktop shell — Tauri layer over neuralnote-core: open/create vaults, browse and edit markdown notes, file/folder CRUD."
 authors = ["NeuralNote"]
@@ -56,6 +56,9 @@ tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "sync
 # `cargo test`, matching the generation the core crate does for the domain types.
 ts-rs = "12.0.1"
 tauri-plugin-process = "2.3.1"
+# Caller-generated chat turn ids are parsed and canonicalised at the native IPC
+# boundary. Generation remains in the webview, so no RNG feature is required.
+uuid = "1"
 
 [dev-dependencies]
 # Behavioural-eval integration test (tests/behavioural_eval.rs): a temp fixture

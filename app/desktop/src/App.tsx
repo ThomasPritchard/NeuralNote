@@ -8,6 +8,7 @@ import {
   PreferencesProvider,
 } from "./preferences/preferences";
 import { UpdateCoordinator } from "./updates/UpdateCoordinator";
+import { WhatsNewModal } from "./whats-new/WhatsNewModal";
 
 /** Top-level route: the workspace once a vault is open, otherwise the welcome
  *  screen (which also renders the brief "loading" state while a vault opens). */
@@ -34,6 +35,7 @@ export default function App({
             <Router />
           </VaultProvider>
         </UpdateCoordinator>
+        <WhatsNewModal />
       </PreferencesProvider>
     </ToastProvider>
   );

@@ -26,6 +26,7 @@ use crate::{config_dir, lock_state, AppState};
 const RECENT_PREFIX: &str = "open-recent:";
 const NAVIGATION_TOGGLE_ACTION: &str = "toggle-sidebar";
 const NAVIGATION_TOGGLE_LABEL: &str = "Toggle Navigation Sidebar";
+const ASSISTANT_PANEL_LABEL: &str = "Neural Assistant AI Panel";
 
 /// Every custom (non-predefined) action id, in one place so the builder and
 /// [`parse_menu_id`] can't drift apart. Predefined natives (copy, quit, …) are
@@ -42,7 +43,6 @@ const CUSTOM_ACTIONS: &[&str] = &[
     "view-files",
     "view-search",
     "toggle-graph",
-    "toggle-mode",
     "toggle-chat",
     NAVIGATION_TOGGLE_ACTION,
     "format-bold",
@@ -206,7 +206,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .build()?;
 
     // Edit: predefined natives operate on the focused webview element (the note
-    // textarea), so undo/redo/cut/copy/paste/select-all need zero wiring. Only
+    // focused note editor, so undo/redo/cut/copy/paste/select-all need zero wiring. Only
     // Find is ours.
     let find = MenuItem::with_id(
         app,
@@ -227,9 +227,9 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&find)
         .build()?;
 
-    // Format items act on the editor's textarea, which is only mounted in edit
-    // mode — so they gate on `editing`, not `vault_open`, to avoid enabled items
-    // that silently do nothing in read mode.
+    // Format items act on the focused rich or raw note editor. They gate on
+    // `editing`, not `vault_open`, to avoid enabled items that silently do
+    // nothing while focus is elsewhere.
     let bold = MenuItem::with_id(app, "format-bold", "Bold", editing, Some("CmdOrCtrl+B"))?;
     let italic = MenuItem::with_id(app, "format-italic", "Italic", editing, Some("CmdOrCtrl+I"))?;
     let h1 = MenuItem::with_id(
@@ -292,18 +292,11 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         vault_open,
         Some("CmdOrCtrl+G"),
     )?;
-    let toggle_mode = MenuItem::with_id(
-        app,
-        "toggle-mode",
-        "Toggle Editing / Reading",
-        vault_open,
-        Some("CmdOrCtrl+E"),
-    )?;
     // The webview owns the chat panel's visibility now (a titlebar button competes
     // with the menu, so the menu is no longer its only toggle). This CheckMenuItem
     // no longer flips any state — it only paints its checkmark from `chat_visible`,
     // a copy the webview pushes back via `set_chat_visible`.
-    let toggle_chat = CheckMenuItemBuilder::with_id("toggle-chat", "Cited Recall Panel")
+    let toggle_chat = CheckMenuItemBuilder::with_id("toggle-chat", ASSISTANT_PANEL_LABEL)
         .checked(chat_visible)
         .enabled(vault_open)
         .build(app)?;
@@ -322,7 +315,6 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<Wry>> {
         .item(&view_search)
         .separator()
         .item(&toggle_graph)
-        .item(&toggle_mode)
         .separator()
         .item(&toggle_sidebar)
         .item(&toggle_chat)
@@ -420,6 +412,12 @@ mod tests {
     fn navigation_toggle_keeps_legacy_action_id_with_explicit_label() {
         assert_eq!(NAVIGATION_TOGGLE_ACTION, "toggle-sidebar");
         assert_eq!(NAVIGATION_TOGGLE_LABEL, "Toggle Navigation Sidebar");
+    }
+
+    #[test]
+    fn view_menu_contract_uses_neural_assistant_without_a_read_edit_toggle() {
+        assert_eq!(ASSISTANT_PANEL_LABEL, "Neural Assistant AI Panel");
+        assert!(!CUSTOM_ACTIONS.contains(&"toggle-mode"));
     }
 
     #[test]

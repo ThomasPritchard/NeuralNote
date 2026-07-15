@@ -150,7 +150,7 @@ function mockDefaults() {
   mockRecommend.mockResolvedValue(SUPPORTED);
   mockHfMeta.mockRejectedValue(new Error("offline"));
   mockInstalled.mockResolvedValue([]);
-  mockSetActive.mockResolvedValue(undefined);
+  mockSetActive.mockResolvedValue(OR_ACTIVE);
   mockSaveKey.mockResolvedValue(undefined);
   // `set_reasoning` returns the freshly persisted status, like the Rust command.
   mockSetReasoning.mockResolvedValue(UNCONFIGURED);
@@ -443,7 +443,29 @@ describe("AiSettingsPage — the catalogue never offers Download while installed
 });
 
 describe("AiSettingsPage — installed models", () => {
+  it("ignores a mount status read that resolves after a provider mutation", async () => {
+    let resolveInitial!: (status: AiStatus) => void;
+    mockAiStatus.mockReturnValueOnce(
+      new Promise<AiStatus>((resolve) => {
+        resolveInitial = resolve;
+      }),
+    );
+    mockSetActive.mockResolvedValueOnce(LOCAL_ACTIVE);
+    mockInstalled.mockResolvedValue([INSTALLED_QWEN]);
+    const { user } = setup();
+
+    await user.click(await screen.findByRole("button", { name: "Use this model" }));
+    expect((await screen.findAllByText("Active")).length).toBeGreaterThan(0);
+
+    await act(async () => resolveInitial(UNCONFIGURED));
+    expect(screen.queryByText("Not configured")).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Use this model" }),
+    ).not.toBeInTheDocument();
+  });
+
   it("lists installed models with disk size and lets one become active", async () => {
+    mockSetActive.mockResolvedValueOnce(LOCAL_ACTIVE);
     mockAiStatus
       .mockResolvedValueOnce(UNCONFIGURED)
       .mockResolvedValue(LOCAL_ACTIVE);

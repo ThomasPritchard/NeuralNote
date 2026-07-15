@@ -14,6 +14,7 @@ use neuralnote_core::CoreError;
 use notify::RecommendedWatcher;
 use tauri::{AppHandle, Manager, State};
 
+use crate::provider_config_mutation::ProviderConfigMutationGate;
 use crate::vault_mutation::{VaultMutationContext, VaultMutationGate};
 
 mod ai;
@@ -21,6 +22,10 @@ mod commands;
 mod event_names;
 mod local;
 mod menu;
+mod openrouter_catalogue;
+#[cfg(test)]
+mod openrouter_catalogue_contract_tests;
+mod provider_config_mutation;
 mod requirement_detection;
 mod requirement_download;
 mod requirement_install_lock;
@@ -61,6 +66,14 @@ pub(crate) struct AppState {
     /// Content hashes for at most the last eight non-empty skill runs. Bounded so
     /// delete authority and memory cannot grow for the lifetime of the app.
     pub(crate) skill_undo_runs: skills::UndoRunStore,
+    /// Session-only OpenRouter ranking cache and the exact validated model IDs
+    /// last offered to the webview. Provider bodies and credentials never enter
+    /// this state.
+    pub(crate) openrouter_catalogue: openrouter_catalogue::OpenRouterCatalogueState,
+    /// Serializes native read-modify-write updates to `ai-config.json`. Kept
+    /// separate from the broad AppState lock so filesystem and keychain I/O do
+    /// not block unrelated session-state access.
+    pub(crate) provider_config_mutations: ProviderConfigMutationGate,
     /// Folders the user explicitly chose via the native picker this session.
     /// Only these — or a path already in the on-disk recents list (itself written
     /// only from a prior explicit pick) — may become a vault root. This stops a
@@ -79,8 +92,8 @@ pub(crate) struct AppState {
     /// per-write logging/validation must cover those reset sites too, not just
     /// `set_chat_visible`.
     pub(crate) chat_visible: bool,
-    /// Whether a text note is currently open in edit mode. The Format menu items
-    /// only do anything when the editor is mounted (edit mode), so they're enabled
+    /// Whether an editable text note is currently open. The Format menu items
+    /// only do anything when the source editor is mounted, so they're enabled
     /// only when this is true — an enabled-but-inert Format item would be a silent
     /// no-op. Pushed from the webview via `set_menu_editing`; reset on vault change.
     pub(crate) editing: bool,
@@ -98,6 +111,8 @@ impl Default for AppState {
             pending_elicitations: Arc::new(skills::PendingElicitations::default()),
             requirement_download: requirement_download::RequirementDownloadState::default(),
             skill_undo_runs: skills::UndoRunStore::default(),
+            openrouter_catalogue: openrouter_catalogue::OpenRouterCatalogueState::default(),
+            provider_config_mutations: ProviderConfigMutationGate::default(),
             authorized: HashSet::new(),
             chat_visible: true,
             editing: false,
@@ -272,6 +287,9 @@ pub fn run() {
             commands::ai::cancel_chat_run,
             commands::ai::open_youtube_timestamp,
             commands::ai::ai_status,
+            commands::ai::openrouter_model_menu,
+            commands::ai::select_openrouter_model,
+            commands::ai::open_openrouter_rankings,
             commands::ai::set_active_provider,
             commands::ai::set_reasoning,
             commands::ai::refresh_reasoning_support,

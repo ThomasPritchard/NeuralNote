@@ -9,7 +9,9 @@ import { afterEach, describe, expect, it } from "vitest";
 import { invoke } from "@tauri-apps/api/core";
 import { clearMocks } from "@tauri-apps/api/mocks";
 import {
+  cancelChatRun,
   cancelRequirementDownload,
+  chat,
   createNoteFromTemplate,
   downloadRequirement,
   listTemplates,
@@ -32,6 +34,61 @@ afterEach(() => {
 const seedVault = (seed: SeedEntry[]): void => {
   createMockVault({ seed }).install();
 };
+
+describe("mockVault exact-turn chat cancellation", () => {
+  const turnId = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e31";
+
+  it("acknowledges the matching stop before streaming provider wind-down", async () => {
+    createMockVault({
+      chatScript: [{ type: "processing" }],
+      cancelChatAfterEvents: 1,
+      cancelChatTail: [
+        { type: "answer", delta: "late provider tail" },
+        { type: "done" },
+      ],
+    }).install();
+    const order: string[] = [];
+    const run = chat(turnId, "hello", [], (event) => {
+      order.push(event.type);
+    });
+
+    await Promise.resolve();
+    expect(order).toEqual(["processing"]);
+    const outcome = await cancelChatRun(turnId);
+    order.push(`outcome:${outcome.status}`);
+
+    expect(outcome).toEqual({ turnId, status: "cancelled" });
+    expect(order).toEqual(["processing", "outcome:cancelled"]);
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    await expect(run).resolves.toBe(turnId);
+    expect(order).toEqual([
+      "processing",
+      "outcome:cancelled",
+      "answer",
+      "done",
+    ]);
+  });
+
+  it("reports an already completed exact turn without replaying a stop tail", async () => {
+    createMockVault({
+      chatScript: [{ type: "done" }],
+      cancelChatTail: [{ type: "answer", delta: "must not replay" }],
+    }).install();
+    const events: string[] = [];
+
+    await expect(
+      chat(turnId, "hello", [], (event) => events.push(event.type)),
+    ).resolves.toBe(turnId);
+    await expect(cancelChatRun(turnId)).resolves.toEqual({
+      turnId,
+      status: "alreadyCompleted",
+    });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+
+    expect(events).toEqual(["done"]);
+  });
+});
 
 describe("mockVault search_vault", () => {
   it("returns an empty response for an empty or whitespace-only query", async () => {

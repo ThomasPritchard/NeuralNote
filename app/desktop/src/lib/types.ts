@@ -45,6 +45,8 @@ export type { CoreError } from "./bindings/CoreError";
 // ── Generated: AI cited chat (events.rs + desktop ai.rs) ──────────────────────
 export type { ApiKeyStatus } from "./bindings/ApiKeyStatus";
 export type { ChatEvent } from "./bindings/ChatEvent";
+export type { CancelChatRunOutcome } from "./bindings/CancelChatRunOutcome";
+export type { CancelChatRunStatus } from "./bindings/CancelChatRunStatus";
 export type { Elicitation } from "./bindings/Elicitation";
 export type { ElicitOption } from "./bindings/ElicitOption";
 export type { NoteKind } from "./bindings/NoteKind";
@@ -62,6 +64,8 @@ export type { SkillListing } from "./bindings/SkillListing";
 export type { ProviderKind } from "./bindings/ProviderKind";
 export type { AiStatus } from "./bindings/AiStatus";
 export type { OpenRouterStatus } from "./bindings/OpenRouterStatus";
+export type { OpenRouterModelChoice } from "./bindings/OpenRouterModelChoice";
+export type { OpenRouterModelMenu } from "./bindings/OpenRouterModelMenu";
 export type { ReasoningSupport } from "./bindings/ReasoningSupport";
 export type { LocalStatus } from "./bindings/LocalStatus";
 export type { HardwareSpec } from "./bindings/HardwareSpec";

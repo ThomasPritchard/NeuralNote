@@ -21,7 +21,14 @@ import {
   X,
   type LucideIcon,
 } from "lucide-react";
-import { useEffect, useRef, type KeyboardEvent, type RefObject } from "react";
+import { getCurrentWindow } from "@tauri-apps/api/window";
+import {
+  useEffect,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type RefObject,
+} from "react";
 import { IconButton } from "@/components/ui/icon-button";
 import { extFromPath, iconForFile } from "./fileMeta";
 
@@ -77,9 +84,11 @@ export function TitleBar({
   onCloseTab,
   onCloseGraph,
 }: Readonly<TitleBarProps>) {
+  const macOSFullscreen = useMacOSFullscreen();
+
   return (
     <header
-      className="nn-titlebar relative grid h-(--titlebar-height) shrink-0 border-b border-border bg-titlebar"
+      className={`nn-titlebar ${macOSFullscreen ? "nn-titlebar-toggle-clearance-fullscreen" : "nn-titlebar-toggle-clearance-windowed"} relative grid h-(--titlebar-height) shrink-0 border-b border-border bg-titlebar`}
       data-navigation-expanded={navigationExpanded}
       data-chat-open={chatOpen}
     >
@@ -88,7 +97,9 @@ export function TitleBar({
       <div data-tauri-drag-region aria-hidden className="absolute inset-0" />
 
       {/* Left: traffic-light spacer (pl), then navigation toggle. */}
-      <div className="relative z-10 flex min-w-0 items-center gap-1 self-stretch pl-[74px] pr-2">
+      <div
+        className={`relative z-10 flex min-w-0 items-center gap-1 self-stretch pr-2 ${macOSFullscreen ? "pl-[12px]" : "pl-[74px]"}`}
+      >
         <TitleBarButton
           icon={PanelLeft}
           label="Toggle navigation sidebar"
@@ -118,6 +129,58 @@ export function TitleBar({
       </div>
     </header>
   );
+}
+
+function isMacOSRuntime(): boolean {
+  return (
+    typeof navigator !== "undefined" &&
+    /Macintosh|Mac OS X/.test(navigator.userAgent)
+  );
+}
+
+function useMacOSFullscreen(): boolean {
+  // TODO(fullscreen-first-paint): represent macOS fullscreen as unknown until
+  // the initial native query resolves so an already-fullscreen launch never
+  // paints the 74 px traffic-light offset first; cover that launch state.
+  const [fullscreen, setFullscreen] = useState(false);
+
+  useEffect(() => {
+    if (!isMacOSRuntime()) return;
+
+    const appWindow = getCurrentWindow();
+    let cancelled = false;
+    let requestVersion = 0;
+    let unlisten: (() => void) | undefined;
+
+    const syncFullscreen = async () => {
+      const request = ++requestVersion;
+      try {
+        const next = await appWindow.isFullscreen();
+        if (!cancelled && request === requestVersion) setFullscreen(next);
+      } catch (error) {
+        console.error("failed to read native fullscreen state:", error);
+      }
+    };
+
+    void syncFullscreen();
+    void appWindow
+      .onResized(() => void syncFullscreen())
+      .then((stopListening) => {
+        if (cancelled) stopListening();
+        else unlisten = stopListening;
+      })
+      .catch((error) => {
+        console.error("failed to subscribe to native window resize:", error);
+      });
+
+    return () => {
+      cancelled = true;
+      requestVersion += 1;
+      unlisten?.();
+    };
+  }, []);
+
+  return fullscreen;
 }
 
 interface TabStripProps {

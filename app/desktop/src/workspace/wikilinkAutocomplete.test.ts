@@ -83,6 +83,12 @@ describe("filterWikilinkSuggestions", () => {
     expect(filterWikilinkSuggestions(INDEX, "zzz")).toEqual([]);
   });
 
+  it("matches vault-relative paths as well as note names", () => {
+    expect(filterWikilinkSuggestions(INDEX, "references/neural")).toEqual([
+      { name: "NeuralNote", relPath: "References/NeuralNote.md" },
+    ]);
+  });
+
   it("caps the list at the limit", () => {
     expect(filterWikilinkSuggestions(INDEX, "", 2)).toHaveLength(2);
   });

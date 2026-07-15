@@ -56,15 +56,15 @@ attach every asset, then publish it. After publication, GitHub locks the release
 The workflow never creates or moves a tag. The supplied tag must already exist on GitHub and point
 at the exact `main` commit selected when the workflow starts.
 
-For the current alpha, accepted tags are `0.1.1` and `v0.1.1`. Prepare the release only after the
+For the current alpha, accepted tags are `0.2.0` and `v0.2.0`. Prepare the release only after the
 release changes have landed on `main`:
 
 ```bash
 git switch main
 git pull --ff-only
 git status --short
-git tag -a v0.1.1 -m "NeuralNote 0.1.1 alpha"
-git push origin v0.1.1
+git tag -a v0.2.0 -m "NeuralNote 0.2.0 alpha"
+git push origin v0.2.0
 ```
 
 Do not move a release tag. The active tag ruleset must reject the attempt. If the tag points anywhere
@@ -74,7 +74,7 @@ except the current `main` commit, the build fails; if it changes later, publicat
 
 1. Open **Actions > release-macos-alpha > Run workflow**.
 2. Keep **Use workflow from** set to `main`.
-3. Enter the existing tag, normally `v0.1.1`.
+3. Enter the existing tag, normally `v0.2.0`.
 4. Select `ad-hoc`.
 5. Check the unnotarized-build confirmation.
 6. Start the workflow and approve the `release` environment if it has a reviewer rule.

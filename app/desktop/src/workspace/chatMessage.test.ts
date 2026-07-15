@@ -9,7 +9,9 @@ import {
   emptyAssistant,
   groupActivity,
   isPartialSkillRun,
+  markAssistantStopped,
   reduceAssistant,
+  reduceAssistantForTurn,
   resolveAnswerMarkers,
   showsNothingFoundCard,
   stripCitationMarkers,
@@ -51,6 +53,14 @@ describe("skill report context", () => {
     expect(isPartialSkillRun(partial)).toBe(true);
     expect(isPartialSkillRun({ ...partial, writtenNotes: [] })).toBe(false);
     expect(isPartialSkillRun({ ...partial, done: false })).toBe(false);
+    expect(
+      isPartialSkillRun({
+        ...partial,
+        stopped: true,
+        skillSteps: [],
+        answer: "",
+      }),
+    ).toBe(true);
   });
 });
 
@@ -72,12 +82,84 @@ describe("emptyAssistant", () => {
     expect(emptyAssistant(true).reasoningRequested).toBe(true);
   });
 
+  it("pins the client turn id and starts in a non-stopped state", () => {
+    const turn = emptyAssistant(false, "turn-1");
+
+    expect(turn.turnId).toBe("turn-1");
+    expect(turn.stopped).toBe(false);
+  });
+
   it("starts every skill-bank accumulator empty", () => {
     const turn = emptyAssistant();
     expect(turn.skillActivations).toEqual([]);
     expect(turn.skillSteps).toEqual([]);
     expect(turn.pendingElicitation).toBeNull();
     expect(turn.writtenNotes).toEqual([]);
+  });
+});
+
+describe("turn-specific event and stop routing", () => {
+  const turnOne = {
+    ...emptyAssistant(false, "turn-1"),
+    answer: "partial one",
+    citations: [
+      {
+        id: "e1",
+        relPath: "One.md",
+        startLine: 1,
+        endLine: 2,
+        text: "one",
+      },
+    ],
+  };
+  const turnTwo = emptyAssistant(false, "turn-2");
+  const messages: ChatMessage[] = [
+    userMessage("first"),
+    turnOne,
+    userMessage("second"),
+    turnTwo,
+  ];
+
+  it("folds a streamed event into only the matching assistant turn", () => {
+    const next = reduceAssistantForTurn(messages, "turn-1", {
+      type: "answer",
+      delta: " continued",
+    });
+
+    expect((next[1] as AssistantMessage).answer).toBe("partial one continued");
+    expect((next[3] as AssistantMessage).answer).toBe("");
+  });
+
+  it("ignores an event whose turn id is absent", () => {
+    expect(
+      reduceAssistantForTurn(messages, "turn-missing", {
+        type: "done",
+      }),
+    ).toBe(messages);
+  });
+
+  it("marks only the matching active turn stopped and preserves partial evidence", () => {
+    const next = markAssistantStopped(messages, "turn-1");
+    const stopped = next[1] as AssistantMessage;
+
+    expect(stopped).toMatchObject({
+      turnId: "turn-1",
+      answer: "partial one",
+      stopped: true,
+      done: true,
+      error: null,
+    });
+    expect(stopped.citations).toEqual(turnOne.citations);
+    expect(next[3]).toBe(turnTwo);
+  });
+
+  it("does not relabel an already-completed or failed turn", () => {
+    const completed = { ...turnOne, done: true };
+    const failed = { ...turnTwo, done: true, error: "provider failed" };
+    const settled: ChatMessage[] = [completed, failed];
+
+    expect(markAssistantStopped(settled, "turn-1")).toBe(settled);
+    expect(markAssistantStopped(settled, "turn-2")).toBe(settled);
   });
 });
 

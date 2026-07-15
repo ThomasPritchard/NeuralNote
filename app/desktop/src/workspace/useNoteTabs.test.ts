@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -6,7 +8,7 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 
 import { invoke } from "@tauri-apps/api/core";
 import type { NoteDoc } from "../lib/types";
-import { useNoteTabs } from "./useNoteTabs";
+import { normalizeRequestedPath, useNoteTabs } from "./useNoteTabs";
 
 const mockInvoke = vi.mocked(invoke);
 
@@ -38,360 +40,236 @@ function deferred<T>() {
 
 beforeEach(() => mockInvoke.mockReset());
 
-describe("useNoteTabs - collection behavior", () => {
-  it("keeps two notes loaded and preserves each tab's draft and mode", async () => {
+describe("normalizeRequestedPath", () => {
+  it("normalizes separators and dot segments without escaping relative parents", () => {
+    expect(normalizeRequestedPath("/v/a/../b.md")).toBe("/v/b.md");
+    expect(normalizeRequestedPath("C:\\v\\.\\b.md")).toBe("C:/v/b.md");
+    expect(normalizeRequestedPath("../b.md")).toBe("../b.md");
+  });
+});
+
+describe("useNoteTabs single-source state", () => {
+  it("loads one complete source draft and exposes no retired mode or rich state", async () => {
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A\r\n"));
+    const { result } = renderHook(() => useNoteTabs());
+
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.draft).toBe("A\r\n"));
+
+    expect(result.current.active.sessionKey).toBe("note-tab-1");
+    expect(result.current.active.sessionHash).toBe("hash:A\r\n");
+    expect(result.current.active).not.toHaveProperty("mode");
+    expect(result.current.active).not.toHaveProperty("richDocument");
+  });
+
+  it("reuses an existing tab for equivalent paths", async () => {
+    mockInvoke.mockResolvedValueOnce(doc("/v/a.md"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/folder/../a.md"));
+    await waitFor(() => expect(result.current.tabs).toHaveLength(1));
+    act(() => result.current.open("/v/a.md", { forceNew: true }));
+    expect(result.current.tabs).toHaveLength(1);
+    expect(mockInvoke).toHaveBeenCalledTimes(1);
+  });
+
+  it("reuses a clean active tab but preserves a dirty tab by opening a new one", async () => {
+    mockInvoke
+      .mockResolvedValueOnce(doc("/v/a.md", "A"))
+      .mockResolvedValueOnce(doc("/v/b.md", "B"))
+      .mockResolvedValueOnce(doc("/v/c.md", "C"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.draft).toBe("A"));
+    const firstId = result.current.activeTabId;
+
+    act(() => result.current.open("/v/b.md"));
+    await waitFor(() => expect(result.current.active.draft).toBe("B"));
+    expect(result.current.activeTabId).toBe(firstId);
+    act(() => result.current.active.setDraft("B changed"));
+    act(() => result.current.open("/v/c.md"));
+    await waitFor(() => expect(result.current.active.draft).toBe("C"));
+    expect(result.current.tabs).toHaveLength(2);
+    expect(result.current.tabs[0].draft).toBe("B changed");
+  });
+
+  it("persists only through write_note with the loaded expected hash", async () => {
+    mockInvoke.mockImplementation((command, args) => {
+      if (command === "read_note") return Promise.resolve(doc("/v/a.md", "A")) as never;
+      if (command === "write_note") {
+        const content = (args as { content: string }).content;
+        return Promise.resolve(doc("/v/a.md", content)) as never;
+      }
+      return Promise.resolve(undefined) as never;
+    });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.draft).toBe("A"));
+    act(() => result.current.active.setDraft("A changed\r\n"));
+    await act(() => result.current.active.save());
+
+    expect(mockInvoke).toHaveBeenCalledWith("write_note", {
+      path: "/v/a.md",
+      content: "A changed\r\n",
+      expectedHash: "hash:A",
+    });
+    expect(result.current.active.dirty).toBe(false);
+  });
+
+  it("keeps later typing dirty when an earlier save resolves", async () => {
+    const write = deferred<NoteDoc>();
+    mockInvoke
+      .mockResolvedValueOnce(doc("/v/a.md", "A"))
+      .mockReturnValueOnce(write.promise as never);
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.draft).toBe("A"));
+    act(() => result.current.active.setDraft("first"));
+    let save!: Promise<void>;
+    act(() => { save = result.current.active.save(); });
+    act(() => result.current.active.setDraft("second"));
+    await act(async () => {
+      write.resolve(doc("/v/a.md", "first"));
+      await save;
+    });
+    expect(result.current.active.draft).toBe("second");
+    expect(result.current.active.dirty).toBe(true);
+  });
+
+  it("binds late editor mutations to the tab that owns the editor session", async () => {
     mockInvoke
       .mockResolvedValueOnce(doc("/v/a.md", "A"))
       .mockResolvedValueOnce(doc("/v/b.md", "B"));
     const { result } = renderHook(() => useNoteTabs());
-
     act(() => result.current.open("/v/a.md"));
-    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
+    await waitFor(() => expect(result.current.active.draft).toBe("A"));
+    const lateSetDraft = result.current.active.setDraft;
+    const lateSetPreservationError = result.current.active.setPreservationError;
+
+    act(() => result.current.open("/v/b.md", { forceNew: true }));
+    await waitFor(() => expect(result.current.active.draft).toBe("B"));
     act(() => {
-      result.current.active.setMode("edit");
-      result.current.active.setDraft("A draft");
+      lateSetDraft("A composed");
+      lateSetPreservationError("A preservation error");
     });
-    act(() => result.current.open("/v/b.md"));
-    await waitFor(() => expect(result.current.active.note?.raw).toBe("B"));
 
-    expect(result.current.tabs).toHaveLength(2);
-    const first = result.current.tabs[0];
-    expect(first.mode).toBe("edit");
-    expect(first.draft).toBe("A draft");
-    expect(first.dirty).toBe(true);
-
-    act(() => result.current.activate(first.id));
-    expect(result.current.active.path).toBe("/v/a.md");
-    expect(result.current.active.draft).toBe("A draft");
+    expect(result.current.tabs[0]).toMatchObject({
+      draft: "A composed",
+      dirty: true,
+      preservationError: "A preservation error",
+    });
+    expect(result.current.tabs[1]).toMatchObject({ draft: "B", dirty: false, preservationError: null });
   });
 
-  it("reuses a clean active tab for ordinary navigation", async () => {
+  it("serializes duplicate saves per tab", async () => {
+    const write = deferred<NoteDoc>();
     mockInvoke
-      .mockResolvedValueOnce(doc("/v/a.md"))
-      .mockResolvedValueOnce(doc("/v/b.md"));
+      .mockResolvedValueOnce(doc("/v/a.md", "A"))
+      .mockReturnValueOnce(write.promise as never);
     const { result } = renderHook(() => useNoteTabs());
-
     act(() => result.current.open("/v/a.md"));
-    await waitFor(() => expect(result.current.active.note).not.toBeNull());
-    const stableId = result.current.activeTabId;
-    act(() => result.current.open("/v/b.md"));
-    await waitFor(() => expect(result.current.active.path).toBe("/v/b.md"));
-
-    expect(result.current.tabs).toHaveLength(1);
-    expect(result.current.activeTabId).toBe(stableId);
-  });
-
-  it("opens a separate tab when forceNew is requested", async () => {
-    mockInvoke
-      .mockResolvedValueOnce(doc("/v/a.md"))
-      .mockResolvedValueOnce(doc("/v/b.md"));
-    const { result } = renderHook(() => useNoteTabs());
-
-    act(() => result.current.open("/v/a.md"));
-    await waitFor(() => expect(result.current.active.note).not.toBeNull());
-    act(() => result.current.open("/v/b.md", { forceNew: true }));
-    await waitFor(() => expect(result.current.active.note?.path).toBe("/v/b.md"));
-
-    expect(result.current.tabs).toHaveLength(2);
-  });
-
-  it("activates an already-open path without rereading or duplicating it", async () => {
-    mockInvoke
-      .mockResolvedValueOnce(doc("/v/a.md"))
-      .mockResolvedValueOnce(doc("/v/b.md"));
-    const { result } = renderHook(() => useNoteTabs());
-
-    act(() => result.current.open("/v/a.md"));
-    await waitFor(() => expect(result.current.active.note).not.toBeNull());
-    const aId = result.current.activeTabId;
-    act(() => result.current.open("/v/b.md", { forceNew: true }));
-    await waitFor(() => expect(result.current.active.note?.path).toBe("/v/b.md"));
-    act(() => result.current.open("/v/a.md"));
-
-    expect(result.current.activeTabId).toBe(aId);
-    expect(result.current.tabs).toHaveLength(2);
-    expect(mockInvoke).toHaveBeenCalledTimes(2);
-  });
-
-  it("deduplicates equivalent provisional path spellings before Rust resolves", async () => {
-    const read = deferred<NoteDoc>();
-    mockInvoke.mockReturnValueOnce(read.promise as Promise<unknown>);
-    const { result } = renderHook(() => useNoteTabs());
-
-    let firstId = "";
-    let secondId = "";
-    act(() => { firstId = result.current.open("/v/Folder/../a.md"); });
-    act(() => { secondId = result.current.open("/v/a.md", { forceNew: true }); });
-
-    expect(secondId).toBe(firstId);
-    expect(result.current.tabs).toHaveLength(1);
-    expect(mockInvoke).toHaveBeenCalledTimes(1);
+    await waitFor(() => expect(result.current.active.draft).toBe("A"));
+    act(() => result.current.active.setDraft("changed"));
+    let first!: Promise<void>;
+    let second!: Promise<void>;
+    act(() => {
+      first = result.current.active.save();
+      second = result.current.active.save();
+    });
+    expect(mockInvoke.mock.calls.filter(([command]) => command === "write_note")).toHaveLength(1);
     await act(async () => {
-      read.resolve(doc("/v/a.md"));
-      await read.promise;
+      write.resolve(doc("/v/a.md", "changed"));
+      await Promise.all([first, second]);
     });
   });
 
-  it("closes the active tab to its right, then falls back to its left", async () => {
+  it("keeps conflicts explicit and overwrites only with a null hash", async () => {
     mockInvoke
-      .mockResolvedValueOnce(doc("/v/a.md"))
-      .mockResolvedValueOnce(doc("/v/b.md"))
-      .mockResolvedValueOnce(doc("/v/c.md"));
+      .mockResolvedValueOnce(doc("/v/a.md", "A"))
+      .mockRejectedValueOnce({ kind: "conflict", message: "changed on disk" })
+      .mockResolvedValueOnce(doc("/v/a.md", "changed"));
     const { result } = renderHook(() => useNoteTabs());
-
     act(() => result.current.open("/v/a.md"));
-    await waitFor(() => expect(result.current.active.note).not.toBeNull());
-    act(() => result.current.open("/v/b.md", { forceNew: true }));
-    await waitFor(() => expect(result.current.active.note?.path).toBe("/v/b.md"));
-    act(() => result.current.open("/v/c.md", { forceNew: true }));
-    await waitFor(() => expect(result.current.active.note?.path).toBe("/v/c.md"));
-    const [, b] = result.current.tabs;
-    act(() => result.current.activate(b.id));
-    act(() => result.current.close(b.id));
-    expect(result.current.active.path).toBe("/v/c.md");
-
-    act(() => result.current.close(result.current.activeTabId!));
-    expect(result.current.active.path).toBe("/v/a.md");
-  });
-});
-
-describe("useNoteTabs - async ownership", () => {
-  it("keeps the renamed relative path when a read resolves after the rename", async () => {
-    const read = deferred<NoteDoc>();
-    mockInvoke.mockReturnValueOnce(read.promise as Promise<unknown>);
-    const { result } = renderHook(() => useNoteTabs());
-
-    act(() => result.current.open("/v/a.md"));
-    act(() => result.current.remap("/v/a.md", "/v/Folder/b.md", "Folder/b.md"));
-    await act(async () => {
-      read.resolve(doc("/v/a.md", "A"));
-      await read.promise;
+    await waitFor(() => expect(result.current.active.draft).toBe("A"));
+    act(() => result.current.active.setDraft("changed"));
+    await act(() => result.current.active.save());
+    expect(result.current.active.conflict).toBe(true);
+    expect(result.current.active.saveError).toBeNull();
+    await act(() => result.current.active.overwrite());
+    expect(mockInvoke).toHaveBeenLastCalledWith("write_note", {
+      path: "/v/a.md",
+      content: "changed",
+      expectedHash: null,
     });
-
-    expect(result.current.active.path).toBe("/v/Folder/b.md");
-    expect(result.current.active.note?.relPath).toBe("Folder/b.md");
+    expect(result.current.active.conflict).toBe(false);
   });
 
-  it("lands out-of-order loads in the tab that started each read", async () => {
-    const a = deferred<NoteDoc>();
-    const b = deferred<NoteDoc>();
-    mockInvoke
-      .mockReturnValueOnce(a.promise as Promise<unknown>)
-      .mockReturnValueOnce(b.promise as Promise<unknown>);
-    const { result } = renderHook(() => useNoteTabs());
-
-    act(() => result.current.open("/v/a.md"));
-    act(() => result.current.open("/v/b.md", { forceNew: true }));
-    await act(async () => {
-      b.resolve(doc("/v/b.md", "B"));
-      await b.promise;
-    });
-    await act(async () => {
-      a.resolve(doc("/v/a.md", "A"));
-      await a.promise;
-    });
-
-    expect(result.current.tabs.map((tab) => [tab.path, tab.note?.raw])).toEqual([
-      ["/v/a.md", "A"],
-      ["/v/b.md", "B"],
-    ]);
-    expect(result.current.active.path).toBe("/v/b.md");
-  });
-
-  it("lands a background save in its owning tab after activation changes", async () => {
+  it("blocks persistence while exact-source preservation is ambiguous", async () => {
     mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
     const { result } = renderHook(() => useNoteTabs());
     act(() => result.current.open("/v/a.md"));
-    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
-    act(() => result.current.active.setDraft("A saved"));
+    await waitFor(() => expect(result.current.active.draft).toBe("A"));
+    act(() => result.current.active.setDraft("changed"));
+    act(() => result.current.active.setPreservationError("ambiguous line endings"));
+    await act(() => result.current.active.save());
+    expect(mockInvoke.mock.calls.map(([command]) => command)).not.toContain("write_note");
+    expect(result.current.active.saveError).toBe("ambiguous line endings");
+    expect(result.current.active.dirty).toBe(true);
+  });
 
+  it("reloads the current path and discards its draft", async () => {
+    mockInvoke
+      .mockResolvedValueOnce(doc("/v/a.md", "A"))
+      .mockResolvedValueOnce(doc("/v/a.md", "disk"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.draft).toBe("A"));
+    act(() => result.current.active.setDraft("local"));
+    act(() => result.current.active.reload());
+    await waitFor(() => expect(result.current.active.draft).toBe("disk"));
+    expect(result.current.active.dirty).toBe(false);
+  });
+
+  it("remaps descendants without losing drafts and closes removed descendants", async () => {
+    mockInvoke
+      .mockResolvedValueOnce(doc("/v/f/a.md", "A"))
+      .mockResolvedValueOnce(doc("/v/other.md", "O"));
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/f/a.md"));
+    await waitFor(() => expect(result.current.active.draft).toBe("A"));
+    act(() => result.current.active.setDraft("local"));
+    act(() => result.current.open("/v/other.md", { forceNew: true }));
+    await waitFor(() => expect(result.current.active.draft).toBe("O"));
+
+    act(() => result.current.remap("/v/f", "/v/g", "g"));
+    expect(result.current.tabs[0].path).toBe("/v/g/a.md");
+    expect(result.current.tabs[0].draft).toBe("local");
+    act(() => result.current.removeDescendants("/v/g"));
+    expect(result.current.tabs.map((tab) => tab.path)).toEqual(["/v/other.md"]);
+  });
+
+  it("keeps a save owned by its tab when another tab becomes active", async () => {
     const write = deferred<NoteDoc>();
-    mockInvoke.mockReturnValueOnce(write.promise as Promise<unknown>);
+    mockInvoke.mockImplementation((command, args) => {
+      if (command === "read_note") {
+        const path = (args as { path: string }).path;
+        return Promise.resolve(doc(path, path.endsWith("a.md") ? "A" : "B")) as never;
+      }
+      if (command === "write_note") return write.promise as never;
+      return Promise.resolve(undefined) as never;
+    });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await waitFor(() => expect(result.current.active.draft).toBe("A"));
+    act(() => result.current.active.setDraft("A saved"));
     let save!: Promise<void>;
     act(() => { save = result.current.active.save(); });
-    mockInvoke.mockResolvedValueOnce(doc("/v/b.md", "B"));
     act(() => result.current.open("/v/b.md", { forceNew: true }));
-    await waitFor(() => expect(result.current.active.note?.raw).toBe("B"));
+    await waitFor(() => expect(result.current.active.draft).toBe("B"));
     await act(async () => {
       write.resolve(doc("/v/a.md", "A saved"));
       await save;
     });
-
     expect(result.current.active.path).toBe("/v/b.md");
-    expect(result.current.tabs[0].note?.raw).toBe("A saved");
-    expect(result.current.tabs[0].saving).toBe(false);
-    expect(result.current.tabs[0].dirty).toBe(false);
-  });
-
-  it("keeps typing performed while a save is in flight dirty", async () => {
-    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
-    const { result } = renderHook(() => useNoteTabs());
-    act(() => result.current.open("/v/a.md"));
-    await waitFor(() => expect(result.current.active.note).not.toBeNull());
-    act(() => result.current.active.setDraft("first edit"));
-    const write = deferred<NoteDoc>();
-    mockInvoke.mockReturnValueOnce(write.promise as Promise<unknown>);
-    let save!: Promise<void>;
-    act(() => { save = result.current.active.save(); });
-    act(() => result.current.active.setDraft("first edit plus more"));
-    await act(async () => {
-      write.resolve(doc("/v/a.md", "first edit"));
-      await save;
-    });
-
-    expect(result.current.active.draft).toBe("first edit plus more");
-    expect(result.current.active.dirty).toBe(true);
-  });
-
-  it("keeps a background conflict attached to the tab that attempted the save", async () => {
-    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
-    const { result } = renderHook(() => useNoteTabs());
-    act(() => result.current.open("/v/a.md"));
-    await waitFor(() => expect(result.current.active.note).not.toBeNull());
-    act(() => result.current.active.setDraft("dirty A"));
-    const write = deferred<NoteDoc>();
-    mockInvoke.mockReturnValueOnce(write.promise as Promise<unknown>);
-    let save!: Promise<void>;
-    act(() => { save = result.current.active.save(); });
-    mockInvoke.mockResolvedValueOnce(doc("/v/b.md", "B"));
-    act(() => result.current.open("/v/b.md", { forceNew: true }));
-    await waitFor(() => expect(result.current.active.note?.path).toBe("/v/b.md"));
-    await act(async () => {
-      write.reject({ kind: "conflict", message: "changed on disk" });
-      await save;
-    });
-
-    expect(result.current.active.conflict).toBe(false);
-    expect(result.current.tabs[0].conflict).toBe(true);
-    expect(result.current.tabs[0].saveError).toBeNull();
-  });
-
-  it("does not let a save response restore a path renamed in flight", async () => {
-    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
-    const { result } = renderHook(() => useNoteTabs());
-    act(() => result.current.open("/v/a.md"));
-    await waitFor(() => expect(result.current.active.note).not.toBeNull());
-    act(() => result.current.active.setDraft("saved"));
-    const write = deferred<NoteDoc>();
-    mockInvoke.mockReturnValueOnce(write.promise as Promise<unknown>);
-    let save!: Promise<void>;
-    act(() => { save = result.current.active.save(); });
-    act(() => result.current.remap("/v/a.md", "/v/renamed.md", "renamed.md"));
-    await act(async () => {
-      write.resolve(doc("/v/a.md", "saved"));
-      await save;
-    });
-
-    expect(result.current.active.path).toBe("/v/renamed.md");
-    expect(result.current.active.note?.path).toBe("/v/renamed.md");
-    expect(result.current.active.note?.relPath).toBe("renamed.md");
-  });
-
-  it("ignores an old save after its clean tab is reused for another note", async () => {
-    mockInvoke.mockResolvedValueOnce(doc("/v/a.md", "A"));
-    const { result } = renderHook(() => useNoteTabs());
-    act(() => result.current.open("/v/a.md"));
-    await waitFor(() => expect(result.current.active.note?.raw).toBe("A"));
-
-    const write = deferred<NoteDoc>();
-    mockInvoke.mockReturnValueOnce(write.promise as Promise<unknown>);
-    let save!: Promise<void>;
-    act(() => { save = result.current.active.save(); });
-    mockInvoke.mockResolvedValueOnce(doc("/v/b.md", "B"));
-    act(() => result.current.open("/v/b.md"));
-    await waitFor(() => expect(result.current.active.note?.raw).toBe("B"));
-    await act(async () => {
-      write.resolve(doc("/v/a.md", "A"));
-      await save;
-    });
-
-    expect(result.current.tabs).toHaveLength(1);
-    expect(result.current.active.path).toBe("/v/b.md");
-    expect(result.current.active.note?.raw).toBe("B");
-  });
-
-  it("merges canonical aliases and preserves an existing dirty draft", async () => {
-    const alias = deferred<NoteDoc>();
-    const canonical = deferred<NoteDoc>();
-    mockInvoke
-      .mockReturnValueOnce(alias.promise as Promise<unknown>)
-      .mockReturnValueOnce(canonical.promise as Promise<unknown>);
-    const { result } = renderHook(() => useNoteTabs());
-    let firstId = "";
-    act(() => { firstId = result.current.open("/v/alias.md"); });
-    act(() => result.current.open("/v/a.md", { forceNew: true }));
-
-    await act(async () => {
-      alias.resolve(doc("/v/a.md", "canonical"));
-      await alias.promise;
-    });
-    act(() => result.current.activate(firstId));
-    act(() => result.current.active.setDraft("important local draft"));
-    await act(async () => {
-      canonical.resolve(doc("/v/a.md", "canonical"));
-      await canonical.promise;
-    });
-
-    expect(result.current.tabs).toHaveLength(1);
-    expect(result.current.activeTabId).toBe(firstId);
-    expect(result.current.active.draft).toBe("important local draft");
-    expect(result.current.active.dirty).toBe(true);
-  });
-});
-
-describe("useNoteTabs - path collection operations", () => {
-  it("remaps every descendant while retaining IDs, drafts, and modes", async () => {
-    mockInvoke
-      .mockResolvedValueOnce(doc("/v/Old/a.md", "A"))
-      .mockResolvedValueOnce(doc("/v/Old/deep/b.md", "B"));
-    const { result } = renderHook(() => useNoteTabs());
-    act(() => result.current.open("/v/Old/a.md"));
-    await waitFor(() => expect(result.current.active.note).not.toBeNull());
-    act(() => {
-      result.current.active.setMode("edit");
-      result.current.active.setDraft("draft A");
-    });
-    act(() => result.current.open("/v/Old/deep/b.md", { forceNew: true }));
-    await waitFor(() => expect(result.current.active.note?.path).toContain("b.md"));
-    const ids = result.current.tabs.map((tab) => tab.id);
-
-    act(() => result.current.remap("/v/Old", "/v/New", "New"));
-
-    expect(result.current.tabs.map((tab) => tab.path)).toEqual([
-      "/v/New/a.md",
-      "/v/New/deep/b.md",
-    ]);
-    expect(result.current.tabs.map((tab) => tab.id)).toEqual(ids);
-    expect(result.current.tabs[0]).toMatchObject({
-      mode: "edit",
-      draft: "draft A",
-      dirty: true,
-    });
-    expect(result.current.tabs.map((tab) => tab.note?.relPath)).toEqual([
-      "New/a.md",
-      "New/deep/b.md",
-    ]);
-  });
-
-  it("reports and removes all descendants, including dirty background tabs", async () => {
-    mockInvoke
-      .mockResolvedValueOnce(doc("/v/Folder/a.md", "A"))
-      .mockResolvedValueOnce(doc("/v/Folder/b.md", "B"))
-      .mockResolvedValueOnce(doc("/v/outside.md", "O"));
-    const { result } = renderHook(() => useNoteTabs());
-    act(() => result.current.open("/v/Folder/a.md"));
-    await waitFor(() => expect(result.current.active.note).not.toBeNull());
-    act(() => result.current.active.setDraft("dirty A"));
-    act(() => result.current.open("/v/Folder/b.md", { forceNew: true }));
-    await waitFor(() => expect(result.current.active.note?.path).toContain("b.md"));
-    act(() => result.current.open("/v/outside.md", { forceNew: true }));
-    await waitFor(() => expect(result.current.active.note?.path).toContain("outside"));
-
-    expect(result.current.tabsInside("/v/Folder")).toHaveLength(2);
-    expect(result.current.tabsInside("/v/Folder").filter((tab) => tab.dirty)).toHaveLength(1);
-    act(() => result.current.removeDescendants("/v/Folder"));
-
-    expect(result.current.tabs.map((tab) => tab.path)).toEqual(["/v/outside.md"]);
-    expect(result.current.active.path).toBe("/v/outside.md");
+    expect(result.current.tabs.find((tab) => tab.path === "/v/a.md")?.dirty).toBe(false);
   });
 });

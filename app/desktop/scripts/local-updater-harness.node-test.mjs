@@ -72,13 +72,13 @@ test("private updater keys must be owner-only regular files and never symlinks",
 
 test("generated overlays isolate identity, artifacts, endpoint, and ad-hoc signing", () => {
   const baseline = buildOverlay({
-    version: "0.1.0",
+    version: "0.1.1",
     publicKey: PUBLIC_KEY,
     port: 48765,
     createUpdaterArtifacts: false,
   });
   const update = buildOverlay({
-    version: "0.1.1",
+    version: "0.2.0",
     publicKey: PUBLIC_KEY,
     port: 48765,
     createUpdaterArtifacts: true,
@@ -102,19 +102,19 @@ test("generated overlays isolate identity, artifacts, endpoint, and ad-hoc signi
 
 test("manifest binds one strictly newer update to the exact loopback archive", () => {
   const manifest = buildManifest({
-    version: "0.1.1",
+    version: "0.2.0",
     platformKey: "darwin-aarch64",
     port: 48765,
     archiveName: "NeuralNote Updater Harness.app.tar.gz",
     signature: "trusted-signature",
   });
-  assert.equal(manifest.version, "0.1.1");
+  assert.equal(manifest.version, "0.2.0");
   assert.deepEqual(manifest.platforms["darwin-aarch64"], {
     signature: "trusted-signature",
     url: "http://127.0.0.1:48765/NeuralNote%20Updater%20Harness.app.tar.gz",
   });
   assert.throws(
-    () => buildManifest({ version: "0.1.0", platformKey: "darwin-aarch64", port: 48765, archiveName: "x", signature: "s" }),
+    () => buildManifest({ version: "0.1.1", platformKey: "darwin-aarch64", port: 48765, archiveName: "x", signature: "s" }),
     /strictly newer/,
   );
 });

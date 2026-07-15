@@ -6,17 +6,18 @@ import {
   ChevronDown,
   FilePlus2,
   Files,
+  FolderOpen,
   Network,
   Search,
   type LucideIcon,
 } from "lucide-react";
-import { AiMark } from "@/components/neural/patterns";
 import { IconButton } from "@/components/ui/icon-button";
 import { cn } from "../lib/cn";
 import { VaultMenu } from "./VaultMenu";
+import type { SidebarPanel } from "./workspaceLayout";
 
 /** Which sidebar panel is showing (Workspace-local view state). */
-export type SidebarPanel = "files" | "search";
+export type { SidebarPanel } from "./workspaceLayout";
 /** What the center pane renders (Workspace-local view state). */
 export type CenterView = "note" | "graph";
 
@@ -68,7 +69,7 @@ export function Ribbon({
             className="mb-5 flex h-9 w-full min-w-0 items-center rounded-md text-left text-[0.8125rem] font-semibold text-sidebar-foreground transition-colors duration-150 ease-spring hover:bg-surface-hover hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
           >
             <span className="nn-navigation-icon-gutter flex w-[56px] shrink-0 justify-center">
-              <AiMark className="size-8" />
+              <FolderOpen className="size-[18px]" aria-hidden />
             </span>
             <span className="nn-navigation-copy flex min-w-0 flex-1 items-center gap-2 pr-2" aria-hidden>
               <span className="min-w-0 flex-1 truncate">{vaultName}</span>
@@ -89,7 +90,7 @@ export function Ribbon({
       >
         <span
           id="nn-quick-links-label"
-          className="nn-navigation-copy mb-1 pl-[56px] pr-2 text-[0.6875rem] font-semibold uppercase tracking-[0.08em] text-muted-foreground"
+          className="nn-navigation-copy mb-1 pl-[56px] pr-2 text-xs font-semibold uppercase tracking-[0.08em] text-muted-foreground"
         >
           Quick links
         </span>
@@ -154,7 +155,10 @@ function RibbonButton({
       <span className="nn-navigation-icon-gutter flex w-[56px] shrink-0 justify-center">
         <Icon className="size-[18px] shrink-0" aria-hidden />
       </span>
-      <span className="nn-navigation-copy min-w-0 truncate pr-2" aria-hidden>
+      <span
+        className="nn-navigation-copy min-w-0 truncate pr-2 text-[0.8125rem]"
+        aria-hidden
+      >
         {label}
       </span>
     </IconButton>

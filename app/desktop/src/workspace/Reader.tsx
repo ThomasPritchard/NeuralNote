@@ -5,12 +5,11 @@
 // the body.
 
 import { AlertTriangle, FileQuestion } from "lucide-react";
+import type { ReactNode } from "react";
 import type { NoteDoc } from "../lib/types";
 import { BacklinksPanel } from "./BacklinksPanel";
 import {
   extFromPath,
-  extLabel,
-  iconForFile,
   isMarkdownExt,
   isMarkdownRenderable,
   isTextLikeExt,
@@ -28,18 +27,39 @@ interface ReaderProps {
 
 export function Reader({ note, noteIndex, onOpenLink }: Readonly<ReaderProps>) {
   const ext = extFromPath(note.path);
-  const TypeIcon = iconForFile(ext);
 
+  return (
+    <NoteDocumentFrame note={note} onOpenLink={onOpenLink}>
+      <NoteBody
+        note={note}
+        ext={ext}
+        noteIndex={noteIndex}
+        onOpenLink={onOpenLink}
+      />
+    </NoteDocumentFrame>
+  );
+}
+
+export function NoteDocumentFrame({
+  note,
+  children,
+  onOpenLink,
+  suppressTitle = false,
+}: Readonly<{
+  note: NoteDoc;
+  children: ReactNode;
+  onOpenLink?: (relPath: string) => void;
+  suppressTitle?: boolean;
+}>) {
+  const ext = extFromPath(note.path);
   return (
     <article className="relative flex-1 overflow-y-auto px-8 py-10">
       <div className="relative mx-auto w-full max-w-[72ch]">
-        <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/12 px-2.5 py-1 text-[0.6875rem] font-medium text-primary ring-1 ring-inset ring-primary/20">
-          <TypeIcon className="size-3" aria-hidden /> {extLabel(ext)}
-        </span>
-
-        <h1 className="nn-heading mt-4 text-[1.75rem] font-semibold leading-tight tracking-tight">
-          {note.title}
-        </h1>
+        {!suppressTitle && (
+          <h1 className="nn-heading text-[1.75rem] font-semibold leading-tight tracking-tight">
+            {note.title}
+          </h1>
+        )}
 
         {note.frontmatterError && (
           <div className="mt-4 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-[0.75rem] text-destructive">
@@ -64,12 +84,7 @@ export function Reader({ note, noteIndex, onOpenLink }: Readonly<ReaderProps>) {
         )}
 
         <div className="mt-7">
-          <NoteBody
-            note={note}
-            ext={ext}
-            noteIndex={noteIndex}
-            onOpenLink={onOpenLink}
-          />
+          {children}
         </div>
 
         {/* Backlinks only exist for actual markdown notes — read_backlinks

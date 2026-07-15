@@ -1,6 +1,6 @@
 # NeuralNote threat model
 
-Date: 2026-07-13
+Date: 2026-07-15
 
 ## Scope and assumptions
 
@@ -45,9 +45,11 @@ responses, downloaded requirement bytes, helper output, and webview IPC argument
 |---|---|---|
 | Vault open/read/write | traversal, symlink escape, overwrite, parser DoS | user-selected roots, canonical parent checks, no-follow/regular-file checks, bounded parsing, create-new semantics, hash-guarded undo |
 | Markdown/frontmatter render | XSS, remote beacons, broken content hiding | no raw HTML, safe URL transform, inert links, CSP, failed-image fallback, explicit lossy/parse notices |
+| Source-native editor | source normalization, widget injection, unsafe navigation, remote fetches, parser or allocation DoS | exact separator map, text-node labels, viewport-bounded decorations, inert images/embeds, guarded vault resolver, safe external schemes, 8 MiB full-document write limit, optimistic concurrency, atomic write |
+| Window-state IPC | unintended native window authority | `core:window:allow-is-fullscreen` exposes only the current main-window fullscreen boolean; it grants no window mutation authority |
 | Chat/tool loop | prompt injection, excessive writes, forged citations | capability grants, fixed schemas, Rust dispatch validation, per-item budgets, evidence hashes, citation revalidation, iteration and span caps |
 | Elicitation | model-provided active media, choice forgery | model images rejected, implementation images fully decoded and bounded, offered IDs and arity validated |
-| Provider IPC/network | key disclosure, arbitrary requests, hangs | OS keychain, redaction, HTTPS, exact curated repositories/models, connect/total timeouts, bounded streaming |
+| Provider IPC/network and settings | key disclosure, arbitrary requests, ranking-data poisoning, hangs, concurrent preference loss | OS keychain, redaction, fixed HTTPS origins, no redirects, authenticated daily rankings, bounded reads, connect/total timeouts, defensive join/filter validation, exact last-offered model selection, in-process mutation sequencing, cross-process advisory lock, atomic config replacement |
 | Ollama sidecar | port hijack, arbitrary model operation | loopback binding, child ownership/health checks, app-owned model store, curated pull/select/chat/delete tags |
 | YouTube helpers | command injection, ambient config/plugin execution, output DoS | typed YouTube URLs, fixed argv, no shell, absolute binaries, cleared environment, no config/default plugins, explicit pinned POT directory, time/output/cancel bounds |
 | Requirement installer | malicious archive/binary, race, partial install | compiled HTTPS URL and digest, streamed SHA-256, archive entry/type/size limits, install locks, atomic publication |
@@ -63,6 +65,14 @@ responses, downloaded requirement bytes, helper output, and webview IPC argument
 An unrelated loopback process could impersonate Ollama or POT. NeuralNote binds app-owned children,
 checks their lifecycle and health, and rejects a healthy endpoint when its own child has exited.
 External provider identity relies on platform TLS and the configured HTTPS origin.
+The OpenRouter model menu fetches only the compiled
+`https://openrouter.ai/api/v1/datasets/rankings-daily` and
+`https://openrouter.ai/api/v1/models` endpoints, with redirects disabled. The API key authenticates
+only the daily dataset request and remains inside the Rust/keychain boundary. Ranking and catalogue
+responses are size-bounded, parsed into fixed data-only structs, joined and filtered in the core,
+and cached only after complete validation. The webview receives no raw provider body, token total,
+or credential and may persist only an identifier from the last validated offer set. The rankings
+attribution opener accepts no caller URL and uses a Rust-owned constant.
 
 ### Tampering
 
@@ -70,6 +80,15 @@ Vault path and symlink swaps are the highest-impact local tampering path. Writes
 the actual parent, create without overwrite, retain the filesystem's stored spelling, and record
 content hashes for undo. Downloaded helpers are verified before atomic publication. Citation spans
 are rechecked against note hashes before emission.
+
+The source-native editor keeps complete Markdown source authoritative. Its line-ending map follows
+CodeMirror transactions and blocks saving if that map becomes inconsistent. Decorations and
+completion use DOM text nodes: raw HTML/MDX/JSX is never mounted, and images and embeds have no
+fetching URL. Widget interaction can move the source selection, edit a bounded task marker, or insert
+a normalized source H1 at a conservatively proven BOM/frontmatter boundary; malformed frontmatter
+keeps the title external. Modifier-key wikilink and Markdown-link navigation can emit only a path
+returned by the existing vault resolver; the native open path remains independently guarded. Every
+save uses the existing expected-hash, serialized-mutation, vault-contained atomic write path.
 
 ### Repudiation
 
@@ -79,14 +98,16 @@ v1 but is not a forensic audit trail.
 
 ### Information disclosure
 
-The API key stays in the OS keychain and error bodies are redacted. The webview cannot load remote
-images, model-authored image URIs are rejected, helper error details are bounded and path-free before
+The API key stays in the OS keychain and error bodies are redacted. Editor image and embed widgets
+contain no `src` or network action, the webview cannot load remote images, model-authored image URIs are rejected, helper error details are bounded and path-free before
 model exposure, and the production bundle emits no source maps. Vault content is intentionally sent
 to the selected model only through chat/retrieval flows initiated by the user.
 
 ### Denial of service
 
-Parsers cap bytes, lines, entries, dimensions, aliases, and decoded media. Tool loops cap iterations,
+Editable full-document writes are capped at 8 MiB before filesystem mutation. Editor decorations
+iterate visible ranges and use CodeMirror's maintained incremental Markdown parser; retained tab
+sessions are bounded. Other parsers cap bytes, lines, entries, dimensions, aliases, and decoded media. Tool loops cap iterations,
 spans, write budgets, and playlist work. Network and process operations have deadlines, bounded pipes,
 and cancellation. The Sonar-reported backtracking expression was replaced by a linear scan.
 
@@ -101,9 +122,14 @@ only through explicit skill activation and can never bypass Rust write or citati
 
 - `../`, absolute, Unicode-normalised, case-variant, and symlink-swapped note paths.
 - Alias-amplified or malformed YAML, huge lines, invalid UTF-8, and binary files.
+- BOM, LF, CRLF, CR, mixed endings, tabs, trailing whitespace, Unicode, ambiguous separator maps,
+  oversized drafts, malformed Markdown, raw HTML/MDX/JSX, unsafe links, remote image/embed targets,
+  completion-label injection, unresolved wikilinks, and forged widget navigation targets.
 - Unknown citation IDs and notes modified between retrieval and answer emission.
 - Model-authored remote and data image URIs.
 - Unknown Hugging Face repositories and Ollama tags sent directly over IPC.
+- Oversized, malformed, duplicate, wrong-day, redirected, or unauthenticated OpenRouter ranking
+  responses; catalogue/ranking slug mismatches; and model IDs not in the last validated offer set.
 - YouTube URLs with option-like video IDs, shell suffixes, block/rate-limit responses, oversized
   metadata, captions, playlists, thumbnails, stderr, and process output.
 - Portable/system yt-dlp configuration and default plugin locations.

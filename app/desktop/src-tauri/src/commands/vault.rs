@@ -270,7 +270,7 @@ pub(crate) fn close_vault(app: AppHandle, state: SharedState) {
     refresh_menu(&app);
 }
 
-/// Pushed from the webview whenever a text note enters or leaves edit mode. The
+/// Pushed from the webview whenever an editable text note opens or closes. The
 /// native Format menu items only do anything while the editor is mounted, so they
 /// track this flag rather than mere vault-open — an enabled Format item that did
 /// nothing would be a silent no-op. Skips the rebuild when the flag is unchanged.

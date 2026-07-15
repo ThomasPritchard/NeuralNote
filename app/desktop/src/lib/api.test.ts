@@ -37,6 +37,8 @@ import {
   onMenu,
   onTreeChanged,
   openVault,
+  openOpenRouterRankings,
+  openRouterModelMenu,
   openYoutubeTimestamp,
   pickNewVaultLocation,
   pickVaultFolder,
@@ -44,17 +46,21 @@ import {
   readLinkGraph,
   readNote,
   readTree,
+  refreshReasoningSupport,
   renameEntry,
   resetWorkspaceState,
   quitApp,
   saveWorkspaceState,
   searchVault,
+  selectOpenRouterModel,
+  setActiveProvider,
+  setReasoning,
   setSkillEnabled,
   setMenuEditing,
   undoSkillRun,
   writeNote,
 } from "./api";
-import type { ChatEvent, PullEvent } from "./types";
+import type { AiStatus, ChatEvent, PullEvent } from "./types";
 
 type ChatCommand = typeof chat;
 
@@ -77,6 +83,7 @@ declare module "@vitest/spy" {
 
 const mockInvoke = vi.mocked(invoke);
 const mockListen = vi.mocked(listen);
+const TURN_ID = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e21";
 
 beforeEach(() => {
   mockInvoke.mockReset();
@@ -108,6 +115,99 @@ describe("errorMessage", () => {
     expect(errorMessage(42)).toBe("Something went wrong.");
     expect(errorMessage({})).toBe("Something went wrong.");
     expect(errorMessage(undefined)).toBe("Something went wrong.");
+  });
+});
+
+describe("AI config mutation sequencing", () => {
+  const status = (model: string, reasoning: boolean): AiStatus => ({
+    activeProvider: "openRouter",
+    reasoningSupported: "unknown",
+    openrouter: { hasKey: true, model, reasoning },
+    local: { activeModelTag: null },
+  });
+
+  it("does not start a later model mutation until the earlier reasoning response resolves", async () => {
+    let resolveReasoning!: (value: AiStatus) => void;
+    let resolveModel!: (value: AiStatus) => void;
+    const reasoningResponse = new Promise<AiStatus>((resolve) => {
+      resolveReasoning = resolve;
+    });
+    const modelResponse = new Promise<AiStatus>((resolve) => {
+      resolveModel = resolve;
+    });
+    mockInvoke.mockImplementation((command) => {
+      if (command === "set_reasoning") return reasoningResponse as never;
+      if (command === "select_openrouter_model") return modelResponse as never;
+      return Promise.resolve(undefined as never);
+    });
+
+    const first = setReasoning(false);
+    const second = selectOpenRouterModel("vendor/new");
+    await vi.waitFor(() => expect(mockInvoke).toHaveBeenCalledTimes(1));
+    expect(mockInvoke).toHaveBeenLastCalledWith("set_reasoning", { enabled: false });
+
+    resolveReasoning(status("vendor/old", false));
+    await expect(first).resolves.toEqual(status("vendor/old", false));
+    await vi.waitFor(() => expect(mockInvoke).toHaveBeenCalledTimes(2));
+    expect(mockInvoke).toHaveBeenLastCalledWith("select_openrouter_model", {
+      model: "vendor/new",
+    });
+    resolveModel(status("vendor/new", false));
+    await expect(second).resolves.toEqual(status("vendor/new", false));
+  });
+
+  it("keeps provider selection and its status read inside the same mutation slot", async () => {
+    const selected = status("vendor/current", false);
+    mockInvoke
+      .mockResolvedValueOnce(undefined as never)
+      .mockResolvedValueOnce(selected as never);
+
+    await expect(setActiveProvider("openRouter")).resolves.toEqual(selected);
+    expect(mockInvoke.mock.calls).toEqual([
+      ["set_active_provider", { provider: "openRouter", localModelTag: undefined }],
+      ["ai_status"],
+    ]);
+  });
+
+  it("does not let a pending capability probe block a later config mutation", async () => {
+    let resolveProbe!: (value: AiStatus) => void;
+    const probeResponse = new Promise<AiStatus>((resolve) => {
+      resolveProbe = resolve;
+    });
+    const staleProbe = status("vendor/old", false);
+    const selected = status("vendor/new", true);
+    mockInvoke.mockImplementation((command) => {
+      if (command === "refresh_reasoning_support") return probeResponse as never;
+      if (command === "select_openrouter_model") {
+        return Promise.resolve(selected as never);
+      }
+      return Promise.resolve(undefined as never);
+    });
+
+    const probe = refreshReasoningSupport();
+    const mutation = selectOpenRouterModel("vendor/new");
+    let mutationResult: AiStatus | undefined;
+    void mutation.then((value) => {
+      mutationResult = value;
+    });
+
+    let failure: unknown;
+    try {
+      await vi.waitFor(() => expect(mutationResult).toEqual(selected), {
+        timeout: 500,
+      });
+      expect(mockInvoke.mock.calls).toContainEqual([
+        "select_openrouter_model",
+        { model: "vendor/new" },
+      ]);
+    } catch (error) {
+      failure = error;
+    } finally {
+      resolveProbe(staleProbe);
+      await expect(probe).resolves.toEqual(staleProbe);
+      await mutation;
+    }
+    if (failure) throw failure;
   });
 });
 
@@ -145,7 +245,7 @@ describe("skills-bank wrappers", () => {
   it("returns a Promise that resolves to the mocked run id", async () => {
     mockInvoke.mockResolvedValueOnce("skill-run-7");
 
-    const result = chat("file this", [], vi.fn());
+    const result = chat(TURN_ID, "file this", [], vi.fn());
 
     expect(result).toBeInstanceOf(Promise);
     await expect(result).resolves.toBe("skill-run-7");
@@ -154,16 +254,17 @@ describe("skills-bank wrappers", () => {
   it("returns the run id produced by chat", async () => {
     mockInvoke.mockResolvedValueOnce("skill-run-7");
 
-    const result: Promise<string> = chat("file this", [], vi.fn());
+    const result: Promise<string> = chat(TURN_ID, "file this", [], vi.fn());
 
     await expect(result).resolves.toBe("skill-run-7");
   });
 
   it("defaults chat activeSkills to an empty list", async () => {
-    await chat("hello", [], vi.fn());
+    await chat(TURN_ID, "hello", [], vi.fn());
 
     expect(mockInvoke).toHaveBeenCalledWith("chat", {
       prompt: "hello",
+      turnId: TURN_ID,
       history: [],
       onEvent: expect.any(Object),
       activeSkills: [],
@@ -171,10 +272,11 @@ describe("skills-bank wrappers", () => {
   });
 
   it("forwards explicit chat activeSkills", async () => {
-    await chat("distil this", [], vi.fn(), ["youtube-distil", "fixture"]);
+    await chat(TURN_ID, "distil this", [], vi.fn(), ["youtube-distil", "fixture"]);
 
     expect(mockInvoke).toHaveBeenCalledWith("chat", {
       prompt: "distil this",
+      turnId: TURN_ID,
       history: [],
       onEvent: expect.any(Object),
       activeSkills: ["youtube-distil", "fixture"],
@@ -183,7 +285,7 @@ describe("skills-bank wrappers", () => {
 
   it("forwards chat channel messages to onEvent", async () => {
     const onEvent = vi.fn();
-    await chat("hello", [], onEvent);
+    await chat(TURN_ID, "hello", [], onEvent);
     const args = mockInvoke.mock.calls.at(-1)?.[1] as {
       onEvent: { onmessage?: (event: ChatEvent) => void };
     };
@@ -205,9 +307,12 @@ describe("skills-bank wrappers", () => {
     });
   });
 
-  it("cancels the single active chat run", async () => {
-    await cancelChatRun();
-    expect(mockInvoke).toHaveBeenCalledWith("cancel_chat_run");
+  it("cancels only the exact caller-owned chat turn and returns its typed outcome", async () => {
+    const outcome = { turnId: TURN_ID, status: "cancelled" as const };
+    mockInvoke.mockResolvedValueOnce(outcome);
+
+    await expect(cancelChatRun(TURN_ID)).resolves.toEqual(outcome);
+    expect(mockInvoke).toHaveBeenCalledWith("cancel_chat_run", { turnId: TURN_ID });
   });
 
   it("opens a validated YouTube timestamp through the Rust shell", async () => {
@@ -302,6 +407,49 @@ describe("skills-bank wrappers", () => {
     await cancelRequirementDownload();
 
     expect(mockInvoke).toHaveBeenCalledWith("cancel_requirement_download");
+  });
+});
+
+describe("OpenRouter model menu wrappers", () => {
+  it("loads the ranked model menu with the caller's refresh intent", async () => {
+    const menu = {
+      models: [],
+      asOf: "2026-07-13",
+      selectedModel: "openai/gpt-5",
+      pinnedSelectedModel: "openai/gpt-5",
+    };
+    mockInvoke.mockResolvedValueOnce(menu);
+
+    await expect(openRouterModelMenu(true)).resolves.toEqual(menu);
+    expect(mockInvoke).toHaveBeenCalledWith("openrouter_model_menu", {
+      forceRefresh: true,
+    });
+  });
+
+  it("defaults model-menu reads to the native daily cache", async () => {
+    await openRouterModelMenu();
+
+    expect(mockInvoke).toHaveBeenCalledWith("openrouter_model_menu", {
+      forceRefresh: false,
+    });
+  });
+
+  it("selects only the exact model offered by the native catalogue", async () => {
+    const status = { activeProvider: "openRouter" };
+    mockInvoke.mockResolvedValueOnce(status);
+
+    await expect(selectOpenRouterModel("anthropic/claude-sonnet-4")).resolves.toEqual(
+      status,
+    );
+    expect(mockInvoke).toHaveBeenCalledWith("select_openrouter_model", {
+      model: "anthropic/claude-sonnet-4",
+    });
+  });
+
+  it("opens the Rust-owned rankings URL without accepting a webview URL", async () => {
+    await openOpenRouterRankings();
+
+    expect(mockInvoke).toHaveBeenCalledWith("open_openrouter_rankings");
   });
 });
 

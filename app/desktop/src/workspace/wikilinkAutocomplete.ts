@@ -68,9 +68,10 @@ export function filterWikilinkSuggestions(
   for (const entry of index) {
     const name = displayName(entry.relPath);
     const lower = name.toLowerCase();
-    if (q === "" || lower.startsWith(q)) {
+    const path = entry.relPath.replace(/\.(?:md|markdown|mdx)$/i, "").toLowerCase();
+    if (q === "" || lower.startsWith(q) || path.startsWith(q)) {
       starts.push({ name, relPath: entry.relPath });
-    } else if (lower.includes(q)) {
+    } else if (lower.includes(q) || path.includes(q)) {
       contains.push({ name, relPath: entry.relPath });
     }
   }

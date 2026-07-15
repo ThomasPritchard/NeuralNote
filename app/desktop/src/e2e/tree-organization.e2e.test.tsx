@@ -6,7 +6,8 @@
 // the explicit no-match message.
 
 import { describe, it, expect } from "vitest";
-import { fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
+import { emit } from "@tauri-apps/api/event";
 import { renderApp } from "./renderApp";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
 
@@ -38,10 +39,10 @@ describe("Journey 7: create a folder and move a note into it", () => {
     await screen.findByRole("heading", { name: "Note", level: 1 });
     expect(screen.getAllByText("Note.md")).toHaveLength(2); // tree row + breadcrumb
 
-    // Create a folder via the vault menu (sidebar header → "New folder"). The
-    // workspace header carries the opened vault's name = basename(path) = "vault".
-    await user.click(screen.getByRole("button", { name: /vault/i }));
-    await user.click(await screen.findByRole("menuitem", { name: "New folder" }));
+    // Create a folder through the native File menu action.
+    await act(async () => {
+      await emit("menu://action", { action: "new-folder" });
+    });
     await user.type(await screen.findByLabelText("New folder name"), "Archive{Enter}");
 
     // Empty folder badge reads 0.

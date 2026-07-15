@@ -48,6 +48,9 @@ struct CacheState {
     value: Option<Option<String>>,
 }
 
+// TODO(cross-process-key-cache): remove this process-lifetime cache or bind it
+// to a cross-process key revision, then prove two running instances observe a
+// save/clear before their next provider request.
 static API_KEY_CACHE: OnceLock<Mutex<CacheState>> = OnceLock::new();
 static OPENROUTER_PRICING_CACHE: OnceLock<Mutex<BTreeMap<String, ModelPricing>>> = OnceLock::new();
 
@@ -133,6 +136,7 @@ pub(crate) fn error_detail(error: CoreError) -> String {
         | CoreError::AlreadyExists(msg)
         | CoreError::OutsideVault(msg)
         | CoreError::InvalidName(msg)
+        | CoreError::InvalidContent(msg)
         | CoreError::Conflict(msg)
         | CoreError::Io(msg)
         | CoreError::Frontmatter(msg)
@@ -158,6 +162,9 @@ pub fn save_api_key(config_dir: &Path, key: &str, model: &str) -> Result<(), Cor
     if key.is_empty() {
         return Err(CoreError::InvalidName("API key cannot be empty".into()));
     }
+    // TODO(keychain-config-preflight): complete every fallible provider-config
+    // mutation/generation check before changing the keychain, or return and
+    // reconcile an explicit partial commit. Cover u64::MAX save and legacy-clear.
     entry(KEY_ACCOUNT)?
         .set_password(key)
         .map_err(|e| CoreError::Io(format!("could not store API key in the keychain: {e}")))?;
@@ -173,11 +180,14 @@ pub fn save_api_key(config_dir: &Path, key: &str, model: &str) -> Result<(), Cor
             error_detail(e)
         ))
     })?;
-    config.model = model.to_string();
-    // TODO(key-configured-derive): derive key_configured from keychain presence on
-    // read (single source of truth), not a persisted flag; closes the crash window
-    // between keychain write and config write (PA-023).
-    config.key_configured = true;
+    config.mutate_with_reasoning_probe_invalidation(|config| {
+        config.model = model.to_string();
+        // TODO(key-configured-derive): derive key_configured from keychain presence on
+        // read (single source of truth), not a persisted flag; closes the crash window
+        // between keychain write and config write (PA-023).
+        config.key_configured = true;
+        Ok(())
+    })?;
     provider_config::write_provider_config(config_dir, &config).map_err(|e| {
         CoreError::Io(format!(
             "API key was stored in the keychain, but the AI preference file could not be updated: {}",
@@ -206,7 +216,10 @@ pub fn clear_api_key(config_dir: &Path) -> Result<(), CoreError> {
             error_detail(e)
         ))
     })?;
-    config.key_configured = false;
+    config.mutate_with_reasoning_probe_invalidation(|config| {
+        config.key_configured = false;
+        Ok(())
+    })?;
     provider_config::write_provider_config(config_dir, &config).map_err(|e| {
         CoreError::Io(format!(
             "The keychain was cleared, but the AI preference file could not be updated: {}",
@@ -298,36 +311,87 @@ impl EventSink for TauriChannelSink {
 /// One chat invocation's observable event-channel/workspace lifecycle. `watch`
 /// retains the closed value, so a provider, prompt, or writer that checks after
 /// teardown still fails immediately; there is no lost-notification window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChatRunCloseReason {
+    UserStop,
+    Lifecycle,
+}
+
 pub(crate) struct ChatRunCloseSignal {
-    sender: tokio::sync::watch::Sender<bool>,
+    sender: tokio::sync::watch::Sender<Option<ChatRunCloseReason>>,
 }
 
 impl Default for ChatRunCloseSignal {
     fn default() -> Self {
-        let (sender, _receiver) = tokio::sync::watch::channel(false);
+        let (sender, _receiver) = tokio::sync::watch::channel(None);
         Self { sender }
     }
 }
 
 impl ChatRunCloseSignal {
     pub(crate) fn close(&self) {
-        self.sender.send_replace(true);
+        self.close_with(ChatRunCloseReason::Lifecycle);
+    }
+
+    /// Record a user-requested stop only if no lifecycle/completion boundary has
+    /// already closed the run. The watch value is retained for every late waiter.
+    pub(crate) fn stop_by_user(&self) -> bool {
+        self.close_with(ChatRunCloseReason::UserStop)
+    }
+
+    fn close_with(&self, reason: ChatRunCloseReason) -> bool {
+        self.sender.send_if_modified(|current| {
+            if current.is_some() {
+                return false;
+            }
+            *current = Some(reason);
+            true
+        })
     }
 
     pub(crate) fn is_closed(&self) -> bool {
+        self.sender.borrow().is_some()
+    }
+
+    pub(crate) fn reason(&self) -> Option<ChatRunCloseReason> {
         *self.sender.borrow()
     }
 
     pub(crate) async fn wait_closed(&self) {
         let mut receiver = self.sender.subscribe();
-        if *receiver.borrow() {
+        if receiver.borrow().is_some() {
             return;
         }
         while receiver.changed().await.is_ok() {
-            if *receiver.borrow() {
+            if receiver.borrow().is_some() {
                 return;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod chat_run_close_tests {
+    use super::*;
+
+    #[test]
+    fn close_reason_is_typed_and_first_writer_wins() {
+        let lifecycle_first = ChatRunCloseSignal::default();
+        lifecycle_first.close();
+        assert_eq!(
+            lifecycle_first.reason(),
+            Some(ChatRunCloseReason::Lifecycle)
+        );
+        assert!(!lifecycle_first.stop_by_user());
+        assert_eq!(
+            lifecycle_first.reason(),
+            Some(ChatRunCloseReason::Lifecycle)
+        );
+
+        let user_first = ChatRunCloseSignal::default();
+        assert!(user_first.stop_by_user());
+        user_first.close();
+        assert_eq!(user_first.reason(), Some(ChatRunCloseReason::UserStop));
     }
 }
 
@@ -760,6 +824,7 @@ mod tests {
             reasoning: false,
             reasoning_support: None,
             reasoning_probed_model: None,
+            reasoning_probe_generation: 0,
             disabled_skills: Vec::new(),
         }
     }
@@ -909,6 +974,13 @@ mod tests {
         assert!(raw.contains(r#""keyConfigured": true"#));
         assert!(raw.contains("anthropic/claude-opus-4.1"));
         assert!(!raw.contains(key), "the API key must never be serialized");
+        assert_eq!(
+            provider_config::read_provider_config(&config_dir)
+                .unwrap()
+                .reasoning_probe_generation,
+            1,
+            "enabling the legacy effective OpenRouter target must invalidate old probe ownership"
+        );
     }
 
     #[test]
@@ -1010,6 +1082,13 @@ mod tests {
         let status = api_key_status(&config_dir).unwrap();
         assert!(!status.has_key);
         assert_eq!(status.model, "openai/gpt-4.1");
+        assert_eq!(
+            provider_config::read_provider_config(&config_dir)
+                .unwrap()
+                .reasoning_probe_generation,
+            2,
+            "clearing the legacy effective OpenRouter target must invalidate old probe ownership"
+        );
         assert_eq!(read_api_key().unwrap(), None);
         assert_eq!(
             keychain.reads.load(Ordering::SeqCst),

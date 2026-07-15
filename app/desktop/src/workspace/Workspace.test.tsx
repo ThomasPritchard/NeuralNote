@@ -1,3 +1,5 @@
+// @vitest-environment jsdom
+
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -28,7 +30,7 @@ const captured = vi.hoisted(() => ({
   ribbon: {} as {
     navigationExpanded: boolean;
     vaultName: string;
-    sidebarPanel: "files" | "search";
+    sidebarPanel: "files" | "search" | null;
     centerView: "note" | "graph";
     onShowFiles: () => void;
     onShowSearch: () => void;
@@ -200,22 +202,24 @@ const node = (path: string): TreeNode => ({
 
 function makeOpen(over: Partial<OpenNote> = {}): OpenNote {
   return {
+    sessionKey: null,
+    sessionHash: null,
     path: null,
     note: null,
     loading: false,
     error: null,
-    mode: "read",
     draft: "",
     dirty: false,
     saving: false,
     saveError: null,
+    preservationError: null,
     conflict: false,
     open: vi.fn(),
     reload: vi.fn(),
     overwrite: vi.fn(),
     repath: vi.fn(),
-    setMode: vi.fn(),
     setDraft: vi.fn(),
+    setPreservationError: vi.fn(),
     save: vi.fn(),
     clear: vi.fn(),
     ...over,
@@ -230,13 +234,14 @@ function makeTabs(over: Partial<NoteTabsController> = {}): NoteTabsController {
           id: "tab-1",
           path: active.path,
           note: active.note,
+          sessionHash: active.sessionHash,
           loading: active.loading,
           error: active.error,
-          mode: active.mode,
           draft: active.draft,
           dirty: active.dirty,
           saving: active.saving,
           saveError: active.saveError,
+          preservationError: active.preservationError,
           conflict: active.conflict,
           loadRevision: 1,
           saveRevision: 0,
@@ -289,13 +294,14 @@ function makeTab(path: string, over: Partial<NoteTab> = {}): NoteTab {
       binary: false,
       lossyText: false,
     },
+    sessionHash: "hash",
     loading: false,
     error: null,
-    mode: "read",
     draft: "body",
     dirty: false,
     saving: false,
     saveError: null,
+    preservationError: null,
     conflict: false,
     loadRevision: 1,
     saveRevision: 0,
@@ -339,7 +345,7 @@ beforeEach(() => {
   win.onCloseRequested.mockClear();
   openState.current = makeOpen();
   tabsState.current = makeTabs();
-  localStorage.clear();
+  globalThis.localStorage?.clear();
 });
 
 afterEach(() => {
@@ -749,19 +755,39 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     );
   });
 
-  it("swaps the sidebar between files and search via the ribbon", () => {
+  it("keeps both sidebar panels mounted while the ribbon swaps and collapses them", () => {
     mockUseVault.mockReturnValue(vaultCtx());
     render(<Workspace />);
     expect(screen.getByTestId("filetree")).toBeInTheDocument();
-    expect(screen.queryByTestId("searchpanel")).not.toBeInTheDocument();
+    expect(screen.getByTestId("searchpanel")).toBeInTheDocument();
+    expect(screen.getByTestId("filetree").parentElement).not.toHaveAttribute(
+      "hidden",
+    );
+    expect(screen.getByTestId("searchpanel").parentElement).toHaveAttribute(
+      "hidden",
+    );
 
     act(() => captured.ribbon.onShowSearch());
-    expect(screen.getByTestId("searchpanel")).toBeInTheDocument();
-    expect(screen.queryByTestId("filetree")).not.toBeInTheDocument();
+    expect(captured.ribbon.sidebarPanel).toBe("search");
+    expect(screen.getByTestId("searchpanel").parentElement).not.toHaveAttribute(
+      "hidden",
+    );
+    expect(screen.getByTestId("filetree").parentElement).toHaveAttribute(
+      "hidden",
+    );
+
+    act(() => captured.ribbon.onShowSearch());
+    expect(captured.ribbon.sidebarPanel).toBeNull();
+    expect(screen.getByTestId("searchpanel").parentElement).toHaveAttribute(
+      "hidden",
+    );
+    expect(screen.queryByRole("separator")).not.toBeInTheDocument();
 
     act(() => captured.ribbon.onShowFiles());
-    expect(screen.getByTestId("filetree")).toBeInTheDocument();
-    expect(screen.queryByTestId("searchpanel")).not.toBeInTheDocument();
+    expect(captured.ribbon.sidebarPanel).toBe("files");
+    expect(screen.getByTestId("filetree").parentElement).not.toHaveAttribute(
+      "hidden",
+    );
   });
 
   it("toggles the center pane between note and graph via the ribbon", () => {
@@ -795,6 +821,7 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
       "data-focus-signal",
       "2",
     );
+    expect(captured.ribbon.sidebarPanel).toBe("search");
   });
 
   // Menu actions the e2e journey doesn't cover (open-recent, new-note,
@@ -826,20 +853,7 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     expect(openState.current.save).not.toHaveBeenCalled();
   });
 
-  it("the toggle-mode action flips a text note between read and edit", () => {
-    openState.current = makeOpen({
-      path: "/v/a.md",
-      note: { binary: false } as unknown as OpenNote["note"],
-      mode: "read",
-    });
-    mockUseVault.mockReturnValue(vaultCtx());
-    render(<Workspace />);
-
-    fireMenu({ action: "toggle-mode" });
-    expect(openState.current.setMode).toHaveBeenCalledWith("edit");
-  });
-
-  it("tells the native menu to enable Format only while editing a text note", async () => {
+  it("tells the native menu to enable Format whenever a text note is open", async () => {
     mockUseVault.mockReturnValue(vaultCtx());
     // Read mode (no note): Format disabled.
     openState.current = makeOpen();
@@ -848,24 +862,22 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
       expect(mockInvoke).toHaveBeenCalledWith("set_menu_editing", { editing: false }),
     );
 
-    // A text note open in edit mode: Format enabled.
+    // A text note is editable in place without a separate mode: Format enabled.
     mockInvoke.mockClear();
     openState.current = makeOpen({
       path: "/v/a.md",
       note: { binary: false } as unknown as OpenNote["note"],
-      mode: "edit",
     });
     rerender(<Workspace />);
     await waitFor(() =>
       expect(mockInvoke).toHaveBeenCalledWith("set_menu_editing", { editing: true }),
     );
 
-    // A binary attachment in edit mode has no editable text: Format stays disabled.
+    // A binary attachment has no editable text: Format stays disabled.
     mockInvoke.mockClear();
     openState.current = makeOpen({
       path: "/v/img.png",
       note: { binary: true } as unknown as OpenNote["note"],
-      mode: "edit",
     });
     rerender(<Workspace />);
     await waitFor(() =>
@@ -919,7 +931,9 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
       fireEvent.keyDown(window, { key: "k" });
     });
     expect(screen.getByTestId("filetree")).toBeInTheDocument();
-    expect(screen.queryByTestId("searchpanel")).not.toBeInTheDocument();
+    expect(screen.getByTestId("searchpanel").parentElement).toHaveAttribute(
+      "hidden",
+    );
   });
 
   it("opens a search result through the guard and lands in note view", () => {
@@ -992,6 +1006,7 @@ describe("Workspace — settings modal", () => {
     // Settings moved off the ribbon onto the titlebar in the overlay-titlebar cut.
     act(() => captured.titlebar.onOpenSettings());
     expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
+    expect(captured.settingsModal.initialSection).toBe("whatsNew");
 
     act(() => captured.settingsModal.onClose());
     expect(screen.queryByTestId("settings-modal")).not.toBeInTheDocument();
@@ -1004,6 +1019,7 @@ describe("Workspace — settings modal", () => {
 
     act(() => captured.chatPane.onOpenSettings());
     expect(screen.getByTestId("settings-modal")).toBeInTheDocument();
+    expect(captured.settingsModal.initialSection).toBe("ai");
 
     // Closing settings must poke the chat pane to re-read the AI status — a
     // provider configured in the modal has to reach the docked pane.
@@ -1112,7 +1128,9 @@ describe("Workspace — titlebar + sidebar", () => {
     render(<Workspace />);
 
     const panes = screen.getByTestId("workspace-panes");
-    const sidebar = screen.getByTestId("filetree").parentElement;
+    const sidebar = screen
+      .getByTestId("filetree")
+      .closest("#nn-primary-sidebar");
     expect(sidebar).toHaveAttribute("id", "nn-primary-sidebar");
     expect(screen.getByRole("separator")).toHaveAttribute(
       "aria-controls",
@@ -1121,6 +1139,31 @@ describe("Workspace — titlebar + sidebar", () => {
     expect(panes.parentElement).toHaveStyle({
       "--navigation-width": "192px",
       "--sidebar-width": "296px",
+      "--splitter-width": "8px",
+    });
+  });
+
+  it("collapses and restores the preferred sidebar width from Files", () => {
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    fireEvent.keyDown(screen.getByRole("separator"), { key: "ArrowRight" });
+    expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
+      "--sidebar-width": "304px",
+    });
+
+    act(() => captured.ribbon.onShowFiles());
+    expect(captured.ribbon.sidebarPanel).toBeNull();
+    expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
+      "--sidebar-width": "0px",
+      "--splitter-width": "0px",
+    });
+    expect(screen.queryByRole("separator")).not.toBeInTheDocument();
+
+    act(() => captured.ribbon.onShowFiles());
+    expect(screen.getByTestId("workspace-panes").parentElement).toHaveStyle({
+      "--sidebar-width": "304px",
+      "--splitter-width": "8px",
     });
   });
 

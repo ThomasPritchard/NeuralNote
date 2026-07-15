@@ -21,6 +21,7 @@ pub mod evidence;
 pub mod llm;
 pub mod local;
 pub mod openai;
+pub mod openrouter_catalogue;
 pub mod orchestrator;
 pub mod provider_config;
 pub mod requirement_binaries;
@@ -55,11 +56,14 @@ pub use local::{
     curated_candidates, is_curated_model, model_installed, recommend_model, CandidateModel,
     HardwareSpec, Recommendation, DEFAULT_LOCAL_MODEL,
 };
+pub use openrouter_catalogue::{
+    latest_completed_utc_day, rank_openrouter_models, OpenRouterRankedModel, OpenRouterRankedModels,
+};
 pub use orchestrator::{
     run_chat, Guards, SkillServices, DEFAULT_MODEL, SKILL_ACTIVATION_FAILURE_MARK,
 };
 pub use provider_config::{
-    read_provider_config, write_provider_config, ProviderConfig, ProviderKind,
+    read_provider_config, write_provider_config, ProviderConfig, ProviderKind, ReasoningProbeTarget,
 };
 pub use requirement_binaries::{
     lookup_requirement_binary, lookup_requirement_source_build, requirement_binaries,

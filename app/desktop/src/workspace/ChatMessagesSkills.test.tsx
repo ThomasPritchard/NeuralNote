@@ -79,6 +79,36 @@ afterEach(() => {
 });
 
 describe("ChatMessages — skill turns", () => {
+  it("renders a user-stopped turn as neutral while preserving its partial answer", () => {
+    renderMessages(
+      skillTurn({
+        turnId: "turn-1",
+        answer: "The partial answer remains visible.",
+        activity: [{ kind: "search", query: "partial" }],
+        stopped: true,
+        done: true,
+      }),
+    );
+
+    expect(screen.getByText("Stopped")).toBeInTheDocument();
+    expect(screen.getByText("The partial answer remains visible.")).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("labels provider failure context as Failed rather than Stopped", () => {
+    renderMessages(
+      skillTurn({
+        activity: [{ kind: "search", query: "provider" }],
+        error: "provider failed",
+        done: true,
+      }),
+    );
+
+    expect(screen.getByText(/^Failed —/)).toBeInTheDocument();
+    expect(screen.queryByText(/^Stopped —/)).not.toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent("provider failed");
+  });
+
   it("offers a verified YouTube timestamp jump beside the note action", async () => {
     const { user } = renderMessages(
       skillTurn({

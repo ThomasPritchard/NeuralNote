@@ -30,7 +30,7 @@ import { GraphView } from "./GraphView";
 import { buildNoteIndex, type NoteIndexEntry } from "./linkResolve";
 import { NotePane } from "./NotePane";
 import { PaneSplitter } from "./PaneSplitter";
-import { Ribbon, type CenterView, type SidebarPanel } from "./Ribbon";
+import { Ribbon, type CenterView } from "./Ribbon";
 import { SearchPanel } from "./SearchPanel";
 import { SettingsModal, type SettingsSection } from "./SettingsModal";
 import { StatusBar } from "./StatusBar";
@@ -103,9 +103,9 @@ export function Workspace() {
   const open = noteTabs.active;
   const [pendingIntent, setPendingIntent] = useState<PendingIntent | null>(null);
   // Workspace-local view state (specs/search-and-graph-view.md §View model).
-  const [sidebarPanel, setSidebarPanel] = useState<SidebarPanel>("files");
   const [centerView, setCenterView] = useState<CenterView>("note");
   const [layoutPreference, setLayoutPreference] = useState(loadWorkspaceLayout);
+  const sidebarPanel = layoutPreference.sidebarPanel;
   const [workspaceMeasurements, setWorkspaceMeasurements] =
     useState<WorkspaceMeasurements>({
       workspaceWidth: 0,
@@ -127,7 +127,7 @@ export function Workspace() {
   // pane re-reads the AI status (a provider configured in Settings must reach
   // the pane without remounting it and wiping the transcript).
   const [settingsOpen, setSettingsOpen] = useState(false);
-  const [settingsSection, setSettingsSection] = useState<SettingsSection>("general");
+  const [settingsSection, setSettingsSection] = useState<SettingsSection>("whatsNew");
   const [templateInsertOpen, setTemplateInsertOpen] = useState(false);
   const [templates, setTemplates] = useState<Awaited<ReturnType<typeof api.listTemplates>>>([]);
   const [aiStatusVersion, bumpAiStatusVersion] = useReducer((n: number) => n + 1, 0);
@@ -411,7 +411,7 @@ export function Workspace() {
     [openNoteAt],
   );
 
-  const handleOpenSettings = useCallback((section: SettingsSection = "general") => {
+  const handleOpenSettings = useCallback((section: SettingsSection = "whatsNew") => {
     setSettingsSection(section);
     setSettingsOpen(true);
   }, []);
@@ -466,12 +466,28 @@ export function Workspace() {
     bumpAiStatusVersion();
   }, []);
 
+  const selectFiles = useCallback(() => {
+    setLayoutPreference((current) => ({ ...current, sidebarPanel: "files" }));
+  }, []);
+  const selectSearch = useCallback(() => {
+    setLayoutPreference((current) => ({ ...current, sidebarPanel: "search" }));
+    bumpSearchFocus();
+  }, []);
   const handleShowFiles = useCallback(() => {
-    setSidebarPanel("files");
+    setLayoutPreference((current) => ({
+      ...current,
+      sidebarPanel: current.sidebarPanel === "files" ? null : "files",
+    }));
   }, []);
   const handleShowSearch = useCallback(() => {
-    setSidebarPanel("search");
-    bumpSearchFocus();
+    setLayoutPreference((current) => {
+      const opening = current.sidebarPanel !== "search";
+      if (opening) bumpSearchFocus();
+      return {
+        ...current,
+        sidebarPanel: opening ? "search" : null,
+      };
+    });
   }, []);
   const handleToggleGraph = useCallback(
     () => setCenterView((v) => (v === "graph" ? "note" : "graph")),
@@ -481,9 +497,9 @@ export function Workspace() {
 
   /** Arm an inline create in the FileTree and select its owning Files pane. */
   const startCreate = useCallback((kind: CreateKind) => {
-    setSidebarPanel("files");
+    selectFiles();
     setPendingCreate(kind);
-  }, []);
+  }, [selectFiles]);
 
   const handleRemap = useCallback((oldPath: string, newNode: TreeNode) => {
     noteTabsRef.current.remap(oldPath, newNode.path, newNode.relPath);
@@ -637,11 +653,6 @@ export function Workspace() {
           case "save":
             if (o.note && o.dirty && !o.saving) void o.save();
             break;
-          case "toggle-mode":
-            if (o.note && !o.note.binary) {
-              o.setMode(o.mode === "edit" ? "read" : "edit");
-            }
-            break;
           case "close-tab": {
             const tabId = noteTabsRef.current.activeTabId;
             if (tabId) {
@@ -670,10 +681,10 @@ export function Workspace() {
             break;
           case "search":
           case "view-search":
-            handleShowSearch();
+            selectSearch();
             break;
           case "view-files":
-            handleShowFiles();
+            selectFiles();
             break;
           case "toggle-graph":
             setCenterView((v) => (v === "graph" ? "note" : "graph"));
@@ -713,16 +724,14 @@ export function Workspace() {
     reportError,
     requestIntent,
     startCreate,
-    handleShowFiles,
-    handleShowSearch,
+    selectFiles,
+    selectSearch,
     toggleNavigation,
   ]);
 
-  // Keep the native Format menu honest: those items act on the editor's textarea,
-  // which is mounted only when a text note is open in edit mode. Push that fact to
-  // Rust so it enables Format only then. Best-effort — the enabled state is
-  // cosmetic, and Rust skips the rebuild when the flag is unchanged.
-  const editing = !!open.note && !open.note.binary && open.mode === "edit";
+  // Every compatible text note is directly editable. Keep Format enabled while
+  // a text note is open; the focused rich/raw editor still owns the command.
+  const editing = !!open.note && !open.note.binary;
   useEffect(() => {
     void api
       .setMenuEditing(editing)
@@ -791,6 +800,7 @@ export function Workspace() {
   const layoutStyle = {
     "--navigation-width": `${effectiveLayout.navigationWidth}px`,
     "--sidebar-width": `${effectiveLayout.sidebarWidth}px`,
+    "--splitter-width": `${effectiveLayout.splitterWidth}px`,
   } as CSSProperties;
 
   return (
@@ -834,9 +844,15 @@ export function Workspace() {
         />
         <div
           id="nn-primary-sidebar"
+          aria-hidden={sidebarPanel === null}
+          inert={sidebarPanel === null ? true : undefined}
           className="nn-primary-sidebar flex min-h-0 shrink-0"
         >
-          {sidebarPanel === "files" ? (
+          <div
+            className="nn-primary-sidebar-panel"
+            hidden={sidebarPanel !== "files"}
+            inert={sidebarPanel === "files" ? undefined : true}
+          >
             <FileTree
               vaultPath={vault.path}
               tree={tree}
@@ -848,19 +864,26 @@ export function Workspace() {
               pendingCreate={pendingCreate}
               onCreateConsumed={consumeCreate}
             />
-          ) : (
+          </div>
+          <div
+            className="nn-primary-sidebar-panel"
+            hidden={sidebarPanel !== "search"}
+            inert={sidebarPanel === "search" ? undefined : true}
+          >
             <SearchPanel focusSignal={searchFocusSignal} onOpen={openNoteAt} />
-          )}
+          </div>
         </div>
-        <PaneSplitter
-          paneId="nn-primary-sidebar"
-          width={effectiveLayout.sidebarWidth}
-          minWidth={SIDEBAR_MIN_WIDTH}
-          maxWidth={effectiveLayout.sidebarMaxWidth}
-          onResize={(sidebarWidth) =>
-            setLayoutPreference((current) => ({ ...current, sidebarWidth }))
-          }
-        />
+        {sidebarPanel !== null && (
+          <PaneSplitter
+            paneId="nn-primary-sidebar"
+            width={effectiveLayout.sidebarWidth}
+            minWidth={SIDEBAR_MIN_WIDTH}
+            maxWidth={effectiveLayout.sidebarMaxWidth}
+            onResize={(sidebarWidth) =>
+              setLayoutPreference((current) => ({ ...current, sidebarWidth }))
+            }
+          />
+        )}
         {centerView === "graph" ? (
           <div
             id={GRAPH_PANEL_ID}

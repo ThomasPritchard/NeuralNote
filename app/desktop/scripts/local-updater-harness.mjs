@@ -21,8 +21,8 @@ import { fileURLToPath, pathToFileURL } from "node:url";
 export const HARNESS_PRODUCT_NAME = "NeuralNote Updater Harness";
 export const HARNESS_IDENTIFIER = "com.neuralnote.desktop.updater-harness";
 
-const BASELINE_VERSION = "0.1.0";
-const UPDATE_VERSION = "0.1.1";
+const BASELINE_VERSION = "0.1.1";
+const UPDATE_VERSION = "0.2.0";
 const DEFAULT_PORT = 48765;
 const MANIFEST_ROUTE = "/latest-alpha.json";
 const MAX_PUBLIC_KEY_BYTES = 8 * 1024;
@@ -106,7 +106,7 @@ export async function validatePrivateKeyPath(candidate) {
 
 export function buildOverlay({ version, publicKey, port, createUpdaterArtifacts }) {
   if (![BASELINE_VERSION, UPDATE_VERSION].includes(version)) {
-    throw new Error("The harness supports only the fixed 0.1.0 to 0.1.1 journey.");
+    throw new Error("The harness supports only the fixed 0.1.1 to 0.2.0 journey.");
   }
   const checkedPort = validatePort(port);
   const checkedKey = validatePublicKey(publicKey);
