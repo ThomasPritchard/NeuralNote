@@ -32,7 +32,7 @@ import { buildNoteIndex, type NoteIndexEntry } from "./linkResolve";
 import { NotePane } from "./NotePane";
 import { PaneSplitter } from "./PaneSplitter";
 import { Ribbon, type CenterView } from "./Ribbon";
-import { SearchPanel } from "./SearchPanel";
+import { SearchPanel, type SearchQueryRequest } from "./SearchPanel";
 import { SettingsModal, type SettingsSection } from "./SettingsModal";
 import { StatusBar } from "./StatusBar";
 import { TemplateInsertDialog } from "./TemplateInsertDialog";
@@ -171,6 +171,9 @@ export function Workspace() {
   const [pendingCreate, setPendingCreate] = useState<CreateKind | null>(null);
   // Bumped whenever ⌘K / the navigation Search action wants the field focused.
   const [searchFocusSignal, bumpSearchFocus] = useReducer((n: number) => n + 1, 0);
+  const [searchQueryRequest, setSearchQueryRequest] =
+    useState<SearchQueryRequest | null>(null);
+  const searchQueryRequestId = useRef(0);
   // Settings modal state, plus a version bumped when it closes so the chat
   // pane re-reads the AI status (a provider configured in Settings must reach
   // the pane without remounting it and wiping the transcript).
@@ -515,6 +518,14 @@ export function Workspace() {
   const selectSearch = useCallback(() => {
     setLayoutPreference((current) => ({ ...current, sidebarPanel: "search" }));
     bumpSearchFocus();
+  }, []);
+  const handleSearchTag = useCallback((tag: string) => {
+    if (!tag.startsWith("#") || tag.length < 2) return;
+    setLayoutPreference((current) => ({ ...current, sidebarPanel: "search" }));
+    setSearchQueryRequest({
+      id: ++searchQueryRequestId.current,
+      query: `tag:${tag}`,
+    });
   }, []);
   const handleShowFiles = useCallback(() => {
     setLayoutPreference((current) => ({
@@ -920,7 +931,11 @@ export function Workspace() {
             hidden={sidebarPanel !== "search"}
             inert={sidebarPanel === "search" ? undefined : true}
           >
-            <SearchPanel focusSignal={searchFocusSignal} onOpen={openNoteAt} />
+            <SearchPanel
+              focusSignal={searchFocusSignal}
+              queryRequest={searchQueryRequest}
+              onOpen={openNoteAt}
+            />
           </div>
         </div>
         {sidebarPanel !== null && (
@@ -964,6 +979,7 @@ export function Workspace() {
               open={open}
               noteIndex={noteIndex}
               onOpenLink={openNoteRel}
+              onSearchTag={handleSearchTag}
               reportError={reportError}
             />
           </div>

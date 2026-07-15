@@ -289,9 +289,20 @@ fn codec_failure(context: &str, error: SymphoniaError) -> CaptureError {
 }
 
 fn unsupported_codec(detail: String) -> CaptureError {
-    // TODO(ffmpeg-fallback): add a consented fallback when a real video has no
-    // mp4a.40.2 rendition, or Symphonia rejects a real AAC-LC payload.
-    CaptureError::UnsupportedAudioCodec(detail)
+    // TODO(ffmpeg-fallback, #59): this is the trigger site for the consented ffmpeg
+    // fallback. The pure-Rust decoder handles only AAC-LC in m4a; a video with no
+    // mp4a.40.2 rendition (HE-AAC, Opus, no-m4a) or a real AAC-LC payload Symphonia
+    // rejects lands here. How often that happens across a representative sample is
+    // measured by the `youtube_audio_coverage_report` harness classifying formats
+    // via `capture::audio_coverage`. Build the fallback (follow-up #59) once the
+    // written threshold in specs/youtube-distil-skill.md is crossed:
+    // >10% of captionless videos lack a decodable AAC-LC m4a, or any single
+    // undecodable class (HE-AAC / Opus / no-m4a) exceeds 5%.
+    CaptureError::UnsupportedAudioCodec(format!(
+        "this video's audio isn't in the supported AAC-LC (m4a) format, so local \
+         transcription can't decode it. Try a video that has captions, or a different \
+         source; support for other audio codecs (via ffmpeg) is planned. Technical detail: {detail}"
+    ))
 }
 
 #[cfg(test)]

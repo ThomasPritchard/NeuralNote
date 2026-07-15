@@ -216,17 +216,17 @@ pub(crate) fn title_and_body(raw: &str, stem: &str) -> (String, String) {
     (title, parsed.body)
 }
 
-struct Parsed {
-    frontmatter: Option<serde_json::Value>,
-    frontmatter_raw: Option<String>,
-    frontmatter_error: Option<String>,
-    body: String,
+pub(crate) struct Parsed {
+    pub(crate) frontmatter: Option<serde_json::Value>,
+    pub(crate) frontmatter_raw: Option<String>,
+    pub(crate) frontmatter_error: Option<String>,
+    pub(crate) body: String,
 }
 
 /// Extract a leading `---` … `---` YAML block (Obsidian/Jekyll style) and parse
 /// it. On a malformed or unterminated block we never lose content: the error is
 /// surfaced and the body falls back to the whole file.
-fn parse_frontmatter(raw: &str) -> Parsed {
+pub(crate) fn parse_frontmatter(raw: &str) -> Parsed {
     // A leading UTF-8 BOM (some Windows editors prepend one) must not hide the
     // opening fence — skip it for detection and extraction only. `raw` itself (and
     // therefore the content hash and the editor draft) is left untouched.
@@ -317,11 +317,18 @@ fn parse_frontmatter_block(block: &str) -> (Option<serde_json::Value>, Option<St
             )),
         );
     }
-    match serde_yaml_ng::from_str::<serde_json::Value>(block) {
-        Ok(serde_json::Value::Null) => (None, None),
+    match serde_yaml_ng::from_str::<serde_yaml_ng::Value>(block) {
+        Ok(serde_yaml_ng::Value::Null) => (None, None),
         // Only a YAML mapping is valid frontmatter; a top-level list or scalar is
         // malformed for our key/value properties view.
-        Ok(v @ serde_json::Value::Object(_)) => (Some(v), None),
+        Ok(value @ serde_yaml_ng::Value::Mapping(_)) => match serde_json::to_value(value) {
+            Ok(v @ serde_json::Value::Object(_)) => (Some(v), None),
+            Ok(_) => (
+                None,
+                Some("frontmatter must be a set of key: value pairs".into()),
+            ),
+            Err(error) => (None, Some(format!("invalid YAML frontmatter: {error}"))),
+        },
         Ok(_) => (
             None,
             Some("frontmatter must be a set of key: value pairs".into()),
@@ -331,7 +338,11 @@ fn parse_frontmatter_block(block: &str) -> (Option<serde_json::Value>, Option<St
 }
 
 /// Title precedence: frontmatter `title` → first markdown `# H1` → file stem.
-fn title_from(frontmatter: &Option<serde_json::Value>, body: &str, stem: &str) -> String {
+pub(crate) fn title_from(
+    frontmatter: &Option<serde_json::Value>,
+    body: &str,
+    stem: &str,
+) -> String {
     if let Some(serde_json::Value::String(t)) = frontmatter.as_ref().and_then(|f| f.get("title")) {
         let t = t.trim();
         if !t.is_empty() {

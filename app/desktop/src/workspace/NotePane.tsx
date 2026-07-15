@@ -29,6 +29,8 @@ interface NotePaneProps {
   noteIndex?: NoteIndexEntry[];
   /** Open another vault note by relPath (the workspace's guarded open). */
   onOpenLink?: (relPath: string) => void;
+  /** Open Search for an Obsidian-compatible inline tag. */
+  onSearchTag?: (tag: string) => void;
   /** Surface a degraded-capability message (the store's reportError) —
    *  threaded through to the editor's menu subscription. */
   reportError?: (message: string) => void;
@@ -145,6 +147,7 @@ function TextNoteBody({
   open,
   noteIndex,
   onOpenLink,
+  onSearchTag,
   reportError,
 }: Readonly<Required<Pick<NotePaneProps, "open">> & Omit<NotePaneProps, "open">>) {
   const note = open.note!;
@@ -158,6 +161,7 @@ function TextNoteBody({
       note={note}
       onOpenLink={onOpenLink}
       suppressTitle={titleMode !== "external"}
+      suppressProperties
     >
       <SaveNotices open={open} />
       {open.preservationError && (
@@ -192,8 +196,12 @@ function TextNoteBody({
             reportError={reportError}
             noteIndex={noteIndex}
             onOpenLink={onOpenLink}
+            onSearchTag={onSearchTag}
             sourceRelPath={note.relPath}
             derivedTitle={titleMode === "placeholder" ? note.title : undefined}
+            frontmatter={note.frontmatter}
+            frontmatterRaw={note.frontmatterRaw}
+            frontmatterError={note.frontmatterError}
           />
         </Suspense>
       </div>
@@ -205,6 +213,7 @@ export function NotePane({
   open,
   noteIndex,
   onOpenLink,
+  onSearchTag,
   reportError,
 }: Readonly<NotePaneProps>) {
   if (!open.path) {
@@ -303,12 +312,18 @@ export function NotePane({
       )}
 
       {note.binary ? (
-        <Reader note={note} noteIndex={noteIndex} onOpenLink={onOpenLink} />
+        <Reader
+          note={note}
+          noteIndex={noteIndex}
+          onOpenLink={onOpenLink}
+          onSearchTag={onSearchTag}
+        />
       ) : (
         <TextNoteBody
           open={open}
           noteIndex={noteIndex}
           onOpenLink={onOpenLink}
+          onSearchTag={onSearchTag}
           reportError={reportError}
         />
       )}

@@ -237,6 +237,29 @@ const stripQuotes = (s: string): string =>
     ? s.slice(1, -1)
     : s;
 
+const parseYamlKey = (source: string): string => {
+  const key = source.trim();
+  if (key.startsWith("'") && key.endsWith("'")) {
+    return key.slice(1, -1).replace(/''/gu, "'");
+  }
+  if (key.startsWith('"') && key.endsWith('"')) {
+    const jsonCompatible = key
+      .replace(/\\x([0-9a-f]{2})/giu, "\\u00$1")
+      .replace(/\\U([0-9a-f]{8})/giu, (_match, hex: string) => {
+        const point = Number.parseInt(hex, 16);
+        if (!Number.isSafeInteger(point) || point > 0x10ffff) return "\\uFFFD";
+        return JSON.stringify(String.fromCodePoint(point)).slice(1, -1);
+      });
+    try {
+      const decoded: unknown = JSON.parse(jsonCompatible);
+      if (typeof decoded === "string") return decoded;
+    } catch {
+      return key;
+    }
+  }
+  return key;
+};
+
 const parseScalarOrArray = (s: string): unknown => {
   if (s === "") return null;
   if (s.startsWith("[") && s.endsWith("]")) {
@@ -247,10 +270,11 @@ const parseScalarOrArray = (s: string): unknown => {
 };
 
 const parseFrontmatter = (raw: string): ParsedNote => {
-  if (!raw.startsWith("---\n") && !raw.startsWith("---\r\n")) {
+  const source = raw.startsWith("\ufeff") ? raw.slice(1) : raw;
+  if (!source.startsWith("---\n") && !source.startsWith("---\r\n")) {
     return { frontmatter: null, frontmatterRaw: null, frontmatterError: null, body: raw };
   }
-  const closed = /^---\r?\n([\s\S]*?)\r?\n(?:---|\.\.\.)\r?\n?([\s\S]*)$/.exec(raw);
+  const closed = /^---\r?\n([\s\S]*?)\r?\n(?:---|\.\.\.)\r?\n?([\s\S]*)$/.exec(source);
   if (!closed) {
     return {
       frontmatter: null,
@@ -262,11 +286,31 @@ const parseFrontmatter = (raw: string): ParsedNote => {
   const block = closed[1];
   const body = closed[2] ?? "";
   const obj: Record<string, unknown> = {};
-  for (const line of block.split("\n").map((l) => l.trim())) {
+  let listKey: string | null = null;
+  for (const sourceLine of block.split("\n")) {
+    const line = sourceLine.trim();
     if (line === "" || line.startsWith("#")) continue;
+    const listItem = /^-\s+(.+)$/.exec(line);
+    if (listItem && listKey !== null) {
+      const values = Array.isArray(obj[listKey]) ? obj[listKey] as unknown[] : [];
+      values.push(stripQuotes(listItem[1].trim()));
+      obj[listKey] = values;
+      continue;
+    }
     const idx = line.indexOf(":");
     if (idx === -1) continue;
-    obj[line.slice(0, idx).trim()] = parseScalarOrArray(line.slice(idx + 1).trim());
+    const key = parseYamlKey(line.slice(0, idx));
+    if (Object.hasOwn(obj, key)) {
+      return {
+        frontmatter: null,
+        frontmatterRaw: block,
+        frontmatterError: `duplicate frontmatter key: ${key}`,
+        body,
+      };
+    }
+    const value = line.slice(idx + 1).trim();
+    obj[key] = parseScalarOrArray(value);
+    listKey = value === "" ? key : null;
   }
   return {
     frontmatter: Object.keys(obj).length > 0 ? obj : null,
@@ -456,6 +500,252 @@ const scanContent = (
   return [out, false];
 };
 
+const TAG_WORD_CHARACTER = /^[\p{L}\p{M}\p{N}_/-]$/u;
+const TAG_UNICODE_SYMBOL = /^\p{S}$/u;
+
+const isTagCharacter = (character: string): boolean =>
+  TAG_WORD_CHARACTER.test(character) ||
+  character === "\u200d" ||
+  ((character.codePointAt(0) ?? 0) > 0x7f && TAG_UNICODE_SYMBOL.test(character));
+
+const validTagName = (name: string): boolean => {
+  const chars = Array.from(name);
+  return chars.length > 0 &&
+    chars.every(isTagCharacter) &&
+    chars.some((character) => !/^\p{N}$/u.test(character));
+};
+
+const parseTagQuery = (query: string): string | null | undefined => {
+  const split = query.indexOf(":");
+  if (split === -1 || query.slice(0, split).toLowerCase() !== "tag") return undefined;
+  const value = query.slice(split + 1);
+  const name = value.startsWith("#") ? value.slice(1) : value;
+  return validTagName(name) ? name : null;
+};
+
+const tagMatches = (candidate: string, requested: string): boolean => {
+  const foldedCandidate = fold(candidate).join("");
+  const foldedRequested = fold(requested).join("");
+  return foldedCandidate === foldedRequested ||
+    foldedCandidate.startsWith(`${foldedRequested}/`);
+};
+
+/** Blank tag-like text in Markdown constructs where Obsidian does not index
+ * tags. Input and output retain the same code-point length. */
+const normalizeReferenceLabel = (label: string): string =>
+  label.trim().replace(/\s+/gu, " ").toLocaleLowerCase();
+
+const maskReferenceDefinitions = (
+  lines: readonly string[],
+): { maskedLines: string[]; labels: Set<string> } => {
+  const maskedLines = [...lines];
+  const labels = new Set<string>();
+  const titleStart = /^(?:["'(])/u;
+  for (let index = 0; index < lines.length; index += 1) {
+    const definition = /^ {0,3}\[([^\]\r\n]+)\]:\s*(.*)$/u.exec(lines[index]);
+    if (!definition) continue;
+    labels.add(normalizeReferenceLabel(definition[1]));
+    maskedLines[index] = " ".repeat(Array.from(lines[index]).length);
+
+    let continuation = index + 1;
+    if (definition[2].trim() === "" && continuation < lines.length) {
+      const destination = /^ {1,3}\S/u.exec(lines[continuation]);
+      if (destination) {
+        maskedLines[continuation] = " ".repeat(Array.from(lines[continuation]).length);
+        continuation += 1;
+      }
+    }
+    if (
+      continuation < lines.length &&
+      /^ {1,3}\S/u.test(lines[continuation]) &&
+      titleStart.test(lines[continuation].trimStart())
+    ) {
+      maskedLines[continuation] = " ".repeat(Array.from(lines[continuation]).length);
+    }
+  }
+  return { maskedLines, labels };
+};
+
+const maskTagContexts = (line: string, referenceLabels: ReadonlySet<string>): string => {
+  const chars = Array.from(line);
+  const blank = (from: number, to: number) => {
+    for (let i = from; i < to; i += 1) chars[i] = " ";
+  };
+  for (let i = 0; i < chars.length; i += 1) {
+    if (chars[i] === "\\" && i + 1 < chars.length) {
+      blank(i, i + 2);
+      i += 1;
+      continue;
+    }
+    if (chars[i] === "[" && chars[i + 1] === "[") {
+      let end = i + 2;
+      while (end + 1 < chars.length && !(chars[end] === "]" && chars[end + 1] === "]")) end += 1;
+      if (end + 1 < chars.length) {
+        blank(i, end + 2);
+        i = end + 1;
+      }
+      continue;
+    }
+    if (chars[i] === "<") {
+      const end = chars.indexOf(">", i + 1);
+      if (end !== -1) {
+        blank(i, end + 1);
+        i = end;
+      }
+      continue;
+    }
+    if (chars[i] === "[") {
+      const close = chars.indexOf("]", i + 1);
+      if (close === -1) continue;
+      if (chars[close + 1] === "(") {
+        const end = chars.indexOf(")", close + 2);
+        if (end === -1) continue;
+        blank(i, end + 1);
+        i = end;
+        continue;
+      }
+      if (chars[close + 1] === "[") {
+        const end = chars.indexOf("]", close + 2);
+        if (end === -1) continue;
+        blank(i, end + 1);
+        i = end;
+        continue;
+      }
+      const label = chars.slice(i + 1, close).join("");
+      if (referenceLabels.has(normalizeReferenceLabel(label))) {
+        blank(i, close + 1);
+        i = close;
+        continue;
+      }
+      let separator = close + 1;
+      while (separator < chars.length && /\s/u.test(chars[separator])) separator += 1;
+      if (chars[separator] === ":") {
+        blank(i, chars.length);
+        break;
+      }
+    }
+  }
+  return chars.join("");
+};
+
+interface TagOccurrence {
+  readonly line: number;
+  readonly range: [number, number];
+}
+
+const inlineTagOccurrences = (body: string, firstLine: number, requested: string): TagOccurrence[] => {
+  const originalLines = body.split(/\r?\n/);
+  const codeMaskedLines = maskCode(body).split(/\r?\n/);
+  const { maskedLines, labels: referenceLabels } = maskReferenceDefinitions(codeMaskedLines);
+  const out: TagOccurrence[] = [];
+  for (let lineIndex = 0; lineIndex < maskedLines.length; lineIndex += 1) {
+    const chars = Array.from(maskTagContexts(maskedLines[lineIndex], referenceLabels));
+    const originalChars = Array.from(originalLines[lineIndex] ?? "");
+    if (/^ {4}/.test(chars.join(""))) continue;
+    for (let i = 0; i < chars.length; i += 1) {
+      if (chars[i] !== "#" || (i > 0 && !/\s/u.test(originalChars[i - 1] ?? ""))) continue;
+      let end = i + 1;
+      while (end < chars.length && isTagCharacter(chars[end])) end += 1;
+      const name = chars.slice(i + 1, end).join("");
+      if (validTagName(name) && tagMatches(name, requested)) {
+        out.push({ line: firstLine + lineIndex, range: [i, end] });
+      }
+      i = Math.max(i, end - 1);
+    }
+  }
+  return out;
+};
+
+const frontmatterTagOccurrences = (
+  frontmatterRaw: string | null,
+  frontmatter: Record<string, unknown> | null,
+  requested: string,
+): TagOccurrence[] => {
+  if (frontmatterRaw === null || frontmatter === null) return [];
+  const semantic = frontmatter.tags;
+  const semanticValues = (Array.isArray(semantic) ? semantic : [semantic])
+    .filter((value): value is string => typeof value === "string")
+    .map((value) => value.startsWith("#") ? value.slice(1) : value)
+    .filter((value) => validTagName(value));
+  if (!semanticValues.some((value) => tagMatches(value, requested))) return [];
+  const out: TagOccurrence[] = [];
+  const lines = frontmatterRaw.split(/\r?\n/);
+  let inTagsList = false;
+  for (let index = 0; index < lines.length; index += 1) {
+    const line = lines[index];
+    const propertySource = /^(.+?):\s*(.*)$/u.exec(line);
+    const property = propertySource && parseYamlKey(propertySource[1]).toLowerCase() === "tags"
+      ? propertySource
+      : null;
+    let values: string[] = [];
+    if (property) {
+      inTagsList = property[2].trim() === "";
+      const rawValue = property[2].trim();
+      if (rawValue.startsWith("[") && rawValue.endsWith("]")) {
+        values = rawValue.slice(1, -1).split(",");
+      } else if (rawValue !== "") {
+        values = [rawValue];
+      }
+    } else if (inTagsList) {
+      const item = /^\s*-\s+(.+)$/.exec(line);
+      if (item) values = [item[1]];
+      else if (line.trim() !== "") inTagsList = false;
+    }
+    for (const rawValue of values) {
+      const value = stripQuotes(rawValue.trim());
+      const name = value.startsWith("#") ? value.slice(1) : value;
+      if (!validTagName(name) || !tagMatches(name, requested)) continue;
+      const startUtf16 = line.indexOf(value);
+      if (startUtf16 === -1) continue;
+      const start = Array.from(line.slice(0, startUtf16)).length;
+      out.push({
+        line: index + 2,
+        range: [start, start + Array.from(value).length],
+      });
+    }
+  }
+  return out;
+};
+
+const scanTags = (
+  raw: string,
+  requested: string,
+  budget: number,
+): [SearchMatch[], boolean] => {
+  const parsed = parseFrontmatter(raw);
+  const source = raw.startsWith("\ufeff") ? raw.slice(1) : raw;
+  if (
+    parsed.frontmatterError !== null &&
+    parsed.frontmatterRaw === null &&
+    (source.startsWith("---\n") || source.startsWith("---\r\n"))
+  ) {
+    return [[], false];
+  }
+  const prefixLength = raw.length - parsed.body.length;
+  const firstBodyLine = prefixLength === 0
+    ? 1
+    : raw.slice(0, prefixLength).split(/\r?\n/).length;
+  const occurrences = [
+    ...frontmatterTagOccurrences(parsed.frontmatterRaw, parsed.frontmatter, requested),
+    ...inlineTagOccurrences(parsed.body, firstBodyLine, requested),
+  ].sort((left, right) => left.line - right.line || left.range[0] - right.range[0]);
+  const byLine = new Map<number, [number, number][]>();
+  for (const occurrence of occurrences) {
+    const ranges = byLine.get(occurrence.line) ?? [];
+    ranges.push(occurrence.range);
+    byLine.set(occurrence.line, ranges);
+  }
+  const sourceLines = raw.split(/\r?\n/);
+  const matches: SearchMatch[] = [];
+  for (const [line, ranges] of byLine) {
+    if (matches.length >= budget) return [matches, true];
+    const source = sourceLines[line - 1] ?? "";
+    const snippet = buildSnippet(Array.from(source), ranges);
+    matches.push({ line, ...snippet });
+  }
+  return [matches, false];
+};
+
 /** Mirror of core `search_vault` (post-walk): the raw text is searched with
  *  frontmatter included; the global budget is consumed IN WALK ORDER during
  *  the scan (a name-hit file walked after exhaustion keeps its hit but loses
@@ -467,6 +757,8 @@ const searchFiles = (files: MdFile[], rawQuery: string): SearchResponse => {
   const trimmed = rawQuery.trim();
   if (trimmed === "") return { hits: [], truncated: false, skippedFiles: 0 };
   const capped = Array.from(trimmed).slice(0, MAX_QUERY_CHARS).join("");
+  const tagQuery = parseTagQuery(capped);
+  if (tagQuery === null) return { hits: [], truncated: false, skippedFiles: 0 };
   const foldedQuery = fold(capped);
 
   const nameHits: FileHit[] = [];
@@ -485,14 +777,15 @@ const searchFiles = (files: MdFile[], rawQuery: string): SearchResponse => {
     const title = titleFrom(parsed.frontmatter, parsed.body, stem);
     // Name/title checks run for every file, even after the content budget is
     // exhausted — a name hit costs no match budget.
-    const nameMatch =
-      containsFolded(stem, foldedQuery) || containsFolded(title, foldedQuery);
+    const nameMatch = tagQuery === undefined &&
+      (containsFolded(stem, foldedQuery) || containsFolded(title, foldedQuery));
 
     const budget = Math.min(MAX_MATCHES_PER_FILE, MAX_TOTAL_MATCHES - total);
-    const [matches, clipped]: [SearchMatch[], boolean] =
-      budget === 0 && truncated
-        ? [[], false] // budget gone and truncation already known — skip the scan
-        : scanContent(file.content, foldedQuery, budget);
+    const [matches, clipped]: [SearchMatch[], boolean] = budget === 0 && truncated
+      ? [[], false] // budget gone and truncation already known — skip the scan
+      : tagQuery === undefined
+        ? scanContent(file.content, foldedQuery, budget)
+        : scanTags(file.content, tagQuery, budget);
     truncated = truncated || clipped;
     total += matches.length;
 

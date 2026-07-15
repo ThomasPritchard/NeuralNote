@@ -217,6 +217,19 @@ fn downmix_rejects_misaligned_or_non_finite_samples() {
 }
 
 #[test]
+fn unsupported_codec_message_is_actionable_and_keeps_technical_detail() {
+    let error = validate_aac_codec(CODEC_ID_PCM_S16LE).unwrap_err();
+    let detail = error.detail();
+
+    // The user gets an explanation and a next step, not just a codec string.
+    assert!(detail.contains("AAC-LC"), "{detail}");
+    assert!(detail.contains("captions"), "{detail}");
+    assert!(detail.contains("planned"), "{detail}");
+    // The diagnostic codec detail is still carried for logs.
+    assert!(detail.contains("Technical detail:"), "{detail}");
+}
+
+#[test]
 fn unsupported_decoder_feature_maps_to_unsupported_codec() {
     // HE-AAC remains simulated because FFmpeg's native AAC encoder cannot emit
     // SBR, and this repository has no provenance-cleared libfdk-aac fixture.

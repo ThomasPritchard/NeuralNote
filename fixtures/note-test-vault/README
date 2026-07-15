@@ -1,0 +1,6 @@
+# Extensionless README
+
+NeuralNote should render this extensionless text file as Markdown.
+
+- [ ] Heading rendered
+- [ ] Task controls available when supported for this file type

@@ -2341,6 +2341,7 @@ dependencies = [
  "chrono",
  "futures",
  "html-escape",
+ "icu_properties",
  "image",
  "log",
  "rubato",

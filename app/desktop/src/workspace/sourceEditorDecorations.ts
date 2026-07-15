@@ -1,5 +1,5 @@
 import { syntaxTree } from "@codemirror/language";
-import { StateEffect, type EditorState, type Extension } from "@codemirror/state";
+import { Prec, StateEffect, StateField, type EditorState, type Extension } from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
@@ -8,6 +8,7 @@ import {
   type ViewUpdate,
   WidgetType,
 } from "@codemirror/view";
+import { sourceFrontmatterRange } from "./sourceFrontmatterPreview";
 
 type SyntaxNode = ReturnType<typeof syntaxTree>["topNode"];
 
@@ -21,6 +22,12 @@ export interface PreviewDecoration {
   readonly label?: string;
   readonly checked?: boolean;
   readonly href?: string;
+  readonly table?: PreviewTable;
+}
+
+export interface PreviewTable {
+  readonly headers: readonly string[];
+  readonly rows: readonly (readonly string[])[];
 }
 
 export interface VisibleRange {
@@ -50,14 +57,63 @@ const MARKER_NAMES = new Set([
 
 export const refreshSourceEditorDecorations = StateEffect.define<null>();
 
+const TABLE_SCAN_MARGIN = 2_048;
+const INITIAL_TABLE_SCAN_LIMIT = 4_096;
+const MAX_TABLE_PREVIEW_CHARS = 32_768;
+const MAX_TABLE_PREVIEW_ROWS = 200;
+const updateSourceEditorTableViewport = StateEffect.define<readonly VisibleRange[]>();
+
+function mergeVisibleRanges(
+  ranges: readonly VisibleRange[],
+  docLength: number,
+  margin = 0,
+): VisibleRange[] {
+  const ordered = ranges
+    .map(({ from, to }) => ({
+      from: Math.max(0, Math.min(docLength, from - margin)),
+      to: Math.max(0, Math.min(docLength, to + margin)),
+    }))
+    .filter((range) => range.from <= range.to)
+    .sort((left, right) => left.from - right.from);
+  const merged: VisibleRange[] = [];
+  for (const range of ordered) {
+    const previous = merged.at(-1);
+    if (previous && range.from <= previous.to) {
+      merged[merged.length - 1] = { from: previous.from, to: Math.max(previous.to, range.to) };
+    } else {
+      merged.push(range);
+    }
+  }
+  return merged;
+}
+
 function insideVisibleRanges(from: number, to: number, ranges: readonly VisibleRange[]): boolean {
   return ranges.some((range) => from >= range.from && to <= range.to);
+}
+
+function intersectsVisibleRanges(from: number, to: number, ranges: readonly VisibleRange[]): boolean {
+  return ranges.some((range) => from < range.to && to > range.from);
 }
 
 function active(state: EditorState, from: number, to: number): boolean {
   return state.selection.ranges.some((range) =>
     range.empty ? range.head >= from && range.head < to : range.from < to && range.to > from,
   );
+}
+
+function activeLink(state: EditorState, from: number, to: number): boolean {
+  return active(state, from, to) || state.selection.ranges.some((range) =>
+    range.empty && range.head === to,
+  );
+}
+
+function headingLineActive(state: EditorState, from: number, to: number): boolean {
+  const firstLine = state.doc.lineAt(from).number;
+  const lastLine = state.doc.lineAt(to).number;
+  return state.selection.ranges.some((range) => {
+    const headLine = state.doc.lineAt(range.head).number;
+    return headLine >= firstLine && headLine <= lastLine;
+  });
 }
 
 function enclosingConstruct(node: SyntaxNode): SyntaxNode {
@@ -84,19 +140,80 @@ function completeFencedCode(node: SyntaxNode): boolean {
   return marks >= 2;
 }
 
+const HIDDEN_TABLE_INLINE_NODES = new Set([
+  "CodeMark",
+  "EmphasisMark",
+  "LinkMark",
+  "StrikethroughMark",
+]);
+
+function renderedInlineText(state: EditorState, node: SyntaxNode): string {
+  if (HIDDEN_TABLE_INLINE_NODES.has(node.name)) return "";
+  if (node.name === "URL" && (node.parent?.name === "Link" || node.parent?.name === "Image")) {
+    return "";
+  }
+  if (!node.firstChild) return state.sliceDoc(node.from, node.to);
+
+  let text = "";
+  let position = node.from;
+  let child: SyntaxNode | null = node.firstChild;
+  while (child) {
+    if (child.from > position) text += state.sliceDoc(position, child.from);
+    text += renderedInlineText(state, child);
+    position = child.to;
+    child = child.nextSibling;
+  }
+  if (position < node.to) text += state.sliceDoc(position, node.to);
+  return text;
+}
+
+function tableCells(state: EditorState, row: SyntaxNode): string[] {
+  const cells: string[] = [];
+  for (let child = row.firstChild; child; child = child.nextSibling) {
+    if (child.name === "TableCell") cells.push(renderedInlineText(state, child).trim());
+  }
+  return cells;
+}
+
+function tablePreview(state: EditorState, table: SyntaxNode): PreviewTable | null {
+  const header = table.getChild("TableHeader");
+  if (!header) return null;
+  const headers = tableCells(state, header);
+  if (headers.length === 0) return null;
+  const rows: string[][] = [];
+  for (let child = table.firstChild; child; child = child.nextSibling) {
+    if (child.name === "TableRow") {
+      if (rows.length >= MAX_TABLE_PREVIEW_ROWS) return null;
+      rows.push(tableCells(state, child));
+    }
+  }
+  return { headers, rows };
+}
+
 export function collectMarkdownPreview(
   state: EditorState,
   visibleRanges: readonly VisibleRange[] = [{ from: 0, to: state.doc.length }],
 ): PreviewDecoration[] {
   const output: PreviewDecoration[] = [];
+  const frontmatter = sourceFrontmatterRange(state);
+  const scanRanges = mergeVisibleRanges(visibleRanges, state.doc.length);
 
-  syntaxTree(state).iterate({
-    from: Math.min(...visibleRanges.map((range) => range.from)),
-    to: Math.max(...visibleRanges.map((range) => range.to)),
-    enter(ref) {
+  for (const scanRange of scanRanges) {
+    syntaxTree(state).iterate({
+      from: scanRange.from,
+      to: scanRange.to,
+      enter(ref) {
       const { node, name, from, to } = ref;
+      if (frontmatter && from >= frontmatter.from && to <= frontmatter.to) return false;
       const construct = enclosingConstruct(node);
-      const constructActive = active(state, construct.from, construct.to);
+      const headingConstruct = /^ATXHeading[1-6]$/.test(construct.name)
+        || /^SetextHeading[12]$/.test(construct.name);
+      const constructActive = (
+        construct.name === "Link"
+          ? activeLink(state, construct.from, construct.to)
+          : active(state, construct.from, construct.to)
+      )
+        || (headingConstruct && headingLineActive(state, construct.from, construct.to));
 
       if (/^ATXHeading[1-6]$/.test(name)) {
         const level = name.at(-1);
@@ -168,7 +285,13 @@ export function collectMarkdownPreview(
           label: `Image: ${label}`,
         });
       } else if (name === "Table") {
-        push(output, visibleRanges, { from, to, kind: "mark", className: "nn-lp-table" });
+        if (intersectsVisibleRanges(from, to, visibleRanges)) {
+          const table = to - from <= MAX_TABLE_PREVIEW_CHARS ? tablePreview(state, node) : null;
+          output.push(table && !active(state, from, to)
+            ? { from, to, kind: "widget", className: "nn-lp-table", table }
+            : { from, to, kind: "mark", className: "nn-lp-table-source" });
+        }
+        return false;
       } else if (MARKER_NAMES.has(name)) {
         const parent = enclosingConstruct(node);
         if (parent.name === "FencedCode" && !completeFencedCode(parent)) return;
@@ -179,8 +302,9 @@ export function collectMarkdownPreview(
           className: constructActive ? "nn-lp-marker-active" : "nn-lp-marker",
         });
       }
-    },
-  });
+      },
+    });
+  }
 
   return output;
 }
@@ -274,6 +398,56 @@ class TaskWidget extends WidgetType {
   }
 }
 
+class TableWidget extends WidgetType {
+  constructor(private readonly item: PreviewDecoration) {
+    super();
+  }
+
+  toDOM(view: EditorView): HTMLElement {
+    const wrapper = document.createElement("div");
+    wrapper.className = "nn-lp-table-widget";
+    const table = document.createElement("table");
+    table.className = this.item.className;
+    table.tabIndex = 0;
+    table.setAttribute("aria-label", "Markdown table");
+    table.title = "Click or press Enter to edit the Markdown source";
+
+    const head = table.createTHead();
+    const headerRow = head.insertRow();
+    for (const label of this.item.table?.headers ?? []) {
+      const cell = document.createElement("th");
+      cell.scope = "col";
+      cell.append(document.createTextNode(label));
+      headerRow.append(cell);
+    }
+
+    const body = table.createTBody();
+    for (const values of this.item.table?.rows ?? []) {
+      const row = body.insertRow();
+      for (const value of values) {
+        const cell = row.insertCell();
+        cell.append(document.createTextNode(value));
+      }
+    }
+
+    const activate = (event: Event) => {
+      event.preventDefault();
+      view.dispatch({ selection: { anchor: this.item.from }, scrollIntoView: true });
+      view.focus();
+    };
+    table.addEventListener("click", activate);
+    table.addEventListener("keydown", (event) => {
+      if (event.key === "Enter" || event.key === " ") activate(event);
+    });
+    wrapper.append(table);
+    return wrapper;
+  }
+
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
+
 function toggleTask(event: Event, view: EditorView): boolean {
   const element = (event.target as Element | null)?.closest<HTMLElement>("[data-nn-task-from]");
   if (!element) return false;
@@ -301,7 +475,7 @@ function toDecorationSet(
 ): DecorationSet {
   const result = safeCollectMarkdownPreview(view.state, view.visibleRanges);
   onError(result.error);
-  const ranges = result.decorations.map((item) => {
+  const ranges = result.decorations.filter((item) => !item.table).map((item) => {
     switch (item.kind) {
       case "line":
         return Decoration.line({ class: item.className }).range(item.from);
@@ -309,14 +483,17 @@ function toDecorationSet(
         return Decoration.replace({}).range(item.from, item.to);
       case "widget":
         return Decoration.replace({
-          widget: item.checked === undefined
-            ? new TextWidget(item.label ?? "", item.className)
-            : new TaskWidget(item),
+          widget: item.table
+            ? new TableWidget(item)
+            : item.checked === undefined
+              ? new TextWidget(item.label ?? "", item.className)
+              : new TaskWidget(item),
           inclusive: false,
         }).range(item.from, item.to);
       case "mark":
         {
-          const target = item.href ? options.resolveLink?.(item.href) : null;
+          const linkActive = view.hasFocus && activeLink(view.state, item.from, item.to);
+          const target = item.href && !linkActive ? options.resolveLink?.(item.href) : null;
           const headingLevel = /^nn-lp-heading-([1-6])$/.exec(item.className)?.[1];
           const attributes: Record<string, string> = {};
           if (headingLevel) {
@@ -325,7 +502,10 @@ function toDecorationSet(
           }
           if (target) {
             attributes["data-nn-markdown-target"] = target;
-            attributes.title = `Command/Control-click to open ${target}`;
+            attributes.title = `Open ${target}`;
+            attributes.role = "link";
+            attributes.tabindex = "0";
+            attributes["aria-keyshortcuts"] = "Enter";
           }
           return Decoration.mark({
             class: item.className,
@@ -337,11 +517,110 @@ function toDecorationSet(
   return Decoration.set(ranges, true);
 }
 
+function tableDecorationSet(
+  state: EditorState,
+  visibleRanges: readonly VisibleRange[],
+): DecorationSet {
+  if (visibleRanges.length === 0) return Decoration.none;
+  const scanRanges = mergeVisibleRanges(visibleRanges, state.doc.length, TABLE_SCAN_MARGIN);
+  const result = safeCollectMarkdownPreview(state, scanRanges);
+  const ranges = result.decorations.flatMap((item) => item.table
+    ? [Decoration.replace({
+        widget: new TableWidget(item),
+        inclusive: false,
+        block: true,
+      }).range(item.from, item.to)]
+    : []);
+  return Decoration.set(ranges, true);
+}
+
+interface TableDecorationState {
+  readonly decorations: DecorationSet;
+  readonly visibleRanges: readonly VisibleRange[];
+}
+
+const sourceEditorTableDecorations = StateField.define<TableDecorationState>({
+  create(state) {
+    const visibleRanges = [{ from: 0, to: Math.min(state.doc.length, INITIAL_TABLE_SCAN_LIMIT) }];
+    return { decorations: tableDecorationSet(state, visibleRanges), visibleRanges };
+  },
+  update(value, transaction) {
+    const viewport = transaction.effects.find((effect) => effect.is(updateSourceEditorTableViewport));
+    let visibleRanges = viewport?.value ?? value.visibleRanges;
+    if (transaction.docChanged && !viewport) {
+      visibleRanges = visibleRanges.map(({ from, to }) => ({
+        from: transaction.changes.mapPos(from, -1),
+        to: transaction.changes.mapPos(to, 1),
+      }));
+    }
+    if (!transaction.docChanged && !transaction.selection && !viewport) return value;
+    return {
+      visibleRanges,
+      decorations: tableDecorationSet(transaction.state, visibleRanges),
+    };
+  },
+  provide: (field) => EditorView.decorations.from(field, (value) => value.decorations),
+});
+
+const sourceEditorTableViewport = ViewPlugin.fromClass(class {
+  private rangeKey = "";
+
+  constructor(view: EditorView) {
+    this.schedule(view);
+  }
+
+  update(update: ViewUpdate): void {
+    if (update.docChanged || update.viewportChanged || update.geometryChanged) {
+      this.schedule(update.view);
+    }
+  }
+
+  private schedule(view: EditorView): void {
+    view.requestMeasure({
+      key: this,
+      read: (measuredView) => mergeVisibleRanges(
+        measuredView.visibleRanges,
+        measuredView.state.doc.length,
+      ),
+      write: (ranges, measuredView) => {
+        const key = ranges.map(({ from, to }) => `${from}:${to}`).join(",");
+        if (key === this.rangeKey) return;
+        this.rangeKey = key;
+        // A measurement write runs inside CodeMirror's update cycle. Defer the
+        // viewport effect so a sidebar resize cannot cause a nested update.
+        queueMicrotask(() => {
+          if (!measuredView.dom.isConnected) return;
+          measuredView.dispatch({ effects: updateSourceEditorTableViewport.of(ranges) });
+        });
+      },
+    });
+  }
+});
+
 export function sourceEditorDecorations(
   onError: (message: string | null) => void,
   options: SourceEditorDecorationOptions = {},
 ): Extension {
-  return ViewPlugin.fromClass(
+  const keyboardLinkHandler = Prec.highest(EditorView.domEventHandlers({
+    keydown(event) {
+      if (
+        event.key !== "Enter"
+        || event.altKey
+        || event.ctrlKey
+        || event.metaKey
+        || event.shiftKey
+      ) return false;
+      const element = (event.target as Element | null)?.closest<HTMLElement>(
+        "[data-nn-markdown-target]",
+      );
+      const target = element?.dataset.nnMarkdownTarget;
+      if (!target) return false;
+      event.preventDefault();
+      options.onOpenLink?.(target);
+      return true;
+    },
+  }));
+  const previewPlugin = ViewPlugin.fromClass(
     class {
       decorations: DecorationSet;
 
@@ -353,7 +632,13 @@ export function sourceEditorDecorations(
         const linksChanged = update.transactions.some((transaction) =>
           transaction.effects.some((effect) => effect.is(refreshSourceEditorDecorations))
         );
-        if (update.docChanged || update.viewportChanged || update.selectionSet || linksChanged) {
+        if (
+          update.docChanged
+          || update.viewportChanged
+          || update.selectionSet
+          || update.focusChanged
+          || linksChanged
+        ) {
           this.decorations = toDecorationSet(update.view, onError, options);
         }
       }
@@ -362,7 +647,18 @@ export function sourceEditorDecorations(
       decorations: (plugin) => plugin.decorations,
       eventHandlers: {
         mousedown(event) {
-          if (!event.metaKey && !event.ctrlKey) return false;
+          if (event.button !== 0) return false;
+          const element = (event.target as Element | null)?.closest<HTMLElement>(
+            "[data-nn-markdown-target]",
+          );
+          const target = element?.dataset.nnMarkdownTarget;
+          if (!target) return false;
+          event.preventDefault();
+          options.onOpenLink?.(target);
+          return true;
+        },
+        click(event) {
+          if (event.detail !== 0) return false;
           const element = (event.target as Element | null)?.closest<HTMLElement>(
             "[data-nn-markdown-target]",
           );
@@ -375,4 +671,10 @@ export function sourceEditorDecorations(
       },
     },
   );
+  return [
+    sourceEditorTableDecorations,
+    sourceEditorTableViewport,
+    keyboardLinkHandler,
+    previewPlugin,
+  ];
 }
