@@ -28,8 +28,13 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
   Rust workspace tests, Clippy, rustfmt, generated-binding drift, and full-history Gitleaks.
   These checks are secret-free and must pass before merge.
 - **Rust-native gate** — `./scripts/rust-quality-gate.sh` prints **GREEN (all categories
-  enforced)**: `clippy -D warnings`, `rustfmt --check`, `cargo llvm-cov --fail-under-lines 90`,
-  `cargo-audit`. A SKIPPED category (e.g. audit offline) is **not** green — re-run with network.
+  enforced)** and exits `0`: `clippy -D warnings`, `rustfmt --check`, `cargo llvm-cov
+  --fail-under-lines 90`, `cargo-audit`. The exit code is the contract automation reads:
+  `0` GREEN (every category ran and passed), `1` RED (real findings — a code verdict), `2`
+  INCOMPLETE (a required category could not run — the tool is absent or the advisory DB was
+  unreachable/offline). **INCOMPLETE is not green:** the gate exits non-zero (`2`) and never
+  prints GREEN, so an incomplete run can't be mistaken for a pass — re-run with the tooling
+  installed and network before trusting it.
 - **Main branch CI** — all frontend tests including mockIPC journeys, frontend and Rust
   90 % line-coverage gates, production build, dependency audits, and the Linux/Windows native
   WebDriver matrix. A red post-merge check blocks release readiness and is fixed immediately.

@@ -192,6 +192,10 @@ jobs:
           npm --prefix app/desktop run check:bindings
           npm --prefix app/desktop run audit:all
           cargo test --workspace --locked
+          # Gate exit codes: 0 GREEN, 1 RED (findings), 2 INCOMPLETE (a required
+          # category could not run — tool absent or advisory DB offline). Under
+          # `set -e` any non-zero (RED *or* INCOMPLETE) fails the release, which is
+          # intended: a release must not proceed on an unenforced gate.
           ./scripts/rust-quality-gate.sh
 
       - name: Validate public release configuration
