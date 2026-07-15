@@ -25,7 +25,8 @@ import type { NoteDoc, TreeNode, WorkspaceState } from "../lib/types";
 import { ChatPane } from "./ChatPane";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { FileTree } from "./FileTree";
-import { normSep } from "./fileMeta";
+import { normSep, parentRelPath, vaultRelPath } from "./fileMeta";
+import { useVaultTree } from "./useVaultTree";
 import { GraphView } from "./GraphView";
 import { buildNoteIndex, type NoteIndexEntry } from "./linkResolve";
 import { NotePane } from "./NotePane";
@@ -122,8 +123,11 @@ function describeDiscard(intent: PendingIntent, dirtyTabCount: number): string {
 export function Workspace() {
   const {
     vault,
-    tree,
-    refreshTree,
+    loaded,
+    expanded,
+    listDir,
+    toggle,
+    refreshDir,
     close,
     openExisting,
     openByPath,
@@ -131,6 +135,17 @@ export function Workspace() {
     clearError,
     reportError,
   } = useVault();
+  // The lazy store (issue #40) no longer holds the whole tree — it loads
+  // directories on demand for the FileTree DISPLAY. But wikilink/`[[` resolution
+  // (buildNoteIndex), the status-bar counts, and the template folder picker all
+  // need the WHOLE vault (a link into an unexpanded folder must still resolve —
+  // moat-adjacent). This keeps a full read_tree for those consumers only, while
+  // the sidebar tree stays lazy. `reportError` is a stable useCallback, so this
+  // doesn't re-read every render.
+  const { tree: fullTree, refresh: refreshFullTree } = useVaultTree(
+    vault?.path,
+    reportError,
+  );
   const toast = useToast();
   const noteTabs = useNoteTabs();
   const open = noteTabs.active;
@@ -415,7 +430,7 @@ export function Workspace() {
     [openNoteAt, vaultPath],
   );
 
-  /** Wikilink/markdown-link resolution index over the loaded tree, shared by
+  /** Wikilink/markdown-link resolution index over the full vault tree, shared by
    *  the reader (clickable links) and editor (`[[` autocomplete). Memoized on
    *  the tree — it only rebuilds when the vault actually rescans. */
   const noteIndex = useMemo<NoteIndexEntry[]>(() => {
@@ -426,9 +441,9 @@ export function Workspace() {
       path: vault.path,
       relPath: "",
       ext: null,
-      children: tree,
+      children: fullTree,
     });
-  }, [vault, tree]);
+  }, [vault, fullTree]);
 
   const handleSelect = useCallback(
     (path: string, forceNew: boolean) => {
@@ -478,7 +493,8 @@ export function Workspace() {
             name,
             template,
           );
-          await refreshTree();
+          // Re-list just the destination folder (targeted, per spec §CRUD).
+          if (vaultPath) await refreshDir(vaultRelPath(parentPath, vaultPath));
           setTemplateInsertOpen(false);
           openNoteAt(created.path);
         } catch (error) {
@@ -486,7 +502,7 @@ export function Workspace() {
         }
       })();
     },
-    [openNoteAt, refreshTree, reportError],
+    [openNoteAt, refreshDir, reportError, vaultPath],
   );
   const handleCloseSettings = useCallback(() => {
     setSettingsOpen(false);
@@ -521,6 +537,17 @@ export function Workspace() {
     [],
   );
   const consumeCreate = useCallback(() => setPendingCreate(null), []);
+
+  // Manual "Refresh" (Ribbon): re-list every currently-loaded directory in
+  // place. Unexpanded folders aren't loaded, so there's nothing to refresh for
+  // them — they fetch fresh on their next expand. Also re-read the whole-vault
+  // tree that feeds the wikilink index, counts, and template picker — the manual
+  // refresh must NOT depend on the disk watcher (working around a dead watcher is
+  // exactly why this button exists), or those consumers would stay silently stale.
+  const handleRefreshTree = useCallback(() => {
+    for (const relPath of loaded.keys()) void refreshDir(relPath);
+    refreshFullTree();
+  }, [loaded, refreshDir, refreshFullTree]);
 
   /** Arm an inline create in the FileTree and select its owning Files pane. */
   const startCreate = useCallback((kind: CreateKind) => {
@@ -583,14 +610,15 @@ export function Workspace() {
         case "delete-entry":
           try {
             await api.deleteEntry(intent.node.path);
-            await refreshTree();
+            // Re-list just the deleted entry's parent folder (per spec §CRUD).
+            await refreshDir(parentRelPath(intent.node.relPath));
             noteTabsRef.current.removeDescendants(intent.node.path);
           } catch (deleteError) {
             toast.error(api.errorMessage(deleteError));
           }
       }
     },
-    [close, closeWindow, openByPath, openExisting, refreshTree, toast],
+    [close, closeWindow, openByPath, openExisting, refreshDir, toast],
   );
 
   const requestIntent = useCallback(
@@ -858,7 +886,7 @@ export function Workspace() {
           onToggleGraph={handleToggleGraph}
           onNewNote={() => startCreate("note")}
           onNewFolder={() => startCreate("folder")}
-          onRefresh={() => void refreshTree()}
+          onRefresh={handleRefreshTree}
           onCloseVault={handleCloseVault}
         />
         <div
@@ -874,9 +902,12 @@ export function Workspace() {
           >
             <FileTree
               vaultPath={vault.path}
-              tree={tree}
               activePath={open.path}
-              refreshTree={refreshTree}
+              loaded={loaded}
+              expanded={expanded}
+              onToggle={toggle}
+              onListDir={listDir}
+              onRefreshDir={refreshDir}
               onSelect={handleSelect}
               onDeleteRequest={handleDeleteRequest}
               onRemap={handleRemap}
@@ -954,7 +985,7 @@ export function Workspace() {
         </div>
       </div>
 
-      <StatusBar vaultName={vault.name} tree={tree} note={open.note} />
+      <StatusBar vaultName={vault.name} tree={fullTree} note={open.note} />
 
       <SettingsModal
         open={settingsOpen}
@@ -965,7 +996,7 @@ export function Workspace() {
         open={templateInsertOpen}
         templates={templates}
         vaultPath={vault.path}
-        tree={tree}
+        tree={fullTree}
         onCreate={handleCreateFromTemplate}
         onClose={() => setTemplateInsertOpen(false)}
       />

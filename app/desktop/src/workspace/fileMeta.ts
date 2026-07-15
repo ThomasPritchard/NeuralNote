@@ -124,6 +124,26 @@ export function isPathInside(child: string, parent: string): boolean {
   return c === p || c.startsWith(`${p}/`);
 }
 
+/** The vault-root-relative path of an absolute path — the key the lazy store's
+ *  `loaded`/`expanded` maps use (`""` for the root itself). Separator-agnostic.
+ *  A path that isn't under the root is returned normalised but unchanged (a
+ *  defensive no-op — callers only pass in-vault paths). */
+export function vaultRelPath(absPath: string, vaultRoot: string): string {
+  const abs = normSep(absPath);
+  const root = normSep(vaultRoot).replace(/\/+$/, "");
+  if (abs === root) return "";
+  return abs.startsWith(`${root}/`) ? abs.slice(root.length + 1) : abs;
+}
+
+/** The parent directory of a vault-relative path, as a relPath (`""` = root).
+ *  `"Notes/a.md" → "Notes"`, `"a.md" → ""`. Used to target the folder a lazy
+ *  `refreshDir` must re-list after a CRUD op. */
+export function parentRelPath(relPath: string): string {
+  const rel = normSep(relPath);
+  const slash = rel.lastIndexOf("/");
+  return slash < 0 ? "" : rel.slice(0, slash);
+}
+
 /**
  * Re-point an open note's path after its file (or an ancestor folder) is moved
  * or renamed from `oldPath` to `newPath`. Returns the new path, or null when the

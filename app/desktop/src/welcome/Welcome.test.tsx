@@ -13,7 +13,10 @@ function ctx(over: Partial<VaultContextValue> = {}): VaultContextValue {
   return {
     status: "welcome",
     vault: null,
-    tree: [],
+    // Lazy file-tree store surface (issue #40): per-directory listings +
+    // expanded set, not one eager tree.
+    loaded: new Map(),
+    expanded: new Set(),
     recents: [],
     error: null,
     clearError: vi.fn(),
@@ -24,7 +27,9 @@ function ctx(over: Partial<VaultContextValue> = {}): VaultContextValue {
     pickNewLocation: vi.fn().mockResolvedValue(null),
     createVault: vi.fn().mockResolvedValue(undefined),
     close: vi.fn().mockResolvedValue(undefined),
-    refreshTree: vi.fn().mockResolvedValue(undefined),
+    listDir: vi.fn().mockResolvedValue(undefined),
+    toggle: vi.fn(),
+    refreshDir: vi.fn().mockResolvedValue(undefined),
     ...over,
   };
 }

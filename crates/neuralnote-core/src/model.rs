@@ -43,7 +43,12 @@ pub struct TreeNode {
     /// Lowercased file extension without the dot (files only; `None` for folders).
     pub ext: Option<String>,
     /// Child nodes (folders only; `None` for files), folders-first then files,
-    /// each group sorted case-insensitively by name.
+    /// each group sorted case-insensitively by name. NOTE the overload: from the
+    /// eager [`crate::tree::read_tree`] a folder's `None` never occurs (it carries
+    /// `Some`, empty for an empty folder), but from the lazy
+    /// [`crate::tree::list_dir`] a folder carries `None` to mean "not loaded yet".
+    /// So `children.unwrap_or_default()` is a correct note-count ONLY over an eager
+    /// tree; never treat a lazy node's `None` as "empty folder".
     pub children: Option<Vec<TreeNode>>,
 }
 

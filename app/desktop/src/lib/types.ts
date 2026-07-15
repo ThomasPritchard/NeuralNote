@@ -12,6 +12,7 @@
 export type { Vault } from "./bindings/Vault";
 export type { EntryKind } from "./bindings/EntryKind";
 export type { TreeNode } from "./bindings/TreeNode";
+export type { DirListing } from "./bindings/DirListing";
 export type { NoteDoc } from "./bindings/NoteDoc";
 export type { RecentVault } from "./bindings/RecentVault";
 export type { TemplateInfo } from "./bindings/TemplateInfo";

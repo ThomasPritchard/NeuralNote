@@ -1,8 +1,17 @@
-// The vault store: lifecycle (welcome → loading → open), the file tree, recent
-// vaults, and a single error channel. This is frozen integration glue — the
-// welcome screen and the workspace both consume `useVault()`; neither should
-// reach past it to `invoke` for vault lifecycle. (Note read/write is done
-// directly via `api` in the workspace, with `refreshTree()` to resync.)
+// The vault store: lifecycle (welcome → loading → open), the LAZY file tree,
+// recent vaults, and a single error channel. This is frozen integration glue —
+// the welcome screen and the workspace both consume `useVault()`; neither should
+// reach past it to `invoke` for vault lifecycle.
+//
+// Lazy file tree (issue #40): instead of one eager `read_tree` walk of the whole
+// vault, the store loads directories on demand. `loaded` caches each directory's
+// immediate children keyed by relPath ("" = root); `expanded` is the set of
+// folders the user has opened (persisted per vault, so expansions survive a
+// restart). Expanding a folder is what triggers its `list_dir` fetch. This is
+// DISPLAY-only: search, the link graph, backlinks, and AI retrieval keep scanning
+// the WHOLE vault through their own commands — nothing here ever narrows them to
+// the loaded subset, so a file behind an unexpanded folder or a truncation is
+// still found and still cited.
 
 import {
   createContext,
@@ -17,14 +26,36 @@ import {
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import * as api from "./api";
 import { errorMessage } from "./api";
+import { loadExpanded, saveExpanded } from "../workspace/treeState";
 import type { RecentVault, TreeNode, Vault } from "./types";
 
 export type VaultStatus = "welcome" | "loading" | "open";
 
+/** Load state of one directory's immediate children. `loading` while its
+ *  `list_dir` fetch is in flight, `error` when it failed (rendered as a
+ *  per-folder row, never a whole-tree failure). */
+export type DirStatus = LoadedDir["status"];
+
+/** One directory's cached listing for the lazy tree — a discriminated union so a
+ *  status can never carry the wrong payload (an `error` always has its message; a
+ *  `loaded` always has `children` + `truncated`; a `loading` carries neither,
+ *  which the flatten walk renders as a loading row). `children` are the
+ *  directory's immediate entries (folders carry `children: null` until themselves
+ *  expanded); `truncated` is how many further entries the per-directory cap
+ *  omitted, driving an explicit "N more…" row. */
+export type LoadedDir =
+  | { status: "loading" }
+  | { status: "loaded"; children: TreeNode[]; truncated: number | null }
+  | { status: "error"; error: string };
+
 export interface VaultContextValue {
   status: VaultStatus;
   vault: Vault | null;
-  tree: TreeNode[];
+  /** Per-directory listings, keyed by relPath ("" = root). Read-only to consumers
+   *  — mutate only through `listDir` / `toggle` / `refreshDir`. */
+  loaded: ReadonlyMap<string, LoadedDir>;
+  /** Folder relPaths the user has expanded (persisted per vault). */
+  expanded: ReadonlySet<string>;
   recents: RecentVault[];
   error: string | null;
   clearError: () => void;
@@ -42,8 +73,15 @@ export interface VaultContextValue {
   createVault: (parentDir: string, name: string) => Promise<void>;
   /** Close the current vault and return to the welcome screen. */
   close: () => Promise<void>;
-  /** Re-read the file tree from disk. */
-  refreshTree: () => Promise<void>;
+  /** Fetch + cache one directory's children (shows a loading row while in
+   *  flight, then a loaded/error listing). Used to populate a folder on expand. */
+  listDir: (relPath: string) => Promise<void>;
+  /** Expand a folder (fetching it if not yet loaded) or collapse it (keeping its
+   *  cached children for an instant re-expand). Persists the expanded set. */
+  toggle: (relPath: string) => void;
+  /** Re-list one already-loaded directory in place, without a loading flicker —
+   *  the CRUD refresh and the external-change watcher use this. */
+  refreshDir: (relPath: string) => Promise<void>;
 }
 
 const VaultContext = createContext<VaultContextValue | null>(null);
@@ -51,10 +89,25 @@ const VaultContext = createContext<VaultContextValue | null>(null);
 export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
   const [status, setStatus] = useState<VaultStatus>("welcome");
   const [vault, setVault] = useState<Vault | null>(null);
-  const [tree, setTree] = useState<TreeNode[]>([]);
+  const [loaded, setLoaded] = useState<ReadonlyMap<string, LoadedDir>>(new Map());
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
   const [recents, setRecents] = useState<RecentVault[]>([]);
   const [error, setError] = useState<string | null>(null);
   const quitRequestedRef = useRef(false);
+
+  // Latest-value refs so the stable `toggle` / watcher callbacks can read current
+  // `loaded` / `expanded` without being re-created (and re-subscribing) on every
+  // directory load. Assigned during render, the standard "current value" pattern.
+  const loadedRef = useRef(loaded);
+  loadedRef.current = loaded;
+  const expandedRef = useRef(expanded);
+  expandedRef.current = expanded;
+
+  // Bumped every time the open vault changes (open/create/close reset `loaded`).
+  // A `list_dir` fetch captures the generation at dispatch and drops its write if
+  // the vault has since changed — so a slow response from a closed vault can never
+  // poison the reopened tree (the same guard `useVaultTree` applies via `cancelled`).
+  const generationRef = useRef(0);
 
   const clearError = useCallback(() => setError(null), []);
   const reportError = useCallback((message: string) => setError(message), []);
@@ -67,13 +120,96 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
     }
   }, []);
 
-  const refreshTree = useCallback(async () => {
+  // Core per-directory fetch. `showLoading` swaps the folder to a loading row
+  // first (fresh expand); leaving it false re-lists in place, keeping the current
+  // children visible until the new listing lands (CRUD + watcher refresh, so an
+  // external edit never flickers every open folder). A failed listing becomes a
+  // per-folder error row — NOT the global error channel — so siblings and the
+  // rest of the tree stay usable; the failure is surfaced in the row, not
+  // swallowed.
+  const fetchDir = useCallback(async (relPath: string, showLoading: boolean) => {
+    const generation = generationRef.current;
+    if (showLoading) {
+      setLoaded((prev) => {
+        const next = new Map(prev);
+        next.set(relPath, { status: "loading" });
+        return next;
+      });
+    }
     try {
-      setTree(await api.readTree());
+      const listing = await api.listDir(relPath);
+      // The vault changed while this was in flight — its result belongs to a
+      // vault that is no longer open, so dropping it keeps the new tree clean.
+      if (generationRef.current !== generation) return;
+      setLoaded((prev) => {
+        const next = new Map(prev);
+        next.set(relPath, {
+          status: "loaded",
+          children: listing.entries,
+          truncated: listing.truncated,
+        });
+        return next;
+      });
     } catch (e) {
-      setError(errorMessage(e));
+      if (generationRef.current !== generation) return;
+      if (!showLoading) {
+        // An in-place refresh (CRUD/watcher) failed: the folder is fine on disk
+        // and its last-good children are still cached, so collapsing it to a
+        // single error row would misrepresent it. Keep the children visible and
+        // surface the failure once on the shared channel — never swallowed.
+        setError(errorMessage(e));
+        return;
+      }
+      setLoaded((prev) => {
+        const next = new Map(prev);
+        next.set(relPath, { status: "error", error: errorMessage(e) });
+        return next;
+      });
     }
   }, []);
+
+  const listDir = useCallback(
+    (relPath: string) => fetchDir(relPath, true),
+    [fetchDir],
+  );
+
+  const refreshDir = useCallback(
+    (relPath: string) => fetchDir(relPath, false),
+    [fetchDir],
+  );
+
+  const toggle = useCallback(
+    (relPath: string) => {
+      const willExpand = !expandedRef.current.has(relPath);
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        if (willExpand) next.add(relPath);
+        else next.delete(relPath);
+        return next;
+      });
+      // Fetch on first expand only; a cached (or in-flight) folder re-reveals
+      // instantly. Persistence is handled by the effect below.
+      if (willExpand && !loadedRef.current.has(relPath)) void listDir(relPath);
+    },
+    [listDir],
+  );
+
+  // Load the root, then re-open + fetch every persisted-expanded folder, so the
+  // user's expansions are restored on open. Root is awaited (first paint waits on
+  // it); the persisted subfolders stream in behind (each shows its own loading
+  // row). `listDir` swallows per-folder failures into error rows, so this never
+  // rejects.
+  const openTree = useCallback(
+    async (vaultPath: string) => {
+      const persisted = loadExpanded(vaultPath);
+      generationRef.current += 1; // invalidate any in-flight fetch from a prior vault
+      setLoaded(new Map());
+      setExpanded(persisted);
+      await listDir("");
+      void Promise.all([...persisted].map((relPath) => listDir(relPath)));
+    },
+    [listDir],
+  );
 
   const openByPath = useCallback(
     async (path: string) => {
@@ -82,7 +218,7 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
       try {
         const opened = await api.openVault(path);
         setVault(opened);
-        setTree(await api.readTree());
+        await openTree(opened.path);
         setStatus("open");
       } catch (e) {
         setError(errorMessage(e));
@@ -90,7 +226,7 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
         void refreshRecents();
       }
     },
-    [refreshRecents],
+    [openTree, refreshRecents],
   );
 
   const openExisting = useCallback(async () => {
@@ -118,14 +254,14 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
       try {
         const created = await api.createVault(parentDir, name);
         setVault(created);
-        setTree(await api.readTree());
+        await openTree(created.path);
         setStatus("open");
       } catch (e) {
         setError(errorMessage(e));
         setStatus("welcome");
       }
     },
-    [],
+    [openTree],
   );
 
   const close = useCallback(async () => {
@@ -135,20 +271,42 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
       setError(errorMessage(e));
     }
     setVault(null);
-    setTree([]);
+    generationRef.current += 1; // invalidate any in-flight fetch from the closed vault
+    setLoaded(new Map());
+    setExpanded(new Set());
     setStatus("welcome");
     void refreshRecents();
   }, [refreshRecents]);
+
+  // Refresh every currently-loaded directory in place — the debounced watcher's
+  // response to an external change. Bounded by what the user has expanded; reads
+  // the live loaded set through the ref so it needn't re-subscribe as folders
+  // load.
+  const refreshAllLoaded = useCallback(async () => {
+    await Promise.all(
+      [...loadedRef.current.keys()].map((relPath) => refreshDir(relPath)),
+    );
+  }, [refreshDir]);
 
   // Load recent vaults on first mount.
   useEffect(() => {
     void refreshRecents();
   }, [refreshRecents]);
 
-  // While a vault is open, re-read the tree when it changes on disk (debounced to
-  // coalesce bursts like a git pull or Obsidian sync). This is the backstop for
-  // *external* edits; in-app create/rename/move/delete refresh themselves, so a
-  // dead watcher degrades only live external sync, never in-app consistency.
+  // Persist the expanded set whenever it changes while a vault is open. Cheap (a
+  // short array) and idempotent, so the redundant write right after open is
+  // harmless; the welcome/loading guard stops `close`'s reset from clobbering the
+  // persisted set with an empty one.
+  useEffect(() => {
+    if (status !== "open" || !vault) return;
+    saveExpanded(vault.path, expanded);
+  }, [status, vault, expanded]);
+
+  // While a vault is open, re-list the loaded directories when the vault changes
+  // on disk (debounced to coalesce bursts like a git pull or Obsidian sync). This
+  // is the backstop for *external* edits; in-app create/rename/move/delete refresh
+  // their own parent, so a dead watcher degrades only live external sync, never
+  // in-app consistency.
   useEffect(() => {
     if (status !== "open") return;
     let cancelled = false;
@@ -162,7 +320,7 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
         // Deferred — round-10; fix by also reloading the open note when its file
         // changes on disk (debounced, draft-preserving).
         if (timer) clearTimeout(timer);
-        timer = setTimeout(() => void refreshTree(), 300);
+        timer = setTimeout(() => void refreshAllLoaded(), 300);
       })
       .then((fn) => {
         // If the effect was already torn down before listen() resolved, unlisten
@@ -180,7 +338,7 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
       if (timer) clearTimeout(timer);
       unlisten?.();
     };
-  }, [status, refreshTree]);
+  }, [status, refreshAllLoaded]);
 
   // Native menu → vault lifecycle. Open Vault / Open Recent must work on the
   // welcome screen, before any vault is open — so they live here in the always-
@@ -227,7 +385,8 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
     () => ({
       status,
       vault,
-      tree,
+      loaded,
+      expanded,
       recents,
       error,
       clearError,
@@ -238,12 +397,15 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
       pickNewLocation,
       createVault,
       close,
-      refreshTree,
+      listDir,
+      toggle,
+      refreshDir,
     }),
     [
       status,
       vault,
-      tree,
+      loaded,
+      expanded,
       recents,
       error,
       clearError,
@@ -254,7 +416,9 @@ export function VaultProvider({ children }: Readonly<{ children: ReactNode }>) {
       pickNewLocation,
       createVault,
       close,
-      refreshTree,
+      listDir,
+      toggle,
+      refreshDir,
     ],
   );
 
