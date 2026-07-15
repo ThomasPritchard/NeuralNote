@@ -1,4 +1,14 @@
 //! Streaming sample-rate conversion and Whisper-compatible WAV emission.
+//!
+//! Coverage note (issue #55): this module deliberately sits below the 90%
+//! line-coverage target. The uncovered lines are defensive guards that are
+//! unreachable with valid inputs and cannot be exercised without a mock
+//! resampler/allocator seam we chose not to add to this security-sensitive
+//! path: the `checked_add`/`checked_mul` overflow arms (would need ~usize::MAX
+//! samples), the `try_reserve` allocation-failure arms, the "flush made no
+//! progress" guard, and the `InterleavedSlice`/`process_into_buffer`
+//! error arms on buffers this code always sizes correctly. See
+//! `docs/security/dependency-advisories.md` neighbours for the auditing stance.
 
 use super::{validate_frame_budget, MAX_AUDIO_DURATION_SECONDS};
 use crate::capture::CaptureError;

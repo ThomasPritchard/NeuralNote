@@ -245,3 +245,120 @@ fn workspace_state_io_failures_are_explicit() {
         .to_string()
         .contains("could not replace workspace state"));
 }
+
+/// True when the filesystem enforces the restrictive permission bits the
+/// permission tests rely on (running as root bypasses them).
+#[cfg(unix)]
+fn permission_restrictions_apply() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    fs::set_permissions(file.path(), fs::Permissions::from_mode(0o000)).unwrap();
+    fs::read(file.path()).is_err()
+}
+
+#[test]
+fn a_neuralnote_state_dir_that_is_a_regular_file_is_an_explicit_error() {
+    let vault = tempfile::tempdir().unwrap();
+    // `.neuralnote` is meant to be the state *directory*; a plain file there must
+    // fail loudly on both the read and the write path, never be treated as usable.
+    fs::write(vault.path().join(".neuralnote"), "not a directory").unwrap();
+
+    let load_error = load_workspace_state(vault.path()).unwrap_err();
+    let reset_error = reset_workspace_state(vault.path()).unwrap_err();
+
+    assert!(load_error.to_string().contains("not a directory"));
+    assert!(reset_error.to_string().contains("not a directory"));
+}
+
+#[test]
+fn a_valid_but_oversized_state_is_refused_before_it_is_written() {
+    let vault = tempfile::tempdir().unwrap();
+    // Every path here is individually valid (relative, normalised, unique, and
+    // confined), so validation passes — only the serialized-size guard should
+    // reject the whole document for exceeding the 64 KiB budget.
+    let paths: Vec<String> = (0..4_000)
+        .map(|index| format!("note-{index:06}.md"))
+        .collect();
+    let refs: Vec<&str> = paths.iter().map(String::as_str).collect();
+
+    let error = save_workspace_state(vault.path(), &state(&refs, None)).unwrap_err();
+
+    assert!(error.to_string().contains("cannot exceed"));
+    assert!(!vault.path().join(".neuralnote").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_dangling_state_symlink_enters_recovery_instead_of_failing() {
+    use std::os::unix::fs::symlink;
+
+    let vault = tempfile::tempdir().unwrap();
+    fs::create_dir(vault.path().join(".neuralnote")).unwrap();
+    // A symlink whose target does not exist: `canonicalize` fails, so the entry
+    // cannot be resolved to a confined regular file and must degrade to recovery
+    // rather than propagate a raw I/O error.
+    symlink(
+        vault.path().join("missing-target.json"),
+        vault.path().join(".neuralnote/workspace-state.json"),
+    )
+    .unwrap();
+
+    let loaded = load_workspace_state(vault.path()).unwrap();
+
+    assert!(loaded.recovered_from_corrupt);
+    assert_eq!(loaded.state, WorkspaceState::default());
+}
+
+#[cfg(unix)]
+#[test]
+fn a_state_file_that_cannot_be_stat_ed_surfaces_a_read_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !permission_restrictions_apply() {
+        return;
+    }
+    let vault = tempfile::tempdir().unwrap();
+    fs::create_dir(vault.path().join(".neuralnote")).unwrap();
+    fs::write(vault.path().join(".neuralnote/workspace-state.json"), "{}").unwrap();
+    // Remove search permission on the state directory: the file still exists but
+    // its metadata cannot be read, which must surface as an explicit read error.
+    fs::set_permissions(
+        vault.path().join(".neuralnote"),
+        fs::Permissions::from_mode(0o600),
+    )
+    .unwrap();
+
+    let result = load_workspace_state(vault.path());
+
+    fs::set_permissions(
+        vault.path().join(".neuralnote"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("could not read workspace state"));
+}
+
+#[cfg(unix)]
+#[test]
+fn a_read_only_vault_root_surfaces_the_state_dir_creation_failure() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !permission_restrictions_apply() {
+        return;
+    }
+    let vault = tempfile::tempdir().unwrap();
+    // The `.neuralnote` directory does not exist yet, and the root is read-only,
+    // so the reset write path cannot create it and must say so.
+    fs::set_permissions(vault.path(), fs::Permissions::from_mode(0o555)).unwrap();
+
+    let result = reset_workspace_state(vault.path());
+
+    fs::set_permissions(vault.path(), fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(result
+        .unwrap_err()
+        .to_string()
+        .contains("could not create workspace state directory"));
+}
