@@ -70,8 +70,16 @@ mod ytdlp_tests;
 mod pot_tests;
 
 #[cfg(test)]
+#[path = "live_eval.rs"]
+mod live_eval;
+
+#[cfg(test)]
 #[path = "live_tests.rs"]
 mod live_tests;
+
+#[cfg(test)]
+#[path = "audio_coverage_harness.rs"]
+mod audio_coverage_harness;
 
 #[cfg(test)]
 #[path = "service_tests.rs"]

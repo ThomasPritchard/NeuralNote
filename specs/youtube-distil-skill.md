@@ -249,6 +249,46 @@ built at all (YAGNI: if the m4a rendition is effectively universal, the fallback
 a trigger, not day-one code). `rubato`'s exact resampler API is an implementation-plan detail to
 verify then, not asserted here.
 
+### 4.6 Spike 4 resolved — measurement, threshold, and the fallback decision (#38 → #59)
+
+Spike 4 is delivered as a **measure-and-decide** slice, not a blind ffmpeg build.
+
+**What ships now (#38).** A deterministic, pure classifier (`capture::audio_coverage`,
+`classify_audio_coverage`) maps a video's yt-dlp audio renditions onto the decoder's real
+capability, unit-tested offline with fixture format lists:
+
+- `aac_lc_m4a` — has an `mp4a.40.2` m4a rendition; **decodable today**.
+- `he_aac` — best m4a is HE-AAC (`mp4a.40.5` / `mp4a.40.29`); the LC decoder rejects it.
+- `opus` — no usable m4a; audio is Opus (WebM/Ogg), which symphonia cannot decode.
+- `no_m4a` — audio exists but neither a decodable m4a nor Opus (e.g. Vorbis, or progressive-only).
+- `other` — no audio renditions listed, or a runtime decode failure the listing can't predict
+  (a data-quality bucket, excluded from the undecodable rate).
+
+A runnable, `#[ignore]`-gated harness (`youtube_audio_coverage_report`, in the desktop crate)
+runs yt-dlp format listing over a URL sample, classifies each video via the core classifier, and
+prints per-class counts + rates plus the threshold decision. It mirrors the repo's live-eval
+gating: it skips unless yt-dlp is **proven runnable** (a bounded `--version` probe, not mere
+presence) *and* a non-empty URL sample is supplied (`NN_AUDIO_COVERAGE_URLS`, else a checked-in
+seed). It never touches the network in the default `cargo test` run.
+
+**The written threshold.** Add the consented ffmpeg fallback when a representative sample
+(**≥ 50 captionless videos** spanning the target content classes) shows that **> 10 % lack a
+decodable AAC-LC m4a rendition** (no-m4a + HE-AAC + Opus combined), **OR any single class**
+(HE-AAC, Opus, or no-m4a) **individually exceeds 5 %**. These bounds live in code as
+`UNDECODABLE_COMBINED_THRESHOLD`, `SINGLE_CLASS_THRESHOLD`, and `MIN_REPRESENTATIVE_SAMPLE`, and
+`CoverageTally::fallback_triggered` is the single source of truth the harness prints.
+
+**The decision.** The product direction is to **implement the consented ffmpeg fallback.** But the
+actual binary integration — pinning, downloading, and executing a third-party LGPL ffmpeg build on
+untrusted media — is **deferred to a dedicated follow-up (#59)** so it lands with real sample data
+and a focused security review rather than blind. #38 delivers the measurement harness, the
+threshold, this decision record, and an **actionable interim limitation**: until #59, a video with
+no decodable AAC-LC m4a fails with `unsupported_audio_codec` whose message explains the video's
+audio isn't in the supported format, suggests trying a captioned video or a different source, and
+notes ffmpeg support is planned. The trigger is recorded at the code site
+(`capture/audio.rs::unsupported_codec`, `TODO(ffmpeg-fallback, #59)`), pointing back at the harness
+and this threshold.
+
 ## 5. Timestamped citation comes for free — the argument that justifies the rewrite
 
 Citations are line-based today: `EvidenceSpan` carries `rel_path`, `start_line`, `end_line`,
