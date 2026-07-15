@@ -9,7 +9,9 @@ import {
   isPathInside,
   isTextLikeExt,
   normSep,
+  parentRelPath,
   remapPath,
+  vaultRelPath,
   wordCount,
 } from "./fileMeta";
 
@@ -133,5 +135,29 @@ describe("normSep", () => {
   it("normalises backslashes to forward slashes", () => {
     expect(normSep("a\\b\\c")).toBe("a/b/c");
     expect(normSep("a/b")).toBe("a/b");
+  });
+});
+
+describe("vaultRelPath", () => {
+  it("maps the root itself to the empty string", () => {
+    expect(vaultRelPath("/v", "/v")).toBe("");
+    expect(vaultRelPath("/v/", "/v")).toBe("");
+  });
+  it("strips the vault-root prefix", () => {
+    expect(vaultRelPath("/v/Notes", "/v")).toBe("Notes");
+    expect(vaultRelPath("/v/Notes/a.md", "/v")).toBe("Notes/a.md");
+  });
+  it("is separator-agnostic and tolerates a trailing-slash root", () => {
+    expect(vaultRelPath("C:\\v\\Notes\\a.md", "C:\\v")).toBe("Notes/a.md");
+    expect(vaultRelPath("/v/Notes", "/v/")).toBe("Notes");
+  });
+});
+
+describe("parentRelPath", () => {
+  it("returns the parent folder relPath, or '' at the root", () => {
+    expect(parentRelPath("Notes/a.md")).toBe("Notes");
+    expect(parentRelPath("Notes/Sub/a.md")).toBe("Notes/Sub");
+    expect(parentRelPath("a.md")).toBe("");
+    expect(parentRelPath("")).toBe("");
   });
 });

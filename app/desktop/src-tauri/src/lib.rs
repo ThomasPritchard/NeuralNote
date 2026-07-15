@@ -268,6 +268,7 @@ pub fn run() {
             commands::vault::set_menu_editing,
             commands::vault::set_chat_visible,
             commands::vault::read_tree,
+            commands::vault::list_dir,
             commands::vault::read_note,
             commands::vault::write_note,
             commands::vault::search_vault,

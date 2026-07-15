@@ -39,7 +39,7 @@ export interface ToastController {
 
 const ToastContext = createContext<ToastController | null>(null);
 
-export function ToastProvider({ children }: { children: ReactNode }) {
+export function ToastProvider({ children }: Readonly<{ children: ReactNode }>) {
   const [state, dispatch] = useReducer(toastReducer, undefined, createToastState);
   const nextId = useRef(0);
 
@@ -90,10 +90,10 @@ export function useToast(): ToastController {
 function ToastViewport({
   toasts,
   onDismiss,
-}: {
+}: Readonly<{
   toasts: ToastRecord[];
   onDismiss: (id: string) => void;
-}) {
+}>) {
   const documentHidden = useDocumentHidden();
   const announcedToastIds = useRef(new Set<string>());
   const [politeAnnouncement, setPoliteAnnouncement] = useState("");
@@ -134,11 +134,11 @@ function ToastItem({
   toast,
   documentHidden,
   onDismiss,
-}: {
+}: Readonly<{
   toast: ToastRecord;
   documentHidden: boolean;
   onDismiss: (id: string) => void;
-}) {
+}>) {
   const [hovered, setHovered] = useState(false);
   const [focusWithin, setFocusWithin] = useState(false);
   const dismiss = useCallback(() => onDismiss(toast.id), [onDismiss, toast.id]);
@@ -228,10 +228,10 @@ function useDismissTimer(
     if (duration === null || paused || remainingDuration === null) return;
 
     const startedAt = Date.now();
-    const timeout = window.setTimeout(onElapsed, remainingDuration);
+    const timeout = globalThis.setTimeout(onElapsed, remainingDuration);
 
     return () => {
-      window.clearTimeout(timeout);
+      globalThis.clearTimeout(timeout);
       const elapsed = Date.now() - startedAt;
       remaining.current = Math.max(0, remainingDuration - elapsed);
     };

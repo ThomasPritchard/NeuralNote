@@ -169,16 +169,61 @@ NeuralGalaxy gains optional `onClusterSelect`/`onClusterHover` props. Chosen ove
 only (clusters never unfold) and link-community detection (unnameable clusters, superseded by
 the AI phase's semantic clustering later).
 
+## Perf — large-vault graph rendering (#39)
+
+The deferred ">2k-note vaults stutter" worry is now bounded. `graphTransform.ts` caps the
+nodes handed to the 3D force sim at `GALAXY_NODE_CAP = 500` per level (keeping the most-linked
+notes, re-derived per drill-down level) and the view surfaces the trim honestly ("Showing the
+{shown} most-linked of {total} notes"). Small vaults are untouched: under the cap, `truncation`
+is `null` and every note renders.
+
+**What is measured, and why not the render.** The real galaxy is WebGL + a d3 force layout;
+neither runs headlessly in jsdom (the e2e suite already renders a stub — see the *Testing*
+section). So the render itself is bounded **by construction, not by direct measurement**: its
+input is capped at 500 nodes regardless of vault size, so its cost cannot grow with the vault.
+What we *do* measure is the pure `toGalaxy` transform that feeds it, plus that structural cap.
+
+**Thresholds** (`graphTransform.perf.test.ts`, over the reproducible ≥2,000-note fixture):
+
+- **Structural cap — the hard gate.** `toGalaxy` never returns more than `GALAXY_NODE_CAP`
+  nodes, every rendered link joins two rendered nodes, and `truncation` reports `{ shown, total }`
+  honestly — asserted for the fixture *and* for an even larger `40 × 200 = 8,000`-note graph, so
+  the guarantee is proven size-independent. This is the interaction-responsiveness bound.
+- **Transform time — a generous smoke ceiling.** Median transform ≤ 100 ms. Deliberately loose:
+  a tight wall-clock p95 flakes in CI (cf. `sourceEditorPerformance.test.ts`), so the cap
+  invariant is the gate and timing only trips on a catastrophic regression.
+
+**Reproducible fixture** (`graphTransform.fixture.ts`). `buildSyntheticVault()` constructs the
+graph structurally — **no randomness**, so results are identical every run and every machine.
+Default `20 folders × 120 notes = 2,400 notes` (> the 2,000 bar and > the 500-node cap), each
+folder with a "map of content" hub every note links to (skewed degree — hubs high, leaves low,
+exactly what the cap ranks on), a hub ring, and a cross-folder bridge from every 10th leaf.
+
+**Recorded result** (Apple Silicon dev machine, Node 24.18, Vitest 4.1):
+
+| Metric | Value |
+| --- | --- |
+| Fixture | 2,400 nodes / 2,620 links |
+| Rendered after cap | 500 nodes / 720 links |
+| Truncation reported | `{ shown: 500, total: 2400 }` |
+| Transform median | ~1.1 ms |
+| Transform p95 | ~1.5 ms |
+
+The transform is ~70× under the 100 ms ceiling on dev hardware. CI thresholds are kept generous
+against this dev measurement — the 100 ms budget is a regression tripwire, not a hardware SLA.
+
 ## Known gaps / deferred
 
 Scroll-to-match in reader/editor; live graph refresh on `vault://tree-changed`; ghost nodes
 for unresolved links; inline `#tag` facets; search ranking beyond name-first; very large
-vault perf (label bands were tuned at ~40 nodes; no node cap in v1 — revisit if >2k-note
-vaults stutter); orb variant + magnet picking (prototype-only experiments).
+vault perf (label bands were tuned at ~40 nodes — **now bounded**, see *Perf — large-vault
+graph rendering (#39)* below); orb variant + magnet picking (prototype-only experiments).
 
-Documented v1 search limitations (review round 1): case-insensitivity is char-wise
-`to_lowercase` + final-sigma (ς→σ) — full Unicode case folding (ß↔ss) is deliberately NOT
-hand-rolled (house cautionary tale; revisit only via a vetted library). Non-UTF-8 notes are
+Documented v1 search behaviour (review round 1, revised by issue #37): case-insensitivity is
+char-wise Unicode **full** case folding (`ß↔ss`, `ﬀ↔ff`, `İ`, final sigma `ς→σ`) via the
+vetted `caseless` crate (Unicode 16.0.0), never hand-rolled tables. The per-char fold keeps
+the folded→original byte-range map exact, so a `ß` matched by an `ss` query still cites the
+`ß`'s precise source span. Non-UTF-8 notes are
 searched lossily (U+FFFD), so a search can miss text the reader shows — the reader flags such
 notes via `lossyText`. Fold-map memory is O(largest line) transiently; acceptable for local
 markdown, revisit in the capture phase.

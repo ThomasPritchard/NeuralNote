@@ -1,8 +1,9 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { useCallback, useRef, useState } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { TreeNode } from "../lib/types";
-import type { CreateKind } from "./TreeRow";
+import type { LoadedDir } from "../lib/store";
 
 const { toastError } = vi.hoisted(() => ({ toastError: vi.fn() }));
 vi.mock("../notifications", () => ({
@@ -28,34 +29,62 @@ import { FileTree } from "./FileTree";
 
 const mockApi = vi.mocked(api);
 
-const fileNode = (name: string): TreeNode => ({
+const fileNode = (name: string, relPath = name): TreeNode => ({
   kind: "file",
   name,
-  path: `/v/${name}`,
-  relPath: name,
+  path: `/v/${relPath}`,
+  relPath,
   ext: "md",
   children: null,
 });
 
-const folderNode = (name: string, children: TreeNode[] = []): TreeNode => ({
+const folderNode = (name: string, children: TreeNode[] = [], relPath = name): TreeNode => ({
   kind: "folder",
   name,
-  path: `/v/${name}`,
-  relPath: name,
+  path: `/v/${relPath}`,
+  relPath,
   ext: null,
   children,
 });
 
-function setup(tree: TreeNode[], over: Partial<Parameters<typeof FileTree>[0]> = {}) {
-  const props = {
+/** Folder nodes in the lazy model carry children: null — the loaded map holds
+ *  the children, not the node. */
+const strip = (nodes: TreeNode[]): TreeNode[] =>
+  nodes.map((n) => (n.kind === "folder" ? { ...n, children: null } : n));
+
+const dir = (children: TreeNode[], truncated: number | null = null): LoadedDir => ({
+  status: "loaded",
+  children: strip(children),
+  truncated,
+});
+
+/** Build the store's per-directory `loaded` map from a nested tree fixture,
+ *  pre-loading every folder (collapsed by default is the EXPANDED set's job). */
+function loadedFrom(nodes: TreeNode[]): Map<string, LoadedDir> {
+  const map = new Map<string, LoadedDir>();
+  const walk = (ns: TreeNode[], rel: string): void => {
+    map.set(rel, dir(ns));
+    for (const n of ns) if (n.kind === "folder" && n.children) walk(n.children, n.relPath);
+  };
+  walk(nodes, "");
+  return map;
+}
+
+type FileTreeProps = Parameters<typeof FileTree>[0];
+
+function setup(nodes: TreeNode[], over: Partial<FileTreeProps> = {}) {
+  const props: FileTreeProps = {
     vaultPath: "/v",
-    tree,
-    activePath: null as string | null,
-    refreshTree: vi.fn().mockResolvedValue(undefined),
+    activePath: null,
+    loaded: loadedFrom(nodes),
+    expanded: new Set<string>(),
+    onToggle: vi.fn(),
+    onListDir: vi.fn().mockResolvedValue(undefined),
+    onRefreshDir: vi.fn().mockResolvedValue(undefined),
     onSelect: vi.fn(),
     onDeleteRequest: vi.fn(),
     onRemap: vi.fn(),
-    pendingCreate: null as CreateKind | null,
+    pendingCreate: null,
     onCreateConsumed: vi.fn(),
     ...over,
   };
@@ -66,39 +95,19 @@ function setup(tree: TreeNode[], over: Partial<Parameters<typeof FileTree>[0]> =
 /** Minimal DataTransfer stand-in for jsdom drag events. */
 const dt = () => ({ effectAllowed: "", setData: vi.fn(), getData: vi.fn() });
 
-// FileTree now persists fold state to localStorage, which this env doesn't
-// expose — install a fresh in-memory one per test (also isolates fold state
-// between tests, since one test's collapse must not leak into another).
-function stubLocalStorage() {
-  const store = new Map<string, string>();
-  vi.stubGlobal("localStorage", {
-    getItem: (k: string) => (store.has(k) ? store.get(k)! : null),
-    setItem: (k: string, v: string) => void store.set(k, String(v)),
-    removeItem: (k: string) => void store.delete(k),
-    clear: () => store.clear(),
-    key: (i: number) => [...store.keys()][i] ?? null,
-    get length() {
-      return store.size;
-    },
-  });
-}
-
 beforeEach(() => {
-  stubLocalStorage();
   toastError.mockReset();
   mockApi.createFolder.mockReset();
   mockApi.createNote.mockReset();
   mockApi.createNoteFromTemplate.mockReset();
   mockApi.renameEntry.mockReset();
   mockApi.moveEntry.mockReset();
-  // No templates by default — the create flow must be exactly the plain one.
   mockApi.listTemplates.mockReset();
   mockApi.listTemplates.mockResolvedValue([]);
 });
 
 afterEach(() => {
   vi.restoreAllMocks();
-  vi.unstubAllGlobals();
 });
 
 describe("FileTree — rendering", () => {
@@ -108,80 +117,183 @@ describe("FileTree — rendering", () => {
   });
 
   it("renders files and folders with the active file marked", () => {
-    setup([folderNode("Notes", [fileNode("a.md")]), fileNode("top.md")], {
+    setup([folderNode("Notes", [fileNode("a.md", "Notes/a.md")]), fileNode("top.md")], {
+      expanded: new Set(["Notes"]),
       activePath: "/v/top.md",
     });
     expect(screen.getByText("Notes")).toBeInTheDocument();
     expect(screen.getByText("top.md")).toBeInTheDocument();
-    expect(screen.getByText("a.md")).toBeInTheDocument(); // folder open by default
+    expect(screen.getByText("a.md")).toBeInTheDocument(); // Notes is in the expanded set
   });
 });
 
-describe("FileTree — fold persistence", () => {
-  it("remembers a collapsed folder across a remount of the same vault", async () => {
-    const user = userEvent.setup();
-    const tree = [folderNode("Notes", [fileNode("a.md")])];
+describe("FileTree — collapse by default", () => {
+  it("starts folders collapsed: children are hidden until expanded", () => {
+    setup([folderNode("Notes", [fileNode("a.md", "Notes/a.md")])]);
+    expect(screen.getByText("Notes")).toBeInTheDocument();
+    expect(screen.queryByText("a.md")).not.toBeInTheDocument();
+  });
 
-    const first = render(
-      <FileTree
-        vaultPath="/v"
-        tree={tree}
-        activePath={null}
-        refreshTree={vi.fn().mockResolvedValue(undefined)}
-        onSelect={vi.fn()}
-        onDeleteRequest={vi.fn()}
-        onRemap={vi.fn()}
-        pendingCreate={null}
-        onCreateConsumed={vi.fn()}
-      />,
-    );
-    // Open by default → child visible. The open folder is the only expanded button.
+  it("shows a folder's children when it is in the expanded set", () => {
+    setup([folderNode("Notes", [fileNode("a.md", "Notes/a.md")])], {
+      expanded: new Set(["Notes"]),
+    });
     expect(screen.getByText("a.md")).toBeInTheDocument();
-    await user.click(screen.getByRole("button", { expanded: true }));
-    expect(screen.queryByText("a.md")).not.toBeInTheDocument();
-    first.unmount();
+  });
 
-    // A fresh mount of the same vault hydrates the fold from storage.
-    render(
-      <FileTree
-        vaultPath="/v"
-        tree={tree}
-        activePath={null}
-        refreshTree={vi.fn().mockResolvedValue(undefined)}
-        onSelect={vi.fn()}
-        onDeleteRequest={vi.fn()}
-        onRemap={vi.fn()}
-        pendingCreate={null}
-        onCreateConsumed={vi.fn()}
-      />,
-    );
+  it("clicking a folder chevron asks the store to toggle it", async () => {
+    const p = setup([folderNode("Notes", [fileNode("a.md", "Notes/a.md")])]);
+    await userEvent.click(screen.getByText("Notes").closest("button")!);
+    expect(p.onToggle).toHaveBeenCalledWith("Notes");
+  });
+});
+
+// A controlled harness that mimics the store: onToggle updates the expanded set
+// and lazily loads a folder's children (a real macrotask) on first expand. This
+// proves the whole expand → load → show → collapse → hide flow end to end.
+function ControlledTree({ full }: Readonly<{ full: TreeNode[] }>) {
+  const dataRef = useRef<Map<string, TreeNode[]>>(undefined);
+  if (!dataRef.current) {
+    const m = new Map<string, TreeNode[]>();
+    const walk = (ns: TreeNode[], rel: string): void => {
+      m.set(rel, ns);
+      for (const n of ns) if (n.kind === "folder") walk(n.children ?? [], n.relPath);
+    };
+    walk(full, "");
+    dataRef.current = m;
+  }
+  const data = dataRef.current;
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const [loaded, setLoaded] = useState<Map<string, LoadedDir>>(
+    () => new Map([["", dir(data.get("") ?? [])]]),
+  );
+  const loadedRef = useRef(loaded);
+  loadedRef.current = loaded;
+
+  const onListDir = useCallback(
+    (rel: string): Promise<void> => {
+      setLoaded((prev) =>
+        new Map(prev).set(rel, { status: "loading" }),
+      );
+      setTimeout(
+        () => setLoaded((prev) => new Map(prev).set(rel, dir(data.get(rel) ?? []))),
+        0,
+      );
+      return Promise.resolve();
+    },
+    [data],
+  );
+
+  const onToggle = useCallback(
+    (rel: string) => {
+      setExpanded((prev) => {
+        const next = new Set(prev);
+        if (next.has(rel)) {
+          next.delete(rel);
+        } else {
+          next.add(rel);
+          if (!loadedRef.current.has(rel)) void onListDir(rel);
+        }
+        return next;
+      });
+    },
+    [onListDir],
+  );
+
+  return (
+    <FileTree
+      vaultPath="/v"
+      activePath={null}
+      loaded={loaded}
+      expanded={expanded}
+      onToggle={onToggle}
+      onListDir={onListDir}
+      onRefreshDir={vi.fn().mockResolvedValue(undefined)}
+      onSelect={vi.fn()}
+      onDeleteRequest={vi.fn()}
+      onRemap={vi.fn()}
+      pendingCreate={null}
+      onCreateConsumed={vi.fn()}
+    />
+  );
+}
+
+describe("FileTree — lazy expand flow", () => {
+  it("expands a folder to load and reveal its children, then collapse hides them", async () => {
+    const user = userEvent.setup();
+    render(<ControlledTree full={[folderNode("Notes", [fileNode("a.md", "Notes/a.md")])]} />);
+
+    // Collapsed by default — the child is not loaded and not shown.
     expect(screen.queryByText("a.md")).not.toBeInTheDocument();
+
+    // Expand: the store loads Notes, then its child appears.
+    await user.click(screen.getByText("Notes").closest("button")!);
+    expect(await screen.findByText("a.md")).toBeInTheDocument();
+
+    // Collapse: the child leaves the flat list entirely.
+    await user.click(screen.getByText("Notes").closest("button")!);
+    expect(screen.queryByText("a.md")).not.toBeInTheDocument();
+  });
+});
+
+describe("FileTree — lazy status rows", () => {
+  it("shows a subtle loading row under an expanded folder whose listing is in flight", () => {
+    // Root is loaded and lists Notes, but Notes' own listing hasn't landed.
+    const loaded = new Map<string, LoadedDir>([["", dir([folderNode("Notes")])]]);
+    setup([], { loaded, expanded: new Set(["Notes"]) });
+    expect(screen.getByText("Loading…")).toBeInTheDocument();
+  });
+
+  it("shows a per-folder error row with a Retry that re-lists just that folder", async () => {
+    const loaded = new Map<string, LoadedDir>([
+      ["", dir([folderNode("Notes")])],
+      ["Notes", { status: "error", error: "Permission denied" }],
+    ]);
+    const p = setup([], { loaded, expanded: new Set(["Notes"]) });
+
+    expect(screen.getByText("Permission denied")).toBeInTheDocument();
+    const retry = screen.getByRole("button", { name: /Retry loading Notes/i });
+    await userEvent.click(retry);
+    expect(p.onListDir).toHaveBeenCalledWith("Notes");
+  });
+
+  it("shows a non-interactive 'N more…' truncation row", () => {
+    const loaded = new Map<string, LoadedDir>([["", dir([fileNode("top.md")], 12)]]);
+    setup([], { loaded });
+
+    const more = screen.getByText("12 more…");
+    expect(more).toBeInTheDocument();
+    // Truncation is informational only — search still reaches those files.
+    expect(more.closest("button")).toBeNull();
+  });
+
+  it("thousand-scale truncation counts are shown human-readable", () => {
+    const loaded = new Map<string, LoadedDir>([["", dir([fileNode("top.md")], 15000)]]);
+    setup([], { loaded });
+    expect(screen.getByText("15,000 more…")).toBeInTheDocument();
   });
 });
 
 describe("FileTree — create", () => {
   it("shows a visible tooltip for the root new-note control", async () => {
     setup([]);
-
     const button = screen.getByRole("button", { name: "New note" });
     await userEvent.hover(button);
-
     expect(await screen.findByRole("tooltip")).toHaveTextContent("New note");
   });
 
-  it("creates a note at the vault root and selects it", async () => {
+  it("creates a note at the vault root, re-lists the root, and selects it", async () => {
     const node = { ...fileNode("New.md"), path: "/v/New.md" };
     mockApi.createNote.mockResolvedValueOnce(node);
     const p = setup([]);
 
     await userEvent.click(screen.getByRole("button", { name: "New note" }));
-    const input = screen.getByLabelText("New note name");
-    await userEvent.type(input, "New.md{Enter}");
+    await userEvent.type(screen.getByLabelText("New note name"), "New.md{Enter}");
 
     await waitFor(() =>
       expect(mockApi.createNote).toHaveBeenCalledWith("/v", "New.md"),
     );
-    expect(p.refreshTree).toHaveBeenCalled();
+    expect(p.onRefreshDir).toHaveBeenCalledWith(""); // root re-listed
     expect(p.onSelect).toHaveBeenCalledWith("/v/New.md", false);
   });
 
@@ -213,14 +325,11 @@ describe("FileTree — create", () => {
     expect(await screen.findByText("Already exists")).toBeInTheDocument();
     expect(screen.getByLabelText("New note name")).toBeInTheDocument();
 
-    // The inline error is dismissible.
     await userEvent.click(screen.getByRole("button", { name: "Dismiss error" }));
     expect(screen.queryByText("Already exists")).not.toBeInTheDocument();
   });
 
   it("creates a folder at the vault root from a pending create request", async () => {
-    // The vault menu moved to the titlebar; root creates reach FileTree
-    // through the pendingCreate prop, which opens the inline row directly.
     mockApi.createFolder.mockResolvedValueOnce(folderNode("Sub"));
     const p = setup([], { pendingCreate: "folder" });
 
@@ -229,7 +338,7 @@ describe("FileTree — create", () => {
     await waitFor(() =>
       expect(mockApi.createFolder).toHaveBeenCalledWith("/v", "Sub"),
     );
-    expect(p.refreshTree).toHaveBeenCalled();
+    expect(p.onRefreshDir).toHaveBeenCalledWith("");
   });
 
   it("creates a note inside a folder via its hover action", async () => {
@@ -237,20 +346,24 @@ describe("FileTree — create", () => {
       ...fileNode("child.md"),
       path: "/v/Notes/child.md",
     });
-    const p = setup([folderNode("Notes", [fileNode("a.md")])]);
+    // Notes starts collapsed; the create action must expand it so the inline row
+    // is reachable.
+    const p = setup([folderNode("Notes", [fileNode("a.md", "Notes/a.md")])]);
 
     await userEvent.click(screen.getByRole("button", { name: "New note in Notes" }));
+    expect(p.onToggle).toHaveBeenCalledWith("Notes"); // expanded to reveal the row
     await userEvent.type(screen.getByLabelText("New note name"), "child.md{Enter}");
 
     await waitFor(() =>
       expect(mockApi.createNote).toHaveBeenCalledWith("/v/Notes", "child.md"),
     );
+    expect(p.onRefreshDir).toHaveBeenCalledWith("Notes");
     expect(p.onSelect).toHaveBeenCalledWith("/v/Notes/child.md", false);
   });
 });
 
 describe("FileTree — rename", () => {
-  it("renames a file and remaps the open note", async () => {
+  it("renames a file, re-lists its parent, and remaps the open note", async () => {
     const renamed = { ...fileNode("b.md"), path: "/v/b.md" };
     mockApi.renameEntry.mockResolvedValueOnce(renamed);
     const p = setup([fileNode("a.md")]);
@@ -263,7 +376,7 @@ describe("FileTree — rename", () => {
     await waitFor(() =>
       expect(mockApi.renameEntry).toHaveBeenCalledWith("/v/a.md", "b.md"),
     );
-    expect(p.refreshTree).toHaveBeenCalled();
+    expect(p.onRefreshDir).toHaveBeenCalledWith(""); // parent of a root file is the root
     expect(p.onRemap).toHaveBeenCalledWith("/v/a.md", renamed);
   });
 
@@ -280,14 +393,43 @@ describe("FileTree — rename", () => {
   });
 });
 
-describe("FileTree — folder collapse", () => {
-  it("toggles a folder open and closed", async () => {
-    setup([folderNode("Notes", [fileNode("a.md")])]);
-    const folderBtn = screen.getByText("Notes").closest("button")!;
-    expect(screen.getByText("a.md")).toBeInTheDocument();
-    await userEvent.click(folderBtn);
+describe("FileTree — folder expand from the store", () => {
+  it("reveals children when the expanded set gains the folder (re-render)", () => {
+    const nodes = [folderNode("Notes", [fileNode("a.md", "Notes/a.md")])];
+    const { rerender } = render(
+      <FileTree
+        vaultPath="/v"
+        activePath={null}
+        loaded={loadedFrom(nodes)}
+        expanded={new Set()}
+        onToggle={vi.fn()}
+        onListDir={vi.fn().mockResolvedValue(undefined)}
+        onRefreshDir={vi.fn().mockResolvedValue(undefined)}
+        onSelect={vi.fn()}
+        onDeleteRequest={vi.fn()}
+        onRemap={vi.fn()}
+        pendingCreate={null}
+        onCreateConsumed={vi.fn()}
+      />,
+    );
     expect(screen.queryByText("a.md")).not.toBeInTheDocument();
-    await userEvent.click(folderBtn);
+
+    rerender(
+      <FileTree
+        vaultPath="/v"
+        activePath={null}
+        loaded={loadedFrom(nodes)}
+        expanded={new Set(["Notes"])}
+        onToggle={vi.fn()}
+        onListDir={vi.fn().mockResolvedValue(undefined)}
+        onRefreshDir={vi.fn().mockResolvedValue(undefined)}
+        onSelect={vi.fn()}
+        onDeleteRequest={vi.fn()}
+        onRemap={vi.fn()}
+        pendingCreate={null}
+        onCreateConsumed={vi.fn()}
+      />,
+    );
     expect(screen.getByText("a.md")).toBeInTheDocument();
   });
 });
@@ -309,6 +451,8 @@ describe("FileTree — drag and drop", () => {
       expect(mockApi.moveEntry).toHaveBeenCalledWith("/v/a.md", "/v/Notes"),
     );
     expect(p.onRemap).toHaveBeenCalledWith("/v/a.md", moved);
+    expect(p.onRefreshDir).toHaveBeenCalledWith(""); // source parent (root)
+    expect(p.onRefreshDir).toHaveBeenCalledWith("Notes"); // dest is loaded
   });
 
   it("no-ops a drop onto a file (stopPropagation, never a root move)", () => {
@@ -334,17 +478,10 @@ describe("FileTree — drag and drop", () => {
   });
 
   it("moves a nested file out to the vault root via the scroll-body drop target", async () => {
-    const nestedFile: TreeNode = {
-      kind: "file",
-      name: "a.md",
-      path: "/v/Notes/a.md",
-      relPath: "Notes/a.md",
-      ext: "md",
-      children: null,
-    };
+    const nestedFile = fileNode("a.md", "Notes/a.md");
     const moved = { ...nestedFile, path: "/v/a.md", relPath: "a.md" };
     mockApi.moveEntry.mockResolvedValueOnce(moved);
-    setup([folderNode("Notes", [nestedFile])]);
+    setup([folderNode("Notes", [nestedFile])], { expanded: new Set(["Notes"]) });
 
     const nested = screen.getByText("a.md").closest("button")!;
     const scrollBody = nested.closest(".overflow-y-auto")!;
@@ -372,10 +509,7 @@ describe("FileTree — TreeRow interactions", () => {
 
   it("raises deletion to Workspace without opening its own confirmation", async () => {
     const onDeleteRequest = vi.fn();
-    setup(
-      [fileNode("a.md")],
-      { onDeleteRequest } as never,
-    );
+    setup([fileNode("a.md")], { onDeleteRequest });
 
     await userEvent.click(screen.getByRole("button", { name: "Delete a.md" }));
 
@@ -417,7 +551,6 @@ describe("FileTree — TreeRow interactions", () => {
     fireEvent.dragLeave(destRow, { dataTransfer: dt() });
     fireEvent.dragEnd(srcRow, { dataTransfer: dt() });
 
-    // No drop occurred, so no move was attempted.
     expect(mockApi.moveEntry).not.toHaveBeenCalled();
   });
 });
@@ -428,13 +561,12 @@ describe("FileTree — filename filter", () => {
     const input = screen.getByLabelText("Filter files by name");
     expect(input).toBeEnabled();
     expect(input).toHaveAttribute("placeholder", "Filter files…");
-    // ⌘K belongs to the vault-wide SearchPanel, not the sidebar filter.
     expect(screen.queryByText("⌘K")).not.toBeInTheDocument();
   });
 
   it("typing narrows the tree to matching files and their ancestor folders", async () => {
     setup([
-      folderNode("Notes", [fileNode("alpha.md"), fileNode("beta.md")]),
+      folderNode("Notes", [fileNode("alpha.md", "Notes/alpha.md"), fileNode("beta.md", "Notes/beta.md")]),
       fileNode("top.md"),
     ]);
 
@@ -446,10 +578,9 @@ describe("FileTree — filename filter", () => {
     expect(screen.queryByText("top.md")).not.toBeInTheDocument();
   });
 
-  it("auto-expands collapsed folders while the filter is active", async () => {
-    setup([folderNode("Notes", [fileNode("alpha.md")])]);
-    await userEvent.click(screen.getByText("Notes").closest("button")!); // collapse
-    expect(screen.queryByText("alpha.md")).not.toBeInTheDocument();
+  it("auto-expands collapsed (but loaded) folders while the filter is active", async () => {
+    setup([folderNode("Notes", [fileNode("alpha.md", "Notes/alpha.md")])]);
+    expect(screen.queryByText("alpha.md")).not.toBeInTheDocument(); // collapsed
 
     await userEvent.type(screen.getByLabelText("Filter files by name"), "alpha");
 
@@ -457,7 +588,12 @@ describe("FileTree — filename filter", () => {
   });
 
   it("keeps only the filtered children of a folder whose own name matches", async () => {
-    setup([folderNode("Projects", [fileNode("alpha.md"), fileNode("project-plan.md")])]);
+    setup([
+      folderNode("Projects", [
+        fileNode("alpha.md", "Projects/alpha.md"),
+        fileNode("project-plan.md", "Projects/project-plan.md"),
+      ]),
+    ]);
 
     await userEvent.type(screen.getByLabelText("Filter files by name"), "project");
 
@@ -478,9 +614,8 @@ describe("FileTree — filename filter", () => {
     expect(await screen.findByRole("tooltip")).toHaveTextContent("Clear filter");
   });
 
-  it("clearing via ✕ restores the full tree and the prior collapse state", async () => {
-    setup([folderNode("Notes", [fileNode("alpha.md")]), fileNode("top.md")]);
-    await userEvent.click(screen.getByText("Notes").closest("button")!); // collapse
+  it("clearing via ✕ restores the full tree and the collapse state", async () => {
+    setup([folderNode("Notes", [fileNode("alpha.md", "Notes/alpha.md")]), fileNode("top.md")]);
     await userEvent.type(screen.getByLabelText("Filter files by name"), "alpha");
     expect(screen.getByText("alpha.md")).toBeInTheDocument();
     expect(screen.queryByText("top.md")).not.toBeInTheDocument();
@@ -489,12 +624,11 @@ describe("FileTree — filename filter", () => {
 
     expect(screen.getByLabelText("Filter files by name")).toHaveValue("");
     expect(screen.getByText("top.md")).toBeInTheDocument(); // full tree back
-    expect(screen.queryByText("alpha.md")).not.toBeInTheDocument(); // Notes still collapsed
+    expect(screen.queryByText("alpha.md")).not.toBeInTheDocument(); // Notes collapsed again
   });
 
   it("Escape clears the filter and restores the full tree and collapse state", async () => {
-    setup([folderNode("Notes", [fileNode("alpha.md")]), fileNode("top.md")]);
-    await userEvent.click(screen.getByText("Notes").closest("button")!); // collapse
+    setup([folderNode("Notes", [fileNode("alpha.md", "Notes/alpha.md")]), fileNode("top.md")]);
     const input = screen.getByLabelText("Filter files by name");
     await userEvent.type(input, "alpha");
     expect(screen.queryByText("top.md")).not.toBeInTheDocument();
@@ -503,7 +637,7 @@ describe("FileTree — filename filter", () => {
 
     expect(input).toHaveValue("");
     expect(screen.getByText("top.md")).toBeInTheDocument();
-    expect(screen.queryByText("alpha.md")).not.toBeInTheDocument(); // Notes still collapsed
+    expect(screen.queryByText("alpha.md")).not.toBeInTheDocument();
   });
 
   it("shows a no-match empty state distinct from the empty-vault copy", async () => {
@@ -517,11 +651,6 @@ describe("FileTree — filename filter", () => {
 });
 
 describe("FileTree — virtualization (PA-005)", () => {
-  // Above VIRTUALIZE_MIN_ROWS the tree body windows via @tanstack/react-virtual.
-  // The virtualizer measures via offsetHeight (jsdom: always 0), so give the
-  // scroll container a real viewport and every row a fixed height — the lib
-  // reads the container synchronously on mount, making the window math
-  // deterministic without ResizeObserver ever firing.
   const VIEWPORT = 600;
   const ROW = 26;
 
@@ -542,11 +671,10 @@ describe("FileTree — virtualization (PA-005)", () => {
     setup(bigTree());
 
     expect(screen.getByText("note-000.md")).toBeInTheDocument();
-    // The far end of the list is NOT in the DOM — that's the windowing.
     expect(screen.queryByText("note-299.md")).not.toBeInTheDocument();
     const mounted = screen.getAllByRole("treeitem").length;
     expect(mounted).toBeLessThan(100);
-    expect(mounted).toBeGreaterThan(VIEWPORT / ROW - 1); // the viewport is filled
+    expect(mounted).toBeGreaterThan(VIEWPORT / ROW - 1);
   });
 
   it("mounts late rows (and drops early ones) when scrolled to the bottom", () => {
@@ -561,34 +689,24 @@ describe("FileTree — virtualization (PA-005)", () => {
     expect(screen.queryByText("note-000.md")).not.toBeInTheDocument();
   });
 
-  it("keeps selection and collapse working through the virtualized body", async () => {
+  it("keeps selection working through the virtualized body", async () => {
     stubLayout();
-    const p = setup([folderNode("Notes", [fileNode("inside.md")]), ...bigTree()]);
+    const p = setup(bigTree());
 
-    // Select a mounted file row.
     await userEvent.click(screen.getByText("note-000.md").closest("button")!);
     expect(p.onSelect).toHaveBeenCalledWith("/v/note-000.md", false);
-
-    // Collapse the folder: its child leaves the flat list entirely.
-    expect(screen.getByText("inside.md")).toBeInTheDocument();
-    await userEvent.click(screen.getByText("Notes").closest("button")!);
-    expect(screen.queryByText("inside.md")).not.toBeInTheDocument();
   });
 
   it("renders small trees without windowing (every row mounted)", () => {
-    // No layout stubs at all: with jsdom's 0-height viewport a virtualized
-    // body would mount almost nothing — every row being present proves the
-    // sub-threshold tree takes the plain, unwindowed path.
-    setup([folderNode("Notes", [fileNode("a.md")]), fileNode("top.md")]);
+    setup([folderNode("Notes", [fileNode("a.md", "Notes/a.md")]), fileNode("top.md")], {
+      expanded: new Set(["Notes"]),
+    });
     expect(screen.getByText("a.md")).toBeInTheDocument();
     expect(screen.getByText("top.md")).toBeInTheDocument();
   });
 });
 
 describe("FileTree — pending create requests", () => {
-  // Root-level creates arrive from window chrome (the native File menu and the
-  // titlebar's vault menu) via the pendingCreate prop; FileTree opens the
-  // inline row and consumes the request exactly once.
   it("opens the root folder-create row and consumes the request", () => {
     const p = setup([], { pendingCreate: "folder" });
     expect(screen.getByLabelText("New folder name")).toBeInTheDocument();
@@ -599,8 +717,6 @@ describe("FileTree — pending create requests", () => {
     const p = setup([], { pendingCreate: "note" });
     expect(screen.getByLabelText("New note name")).toBeInTheDocument();
     expect(p.onCreateConsumed).toHaveBeenCalledTimes(1);
-    // A note create kicks off the optional template fetch — flush its (empty)
-    // resolution so the state update lands inside the test.
     await act(async () => {});
     expect(screen.queryByLabelText("Note template")).not.toBeInTheDocument();
   });

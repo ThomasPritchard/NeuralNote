@@ -92,21 +92,25 @@ export function GeneralSettingsPage() {
           disabled={autostart === null || changingAutostart}
           onChange={(checked) => void changeAutostart(checked)}
         />
-        {autostart === null && <p role="status" className="mt-1 text-xs text-muted-foreground">Reading macOS registration…</p>}
+        {autostart === null && <output className="mt-1 block text-xs text-muted-foreground">Reading macOS registration…</output>}
       </div>
     </section>
   );
 }
 
+// Transient progress states render as <output> — the native element with an
+// implicit polite "status" live region — so assistive tech announces them
+// without interrupting; failures stay role="alert" (assertive by design).
+// `block` mirrors the sibling <p> display so the swap is layout-identical.
 function UpdateStatus({ state }: Readonly<{ state: ReturnType<typeof useUpdateCoordinator>["state"] }>) {
   switch (state.status) {
     case "idle": return <p className="text-xs text-muted-foreground">Ready to check.</p>;
-    case "checking": return <p role="status" className="text-xs text-muted-foreground">Checking for updates…</p>;
+    case "checking": return <output className="block text-xs text-muted-foreground">Checking for updates…</output>;
     case "upToDate": return <p className="text-xs text-muted-foreground">NeuralNote is up to date.</p>;
     case "available": return <p className="text-xs text-primary">Version {state.update.version} is available.</p>;
     case "checkFailed": return <p role="alert" className="text-xs text-destructive">Update check failed: {state.message}</p>;
-    case "installing": return <p role="status" className="text-xs text-muted-foreground">Installing update…</p>;
-    case "relaunching": return <p role="status" className="text-xs text-muted-foreground">Relaunching…</p>;
+    case "installing": return <output className="block text-xs text-muted-foreground">Installing update…</output>;
+    case "relaunching": return <output className="block text-xs text-muted-foreground">Relaunching…</output>;
     case "installFailed": return <p role="alert" className="text-xs text-destructive">Install failed: {state.message}</p>;
   }
 }

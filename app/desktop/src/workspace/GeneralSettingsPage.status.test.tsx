@@ -99,6 +99,56 @@ describe("GeneralSettingsPage — update status branches", () => {
   });
 });
 
+describe("GeneralSettingsPage — live region semantics", () => {
+  // Transient progress must be announced politely (status); failures must
+  // interrupt (alert). The status branches render as native <output>, whose
+  // implicit role is "status" — these assertions pin the live-region contract,
+  // not the tag, so a future markup change stays honest for assistive tech.
+  const liveCases: ReadonlyArray<
+    readonly [string, UpdateState, string, "status" | "alert"]
+  > = [
+    ["checking", { status: "checking", source: "manual" }, "Checking for updates…", "status"],
+    [
+      "installing",
+      { status: "installing", update: UPDATE, downloadedBytes: 0 },
+      "Installing update…",
+      "status",
+    ],
+    ["relaunching", { status: "relaunching", update: UPDATE }, "Relaunching…", "status"],
+    [
+      "checkFailed",
+      { status: "checkFailed", message: "network down" },
+      "Update check failed: network down",
+      "alert",
+    ],
+    [
+      "installFailed",
+      { status: "installFailed", update: UPDATE, message: "bad signature" },
+      "Install failed: bad signature",
+      "alert",
+    ],
+  ];
+
+  it.each(liveCases)("announces the %s message via a %s live region", (_name, state, message, role) => {
+    coordinator.state = state;
+    renderPage();
+    expect(screen.getByText(message)).toHaveRole(role);
+  });
+
+  it("announces the startup-registration read as a status while it is pending", () => {
+    vi.mocked(getAutostartEnabled).mockReturnValue(new Promise(() => {}));
+    renderPage();
+    expect(screen.getByText("Reading macOS registration…")).toHaveRole("status");
+  });
+
+  it("clears the registration status once the OS state is known", async () => {
+    renderPage();
+    await waitFor(() =>
+      expect(screen.queryByText("Reading macOS registration…")).not.toBeInTheDocument(),
+    );
+  });
+});
+
 describe("GeneralSettingsPage — startup registration failures", () => {
   it("falls back to disabled and warns when startup state cannot be read", async () => {
     vi.mocked(getAutostartEnabled).mockRejectedValue({

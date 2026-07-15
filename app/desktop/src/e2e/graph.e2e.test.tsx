@@ -216,6 +216,9 @@ describe("Journey 13: graph guard and failure surfacing", () => {
   it("opens a graph note in a new tab while preserving the dirty buffer", async () => {
     const { user } = await openVault(LINKED_SEED);
 
+    // notes/ is collapsed by default (lazy tree) — expand it to reach Beta.md.
+    await user.click(await screen.findByRole("button", { name: /^notes/ }));
+
     // Open Beta and dirty its buffer.
     await user.click(await screen.findByRole("button", { name: "Beta.md" }));
     await screen.findByRole("heading", { name: "Beta", level: 1 });

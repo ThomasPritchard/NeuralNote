@@ -1,69 +1,92 @@
 // The vault file tree (Obsidian-style): collapsible folders, selectable files,
-// and full create / rename / delete / move. CRUD goes through api.ts, then
-// re-syncs via the store's refreshTree(). Every op failure is surfaced in an
-// inline toast — never swallowed. The reader-affecting cases (open note deleted,
-// renamed, or moved) are reported up so the parent can keep the reader honest.
-// Large vaults render through a virtualized flat row list (flattenTree.ts +
-// @tanstack/react-virtual) so only the visible window mounts (PA-005).
+// and full create / rename / delete / move. It renders the LAZY store model
+// (issue #40): folders start collapsed and load their children on expand, so a
+// large vault never walks or mounts its whole tree up front. Expansion state
+// (`expanded`) and per-directory listings (`loaded`) live in the store; this
+// component is the pure display. CRUD goes through api.ts, then re-lists just the
+// affected folder via the store's refreshDir(); every op failure is surfaced in
+// an inline toast/row — never swallowed. Reader-affecting cases (open note
+// deleted, renamed, or moved) are reported up so the parent keeps the reader
+// honest. Rows flatten (flattenTree.ts) and window through
+// @tanstack/react-virtual so only the visible slice mounts (PA-005).
 
-import { memo, useEffect, useRef, useState } from "react";
+import { memo, useEffect, useRef, useState, type ReactNode } from "react";
 import { useVirtualizer } from "@tanstack/react-virtual";
 import { FilePlus2, Search, X } from "lucide-react";
 import { IconButton } from "@/components/ui/icon-button";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
+import type { LoadedDir } from "../lib/store";
 import { useToast } from "../notifications";
 import type { TreeNode } from "../lib/types";
-import { normSep } from "./fileMeta";
-import { filterTree } from "./filterTree";
+import { normSep, parentRelPath, vaultRelPath } from "./fileMeta";
+import { filterLoadedTree } from "./loadedTree";
 import { flattenTree, rowKey, type FlatRow } from "./flattenTree";
 import {
   CreateRow,
+  ErrorRow,
+  LoadingRow,
+  MoreRow,
   TreeRow,
   type CreateKind,
   type CreatingState,
   type TreeContext,
 } from "./TreeRow";
-import { loadCollapsed, saveCollapsed } from "./treeState";
 
 // ── Virtualization (PA-005) ────────────────────────────────────────────────
-// The headline v1 user opens an existing Obsidian vault of thousands of notes
-// with folders open by default — mounting every row wrecks first paint and
-// scroll. Above this row count the tree body windows via
-// @tanstack/react-virtual; below it, rows render plainly (identical DOM to
-// the pre-virtualized tree, zero overhead for small vaults).
+// A large expanded vault can still flatten to thousands of rows; above this
+// count the tree body windows via @tanstack/react-virtual; below it, rows render
+// plainly (identical DOM to the un-windowed tree, zero overhead for small
+// vaults).
 const VIRTUALIZE_MIN_ROWS = 100;
 /** Estimated row height (px) before dynamic measurement lands — a file row is
  *  ~26px (13px text + 5px vertical padding each side). */
 const ROW_ESTIMATE = 26;
 
-/** One flattened row: the node (or inline create input) wrapped in one
- *  indent-guide layer per ancestor level. Stacked flush rows join their
- *  `border-l` hairlines into the same continuous guide lines the old
- *  recursive nesting drew. */
+/** One flattened row: a node, an inline create input, or one of the lazy-only
+ *  status rows (loading / error / "N more…"), each wrapped in one indent-guide
+ *  layer per ancestor level. Stacked flush rows join their `border-l` hairlines
+ *  into the same continuous guide lines the old recursive nesting drew. */
 function FlatTreeRow({ row, ctx }: Readonly<{ row: FlatRow; ctx: TreeContext }>) {
-  let content =
-    row.kind === "create" ? (
-      <CreateRow kind={row.createKind} ctx={ctx} />
-    ) : (
-      <TreeRow node={row.node} ctx={ctx} />
-    );
+  let content: ReactNode;
+  switch (row.kind) {
+    case "node":
+      content = <TreeRow node={row.node} ctx={ctx} />;
+      break;
+    case "create":
+      content = <CreateRow kind={row.createKind} ctx={ctx} />;
+      break;
+    case "loading":
+      content = <LoadingRow />;
+      break;
+    case "error":
+      content = (
+        <ErrorRow parentPath={row.parentPath} message={row.message} onRetry={ctx.onRetry} />
+      );
+      break;
+    case "more":
+      content = <MoreRow count={row.count} />;
+      break;
+  }
   for (let i = 0; i < row.depth; i++) {
     content = <div className="ml-[7px] border-l border-border/60 pl-2">{content}</div>;
   }
   return content;
 }
 
-// While the filename filter is active every surviving folder renders expanded:
-// this empty set is passed as the tree's collapsed-set so the user's real
-// collapse state stays untouched and restores when the filter clears.
-const NO_COLLAPSED: Set<string> = new Set();
-
 interface FileTreeProps {
   vaultPath: string;
-  tree: TreeNode[];
   activePath: string | null;
-  refreshTree: () => Promise<void>;
+  /** Per-directory listings, keyed by relPath ("" = root) — the lazy store state. */
+  loaded: ReadonlyMap<string, LoadedDir>;
+  /** Folder relPaths currently expanded (persisted by the store). */
+  expanded: ReadonlySet<string>;
+  /** Expand/collapse a folder (the store fetches it on first expand). */
+  onToggle: (relPath: string) => void;
+  /** Re-attempt a folder's lazy listing (the error row's Retry). */
+  onListDir: (relPath: string) => Promise<void>;
+  /** Re-list one folder in place after a CRUD op (targeted, never a full walk). */
+  onRefreshDir: (relPath: string) => Promise<void>;
   onSelect: (path: string, openInNewTab: boolean) => void;
   /** Workspace owns delete confirmation because background tabs may be dirty. */
   onDeleteRequest: (node: TreeNode) => void;
@@ -79,9 +102,12 @@ interface FileTreeProps {
 // referentially stable handlers (useCallback) so this skips the keystroke churn.
 export const FileTree = memo(function FileTree({
   vaultPath,
-  tree,
   activePath,
-  refreshTree,
+  loaded,
+  expanded,
+  onToggle,
+  onListDir,
+  onRefreshDir,
   onSelect,
   onDeleteRequest,
   onRemap,
@@ -89,10 +115,6 @@ export const FileTree = memo(function FileTree({
   onCreateConsumed,
 }: FileTreeProps) {
   const toast = useToast();
-  // Folders are open by default (empty set); the user's manual folds persist per
-  // vault so they survive an app restart. Lazy-loaded once — vaultPath is stable
-  // for a mount because App swaps Workspace↔Welcome on any vault change.
-  const [collapsed, setCollapsed] = useState<Set<string>>(() => loadCollapsed(vaultPath));
   const [filter, setFilter] = useState("");
   const [creating, setCreating] = useState<CreatingState | null>(null);
   const [renaming, setRenaming] = useState<string | null>(null);
@@ -111,15 +133,17 @@ export const FileTree = memo(function FileTree({
     }
   };
 
-  // Mirror the fold state to storage on every change. Cheap (a short array) and
-  // idempotent, so the redundant write on mount is harmless.
-  useEffect(() => {
-    saveCollapsed(vaultPath, collapsed);
-  }, [vaultPath, collapsed]);
-
   const startCreate = (parentPath: string, kind: CreateKind) => {
     setRenaming(null);
     setOpError(null);
+    // Ensure the target folder is expanded (and its children fetched) so the
+    // inline create row is reachable under it. The row itself shows immediately
+    // via the force-open below even before this expand round-trips; expanding
+    // also loads the folder's existing siblings. The root needs no expansion.
+    if (parentPath !== vaultPath) {
+      const rel = vaultRelPath(parentPath, vaultPath);
+      if (!expanded.has(rel)) onToggle(rel);
+    }
     setCreating({ parentPath, kind });
   };
 
@@ -146,11 +170,10 @@ export const FileTree = memo(function FileTree({
     setRenaming(null);
   };
 
-  // CRUD ops refresh the tree explicitly so the sidebar updates immediately and
-  // never depends on the filesystem watcher being alive (a dead watcher must not
-  // leave the tree silently stale). The watcher (store.tsx) is the backstop for
-  // *external* changes; the brief double-rescan when both fire is acceptable for
-  // an infrequent, user-initiated op.
+  // CRUD ops re-list just the affected folder(s) so the sidebar updates
+  // immediately without depending on the filesystem watcher being alive (a dead
+  // watcher must not leave the tree silently stale). The watcher (store.tsx) is
+  // the backstop for *external* changes.
   const submitCreate = async (name: string) => {
     if (!creating) return;
     const { parentPath, kind } = creating;
@@ -162,7 +185,7 @@ export const FileTree = memo(function FileTree({
         node = await api.createNote(parentPath, name);
       }
       setCreating(null);
-      await refreshTree();
+      await onRefreshDir(vaultRelPath(parentPath, vaultPath));
       if (kind === "note") onSelect(node.path, false);
     } catch (e) {
       // Keep the input open (and the chosen template) so the user can correct
@@ -175,7 +198,8 @@ export const FileTree = memo(function FileTree({
     try {
       const node = await api.renameEntry(path, name);
       setRenaming(null);
-      await refreshTree();
+      // The name and its sort position changed, so re-list the parent folder.
+      await onRefreshDir(parentRelPath(vaultRelPath(path, vaultPath)));
       onRemap(path, node);
     } catch (e) {
       surfaceOperationError(e, true);
@@ -191,30 +215,42 @@ export const FileTree = memo(function FileTree({
     if (currentParent === normSep(destFolderPath)) return; // no-op
     try {
       const node = await api.moveEntry(src, destFolderPath);
-      await refreshTree();
+      const srcParentRel = parentRelPath(vaultRelPath(src, vaultPath));
+      const destRel = vaultRelPath(destFolderPath, vaultPath);
+      await onRefreshDir(srcParentRel);
+      // Only re-list the destination if it is currently loaded (on screen); a
+      // collapsed/unloaded destination fetches fresh on its next expand, so
+      // there is nothing on screen to update.
+      if (loaded.has(destRel)) await onRefreshDir(destRel);
       onRemap(src, node);
     } catch (e) {
       surfaceOperationError(e);
     }
   };
 
-  // TODO(PA-010): `ctx` is rebuilt every render, so React.memo(TreeRow) never
-  // bites. The per-keystroke win already comes from React.memo(FileTree) above
-  // (the workspace passes stable handlers), and virtualization now bounds how
-  // many rows mount at all; making row-level memo effective means
-  // useCallback-ing these handlers + useMemo-ing ctx — a future optimisation,
-  // deferred as a low-value nicety.
   const filterActive = filter.trim() !== "";
-  const visibleTree = filterActive ? filterTree(tree, filter) : tree;
+  // While filtering, render over the LOADED portion filtered to matches +
+  // their ancestor folders, every surviving folder forced open — the lazy
+  // equivalent of the old "expand everything while filtering". This is a display
+  // filter over loaded nodes only, NOT vault search (⌘K, which stays full).
+  const filtered = filterActive ? filterLoadedTree(loaded, filter) : null;
+  const flattenMap = filtered ? filtered.map : loaded;
 
-  // The flat, ordered list of rows actually visible (open folders only, plus
-  // the transient create row) — the model the windowed body renders from.
-  const flatRows = flattenTree(
-    visibleTree,
-    filterActive ? NO_COLLAPSED : collapsed,
-    creating,
-    vaultPath,
-  );
+  // Force-open the folder currently being created in (if not the root), so its
+  // inline create row is visible before the store's expand round-trips.
+  const creatingRel =
+    creating && creating.parentPath !== vaultPath
+      ? vaultRelPath(creating.parentPath, vaultPath)
+      : null;
+  const baseExpanded = filtered ? filtered.expanded : expanded;
+  const flattenExpanded =
+    creatingRel !== null && !baseExpanded.has(creatingRel)
+      ? new Set(baseExpanded).add(creatingRel)
+      : baseExpanded;
+
+  // The flat, ordered list of rows actually visible — the model the windowed
+  // body renders from.
+  const flatRows = flattenTree(flattenMap, flattenExpanded, creating, vaultPath);
   const virtualize = flatRows.length > VIRTUALIZE_MIN_ROWS;
 
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -231,23 +267,23 @@ export const FileTree = memo(function FileTree({
 
   const ctx: TreeContext = {
     activePath,
-    // Filtering forces every surviving folder open without touching the real
-    // collapse state, so it restores intact when the filter clears.
-    collapsed: filterActive ? NO_COLLAPSED : collapsed,
+    // Same set the flatten used, so the chevron/aria-expanded state and the row
+    // list can never disagree (covers filter force-open + create force-open).
+    expanded: flattenExpanded,
     creating,
     renaming,
     dragPath,
     toggle: (relPath) => {
-      // A toggle while filtering would mutate the real collapse state with no
-      // visible effect (everything renders expanded) — ignore it instead.
+      // A toggle while filtering would mutate the real expand state with no
+      // visible effect (everything renders open) — ignore it instead.
       if (filterActive) return;
-      setCollapsed((prev) => {
-        const next = new Set(prev);
-        if (next.has(relPath)) next.delete(relPath);
-        else next.add(relPath);
-        return next;
-      });
+      onToggle(relPath);
     },
+    childCount: (relPath) => {
+      const listing = loaded.get(relPath);
+      return listing?.status === "loaded" ? listing.children.length : null;
+    },
+    onRetry: (relPath) => void onListDir(relPath),
     onSelect,
     onStartCreate: startCreate,
     onStartRename: startRename,
@@ -260,7 +296,14 @@ export const FileTree = memo(function FileTree({
     onDrop: moveTo,
   };
 
+  const rootListing = loaded.get("");
+  const rootReady = rootListing?.status === "loaded";
+  const rootEmpty = rootReady && rootListing.children.length === 0;
   const creatingAtRoot = creating?.parentPath === vaultPath;
+  // "No match" only once the root has loaded and the filtered flatten yields no
+  // actual node rows (a lone create row doesn't count as a match).
+  const noFilterMatch =
+    filterActive && rootReady && !flatRows.some((row) => row.kind === "node");
 
   return (
     <aside className="nn-sidebar flex shrink-0 flex-col border-r border-border bg-sidebar">
@@ -269,7 +312,7 @@ export const FileTree = memo(function FileTree({
           moved to the window titlebar; root note creation stays here because
           it's a file-explorer affordance, not window chrome. Full-text vault
           search lives in the ⌘K SearchPanel; this filter only matches file
-          names. */}
+          names that are currently loaded. */}
       <div className="flex items-center gap-1.5 px-3 pb-2 pt-3">
         <label className="flex min-w-0 flex-1 items-center gap-2 rounded-md border border-border bg-background/40 px-2 py-1.5 text-[0.8125rem] text-muted-foreground/70">
           <Search className="size-3.5 shrink-0" aria-hidden />
@@ -322,12 +365,12 @@ export const FileTree = memo(function FileTree({
           void moveTo(vaultPath);
         }}
       >
-        {tree.length === 0 && !creatingAtRoot && (
+        {rootEmpty && !creatingAtRoot && !filterActive && (
           <p className="px-2 py-6 text-center text-[0.75rem] leading-relaxed text-muted-foreground/70">
             This vault is empty. Use the + above to create your first note.
           </p>
         )}
-        {tree.length > 0 && filterActive && visibleTree.length === 0 && (
+        {noFilterMatch && (
           <p className="px-2 py-6 text-center text-[0.75rem] leading-relaxed text-muted-foreground/70">
             No files match &quot;{filter}&quot;
           </p>
@@ -336,7 +379,7 @@ export const FileTree = memo(function FileTree({
           // Windowed body: a spacer at the full list height, with only the
           // visible slice mounted, absolutely placed at its offset. Rows
           // measure themselves (measureElement) so the taller create row and
-          // any future variable-height rows stay correctly stacked.
+          // any variable-height rows stay correctly stacked.
           <div className="relative w-full" style={{ height: rowVirtualizer.getTotalSize() }}>
             {rowVirtualizer.getVirtualItems().map((item) => (
               <div

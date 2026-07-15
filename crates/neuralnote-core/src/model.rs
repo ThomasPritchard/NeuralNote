@@ -43,8 +43,30 @@ pub struct TreeNode {
     /// Lowercased file extension without the dot (files only; `None` for folders).
     pub ext: Option<String>,
     /// Child nodes (folders only; `None` for files), folders-first then files,
-    /// each group sorted case-insensitively by name.
+    /// each group sorted case-insensitively by name. NOTE the overload: from the
+    /// eager [`crate::tree::read_tree`] a folder's `None` never occurs (it carries
+    /// `Some`, empty for an empty folder), but from the lazy
+    /// [`crate::tree::list_dir`] a folder carries `None` to mean "not loaded yet".
+    /// So `children.unwrap_or_default()` is a correct note-count ONLY over an eager
+    /// tree; never treat a lazy node's `None` as "empty folder".
     pub children: Option<Vec<TreeNode>>,
+}
+
+/// One directory's immediate children, for the lazy file-tree DISPLAY path only.
+/// Produced by [`crate::tree::list_dir`]; never consumed by search, the link
+/// graph, backlinks, or AI retrieval — those keep scanning the whole vault.
+#[derive(Debug, Clone, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct DirListing {
+    /// One level of children, folders-first then files (case-insensitive by
+    /// name). Folder entries carry `children: None`, meaning "not loaded yet" —
+    /// distinct from a file's `None`, disambiguated by `kind`.
+    pub entries: Vec<TreeNode>,
+    /// `Some(n)` = n further entries in THIS directory were omitted by the
+    /// per-directory cap; `None` = complete listing. Drives an explicit
+    /// "N more…" row so truncation is never silent.
+    pub truncated: Option<u32>,
 }
 
 /// A note opened in the reader/editor: parsed frontmatter + markdown body, with

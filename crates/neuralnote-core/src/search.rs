@@ -2,12 +2,15 @@
 //! phase's embeddings supersede ranking later).
 //!
 //! Matching is case-insensitive via a per-line fold map: each original char's
-//! `to_lowercase()` output is recorded together with the char it came from, and
-//! matches found in the folded text are mapped back through that record. The
-//! original line is never indexed with offsets derived from a lowercased copy —
-//! folding can change length (`İ` → `i` + combining dot), so such offsets drift
+//! Unicode *full* case fold ([`fold_char`]) is recorded together with the char
+//! it came from, and matches found in the folded text are mapped back through
+//! that record. The original line is never indexed with offsets derived from a
+//! folded copy — folding can change length (`İ` → `i` + combining dot, `ß` →
+//! `ss`), so such offsets drift
 //! and byte-slicing with them panics. Every slice boundary below comes from
 //! `char_indices`, making boundary panics impossible by construction.
+
+use caseless::Caseless;
 
 use crate::error::CoreResult;
 use crate::model::{FileHit, SearchMatch, SearchResponse, TreeNode};
@@ -178,12 +181,23 @@ fn scan_content(raw: &str, folded_query: &[char], budget: usize) -> (Vec<SearchM
     (out, false)
 }
 
-/// Case-fold one char: `to_lowercase` plus Greek final-sigma normalisation
-/// (ς → σ), so word-final sigma matches regardless of position. Deliberately
-/// NO other multi-char equivalences (ß→ss, etc.) — hand-rolled Unicode tables
-/// are a known bug farm here; the ß limitation is documented in the spec.
+/// Case-fold one char to its Unicode *full* case fold — the CaseFolding.txt
+/// C+F mappings, where one code point can expand to several: `ß → "ss"`,
+/// `ﬀ → "ff"`, `İ → "i\u{307}"`, and Greek final sigma `ς → σ` (so word-final
+/// sigma still matches). The mapping is context-free per code point, which is
+/// precisely why folding char-by-char preserves the `fold_origin` /
+/// `char_starts` bookkeeping that maps a folded match back to an EXACT original
+/// byte range — the citation moat. Full folding subsumes the previous
+/// hand-rolled `to_lowercase` + final-sigma pass (and the old ß→ss limitation).
+///
+/// Unicode version: the tables are `caseless` 0.2.2's, targeting **Unicode
+/// 16.0.0** (assert via `caseless::UNICODE_VERSION`). Upgrade policy: bump the
+/// `caseless` dependency to adopt a newer Unicode revision — a fold table only
+/// ever *adds* code points, so an upgrade can widen matches but never weakens
+/// the byte-range guarantee, which is structural (from `char_indices`), not
+/// data-driven.
 fn fold_char(ch: char) -> impl Iterator<Item = char> {
-    ch.to_lowercase().map(|c| if c == 'ς' { 'σ' } else { c })
+    std::iter::once(ch).default_case_fold()
 }
 
 /// Case-fold a string the same way lines are folded (per-char [`fold_char`]).
@@ -202,7 +216,7 @@ fn contains_folded(text: &str, folded_query: &[char]) -> bool {
 /// A line's fold map: the folded text plus enough bookkeeping to map any folded
 /// match back to an original char range and to slice the original line safely.
 pub(crate) struct FoldedLine {
-    /// Each original char's `to_lowercase()` output, concatenated.
+    /// Each original char's full case fold ([`fold_char`]), concatenated.
     pub(crate) folded: Vec<char>,
     /// The original CHAR index each folded char came from (pushed once per
     /// emitted folded char, so expansion like `İ` → 2 chars stays mapped).
