@@ -1192,6 +1192,38 @@ mod injection_tests {
     }
 
     #[test]
+    fn pooled_content_never_surfaces_under_a_different_scanned_path() {
+        // Adversarial #67: same-file-only substitution rests on an EXACT absolute-path
+        // key lookup (`injected.pool.get(node.path)`). The pool holds POISON keyed to
+        // file A's path, but the vault contains only file B. B misses the pool (its
+        // path isn't a key), so it is read from its real disk content, and the poison
+        // keyed to A's path can never attach to a different scanned path.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("b.md"), "genuine target line in b\n").unwrap();
+        let key_a = key_for(&dir, "a.md"); // a path deliberately NOT present on disk
+        let key_b = key_for(&dir, "b.md");
+        let mut pool: HashMap<String, Arc<str>> = HashMap::new();
+        pool.insert(key_a, Arc::from("POISON target content for b\n"));
+
+        let (resp, content) = search_vault_with_content(dir.path(), "target", &pool).unwrap();
+
+        // B matched on its own real disk content — never the poison keyed to A.
+        assert_eq!(resp.hits.len(), 1, "only the on-disk file B matches");
+        assert_eq!(resp.hits[0].path, key_b);
+        assert_eq!(resp.hits[0].matches[0].snippet, "genuine target line in b");
+        assert_eq!(
+            content.get(&key_b).map(String::as_str),
+            Some("genuine target line in b\n"),
+            "b.md carries its real disk content, not the poison keyed to a.md"
+        );
+        // The poison string appears nowhere in the returned content.
+        assert!(
+            !content.values().any(|value| value.contains("POISON")),
+            "content under one path's key can never surface under a different scanned path"
+        );
+    }
+
+    #[test]
     fn an_empty_pool_reads_every_file_from_disk() {
         // An empty pool is the pure-disk path: every hit's content comes from disk and
         // the response matches the public `search_vault` exactly (behaviour unchanged).

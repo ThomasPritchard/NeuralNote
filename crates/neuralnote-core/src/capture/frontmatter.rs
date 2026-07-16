@@ -182,4 +182,19 @@ mod tests {
         assert!(validate_relative_source_path("sources/2026/article.html").is_ok());
         assert!(validate_relative_source_path(".neuralnote/sources/full.md").is_ok());
     }
+
+    #[test]
+    fn full_source_path_rejects_a_colon_component_at_this_boundary() {
+        // Issue #69: the old bespoke `contains(':')` rejection was folded into the
+        // shared `parse_portable_rel_path`. Pin the seam HERE so a future loosening of
+        // the shared predicate's colon handling still fails at the full_source
+        // boundary — a colon component must stay rejected regardless.
+        assert!(
+            validate_relative_source_path("Areas/a:b.md").is_err(),
+            "a path with a colon component must stay rejected at the full_source boundary"
+        );
+        // A legitimate colon-free portable path in the same shape still passes, so the
+        // rejection is the colon, not the folder depth.
+        assert!(validate_relative_source_path("Areas/ab.md").is_ok());
+    }
 }

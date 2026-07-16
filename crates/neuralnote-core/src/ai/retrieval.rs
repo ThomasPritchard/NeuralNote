@@ -950,6 +950,59 @@ mod tests {
     }
 
     #[test]
+    fn a_stale_pooled_span_is_dropped_by_the_verifier_never_surfaced() {
+        // Issue #67 END TO END — the composition the two halves (retrieval reuse and
+        // the verifier's drop) are each tested for separately, but not together.
+        // Query A pools a note's content; the note is then rewritten on disk so its
+        // content_hash moves; query B reuses the STALE pooled bytes to build a span
+        // carrying the OLD content and OLD hash. The CitationVerifier re-reads disk,
+        // sees the hash has moved, and DROPS the span — a citation from stale pooled
+        // bytes is never surfaced as a wrong citation (the moat, verify.rs:60-66).
+        use crate::ai::verify::CitationVerifier;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("both.md");
+        fs::write(&f, "alpha and beta appear together\n").unwrap();
+        let r = KeywordRetriever::new(dir.path());
+
+        // Query A loads both.md's content into the run's content pool.
+        let a = r.search_notes("alpha", 8, None).unwrap();
+        assert_eq!(a.spans.len(), 1);
+
+        // The note is rewritten on disk AFTER its content was pooled — the new body
+        // shares neither term, so a disk read by query B would match nothing.
+        fs::write(&f, "gamma delta epsilon rewritten\n").unwrap();
+
+        // Query B (a term present only in the STALE pooled copy) still finds it: the
+        // exact-path pool hit means it reuses the pooled bytes and never reads disk.
+        let b = r.search_notes("beta", 8, None).unwrap();
+        assert_eq!(
+            b.spans.len(),
+            1,
+            "query B reused the pooled (now-stale) content — no disk read"
+        );
+        let stale = &b.spans[0];
+        // The span was built from the stale pooled bytes: its text and hash are the OLD
+        // note, not the current disk content.
+        assert_eq!(stale.text, "alpha and beta appear together");
+        assert_eq!(
+            stale.content_hash,
+            crate::note::content_hash("alpha and beta appear together\n"),
+            "the span carries the stale pooled content's hash"
+        );
+
+        // The moat: the verifier re-reads disk, the hash has moved, and the stale span
+        // is DROPPED — never surfaced as a citation whose text matches the stale bytes.
+        let verifier = CitationVerifier::new(dir.path());
+        let err = verifier
+            .verify(stale)
+            .expect_err("a stale pooled span must be dropped, not verified");
+        assert!(
+            err.contains("changed on disk"),
+            "the drop reason must name the on-disk change, got: {err}"
+        );
+    }
+
+    #[test]
     fn repeated_note_reads_within_a_run_touch_disk_once_per_path() {
         let v = vault();
         let (reader, r) = counting_retriever(v.path());
