@@ -110,32 +110,26 @@ pub(crate) fn validate_skill_routing_profile(
     Ok(())
 }
 
-/// Validate a saved routing folder: the shared vault-relative grammar (absolute,
+/// Validate a saved routing folder through the shared portable vault-relative
+/// predicate — [`crate::paths::parse_portable_rel_path`], the same grammar the
+/// frontmatter, routing-inventory, and vault-scheme boundaries use (absolute,
 /// traversal, empty-component, separator, drive-prefix, and invisible-character
-/// rejection) plus this boundary's extras — a byte cap, no surrounding
-/// whitespace, the `<>:"|?*` portability class, and no component ending in a dot
-/// or space.
+/// rejection, the `<>:"|?*` portability class, reserved Windows device names, and
+/// no component with a leading space or a trailing dot or space) — plus this
+/// boundary's own extras that the shared predicate does not cover: a byte cap and
+/// no surrounding whitespace on the whole string (which also catches non-ASCII
+/// boundary whitespace such as U+00A0 that the per-component leading/trailing-space
+/// rule does not).
 pub(crate) fn validate_folder_path(path: &str) -> Result<(), CaptureError> {
     if path.is_empty() || path.len() > MAX_PROFILE_FOLDER_BYTES || path.trim() != path {
         return Err(profile_error(
             "default folder is empty or exceeds its limit",
         ));
     }
-    let Ok(parsed) = crate::paths::VaultRelPath::parse(path) else {
-        return Err(profile_error("default folder must be vault-relative"));
-    };
-    if path
-        .chars()
-        .any(|character| matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
-    {
-        return Err(profile_error("default folder contains unsafe characters"));
-    }
-    if parsed
-        .components()
-        .iter()
-        .any(|component| component.ends_with('.') || component.ends_with(' '))
-    {
-        return Err(profile_error("default folder contains an unsafe component"));
+    if crate::paths::parse_portable_rel_path(path).is_err() {
+        return Err(profile_error(
+            "default folder must be a portable vault-relative path",
+        ));
     }
     Ok(())
 }
