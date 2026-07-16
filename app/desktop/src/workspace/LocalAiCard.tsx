@@ -8,7 +8,7 @@
 // that row's metadata line instead of erroring the card.
 
 import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { Check, Cpu, Download, RefreshCw, Trash2 } from "lucide-react";
+import { Check, Cpu, Download, Info, RefreshCw, Trash2 } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import { cn } from "../lib/cn";
@@ -337,6 +337,20 @@ export function LocalAiCard({
         description="A model that runs entirely on this machine — private, no key needed."
         active={localActive}
       >
+        {/* Honest expectation-setting, not an error: local runs private and
+            local, but cited recall is the product's core promise, and on this
+            tier the citation markers land only intermittently — so we point at
+            the API-key path for the most reliable citations. Muted/informational
+            register (never the destructive InlineError styling). */}
+        <p className="flex items-start gap-1.5 rounded-lg bg-background/50 px-3 py-2 text-[0.6875rem] leading-snug text-muted-foreground ring-1 ring-inset ring-border">
+          <Info className="mt-px size-3.5 shrink-0" aria-hidden />
+          <span className="min-w-0">
+            Local models run entirely on this machine — private, with no internet
+            needed. For the most reliable source citations, connect an API key
+            (OpenRouter); citation accuracy is best-effort with a local model.
+          </span>
+        </p>
+
         {/* Hardware readout driving the recommendation. */}
         {hardware && (
           <p className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg bg-background/50 px-3 py-2 text-[0.6875rem] text-muted-foreground ring-1 ring-inset ring-border">

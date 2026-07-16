@@ -233,6 +233,40 @@ async fn run_five_cases(root: &Path, model: &str, client: &desktop_lib::OpenAiCh
     assert_eq!(count_citations(&follow_up), 0, "Case 5 follow-up citations");
 }
 
+/// Classify a one-token Ollama `/api/generate` probe into runner health.
+///
+/// Healthy = a 2xx response whose body parses as a JSON object and carries no
+/// `error` property. Ollama surfaces both runner failures (dead `llama-server`,
+/// broken `OLLAMA_LIBRARY_PATH`) and model-not-found via an `error` property, and
+/// can even emit one in-band on a 200 mid-stream frame — so the `error` property is
+/// inspected regardless of status. Any `error` body, any non-2xx status, or an
+/// unparseable/non-object 2xx body is treated as an unavailable runner so the caller
+/// can skip loudly rather than let a later eval case hard-fail on an HTTP 500.
+fn classify_runner_health(status: u16, body: &str) -> Result<(), String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(body).ok();
+
+    if let Some(message) = parsed
+        .as_ref()
+        .and_then(|value| value.get("error"))
+        .and_then(|error| error.as_str())
+        .map(str::trim)
+        .filter(|error| !error.is_empty())
+    {
+        return Err(format!(
+            "the Ollama one-token probe reported a runner error: {message}"
+        ));
+    }
+
+    if !(200..300).contains(&status) {
+        return Err(format!("the Ollama one-token probe returned HTTP {status}"));
+    }
+
+    match parsed {
+        Some(serde_json::Value::Object(_)) => Ok(()),
+        _ => Err("the Ollama one-token probe returned an unrecognised success body".to_string()),
+    }
+}
+
 async fn ollama_available(port: u16) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
@@ -257,21 +291,40 @@ async fn ollama_available(port: u16) -> Result<(), String> {
     let models = neuralnote_core::ai::parse_installed_models(&body)
         .map_err(|error| format!("the Ollama /api/tags body could not be parsed: {error}"))?;
 
-    // TODO(eval-ollama-runnability-probe): this checks the model is *listed*, not that
-    // it can *run*. An Ollama that lists the model but can't start its `llama-server`
-    // runner (missing binary / broken OLLAMA_LIBRARY_PATH) passes this guard and then
-    // hard-fails at Case 1 with a 500 instead of skipping loudly. To make the skip
-    // robust, probe a one-token generation here and treat a runner error as "unavailable".
-    if models.iter().any(|model| {
+    let listed = models.iter().any(|model| {
         neuralnote_core::ai::model_installed(&model.tag, neuralnote_core::ai::DEFAULT_LOCAL_MODEL)
-    }) {
-        Ok(())
-    } else {
-        Err(format!(
+    });
+    if !listed {
+        return Err(format!(
             "the required local model '{}' is not installed",
             neuralnote_core::ai::DEFAULT_LOCAL_MODEL
-        ))
+        ));
     }
+
+    // Listing the model does not prove the runner can start. An Ollama that lists the
+    // model but can't launch its `llama-server` (missing binary / broken
+    // OLLAMA_LIBRARY_PATH) passes the /api/tags check and then 500s on the first real
+    // generation. Probe one token here so that failure becomes a loud skip instead of a
+    // Case-1 hard failure. A cold model load can take tens of seconds, so this request
+    // is given its own generous timeout, well beyond the reachability client's default.
+    let probe = client
+        .post(format!("http://127.0.0.1:{port}/api/generate"))
+        .timeout(Duration::from_secs(120))
+        .json(&serde_json::json!({
+            "model": neuralnote_core::ai::DEFAULT_LOCAL_MODEL,
+            "prompt": "hi",
+            "stream": false,
+            "options": { "num_predict": 1 },
+        }))
+        .send()
+        .await
+        .map_err(|error| format!("the Ollama one-token probe failed: {error}"))?;
+    let status = probe.status().as_u16();
+    let body = probe
+        .text()
+        .await
+        .map_err(|error| format!("the Ollama one-token probe body could not be read: {error}"))?;
+    classify_runner_health(status, &body)
 }
 
 // Both tiers are live-model probes with an external dependency (a billed OpenRouter
@@ -325,13 +378,18 @@ async fn local_ollama_behavioural_eval() {
 
     let vault = fixture_vault();
     let client = desktop_lib::ollama_chat_client(port, false);
-    // TODO(local-model-citation-reliability): measured 2026-07-10 against the packaged
-    // sidecar, DEFAULT_LOCAL_MODEL (qwen3.5:9b) passes Case 3 (factual-in-vault ⇒ ≥1
-    // verified citation) only ~1 run in 3 — it inconsistently emits the `[eN]` marker,
-    // though the pipeline verifies correctly when it does. The eval is right to demand
-    // a citation; the small model is marginal for the moat on the local path. Product
-    // decision (a stronger default local model, or setting local as best-effort) — not a
-    // code fix, and NOT to be papered over by loosening the assertion. See
+    // RESOLVED(local-model-citation-reliability): measured 2026-07-10 against the
+    // packaged sidecar, DEFAULT_LOCAL_MODEL (qwen3.5:9b) passed Case 3 (factual-in-vault
+    // ⇒ ≥1 verified citation) only ~1 run in 3 — it inconsistently emitted the `[eN]`
+    // marker, though the pipeline verified correctly when it did. Product decision: the
+    // local tier is explicitly BEST-EFFORT for citation fidelity. The strict Case 3
+    // assertion is DELIBERATELY RETAINED (a wrong citation is worse than no answer, so
+    // the eval must keep demanding one) — it is not loosened, skipped, or made
+    // conditional. The default local model and RAM-adaptive sizing are unchanged; larger
+    // tiers (e.g. qwen3.5:27b) are auto-selected on capable hardware, where adherence is
+    // stronger. Product copy elsewhere steers users wanting the most reliable citations
+    // to the BYO-API-key path. Empirical tier-comparison (9b vs 27b vs API) is tracked as
+    // a filed follow-up issue, not resolved here. See
     // [[project-local-model-marginal-for-citation]].
     run_five_cases(
         vault.path(),
@@ -339,4 +397,49 @@ async fn local_ollama_behavioural_eval() {
         &client,
     )
     .await;
+}
+
+// The live probe needs a real Ollama, so the runnability classification is factored into
+// the pure `classify_runner_health` helper and unit-tested here for the three preflight
+// states. These run on the default `cargo test -p desktop` path; the live wiring stays in
+// the `#[ignore]` eval above.
+#[test]
+fn runner_health_listed_and_runnable_is_ok() {
+    let body =
+        r#"{"model":"qwen3.5:9b","created_at":"2026-07-16T00:00:00Z","response":"Hi","done":true}"#;
+    assert!(classify_runner_health(200, body).is_ok());
+}
+
+#[test]
+fn runner_health_listed_but_broken_runner_is_unavailable() {
+    let body = r#"{"error":"llama runner process has terminated: exit status 127"}"#;
+    let reason = classify_runner_health(500, body).expect_err("a dead runner must be unavailable");
+    assert!(
+        reason.contains("runner error") && reason.contains("terminated"),
+        "reason should surface the runner error, got: {reason}"
+    );
+}
+
+#[test]
+fn runner_health_missing_model_is_unavailable() {
+    let body = r#"{"error":"model \"qwen3.5:9b\" not found, try pulling it first"}"#;
+    let reason =
+        classify_runner_health(404, body).expect_err("a not-found model must be unavailable");
+    assert!(
+        reason.contains("not found"),
+        "reason should surface the model-not-found error, got: {reason}"
+    );
+}
+
+#[test]
+fn runner_health_in_band_error_on_200_is_unavailable() {
+    // Ollama keeps HTTP 200 when a runner dies mid-stream and reports the failure in-band,
+    // so an `error` body must be treated as unavailable regardless of a 2xx status.
+    let body = r#"{"error":"an error was encountered while running the model"}"#;
+    assert!(classify_runner_health(200, body).is_err());
+}
+
+#[test]
+fn runner_health_unparseable_success_body_is_unavailable() {
+    assert!(classify_runner_health(200, "not json").is_err());
 }
