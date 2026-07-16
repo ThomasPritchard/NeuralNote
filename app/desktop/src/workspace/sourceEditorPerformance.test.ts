@@ -6,6 +6,17 @@ import { collectObsidianPreview } from "./obsidianLivePreview";
 import { collectMarkdownPreview } from "./sourceEditorDecorations";
 import { applySourceChanges, loadSourceText, serializeSourceText } from "./sourceText";
 
+// v8 coverage instrumentation multiplies wall-clock time per instrumented
+// function call, so these wall-clock budgets measure the *instrument*, not the
+// code, when run under `npm run coverage` (which sets VITEST_COVERAGE=1). The
+// real budget gate runs uninstrumented in `test:unit` (both Node versions, every
+// PR and push); we only skip the redundant, timing-invalid coverage re-run.
+// @types/node is intentionally absent from this project, so read the flag off
+// globalThis rather than a bare `process`.
+const UNDER_COVERAGE_INSTRUMENTATION =
+  (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env
+    ?.VITEST_COVERAGE === "1";
+
 const PARAGRAPH = "A representative paragraph with **strong text**, [[Vault Link]], Unicode café 界, and trailing spaces.  ";
 const FIXTURE = Array.from(
   { length: 5_000 },
@@ -13,7 +24,7 @@ const FIXTURE = Array.from(
 ).join("\r\n\r\n");
 
 describe("source editor performance budgets", () => {
-  it("opens the visible portion of a 500 KiB / 5,000-paragraph fixture within budget", () => {
+  it.skipIf(UNDER_COVERAGE_INSTRUMENTATION)("opens the visible portion of a 500 KiB / 5,000-paragraph fixture within budget", () => {
     expect(new TextEncoder().encode(FIXTURE).byteLength).toBeGreaterThanOrEqual(500 * 1024);
     const samples: number[] = [];
     for (let run = 0; run < 5; run += 1) {
@@ -31,7 +42,7 @@ describe("source editor performance budgets", () => {
     expect(samples[2]).toBeLessThanOrEqual(1_500);
   });
 
-  it("keeps p95 exact-source reconstruction below the 50 ms key-to-paint budget", () => {
+  it.skipIf(UNDER_COVERAGE_INSTRUMENTATION)("keeps p95 exact-source reconstruction below the 50 ms key-to-paint budget", () => {
     let source = loadSourceText(FIXTURE);
     let state = EditorState.create({
       doc: source.text,
