@@ -214,6 +214,15 @@ describe("AiSettingsPage — header + hardware", () => {
     expect(screen.getByText("aarch64 / macos")).toBeInTheDocument();
   });
 
+  it("sets honest citation expectations on the Local AI card, pointing at the API-key path", async () => {
+    setup();
+    // Calm, informational guidance (not an error): local is private/offline, but
+    // the API-key provider is recommended for the most reliable source citations.
+    expect(
+      await screen.findByText(/for the most reliable source citations, connect an API key/i),
+    ).toBeInTheDocument();
+  });
+
   it("surfaces a failed status read inline", async () => {
     mockAiStatus.mockRejectedValue({ kind: "io", message: "config unreadable" });
     setup();

@@ -739,8 +739,8 @@ const scanTags = (
   const matches: SearchMatch[] = [];
   for (const [line, ranges] of byLine) {
     if (matches.length >= budget) return [matches, true];
-    const source = sourceLines[line - 1] ?? "";
-    const snippet = buildSnippet(Array.from(source), ranges);
+    const lineText = sourceLines[line - 1] ?? "";
+    const snippet = buildSnippet(Array.from(lineText), ranges);
     matches.push({ line, ...snippet });
   }
   return [matches, false];
@@ -967,7 +967,7 @@ const extractMdLinks = (text: string, emit: (t: string, offset: number) => void)
 };
 
 /** Mirror of core `has_scheme` (RFC 3986 scheme prefix). */
-const URL_SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.\-]*:/;
+const URL_SCHEME_RE = /^[A-Za-z][A-Za-z0-9+.-]*:/;
 
 /** Mirror of core `normalize_md_target`: lexical resolution against the source
  *  note's folder. Null for external targets (scheme or absolute), empty
@@ -1234,6 +1234,9 @@ const findTitleMentions = (body: string, title: string): [number, string][] => {
   return mentions;
 };
 
+const bySourceThenLine = <T extends { sourceRel: string; line: number }>(a: T, b: T): number =>
+  a.sourceRel === b.sourceRel ? a.line - b.line : a.sourceRel < b.sourceRel ? -1 : 1;
+
 const buildBacklinks = (files: MdFile[], targetRel: string): Backlinks => {
   const target = files.find((file) => file.rel === targetRel);
   if (!target) {
@@ -1275,8 +1278,6 @@ const buildBacklinks = (files: MdFile[], targetRel: string): Backlinks => {
     }
   }
 
-  const bySourceThenLine = <T extends { sourceRel: string; line: number }>(a: T, b: T): number =>
-    a.sourceRel === b.sourceRel ? a.line - b.line : a.sourceRel < b.sourceRel ? -1 : 1;
   linked.sort(bySourceThenLine);
   unlinked.sort(bySourceThenLine);
   return { linked, unlinked, skippedFiles: skipped.count };
@@ -1500,6 +1501,12 @@ const renderTemplate = (
  *  self-links drop, and edges dedupe on the unordered pair (NUL-joined —
  *  relPaths can contain spaces, so a printable join would be ambiguous).
  *  `skippedFiles` is always 0 here — the in-memory FS can't fail per-file. */
+const pushIndexEntry = (map: Map<string, string[]>, key: string, rel: string): void => {
+  const list = map.get(key);
+  if (list) list.push(rel);
+  else map.set(key, [rel]);
+};
+
 const buildLinkGraph = (files: MdFile[]): LinkGraph => {
   const nodes: GraphNode[] = [];
   const noteTargets: [string, RawTarget[]][] = [];
@@ -1508,11 +1515,6 @@ const buildLinkGraph = (files: MdFile[]): LinkGraph => {
   // Lowercased relPath → relPaths, for markdown-link resolution.
   const byRel = new Map<string, string[]>();
   let skippedFiles = 0;
-  const push = (map: Map<string, string[]>, key: string, rel: string): void => {
-    const list = map.get(key);
-    if (list) list.push(rel);
-    else map.set(key, [rel]);
-  };
 
   for (const f of files) {
     const stem = stemOf(f.rel);
@@ -1525,9 +1527,9 @@ const buildLinkGraph = (files: MdFile[]): LinkGraph => {
       title: titleFrom(parsed.frontmatter, parsed.body, stem),
       cluster: clusterOf(f.rel),
     });
-    push(byName, stem.toLowerCase(), f.rel);
-    push(byName, basename(f.rel).toLowerCase(), f.rel);
-    push(byRel, f.rel.toLowerCase(), f.rel);
+    pushIndexEntry(byName, stem.toLowerCase(), f.rel);
+    pushIndexEntry(byName, basename(f.rel).toLowerCase(), f.rel);
+    pushIndexEntry(byRel, f.rel.toLowerCase(), f.rel);
     noteTargets.push([f.rel, f.unreadable ? [] : extractTargets(f.rel, parsed.body)]);
   }
   const allRels = nodes.map((n) => n.id);
@@ -1679,6 +1681,19 @@ const DEFAULT_REQUIREMENT_DOWNLOAD_SCRIPT: PullEvent[] = [
   },
   { type: "success" },
 ];
+
+const normalizeAbsPath = (path: string): string => {
+  const parts: string[] = [];
+  for (const part of path.split("/")) {
+    if (part === "" || part === ".") continue;
+    if (part === "..") parts.pop();
+    else parts.push(part);
+  }
+  return `/${parts.join("/")}`;
+};
+
+const isSameOrInside = (candidate: string, folder: string): boolean =>
+  candidate === folder || candidate.startsWith(`${folder}/`);
 
 export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
   let root = VAULT_ROOT;
@@ -1866,15 +1881,6 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     throw { kind, message } satisfies CoreErrorLike;
   };
 
-  const normalizeAbsPath = (path: string): string => {
-    const parts: string[] = [];
-    for (const part of path.split("/")) {
-      if (part === "" || part === ".") continue;
-      if (part === "..") parts.pop();
-      else parts.push(part);
-    }
-    return `/${parts.join("/")}`;
-  };
 
   const resolveVaultPath = (path: string): string => {
     const abs = normalizeAbsPath(path.startsWith("/") ? path : `${root}/${path}`);
@@ -1951,6 +1957,7 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
 
   /** Re-key `from` (and, for a folder, every descendant) to `to`, content intact. */
   const rekey = (from: string, to: string): void => {
+    // eslint-disable-next-line unicorn/no-useless-spread -- snapshot keys before the loop mutates `entries`, avoiding mutate-during-iteration.
     for (const key of [...entries.keys()]) {
       if (key === from) {
         entries.set(to, entries.get(key)!);
@@ -2086,8 +2093,6 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     return out;
   };
 
-  const isSameOrInside = (candidate: string, folder: string): boolean =>
-    candidate === folder || candidate.startsWith(`${folder}/`);
 
   const resolveTemplateFile = (settings: TemplateSettings, template: string): string => {
     const folder = existingTemplateFolder(settings);
@@ -2231,6 +2236,7 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
       case "delete_entry": {
         const path = a.path as string;
         if (!entries.has(path)) fail("notFound", `${path} not found`);
+        // eslint-disable-next-line unicorn/no-useless-spread -- snapshot keys before the loop mutates `entries`, avoiding mutate-during-iteration.
         for (const key of [...entries.keys()]) {
           if (key === path || key.startsWith(`${path}/`)) entries.delete(key);
         }

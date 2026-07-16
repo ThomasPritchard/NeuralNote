@@ -58,11 +58,14 @@ pub(crate) fn retain_chat_undo_ledger(
     }
 }
 
-/// Resolve a live structured prompt. Validation is performed against the parked
-/// server-side option set; invalid choices leave the prompt live for a retry.
+/// Resolve a live structured prompt owned by `turn_id`. Validation is performed
+/// against the parked server-side option set; invalid choices leave the prompt
+/// live for a retry. The turn id scopes the answer to its own run so a reused
+/// model-authored elicitation id in a sibling run is never resolved by mistake.
 #[tauri::command]
 pub(crate) fn answer_elicitation(
     state: crate::SharedState<'_>,
+    turn_id: String,
     id: String,
     choices: Vec<String>,
 ) -> Result<(), neuralnote_core::CoreError> {
@@ -70,7 +73,12 @@ pub(crate) fn answer_elicitation(
         let state = crate::lock_state(&state);
         std::sync::Arc::clone(&state.pending_elicitations)
     };
-    pending.answer(&id, choices)
+    // Parse the untrusted IPC run id to its `Uuid` once, here at the command
+    // boundary — the registry keys every run by `Uuid`, so a string that is not a
+    // live run's id simply names no live prompt (the same "not live" rejection a
+    // stale or timed-out id already gets).
+    let turn_id = uuid::Uuid::parse_str(&turn_id).map_err(|_| elicitation::not_live(&id))?;
+    pending.answer(turn_id, &id, choices)
 }
 
 /// Consume one run ledger once every file reaches a terminal result. A vault
@@ -165,10 +173,20 @@ fn undo_skill_run_inner_with(
         // Taking before I/O reserves the authority against concurrent callers. Put
         // back only entries whose I/O failed; terminal paths must not regain delete
         // authority if a byte-identical replacement appears before the retry.
+        // A ledger may repeat a path (resolve-to-latest-write dedups it to a single
+        // report line), so the coverage invariant is one line per *distinct* path —
+        // an under-report would silently strip an unreported path of delete authority.
+        let distinct_paths = stored
+            .ledger
+            .entries()
+            .iter()
+            .map(|entry| entry.rel_path.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         debug_assert_eq!(
             report.files.len(),
-            stored.ledger.entries().len(),
-            "apply_undo must report every ledger entry"
+            distinct_paths,
+            "apply_undo must report every distinct ledger path exactly once"
         );
         stored.ledger.retain_entries(|entry| {
             report.files.iter().any(|file| {
@@ -275,7 +293,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         debug_assertions,
-        should_panic(expected = "apply_undo must report every ledger entry")
+        should_panic(expected = "apply_undo must report every distinct ledger path exactly once")
     )]
     fn incomplete_failed_undo_report_trips_entry_coverage_assertion() {
         let vault = tempfile::tempdir().unwrap();

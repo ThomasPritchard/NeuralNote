@@ -59,6 +59,21 @@ pub fn consume_sse_line(
             full.push_str(&delta);
             Ok(None)
         }
+        SseEvent::Truncated { delta } => {
+            // Stream the trailing token (if any) into the answer FIRST, so the returned
+            // string stays byte-equal to the Answer deltas the orchestrator verifies
+            // citations against — a severed `[eN]` is preserved verbatim here and dropped
+            // later by the citation parser, never emitted as a citation. Then surface the
+            // truncation. Non-terminal: `[DONE]`/EOF still ends the stream.
+            if let Some(delta) = delta {
+                sink.send(ChatEvent::Answer {
+                    delta: delta.clone(),
+                });
+                full.push_str(&delta);
+            }
+            sink.send(ChatEvent::AnswerTruncated);
+            Ok(None)
+        }
         SseEvent::Done => Ok(Some(full.clone())),
         SseEvent::Error(msg) => Err(CoreError::Llm(msg)),
         SseEvent::Other => Ok(None),
@@ -80,11 +95,12 @@ pub fn finish_answer(full: String) -> CoreResult<String> {
 }
 
 /// Sane output ceiling for the streamed answer turn; tool-deciding turns stay uncapped so long tool-call JSON is never truncated.
-// TODO(answer-truncation-signal): if the model hits this ceiling the provider sends
-// `finish_reason: "length"` before `[DONE]`; parse it in the SSE stream and surface a
-// "answer truncated at the length limit" notice so a capped answer is never shown as a
-// complete one. Moat-safe today (a cut-off `[eN]` marker simply goes uncited, never
-// mis-cited), so this is UX polish, not a correctness fix.
+///
+/// When the model hits this ceiling the provider sends `finish_reason: "length"` before
+/// `[DONE]`; [`parse_sse_line`] maps that to [`SseEvent::Truncated`] and [`consume_sse_line`]
+/// surfaces a [`ChatEvent::AnswerTruncated`], so a capped answer is never shown as a complete
+/// one. A citation marker severed by the cut simply goes uncited (an incomplete `[eN]` never
+/// parses) — never mis-cited.
 pub const ANSWER_MAX_TOKENS: u32 = 4096;
 
 /// Build the OpenAI-compatible request body. `num_ctx` is set only by the local
@@ -141,6 +157,11 @@ pub enum SseEvent {
     /// short-circuited: dropping the content would silently lose an answer token — and
     /// with it, possibly a leading `[eN]` citation marker.
     ReasoningAndDelta { reasoning: String, delta: String },
+    /// A `finish_reason: "length"` frame — the provider hit its output-token ceiling
+    /// and cut the answer short. Carries any trailing content in the SAME frame so a
+    /// final token (and any `[eN]` marker riding on it) is never dropped. Non-fatal:
+    /// the partial answer is kept and flagged, then `[DONE]`/EOF ends the stream.
+    Truncated { delta: Option<String> },
     /// The `data: [DONE]` terminator.
     Done,
     /// A mid-stream OpenRouter `error` frame (HTTP was already 200) — fatal, must
@@ -186,9 +207,11 @@ pub fn parse_sse_line(line: &str) -> SseEvent {
                     None => SseEvent::Error(format!("OpenRouter stream error: {msg}")),
                 };
             }
-            let Some(delta) = chunk.choices.into_iter().next().map(|c| c.delta) else {
+            let Some(choice) = chunk.choices.into_iter().next() else {
                 return SseEvent::Other;
             };
+            let finish_reason = choice.finish_reason;
+            let delta = choice.delta;
             // Read reasoning BEFORE the empty-content filter — the same reason the error
             // frame is read first. A reasoning-only chunk carries an empty `delta.content`,
             // so filtering first would silently drop every reasoning token, the exact
@@ -199,6 +222,15 @@ pub fn parse_sse_line(line: &str) -> SseEvent {
             // on reasoning would drop the answer token beside it.
             let reasoning = extract_reasoning(&delta);
             let content = delta.content.filter(|s| !s.is_empty());
+            // A `length` finish means the provider hit its output-token ceiling. Surface
+            // it, but keep any content token on the same frame (the wire may carry the
+            // final token beside the finish reason) — dropping it would lose an answer
+            // token, and any citation marker riding on it. `stop`, `tool_calls`, and a
+            // null finish are all ordinary and fall through to the content/reasoning
+            // classification below.
+            if finish_reason.as_deref() == Some("length") {
+                return SseEvent::Truncated { delta: content };
+            }
             match (reasoning, content) {
                 (Some(reasoning), Some(delta)) => SseEvent::ReasoningAndDelta { reasoning, delta },
                 (Some(reasoning), None) => SseEvent::Reasoning(reasoning),
@@ -404,6 +436,12 @@ struct StreamError {
 struct StreamChoice {
     #[serde(default)]
     delta: StreamDelta,
+    /// Set on the final choice of a turn: `"stop"` (natural end), `"length"` (hit the
+    /// output-token ceiling — a truncated answer), `"tool_calls"`, `"error"`, etc.
+    /// Absent (`null`) on every mid-stream chunk. Only `"length"` changes behaviour
+    /// here; the rest are informational on this streamed answer path.
+    #[serde(default)]
+    finish_reason: Option<String>,
 }
 #[derive(Deserialize, Default)]
 struct StreamDelta {
@@ -822,5 +860,138 @@ mod tests {
             .iter()
             .filter(|e| matches!(e, ChatEvent::Thinking { .. }))
             .count()
+    }
+
+    #[test]
+    fn sse_length_finish_yields_truncated_with_no_trailing_content() {
+        // The provider hit its output-token ceiling. OpenAI-compatible streams put
+        // `finish_reason: "length"` on a final choice whose delta is empty — it must
+        // surface as Truncated, not be filtered to Other by the empty-delta guard.
+        let line = r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"length"}]}"#;
+        match parse_sse_line(line) {
+            SseEvent::Truncated { delta } => assert_eq!(delta, None),
+            _ => panic!("expected SseEvent::Truncated for a length-finish frame"),
+        }
+    }
+
+    #[test]
+    fn sse_length_finish_preserves_a_trailing_content_token() {
+        // A frame may carry BOTH the final content token AND `finish_reason: "length"`.
+        // Dropping the content would lose an answer token — and any `[eN]` marker riding
+        // on it — the same guarantee the ReasoningAndDelta case protects.
+        let line = r#"data: {"choices":[{"delta":{"content":" [e1"},"finish_reason":"length"}]}"#;
+        match parse_sse_line(line) {
+            SseEvent::Truncated { delta } => assert_eq!(delta.as_deref(), Some(" [e1")),
+            _ => panic!("expected SseEvent::Truncated carrying the trailing token"),
+        }
+    }
+
+    #[test]
+    fn sse_stop_finish_is_not_truncated() {
+        // Ordinary completion: `finish_reason: "stop"` is the happy path — never a
+        // truncation. An empty-delta stop frame is simply Other; a content stop frame is
+        // a plain Delta.
+        assert!(matches!(
+            parse_sse_line(
+                r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"stop"}]}"#
+            ),
+            SseEvent::Other
+        ));
+        assert!(matches!(
+            parse_sse_line(r#"data: {"choices":[{"delta":{"content":"end."},"finish_reason":"stop"}]}"#),
+            SseEvent::Delta(d) if d == "end."
+        ));
+    }
+
+    #[test]
+    fn sse_tool_call_finish_is_not_truncated() {
+        // A tool-call finish is distinct from a length cut and must not be surfaced as
+        // truncation (tool turns aren't streamed, but a defensive parser must still
+        // distinguish the reason).
+        assert!(matches!(
+            parse_sse_line(
+                r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"tool_calls"}]}"#
+            ),
+            SseEvent::Other
+        ));
+    }
+
+    #[test]
+    fn consume_sse_line_length_finish_flags_truncation_without_content() {
+        let mut sink = VecSink::default();
+        let mut full = String::from("partial answer");
+        let stop = consume_sse_line(
+            br#"data: {"choices":[{"delta":{"content":""},"finish_reason":"length"}]}"#,
+            &mut sink,
+            &mut full,
+        )
+        .unwrap();
+        // Not terminal: `[DONE]`/EOF still ends the stream. The accumulated answer is
+        // untouched, and a single AnswerTruncated event is surfaced.
+        assert!(stop.is_none());
+        assert_eq!(full, "partial answer");
+        match sink.0.as_slice() {
+            [ChatEvent::AnswerTruncated] => {}
+            other => panic!("expected a single AnswerTruncated event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn consume_sse_line_length_finish_accumulates_trailing_token_then_flags() {
+        // A trailing token on the length frame reaches both the sink and `full` BEFORE
+        // the truncation flag — so the returned answer stays byte-equal to the streamed
+        // Answer deltas, and a severed marker is preserved verbatim (to be dropped later
+        // by the citation parser, never emitted as a citation).
+        let mut sink = VecSink::default();
+        let mut full = String::from("Sugar is sweet");
+        consume_sse_line(
+            br#"data: {"choices":[{"delta":{"content":" and salt [e2"},"finish_reason":"length"}]}"#,
+            &mut sink,
+            &mut full,
+        )
+        .unwrap();
+        assert_eq!(full, "Sugar is sweet and salt [e2");
+        match sink.0.as_slice() {
+            [ChatEvent::Answer { delta }, ChatEvent::AnswerTruncated] => {
+                assert_eq!(delta, " and salt [e2");
+            }
+            other => panic!("expected Answer then AnswerTruncated, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn chunk_split_frames_reassemble_and_flag_truncation() {
+        // Frames arrive split across arbitrary byte boundaries (the wire does not align
+        // chunks to SSE lines). Reassembling by newline and consuming each complete line
+        // must yield the same answer + truncation signal regardless of the split points.
+        let wire = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Photosynthesis \"}}]}\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"needs light [e1\"},\"finish_reason\":\"length\"}]}\n",
+            "data: [DONE]\n",
+        );
+        // Split the byte stream at an awkward interior point (mid-JSON, mid-multibyte-safe
+        // ASCII) to prove reassembly, exactly as the shell's byte-buffer loop does.
+        let bytes = wire.as_bytes();
+        let mut sink = VecSink::default();
+        let mut full = String::new();
+        let mut buf: Vec<u8> = Vec::new();
+        let mut answer: Option<String> = None;
+        for chunk in [&bytes[..40], &bytes[40..95], &bytes[95..]] {
+            buf.extend_from_slice(chunk);
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line: Vec<u8> = buf.drain(..=pos).collect();
+                if let Some(done) = consume_sse_line(&line, &mut sink, &mut full).unwrap() {
+                    answer = Some(done);
+                }
+            }
+        }
+        assert_eq!(answer.as_deref(), Some("Photosynthesis needs light [e1"));
+        assert_eq!(full, "Photosynthesis needs light [e1");
+        assert!(
+            sink.0
+                .iter()
+                .any(|e| matches!(e, ChatEvent::AnswerTruncated)),
+            "the length cut must be surfaced even when frames were chunk-split"
+        );
     }
 }

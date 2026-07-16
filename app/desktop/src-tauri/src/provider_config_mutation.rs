@@ -66,14 +66,38 @@ impl ProviderConfigMutationGate {
         Arc::ptr_eq(&self.inner, &other.inner)
     }
 
+    /// Apply a config mutation where the OpenRouter key presence is unchanged across
+    /// it (the common case — model, provider, reasoning, or skill preferences). The
+    /// caller supplies the current keychain presence so the reasoning-probe
+    /// invalidation can resolve the effective target on both sides of the mutation.
     pub(crate) fn update(
         &self,
         config_dir: &Path,
+        key_present: bool,
+        mutation: impl FnOnce(&mut ProviderConfig) -> Result<(), CoreError>,
+    ) -> CoreResult<ProviderConfig> {
+        self.update_with_key_transition(config_dir, key_present, key_present, mutation)
+    }
+
+    /// Apply a config mutation that also changes the OpenRouter key presence — a key
+    /// save (absent → present) or clear (present → absent). The effective OpenRouter
+    /// provider is derived from the keychain, not persisted, so the transition itself
+    /// can change the reasoning-probe target even when no config field moves; passing
+    /// the before/after presence lets the invalidation see it.
+    pub(crate) fn update_with_key_transition(
+        &self,
+        config_dir: &Path,
+        key_present_before: bool,
+        key_present_after: bool,
         mutation: impl FnOnce(&mut ProviderConfig) -> Result<(), CoreError>,
     ) -> CoreResult<ProviderConfig> {
         self.run(config_dir, || {
             let mut config = neuralnote_core::ai::read_provider_config(config_dir)?;
-            config.mutate_with_reasoning_probe_invalidation(mutation)?;
+            config.mutate_with_reasoning_probe_invalidation(
+                key_present_before,
+                key_present_after,
+                mutation,
+            )?;
             neuralnote_core::ai::write_provider_config(config_dir, &config)?;
             Ok(config)
         })
@@ -270,7 +294,7 @@ mod tests {
         let gate = ProviderConfigMutationGate::default();
         std::thread::scope(|scope| {
             let update = scope.spawn(|| {
-                gate.update(dir.path(), |config| {
+                gate.update(dir.path(), false, |config| {
                     config.reasoning = false;
                     Ok(())
                 })
@@ -305,7 +329,6 @@ mod tests {
             &ProviderConfig {
                 active_provider: Some(neuralnote_core::ai::ProviderKind::OpenRouter),
                 model: "vendor/a".into(),
-                key_configured: true,
                 reasoning_probe_generation: u64::MAX,
                 ..Default::default()
             },
@@ -317,7 +340,7 @@ mod tests {
         .unwrap();
 
         let error = ProviderConfigMutationGate::default()
-            .update(dir.path(), |config| {
+            .update(dir.path(), true, |config| {
                 config.model = "vendor/b".into();
                 Ok(())
             })

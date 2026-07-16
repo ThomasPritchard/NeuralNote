@@ -258,18 +258,11 @@ fn validate_topic(topic: &str) -> Result<&str, CaptureError> {
     Ok(topic)
 }
 
-// TODO(path-safety-unify): replace this local rule set with one shared
-// vault-relative path policy.
+/// A host-supplied inventory path safe to route against: the shared vault-relative
+/// grammar plus this boundary's byte cap. The grammar owns absolute/traversal/
+/// empty-component/separator/invisible-character rejection.
 fn is_safe_inventory_path(path: &str) -> bool {
-    !path.is_empty()
-        && path.len() <= MAX_INVENTORY_PATH_BYTES
-        && !path.starts_with('/')
-        && !path.starts_with('\\')
-        && !path.contains('\\')
-        && !path.chars().any(char::is_control)
-        && path
-            .split('/')
-            .all(|component| !component.is_empty() && !matches!(component, "." | ".."))
+    path.len() <= MAX_INVENTORY_PATH_BYTES && crate::paths::VaultRelPath::is_valid(path)
 }
 
 impl From<PersistedVaultScheme> for VaultScheme {

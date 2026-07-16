@@ -71,6 +71,11 @@ export interface AssistantMessage {
   done: boolean;
   /** A matching user stop won before normal completion. */
   stopped: boolean;
+  /** The streamed answer hit the model's token/length ceiling and was cut off.
+   *  The partial answer and its citations are still valid — this only marks the
+   *  turn incomplete so the UI can say so; it never discards accumulated text.
+   *  (Distinct from `CoverageView.truncated`, which is about search coverage.) */
+  truncated: boolean;
 }
 
 export type ChatMessage = UserMessage | AssistantMessage;
@@ -101,6 +106,7 @@ export function emptyAssistant(
     error: null,
     done: false,
     stopped: false,
+    truncated: false,
   };
 }
 
@@ -286,6 +292,11 @@ export function reduceAssistant(
       return { ...turn, thinking: turn.thinking + event.delta };
     case "answer":
       return { ...turn, answer: turn.answer + event.delta };
+    case "answerTruncated":
+      // The model hit its token/length ceiling mid-answer. The accumulated
+      // answer and citations stay exactly as streamed — only the incomplete
+      // flag is set, so the UI can surface it without ever losing the partial.
+      return { ...turn, truncated: true };
     case "citation":
       return {
         ...turn,

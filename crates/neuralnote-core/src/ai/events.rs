@@ -84,6 +84,12 @@ pub enum ChatEvent {
     CitationDropped { reason: String },
     /// A chunk of the streamed final answer text.
     Answer { delta: String },
+    /// The provider stopped at its output-token ceiling (`finish_reason: "length"`):
+    /// the streamed answer is cut short, NOT complete. Surfaced so a truncated answer
+    /// is never presented as whole. Moat-safe: a citation marker severed mid-token is
+    /// already dropped by the verifier (an incomplete `[eN]` never parses), so this
+    /// flags incompleteness without ever risking a wrong citation.
+    AnswerTruncated,
     /// A verified citation backing the answer. `id` is the evidence handle the
     /// model cited; the rest locates and quotes the source.
     Citation {
@@ -149,6 +155,13 @@ mod tests {
             })["type"],
             "searching"
         );
+    }
+
+    #[test]
+    fn answer_truncated_is_a_camel_case_unit_event() {
+        // The provider-token-ceiling signal is a distinct, user-visible event — not a
+        // silent drop and not conflated with search-coverage truncation.
+        assert_eq!(json(&ChatEvent::AnswerTruncated)["type"], "answerTruncated");
     }
 
     #[test]

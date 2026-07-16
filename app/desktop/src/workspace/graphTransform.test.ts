@@ -5,6 +5,7 @@ import { degreeVal, toGalaxy } from "./graphTransform";
 
 // nodeChrome (for the HUB_VAL coherence check) pulls in three-spritetext,
 // which needs a 2D canvas at construction time — jsdom lacks one.
+// eslint-disable-next-line typescript/no-extraneous-class -- minimal constructable stub for the mocked default export; the math under test never touches it.
 vi.mock("three-spritetext", () => ({ default: class {} }));
 import { HUB_VAL } from "./galaxy/nodeChrome";
 

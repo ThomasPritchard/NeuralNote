@@ -1074,10 +1074,10 @@ describe("ChatPane — chat view", () => {
   });
 });
 
-describe("ChatPane — composer reasoning toggle", () => {
-  const chip = () => screen.getByRole("button", { name: "Show model reasoning" });
-  const findChip = () => screen.findByRole("button", { name: "Show model reasoning" });
+const chip = () => screen.getByRole("button", { name: "Show model reasoning" });
+const findChip = () => screen.findByRole("button", { name: "Show model reasoning" });
 
+describe("ChatPane — composer reasoning toggle", () => {
   it("renders the persisted opt-in from the status echo and probes support once", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive(DEFAULT_MODEL, { reasoning: true }));
     // The probe echoes "unknown" — the fail-open verdict keeps the chip enabled.

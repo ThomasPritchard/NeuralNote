@@ -219,13 +219,10 @@ fn parse_johnny_category(component: &str) -> Option<u8> {
     number.parse().ok()
 }
 
-// TODO(path-safety-unify): replace this local rule set with one shared
-// vault-relative path policy.
+/// A host-supplied inventory path safe to classify against: the shared
+/// vault-relative grammar plus this boundary's byte cap. The grammar already
+/// rejects absolute paths, traversal, empty components, separators, and invisible
+/// characters, so this boundary keeps only its own size constraint on top.
 fn is_bounded_path(path: &str) -> bool {
-    !path.is_empty()
-        && path.len() <= MAX_INVENTORY_PATH_BYTES
-        && !path.starts_with('/')
-        && !path.starts_with('\\')
-        && !path.contains('\\')
-        && !path.chars().any(char::is_control)
+    path.len() <= MAX_INVENTORY_PATH_BYTES && crate::paths::VaultRelPath::is_valid(path)
 }

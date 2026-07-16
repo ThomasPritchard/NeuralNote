@@ -6,7 +6,7 @@
 
 use crate::ai::{capabilities::ReasoningSupport, DEFAULT_MODEL};
 use crate::error::{CoreError, CoreResult};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use ts_rs::TS;
@@ -31,13 +31,25 @@ pub struct ReasoningProbeTarget {
     pub generation: u64,
 }
 
+/// A reasoning-capability verdict paired with the exact model it was probed
+/// against. The two are only meaningful together — a verdict without its model, or
+/// a model without its verdict, is unusable — so they travel as one value and the
+/// illegal half-set state is unrepresentable. Persisted as the `reasoningProbe`
+/// object in `ai-config.json`; `None` on the owning [`ProviderConfig`] field means
+/// "never probed".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProbedReasoning {
+    pub model: String,
+    pub support: ReasoningSupport,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ProviderConfig {
     #[serde(default)]
     pub active_provider: Option<ProviderKind>,
     pub model: String,
-    pub key_configured: bool,
     #[serde(default)]
     pub local_model_tag: Option<String>,
     /// Whether to request reasoning tokens on the answer turn.
@@ -46,23 +58,11 @@ pub struct ProviderConfig {
     /// installs migrate to "off" for free.
     #[serde(default)]
     pub reasoning: bool,
-    /// Cached reasoning/thinking verdict for the selected model. `None` = never probed.
-    // TODO(reasoning-cache-newtype): this field and `reasoning_probed_model` are only ever
-    // meaningful together — a verdict without the model it was probed against is unusable, and
-    // vice versa. `cached_reasoning_support` enforces that pairing at the one read site today,
-    // but the two independent `Option`s let the illegal half-set states be constructed. Fold
-    // them into a single `Option<ProbedReasoning { model, support }>` to make the invariant
-    // unrepresentable. Deferred, not done now: it changes the persisted ai-config.json shape,
-    // so it wants a serde migration (flatten or a versioned read) — worth doing before the
-    // format has real users, but out of scope for this slice.
+    /// Cached reasoning verdict paired with the model it belongs to. `None` = never
+    /// probed. The pairing is all-or-nothing by construction (see [`ProbedReasoning`]),
+    /// so a stale `Unsupported` can never outlive the model it was probed against.
     #[serde(default)]
-    pub reasoning_support: Option<ReasoningSupport>,
-    /// Which model string the cached verdict belongs to. The cache is valid ONLY when this
-    /// equals the currently selected model; a mismatch (e.g. after a model upgrade) means the
-    /// verdict is stale and must be re-probed. This is what stops a stale `Unsupported` from
-    /// outliving a model change. See [`Self::reasoning_support`] for a planned newtype fold.
-    #[serde(default)]
-    pub reasoning_probed_model: Option<String>,
+    pub reasoning_probe: Option<ProbedReasoning>,
     /// Monotonic cross-process ownership token for reasoning-capability probes.
     /// A probe result may commit only while this generation and its target still
     /// match. Legacy configs start at zero.
@@ -79,16 +79,90 @@ fn default_disabled_skills() -> Vec<String> {
     Vec::new()
 }
 
+/// Tolerant on-disk mirror of [`ProviderConfig`]. It accepts every shape the format
+/// has ever written and is folded into the strict runtime type by the manual
+/// `Deserialize` below. Two migrations live here:
+///
+/// * **Reasoning cache (issue #15):** the current `reasoningProbe` object is read
+///   directly; a pre-#15 file carrying the two independent `reasoningSupport` /
+///   `reasoningProbedModel` fields is folded into the paired value.
+/// * **Key-configured flag (issue #14):** the old `keyConfigured` bool is no longer
+///   a field — keychain presence is the authoritative source — so it is simply
+///   absent here. serde drops the now-unknown key, so an old file still loads and
+///   its model / provider preferences are preserved.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawProviderConfig {
+    #[serde(default)]
+    active_provider: Option<ProviderKind>,
+    model: String,
+    #[serde(default)]
+    local_model_tag: Option<String>,
+    #[serde(default)]
+    reasoning: bool,
+    #[serde(default)]
+    reasoning_probe: Option<ProbedReasoning>,
+    #[serde(default)]
+    reasoning_support: Option<ReasoningSupport>,
+    #[serde(default)]
+    reasoning_probed_model: Option<String>,
+    #[serde(default)]
+    reasoning_probe_generation: u64,
+    #[serde(default = "default_disabled_skills")]
+    disabled_skills: Vec<String>,
+}
+
+/// Fold whichever reasoning-cache shape the file carried into the paired value. The
+/// current `reasoningProbe` wins when present. Otherwise the legacy pair is folded
+/// only when BOTH halves are present; a half-populated legacy state (a verdict with
+/// no model, or a model with no verdict) is normalized to `None`. That state was
+/// already unusable — `cached_reasoning_support` treated it as `Unknown` — so
+/// dropping it loses nothing and keeps the fail-open guarantee: an unknown verdict
+/// never blocks usage.
+fn fold_reasoning_probe(
+    paired: Option<ProbedReasoning>,
+    legacy_support: Option<ReasoningSupport>,
+    legacy_model: Option<String>,
+) -> Option<ProbedReasoning> {
+    if paired.is_some() {
+        return paired;
+    }
+    match (legacy_model, legacy_support) {
+        (Some(model), Some(support)) => Some(ProbedReasoning { model, support }),
+        _ => None,
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderConfig {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let raw = RawProviderConfig::deserialize(deserializer)?;
+        Ok(ProviderConfig {
+            active_provider: raw.active_provider,
+            model: raw.model,
+            local_model_tag: raw.local_model_tag,
+            reasoning: raw.reasoning,
+            reasoning_probe: fold_reasoning_probe(
+                raw.reasoning_probe,
+                raw.reasoning_support,
+                raw.reasoning_probed_model,
+            ),
+            reasoning_probe_generation: raw.reasoning_probe_generation,
+            disabled_skills: raw.disabled_skills,
+        })
+    }
+}
+
 impl Default for ProviderConfig {
     fn default() -> Self {
         Self {
             active_provider: None,
             model: DEFAULT_MODEL.to_string(),
-            key_configured: false,
             local_model_tag: None,
             reasoning: false,
-            reasoning_support: None,
-            reasoning_probed_model: None,
+            reasoning_probe: None,
             reasoning_probe_generation: 0,
             disabled_skills: default_disabled_skills(),
         }
@@ -96,25 +170,31 @@ impl Default for ProviderConfig {
 }
 
 impl ProviderConfig {
-    fn reasoning_probe_identity(&self) -> Option<(ProviderKind, String)> {
+    fn reasoning_probe_identity(&self, key_present: bool) -> Option<(ProviderKind, String)> {
         Some((
-            self.effective_provider()?,
-            self.selected_model()?.to_string(),
+            self.effective_provider(key_present)?,
+            self.selected_model(key_present)?.to_string(),
         ))
     }
 
-    /// Apply a config mutation and invalidate outstanding reasoning probes when
-    /// that mutation changes the effective provider/model target. Mutations to
-    /// dormant-provider settings and unrelated preferences keep their ownership
-    /// generation unchanged.
+    /// Apply a config mutation and invalidate outstanding reasoning probes when the
+    /// effective provider/model target changes across it. The key-presence transition
+    /// is supplied explicitly (`key_present_before` / `key_present_after`) because the
+    /// effective OpenRouter provider is derived from the keychain, not persisted: a
+    /// save (absent → present) or clear (present → absent) is a target change even
+    /// when no config field moves. Mutations to dormant-provider settings and unrelated
+    /// preferences, where presence is constant and no target field moves, keep their
+    /// ownership generation unchanged.
     pub fn mutate_with_reasoning_probe_invalidation<T>(
         &mut self,
+        key_present_before: bool,
+        key_present_after: bool,
         mutation: impl FnOnce(&mut Self) -> CoreResult<T>,
     ) -> CoreResult<T> {
-        let previous_target = self.reasoning_probe_identity();
+        let previous_target = self.reasoning_probe_identity(key_present_before);
         let mut candidate = self.clone();
         let result = mutation(&mut candidate)?;
-        if candidate.reasoning_probe_identity() != previous_target {
+        if candidate.reasoning_probe_identity(key_present_after) != previous_target {
             candidate.invalidate_reasoning_probe()?;
         }
         *self = candidate;
@@ -124,8 +204,7 @@ impl ProviderConfig {
     fn invalidate_reasoning_probe(&mut self) -> CoreResult<()> {
         let generation = self.next_reasoning_probe_generation()?;
         self.reasoning_probe_generation = generation;
-        self.reasoning_support = None;
-        self.reasoning_probed_model = None;
+        self.reasoning_probe = None;
         Ok(())
     }
 
@@ -140,11 +219,14 @@ impl ProviderConfig {
             })
     }
 
-    /// Bridges old OpenRouter-only installs without rewriting their config on read.
-    pub fn effective_provider(&self) -> Option<ProviderKind> {
+    /// The effective provider. An explicit `active_provider` always wins; otherwise
+    /// a present OpenRouter key (from the keychain — the authoritative source, passed
+    /// in as `key_present`) bridges old OpenRouter-only installs without rewriting
+    /// their config on read. No explicit provider and no key means none.
+    pub fn effective_provider(&self, key_present: bool) -> Option<ProviderKind> {
         if let Some(kind) = self.active_provider {
             Some(kind)
-        } else if self.key_configured {
+        } else if key_present {
             Some(ProviderKind::OpenRouter)
         } else {
             None
@@ -153,8 +235,8 @@ impl ProviderConfig {
 
     /// The model string of the effective provider: OpenRouter uses `model`, Local
     /// uses `local_model_tag`, and no provider has no selected model.
-    pub fn selected_model(&self) -> Option<&str> {
-        match self.effective_provider()? {
+    pub fn selected_model(&self, key_present: bool) -> Option<&str> {
+        match self.effective_provider(key_present)? {
             ProviderKind::OpenRouter => Some(&self.model),
             ProviderKind::Local => self.local_model_tag.as_deref(),
         }
@@ -163,24 +245,23 @@ impl ProviderConfig {
     /// The cached reasoning verdict if it is still valid for the current selected
     /// model; otherwise `Unknown` (never probed, or stale after a model change).
     /// Fail-open by construction.
-    pub fn cached_reasoning_support(&self) -> ReasoningSupport {
-        match (
-            self.selected_model(),
-            self.reasoning_probed_model.as_deref(),
-            self.reasoning_support,
-        ) {
-            (Some(current), Some(probed), Some(support)) if current == probed => support,
+    pub fn cached_reasoning_support(&self, key_present: bool) -> ReasoningSupport {
+        match (self.selected_model(key_present), &self.reasoning_probe) {
+            (Some(current), Some(probe)) if current == probe.model => probe.support,
             _ => ReasoningSupport::Unknown,
         }
     }
 
     /// Allocate the next persisted ownership token before a provider probe starts.
     /// Returns `None` when there is no complete provider/model target to probe.
-    pub fn start_reasoning_probe(&mut self) -> CoreResult<Option<ReasoningProbeTarget>> {
-        let Some(provider) = self.effective_provider() else {
+    pub fn start_reasoning_probe(
+        &mut self,
+        key_present: bool,
+    ) -> CoreResult<Option<ReasoningProbeTarget>> {
+        let Some(provider) = self.effective_provider(key_present) else {
             return Ok(None);
         };
-        let Some(model) = self.selected_model().map(str::to_owned) else {
+        let Some(model) = self.selected_model(key_present).map(str::to_owned) else {
             return Ok(None);
         };
         let generation = self.next_reasoning_probe_generation()?;
@@ -195,17 +276,20 @@ impl ProviderConfig {
     /// Apply a completed probe only if no later probe or target change superseded it.
     pub fn apply_reasoning_probe(
         &mut self,
+        key_present: bool,
         target: &ReasoningProbeTarget,
         support: ReasoningSupport,
     ) -> bool {
-        let target_is_current = self.effective_provider() == Some(target.provider)
-            && self.selected_model() == Some(target.model.as_str())
+        let target_is_current = self.effective_provider(key_present) == Some(target.provider)
+            && self.selected_model(key_present) == Some(target.model.as_str())
             && self.reasoning_probe_generation == target.generation;
         if !target_is_current {
             return false;
         }
-        self.reasoning_support = Some(support);
-        self.reasoning_probed_model = Some(target.model.clone());
+        self.reasoning_probe = Some(ProbedReasoning {
+            model: target.model.clone(),
+            support,
+        });
         true
     }
 }
@@ -291,17 +375,22 @@ mod tests {
         ProviderConfig::default()
     }
 
+    fn probed(model: &str, support: ReasoningSupport) -> Option<ProbedReasoning> {
+        Some(ProbedReasoning {
+            model: model.into(),
+            support,
+        })
+    }
+
     #[test]
     fn roundtrip_preserves_all_fields() {
         let dir = tempfile::tempdir().unwrap();
         let config = ProviderConfig {
             active_provider: Some(ProviderKind::Local),
             model: " openai/gpt-4.1 ".into(),
-            key_configured: true,
             local_model_tag: Some("qwen2.5:7b".into()),
             reasoning: true,
-            reasoning_support: Some(ReasoningSupport::Supported),
-            reasoning_probed_model: Some("qwen2.5:7b".into()),
+            reasoning_probe: probed("qwen2.5:7b", ReasoningSupport::Supported),
             reasoning_probe_generation: 9,
             disabled_skills: vec![FIXTURE_SKILL_ID.into()],
         };
@@ -343,15 +432,8 @@ mod tests {
         write_provider_config(
             dir.path(),
             &ProviderConfig {
-                active_provider: None,
                 model: "openai/gpt-4.1".into(),
-                key_configured: true,
-                local_model_tag: None,
-                reasoning: false,
-                reasoning_support: None,
-                reasoning_probed_model: None,
-                reasoning_probe_generation: 0,
-                disabled_skills: Vec::new(),
+                ..default_config()
             },
         )
         .unwrap();
@@ -383,15 +465,8 @@ mod tests {
         write_provider_config(
             dir.path(),
             &ProviderConfig {
-                active_provider: None,
                 model: "  ".into(),
-                key_configured: false,
-                local_model_tag: None,
-                reasoning: false,
-                reasoning_support: None,
-                reasoning_probed_model: None,
-                reasoning_probe_generation: 0,
-                disabled_skills: Vec::new(),
+                ..default_config()
             },
         )
         .unwrap();
@@ -403,15 +478,8 @@ mod tests {
         write_provider_config(
             dir.path(),
             &ProviderConfig {
-                active_provider: None,
                 model: " openai/gpt-4.1 ".into(),
-                key_configured: false,
-                local_model_tag: None,
-                reasoning: false,
-                reasoning_support: None,
-                reasoning_probed_model: None,
-                reasoning_probe_generation: 0,
-                disabled_skills: Vec::new(),
+                ..default_config()
             },
         )
         .unwrap();
@@ -421,8 +489,32 @@ mod tests {
         );
     }
 
+    // ── Issue #14: keychain is authoritative; the persisted flag is gone ──────
+
     #[test]
-    fn old_file_migrates_and_uses_key_configured_bridge() {
+    fn legacy_key_configured_flag_is_ignored_on_read_and_prefs_are_preserved() {
+        // An old file carrying `keyConfigured` still loads: the now-unknown key is
+        // dropped and the model / provider preferences beside it survive untouched.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_file(dir.path()),
+            r#"{"model":"openai/gpt-4.1","keyConfigured":true,"localModelTag":"qwen2.5:7b"}"#,
+        )
+        .unwrap();
+
+        let config = read_provider_config(dir.path()).unwrap();
+
+        assert_eq!(config.active_provider, None);
+        assert_eq!(config.model, "openai/gpt-4.1");
+        assert_eq!(config.local_model_tag.as_deref(), Some("qwen2.5:7b"));
+        assert_eq!(config.reasoning_probe, None);
+        assert_eq!(config.disabled_skills, default_config().disabled_skills);
+    }
+
+    #[test]
+    fn key_configured_is_never_reserialized() {
+        // The flag is not a field, so it can never be written back — the persisted
+        // shape no longer carries key state at all (keychain owns it).
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             config_file(dir.path()),
@@ -431,16 +523,26 @@ mod tests {
         .unwrap();
 
         let config = read_provider_config(dir.path()).unwrap();
+        write_provider_config(dir.path(), &config).unwrap();
 
-        assert_eq!(config.active_provider, None);
-        assert_eq!(config.model, "openai/gpt-4.1");
-        assert!(config.key_configured);
-        assert_eq!(config.local_model_tag, None);
-        assert_eq!(config.reasoning_support, None);
-        assert_eq!(config.reasoning_probed_model, None);
-        assert!(config.disabled_skills.is_empty());
-        assert_eq!(config.disabled_skills, default_config().disabled_skills);
-        assert_eq!(config.effective_provider(), Some(ProviderKind::OpenRouter));
+        let raw = fs::read_to_string(config_file(dir.path())).unwrap();
+        assert!(!raw.contains("keyConfigured"));
+    }
+
+    #[test]
+    fn effective_provider_bridges_openrouter_only_when_a_key_is_present() {
+        // Legacy install: no explicit provider. The bridge fires only when the
+        // keychain says a key is present — the caller supplies that fact.
+        let config = ProviderConfig {
+            model: "openai/gpt-4.1".into(),
+            ..default_config()
+        };
+
+        assert_eq!(
+            config.effective_provider(true),
+            Some(ProviderKind::OpenRouter)
+        );
+        assert_eq!(config.effective_provider(false), None);
     }
 
     #[test]
@@ -461,7 +563,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         fs::write(
             config_file(dir.path()),
-            r#"{"model":"openai/gpt-4.1","keyConfigured":true,"disabledSkills":[]}"#,
+            r#"{"model":"openai/gpt-4.1","disabledSkills":[]}"#,
         )
         .unwrap();
         assert!(read_provider_config(dir.path())
@@ -475,36 +577,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let config = ProviderConfig {
             active_provider: Some(ProviderKind::Local),
-            model: DEFAULT_MODEL.to_string(),
-            key_configured: false,
-            local_model_tag: None,
-            reasoning: false,
-            reasoning_support: None,
-            reasoning_probed_model: None,
-            reasoning_probe_generation: 0,
-            disabled_skills: Vec::new(),
+            ..default_config()
         };
 
         write_provider_config(dir.path(), &config).unwrap();
         let read = read_provider_config(dir.path()).unwrap();
 
         assert_eq!(read.active_provider, Some(ProviderKind::Local));
-        assert_eq!(read.effective_provider(), Some(ProviderKind::Local));
+        assert_eq!(read.effective_provider(false), Some(ProviderKind::Local));
     }
 
     #[test]
     fn local_model_tag_roundtrips() {
         let dir = tempfile::tempdir().unwrap();
         let config = ProviderConfig {
-            active_provider: None,
-            model: DEFAULT_MODEL.to_string(),
-            key_configured: false,
             local_model_tag: Some("qwen2.5:7b".into()),
-            reasoning: false,
-            reasoning_support: None,
-            reasoning_probed_model: None,
-            reasoning_probe_generation: 0,
-            disabled_skills: Vec::new(),
+            ..default_config()
         };
 
         write_provider_config(dir.path(), &config).unwrap();
@@ -517,37 +605,34 @@ mod tests {
 
     #[test]
     fn effective_provider_policy_cases() {
-        assert_eq!(default_config().effective_provider(), None);
+        assert_eq!(default_config().effective_provider(false), None);
 
+        // A present key with no explicit provider bridges to OpenRouter.
         assert_eq!(
-            ProviderConfig {
-                key_configured: true,
-                ..default_config()
-            }
-            .effective_provider(),
+            default_config().effective_provider(true),
             Some(ProviderKind::OpenRouter)
         );
 
+        // An explicit provider always wins over the keychain bridge.
         assert_eq!(
             ProviderConfig {
                 active_provider: Some(ProviderKind::Local),
-                key_configured: true,
                 ..default_config()
             }
-            .effective_provider(),
+            .effective_provider(true),
             Some(ProviderKind::Local)
         );
     }
 
     #[test]
-    fn selected_model_uses_openrouter_model_for_key_configured_install() {
+    fn selected_model_uses_openrouter_model_when_key_present() {
         let config = ProviderConfig {
             model: "openai/gpt-4.1".into(),
-            key_configured: true,
             ..default_config()
         };
 
-        assert_eq!(config.selected_model(), Some("openai/gpt-4.1"));
+        assert_eq!(config.selected_model(true), Some("openai/gpt-4.1"));
+        assert_eq!(config.selected_model(false), None);
     }
 
     #[test]
@@ -558,12 +643,93 @@ mod tests {
             ..default_config()
         };
 
-        assert_eq!(config.selected_model(), Some("qwen2.5:7b"));
+        assert_eq!(config.selected_model(false), Some("qwen2.5:7b"));
     }
 
     #[test]
     fn selected_model_is_none_without_effective_provider() {
-        assert_eq!(default_config().selected_model(), None);
+        assert_eq!(default_config().selected_model(false), None);
+    }
+
+    // ── Issue #15: the reasoning cache is one atomic paired value ─────────────
+
+    #[test]
+    fn old_two_field_reasoning_cache_migrates_to_paired_value() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_file(dir.path()),
+            r#"{"model":"openai/gpt-4.1","reasoningSupport":"supported","reasoningProbedModel":"openai/gpt-4.1"}"#,
+        )
+        .unwrap();
+
+        let config = read_provider_config(dir.path()).unwrap();
+
+        assert_eq!(
+            config.reasoning_probe,
+            probed("openai/gpt-4.1", ReasoningSupport::Supported)
+        );
+    }
+
+    #[test]
+    fn half_populated_legacy_reasoning_cache_normalizes_to_none() {
+        // A verdict with no model, or a model with no verdict, was always unusable.
+        // Both halves-only shapes normalize to `None` — fail open, never blocking.
+        let dir = tempfile::tempdir().unwrap();
+
+        fs::write(
+            config_file(dir.path()),
+            r#"{"model":"openai/gpt-4.1","reasoningSupport":"unsupported"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_provider_config(dir.path()).unwrap().reasoning_probe,
+            None
+        );
+
+        fs::write(
+            config_file(dir.path()),
+            r#"{"model":"openai/gpt-4.1","reasoningProbedModel":"openai/gpt-4.1"}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_provider_config(dir.path()).unwrap().reasoning_probe,
+            None
+        );
+    }
+
+    #[test]
+    fn paired_reasoning_probe_serializes_without_legacy_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = ProviderConfig {
+            model: "openai/gpt-4.1".into(),
+            reasoning_probe: probed("openai/gpt-4.1", ReasoningSupport::Supported),
+            ..default_config()
+        };
+
+        write_provider_config(dir.path(), &config).unwrap();
+
+        let raw = fs::read_to_string(config_file(dir.path())).unwrap();
+        assert!(raw.contains("reasoningProbe"));
+        assert!(!raw.contains("reasoningSupport"));
+        assert!(!raw.contains("reasoningProbedModel"));
+        assert_eq!(read_provider_config(dir.path()).unwrap(), config);
+    }
+
+    #[test]
+    fn new_reasoning_probe_shape_wins_over_legacy_fields_when_both_present() {
+        // A file written mid-migration could carry both shapes; the paired value is
+        // authoritative and the stray legacy fields are ignored.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_file(dir.path()),
+            r#"{"model":"openai/gpt-4.1","reasoningProbe":{"model":"new/model","support":"supported"},"reasoningSupport":"unsupported","reasoningProbedModel":"old/model"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(
+            read_provider_config(dir.path()).unwrap().reasoning_probe,
+            probed("new/model", ReasoningSupport::Supported)
+        );
     }
 
     #[test]
@@ -571,19 +737,18 @@ mod tests {
         let mut config = ProviderConfig {
             active_provider: Some(ProviderKind::OpenRouter),
             model: "vendor/current".into(),
-            key_configured: true,
             ..default_config()
         };
 
-        let older = config.start_reasoning_probe().unwrap().unwrap();
-        let newer = config.start_reasoning_probe().unwrap().unwrap();
+        let older = config.start_reasoning_probe(true).unwrap().unwrap();
+        let newer = config.start_reasoning_probe(true).unwrap().unwrap();
 
         assert_eq!(older.generation, 1);
         assert_eq!(newer.generation, 2);
-        assert!(config.apply_reasoning_probe(&newer, ReasoningSupport::Unsupported));
-        assert!(!config.apply_reasoning_probe(&older, ReasoningSupport::Supported));
+        assert!(config.apply_reasoning_probe(true, &newer, ReasoningSupport::Unsupported));
+        assert!(!config.apply_reasoning_probe(true, &older, ReasoningSupport::Supported));
         assert_eq!(
-            config.cached_reasoning_support(),
+            config.cached_reasoning_support(true),
             ReasoningSupport::Unsupported
         );
     }
@@ -599,7 +764,7 @@ mod tests {
         let mut config = read_provider_config(dir.path()).unwrap();
         assert_eq!(config.reasoning_probe_generation, 0);
 
-        let target = config.start_reasoning_probe().unwrap().unwrap();
+        let target = config.start_reasoning_probe(true).unwrap().unwrap();
         write_provider_config(dir.path(), &config).unwrap();
 
         assert_eq!(target.generation, 1);
@@ -616,12 +781,11 @@ mod tests {
         let mut config = ProviderConfig {
             active_provider: Some(ProviderKind::OpenRouter),
             model: "vendor/current".into(),
-            key_configured: true,
             reasoning_probe_generation: u64::MAX,
             ..default_config()
         };
 
-        let error = config.start_reasoning_probe().unwrap_err();
+        let error = config.start_reasoning_probe(true).unwrap_err();
 
         assert!(matches!(error, CoreError::InvalidContent(_)));
         assert_eq!(config.reasoning_probe_generation, u64::MAX);
@@ -632,23 +796,40 @@ mod tests {
         let mut config = ProviderConfig {
             active_provider: Some(ProviderKind::OpenRouter),
             model: "vendor/a".into(),
-            key_configured: true,
-            reasoning_support: Some(ReasoningSupport::Supported),
-            reasoning_probed_model: Some("vendor/a".into()),
+            reasoning_probe: probed("vendor/a", ReasoningSupport::Supported),
             reasoning_probe_generation: 4,
             ..default_config()
         };
 
         config
-            .mutate_with_reasoning_probe_invalidation(|config| {
+            .mutate_with_reasoning_probe_invalidation(true, true, |config| {
                 config.model = "vendor/b".into();
                 Ok(())
             })
             .unwrap();
 
         assert_eq!(config.reasoning_probe_generation, 5);
-        assert_eq!(config.reasoning_support, None);
-        assert_eq!(config.reasoning_probed_model, None);
+        assert_eq!(config.reasoning_probe, None);
+    }
+
+    #[test]
+    fn key_presence_change_invalidates_the_probe_even_when_no_field_moves() {
+        // Clearing the OpenRouter key (present → absent) changes the effective
+        // provider from OpenRouter to none, so the cached verdict must be invalidated
+        // even though the empty mutation touches no config field.
+        let mut config = ProviderConfig {
+            model: "vendor/a".into(),
+            reasoning_probe: probed("vendor/a", ReasoningSupport::Supported),
+            reasoning_probe_generation: 4,
+            ..default_config()
+        };
+
+        config
+            .mutate_with_reasoning_probe_invalidation(true, false, |_config| Ok(()))
+            .unwrap();
+
+        assert_eq!(config.reasoning_probe_generation, 5);
+        assert_eq!(config.reasoning_probe, None);
     }
 
     #[test]
@@ -656,17 +837,15 @@ mod tests {
         let mut config = ProviderConfig {
             active_provider: Some(ProviderKind::Local),
             model: "vendor/old".into(),
-            key_configured: true,
             local_model_tag: Some("qwen2.5:7b".into()),
             reasoning: false,
-            reasoning_support: Some(ReasoningSupport::Supported),
-            reasoning_probed_model: Some("qwen2.5:7b".into()),
+            reasoning_probe: probed("qwen2.5:7b", ReasoningSupport::Supported),
             reasoning_probe_generation: 4,
             ..default_config()
         };
 
         config
-            .mutate_with_reasoning_probe_invalidation(|config| {
+            .mutate_with_reasoning_probe_invalidation(true, true, |config| {
                 config.model = "vendor/new".into();
                 config.reasoning = true;
                 config.disabled_skills.push(FIXTURE_SKILL_ID.into());
@@ -675,8 +854,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(config.reasoning_probe_generation, 4);
-        assert_eq!(config.reasoning_support, Some(ReasoningSupport::Supported));
-        assert_eq!(config.reasoning_probed_model.as_deref(), Some("qwen2.5:7b"));
+        assert_eq!(
+            config.reasoning_probe,
+            probed("qwen2.5:7b", ReasoningSupport::Supported)
+        );
     }
 
     #[test]
@@ -684,16 +865,14 @@ mod tests {
         let mut config = ProviderConfig {
             active_provider: Some(ProviderKind::OpenRouter),
             model: "vendor/a".into(),
-            key_configured: true,
-            reasoning_support: Some(ReasoningSupport::Unsupported),
-            reasoning_probed_model: Some("vendor/a".into()),
+            reasoning_probe: probed("vendor/a", ReasoningSupport::Unsupported),
             reasoning_probe_generation: u64::MAX,
             ..default_config()
         };
         let original = config.clone();
 
         let error = config
-            .mutate_with_reasoning_probe_invalidation(|config| {
+            .mutate_with_reasoning_probe_invalidation(true, true, |config| {
                 config.model = "vendor/b".into();
                 Ok(())
             })
@@ -708,14 +887,13 @@ mod tests {
         let mut config = ProviderConfig {
             active_provider: Some(ProviderKind::OpenRouter),
             model: "vendor/a".into(),
-            key_configured: true,
             reasoning_probe_generation: 3,
             ..default_config()
         };
         let original = config.clone();
 
         let error = config
-            .mutate_with_reasoning_probe_invalidation(|config| {
+            .mutate_with_reasoning_probe_invalidation(true, true, |config| {
                 config.model = "vendor/b".into();
                 Err::<(), _>(CoreError::InvalidName("rejected mutation".into()))
             })
@@ -730,78 +908,68 @@ mod tests {
         let mut config = ProviderConfig {
             active_provider: Some(ProviderKind::OpenRouter),
             model: "shared/model".into(),
-            key_configured: true,
             local_model_tag: Some("shared/model".into()),
-            reasoning_support: Some(ReasoningSupport::Supported),
-            reasoning_probed_model: Some("shared/model".into()),
+            reasoning_probe: probed("shared/model", ReasoningSupport::Supported),
             reasoning_probe_generation: 2,
             ..default_config()
         };
 
         config
-            .mutate_with_reasoning_probe_invalidation(|config| {
+            .mutate_with_reasoning_probe_invalidation(true, true, |config| {
                 config.active_provider = Some(ProviderKind::Local);
                 Ok(())
             })
             .unwrap();
 
         assert_eq!(config.reasoning_probe_generation, 3);
-        assert_eq!(config.cached_reasoning_support(), ReasoningSupport::Unknown);
+        assert_eq!(
+            config.cached_reasoning_support(true),
+            ReasoningSupport::Unknown
+        );
     }
 
     #[test]
     fn cached_reasoning_support_returns_valid_model_verdict() {
         let config = ProviderConfig {
             model: "openai/gpt-4.1".into(),
-            key_configured: true,
-            reasoning_support: Some(ReasoningSupport::Supported),
-            reasoning_probed_model: Some("openai/gpt-4.1".into()),
+            reasoning_probe: probed("openai/gpt-4.1", ReasoningSupport::Supported),
             ..default_config()
         };
 
         assert_eq!(
-            config.cached_reasoning_support(),
+            config.cached_reasoning_support(true),
             ReasoningSupport::Supported
         );
     }
 
     #[test]
     fn cached_reasoning_support_is_unknown_after_model_change() {
+        // The verdict belongs to `old/model`; the selected model is now `new/model`,
+        // so the cache for A is not used for B.
         let config = ProviderConfig {
             model: "new/model".into(),
-            key_configured: true,
-            reasoning_support: Some(ReasoningSupport::Unsupported),
-            reasoning_probed_model: Some("old/model".into()),
+            reasoning_probe: probed("old/model", ReasoningSupport::Unsupported),
             ..default_config()
         };
 
-        assert_eq!(config.cached_reasoning_support(), ReasoningSupport::Unknown);
+        assert_eq!(
+            config.cached_reasoning_support(true),
+            ReasoningSupport::Unknown
+        );
     }
 
     #[test]
     fn cached_reasoning_support_is_unknown_without_verdict() {
         let config = ProviderConfig {
             model: "openai/gpt-4.1".into(),
-            key_configured: true,
-            reasoning_support: None,
-            reasoning_probed_model: Some("openai/gpt-4.1".into()),
+            reasoning_probe: None,
             ..default_config()
         };
 
-        assert_eq!(config.cached_reasoning_support(), ReasoningSupport::Unknown);
-    }
-
-    #[test]
-    fn cached_reasoning_support_is_unknown_without_probed_model() {
-        let config = ProviderConfig {
-            model: "openai/gpt-4.1".into(),
-            key_configured: true,
-            reasoning_support: Some(ReasoningSupport::Supported),
-            reasoning_probed_model: None,
-            ..default_config()
-        };
-
-        assert_eq!(config.cached_reasoning_support(), ReasoningSupport::Unknown);
+        assert_eq!(
+            config.cached_reasoning_support(true),
+            ReasoningSupport::Unknown
+        );
     }
 
     #[test]
@@ -814,28 +982,24 @@ mod tests {
         let value = serde_json::to_value(ProviderConfig {
             active_provider: Some(ProviderKind::Local),
             model: "openai/gpt-4.1".into(),
-            key_configured: true,
             local_model_tag: Some("qwen2.5:7b".into()),
             reasoning: true,
-            reasoning_support: Some(ReasoningSupport::Supported),
-            reasoning_probed_model: Some("qwen2.5:7b".into()),
+            reasoning_probe: probed("qwen2.5:7b", ReasoningSupport::Supported),
             reasoning_probe_generation: 7,
             disabled_skills: vec![FIXTURE_SKILL_ID.into()],
         })
         .unwrap();
 
         assert!(value.get("activeProvider").is_some());
-        assert!(value.get("keyConfigured").is_some());
+        assert!(value.get("keyConfigured").is_none());
         assert!(value.get("localModelTag").is_some());
         assert_eq!(value.get("reasoning"), Some(&serde_json::json!(true)));
         assert_eq!(
-            value.get("reasoningSupport"),
-            Some(&serde_json::json!("supported"))
+            value.get("reasoningProbe"),
+            Some(&serde_json::json!({"model":"qwen2.5:7b","support":"supported"}))
         );
-        assert_eq!(
-            value.get("reasoningProbedModel"),
-            Some(&serde_json::json!("qwen2.5:7b"))
-        );
+        assert!(value.get("reasoningSupport").is_none());
+        assert!(value.get("reasoningProbedModel").is_none());
         assert_eq!(
             value.get("reasoningProbeGeneration"),
             Some(&serde_json::json!(7))

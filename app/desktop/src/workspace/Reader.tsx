@@ -134,6 +134,9 @@ function NoteBody({
   return <UnsupportedNotice ext={ext} raw={isTextLikeExt(ext) ? note.raw : null} />;
 }
 
+const normalizeForTitleMatch = (value: string): string =>
+  value.normalize("NFKC").trim().replace(/\s+/g, " ");
+
 /**
  * The backend derives a note's title from frontmatter, then the first H1, then
  * the filename. When that H1 is the first body element, the reader's document
@@ -160,9 +163,8 @@ export function withoutRepeatedLeadingTitle(body: string, title: string): string
   }
   if (headingEnd === headingTextStart) return body;
 
-  const normalize = (value: string) =>
-    value.normalize("NFKC").trim().replace(/\s+/g, " ");
-  if (normalize(body.slice(headingTextStart, headingEnd)) !== normalize(title)) return body;
+  if (normalizeForTitleMatch(body.slice(headingTextStart, headingEnd)) !== normalizeForTitleMatch(title))
+    return body;
 
   const lineEnd = body[headingEnd] === "\r" && body[headingEnd + 1] === "\n"
     ? headingEnd + 2

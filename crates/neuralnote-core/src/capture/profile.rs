@@ -110,35 +110,31 @@ pub(crate) fn validate_skill_routing_profile(
     Ok(())
 }
 
-// TODO(path-safety-unify): replace this local rule set with one shared
-// vault-relative path policy.
+/// Validate a saved routing folder: the shared vault-relative grammar (absolute,
+/// traversal, empty-component, separator, drive-prefix, and invisible-character
+/// rejection) plus this boundary's extras — a byte cap, no surrounding
+/// whitespace, the `<>:"|?*` portability class, and no component ending in a dot
+/// or space.
 pub(crate) fn validate_folder_path(path: &str) -> Result<(), CaptureError> {
     if path.is_empty() || path.len() > MAX_PROFILE_FOLDER_BYTES || path.trim() != path {
         return Err(profile_error(
             "default folder is empty or exceeds its limit",
         ));
     }
-    if path.starts_with('/')
-        || path.starts_with('\\')
-        || path.contains('\\')
-        || is_windows_absolute(path)
-    {
+    if !crate::paths::VaultRelPath::is_valid(path) {
         return Err(profile_error("default folder must be vault-relative"));
     }
-    if path.chars().any(|character| {
-        character.is_control() || matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*')
-    }) {
+    if path
+        .chars()
+        .any(|character| matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
+    {
         return Err(profile_error("default folder contains unsafe characters"));
     }
-
-    for component in path.split('/') {
-        if component.is_empty()
-            || matches!(component, "." | "..")
-            || component.ends_with('.')
-            || component.ends_with(' ')
-        {
-            return Err(profile_error("default folder contains an unsafe component"));
-        }
+    if path
+        .split('/')
+        .any(|component| component.ends_with('.') || component.ends_with(' '))
+    {
+        return Err(profile_error("default folder contains an unsafe component"));
     }
     Ok(())
 }
@@ -163,11 +159,6 @@ fn validate_vault_profile(profile: &VaultProfile) -> Result<(), CaptureError> {
         validate_skill_routing_profile(routing)?;
     }
     Ok(())
-}
-
-fn is_windows_absolute(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn profile_error(detail: &str) -> CaptureError {

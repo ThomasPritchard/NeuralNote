@@ -6,7 +6,6 @@
 //! AI/provider verbs in [`commands::ai`]. All path logic and data safety live in the
 //! core crate; this shell only wires it to the webview.
 
-use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -18,6 +17,7 @@ use crate::provider_config_mutation::ProviderConfigMutationGate;
 use crate::vault_mutation::{VaultMutationContext, VaultMutationGate};
 
 mod ai;
+mod authorized_paths;
 mod commands;
 mod event_names;
 mod local;
@@ -79,10 +79,13 @@ pub(crate) struct AppState {
     /// only from a prior explicit pick) — may become a vault root. This stops a
     /// compromised webview from pointing the vault, and thus every file command,
     /// at an arbitrary path it supplies to `open_vault`/`create_vault`.
-    // TODO(authorized-set-unbounded): this grows once per folder picked and is
-    // never pruned. Bounded by picks-per-session (tiny in practice), so deferred —
-    // round-9 FYI. Cap or LRU-evict it if a session could realistically pick many.
-    pub(crate) authorized: HashSet<PathBuf>,
+    ///
+    /// Bounded LRU (see [`authorized_paths`]): capped so this can't grow for the
+    /// life of the process, evicting the oldest pick first. Eviction only *forgets*
+    /// — it never widens authority — and an evicted path fails closed on the next
+    /// authorization check. Reopening a previously opened vault still works because
+    /// that vault is also written to the on-disk recents list.
+    pub(crate) authorized: authorized_paths::AuthorizedPaths,
     /// Whether the cited-recall chat panel is shown. The webview owns this now (a
     /// titlebar button competes with the View menu, so the menu can't be its sole
     /// toggle); this copy exists only so the native View-menu checkmark can be
@@ -113,7 +116,7 @@ impl Default for AppState {
             skill_undo_runs: skills::UndoRunStore::default(),
             openrouter_catalogue: openrouter_catalogue::OpenRouterCatalogueState::default(),
             provider_config_mutations: ProviderConfigMutationGate::default(),
-            authorized: HashSet::new(),
+            authorized: authorized_paths::AuthorizedPaths::default(),
             chat_visible: true,
             editing: false,
             vault_mutations: VaultMutationGate::default(),

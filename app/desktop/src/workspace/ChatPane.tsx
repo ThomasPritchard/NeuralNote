@@ -450,13 +450,13 @@ export function ChatPane({
     statusGenerationRef.current = generation;
     api
       .aiStatus()
-      .then((status) => {
+      .then((nextStatus) => {
         if (cancelled || statusGenerationRef.current !== generation) return;
         // A later refresh that still reports "nothing configured" must not
         // stomp a manually-chosen first-run view (guided setup / skipped);
         // only the mount pass may land on the picker from scratch.
-        if (status.activeProvider === null && viewRef.current !== "loading") return;
-        commitStatus(mergeStatusRead(statusRef.current, status));
+        if (nextStatus.activeProvider === null && viewRef.current !== "loading") return;
+        commitStatus(mergeStatusRead(statusRef.current, nextStatus));
       })
       .catch((e) => {
         if (cancelled || statusGenerationRef.current !== generation) return;

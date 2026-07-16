@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 
 // three-spritetext draws on a 2D canvas context at construction time, which
 // jsdom lacks — the pure math under test never touches it.
+// eslint-disable-next-line typescript/no-extraneous-class -- minimal constructable stub for the mocked default export; the math under test never touches it.
 vi.mock("three-spritetext", () => ({ default: class {} }));
 
 import {

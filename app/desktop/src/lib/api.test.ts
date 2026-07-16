@@ -99,14 +99,14 @@ describe("errorMessage", () => {
   });
 });
 
-describe("AI config mutation sequencing", () => {
-  const status = (model: string, reasoning: boolean): AiStatus => ({
-    activeProvider: "openRouter",
-    reasoningSupported: "unknown",
-    openrouter: { hasKey: true, model, reasoning },
-    local: { activeModelTag: null },
-  });
+const makeStatus = (model: string, reasoning: boolean): AiStatus => ({
+  activeProvider: "openRouter",
+  reasoningSupported: "unknown",
+  openrouter: { hasKey: true, model, reasoning },
+  local: { activeModelTag: null },
+});
 
+describe("AI config mutation sequencing", () => {
   it("does not start a later model mutation until the earlier reasoning response resolves", async () => {
     let resolveReasoning!: (value: AiStatus) => void;
     let resolveModel!: (value: AiStatus) => void;
@@ -127,18 +127,18 @@ describe("AI config mutation sequencing", () => {
     await vi.waitFor(() => expect(mockInvoke).toHaveBeenCalledTimes(1));
     expect(mockInvoke).toHaveBeenLastCalledWith("set_reasoning", { enabled: false });
 
-    resolveReasoning(status("vendor/old", false));
-    await expect(first).resolves.toEqual(status("vendor/old", false));
+    resolveReasoning(makeStatus("vendor/old", false));
+    await expect(first).resolves.toEqual(makeStatus("vendor/old", false));
     await vi.waitFor(() => expect(mockInvoke).toHaveBeenCalledTimes(2));
     expect(mockInvoke).toHaveBeenLastCalledWith("select_openrouter_model", {
       model: "vendor/new",
     });
-    resolveModel(status("vendor/new", false));
-    await expect(second).resolves.toEqual(status("vendor/new", false));
+    resolveModel(makeStatus("vendor/new", false));
+    await expect(second).resolves.toEqual(makeStatus("vendor/new", false));
   });
 
   it("keeps provider selection and its status read inside the same mutation slot", async () => {
-    const selected = status("vendor/current", false);
+    const selected = makeStatus("vendor/current", false);
     mockInvoke
       .mockResolvedValueOnce(undefined as never)
       .mockResolvedValueOnce(selected as never);
@@ -155,8 +155,8 @@ describe("AI config mutation sequencing", () => {
     const probeResponse = new Promise<AiStatus>((resolve) => {
       resolveProbe = resolve;
     });
-    const staleProbe = status("vendor/old", false);
-    const selected = status("vendor/new", true);
+    const staleProbe = makeStatus("vendor/old", false);
+    const selected = makeStatus("vendor/new", true);
     mockInvoke.mockImplementation((command) => {
       if (command === "refresh_reasoning_support") return probeResponse as never;
       if (command === "select_openrouter_model") {
@@ -279,10 +279,11 @@ describe("skills-bank wrappers", () => {
     });
   });
 
-  it("answers a live elicitation with the selected option ids", async () => {
-    await answerElicitation("consent-1", ["yes"]);
+  it("answers a live elicitation with the selected option ids scoped to its run", async () => {
+    await answerElicitation(TURN_ID, "consent-1", ["yes"]);
 
     expect(mockInvoke).toHaveBeenCalledWith("answer_elicitation", {
+      turnId: TURN_ID,
       id: "consent-1",
       choices: ["yes"],
     });
