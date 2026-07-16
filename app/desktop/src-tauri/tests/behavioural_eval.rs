@@ -267,7 +267,18 @@ fn classify_runner_health(status: u16, body: &str) -> Result<(), String> {
     }
 }
 
-async fn ollama_available(port: u16) -> Result<(), String> {
+/// The local model the eval should exercise. Defaults to `DEFAULT_LOCAL_MODEL`,
+/// but `NEURALNOTE_EVAL_MODEL` overrides it so the same harness can measure
+/// per-tier citation adherence (#68) without editing the shipped default.
+fn eval_local_model() -> String {
+    std::env::var("NEURALNOTE_EVAL_MODEL")
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| neuralnote_core::ai::DEFAULT_LOCAL_MODEL.to_string())
+}
+
+async fn ollama_available(port: u16, model: &str) -> Result<(), String> {
     let client = reqwest::Client::builder()
         .connect_timeout(Duration::from_secs(2))
         .timeout(Duration::from_secs(5))
@@ -291,13 +302,12 @@ async fn ollama_available(port: u16) -> Result<(), String> {
     let models = neuralnote_core::ai::parse_installed_models(&body)
         .map_err(|error| format!("the Ollama /api/tags body could not be parsed: {error}"))?;
 
-    let listed = models.iter().any(|model| {
-        neuralnote_core::ai::model_installed(&model.tag, neuralnote_core::ai::DEFAULT_LOCAL_MODEL)
-    });
+    let listed = models
+        .iter()
+        .any(|installed| neuralnote_core::ai::model_installed(&installed.tag, model));
     if !listed {
         return Err(format!(
-            "the required local model '{}' is not installed",
-            neuralnote_core::ai::DEFAULT_LOCAL_MODEL
+            "the required local model '{model}' is not installed"
         ));
     }
 
@@ -311,7 +321,7 @@ async fn ollama_available(port: u16) -> Result<(), String> {
         .post(format!("http://127.0.0.1:{port}/api/generate"))
         .timeout(Duration::from_secs(120))
         .json(&serde_json::json!({
-            "model": neuralnote_core::ai::DEFAULT_LOCAL_MODEL,
+            "model": model,
             "prompt": "hi",
             "stream": false,
             "options": { "num_predict": 1 },
@@ -366,37 +376,35 @@ async fn local_ollama_behavioural_eval() {
         .ok()
         .and_then(|value| value.parse::<u16>().ok())
         .unwrap_or(11434);
+    let model = eval_local_model();
     let enable_hint = format!(
-        "start Ollama with '{}' pulled (ollama pull {}); set NEURALNOTE_OLLAMA_PORT if it is not on 11434",
-        neuralnote_core::ai::DEFAULT_LOCAL_MODEL,
-        neuralnote_core::ai::DEFAULT_LOCAL_MODEL
+        "start Ollama with '{model}' pulled (ollama pull {model}); set NEURALNOTE_OLLAMA_PORT if it is not on 11434, or NEURALNOTE_EVAL_MODEL to measure a different tier"
     );
-    if let Err(reason) = ollama_available(port).await {
+    if let Err(reason) = ollama_available(port, &model).await {
         skip_or_fail("Ollama", &reason, &enable_hint);
         return;
     }
 
     let vault = fixture_vault();
     let client = desktop_lib::ollama_chat_client(port, false);
-    // RESOLVED(local-model-citation-reliability): measured 2026-07-10 against the
-    // packaged sidecar, DEFAULT_LOCAL_MODEL (qwen3.5:9b) passed Case 3 (factual-in-vault
-    // ⇒ ≥1 verified citation) only ~1 run in 3 — it inconsistently emitted the `[eN]`
-    // marker, though the pipeline verified correctly when it did. Product decision: the
-    // local tier is explicitly BEST-EFFORT for citation fidelity. The strict Case 3
-    // assertion is DELIBERATELY RETAINED (a wrong citation is worse than no answer, so
-    // the eval must keep demanding one) — it is not loosened, skipped, or made
-    // conditional. The default local model and RAM-adaptive sizing are unchanged; larger
-    // tiers (e.g. qwen3.5:27b) are auto-selected on capable hardware, where adherence is
-    // stronger. Product copy elsewhere steers users wanting the most reliable citations
-    // to the BYO-API-key path. Empirical tier-comparison (9b vs 27b vs API) is tracked as
-    // a filed follow-up issue, not resolved here. See
-    // [[project-local-model-marginal-for-citation]].
-    run_five_cases(
-        vault.path(),
-        neuralnote_core::ai::DEFAULT_LOCAL_MODEL,
-        &client,
-    )
-    .await;
+    // RESOLVED(local-model-citation-reliability): DEFAULT_LOCAL_MODEL (qwen3.5:9b)
+    // passes Case 3 (factual-in-vault ⇒ ≥1 verified citation) only ~1 run in 3 — it
+    // inconsistently emits the `[eN]` marker, though the pipeline verifies correctly
+    // when it does. Product decision: the local tier is explicitly BEST-EFFORT for
+    // citation fidelity. The strict Case 3 assertion is DELIBERATELY RETAINED (a wrong
+    // citation is worse than no answer, so the eval must keep demanding one) — it is
+    // not loosened, skipped, or made conditional.
+    //
+    // RESOLVED(#68) — tier comparison, measured 2026-07-16 (K=6 runs/model via the
+    // NEURALNOTE_EVAL_MODEL override below): granite4.1:3b 1/6, qwen3.5:4b 1/6,
+    // qwen3.5:9b 2/6, granite4.1:8b 0/6, qwen3.5:27b 1/6. Two findings: (1) bigger is
+    // NOT reliably better past 9b — 27b matched the smallest tiers at 3× the latency
+    // (~190s/run) and 26 GB RAM; (2) the qwen3.5 family beats granite4.1, which emits
+    // no verified citation even at 8b. So the default (9b) and the RAM-adaptive sizing
+    // stand: 9b is the best-measured local tier, and no local model is reliable enough
+    // to change the "steer citation-critical users to BYO-API-key" stance. Re-run per
+    // tier with `NEURALNOTE_EVAL_MODEL=<tag>`. See [[project-local-model-marginal-for-citation]].
+    run_five_cases(vault.path(), &model, &client).await;
 }
 
 // The live probe needs a real Ollama, so the runnability classification is factored into
