@@ -13,50 +13,48 @@ export interface ReleaseNotes {
 }
 
 const RELEASE_NOTES: Readonly<Record<string, ReleaseNotes>> = {
-  "0.2.0": {
-    version: "0.2.0",
-    title: "What's new in NeuralNote 0.2.0",
+  "0.2.1": {
+    version: "0.2.1",
+    title: "What's new in NeuralNote 0.2.1",
     introduction:
-      "This release makes NeuralNote feel like one coherent workspace: notes edit in place, links navigate naturally, and the active AI model stays close to the conversation.",
+      "NeuralNote 0.2.1 is a reliability and polish release. Search reaches more of your vault, open notes stay in step with changes made outside the app, the assistant is more honest about cut-off answers and evidence, and keyboard and screen-reader access improve. The vault format and your saved settings are unchanged.",
     groups: [
       {
-        title: "Source-native editing",
+        title: "Editing and search",
         items: [
-          "Markdown now edits in one live-preview surface. Supported syntax is styled in place while your exact source remains authoritative.",
-          "Headings, including a note's leading H1 title, stay in the document and can be edited directly.",
-          "Standard links and resolved Obsidian wikilinks open their target through NeuralNote's guarded vault resolver. Unresolved or unsafe links remain inert.",
-          "Type [[ to choose a note, with duplicate paths shown clearly. The caret stays inside the link so you can add a heading or block fragment with #, or display text with |.",
-          "Headings, emphasis, lists, tasks, blockquotes, code, tables, links, callouts, and block IDs receive conservative live-preview treatment.",
-          "Malformed Markdown and plugin syntax such as Dataview, raw HTML, MDX, and JSX stay visible and editable without executing.",
-          "Save, dirty state, conflicts, reload, overwrite, tabs, Properties, backlinks, formatting, BOMs, and original line endings remain source-preserving.",
+          "Search now covers plain-text notes, so a .txt or .text file is found and cited on the exact line the reader shows.",
+          "Vault search matches accented and non-Latin text consistently, using full Unicode-aware case folding.",
+          "Notes saved in non-UTF-8 encodings read and search the same way, with no mismatch between the reader and search results.",
+          "Open notes reload safely when their file changes outside NeuralNote, keeping your place instead of showing stale text.",
+          "Fixes to the Markdown source editor correct rendering and interaction glitches during live-preview editing.",
         ],
       },
       {
         title: "Neural Assistant AI",
         items: [
-          "Cited recall is now Neural Assistant AI, with the same honest citations back to vault notes and line evidence.",
-          "The chat composer shows the active model and includes a keyboard-accessible model picker.",
-          "OpenRouter offers a bounded, validated list of compatible tool-capable models without silently replacing your current choice.",
-          "Local AI users can jump straight from the composer to model management in Settings.",
-          "Stop response keeps partial output visible and distinguishes a user stop from provider or app-lifecycle failures.",
+          "When a provider stops an answer at its length limit, NeuralNote now flags the answer as truncated instead of presenting it as complete.",
+          "Cited answers stay trustworthy: reused note text is re-verified before it is cited, so a stale span is dropped rather than attributed to the wrong line.",
+          "A citation's supporting evidence widens automatically when a later step needs more surrounding context.",
+          "The local AI option is now clearly labelled best-effort for citation fidelity, and points you to the API-key path when reliable citations matter most.",
+          "Transient failures in the assistant's tool steps retry with a short backoff instead of surfacing as an error.",
         ],
       },
       {
-        title: "Workspace and presentation",
+        title: "Accessibility and interface",
         items: [
-          "Files and Search now use matching pane toggles and keep their hierarchy, query, and results mounted while hidden.",
-          "Sidebar layout preferences migrate safely and restore the selected pane and preferred width.",
-          "The macOS titlebar follows native fullscreen state while other platforms keep their existing geometry.",
-          "Note paths use the primary interface typeface, sidebar typography is refined, and the welcome screen uses the tracked NeuralNote mark.",
+          "File-tree entries gain a keyboard-accessible Move to action, so notes can be reorganised without a pointer.",
+          "Settings pages, the pane splitter, the ribbon, and the title bar expose clearer, more semantic roles to screen readers.",
+          "The title bar's drag region is hit-tested accurately, so window dragging responds where you expect.",
         ],
       },
       {
         title: "Reliability and release readiness",
         items: [
-          "OpenRouter catalogue and ranking traffic is bounded, validated, and kept behind the native keychain boundary.",
-          "Changing an OpenRouter model updates only that model and never exposes or replaces the provider key.",
-          "Editing retains expected-hash conflict detection, vault containment, symlink and path-race protection, atomic writes, recoverable drafts, and the 8 MiB editable-note limit.",
-          "Application packages, updater checks, and the local upgrade journey are aligned on version 0.2.0.",
+          "Undo history recovers cleanly after an unexpected shutdown, restoring quarantined entries instead of losing them.",
+          "Undo records resolve to the latest write for a note, so a stale entry can never authorise deleting newer content.",
+          "Local-model downloads check free disk space first and report accurate overall progress across multi-part model pulls.",
+          "Vault paths are validated through one stricter, shared check, closing edge cases around unusual path components.",
+          "Application packages, updater checks, and the upgrade journey are aligned on version 0.2.1.",
         ],
       },
     ],

@@ -239,19 +239,19 @@ test("the immutable GitHub release description includes the complete v0.2.1 chan
   const validate = stepBody(publish, "Validate downloaded release artifacts");
   const draft = stepBody(publish, "Create draft GitHub prerelease");
 
-  assert.match(releaseNotes, /^# NeuralNote 0\.2\.0 ALPHA$/m);
+  assert.match(releaseNotes, /^# NeuralNote 0\.2\.1 ALPHA$/m);
   for (const heading of [
-    "Source-native editing",
+    "Editing and search",
     "Neural Assistant AI",
-    "Workspace and presentation",
+    "Accessibility and interface",
     "Reliability and release readiness",
   ]) {
     assert.match(releaseNotes, new RegExp(`^## ${heading}$`, "m"));
   }
-  assert.match(releaseNotes, /leading H1 title/);
-  assert.match(releaseNotes, /Standard links and resolved Obsidian wikilinks/);
-  assert.match(releaseNotes, /Stop response/);
-  assert.match(releaseNotes, /8 MiB editable-note limit/);
+  assert.match(releaseNotes, /plain-text notes/);
+  assert.match(releaseNotes, /best-effort for citation fidelity/);
+  assert.match(releaseNotes, /keyboard-accessible Move to action/);
+  assert.match(releaseNotes, /aligned on version 0\.2\.1/);
   const bundledItems = [...bundledReleaseNotes.matchAll(/items:\s*\[([\s\S]*?)\]/g)].flatMap(
     ([, items]) => [...items.matchAll(/"(?:[^"\\]|\\.)*"/g)].map(([item]) => JSON.parse(item)),
   );

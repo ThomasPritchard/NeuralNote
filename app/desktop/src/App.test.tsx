@@ -28,13 +28,13 @@ vi.mock("./updates/UpdateCoordinator", () => ({
 import * as api from "./lib/api";
 import App from "./App";
 
-const SEEN_0_2: AppPreferencesLoad = {
+const SEEN_CURRENT: AppPreferencesLoad = {
   preferences: {
     automaticUpdateChecks: true,
     theme: "neuralVioletDark",
     fontScale: "default",
     fontFamily: "inter",
-    lastSeenWhatsNewVersion: "0.2.0",
+    lastSeenWhatsNewVersion: "0.2.1",
   },
   recoveredFromCorrupt: false,
   recoveryMessage: null,
@@ -48,20 +48,20 @@ afterEach(() => {
 describe("App router", () => {
   it("renders the welcome screen when no vault is open", () => {
     mockUseVault.mockReturnValue({ status: "welcome" });
-    render(<App initialPreferences={SEEN_0_2} />);
+    render(<App initialPreferences={SEEN_CURRENT} />);
     expect(screen.getByText("welcome-screen")).toBeInTheDocument();
     expect(screen.queryByText("workspace-screen")).not.toBeInTheDocument();
   });
 
   it("renders the welcome screen during the loading state", () => {
     mockUseVault.mockReturnValue({ status: "loading" });
-    render(<App initialPreferences={SEEN_0_2} />);
+    render(<App initialPreferences={SEEN_CURRENT} />);
     expect(screen.getByText("welcome-screen")).toBeInTheDocument();
   });
 
   it("renders the workspace once a vault is open", () => {
     mockUseVault.mockReturnValue({ status: "open" });
-    render(<App initialPreferences={SEEN_0_2} />);
+    render(<App initialPreferences={SEEN_CURRENT} />);
     expect(screen.getByText("workspace-screen")).toBeInTheDocument();
   });
 
@@ -70,9 +70,9 @@ describe("App router", () => {
     render(
       <App
         initialPreferences={{
-          ...SEEN_0_2,
+          ...SEEN_CURRENT,
           preferences: {
-            ...SEEN_0_2.preferences,
+            ...SEEN_CURRENT.preferences,
             lastSeenWhatsNewVersion: null,
           },
         }}
@@ -80,7 +80,7 @@ describe("App router", () => {
     );
 
     const dialog = screen.getByRole("dialog", {
-      name: "What's new in NeuralNote 0.2.0",
+      name: "What's new in NeuralNote 0.2.1",
     });
     expect(dialog).toBeInTheDocument();
     expect(dialog).toHaveFocus();
@@ -89,7 +89,7 @@ describe("App router", () => {
 
   it("does not reopen What's new when the installed version is already acknowledged", () => {
     mockUseVault.mockReturnValue({ status: "welcome" });
-    render(<App initialPreferences={SEEN_0_2} />);
+    render(<App initialPreferences={SEEN_CURRENT} />);
 
     expect(screen.queryByRole("dialog", { name: /what's new/i })).not.toBeInTheDocument();
   });
@@ -101,9 +101,9 @@ describe("App router", () => {
     render(
       <App
         initialPreferences={{
-          ...SEEN_0_2,
+          ...SEEN_CURRENT,
           preferences: {
-            ...SEEN_0_2.preferences,
+            ...SEEN_CURRENT.preferences,
             lastSeenWhatsNewVersion: "0.1.1",
           },
         }}
@@ -116,8 +116,8 @@ describe("App router", () => {
     expect(screen.queryByRole("dialog", { name: /what's new/i })).not.toBeInTheDocument();
     await waitFor(() =>
       expect(api.saveAppPreferences).toHaveBeenCalledWith({
-        ...SEEN_0_2.preferences,
-        lastSeenWhatsNewVersion: "0.2.0",
+        ...SEEN_CURRENT.preferences,
+        lastSeenWhatsNewVersion: "0.2.1",
       }),
     );
   });
@@ -129,9 +129,9 @@ describe("App router", () => {
     render(
       <App
         initialPreferences={{
-          ...SEEN_0_2,
+          ...SEEN_CURRENT,
           preferences: {
-            ...SEEN_0_2.preferences,
+            ...SEEN_CURRENT.preferences,
             lastSeenWhatsNewVersion: null,
           },
         }}
