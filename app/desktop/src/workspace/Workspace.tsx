@@ -1,10 +1,13 @@
 // The workspace: navigation · file tree / search panel · reader/editor / graph ·
 // cited-chat stub · status bar. This orchestrator owns the multi-note tab state,
-// the Workspace-local view state (which sidebar panel and
-// center view are showing — deliberately NOT in the vault store), and the
-// glue that keeps tabs honest when the tree mutates underneath them. Navigation
-// preserves dirty tabs; destructive tab, vault, and window actions share one
-// explicit unsaved-edit guard.
+// the shared open-by-path handlers, the settings/template dialogs, and the native
+// menu + window-close wiring that ties every concern together. The three concern
+// clusters it used to hold inline now live in co-located hooks:
+//   · useWorkspaceLayout      — sidebar/navigation geometry, panel routing, search signals
+//   · useWorkspaceLifecycle   — durable tab state + the destructive-action guard
+//   · workspaceIntents        — the pure copy/serialisation behind those two
+// and the central panes subtree renders through WorkspacePanes. The menu/close
+// subscriptions stay here on purpose — they dispatch across all three concerns.
 // Tree CRUD lives in FileTree; lifecycle errors flow from the store.
 
 import {
@@ -16,109 +19,30 @@ import {
   useState,
   type CSSProperties,
 } from "react";
-import { getCurrentWindow } from "@tauri-apps/api/window";
-import type { UnlistenFn } from "@tauri-apps/api/event";
 import * as api from "../lib/api";
 import { useVault } from "../lib/store";
 import { useToast } from "../notifications";
-import type { NoteDoc, TreeNode, WorkspaceState } from "../lib/types";
-import { ChatPane } from "./ChatPane";
+import type { TreeNode } from "../lib/types";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { FileTree } from "./FileTree";
-import { normSep, parentRelPath, vaultRelPath } from "./fileMeta";
+import { vaultRelPath } from "./fileMeta";
 import { useVaultTree } from "./useVaultTree";
-import { GraphView } from "./GraphView";
 import { buildNoteIndex, type NoteIndexEntry } from "./linkResolve";
-import { NotePane } from "./NotePane";
-import { PaneSplitter } from "./PaneSplitter";
-import { Ribbon, type CenterView } from "./Ribbon";
-import { SearchPanel, type SearchQueryRequest } from "./SearchPanel";
+import { type CenterView } from "./Ribbon";
 import { SettingsModal, type SettingsSection } from "./SettingsModal";
 import { StatusBar } from "./StatusBar";
 import { TemplateInsertDialog } from "./TemplateInsertDialog";
-import {
-  GRAPH_PANEL_ID,
-  GRAPH_TAB_ID,
-  noteTabPanelId,
-  noteTabTriggerId,
-  TitleBar,
-  type TitleBarTabSummary,
-} from "./TitleBar";
+import { TitleBar, type TitleBarTabSummary } from "./TitleBar";
 import type { CreateKind } from "./TreeRow";
-import { useNoteTabs, type NoteTab } from "./useNoteTabs";
+import { useNoteTabs } from "./useNoteTabs";
+import { useWorkspaceLayout } from "./useWorkspaceLayout";
+import { useWorkspaceLifecycle } from "./useWorkspaceLifecycle";
+import { useWorkspaceMenu } from "./useWorkspaceMenu";
+import { WorkspacePanes } from "./WorkspacePanes";
 import {
-  deriveEffectiveWorkspaceLayout,
-  loadWorkspaceLayout,
-  saveWorkspaceLayout,
-  SIDEBAR_MIN_WIDTH,
-  type WorkspaceMeasurements,
-} from "./workspaceLayout";
-import { createWorkspaceStateWriter } from "./workspaceStateWriter";
-
-type PendingIntent =
-  | { kind: "close-tab"; tabId: string; restoreFocus: HTMLElement | null }
-  | { kind: "close-vault" }
-  | { kind: "close-window" }
-  | { kind: "quit-app" }
-  | { kind: "open-vault" }
-  | { kind: "open-recent"; path: string }
-  | { kind: "delete-entry"; node: TreeNode; dirtyCount: number };
-
-function tabRelativePath(vaultPath: string, tab: NoteTab): string | null {
-  if (tab.note?.relPath) return tab.note.relPath;
-  const root = `${normSep(vaultPath).replace(/\/$/, "")}/`;
-  const path = normSep(tab.path);
-  return path.startsWith(root) ? path.slice(root.length) : null;
-}
-
-function persistedWorkspaceState(
-  vaultPath: string,
-  tabs: readonly NoteTab[],
-  activeTabId: string | null,
-): WorkspaceState {
-  const paths = new Map<string, string>();
-  for (const tab of tabs) {
-    const relative = tabRelativePath(vaultPath, tab);
-    if (relative) paths.set(tab.id, relative);
-  }
-  return {
-    openPaths: [...paths.values()],
-    activePath: activeTabId ? (paths.get(activeTabId) ?? null) : null,
-  };
-}
-
-function confirmDialogTitle(intent: PendingIntent): string {
-  if (intent.kind !== "delete-entry") return "Discard unsaved changes?";
-  const entityLabel = intent.node.kind === "folder" ? "folder" : "note";
-  return `Delete ${entityLabel}?`;
-}
-
-/** A compatible text note is open and directly editable (binary notes are not). */
-function isEditableTextNote(note: NoteDoc | null): boolean {
-  return note !== null && !note.binary;
-}
-
-function confirmDialogLabel(intent: PendingIntent): string {
-  return intent.kind === "delete-entry" ? "Move to Trash" : "Discard";
-}
-
-/** The body of the discard-confirmation dialog for a pending destructive intent.
- *  `dirtyTabCount` is only consulted for the whole-vault/window discard case. */
-function describeDiscard(intent: PendingIntent, dirtyTabCount: number): string {
-  if (intent.kind === "delete-entry") {
-    const tabNoun = intent.dirtyCount === 1 ? "tab has" : "tabs have";
-    const dirtyWarning =
-      intent.dirtyCount > 0
-        ? ` ${intent.dirtyCount} open ${tabNoun} unsaved changes that will be lost.`
-        : "";
-    return `“${intent.node.name}” will be moved to the Trash.${dirtyWarning}`;
-  }
-  if (intent.kind === "close-tab") {
-    return "This note has edits that haven't been saved. If you continue, they'll be lost.";
-  }
-  const tabNoun = dirtyTabCount === 1 ? "note has" : "notes have";
-  return `${dirtyTabCount} open ${tabNoun} unsaved changes. If you continue, they'll be lost.`;
-}
+  confirmDialogLabel,
+  confirmDialogTitle,
+  isEditableTextNote,
+} from "./workspaceIntents";
 
 export function Workspace() {
   const {
@@ -149,19 +73,8 @@ export function Workspace() {
   const toast = useToast();
   const noteTabs = useNoteTabs();
   const open = noteTabs.active;
-  const [pendingIntent, setPendingIntent] = useState<PendingIntent | null>(null);
   // Workspace-local view state (specs/search-and-graph-view.md §View model).
   const [centerView, setCenterView] = useState<CenterView>("note");
-  const [layoutPreference, setLayoutPreference] = useState(loadWorkspaceLayout);
-  const sidebarPanel = layoutPreference.sidebarPanel;
-  const [workspaceMeasurements, setWorkspaceMeasurements] =
-    useState<WorkspaceMeasurements>({
-      workspaceWidth: 0,
-      chatWidth: 0,
-      navigationWidth: 0,
-      reservedChatWidth: 0,
-    });
-  const workspacePanesRef = useRef<HTMLDivElement>(null);
   // Whether the cited-recall chat panel is shown. The webview owns this state now;
   // an effect below pushes each change to Rust, which keeps a copy only to paint the
   // View-menu checkmark (mirrors the editing → setMenuEditing pattern).
@@ -169,11 +82,6 @@ export function Workspace() {
   // A menu-requested "new note/folder" awaiting the FileTree to open its inline
   // create row; cleared once consumed so it can't re-fire on a sidebar remount.
   const [pendingCreate, setPendingCreate] = useState<CreateKind | null>(null);
-  // Bumped whenever ⌘K / the navigation Search action wants the field focused.
-  const [searchFocusSignal, bumpSearchFocus] = useReducer((n: number) => n + 1, 0);
-  const [searchQueryRequest, setSearchQueryRequest] =
-    useState<SearchQueryRequest | null>(null);
-  const searchQueryRequestId = useRef(0);
   // Settings modal state, plus a version bumped when it closes so the chat
   // pane re-reads the AI status (a provider configured in Settings must reach
   // the pane without remounting it and wiping the transcript).
@@ -183,244 +91,55 @@ export function Workspace() {
   const [templates, setTemplates] = useState<Awaited<ReturnType<typeof api.listTemplates>>>([]);
   const [aiStatusVersion, bumpAiStatusVersion] = useReducer((n: number) => n + 1, 0);
 
-  const effectiveLayout = useMemo(
-    () =>
-      deriveEffectiveWorkspaceLayout(layoutPreference, workspaceMeasurements),
-    [layoutPreference, workspaceMeasurements],
-  );
-  const effectiveNavigationExpandedRef = useRef(
-    effectiveLayout.navigationExpanded,
-  );
-  effectiveNavigationExpandedRef.current = effectiveLayout.navigationExpanded;
+  const vaultPath = vault?.path;
 
-  const toggleNavigation = useCallback(() => {
-    setLayoutPreference((current) => ({
-      ...current,
-      // Toggle what the user can currently see. If responsive layout has
-      // temporarily compacted an expanded preference, an attempted expansion
-      // remains expanded in preference rather than silently reversing it.
-      navigationExpanded: !effectiveNavigationExpandedRef.current,
-    }));
-  }, []);
+  // Layout geometry + panel routing + search signals (effects: save layout, measure).
+  const {
+    effectiveLayout,
+    sidebarPanel,
+    workspacePanesRef,
+    setLayoutPreference,
+    toggleNavigation,
+    selectFiles,
+    selectSearch,
+    handleSearchTag,
+    handleShowFiles,
+    handleShowSearch,
+    searchFocusSignal,
+    searchQueryRequest,
+  } = useWorkspaceLayout(showChat, vaultPath);
 
-  useEffect(() => saveWorkspaceLayout(layoutPreference), [layoutPreference]);
+  // Durable tab state + destructive-action guard (effects: load, restore, write, flush).
+  const {
+    pendingIntent,
+    requestIntent,
+    handleDeleteRequest,
+    handleCloseVault,
+    discardMessage,
+    confirmPendingIntent,
+    cancelPendingIntent,
+  } = useWorkspaceLifecycle({
+    vaultPath,
+    noteTabs,
+    toast,
+    setCenterView,
+    close,
+    openExisting,
+    openByPath,
+    refreshDir,
+  });
 
-  useEffect(() => {
-    const workspace = workspacePanesRef.current;
-    if (!workspace) return;
-    const chatSlot = workspace.querySelector<HTMLElement>(".nn-chat-slot");
-    const chatPane = workspace.querySelector<HTMLElement>(".nn-chat-pane");
-    const navigation = workspace.querySelector<HTMLElement>(".nn-ribbon");
-    const measure = () => {
-      const chatWidth = chatSlot?.getBoundingClientRect().width ?? 0;
-      const chatTargetWidth = chatPane?.getBoundingClientRect().width ?? 0;
-      // Reserve the chat's target width as soon as it starts opening. This
-      // starts navigation compaction at the same time as the chat transition,
-      // rather than waiting until the editor has nearly run out of space.
-      const openReservedWidth = chatTargetWidth > 0 ? chatTargetWidth : chatWidth;
-      const next = {
-        workspaceWidth: workspace.getBoundingClientRect().width,
-        // Read the slot's current rendered width so responsive clamping follows
-        // the chat animation instead of jumping to its final state.
-        chatWidth,
-        navigationWidth: navigation?.getBoundingClientRect().width ?? 0,
-        reservedChatWidth: showChat ? openReservedWidth : chatWidth,
-      };
-      setWorkspaceMeasurements((current) =>
-        current.workspaceWidth === next.workspaceWidth &&
-        current.chatWidth === next.chatWidth &&
-        current.navigationWidth === next.navigationWidth &&
-        current.reservedChatWidth === next.reservedChatWidth
-          ? current
-          : next,
-      );
-    };
-    const observer = new ResizeObserver(measure);
-    observer.observe(workspace);
-    if (chatSlot) observer.observe(chatSlot);
-    if (chatPane) observer.observe(chatPane);
-    if (navigation) observer.observe(navigation);
-    measure();
-    return () => observer.disconnect();
-  }, [showChat, vault?.path]);
-
-  // Stable callbacks read the latest collection without re-registering native
-  // listeners on every editor keystroke.
+  // Stable callbacks read the latest tabs without re-registering native listeners
+  // on every editor keystroke.
   const noteTabsRef = useRef(noteTabs);
   noteTabsRef.current = noteTabs;
-  const pendingIntentRef = useRef(pendingIntent);
-  pendingIntentRef.current = pendingIntent;
-  const quitInFlightRef = useRef(false);
-  const [workspaceStateReady, setWorkspaceStateReady] = useState(false);
-  const [workspaceStateBlocked, setWorkspaceStateBlocked] = useState(false);
-  const activeVaultPathRef = useRef<string | null>(null);
-  const restorePlanRef = useRef<{
-    ids: string[];
-    desiredId: string | null;
-  } | null>(null);
-  const workspaceWriterRef = useRef<ReturnType<
-    typeof createWorkspaceStateWriter
-  > | null>(null);
-  workspaceWriterRef.current ??= createWorkspaceStateWriter(
-    api.saveWorkspaceState,
-    (writeError) =>
-      toast.error(api.errorMessage(writeError), {
-        dedupKey: "workspace-state-save",
-      }),
-  );
-
-  /** Force-close the window past the close-request guard. If destroy() rejects the
-   *  window is merely left open (safe — no data lost), so log rather than swallow. */
-  const closeWindow = useCallback(async () => {
-    try {
-      await getCurrentWindow().destroy();
-    } catch (err) {
-      console.error("window destroy failed:", err);
-    }
-  }, []);
 
   /** Open a note by absolute path. Dirty active tabs are preserved by the tab
    *  controller, so navigation itself is never destructive and never prompts. */
-  const openNoteAt = useCallback(
-    (absPath: string, forceNew = false) => {
-      noteTabsRef.current.open(absPath, { forceNew });
-      setCenterView("note");
-    },
-    [],
-  );
-
-  const vaultPath = vault?.path;
-
-  useEffect(() => {
-    if (!vaultPath) {
-      activeVaultPathRef.current = null;
-      return;
-    }
-    if (
-      activeVaultPathRef.current !== null &&
-      activeVaultPathRef.current !== vaultPath
-    ) {
-      noteTabsRef.current.clear();
-    }
-    activeVaultPathRef.current = vaultPath;
-    let cancelled = false;
-    let recoveryToastId: string | null = null;
-    setWorkspaceStateReady(false);
-    setWorkspaceStateBlocked(false);
-    restorePlanRef.current = null;
-
-    // Hoisted out of the recovery-toast action so the reset promise chain sits
-    // near the top of the effect rather than nested five callbacks deep.
-    const applyReset = () => {
-      if (cancelled || activeVaultPathRef.current !== vaultPath) return;
-      void api
-        .resetWorkspaceState()
-        .then(() => {
-          if (cancelled) return;
-          setWorkspaceStateBlocked(false);
-          workspaceWriterRef.current?.schedule(
-            persistedWorkspaceState(
-              vaultPath,
-              noteTabsRef.current.tabs,
-              noteTabsRef.current.activeTabId,
-            ),
-          );
-        })
-        .catch((resetError) =>
-          toast.error(api.errorMessage(resetError), {
-            dedupKey: "workspace-state-reset",
-          }),
-        );
-    };
-
-    void api
-      .loadWorkspaceState()
-      .then((restored) => {
-        if (cancelled) return;
-        if (restored.recoveredFromCorrupt) {
-          setWorkspaceStateBlocked(true);
-          setWorkspaceStateReady(true);
-          recoveryToastId = toast.error(
-            restored.recoveryMessage ?? "Workspace tab state could not be restored.",
-            {
-              dedupKey: "workspace-state-recovery",
-              action: {
-                label: "Reset tab state",
-                onClick: applyReset,
-              },
-            },
-          );
-          return;
-        }
-
-        const ids: string[] = [];
-        let desiredId: string | null = null;
-        for (const relativePath of restored.state.openPaths) {
-          const id = noteTabsRef.current.open(`${vaultPath}/${relativePath}`, {
-            forceNew: true,
-          });
-          ids.push(id);
-          if (relativePath === restored.state.activePath) desiredId = id;
-        }
-        if (ids.length === 0) {
-          setWorkspaceStateReady(true);
-        } else {
-          restorePlanRef.current = { ids, desiredId };
-        }
-      })
-      .catch((loadError) => {
-        if (cancelled) return;
-        setWorkspaceStateBlocked(true);
-        setWorkspaceStateReady(true);
-        toast.error(api.errorMessage(loadError), {
-          dedupKey: "workspace-state-load",
-        });
-      });
-
-    return () => {
-      cancelled = true;
-      if (recoveryToastId) toast.dismiss(recoveryToastId);
-    };
-  }, [toast, vaultPath]);
-
-  useEffect(() => {
-    const plan = restorePlanRef.current;
-    if (!plan) return;
-    const tracked = noteTabs.tabs.filter((tab) => plan.ids.includes(tab.id));
-    if (tracked.some((tab) => tab.loading)) return;
-
-    const restored = tracked.filter((tab) => tab.note !== null && tab.error === null);
-    const failed = tracked.filter((tab) => tab.note === null || tab.error !== null);
-    for (const tab of failed) noteTabs.close(tab.id);
-    const desired = restored.find((tab) => tab.id === plan.desiredId);
-    const fallback = desired ?? restored[0] ?? null;
-    if (fallback) {
-      noteTabs.activate(fallback.id);
-      setCenterView("note");
-    }
-    if (failed.length > 0) {
-      toast.warning(
-        `${failed.length} saved ${failed.length === 1 ? "tab was" : "tabs were"} skipped because the note could not be opened.`,
-        { dedupKey: "workspace-state-missing-notes" },
-      );
-    }
-    restorePlanRef.current = null;
-    setWorkspaceStateReady(true);
-  }, [noteTabs, noteTabs.tabs, toast]);
-
-  useEffect(() => {
-    if (!vaultPath || !workspaceStateReady || workspaceStateBlocked) return;
-    workspaceWriterRef.current?.schedule(
-      persistedWorkspaceState(vaultPath, noteTabs.tabs, noteTabs.activeTabId),
-    );
-  }, [noteTabs.activeTabId, noteTabs.tabs, vaultPath, workspaceStateBlocked, workspaceStateReady]);
-
-  useEffect(
-    () => () => {
-      void workspaceWriterRef.current?.flush();
-    },
-    [],
-  );
+  const openNoteAt = useCallback((absPath: string, forceNew = false) => {
+    noteTabsRef.current.open(absPath, { forceNew });
+    setCenterView("note");
+  }, []);
 
   /** Open a note by vault-relative path (graph nodes, wikilinks, backlink
    *  sources); joins onto the vault root, same as ChatPane's citation-open.
@@ -460,12 +179,6 @@ export function Workspace() {
     setSettingsSection(section);
     setSettingsOpen(true);
   }, []);
-
-  useEffect(() => {
-    if (!error) return;
-    toast.error(error, { dedupKey: `vault-error:${error}` });
-    clearError();
-  }, [clearError, error, toast]);
 
   const handleInsertTemplate = useCallback(async () => {
     try {
@@ -512,37 +225,6 @@ export function Workspace() {
     bumpAiStatusVersion();
   }, []);
 
-  const selectFiles = useCallback(() => {
-    setLayoutPreference((current) => ({ ...current, sidebarPanel: "files" }));
-  }, []);
-  const selectSearch = useCallback(() => {
-    setLayoutPreference((current) => ({ ...current, sidebarPanel: "search" }));
-    bumpSearchFocus();
-  }, []);
-  const handleSearchTag = useCallback((tag: string) => {
-    if (!tag.startsWith("#") || tag.length < 2) return;
-    setLayoutPreference((current) => ({ ...current, sidebarPanel: "search" }));
-    setSearchQueryRequest({
-      id: ++searchQueryRequestId.current,
-      query: `tag:${tag}`,
-    });
-  }, []);
-  const handleShowFiles = useCallback(() => {
-    setLayoutPreference((current) => ({
-      ...current,
-      sidebarPanel: current.sidebarPanel === "files" ? null : "files",
-    }));
-  }, []);
-  const handleShowSearch = useCallback(() => {
-    setLayoutPreference((current) => {
-      const opening = current.sidebarPanel !== "search";
-      if (opening) bumpSearchFocus();
-      return {
-        ...current,
-        sidebarPanel: opening ? "search" : null,
-      };
-    });
-  }, []);
   const handleToggleGraph = useCallback(
     () => setCenterView((v) => (v === "graph" ? "note" : "graph")),
     [],
@@ -570,262 +252,29 @@ export function Workspace() {
     noteTabsRef.current.remap(oldPath, newNode.path, newNode.relPath);
   }, []);
 
-  const performIntent = useCallback(
-    async (intent: PendingIntent) => {
-      switch (intent.kind) {
-        case "close-tab": {
-          const tabs = noteTabsRef.current.tabs;
-          const closingIndex = tabs.findIndex((tab) => tab.id === intent.tabId);
-          const wasActive = noteTabsRef.current.activeTabId === intent.tabId;
-          const focusTabId = wasActive
-            ? (tabs[closingIndex + 1]?.id ?? tabs[closingIndex - 1]?.id ?? null)
-            : noteTabsRef.current.activeTabId;
-          noteTabsRef.current.close(intent.tabId);
-          queueMicrotask(() => {
-            const target = focusTabId
-              ? document.getElementById(noteTabTriggerId(focusTabId))
-              : document.getElementById("nn-empty-note-panel");
-            target?.focus();
-          });
-          return;
-        }
-        case "close-vault":
-          await workspaceWriterRef.current?.flush();
-          await close();
-          return;
-        case "close-window":
-          await workspaceWriterRef.current?.flush();
-          await closeWindow();
-          return;
-        case "quit-app":
-          if (quitInFlightRef.current) return;
-          quitInFlightRef.current = true;
-          try {
-            await workspaceWriterRef.current?.flush();
-            await api.quitApp();
-          } catch (quitError) {
-            quitInFlightRef.current = false;
-            toast.error(api.errorMessage(quitError), {
-              dedupKey: "quit-app-failed",
-            });
-          }
-          return;
-        case "open-vault":
-          await workspaceWriterRef.current?.flush();
-          await openExisting();
-          return;
-        case "open-recent":
-          await workspaceWriterRef.current?.flush();
-          await openByPath(intent.path);
-          return;
-        case "delete-entry":
-          try {
-            await api.deleteEntry(intent.node.path);
-            // Re-list just the deleted entry's parent folder (per spec §CRUD).
-            await refreshDir(parentRelPath(intent.node.relPath));
-            noteTabsRef.current.removeDescendants(intent.node.path);
-          } catch (deleteError) {
-            toast.error(api.errorMessage(deleteError));
-          }
-      }
-    },
-    [close, closeWindow, openByPath, openExisting, refreshDir, toast],
-  );
-
-  const requestIntent = useCallback(
-    (intent: PendingIntent) => {
-      if (pendingIntentRef.current) return;
-      const mustConfirm =
-        intent.kind === "delete-entry" ||
-        (intent.kind === "close-tab"
-          ? Boolean(
-              noteTabsRef.current.tabs.find((tab) => tab.id === intent.tabId)
-                ?.dirty,
-            )
-          : noteTabsRef.current.dirtyTabs.length > 0);
-      if (mustConfirm) {
-        pendingIntentRef.current = intent;
-        setPendingIntent(intent);
-      } else {
-        void performIntent(intent);
-      }
-    },
-    [performIntent],
-  );
-
-  const handleDeleteRequest = useCallback(
-    (node: TreeNode) => {
-      const dirtyCount = noteTabsRef.current
-        .tabsInside(node.path)
-        .filter((tab) => tab.dirty).length;
-      requestIntent({ kind: "delete-entry", node, dirtyCount });
-    },
-    [requestIntent],
-  );
-
-  const handleCloseVault = useCallback(
-    () => requestIntent({ kind: "close-vault" }),
-    [requestIntent],
-  );
-
-  // Intercept OS window close / Cmd-Q: hold the window long enough to flush the
-  // ordered workspace state, and route dirty tabs through the same discard guard
-  // as other destructive actions. Mirrors store.tsx's
-  // cancelled-flag teardown so a listen() that resolves after unmount can't leak.
   useEffect(() => {
-    let cancelled = false;
-    let unlisten: UnlistenFn | undefined;
-    void getCurrentWindow()
-      .onCloseRequested((event) => {
-        // Always hold the native close briefly so the newest ordered tab state can
-        // flush before destroy. Dirty tabs route through the same explicit warning.
-        event.preventDefault();
-        requestIntent({ kind: "close-window" });
-      })
-      .then((fn) => {
-        if (cancelled) fn();
-        else unlisten = fn;
-      })
-      .catch((err) => {
-        // If the guard can't install, an OS close would silently discard unsaved
-        // edits — surface it to the user (not just the console) so they know the
-        // unsaved-changes protection is off and can save manually.
-        console.error("failed to install unsaved-edit close guard:", err);
-        reportError(
-          "Couldn't enable the unsaved-changes guard — save manually before closing the window.",
-        );
-      });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [reportError, requestIntent]);
+    if (!error) return;
+    toast.error(error, { dedupKey: `vault-error:${error}` });
+    clearError();
+  }, [clearError, error, toast]);
 
-  // Native menu → vault-scoped actions. While Workspace is mounted it also owns
-  // Open Vault / Open Recent so every dirty tab can guard the vault switch.
-  useEffect(() => {
-    let cancelled = false;
-    let unlisten: UnlistenFn | undefined;
-    void api
-      .onMenu((e) => {
-        const o = noteTabsRef.current.active;
-        switch (e.action) {
-          case "new-note":
-            startCreate("note");
-            break;
-          case "new-folder":
-            startCreate("folder");
-            break;
-          case "save":
-            if (o.note && o.dirty && !o.saving) void o.save();
-            break;
-          case "close-tab": {
-            const tabId = noteTabsRef.current.activeTabId;
-            if (tabId) {
-              requestIntent({
-                kind: "close-tab",
-                tabId,
-                restoreFocus: document.activeElement as HTMLElement | null,
-              });
-            }
-            break;
-          }
-          case "close-window":
-            requestIntent({ kind: "close-window" });
-            break;
-          case "quit-app":
-            requestIntent({ kind: "quit-app" });
-            break;
-          case "close-vault":
-            requestIntent({ kind: "close-vault" });
-            break;
-          case "open-vault":
-            requestIntent({ kind: "open-vault" });
-            break;
-          case "open-recent":
-            if (e.path) requestIntent({ kind: "open-recent", path: e.path });
-            break;
-          case "search":
-          case "view-search":
-            selectSearch();
-            break;
-          case "view-files":
-            selectFiles();
-            break;
-          case "toggle-graph":
-            setCenterView((v) => (v === "graph" ? "note" : "graph"));
-            break;
-          case "toggle-chat":
-            // The webview owns showChat; the CheckMenuItem just requests a flip
-            // (no `checked` payload). The effect below pushes the new value to Rust.
-            setShowChat((v) => !v);
-            break;
-          case "toggle-sidebar":
-            toggleNavigation();
-            break;
-          case "format-bold":
-          case "format-italic":
-          case "format-h1":
-          case "format-h2":
-          case "format-h3":
-          case "format-link":
-            // Formatting actions are owned by the focused note editor's own menu
-            // subscription (markdownFormat.ts); they are intentional no-ops here.
-            break;
-          default: {
-            // MenuAction is generated from Rust's CUSTOM_ACTIONS (#19), so this is
-            // exhaustive: a NEW native action that no consumer handles fails the
-            // build here instead of silently becoming a dead menu item. The runtime
-            // warn is belt-and-braces if an untyped id ever reaches the webview.
-            const unhandled: never = e.action;
-            console.warn("unhandled menu action:", unhandled);
-            break;
-          }
-        }
-      })
-      .then((fn) => {
-        if (cancelled) fn();
-        else unlisten = fn;
-      })
-      // A failed listen leaves every vault-scoped menu item dead — Save most of
-      // all, which now lives ONLY on the menu. The store's own onMenu subscription
-      // covers just Open Vault/Recent and has already resolved by the time this
-      // one runs (it's mounted from app start), so it can't surface this for us.
-      // Surface it here so a silently-dead Save can never masquerade as working.
-      .catch((err) => {
-        console.error("failed to subscribe to menu actions:", err);
-        reportError(
-          "Menu actions are unavailable — use the on-screen controls, and save with the Save button.",
-        );
-      });
-    return () => {
-      cancelled = true;
-      unlisten?.();
-    };
-  }, [
-    reportError,
+  // Native menu + window-close integration (effects: close guard, menu dispatch,
+  // Format-menu sync, chat-visibility sync). It dispatches across every concern,
+  // so it takes their handlers; called last so its effects run after the others.
+  const editing = isEditableTextNote(open.note);
+  useWorkspaceMenu({
+    noteTabs,
     requestIntent,
+    reportError,
     startCreate,
     selectFiles,
     selectSearch,
     toggleNavigation,
-  ]);
-
-  // Every compatible text note is directly editable. Keep Format enabled while
-  // a text note is open; the focused rich/raw editor still owns the command.
-  const editing = isEditableTextNote(open.note);
-  useEffect(() => {
-    void api
-      .setMenuEditing(editing)
-      .catch((err) => console.error("failed to sync editor state to the menu:", err));
-  }, [editing]);
-
-  // The webview owns showChat; push each change to Rust so the View-menu checkmark
-  // stays in agreement (mirrors the editing effect above). Best-effort — cosmetic.
-  useEffect(() => {
-    void api.setChatVisible(showChat).catch((err) =>
-      console.error("failed to sync chat visibility to the menu:", err));
-  }, [showChat]);
+    setCenterView,
+    setShowChat,
+    editing,
+    showChat,
+  });
 
   const titlebarTabs = useMemo<TitleBarTabSummary[]>(
     () =>
@@ -861,14 +310,6 @@ export function Workspace() {
 
   const handleCloseGraph = useCallback(() => setCenterView("note"), []);
 
-  const discardMessage = useMemo(
-    () =>
-      pendingIntent
-        ? describeDiscard(pendingIntent, noteTabs.dirtyTabs.length)
-        : "",
-    [noteTabs.dirtyTabs.length, pendingIntent],
-  );
-
   if (!vault) return null;
 
   const layoutStyle = {
@@ -895,127 +336,46 @@ export function Workspace() {
         onCloseTab={handleCloseTab}
         onCloseGraph={handleCloseGraph}
       />
-      <div
-        ref={workspacePanesRef}
-        id="nn-main-content"
-        tabIndex={-1}
-        data-testid="workspace-panes"
-        className="nn-workspace-panes flex min-h-0 flex-1 overflow-hidden outline-none"
-      >
-        <Ribbon
-          navigationExpanded={effectiveLayout.navigationExpanded}
-          vaultName={vault.name}
-          sidebarPanel={sidebarPanel}
-          centerView={centerView}
-          onShowFiles={handleShowFiles}
-          onShowSearch={handleShowSearch}
-          onInsertTemplate={() => void handleInsertTemplate()}
-          onToggleGraph={handleToggleGraph}
-          onNewNote={() => startCreate("note")}
-          onNewFolder={() => startCreate("folder")}
-          onRefresh={handleRefreshTree}
-          onCloseVault={handleCloseVault}
-        />
-        <div
-          id="nn-primary-sidebar"
-          aria-hidden={sidebarPanel === null}
-          inert={sidebarPanel === null ? true : undefined}
-          className="nn-primary-sidebar flex min-h-0 shrink-0"
-        >
-          <div
-            className="nn-primary-sidebar-panel"
-            hidden={sidebarPanel !== "files"}
-            inert={sidebarPanel === "files" ? undefined : true}
-          >
-            <FileTree
-              vaultPath={vault.path}
-              activePath={open.path}
-              loaded={loaded}
-              expanded={expanded}
-              onToggle={toggle}
-              onListDir={listDir}
-              onRefreshDir={refreshDir}
-              onSelect={handleSelect}
-              onDeleteRequest={handleDeleteRequest}
-              onRemap={handleRemap}
-              pendingCreate={pendingCreate}
-              onCreateConsumed={consumeCreate}
-            />
-          </div>
-          <div
-            className="nn-primary-sidebar-panel"
-            hidden={sidebarPanel !== "search"}
-            inert={sidebarPanel === "search" ? undefined : true}
-          >
-            <SearchPanel
-              focusSignal={searchFocusSignal}
-              queryRequest={searchQueryRequest}
-              onOpen={openNoteAt}
-            />
-          </div>
-        </div>
-        {sidebarPanel !== null && (
-          <PaneSplitter
-            paneId="nn-primary-sidebar"
-            width={effectiveLayout.sidebarWidth}
-            minWidth={SIDEBAR_MIN_WIDTH}
-            maxWidth={effectiveLayout.sidebarMaxWidth}
-            onResize={(sidebarWidth) =>
-              setLayoutPreference((current) => ({ ...current, sidebarWidth }))
-            }
-          />
-        )}
-        {centerView === "graph" ? (
-          <div
-            id={GRAPH_PANEL_ID}
-            role="tabpanel"
-            aria-labelledby={GRAPH_TAB_ID}
-            tabIndex={0}
-            className="flex min-w-0 flex-1"
-          >
-            <GraphView onOpenNote={openNoteRel} />
-          </div>
-        ) : (
-          <div
-            id={
-              noteTabs.activeTabId
-                ? noteTabPanelId(noteTabs.activeTabId)
-                : "nn-empty-note-panel"
-            }
-            role="tabpanel"
-            aria-labelledby={
-              noteTabs.activeTabId
-                ? noteTabTriggerId(noteTabs.activeTabId)
-                : undefined
-            }
-            tabIndex={noteTabs.activeTabId ? 0 : -1}
-            className="flex min-w-0 flex-1"
-          >
-            <NotePane
-              open={open}
-              noteIndex={noteIndex}
-              onOpenLink={openNoteRel}
-              onSearchTag={handleSearchTag}
-              reportError={reportError}
-            />
-          </div>
-        )}
-        {/* Keep ChatPane mounted and collapse only its clipping slot. Unmounting
-            would discard the transcript and abandon an in-flight streamed answer;
-            inert + aria-hidden remove the collapsed controls from interaction. */}
-        <div
-          className="nn-chat-slot"
-          data-visible={showChat}
-          aria-hidden={!showChat}
-          inert={!showChat}
-        >
-          <ChatPane
-            openNoteAt={openNoteAt}
-            onOpenSettings={() => handleOpenSettings("ai")}
-            refreshSignal={aiStatusVersion}
-          />
-        </div>
-      </div>
+      <WorkspacePanes
+        panesRef={workspacePanesRef}
+        effectiveLayout={effectiveLayout}
+        vaultName={vault.name}
+        vaultPath={vault.path}
+        sidebarPanel={sidebarPanel}
+        centerView={centerView}
+        setLayoutPreference={setLayoutPreference}
+        onShowFiles={handleShowFiles}
+        onShowSearch={handleShowSearch}
+        onInsertTemplate={() => void handleInsertTemplate()}
+        onToggleGraph={handleToggleGraph}
+        onNewNote={() => startCreate("note")}
+        onNewFolder={() => startCreate("folder")}
+        onRefresh={handleRefreshTree}
+        onCloseVault={handleCloseVault}
+        activePath={open.path}
+        loaded={loaded}
+        expanded={expanded}
+        onToggle={toggle}
+        onListDir={listDir}
+        onRefreshDir={refreshDir}
+        onSelect={handleSelect}
+        onDeleteRequest={handleDeleteRequest}
+        onRemap={handleRemap}
+        pendingCreate={pendingCreate}
+        onCreateConsumed={consumeCreate}
+        searchFocusSignal={searchFocusSignal}
+        searchQueryRequest={searchQueryRequest}
+        activeTabId={noteTabs.activeTabId}
+        onOpenNote={openNoteRel}
+        open={open}
+        noteIndex={noteIndex}
+        onSearchTag={handleSearchTag}
+        reportError={reportError}
+        showChat={showChat}
+        aiStatusVersion={aiStatusVersion}
+        onOpenChatSettings={() => handleOpenSettings("ai")}
+        openNoteAt={openNoteAt}
+      />
 
       <StatusBar vaultName={vault.name} tree={fullTree} note={open.note} />
 
@@ -1039,21 +399,8 @@ export function Workspace() {
           message={discardMessage}
           confirmLabel={confirmDialogLabel(pendingIntent)}
           tone="danger"
-          onConfirm={() => {
-            const intent = pendingIntent;
-            pendingIntentRef.current = null;
-            setPendingIntent(null);
-            void performIntent(intent);
-          }}
-          onCancel={() => {
-            const restoreFocus =
-              pendingIntent.kind === "close-tab"
-                ? pendingIntent.restoreFocus
-                : null;
-            pendingIntentRef.current = null;
-            setPendingIntent(null);
-            queueMicrotask(() => restoreFocus?.focus());
-          }}
+          onConfirm={confirmPendingIntent}
+          onCancel={cancelPendingIntent}
         />
       )}
     </div>
