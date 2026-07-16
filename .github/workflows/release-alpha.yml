@@ -4,9 +4,9 @@ on:
   workflow_dispatch:
     inputs:
       release_tag:
-        description: Existing tag for the 0.2.0 alpha release
+        description: Existing tag for the 0.2.1 alpha release
         required: true
-        default: v0.2.0
+        default: v0.2.1
       signing_mode:
         description: macOS signing and trust mode
         type: choice
@@ -51,8 +51,8 @@ jobs:
             exit 1
           fi
           case "$RELEASE_TAG" in
-            0.2.0|v0.2.0) ;;
-            *) echo "::error::Release tag must be 0.2.0 or v0.2.0"; exit 1 ;;
+            0.2.1|v0.2.1) ;;
+            *) echo "::error::Release tag must be 0.2.1 or v0.2.1"; exit 1 ;;
           esac
           case "$SIGNING_MODE" in
             ad-hoc|developer-id) ;;
@@ -74,7 +74,7 @@ jobs:
     outputs:
       release_sha: ${{ steps.release_source.outputs.RELEASE_SHA }}
     env:
-      RELEASE_VERSION: 0.2.0
+      RELEASE_VERSION: 0.2.1
       RELEASE_TAG: ${{ inputs.release_tag }}
 
     steps:
@@ -100,8 +100,8 @@ jobs:
             exit 1
           fi
           case "$RELEASE_TAG" in
-            0.2.0|v0.2.0) ;;
-            *) echo "::error::Release tag must be 0.2.0 or v0.2.0"; exit 1 ;;
+            0.2.1|v0.2.1) ;;
+            *) echo "::error::Release tag must be 0.2.1 or v0.2.1"; exit 1 ;;
           esac
           case "$SIGNING_MODE" in
             ad-hoc|developer-id) ;;
@@ -348,8 +348,8 @@ jobs:
           const manifest = {
             version: process.env.RELEASE_VERSION,
             notes: isAdHoc
-              ? 'NeuralNote 0.2.0 ALPHA. Ad-hoc signed and unnotarized.'
-              : 'NeuralNote 0.2.0 ALPHA. Developer ID signed and notarized.',
+              ? 'NeuralNote 0.2.1 ALPHA. Ad-hoc signed and unnotarized.'
+              : 'NeuralNote 0.2.1 ALPHA. Developer ID signed and notarized.',
             pub_date: new Date().toISOString(),
             platforms: {
               'darwin-aarch64': {
@@ -375,7 +375,7 @@ jobs:
           cp "$UPDATE_BUNDLE" "$RELEASE_ARTIFACT_DIR/"
           cp "$UPDATE_SIGNATURE" "$RELEASE_ARTIFACT_DIR/"
           cp "$RELEASE_MANIFEST" "$RELEASE_ARTIFACT_DIR/latest-alpha.json"
-          cp docs/releases/v0.2.0.md "$RELEASE_ARTIFACT_DIR/RELEASE_NOTES.md"
+          cp docs/releases/v0.2.1.md "$RELEASE_ARTIFACT_DIR/RELEASE_NOTES.md"
           if [ "$SIGNING_MODE" = "ad-hoc" ]; then
             cat >> "$RELEASE_ARTIFACT_DIR/RELEASE_NOTES.md" <<'NOTES'
 
@@ -422,7 +422,7 @@ jobs:
       actions: read
       contents: write
     env:
-      RELEASE_VERSION: 0.2.0
+      RELEASE_VERSION: 0.2.1
       RELEASE_TAG: ${{ inputs.release_tag }}
       RELEASE_SHA: ${{ needs.build.outputs.release_sha }}
       SIGNING_MODE: ${{ inputs.signing_mode }}
@@ -519,9 +519,9 @@ jobs:
             exit 1
           fi
           if [ "$SIGNING_MODE" = "ad-hoc" ]; then
-            RELEASE_TITLE="0.2.0 ALPHA (ad-hoc signed, unnotarized)"
+            RELEASE_TITLE="0.2.1 ALPHA (ad-hoc signed, unnotarized)"
           else
-            RELEASE_TITLE="0.2.0 ALPHA"
+            RELEASE_TITLE="0.2.1 ALPHA"
           fi
           if gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             read -r RELEASE_IS_DRAFT RELEASE_IS_PRERELEASE < <(
@@ -663,5 +663,5 @@ jobs:
             echo "release-manifests already contains this manifest; nothing to publish"
             exit 0
           fi
-          git -C "$MANIFEST_WORKTREE" commit -m "release: publish NeuralNote 0.2.0 alpha manifest"
+          git -C "$MANIFEST_WORKTREE" commit -m "release: publish NeuralNote 0.2.1 alpha manifest"
           git -C "$MANIFEST_WORKTREE" push origin HEAD:refs/heads/release-manifests

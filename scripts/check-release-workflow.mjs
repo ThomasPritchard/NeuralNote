@@ -63,7 +63,7 @@ const build = jobBody("build");
 const publish = jobBody("publish");
 
 test("all production manifests use the release version", async () => {
-  const releaseVersion = "0.2.0";
+  const releaseVersion = "0.2.1";
   const [desktopPackage, nativeE2ePackage, tauriConfig] = await Promise.all([
     readRepositoryFile("app/desktop/package.json"),
     readRepositoryFile("app/desktop/e2e-native/package.json"),
@@ -86,7 +86,7 @@ test("all production manifests use the release version", async () => {
 test("release publication is manual-only and requires an explicit signing choice", () => {
   assert.match(trigger, /\n  workflow_dispatch:\s*$/m);
   assert.doesNotMatch(trigger, /^  (?:push|pull_request|schedule|release|workflow_run|workflow_call):/m);
-  assert.match(trigger, /release_tag:[\s\S]*?required:\s*true[\s\S]*?default:\s*v0\.2\.0/);
+  assert.match(trigger, /release_tag:[\s\S]*?required:\s*true[\s\S]*?default:\s*v0\.2\.1/);
   assert.match(
     trigger,
     /signing_mode:[\s\S]*?type:\s*choice[\s\S]*?required:\s*true[\s\S]*?default:\s*ad-hoc[\s\S]*?options:[\s\S]*?- ad-hoc[\s\S]*?- developer-id/,
@@ -233,8 +233,8 @@ test("the publisher stages a draft prerelease and exposes the manifest last", ()
   );
 });
 
-test("the immutable GitHub release description includes the complete v0.2.0 changelog", async () => {
-  const releaseNotes = await readRepositoryFile("docs/releases/v0.2.0.md");
+test("the immutable GitHub release description includes the complete v0.2.1 changelog", async () => {
+  const releaseNotes = await readRepositoryFile("docs/releases/v0.2.1.md");
   const bundledReleaseNotes = await readRepositoryFile("app/desktop/src/whats-new/releaseNotes.ts");
   const validate = stepBody(publish, "Validate downloaded release artifacts");
   const draft = stepBody(publish, "Create draft GitHub prerelease");
@@ -260,7 +260,7 @@ test("the immutable GitHub release description includes the complete v0.2.0 chan
     .filter((line) => line.startsWith("- "))
     .map((line) => line.slice(2).replaceAll("`", ""));
   assert.deepEqual(publishedItems, bundledItems);
-  assert.match(build, /docs\/releases\/v0\.2\.0\.md/);
+  assert.match(build, /docs\/releases\/v0\.2\.1\.md/);
   assert.match(build, /ad-hoc signed and unnotarized/);
   assert.match(build, /Developer ID signed and notarized/);
   assert.match(validate, /RELEASE_NOTES/);
