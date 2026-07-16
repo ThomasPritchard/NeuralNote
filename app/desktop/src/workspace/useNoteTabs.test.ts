@@ -9,7 +9,8 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn() }));
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import type { NoteDoc } from "../lib/types";
-import { normalizeRequestedPath, useNoteTabs } from "./useNoteTabs";
+import { normalizeRequestedPath } from "./noteTabsReducer";
+import { useNoteTabs } from "./useNoteTabs";
 
 const mockInvoke = vi.mocked(invoke);
 const mockListen = vi.mocked(listen);

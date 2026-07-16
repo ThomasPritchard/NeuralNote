@@ -16,10 +16,12 @@ use crate::error::CoreResult;
 use crate::links::mask_code;
 use crate::model::{FileHit, SearchMatch, SearchResponse, TreeNode};
 use crate::note::{decode_note_text, parse_frontmatter, title_and_body, title_from, Parsed};
-use crate::tree::{markdown_files, read_tree};
+use crate::tree::{read_tree, text_note_files};
 use icu_properties::{props::GeneralCategory, CodePointMapData, CodePointMapDataBorrowed};
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
+use std::sync::Arc;
 
 /// Total content matches returned per search (the UI shows a truncation banner).
 pub const MAX_TOTAL_MATCHES: usize = 200;
@@ -31,7 +33,8 @@ pub const SNIPPET_MAX_CHARS: usize = 200;
 /// server-side (never an error) so a pasted blob can't drive unbounded work.
 pub const MAX_QUERY_CHARS: usize = 256;
 
-/// Case-insensitively search every markdown note under `root` for `query`.
+/// Case-insensitively search every text note under `root` for `query` — the same
+/// notes the reader displays as text (markdown plus plain-text `.txt`/`.text`).
 ///
 /// Ordinary queries scan the raw file text, frontmatter included (Obsidian
 /// behavior). A single `tag:name` or `tag:#name` operator instead matches
@@ -39,7 +42,7 @@ pub const MAX_QUERY_CHARS: usize = 256;
 /// Name/title hits rank before content-only hits, each group in tree-walk order.
 /// Queries longer than [`MAX_QUERY_CHARS`] are truncated to it.
 pub fn search_vault(root: &Path, query: &str) -> CoreResult<SearchResponse> {
-    Ok(search_vault_inner(root, query, false)?.0)
+    Ok(search_vault_inner(root, query, false, None)?.0)
 }
 
 /// Like [`search_vault`], but also returns the raw text of every file that
@@ -50,11 +53,23 @@ pub fn search_vault(root: &Path, query: &str) -> CoreResult<SearchResponse> {
 /// name-only hit has no line to cite), and the text is byte-identical to what
 /// [`crate::note::read_note`] would load, so the reused content hashes to the same
 /// `content_hash` the citation verifier expects.
+///
+/// `injected` lets a caller feed in content an EARLIER search in the same chat run
+/// already loaded (retrieval's run-scoped pool, issue #67): keyed by the same
+/// absolute path, a hit is scanned in place instead of re-reading that file from
+/// disk. A pooled entry was itself produced by this function's `decode_note_text`,
+/// so — for identical file bytes — it is byte-identical to a fresh read via the ONE
+/// shared decode policy (issue #33); an exact-path miss falls back to a disk read.
+/// The only residual doubt is within-run staleness (the file changed after it was
+/// pooled), which the citation verifier catches downstream: it re-reads disk and
+/// drops any span whose hash moved (see `ai::verify`). Pass an empty map for the
+/// pure-disk behaviour.
 pub(crate) fn search_vault_with_content(
     root: &Path,
     query: &str,
+    injected: &HashMap<String, Arc<str>>,
 ) -> CoreResult<(SearchResponse, HashMap<String, String>)> {
-    search_vault_inner(root, query, true)
+    search_vault_inner(root, query, true, Some(injected))
 }
 
 /// The shared search body. When `retain_content` is set, the raw text of each
@@ -66,6 +81,7 @@ fn search_vault_inner(
     root: &Path,
     query: &str,
     retain_content: bool,
+    injected: Option<&HashMap<String, Arc<str>>>,
 ) -> CoreResult<(SearchResponse, HashMap<String, String>)> {
     let trimmed = query.trim();
     if trimmed.is_empty() {
@@ -92,20 +108,32 @@ fn search_vault_inner(
     let mut truncated = false;
     let mut skipped_files: u32 = 0;
 
-    for node in markdown_files(&tree) {
-        // Decode via the ONE shared policy [`decode_note_text`], so the text search
-        // indexes is byte-identical to what the reader ([`read_note`]) presents for
-        // the same file — a Latin-1 note is searchable exactly as shown, and the
-        // citation moat (retrieval reusing this content, then hashing it to match
-        // the reader's) holds by construction, not coincidence (issue #33). An
-        // unreadable file is skipped loudly (logged AND counted), never fatal.
-        let raw = match std::fs::read(&node.path) {
-            Ok(bytes) => decode_note_text(bytes).0,
-            Err(e) => {
-                log::warn!("search: skipping unreadable file {}: {e}", node.path);
-                skipped_files = skipped_files.saturating_add(1);
-                continue;
-            }
+    for node in text_note_files(&tree) {
+        // Reuse content an earlier search in this run already loaded (issue #67),
+        // matched on the SAME absolute path string as [`FileHit::path`] — an exact-key
+        // hit only, so a mismatched path can never inject the wrong file. A pooled
+        // value is itself this scan's own `decode_note_text` output, so for identical
+        // file bytes it equals a fresh read below by construction. When the pool does
+        // not cover this path we fall back to reading it from disk, decoding via the
+        // ONE shared policy [`decode_note_text`] so the text search indexes is
+        // byte-identical to what the reader ([`read_note`]) presents — a Latin-1 note
+        // is searchable exactly as shown, and the citation moat (retrieval reusing
+        // this content, then hashing it to match the reader's) holds by construction,
+        // not coincidence (issue #33). An unreadable file is skipped loudly (logged
+        // AND counted), never fatal.
+        let pooled: Option<&str> = injected
+            .and_then(|pool| pool.get(node.path.as_str()))
+            .map(|content| content.as_ref());
+        let raw: Cow<str> = match pooled {
+            Some(content) => Cow::Borrowed(content),
+            None => match std::fs::read(&node.path) {
+                Ok(bytes) => Cow::Owned(decode_note_text(bytes).0),
+                Err(e) => {
+                    log::warn!("search: skipping unreadable file {}: {e}", node.path);
+                    skipped_files = skipped_files.saturating_add(1);
+                    continue;
+                }
+            },
         };
         let budget = MAX_MATCHES_PER_FILE.min(MAX_TOTAL_MATCHES - total);
         let (hit, clipped) = match &mode {
@@ -120,8 +148,9 @@ fn search_vault_inner(
         total += hit.matches.len();
         // Retain the content only for a hit with quotable lines — a name-only hit
         // carries no match to build a span from, so its content is never needed.
+        // `into_owned` clones only a borrowed (injected) value; a disk read is moved.
         if retain_content && !hit.matches.is_empty() {
-            content_by_path.insert(node.path.clone(), raw);
+            content_by_path.insert(node.path.clone(), raw.into_owned());
         }
         if hit.name_match {
             name_hits.push(hit);
@@ -1054,5 +1083,164 @@ mod tag_parser_tests {
         };
         let ranges = matching_tag_ranges(&line, &line, &query);
         assert!(ranges.len() <= 32, "collected {} ranges", ranges.len());
+    }
+}
+
+/// Content injection (issue #67): a later search reusing content an earlier search
+/// already loaded, without a second disk read — and the fallback/parity guarantees
+/// that keep the citation moat intact when it does.
+#[cfg(test)]
+mod injection_tests {
+    use super::*;
+    use std::fs;
+
+    /// The exact absolute-path key `search_vault` uses for a note — `read_tree`
+    /// canonicalizes the root, so the pool must key on the canonicalized path, not
+    /// the (possibly symlinked) tempdir path. This mirrors how retrieval fills the
+    /// pool from real [`FileHit::path`] values.
+    fn key_for(dir: &tempfile::TempDir, name: &str) -> String {
+        dir.path()
+            .canonicalize()
+            .unwrap()
+            .join(name)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn injected_content_is_scanned_without_touching_disk() {
+        // The file on disk holds text that does NOT contain the query; the injected
+        // content does. A match therefore proves the scan read the injected bytes and
+        // never consulted disk (a disk read would find nothing to match).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("note.md"), "apple pie on disk\n").unwrap();
+        let key = key_for(&dir, "note.md");
+        let mut pool: HashMap<String, Arc<str>> = HashMap::new();
+        pool.insert(key.clone(), Arc::from("banana bread injected\n"));
+
+        let (resp, content) = search_vault_with_content(dir.path(), "banana", &pool).unwrap();
+        assert_eq!(resp.hits.len(), 1, "the injected content matched");
+        assert_eq!(resp.hits[0].matches[0].snippet, "banana bread injected");
+        assert_eq!(
+            content.get(&key).map(String::as_str),
+            Some("banana bread injected\n"),
+            "the returned content is the injected bytes verbatim"
+        );
+
+        // A term that exists only on disk must NOT match — disk was never read.
+        let (disk_only, _) = search_vault_with_content(dir.path(), "apple", &pool).unwrap();
+        assert!(
+            disk_only.hits.is_empty(),
+            "disk content is ignored when the path is injected"
+        );
+    }
+
+    #[test]
+    fn injection_parity_equals_a_fresh_disk_read_for_identical_content() {
+        // THE parity test: injecting content byte-identical to what disk decodes to
+        // yields a result byte-for-byte identical to the pure-disk path — same hits,
+        // matches, lines, snippets, ranges, and the same returned content map.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("note.md"),
+            "# Title\n\nThe target line is here.\nAnother target below.\n",
+        )
+        .unwrap();
+        let key = key_for(&dir, "note.md");
+
+        let (disk_resp, disk_content) =
+            search_vault_with_content(dir.path(), "target", &HashMap::new()).unwrap();
+        // Inject exactly what the disk read decoded to — the pool's own contract.
+        let mut pool: HashMap<String, Arc<str>> = HashMap::new();
+        pool.insert(
+            key.clone(),
+            Arc::from(disk_content.get(&key).unwrap().as_str()),
+        );
+        let (inj_resp, inj_content) =
+            search_vault_with_content(dir.path(), "target", &pool).unwrap();
+
+        assert_eq!(
+            serde_json::to_value(&disk_resp).unwrap(),
+            serde_json::to_value(&inj_resp).unwrap(),
+            "the response must be byte-identical to the disk path"
+        );
+        assert_eq!(
+            disk_content, inj_content,
+            "the returned content map must be byte-identical to the disk path"
+        );
+    }
+
+    #[test]
+    fn a_path_missing_from_the_pool_falls_back_to_disk() {
+        // Two files; only one is injected. The uninjected file must still be found —
+        // the explicit fallback to a disk read when the pool lacks a path.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.md"), "shared target in a\n").unwrap();
+        fs::write(dir.path().join("b.md"), "shared target in b\n").unwrap();
+        let key_a = key_for(&dir, "a.md");
+        let key_b = key_for(&dir, "b.md");
+        let mut pool: HashMap<String, Arc<str>> = HashMap::new();
+        pool.insert(key_a.clone(), Arc::from("shared target in a\n")); // only a is injected
+
+        let (resp, content) = search_vault_with_content(dir.path(), "target", &pool).unwrap();
+        let paths: Vec<&str> = resp.hits.iter().map(|h| h.path.as_str()).collect();
+        assert!(paths.contains(&key_a.as_str()), "injected file matched");
+        assert!(
+            content.contains_key(&key_b),
+            "the uninjected file was read from disk (fallback)"
+        );
+    }
+
+    #[test]
+    fn pooled_content_never_surfaces_under_a_different_scanned_path() {
+        // Adversarial #67: same-file-only substitution rests on an EXACT absolute-path
+        // key lookup (`injected.pool.get(node.path)`). The pool holds POISON keyed to
+        // file A's path, but the vault contains only file B. B misses the pool (its
+        // path isn't a key), so it is read from its real disk content, and the poison
+        // keyed to A's path can never attach to a different scanned path.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("b.md"), "genuine target line in b\n").unwrap();
+        let key_a = key_for(&dir, "a.md"); // a path deliberately NOT present on disk
+        let key_b = key_for(&dir, "b.md");
+        let mut pool: HashMap<String, Arc<str>> = HashMap::new();
+        pool.insert(key_a, Arc::from("POISON target content for b\n"));
+
+        let (resp, content) = search_vault_with_content(dir.path(), "target", &pool).unwrap();
+
+        // B matched on its own real disk content — never the poison keyed to A.
+        assert_eq!(resp.hits.len(), 1, "only the on-disk file B matches");
+        assert_eq!(resp.hits[0].path, key_b);
+        assert_eq!(resp.hits[0].matches[0].snippet, "genuine target line in b");
+        assert_eq!(
+            content.get(&key_b).map(String::as_str),
+            Some("genuine target line in b\n"),
+            "b.md carries its real disk content, not the poison keyed to a.md"
+        );
+        // The poison string appears nowhere in the returned content.
+        assert!(
+            !content.values().any(|value| value.contains("POISON")),
+            "content under one path's key can never surface under a different scanned path"
+        );
+    }
+
+    #[test]
+    fn an_empty_pool_reads_every_file_from_disk() {
+        // An empty pool is the pure-disk path: every hit's content comes from disk and
+        // the response matches the public `search_vault` exactly (behaviour unchanged).
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("n.md"), "target line here\n").unwrap();
+        let (resp, content) =
+            search_vault_with_content(dir.path(), "target", &HashMap::new()).unwrap();
+        let public = search_vault(dir.path(), "target").unwrap();
+        assert_eq!(
+            serde_json::to_value(&resp).unwrap(),
+            serde_json::to_value(&public).unwrap(),
+            "with no injection the response equals public search_vault"
+        );
+        assert_eq!(
+            content.len(),
+            1,
+            "the disk-read content is retained as before"
+        );
     }
 }

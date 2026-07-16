@@ -219,10 +219,40 @@ fn parse_johnny_category(component: &str) -> Option<u8> {
     number.parse().ok()
 }
 
-/// A host-supplied inventory path safe to classify against: the shared
-/// vault-relative grammar plus this boundary's byte cap. The grammar already
+/// A host-supplied inventory path safe to classify against: this boundary's byte
+/// cap plus the shared *portable* vault-relative grammar. The grammar already
 /// rejects absolute paths, traversal, empty components, separators, and invisible
-/// characters, so this boundary keeps only its own size constraint on top.
+/// characters; the portable layer additionally refuses the Windows non-portable
+/// class (reserved device names, `<>:"|?*`, and the trailing dot/space that could
+/// fold toward `..`), keeping this classifier consistent with the write boundary.
 fn is_bounded_path(path: &str) -> bool {
-    path.len() <= MAX_INVENTORY_PATH_BYTES && crate::paths::VaultRelPath::is_valid(path)
+    path.len() <= MAX_INVENTORY_PATH_BYTES && crate::paths::parse_portable_rel_path(path).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn bounded_path_rejects_windows_trailing_dot_and_space_components() {
+        for path in ["Projects ", "Projects.", "Projects/.. ", "2024/03 "] {
+            assert!(
+                !is_bounded_path(path),
+                "{path:?} must be rejected as a non-portable inventory path"
+            );
+        }
+    }
+
+    #[test]
+    fn bounded_path_accepts_legitimate_scheme_folders() {
+        for path in [
+            "Projects",
+            "Areas/Reading",
+            "2024/03",
+            "10-19 Finance",
+            ".neuralnote",
+        ] {
+            assert!(is_bounded_path(path), "{path:?} must remain a bounded path");
+        }
+    }
 }

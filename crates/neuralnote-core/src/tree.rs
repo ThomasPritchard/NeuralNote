@@ -209,22 +209,56 @@ pub fn is_markdown_ext(ext: Option<&str>) -> bool {
     ext.is_some_and(|e| MARKDOWN_EXTENSIONS.contains(&e))
 }
 
+/// Plain-text note extensions the reader renders as text but does NOT treat as
+/// Markdown. Disjoint from [`MARKDOWN_EXTENSIONS`]; the union of the two is the
+/// full text-note vocabulary ([`is_text_note_ext`]).
+const PLAIN_TEXT_NOTE_EXTENSIONS: [&str; 2] = ["txt", "text"];
+
+/// True when `ext` is a text note the reader displays as text — every Markdown
+/// extension plus the plain-text ones ([`PLAIN_TEXT_NOTE_EXTENSIONS`]). This is
+/// the SINGLE source of truth for "what is a searchable text note", shared by the
+/// reader (`note::is_text_note`, binary-vs-text decode) and the search scan
+/// ([`text_note_files`]) so the set search scans cannot drift from the set the
+/// reader shows (issue #63). `ext` MUST already be lowercased, like
+/// [`is_markdown_ext`].
+pub fn is_text_note_ext(ext: Option<&str>) -> bool {
+    is_markdown_ext(ext) || ext.is_some_and(|e| PLAIN_TEXT_NOTE_EXTENSIONS.contains(&e))
+}
+
 /// Flatten every markdown file out of a scanned tree, in tree-walk order
 /// (deterministic: folders-first, case-insensitive by name — the [`read_tree`]
 /// sort). Consumers that start from `read_tree` + this helper inherit the scan
 /// rules (hidden-dotdir skip, symlink skip, depth cap) by construction.
 pub fn markdown_files(nodes: &[TreeNode]) -> Vec<&TreeNode> {
+    collect_files(nodes, is_markdown_ext)
+}
+
+/// Flatten every text note (markdown AND plain-text, per [`is_text_note_ext`]) out
+/// of a scanned tree — the search scan set, matching what the reader displays.
+/// Same tree-walk order and inherited scan rules as [`markdown_files`].
+pub fn text_note_files(nodes: &[TreeNode]) -> Vec<&TreeNode> {
+    collect_files(nodes, is_text_note_ext)
+}
+
+/// Flatten every leaf whose extension satisfies `keep`, in [`read_tree`] tree-walk
+/// order. The single recursive walker behind [`markdown_files`] and
+/// [`text_note_files`]; they differ only by the extension predicate.
+fn collect_files(nodes: &[TreeNode], keep: fn(Option<&str>) -> bool) -> Vec<&TreeNode> {
     let mut out = Vec::new();
-    collect_markdown(nodes, &mut out);
+    collect_into(nodes, keep, &mut out);
     out
 }
 
-fn collect_markdown<'a>(nodes: &'a [TreeNode], out: &mut Vec<&'a TreeNode>) {
+fn collect_into<'a>(
+    nodes: &'a [TreeNode],
+    keep: fn(Option<&str>) -> bool,
+    out: &mut Vec<&'a TreeNode>,
+) {
     for node in nodes {
         match &node.children {
-            Some(children) => collect_markdown(children, out),
+            Some(children) => collect_into(children, keep, out),
             None => {
-                if is_markdown_ext(node.ext.as_deref()) {
+                if keep(node.ext.as_deref()) {
                     out.push(node);
                 }
             }

@@ -1,0 +1,330 @@
+import type { NoteDoc } from "../lib/types";
+import { isPathInside, normSep, remapPath } from "./fileMeta";
+
+export interface NoteTab {
+  id: string;
+  path: string;
+  note: NoteDoc | null;
+  sessionHash: string | null;
+  loading: boolean;
+  error: string | null;
+  draft: string;
+  dirty: boolean;
+  saving: boolean;
+  saveError: string | null;
+  preservationError: string | null;
+  conflict: boolean;
+  /** True when the note's file was removed on disk while the tab is open (an
+   *  external deletion, or a rename that moved it out from under the tab). The
+   *  note + draft are kept — never dropped — so the user can re-save to recover;
+   *  the reader surfaces the deletion so the open note is never silently stale. */
+  externalDeleted: boolean;
+  loadRevision: number;
+  saveRevision: number;
+}
+
+export interface TabsState {
+  tabs: NoteTab[];
+  activeTabId: string | null;
+}
+
+export type Action =
+  | { type: "add-loading"; tab: NoteTab }
+  | { type: "load-start"; id: string; path: string; revision: number }
+  | { type: "load-success"; id: string; requestedPath: string; revision: number; doc: NoteDoc }
+  | { type: "load-error"; id: string; revision: number; message: string }
+  | { type: "activate"; id: string }
+  | { type: "close"; id: string }
+  | { type: "set-draft"; id: string; draft: string }
+  | { type: "set-preservation-error"; id: string; message: string | null }
+  | { type: "save-start"; id: string; revision: number }
+  | { type: "save-success"; id: string; revision: number; pathAtStart: string; doc: NoteDoc }
+  | { type: "save-error"; id: string; revision: number; message: string; conflict: boolean }
+  | { type: "external-update"; id: string; doc: NoteDoc }
+  | { type: "external-delete"; id: string }
+  | { type: "remap"; oldPath: string; newPath: string; newRelPath?: string }
+  | { type: "remove-descendants"; path: string }
+  | { type: "clear" };
+
+export const EMPTY_STATE: TabsState = { tabs: [], activeTabId: null };
+
+export function normalizeRequestedPath(path: string): string {
+  const normalized = normSep(path);
+  const absolute = normalized.startsWith("/");
+  const drive = /^[A-Za-z]:/.exec(normalized)?.[0] ?? "";
+  const tail = drive ? normalized.slice(drive.length) : normalized;
+  const parts: string[] = [];
+  for (const part of tail.split("/")) {
+    if (!part || part === ".") continue;
+    if (part === ".." && parts.length > 0 && parts.at(-1) !== "..") parts.pop();
+    else if (part !== ".." || !absolute) parts.push(part);
+  }
+  const rootPrefix = absolute ? "/" : "";
+  const prefix = drive ? `${drive}/` : rootPrefix;
+  return `${prefix}${parts.join("/")}` || (absolute ? "/" : ".");
+}
+
+function replaceTab(state: TabsState, id: string, update: (tab: NoteTab) => NoteTab): TabsState {
+  return { ...state, tabs: state.tabs.map((tab) => (tab.id === id ? update(tab) : tab)) };
+}
+
+/** Apply a freshly loaded document to a tab, unless the tab has unsaved edits —
+ *  in which case only the loading flags clear so the draft is never clobbered. */
+function applyLoad(tab: NoteTab, path: string, loadedDoc: NoteDoc): NoteTab {
+  if (tab.dirty && tab.note) return { ...tab, loading: false, error: null };
+  return {
+    ...tab,
+    path,
+    note: loadedDoc,
+    sessionHash: loadedDoc.contentHash,
+    loading: false,
+    error: null,
+    draft: loadedDoc.raw,
+    dirty: false,
+    preservationError: null,
+    externalDeleted: false,
+  };
+}
+
+/** The relPath to record for a loaded doc. When the tab was remapped underneath
+ *  the in-flight read, preserve the tab's own relPath (falling back to one derived
+ *  from the request's vault prefix); otherwise trust the loaded doc. */
+function resolveLoadedRelPath(
+  action: Extract<Action, { type: "load-success" }>,
+  target: NoteTab,
+  wasRemapped: boolean,
+): string {
+  if (!wasRemapped) return action.doc.relPath;
+  const requestedPath = normSep(action.requestedPath);
+  const requestedRelPath = normSep(action.doc.relPath).replace(/^\/+/, "");
+  const vaultPrefix = requestedPath.endsWith(requestedRelPath)
+    ? requestedPath.slice(0, -requestedRelPath.length)
+    : null;
+  const remappedPath = normSep(target.path);
+  const remappedRelPath =
+    vaultPrefix !== null && remappedPath.startsWith(vaultPrefix)
+      ? remappedPath.slice(vaultPrefix.length).replace(/^\/+/, "")
+      : null;
+  return target.note?.relPath ?? remappedRelPath ?? action.doc.relPath;
+}
+
+/** When a load resolves onto a path already held by another tab, pick which tab
+ *  survives the merge: a dirty tab always wins; otherwise the earlier tab. */
+function pickSurvivor(
+  target: NoteTab,
+  alias: NoteTab,
+  targetIndex: number,
+  aliasIndex: number,
+): NoteTab {
+  if (alias.dirty) return alias;
+  if (target.dirty) return target;
+  return targetIndex < aliasIndex ? target : alias;
+}
+
+/** Collapse the target and its alias into a single surviving tab, dropping the
+ *  other and re-pointing the active tab if it was the one removed. */
+function mergeAliasedTabs(
+  state: TabsState,
+  target: NoteTab,
+  alias: NoteTab,
+  path: string,
+  loadedDoc: NoteDoc,
+): TabsState {
+  const targetIndex = state.tabs.findIndex((tab) => tab.id === target.id);
+  const aliasIndex = state.tabs.findIndex((tab) => tab.id === alias.id);
+  const survivor = pickSurvivor(target, alias, targetIndex, aliasIndex);
+  const removedId = survivor.id === target.id ? alias.id : target.id;
+  const merged = applyLoad(survivor, path, loadedDoc);
+  return {
+    tabs: state.tabs
+      .filter((tab) => tab.id !== removedId)
+      .map((tab) => (tab.id === survivor.id ? merged : tab)),
+    activeTabId: state.activeTabId === removedId ? survivor.id : state.activeTabId,
+  };
+}
+
+function reconciledLoad(
+  state: TabsState,
+  action: Extract<Action, { type: "load-success" }>,
+): TabsState {
+  const target = state.tabs.find((tab) => tab.id === action.id);
+  if (!target) return state;
+  if (target.loadRevision !== action.revision) return state;
+
+  const wasRemapped =
+    normalizeRequestedPath(target.path) !==
+    normalizeRequestedPath(action.requestedPath);
+  const path = wasRemapped ? target.path : action.doc.path;
+  const relPath = resolveLoadedRelPath(action, target, wasRemapped);
+  const loadedDoc = { ...action.doc, path, relPath };
+  const alias = state.tabs.find(
+    (tab) =>
+      tab.id !== action.id &&
+      normalizeRequestedPath(tab.path) === normalizeRequestedPath(path),
+  );
+
+  if (alias) return mergeAliasedTabs(state, target, alias, path, loadedDoc);
+  return replaceTab(state, action.id, (tab) => applyLoad(tab, path, loadedDoc));
+}
+
+export function noteTabsReducer(state: TabsState, action: Action): TabsState {
+  switch (action.type) {
+    case "add-loading":
+      return { tabs: [...state.tabs, action.tab], activeTabId: action.tab.id };
+    case "load-start":
+      return replaceTab(state, action.id, (tab) => ({
+        ...tab,
+        path: action.path,
+        note: null,
+        sessionHash: null,
+        loading: true,
+        error: null,
+        draft: "",
+        dirty: false,
+        saving: false,
+        saveError: null,
+        preservationError: null,
+        conflict: false,
+        externalDeleted: false,
+        loadRevision: action.revision,
+        saveRevision: tab.saveRevision + 1,
+      }));
+    case "load-success":
+      return reconciledLoad(state, action);
+    case "load-error":
+      return replaceTab(state, action.id, (tab) =>
+        tab.loadRevision === action.revision
+          ? { ...tab, loading: false, error: action.message, note: null, sessionHash: null, draft: "", dirty: false }
+          : tab,
+      );
+    case "activate":
+      return state.tabs.some((tab) => tab.id === action.id) ? { ...state, activeTabId: action.id } : state;
+    case "close": {
+      const index = state.tabs.findIndex((tab) => tab.id === action.id);
+      if (index < 0) return state;
+      const tabs = state.tabs.filter((tab) => tab.id !== action.id);
+      return state.activeTabId === action.id
+        ? { tabs, activeTabId: tabs[index]?.id ?? tabs[index - 1]?.id ?? null }
+        : { ...state, tabs };
+    }
+    case "set-draft":
+      return replaceTab(state, action.id, (tab) => ({
+        ...tab,
+        draft: action.draft,
+        dirty: tab.note !== null && action.draft !== tab.note.raw,
+      }));
+    case "set-preservation-error":
+      return replaceTab(state, action.id, (tab) => ({ ...tab, preservationError: action.message }));
+    case "save-start":
+      return replaceTab(state, action.id, (tab) => ({
+        ...tab,
+        saving: true,
+        saveError: null,
+        saveRevision: action.revision,
+      }));
+    case "save-success":
+      return replaceTab(state, action.id, (tab) => {
+        if (tab.saveRevision !== action.revision) return tab;
+        const wasRemapped = normalizeRequestedPath(tab.path) !== normalizeRequestedPath(action.pathAtStart);
+        const savedDoc = {
+          ...action.doc,
+          path: tab.path,
+          relPath: wasRemapped ? (tab.note?.relPath ?? action.doc.relPath) : action.doc.relPath,
+        };
+        return {
+          ...tab,
+          note: savedDoc,
+          saving: false,
+          saveError: null,
+          conflict: false,
+          externalDeleted: false,
+          dirty: tab.draft !== savedDoc.raw,
+        };
+      });
+    case "save-error":
+      return replaceTab(state, action.id, (tab) =>
+        tab.saveRevision === action.revision
+          ? {
+              ...tab,
+              saving: false,
+              saveError: action.conflict ? null : action.message,
+              conflict: action.conflict,
+            }
+          : tab,
+      );
+    case "external-update":
+      return replaceTab(state, action.id, (tab) => {
+        if (!tab.note) return tab;
+        if (tab.dirty) {
+          // Unsaved edits are present: never clobber the draft. Raise the same
+          // conflict the save path raises so the user resolves it explicitly
+          // (reload to take disk, or overwrite to keep the draft).
+          return { ...tab, conflict: true, externalDeleted: false };
+        }
+        // Clean tab: adopt the on-disk version. Keep the tab's own path/relPath —
+        // the file's identity is unchanged (we read the tab's current path).
+        const reloaded = { ...action.doc, path: tab.path, relPath: tab.note.relPath };
+        return {
+          ...tab,
+          note: reloaded,
+          sessionHash: reloaded.contentHash,
+          draft: reloaded.raw,
+          dirty: false,
+          conflict: false,
+          externalDeleted: false,
+          error: null,
+        };
+      });
+    case "external-delete":
+      return replaceTab(state, action.id, (tab) =>
+        tab.note ? { ...tab, externalDeleted: true } : tab,
+      );
+    case "remap":
+      return {
+        ...state,
+        tabs: state.tabs.map((tab) => {
+          const path = remapPath(tab.path, action.oldPath, action.newPath);
+          if (!path) return tab;
+          const suffix = normSep(tab.path).slice(normSep(action.oldPath).length);
+          const relPath = action.newRelPath ? `${action.newRelPath}${suffix}` : tab.note?.relPath;
+          return {
+            ...tab,
+            path,
+            note: tab.note ? { ...tab.note, path, relPath: relPath ?? tab.note.relPath } : null,
+          };
+        }),
+      };
+    case "remove-descendants": {
+      const removed = new Set(state.tabs.filter((tab) => isPathInside(tab.path, action.path)).map((tab) => tab.id));
+      if (removed.size === 0) return state;
+      const activeIndex = state.tabs.findIndex((tab) => tab.id === state.activeTabId);
+      const tabs = state.tabs.filter((tab) => !removed.has(tab.id));
+      if (!state.activeTabId || !removed.has(state.activeTabId)) return { ...state, tabs };
+      const right = state.tabs.slice(activeIndex + 1).find((tab) => !removed.has(tab.id));
+      const left = state.tabs.slice(0, activeIndex).reverse().find((tab) => !removed.has(tab.id));
+      return { tabs, activeTabId: right?.id ?? left?.id ?? null };
+    }
+    case "clear":
+      return EMPTY_STATE;
+  }
+}
+
+export function loadingTab(id: string, path: string): NoteTab {
+  return {
+    id,
+    path,
+    note: null,
+    sessionHash: null,
+    loading: true,
+    error: null,
+    draft: "",
+    dirty: false,
+    saving: false,
+    saveError: null,
+    preservationError: null,
+    conflict: false,
+    externalDeleted: false,
+    loadRevision: 1,
+    saveRevision: 0,
+  };
+}

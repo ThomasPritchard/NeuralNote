@@ -154,7 +154,7 @@ pub(crate) fn next_chat_run_id() -> String {
 /// raw entry instead would emit a spurious second "missing" line and, before this
 /// fix, validated against the *first* recorded hash — letting a stale hash decide
 /// the fate of a newer note.
-fn distinct_rel_paths(ledger: &UndoLedger) -> Vec<&str> {
+pub(crate) fn distinct_rel_paths(ledger: &UndoLedger) -> Vec<&str> {
     let mut seen = std::collections::HashSet::new();
     ledger
         .entries()

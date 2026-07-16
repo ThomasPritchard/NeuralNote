@@ -1448,14 +1448,50 @@ mod tests {
     }
 
     #[test]
-    fn search_only_scans_markdown_files() {
+    fn search_scans_text_notes_not_binary_attachments() {
+        // Text notes the reader displays (markdown AND plain `.txt`) are scanned;
+        // binary attachments (`.png`) are not (issue #63).
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("notes.txt"), "target text\n").unwrap();
         fs::write(dir.path().join("img.png"), b"target\xff\xfe").unwrap();
         fs::write(dir.path().join("doc.md"), "target text\n").unwrap();
         let r = search::search_vault(dir.path(), "target").unwrap();
+        let mut rels: Vec<&str> = r.hits.iter().map(|h| h.rel_path.as_str()).collect();
+        rels.sort_unstable();
+        assert_eq!(rels, ["doc.md", "notes.txt"]);
+    }
+
+    #[test]
+    fn search_scans_txt_and_text_notes_with_correct_citation() {
+        // The reader shows `.txt`/`.text` notes as text (`is_text_note`), so search
+        // must scan them too (issue #63) — and cite the EXACT file + line, exactly
+        // as it does for markdown. Citation fidelity is the moat: a `.txt` hit must
+        // point at the real line the term is on.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("plain.txt"), "intro line\ntarget in txt\n").unwrap();
+        fs::write(
+            dir.path().join("other.text"),
+            "first\nsecond\ntarget in text\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("doc.md"), "target in md\n").unwrap();
+
+        let r = search::search_vault(dir.path(), "target").unwrap();
         let rels: Vec<&str> = r.hits.iter().map(|h| h.rel_path.as_str()).collect();
-        assert_eq!(rels, ["doc.md"]);
+        assert!(rels.contains(&"plain.txt"), "txt note must be searchable");
+        assert!(rels.contains(&"other.text"), "text note must be searchable");
+        assert!(rels.contains(&"doc.md"), "md note must still be searchable");
+
+        let txt = r.hits.iter().find(|h| h.rel_path == "plain.txt").unwrap();
+        assert_eq!(txt.matches[0].line, 2, "txt citation cites the exact line");
+        let m = &txt.matches[0];
+        assert_eq!(slice_chars(&m.snippet, m.ranges[0]), "target");
+
+        let text = r.hits.iter().find(|h| h.rel_path == "other.text").unwrap();
+        assert_eq!(
+            text.matches[0].line, 3,
+            "text citation cites the exact line"
+        );
     }
 
     #[test]

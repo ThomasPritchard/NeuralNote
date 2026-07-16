@@ -1221,7 +1221,8 @@ async fn chat_via_openrouter(
     .with_youtube_io(run.youtube_io)
     .with_youtube_requirements(run.youtube_requirements)
     .with_capture_cancellation(run.capture_cancellation.clone())
-    .with_extractor_update_session(run.extractor_updates.clone());
+    .with_extractor_update_session(run.extractor_updates.clone())
+    .with_retry_delay(&ai::TokioRetryDelay);
     if let Some(pricing) = pricing.as_ref() {
         skill_services = skill_services.with_pricing(pricing);
     }
@@ -1347,7 +1348,8 @@ async fn chat_via_local(
     .with_youtube_requirements(run.youtube_requirements)
     .with_pricing(&pricing)
     .with_capture_cancellation(run.capture_cancellation.clone())
-    .with_extractor_update_session(run.extractor_updates.clone());
+    .with_extractor_update_session(run.extractor_updates.clone())
+    .with_retry_delay(&ai::TokioRetryDelay);
     match run_chat(
         run.prompt,
         run.history,
