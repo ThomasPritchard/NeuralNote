@@ -13,28 +13,55 @@
     "vitest",
     "jsx-a11y"
   ],
-  // TODO(lint-baseline): retire these adoption exceptions in scoped changes with
-  // regression or accessibility coverage; enabling them now creates 1,886
-  // pre-existing findings and would require an unrelated application rewrite.
   "rules": {
-    "eslint/no-shadow": "off",
-    "eslint/no-underscore-dangle": "off",
-    "eslint/no-unmodified-loop-condition": "off",
-    "eslint/no-useless-escape": "off",
-    "jsx-a11y/control-has-associated-label": "off",
-    "jsx-a11y/no-autofocus": "off",
-    "jsx-a11y/no-noninteractive-element-interactions": "off",
-    "jsx-a11y/no-noninteractive-element-to-interactive-role": "off",
-    "jsx-a11y/prefer-tag-over-role": "off",
+    "eslint/no-underscore-dangle": [
+      "error",
+      {
+        "allow": [
+          "__TAURI_INTERNALS__",
+          "__composer",
+          "__forces",
+          "__customForces",
+          "__controls",
+          "__z3d"
+        ]
+      }
+    ],
+    // Deliberately still off. Each line records why the rule cannot reach zero
+    // without an unsafe change, and how many findings remain (2026-07 baseline).
+    //
+    // Incompatible with this project's toolchain: React 19 + the automatic JSX
+    // runtime (@vitejs/plugin-react) means JSX never expands to React.createElement,
+    // so `React` is intentionally not imported. The rule is N/A, not debt. (1745)
     "react/react-in-jsx-scope": "off",
-    "typescript/no-extraneous-class": "off",
-    "typescript/triple-slash-reference": "off",
-    "unicorn/consistent-function-scoping": "off",
-    "unicorn/no-array-reverse": "off",
+    // Style/strictness rule requiring explicit generics on every vi.fn()/vi.mock()
+    // call. 528 findings across the test suite; a mechanical mass-rewrite of test
+    // mocks with no correctness or accessibility payoff. Deferred. (528)
+    "vitest/require-mock-type-parameters": "off",
+    // Each fix swaps a semantic tag for another (div[role=status] -> output,
+    // div[role=slider] -> input, ul[role=listbox] -> select). Those tags carry
+    // different default display/behaviour, so enforcing this changes appearance
+    // and belongs in a visual-reviewed pass, not lint remediation. (12)
+    "jsx-a11y/prefer-tag-over-role": "off",
+    // The only fix is removing `autoFocus`, which is a deliberate behaviour choice
+    // (initial focus in newly-opened dialogs/forms). Removing it is a UX/behaviour
+    // change out of scope for lint remediation. (2)
+    "jsx-a11y/no-autofocus": "off",
+    // SkillPicker's listbox/option combobox pattern needs a markup restructure to
+    // satisfy; that is presentational work with behaviour implications, not a
+    // mechanical lint fix. (2)
+    "jsx-a11y/no-noninteractive-element-to-interactive-role": "off",
+    // The toast container <li> carries hover/focus handlers by design (pause the
+    // auto-dismiss timer). Satisfying the rule means restructuring the toast markup
+    // and risks changing that intentional behaviour. (1)
+    "jsx-a11y/no-noninteractive-element-interactions": "off",
+    // The only fix is `Array#toSorted`/`toReversed` (ES2023), but this program's
+    // tsconfig `lib` baseline is ES2022 and the codebase convention is copy-then-sort
+    // in place (`[...xs].sort()`). Every current call site already sorts a fresh copy,
+    // so there is no mutation to fix; enabling would force an out-of-scope TS baseline
+    // bump. (no-array-sort: 18, no-array-reverse: 1)
     "unicorn/no-array-sort": "off",
-    "unicorn/no-useless-spread": "off",
-    "unicorn/prefer-add-event-listener": "off",
-    "vitest/require-mock-type-parameters": "off"
+    "unicorn/no-array-reverse": "off"
   },
   "ignorePatterns": [
     "coverage/**",

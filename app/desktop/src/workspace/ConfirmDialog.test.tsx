@@ -17,6 +17,24 @@ function setup(overrides = {}) {
   return props;
 }
 
+function Harness() {
+  const [open, setOpen] = useState(false);
+  return (
+    <>
+      <button type="button" onClick={() => setOpen(true)}>Delete selected note</button>
+      {open && (
+        <ConfirmDialog
+          title="Delete note?"
+          message="This cannot be undone."
+          confirmLabel="Delete"
+          onConfirm={() => setOpen(false)}
+          onCancel={() => setOpen(false)}
+        />
+      )}
+    </>
+  );
+}
+
 describe("ConfirmDialog", () => {
   it("renders title, message and labels (default cancel label)", () => {
     setup();
@@ -68,24 +86,6 @@ describe("ConfirmDialog", () => {
   });
 
   it("returns focus to the control that opened it", async () => {
-    function Harness() {
-      const [open, setOpen] = useState(false);
-      return (
-        <>
-          <button type="button" onClick={() => setOpen(true)}>Delete selected note</button>
-          {open && (
-            <ConfirmDialog
-              title="Delete note?"
-              message="This cannot be undone."
-              confirmLabel="Delete"
-              onConfirm={() => setOpen(false)}
-              onCancel={() => setOpen(false)}
-            />
-          )}
-        </>
-      );
-    }
-
     const user = userEvent.setup();
     render(<Harness />);
     const opener = screen.getByRole("button", { name: "Delete selected note" });

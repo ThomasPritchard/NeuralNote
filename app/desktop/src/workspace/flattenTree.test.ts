@@ -40,6 +40,9 @@ const dir = (children: TreeNode[], truncated: number | null = null): LoadedDir =
 const NONE: ReadonlySet<string> = new Set();
 
 /** Compact fingerprint per row so the ordering contract reads at a glance. */
+const createKey = (rows: FlatRow[]): string | undefined =>
+  rows.map(rowKey).find((k) => k.startsWith("create:"));
+
 const shape = (rows: FlatRow[]): string[] =>
   rows.map((r) => {
     switch (r.kind) {
@@ -255,8 +258,6 @@ describe("flattenTree — row keys", () => {
       { parentPath: "/v/A", kind: "note" },
       "/v",
     );
-    const createKey = (rows: FlatRow[]) =>
-      rows.map(rowKey).find((k) => k.startsWith("create:"));
     expect(createKey(rootCreate)).not.toBe(createKey(folderCreate));
   });
 });

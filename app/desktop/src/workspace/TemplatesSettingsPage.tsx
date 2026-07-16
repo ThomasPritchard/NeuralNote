@@ -181,7 +181,12 @@ function FormatField({ id, label, value, presets, previewLabel, onChange }: Read
     <div className="flex flex-col gap-1.5">
       <label htmlFor={id} className="text-xs font-medium">{label}</label>
       <input id={id} list={`${id}-presets`} value={value} onChange={(event) => onChange(event.currentTarget.value)} aria-invalid={error !== null} aria-describedby={feedbackId} className="h-9 rounded-md border border-input bg-background px-3 font-mono text-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" />
-      <datalist id={`${id}-presets`}>{presets.map((preset) => <option key={preset} value={preset} />)}</datalist>
+      <datalist id={`${id}-presets`}>
+        {presets.map((preset) => (
+          // eslint-disable-next-line jsx-a11y/control-has-associated-label -- datalist suggestion: the option's `value` is its own visible label.
+          <option key={preset} value={preset} />
+        ))}
+      </datalist>
       <output id={feedbackId} htmlFor={id} aria-label={previewLabel} aria-live="polite" className={error === null ? "text-xs text-muted-foreground" : "text-xs text-destructive"}>
         {error === null ? `Preview: ${formatMomentPreview(value)}` : `Error: ${error}`}
       </output>

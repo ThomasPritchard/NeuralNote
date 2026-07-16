@@ -68,13 +68,14 @@ function clickNode(id: string) {
 
 // Handles normally register from makeStarNode (mocked away with the
 // renderer) — register fakes so the focus plumbing has targets.
+const makeNodeHandle = () => ({
+  update: vi.fn<(time: number) => void>(),
+  setHover: vi.fn<(on: boolean) => void>(),
+  setDimmed: vi.fn<(on: boolean) => void>(),
+});
+
 function registerFakes() {
-  const make = () => ({
-    update: vi.fn<(time: number) => void>(),
-    setHover: vi.fn<(on: boolean) => void>(),
-    setDimmed: vi.fn<(on: boolean) => void>(),
-  });
-  const handles = { alpha: make(), beta: make(), gamma: make() };
+  const handles = { alpha: makeNodeHandle(), beta: makeNodeHandle(), gamma: makeNodeHandle() };
   registerNode("alpha.md", handles.alpha);
   registerNode("notes/beta.md", handles.beta);
   registerNode("notes/gamma.md", handles.gamma);

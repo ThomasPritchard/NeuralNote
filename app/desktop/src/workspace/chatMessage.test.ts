@@ -521,14 +521,15 @@ describe("stripCitationMarkers", () => {
   });
 });
 
+const cite = (id: string): CitationView => ({
+  id,
+  relPath: "a.md",
+  startLine: 1,
+  endLine: 1,
+  text: "x",
+});
+
 describe("resolveAnswerMarkers", () => {
-  const cite = (id: string): CitationView => ({
-    id,
-    relPath: "a.md",
-    startLine: 1,
-    endLine: 1,
-    text: "x",
-  });
 
   it("leaves markers untouched while the turn is still streaming", () => {
     // Citations arrive after the answer streams — don't strip mid-generation.

@@ -106,6 +106,8 @@ function clickNode(id: string) {
   act(() => harness.props.onNodeClick(node));
 }
 
+const legendCard = () => within(screen.getByText("Clusters").parentElement as HTMLElement);
+
 describe("Journey 12: graph view over real link data", () => {
   it("mounts the galaxy with resolved nodes, links, and the cross-folder bridge", async () => {
     const { user } = await openVault(LINKED_SEED);
@@ -149,8 +151,7 @@ describe("Journey 12: graph view over real link data", () => {
 
     // Drill: click the "notes" cluster IN THE LEGEND (the sidebar tree also
     // shows folder names, so scope to the legend card).
-    const legend = () => within(screen.getByText("Clusters").parentElement as HTMLElement);
-    await user.click(legend().getByRole("button", { name: "notes" }));
+    await user.click(legendCard().getByRole("button", { name: "notes" }));
 
     // The stub received ONLY the folder's notes; the intra-folder link stays,
     // recomputed as a normal link at this level (both notes sit directly in
@@ -169,12 +170,12 @@ describe("Journey 12: graph view over real link data", () => {
     // action) and the breadcrumb's inert current level (SPAN). Clicking the
     // "" row must be a no-op: the drilled payload stays exactly as it is.
     expect(
-      legend()
+      legendCard()
         .getAllByText("notes")
         .map((el) => el.tagName)
         .sort(),
     ).toEqual(["BUTTON", "SPAN"]);
-    await user.click(legend().getByRole("button", { name: "notes" }));
+    await user.click(legendCard().getByRole("button", { name: "notes" }));
     expect(harness.props.graphData.nodes.map((n: any) => n.id).sort()).toEqual([
       "notes/Alpha.md",
       "notes/Beta.md",

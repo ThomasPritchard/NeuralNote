@@ -5,6 +5,11 @@ export interface WorkspaceStateWriter {
   flush: () => Promise<void>;
 }
 
+const isSameState = (left: WorkspaceState, right: WorkspaceState): boolean =>
+  left.activePath === right.activePath &&
+  left.openPaths.length === right.openPaths.length &&
+  left.openPaths.every((path, index) => path === right.openPaths[index]);
+
 export function createWorkspaceStateWriter(
   save: (state: WorkspaceState) => Promise<void>,
   onError: (error: unknown) => void,
@@ -13,11 +18,6 @@ export function createWorkspaceStateWriter(
   let running: Promise<void> | null = null;
   let scheduled = false;
   let lastSaved: WorkspaceState | null = null;
-
-  const isSameState = (left: WorkspaceState, right: WorkspaceState) =>
-    left.activePath === right.activePath &&
-    left.openPaths.length === right.openPaths.length &&
-    left.openPaths.every((path, index) => path === right.openPaths[index]);
 
   const drain = async (): Promise<void> => {
     scheduled = false;
@@ -54,6 +54,7 @@ export function createWorkspaceStateWriter(
     },
     async flush() {
       scheduled = false;
+      // eslint-disable-next-line eslint/no-unmodified-loop-condition -- `running`/`pending` are reassigned inside the awaited `drain()` closure, which static analysis can't see.
       while (running || pending) {
         if (running) await running;
         else await drain();

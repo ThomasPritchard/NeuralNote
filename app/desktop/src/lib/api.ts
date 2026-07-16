@@ -289,6 +289,7 @@ export const chat = (
   activeSkills: string[] = [],
 ): Promise<string> => {
   const channel = new Channel<ChatEvent>();
+  // eslint-disable-next-line unicorn/prefer-add-event-listener -- Tauri Channel exposes only `onmessage`; it has no addEventListener.
   channel.onmessage = onEvent;
   return invoke<string>("chat", {
     turnId,
@@ -407,6 +408,7 @@ export const pullLocalModel = (
   onEvent: (event: PullEvent) => void,
 ): Promise<void> => {
   const channel = new Channel<PullEvent>();
+  // eslint-disable-next-line unicorn/prefer-add-event-listener -- Tauri Channel exposes only `onmessage`; it has no addEventListener.
   channel.onmessage = onEvent;
   return invoke<void>("pull_local_model", { tag, onEvent: channel });
 };
@@ -421,6 +423,7 @@ export const downloadRequirement = (
   onEvent: (event: PullEvent) => void,
 ): Promise<void> => {
   const channel = new Channel<PullEvent>();
+  // eslint-disable-next-line unicorn/prefer-add-event-listener -- Tauri Channel exposes only `onmessage`; it has no addEventListener.
   channel.onmessage = onEvent;
   return invoke<void>("download_requirement", { name, onEvent: channel });
 };

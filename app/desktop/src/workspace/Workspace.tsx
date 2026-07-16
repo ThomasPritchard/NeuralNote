@@ -335,13 +335,13 @@ export function Workspace() {
 
     void api
       .loadWorkspaceState()
-      .then((loaded) => {
+      .then((restored) => {
         if (cancelled) return;
-        if (loaded.recoveredFromCorrupt) {
+        if (restored.recoveredFromCorrupt) {
           setWorkspaceStateBlocked(true);
           setWorkspaceStateReady(true);
           recoveryToastId = toast.error(
-            loaded.recoveryMessage ?? "Workspace tab state could not be restored.",
+            restored.recoveryMessage ?? "Workspace tab state could not be restored.",
             {
               dedupKey: "workspace-state-recovery",
               action: {
@@ -355,12 +355,12 @@ export function Workspace() {
 
         const ids: string[] = [];
         let desiredId: string | null = null;
-        for (const relativePath of loaded.state.openPaths) {
+        for (const relativePath of restored.state.openPaths) {
           const id = noteTabsRef.current.open(`${vaultPath}/${relativePath}`, {
             forceNew: true,
           });
           ids.push(id);
-          if (relativePath === loaded.state.activePath) desiredId = id;
+          if (relativePath === restored.state.activePath) desiredId = id;
         }
         if (ids.length === 0) {
           setWorkspaceStateReady(true);
@@ -482,8 +482,8 @@ export function Workspace() {
       }
       setTemplates(listed);
       setTemplateInsertOpen(true);
-    } catch (error) {
-      toast.error(api.errorMessage(error));
+    } catch (settingsError) {
+      toast.error(api.errorMessage(settingsError));
     }
   }, [handleOpenSettings, toast]);
 
@@ -500,8 +500,8 @@ export function Workspace() {
           if (vaultPath) await refreshDir(vaultRelPath(parentPath, vaultPath));
           setTemplateInsertOpen(false);
           openNoteAt(created.path);
-        } catch (error) {
-          reportError(api.errorMessage(error));
+        } catch (createError) {
+          reportError(api.errorMessage(createError));
         }
       })();
     },

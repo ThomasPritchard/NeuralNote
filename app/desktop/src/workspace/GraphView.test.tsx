@@ -307,26 +307,26 @@ describe("GraphView", () => {
   });
 });
 
+// Two levels under notes/ so the journey can drill twice.
+const deepGraph = (): LinkGraph => ({
+  nodes: [
+    { id: "alpha.md", title: "Alpha", cluster: "" },
+    { id: "notes/beta.md", title: "Beta", cluster: "notes" },
+    { id: "notes/daily/gamma.md", title: "Gamma", cluster: "notes" },
+    { id: "notes/daily/delta.md", title: "Delta", cluster: "notes" },
+    { id: "essays/epsilon.md", title: "Epsilon", cluster: "essays" },
+  ],
+  links: [
+    { source: "alpha.md", target: "notes/beta.md", bridge: true },
+    { source: "notes/beta.md", target: "notes/daily/gamma.md", bridge: false },
+    { source: "notes/daily/gamma.md", target: "notes/daily/delta.md", bridge: false },
+    { source: "essays/epsilon.md", target: "notes/beta.md", bridge: true },
+  ],
+  skippedFiles: 0,
+});
+
 // ── Cluster drill-down (spec §Addendum) ─────────────────────────────────────
 describe("GraphView cluster drill-down", () => {
-  // Two levels under notes/ so the journey can drill twice.
-  const deepGraph = (): LinkGraph => ({
-    nodes: [
-      { id: "alpha.md", title: "Alpha", cluster: "" },
-      { id: "notes/beta.md", title: "Beta", cluster: "notes" },
-      { id: "notes/daily/gamma.md", title: "Gamma", cluster: "notes" },
-      { id: "notes/daily/delta.md", title: "Delta", cluster: "notes" },
-      { id: "essays/epsilon.md", title: "Epsilon", cluster: "essays" },
-    ],
-    links: [
-      { source: "alpha.md", target: "notes/beta.md", bridge: true },
-      { source: "notes/beta.md", target: "notes/daily/gamma.md", bridge: false },
-      { source: "notes/daily/gamma.md", target: "notes/daily/delta.md", bridge: false },
-      { source: "essays/epsilon.md", target: "notes/beta.md", bridge: true },
-    ],
-    skippedFiles: 0,
-  });
-
   const nodeIds = () => harness.props.graphData.nodes.map((n: any) => n.id).sort();
 
   async function renderDeep() {
