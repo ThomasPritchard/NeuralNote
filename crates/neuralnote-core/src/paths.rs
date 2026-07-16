@@ -92,6 +92,8 @@ const CONFUSABLE_SEPARATORS: &[char] = &[
     '\u{29F9}', // ⧹ BIG REVERSE SOLIDUS
     '\u{2216}', // ∖ SET MINUS
     '\u{2572}', // ╲ BOX DRAWINGS LIGHT DIAGONAL UPPER LEFT TO LOWER RIGHT
+    '\u{FE68}', // ﹨ SMALL REVERSE SOLIDUS
+    '\u{29F5}', // ⧵ REVERSE SOLIDUS OPERATOR
 ];
 
 /// A vault-relative path whose *grammar* has passed the single shared gate that
@@ -125,9 +127,17 @@ impl VaultRelPath {
     /// Validate `raw` against the shared grammar and capture its components.
     pub fn parse(raw: &str) -> CoreResult<Self> {
         Self::check_grammar(raw)?;
-        Ok(Self {
-            components: raw.split('/').map(str::to_string).collect(),
-        })
+        let components: Vec<String> = raw.split('/').map(str::to_string).collect();
+        // check_grammar rejects an empty `raw` and every empty component, so a
+        // `split('/')` always yields at least one non-empty part here. leaf() and
+        // parent_components() depend on this; assert it so a future change that
+        // could construct an empty component list trips in tests rather than
+        // panicking later at the .last()/slice.
+        debug_assert!(
+            !components.is_empty(),
+            "a validated VaultRelPath must have at least one component"
+        );
+        Ok(Self { components })
     }
 
     /// Whether `raw` satisfies the shared grammar, without allocating its
@@ -339,7 +349,7 @@ mod vault_rel_path_tests {
     }
 
     #[test]
-    fn rejects_invisible_and_confusable_component_characters() {
+    fn rejects_invisible_component_characters() {
         for raw in [
             "a\u{200b}b",     // zero-width space
             "a\u{200d}b",     // zero-width joiner
@@ -350,13 +360,25 @@ mod vault_rel_path_tests {
             "a\u{2028}b",     // line separator
             "a\u{2029}b",     // paragraph separator
             "a\tb",           // ASCII control
-            "a\u{2215}b",     // division-slash separator look-alike
-            "a\u{ff0f}b",     // fullwidth solidus look-alike
-            "a\u{2044}b",     // fraction slash look-alike
         ] {
             assert!(
                 matches!(VaultRelPath::parse(raw), Err(CoreError::InvalidName(_))),
                 "{raw:?} must be refused as InvalidName"
+            );
+        }
+    }
+
+    #[test]
+    fn rejects_every_confusable_separator_in_the_blocklist() {
+        // Table-driven over the actual constant so no entry can be silently
+        // dropped without a test turning red — each look-alike, embedded in an
+        // otherwise-valid component, must be refused.
+        for &sep in CONFUSABLE_SEPARATORS {
+            let raw = format!("a{sep}b");
+            assert!(
+                matches!(VaultRelPath::parse(&raw), Err(CoreError::InvalidName(_))),
+                "component containing U+{:04X} must be refused as InvalidName",
+                sep as u32
             );
         }
     }
