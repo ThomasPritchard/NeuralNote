@@ -60,7 +60,8 @@ pub use openrouter_catalogue::{
     latest_completed_utc_day, rank_openrouter_models, OpenRouterRankedModel, OpenRouterRankedModels,
 };
 pub use orchestrator::{
-    run_chat, Guards, SkillServices, DEFAULT_MODEL, SKILL_ACTIVATION_FAILURE_MARK,
+    run_chat, Guards, NoRetryDelay, RetryDelay, SkillServices, DEFAULT_MODEL,
+    SKILL_ACTIVATION_FAILURE_MARK,
 };
 pub use provider_config::{
     read_provider_config, write_provider_config, ProbedReasoning, ProviderConfig, ProviderKind,

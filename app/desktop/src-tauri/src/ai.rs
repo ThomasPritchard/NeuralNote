@@ -13,7 +13,7 @@ use futures_util::StreamExt;
 use neuralnote_core::ai::{openai, provider_config};
 use neuralnote_core::ai::{
     openrouter_reasoning_support, parse_openrouter_input_pricing, ChatEvent, Completion, EventSink,
-    LlmClient, LlmMessage, LlmRequest, ReasoningSupport, Role,
+    LlmClient, LlmMessage, LlmRequest, ReasoningSupport, RetryDelay, Role,
 };
 use neuralnote_core::capture::ModelPricing;
 use neuralnote_core::CoreError;
@@ -596,6 +596,17 @@ impl LlmClient for OpenAiChatClient {
             openai::consume_sse_line(&buf, sink, &mut full)?;
         }
         openai::finish_answer(full)
+    }
+}
+
+/// The runtime-backed [`RetryDelay`]: the core owns the backoff value, the shell owns the
+/// clock. Non-blocking — it awaits the Tokio timer rather than sleeping a worker thread.
+pub struct TokioRetryDelay;
+
+#[async_trait]
+impl RetryDelay for TokioRetryDelay {
+    async fn delay(&self, duration: Duration) {
+        tokio::time::sleep(duration).await;
     }
 }
 

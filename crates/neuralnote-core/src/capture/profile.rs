@@ -121,17 +121,18 @@ pub(crate) fn validate_folder_path(path: &str) -> Result<(), CaptureError> {
             "default folder is empty or exceeds its limit",
         ));
     }
-    if !crate::paths::VaultRelPath::is_valid(path) {
+    let Ok(parsed) = crate::paths::VaultRelPath::parse(path) else {
         return Err(profile_error("default folder must be vault-relative"));
-    }
+    };
     if path
         .chars()
         .any(|character| matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
     {
         return Err(profile_error("default folder contains unsafe characters"));
     }
-    if path
-        .split('/')
+    if parsed
+        .components()
+        .iter()
         .any(|component| component.ends_with('.') || component.ends_with(' '))
     {
         return Err(profile_error("default folder contains an unsafe component"));

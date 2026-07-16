@@ -258,11 +258,14 @@ fn validate_topic(topic: &str) -> Result<&str, CaptureError> {
     Ok(topic)
 }
 
-/// A host-supplied inventory path safe to route against: the shared vault-relative
-/// grammar plus this boundary's byte cap. The grammar owns absolute/traversal/
-/// empty-component/separator/invisible-character rejection.
+/// A host-supplied inventory path safe to route against: this boundary's byte cap
+/// plus the shared *portable* vault-relative grammar. The grammar owns absolute/
+/// traversal/empty-component/separator/invisible-character rejection; the portable
+/// layer additionally refuses the Windows non-portable class (reserved device
+/// names, `<>:"|?*`, and the trailing dot/space that could fold toward `..`), so a
+/// folder that could never be written into is never suggested as a route.
 fn is_safe_inventory_path(path: &str) -> bool {
-    path.len() <= MAX_INVENTORY_PATH_BYTES && crate::paths::VaultRelPath::is_valid(path)
+    path.len() <= MAX_INVENTORY_PATH_BYTES && crate::paths::parse_portable_rel_path(path).is_ok()
 }
 
 impl From<PersistedVaultScheme> for VaultScheme {
@@ -273,6 +276,37 @@ impl From<PersistedVaultScheme> for VaultScheme {
             PersistedVaultScheme::TopicFolders => Self::TopicFolders,
             PersistedVaultScheme::DateBased => Self::DateBased,
             PersistedVaultScheme::JohnnyDecimal => Self::JohnnyDecimal,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inventory_paths_with_trailing_dot_or_space_components_are_unsafe() {
+        for path in [
+            "Areas ",
+            "Areas.",
+            "Areas/.. ",
+            "Areas/Reading ",
+            "Areas/deep.",
+        ] {
+            assert!(
+                !is_safe_inventory_path(path),
+                "{path:?} must be rejected as a non-portable inventory path"
+            );
+        }
+    }
+
+    #[test]
+    fn legitimate_inventory_paths_stay_safe() {
+        for path in ["Areas", "Areas/Reading", "24.05 Finance", ".neuralnote"] {
+            assert!(
+                is_safe_inventory_path(path),
+                "{path:?} must remain a safe inventory path"
+            );
         }
     }
 }

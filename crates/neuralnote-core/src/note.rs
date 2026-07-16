@@ -126,12 +126,15 @@ pub fn read_note(root: &Path, target: &Path) -> CoreResult<NoteDoc> {
 }
 
 /// Whether a path is a text note we should always try to show as text (decoding
-/// lossily if needed) rather than treat as a binary attachment.
+/// lossily if needed) rather than treat as a binary attachment. Delegates to the
+/// single source of truth ([`crate::tree::is_text_note_ext`]) so the reader and the
+/// search scan share ONE text-note vocabulary and cannot drift (issue #63).
 fn is_text_note(path: &Path) -> bool {
-    path.extension()
+    let ext = path
+        .extension()
         .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .is_some_and(|e| matches!(e.as_str(), "md" | "markdown" | "txt" | "text" | "mdx"))
+        .map(|e| e.to_ascii_lowercase());
+    crate::tree::is_text_note_ext(ext.as_deref())
 }
 
 /// Read a file as a string the *same way the reader does* — lossily — so a note

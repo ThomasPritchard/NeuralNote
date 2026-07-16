@@ -127,7 +127,15 @@ type SearchData = (SearchResponse, HashMap<String, String>);
 trait VaultReader: Send + Sync {
     fn read_tree(&self, root: &Path) -> CoreResult<Vec<TreeNode>>;
     fn read_note(&self, root: &Path, path: &Path) -> CoreResult<NoteDoc>;
-    fn search(&self, root: &Path, query: &str) -> CoreResult<SearchData>;
+    /// `injected` is the run's accumulated content pool (issue #67): content earlier
+    /// searches in this run already loaded, so this scan can reuse a note it covers
+    /// instead of re-reading it from disk. Empty means a pure-disk scan.
+    fn search(
+        &self,
+        root: &Path,
+        query: &str,
+        injected: &HashMap<String, Arc<str>>,
+    ) -> CoreResult<SearchData>;
 }
 
 /// The production reader: each call goes straight to disk via the existing free
@@ -143,8 +151,13 @@ impl VaultReader for DiskVaultReader {
         read_note(root, path)
     }
 
-    fn search(&self, root: &Path, query: &str) -> CoreResult<SearchData> {
-        search_vault_with_content(root, query)
+    fn search(
+        &self,
+        root: &Path,
+        query: &str,
+        injected: &HashMap<String, Arc<str>>,
+    ) -> CoreResult<SearchData> {
+        search_vault_with_content(root, query, injected)
     }
 }
 
@@ -158,6 +171,11 @@ struct RunCache {
     tree: Option<Arc<Vec<TreeNode>>>,
     notes: HashMap<PathBuf, Arc<NoteDoc>>,
     searches: HashMap<String, Arc<SearchData>>,
+    /// Decoded note text, keyed by absolute path, accumulated across every search in
+    /// the run so a LATER query can reuse a note an earlier query already loaded
+    /// without a second disk read (issue #67). Each value is an `Arc<str>` so a
+    /// snapshot of the pool is cheap pointer clones, never a copy of any note's text.
+    content_pool: HashMap<String, Arc<str>>,
 }
 
 /// Keyword retrieval over the existing vault search. Holds the vault root, the
@@ -229,12 +247,25 @@ impl KeywordRetriever {
         if let Some(data) = self.cache.lock().unwrap().searches.get(query).cloned() {
             return Ok(data);
         }
-        let data = Arc::new(self.reader.search(&self.root, query)?);
-        self.cache
-            .lock()
-            .unwrap()
-            .searches
-            .insert(query.to_string(), Arc::clone(&data));
+        // Snapshot the run's accumulated content pool (Arc clones — no note text is
+        // copied) and release the lock before the vault scan touches disk, keeping the
+        // critical section I/O-free. Passing it in lets this scan reuse content an
+        // earlier query already loaded, skipping a second disk read of the same note
+        // (issue #67); byte-identity and the disk fallback are guaranteed inside
+        // `search_vault_with_content`.
+        let injected = self.cache.lock().unwrap().content_pool.clone();
+        let data = Arc::new(self.reader.search(&self.root, query, &injected)?);
+        let mut cache = self.cache.lock().unwrap();
+        // Fold this scan's freshly-loaded content into the pool so a LATER query can
+        // reuse it. `or_insert` keeps the first-loaded bytes for a path stable across
+        // the run, matching the same-query cache's within-run view.
+        for (path, content) in &data.1 {
+            cache
+                .content_pool
+                .entry(path.clone())
+                .or_insert_with(|| Arc::from(content.as_str()));
+        }
+        cache.searches.insert(query.to_string(), Arc::clone(&data));
         Ok(data)
     }
 
@@ -838,14 +869,19 @@ mod tests {
             *self.note_reads.lock().unwrap() += 1;
             self.inner.read_note(root, path)
         }
-        fn search(&self, root: &Path, query: &str) -> CoreResult<SearchData> {
+        fn search(
+            &self,
+            root: &Path,
+            query: &str,
+            injected: &HashMap<String, Arc<str>>,
+        ) -> CoreResult<SearchData> {
             *self
                 .search_reads
                 .lock()
                 .unwrap()
                 .entry(query.to_string())
                 .or_default() += 1;
-            self.inner.search(root, query)
+            self.inner.search(root, query, injected)
         }
     }
 
@@ -869,6 +905,48 @@ mod tests {
         assert_eq!(first.spans[0].text, again.spans[0].text);
         assert_eq!(first.spans[0].content_hash, again.spans[0].content_hash);
         assert_eq!(first.spans[0].rel_path, again.spans[0].rel_path);
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn a_later_query_reuses_content_a_prior_query_loaded_without_re_reading_disk() {
+        // Issue #67: a DIFFERENT query later in the run reuses content the first query
+        // already loaded, with no second disk read of that note. Proven by making the
+        // file unreadable AFTER the first query pooled its content: the second query
+        // still surfaces the note (so it never re-read disk) and counts no skip.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("both.md");
+        fs::write(&f, "alpha and beta appear together\n").unwrap();
+        let r = KeywordRetriever::new(dir.path());
+
+        // Query A loads both.md's content into the run's content pool.
+        let a = r.search_notes("alpha", 8, None).unwrap();
+        assert_eq!(a.spans.len(), 1);
+
+        // The note becomes unreadable only AFTER its content was pooled.
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+
+        // Query B (a different term present in the same note) still finds it — it
+        // reused the pooled content instead of re-reading the now-unreadable file.
+        let b = r.search_notes("beta", 8, None).unwrap();
+        // Restore permissions first so tempdir cleanup can't fail regardless of asserts.
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+        assert_eq!(
+            b.spans.len(),
+            1,
+            "the second query reused pooled content — no disk read of the note"
+        );
+        assert_eq!(b.spans[0].rel_path, "both.md");
+        assert_eq!(
+            b.skipped_files, 0,
+            "reuse means the unreadable file is never even opened, so nothing is skipped"
+        );
+        // The reused span is a faithful citation: its hash is the hash of that content.
+        assert_eq!(
+            b.spans[0].content_hash,
+            crate::note::content_hash("alpha and beta appear together\n")
+        );
     }
 
     #[test]

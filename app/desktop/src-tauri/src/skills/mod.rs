@@ -176,13 +176,9 @@ fn undo_skill_run_inner_with(
         // A ledger may repeat a path (resolve-to-latest-write dedups it to a single
         // report line), so the coverage invariant is one line per *distinct* path —
         // an under-report would silently strip an unreported path of delete authority.
-        let distinct_paths = stored
-            .ledger
-            .entries()
-            .iter()
-            .map(|entry| entry.rel_path.as_str())
-            .collect::<std::collections::HashSet<_>>()
-            .len();
+        // The same distinct-path decomposition drives the undo report itself, so both
+        // sites share `undo::distinct_rel_paths` rather than re-deriving the set.
+        let distinct_paths = undo::distinct_rel_paths(&stored.ledger).len();
         debug_assert_eq!(
             report.files.len(),
             distinct_paths,

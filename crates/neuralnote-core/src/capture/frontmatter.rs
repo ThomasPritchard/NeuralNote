@@ -118,17 +118,17 @@ fn validate_url(url: &str) -> Result<(), CaptureError> {
     }
 }
 
-/// Validate the `full_source` vault-relative path: the shared vault-relative
-/// grammar, plus this boundary's byte cap and its stricter rejection of *any*
-/// colon (not just a drive prefix), since a stored source path is never a note
-/// name and must stay portable across filesystems.
+/// Validate the `full_source` vault-relative path: this boundary's byte cap plus
+/// the shared *portable* vault-relative grammar. A stored source path is never a
+/// note name and must stay portable across filesystems, so it is validated through
+/// [`crate::paths::parse_portable_rel_path`] — which rejects the whole Windows
+/// non-portable class (any colon, the `<>"|?*` characters, reserved device names,
+/// and the trailing dot/space that could fold toward `..` on Windows) in one place,
+/// rather than this boundary hand-rolling a subset.
 fn validate_relative_source_path(path: &str) -> Result<(), CaptureError> {
-    if path.len() > MAX_SOURCE_PATH_BYTES
-        || path.contains(':')
-        || !crate::paths::VaultRelPath::is_valid(path)
-    {
+    if path.len() > MAX_SOURCE_PATH_BYTES || crate::paths::parse_portable_rel_path(path).is_err() {
         return Err(invalid_source(
-            "nn.source.full_source must be a bounded vault-relative path",
+            "nn.source.full_source must be a bounded, portable vault-relative path",
         ));
     }
     Ok(())
@@ -156,4 +156,30 @@ fn key(value: &str) -> Value {
 
 fn string(value: &str) -> Value {
     Value::String(value.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn full_source_path_rejects_windows_trailing_dot_and_space_components() {
+        for path in [
+            "sources/.. ",    // dot-dot-space folds toward `..` on Windows
+            "sources/note ",  // trailing space
+            "sources/note.",  // trailing dot
+            "bad /full.html", // trailing space on an interior component
+        ] {
+            assert!(
+                validate_relative_source_path(path).is_err(),
+                "{path:?} must be refused as a non-portable full_source path"
+            );
+        }
+    }
+
+    #[test]
+    fn full_source_path_accepts_a_legitimate_portable_path() {
+        assert!(validate_relative_source_path("sources/2026/article.html").is_ok());
+        assert!(validate_relative_source_path(".neuralnote/sources/full.md").is_ok());
+    }
 }

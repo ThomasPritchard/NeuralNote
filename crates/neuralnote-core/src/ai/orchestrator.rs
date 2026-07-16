@@ -20,8 +20,10 @@ use crate::ai::youtube::{
     UNAVAILABLE_YOUTUBE_IO,
 };
 use crate::capture::{PricingInput, UnavailableVaultProfileIo, VaultProfileIo};
-use crate::error::{CoreError, CoreResult};
+use crate::error::CoreResult;
+use async_trait::async_trait;
 use std::path::Path;
+use std::time::Duration;
 
 const MAX_PLAYLIST_TURNS_PER_ITEM: usize = 8;
 
@@ -90,6 +92,28 @@ These hold in both modes:
   invent a citation or an answer.
 - Keep answers concise and grounded in the cited evidence."#;
 
+/// Host seam for the retry backoff pause. The core owns *how long* to wait (its retry
+/// policy) but never owns a clock — every timer in the app lives in the host — so it
+/// hands the duration to this seam and awaits it. The shell backs it with its async
+/// runtime timer; tests supply a deterministic double so backoff is exercised without
+/// real time passing.
+#[async_trait]
+pub trait RetryDelay: Send + Sync {
+    /// Await `duration` before the caller retries. Must not block the executor thread.
+    async fn delay(&self, duration: Duration);
+}
+
+/// The no-op default: retry immediately. Used by non-host callers and any run that does
+/// not wire a real timer; the desktop shell overrides it with a runtime-backed delay.
+pub struct NoRetryDelay;
+
+#[async_trait]
+impl RetryDelay for NoRetryDelay {
+    async fn delay(&self, _duration: Duration) {}
+}
+
+static NO_RETRY_DELAY: NoRetryDelay = NoRetryDelay;
+
 /// Shell-supplied seams and pure skill policy for one chat run.
 pub struct SkillServices<'a> {
     registry: &'a SkillRegistry,
@@ -103,6 +127,7 @@ pub struct SkillServices<'a> {
     capture_cancellation: CaptureCancellation,
     pricing: Option<&'a PricingInput>,
     extractor_updates: ExtractorUpdateSession,
+    retry_delay: &'a dyn RetryDelay,
 }
 
 static UNAVAILABLE_VAULT_PROFILE_IO: UnavailableVaultProfileIo = UnavailableVaultProfileIo;
@@ -129,6 +154,8 @@ impl<'a> SkillServices<'a> {
             // Non-host callers get an isolated allowance; the desktop shell overrides
             // this with its app-session-owned update state through the builder below.
             extractor_updates: ExtractorUpdateSession::default(),
+            // No-op backoff by default; the desktop shell wires its runtime timer.
+            retry_delay: &NO_RETRY_DELAY,
         }
     }
 
@@ -163,6 +190,13 @@ impl<'a> SkillServices<'a> {
     /// Override the current per-run default with update state retained by a host.
     pub fn with_extractor_update_session(mut self, updates: ExtractorUpdateSession) -> Self {
         self.extractor_updates = updates;
+        self
+    }
+
+    /// Wire the host's runtime-backed retry backoff. Without this, retries fire
+    /// immediately (the [`NoRetryDelay`] default).
+    pub fn with_retry_delay(mut self, retry_delay: &'a dyn RetryDelay) -> Self {
+        self.retry_delay = retry_delay;
         self
     }
 }
@@ -671,17 +705,18 @@ impl ChatSession<'_> {
             match self.llm.complete(request).await {
                 Ok(completion) => return Ok(completion),
                 Err(error) => {
-                    let retryable =
-                        retries > 0 && is_transient_llm_error(&error) && !self.run_cancelled();
+                    let retryable = retries > 0 && error.is_retryable() && !self.run_cancelled();
                     if !retryable {
                         return Err(error);
                     }
                     retries -= 1;
-                    // Bounded backoff is intentionally the host transport's job: the core
-                    // is runtime-agnostic and never sleeps (every timer in the app lives
-                    // in the host), and the retried `complete` re-enters the host's
-                    // cancellable wrapper, which surfaces a mid-flight stop as a
+                    // Bounded backoff before the retry, paced by a host-injected timer:
+                    // the core owns the delay *value* (its retry policy) but never a
+                    // clock — every timer in the app lives in the host. A single retry
+                    // means one fixed pause. The retried `complete` then re-enters the
+                    // host's cancellable wrapper, which surfaces a mid-flight stop as a
                     // non-transient `Conflict` — so we never spin past a cancellation.
+                    self.skill_services.retry_delay.delay(RETRY_BACKOFF).await;
                 }
             }
         }
@@ -1431,63 +1466,13 @@ fn truncate_content_to_tokens(content: &str, max_tokens: usize) -> String {
 /// The number of extra attempts after the first for a tool-decision `complete` turn.
 const MAX_COMPLETE_RETRIES: usize = 1;
 
-/// Whether a `complete`-turn transport error is TRANSIENT (worth one retry: a
-/// rate-limit, a server 5xx, or a dropped/failed connection) rather than PERMANENT
-/// (auth, bad request, an unparseable body — a retry would only repeat it).
-///
-/// Classification is by message because [`CoreError`] carries no structured HTTP status
-/// (it crosses the Tauri boundary as `{kind, message}`). This couples to the host
-/// transport's wording (app/desktop/src-tauri/src/ai.rs): HTTP failures format as
-/// `"<provider> returned <status> ..."`, a pre-response send failure as
-/// `"request to <provider> failed: ..."`. Only the transport error kinds
-/// (`Llm` / `LocalAi`) can be transient; a `Conflict` (the cancellation error) or any
-/// domain error never is, so a user-stopped turn is never retried.
-fn is_transient_llm_error(error: &CoreError) -> bool {
-    let message = match error {
-        CoreError::Llm(m) | CoreError::LocalAi(m) => m.as_str(),
-        _ => return false,
-    };
-    match http_status_in(message) {
-        Some(status) => is_transient_status(status),
-        // No HTTP status was received — the connection failed, dropped, or timed out
-        // before a response. That is exactly the retryable transient class.
-        None => is_dropped_connection(message),
-    }
-}
-
-/// 408 Request Timeout and 425 Too Early are retryable per RFC 9110; 429 is rate-limit;
-/// every 5xx is a server-side transient. All other 4xx are the caller's fault (permanent).
-fn is_transient_status(status: u16) -> bool {
-    matches!(status, 408 | 425 | 429 | 500..=599)
-}
-
-/// The HTTP status the transport embedded as `"... returned <status> ..."`, if any.
-fn http_status_in(message: &str) -> Option<u16> {
-    let after = message.split("returned ").nth(1)?;
-    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    let status = digits.parse::<u16>().ok()?;
-    (100..=599).contains(&status).then_some(status)
-}
-
-/// A pre-response transport failure — no HTTP status because the connection failed,
-/// dropped, or timed out. The retryable transient class.
-fn is_dropped_connection(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    (lower.contains("request to") && lower.contains("failed"))
-        || TRANSPORT_DROP_SIGNALS
-            .iter()
-            .any(|signal| lower.contains(signal))
-}
-
-const TRANSPORT_DROP_SIGNALS: &[&str] = &[
-    "error sending request",
-    "connection closed",
-    "closed before",
-    "connection reset",
-    "broken pipe",
-    "timed out",
-    "timeout",
-];
+/// The bounded pause before the single retry, awaited through the host-injected
+/// [`RetryDelay`] seam. One retry today means one fixed pause: 500 ms gives a rate-limit
+/// (429) or a server 5xx brief breathing room without a user-perceptible stall, and is
+/// short enough that a mid-flight user stop is observed on the very next `complete`.
+/// Retryability itself lives on [`crate::error::CoreError::is_retryable`] — the one place that decides
+/// which transport failures are transient.
+const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 #[cfg(test)]
 mod tests {
@@ -3677,39 +3662,93 @@ mod tests {
         }
     }
 
+    /// A [`RetryDelay`] double that records every pause it was asked to await instead of
+    /// sleeping — so a test can prove the backoff seam is exercised without real time
+    /// passing (the recorded durations also confirm the core hands over the right value).
+    #[derive(Default)]
+    struct RecordingDelay {
+        awaited: Mutex<Vec<Duration>>,
+    }
+
+    #[async_trait]
+    impl RetryDelay for RecordingDelay {
+        async fn delay(&self, duration: Duration) {
+            self.awaited.lock().unwrap().push(duration);
+        }
+    }
+
+    impl RecordingDelay {
+        fn awaited(&self) -> Vec<Duration> {
+            self.awaited.lock().unwrap().clone()
+        }
+    }
+
     #[test]
-    fn transient_classifier_retries_only_transient_transport_failures() {
-        for message in [
-            "openrouter returned 429 Too Many Requests: slow down",
-            "openrouter returned 500 Internal Server Error",
-            "openrouter returned 503 Service Unavailable",
-            "openrouter returned 408 Request Timeout",
-            "request to openrouter failed: error sending request for url (x): connection closed before message completed",
-            "request to ollama failed: operation timed out",
-        ] {
-            assert!(
-                is_transient_llm_error(&CoreError::Llm(message.into())),
-                "{message} should be transient"
-            );
-        }
-        for message in [
-            "openrouter returned 400 Bad Request: bad model",
-            "openrouter returned 401 Unauthorized",
-            "openrouter returned 403 Forbidden",
-            "openrouter returned 404 Not Found",
-            "could not parse openrouter response: expected value at line 1",
-        ] {
-            assert!(
-                !is_transient_llm_error(&CoreError::Llm(message.into())),
-                "{message} should NOT be transient"
-            );
-        }
-        // A user-stop surfaces as Conflict, and domain errors are never transport
-        // faults — neither is ever retried.
-        assert!(!is_transient_llm_error(&CoreError::Conflict(
-            "chat run stopped by the user".into()
-        )));
-        assert!(!is_transient_llm_error(&CoreError::InvalidName("x".into())));
+    fn tool_turn_awaits_injected_backoff_once_before_a_transient_retry() {
+        let env = retry_env();
+        let delay = RecordingDelay::default();
+        let services = SkillServices::new(
+            &env.skills,
+            &env.environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        )
+        .with_retry_delay(&delay);
+        let llm = MockLlmClient::new(vec![final_turn()], "answer").with_complete_failures(vec![
+            CoreError::Llm("openrouter returned 429 Too Many Requests".into()),
+        ]);
+        let session = ChatSession {
+            root: env._vault.path(),
+            model: "test-model",
+            provider: &env.provider,
+            llm: &llm,
+            skill_services: &services,
+            guards: &env.guards,
+        };
+
+        block_on(session.complete_tool_turn(&tool_decision_request())).unwrap();
+
+        assert_eq!(llm.completion_requests().len(), 2, "retried exactly once");
+        assert_eq!(
+            delay.awaited(),
+            vec![RETRY_BACKOFF],
+            "the retry awaits the injected backoff exactly once, at the policy value"
+        );
+    }
+
+    #[test]
+    fn tool_turn_does_not_await_backoff_for_a_non_transient_failure() {
+        let env = retry_env();
+        let delay = RecordingDelay::default();
+        let services = SkillServices::new(
+            &env.skills,
+            &env.environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        )
+        .with_retry_delay(&delay);
+        let llm = MockLlmClient::new(vec![final_turn()], "answer").with_complete_failures(vec![
+            CoreError::Llm("openrouter returned 400 Bad Request: bad model".into()),
+        ]);
+        let session = ChatSession {
+            root: env._vault.path(),
+            model: "test-model",
+            provider: &env.provider,
+            llm: &llm,
+            skill_services: &services,
+            guards: &env.guards,
+        };
+
+        let result = block_on(session.complete_tool_turn(&tool_decision_request()));
+
+        assert!(result.is_err(), "a 400 is permanent — no retry");
+        assert_eq!(llm.completion_requests().len(), 1);
+        assert!(
+            delay.awaited().is_empty(),
+            "a non-retryable failure never pauses for backoff"
+        );
     }
 
     #[test]

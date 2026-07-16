@@ -217,6 +217,22 @@ pub fn parse_note_rel_path(raw: &str) -> CoreResult<VaultRelPath> {
     Ok(path)
 }
 
+/// The portable vault-relative grammar shared by every *non-note* boundary that
+/// stores or routes against an untrusted path (frontmatter `full_source`, routing
+/// inventory, vault-scheme classification): the shared [`VaultRelPath`] grammar plus
+/// [`validate_portable_component`] on every component. Unlike [`parse_note_rel_path`]
+/// it imposes no `.md` extension and no leading-dot ban, so a real `.neuralnote`
+/// folder still validates — but it does close the Windows trailing-dot/space folding
+/// gap (`".. "`, `"foo "`, `"foo."`) that the bare grammar leaves open, routing all
+/// of those boundaries through one portable predicate instead of a per-site copy.
+pub fn parse_portable_rel_path(raw: &str) -> CoreResult<VaultRelPath> {
+    let path = VaultRelPath::parse(raw)?;
+    for component in path.components() {
+        validate_portable_component(component)?;
+    }
+    Ok(path)
+}
+
 fn is_forbidden_path_char(character: char) -> bool {
     if CONFUSABLE_SEPARATORS.contains(&character) {
         return true;
@@ -413,6 +429,39 @@ mod vault_rel_path_tests {
         // The grammar never URL-decodes, so `%2e%2e` cannot smuggle traversal.
         let parsed = VaultRelPath::parse("a/%2e%2e/b").unwrap();
         assert_eq!(parsed.components(), ["a", "%2e%2e", "b"]);
+    }
+
+    #[test]
+    fn portable_rel_path_bans_trailing_dot_space_but_allows_dot_prefixed_folders() {
+        // The Windows trailing-dot/space folding gap the bare grammar leaves open.
+        for raw in [
+            "..\u{0020}",     // dot-dot-space: not literally `..`, folds toward it
+            "foo\u{0020}",    // trailing space
+            "foo.",           // trailing dot
+            "Areas /Reading", // trailing space on an interior component
+            "Areas/deep./x",  // trailing dot on an interior component
+            "CON",            // reserved device name still refused
+            "a:b",            // portable char class still refused
+        ] {
+            assert!(
+                parse_portable_rel_path(raw).is_err(),
+                "{raw:?} must be refused as non-portable"
+            );
+        }
+
+        // Legitimate names — including a `.neuralnote` inventory folder that the
+        // note grammar's leading-dot ban would wrongly reject — still validate.
+        for raw in [
+            ".neuralnote",
+            "Areas/Reading",
+            "24.05 Finance",
+            "Caf\u{00e9}.md",
+        ] {
+            assert!(
+                parse_portable_rel_path(raw).is_ok(),
+                "{raw:?} must remain a valid portable path"
+            );
+        }
     }
 
     #[test]
