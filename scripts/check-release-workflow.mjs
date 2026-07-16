@@ -285,14 +285,15 @@ test("the publisher can safely resume after release or manifest publication", ()
   assert.match(publishRelease, /RELEASE_ALREADY_PUBLISHED/);
   assert.match(publishRelease, /--json isImmutable/);
   assert.match(publishRelease, /"\$RELEASE_IS_IMMUTABLE"\s*!=\s*"true"/);
+  // Exact-ref probe (no --heads): `--heads <full-ref>` is a version-dependent
+  // footgun that sent the second-ever release down the orphan path and failed the
+  // non-fast-forward push (0.2.1 manifest publish). Assert the fixed form is present
+  // and guard the buggy `--heads ... release-manifests` form from ever returning.
   assert.match(
     publishManifest,
-    /git ls-remote --exit-code --heads origin refs\/heads\/release-manifests/,
+    /git ls-remote --exit-code origin refs\/heads\/release-manifests/,
   );
-  assert.doesNotMatch(
-    publishManifest,
-    /git ls-remote --exit-code --heads origin release-manifests(?:\s|>)/,
-  );
+  assert.doesNotMatch(publishManifest, /git ls-remote[^\n]*--heads[^\n]*release-manifests/);
   assert.match(publishManifest, /release-manifests already contains this manifest/);
   assert.doesNotMatch(publishManifest, /already contains this manifest[\s\S]*?exit 1/);
 });
