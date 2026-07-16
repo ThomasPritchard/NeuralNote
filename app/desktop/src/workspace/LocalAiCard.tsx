@@ -6,12 +6,16 @@
 // with one deliberate exception: the Hugging Face transparency metadata is
 // non-fatal by contract (types.ts HfModelMeta), so a failed lookup just omits
 // that row's metadata line instead of erroring the card.
+//
+// This file is the composing top-level view: it owns the loads, the pull
+// channel, and the actions, and hands the rendering to three presentational
+// siblings — LocalAiOverview (machine + recommendation), LocalAiCatalogue, and
+// LocalAiInstalled.
 
-import { useCallback, useEffect, useState, type ReactNode } from "react";
-import { Check, Cpu, Download, Info, RefreshCw, Trash2 } from "lucide-react";
+import { useCallback, useEffect, useState } from "react";
+import { Cpu, Info } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
-import { cn } from "../lib/cn";
 import type {
   AiStatus,
   CandidateModel,
@@ -21,64 +25,13 @@ import type {
   PullEvent,
   Recommendation,
 } from "../lib/types";
-import { buttonVariants } from "@/components/ui/button";
-import { Progress } from "@/components/ui/progress";
+import { gb } from "./localAiFormat";
+import type { InstalledScan, PullProgress } from "./localAiTypes";
 import { ConfirmDialog } from "./ConfirmDialog";
-import { LABEL } from "./KeySetupPanel";
-import { ActiveBadge, InlineError, LoadingRow, ProviderCard } from "./ProviderCard";
-
-const GIB = 1024 ** 3;
-/** Whole-GB label for memory sizes (hardware readout, min-RAM). */
-const wholeGb = (bytes: number) => `${Math.round(bytes / GIB)} GB`;
-/** One-decimal GB label for download/disk sizes. */
-const gb = (bytes: number) => `${(bytes / GIB).toFixed(1)} GB`;
-
-const COMPACT = new Intl.NumberFormat("en", {
-  notation: "compact",
-  maximumFractionDigits: 1,
-});
-const DATE = new Intl.DateTimeFormat("en-GB", {
-  day: "numeric",
-  month: "short",
-  year: "numeric",
-});
-/** "12 Jun 2026", or null when HF hands back an unparseable timestamp. */
-const fmtDate = (iso: string): string | null => {
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? null : DATE.format(d);
-};
-
-/** A catalogue row's HF transparency fragments — "1.2M downloads", the
- *  licence, "updated 12 Jun 2026" — skipping whatever HF didn't provide.
- *  Absent metadata (lookup failed or still in flight) → no fragments. */
-const hfMetaBits = (meta: HfModelMeta | undefined): string[] => {
-  if (!meta) return [];
-  const updated = meta.lastModified ? fmtDate(meta.lastModified) : null;
-  return [
-    meta.downloads == null ? null : `${COMPACT.format(meta.downloads)} downloads`,
-    meta.license,
-    updated ? `updated ${updated}` : null,
-  ].filter((bit): bit is string => bit != null);
-};
-
-/** The installed-model scan as one explicit state machine. `checking` is a
- *  real state, distinct from "not installed": until the scan resolves (or
- *  after it fails) the catalogue can neither claim a model is Installed nor
- *  offer Download — treating "not yet known" as "not installed" is how an
- *  already-installed model got offered for a multi-gigabyte re-download. */
-type InstalledScan =
-  | { status: "checking" }
-  | { status: "ready"; models: InstalledModel[] }
-  | { status: "error"; message: string };
-
-/** The freshest streamed pull frame for the one in-flight download. */
-interface PullProgress {
-  tag: string;
-  status: string;
-  completed: number | null;
-  total: number | null;
-  percent: number | null;
-}
+import { LocalAiCatalogue } from "./LocalAiCatalogue";
+import { LocalAiInstalled } from "./LocalAiInstalled";
+import { LocalAiOverview } from "./LocalAiOverview";
+import { ProviderCard } from "./ProviderCard";
 
 // State-updater factories, named at module level so the promise chains that use
 // them stay within Sonar's callback-nesting depth (S2004).
@@ -274,60 +227,6 @@ export function LocalAiCard({
   const localActive = status?.activeProvider === "local";
   const recommendedTag =
     recommendation?.status === "supported" ? recommendation.modelTag : null;
-  // Only a RESOLVED scan may claim a model is installed; every other status
-  // is handled explicitly by catalogueAction below.
-  const installedTags = new Set(
-    installedScan.status === "ready"
-      ? installedScan.models.map((m) => m.tag)
-      : [],
-  );
-
-  /** The action slot for one catalogue row — an explicit function of the
-   *  in-flight pull and the installed scan, so "scan still running" can never
-   *  silently read as "not installed, offer Download". */
-  const catalogueAction = (c: CandidateModel): ReactNode => {
-    if (pull?.tag === c.tag) {
-      return (
-        <button
-          type="button"
-          onClick={() => cancelPull(c.tag)}
-          disabled={cancelling}
-          className={buttonVariants({ tone: "quiet", size: "sm" })}
-        >
-          {cancelling ? "Cancelling…" : "Cancel"}
-        </button>
-      );
-    }
-    // Still determining what's installed: show that a check is running and
-    // offer nothing — neither Download nor Installed is knowable yet.
-    if (installedScan.status === "checking") {
-      return <LoadingRow label="Checking…" />;
-    }
-    // Known installed → the Installed chip carries the state; no action.
-    if (installedScan.status === "ready" && installedTags.has(c.tag)) {
-      return null;
-    }
-    return (
-      <button
-        type="button"
-        onClick={() => startPull(c.tag)}
-        // One pull at a time (a single cancel channel) — and held while the
-        // installed scan is in error: we can't verify the model isn't already
-        // on disk, so the failure fails safe (the Installed section surfaces
-        // it with a Retry).
-        disabled={pull !== null || installedScan.status === "error"}
-        className={cn(
-          "flex items-center gap-1.5",
-          c.tag === recommendedTag
-            ? buttonVariants({ tone: "primary", size: "sm" })
-            : buttonVariants({ tone: "quiet", size: "sm" }),
-        )}
-      >
-        <Download className="size-3.5" aria-hidden />
-        Download
-      </button>
-    );
-  };
 
   return (
     <>
@@ -351,209 +250,36 @@ export function LocalAiCard({
           </span>
         </p>
 
-        {/* Hardware readout driving the recommendation. */}
-        {hardware && (
-          <p className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-lg bg-background/50 px-3 py-2 text-[0.6875rem] text-muted-foreground ring-1 ring-inset ring-border">
-            <span className="font-medium text-foreground/80">This machine</span>
-            <span className="nn-mono">{wholeGb(hardware.totalRamBytes)} RAM</span>
-            <span aria-hidden>·</span>
-            <span className="nn-mono">{hardware.cpuBrand}</span>
-            <span aria-hidden>·</span>
-            <span className="nn-mono">{hardware.cpuCores} cores</span>
-            {hardware.gpuLabel && (
-              <>
-                <span aria-hidden>·</span>
-                <span className="nn-mono">{hardware.gpuLabel}</span>
-              </>
-            )}
-            <span aria-hidden>·</span>
-            <span className="nn-mono">
-              {hardware.arch} / {hardware.os}
-            </span>
-          </p>
-        )}
-        {!hardware && !hardwareError && <LoadingRow label="Reading this machine's specs…" />}
-        {hardwareError && <InlineError>{hardwareError}</InlineError>}
+        <LocalAiOverview
+          hardware={hardware}
+          hardwareError={hardwareError}
+          recommendation={recommendation}
+          recommendationError={recommendationError}
+        />
 
-        {/* Recommendation verdict. The unsupported reason renders verbatim —
-            the backend copy is the user-facing contract. */}
-        {!recommendation && !recommendationError && (
-          <LoadingRow label="Checking what this machine can run…" />
-        )}
-        {recommendationError && <InlineError>{recommendationError}</InlineError>}
-        {recommendation?.status === "unsupported" && (
-          <InlineError>{recommendation.reason}</InlineError>
-        )}
-        {recommendation?.status === "supported" && (
-          <div className="rounded-lg bg-primary/[0.07] px-3 py-2.5 ring-1 ring-inset ring-primary/25">
-            <p className="flex flex-wrap items-center gap-1.5 text-[0.75rem] font-medium text-foreground/90">
-              <Check className="size-3.5 shrink-0 text-primary" aria-hidden />
-              Recommended for this machine:
-              <span className="nn-mono text-primary">{recommendation.modelTag}</span>
-              <span className="font-normal text-muted-foreground">
-                ({recommendation.params})
-              </span>
-            </p>
-            <p className="mt-1 text-[0.6875rem] leading-snug text-muted-foreground">
-              {recommendation.why} Uses about {gb(recommendation.estRamBytes)} of
-              memory while running.
-            </p>
-          </div>
-        )}
+        <LocalAiCatalogue
+          candidates={candidates}
+          candidatesError={candidatesError}
+          hfMeta={hfMeta}
+          recommendedTag={recommendedTag}
+          installedScan={installedScan}
+          pull={pull}
+          pullErrors={pullErrors}
+          cancelling={cancelling}
+          onStartPull={startPull}
+          onCancelPull={cancelPull}
+        />
 
-        {/* Curated catalogue — the allowlist is the source of truth for what
-            may be installed (it protects cited chat's tool-calling). */}
-        <div className="flex flex-col gap-2">
-          <h5 id="ai-model-catalogue" className={LABEL}>
-            Model catalogue
-          </h5>
-          {!candidates && !candidatesError && (
-            <LoadingRow label="Loading the model catalogue…" />
-          )}
-          {candidatesError && <InlineError>{candidatesError}</InlineError>}
-          {candidates && (
-            <ul aria-labelledby="ai-model-catalogue" className="flex flex-col gap-2">
-              {candidates.map((c) => {
-                const metaBits = hfMetaBits(hfMeta[c.hfRepo]);
-                const pulling = pull?.tag === c.tag;
-                const isInstalled =
-                  installedScan.status === "ready" && installedTags.has(c.tag);
-                return (
-                  <li
-                    key={c.tag}
-                    className="flex flex-col gap-2 rounded-lg bg-background/50 p-3 ring-1 ring-inset ring-border"
-                  >
-                    <div className="flex flex-wrap items-center gap-2">
-                      <span className="nn-mono text-[0.8125rem] font-medium text-foreground">
-                        {c.tag}
-                      </span>
-                      {c.tag === recommendedTag && (
-                        <span className="rounded-full bg-primary/10 px-2 py-0.5 text-[0.625rem] font-medium text-primary ring-1 ring-inset ring-primary/30">
-                          Recommended
-                        </span>
-                      )}
-                      {isInstalled && (
-                        <span className="flex items-center gap-1 rounded-full bg-muted px-2 py-0.5 text-[0.625rem] font-medium text-muted-foreground">
-                          <Check className="size-2.5" aria-hidden />
-                          Installed
-                        </span>
-                      )}
-                      <span className="ml-auto">{catalogueAction(c)}</span>
-                    </div>
-                    <p className="text-[0.6875rem] text-muted-foreground">
-                      {c.params} · {gb(c.downloadBytes)} download · needs{" "}
-                      {wholeGb(c.minRamBytes)} RAM · {c.license}
-                    </p>
-                    {metaBits.length > 0 && (
-                      <p className="text-[0.6875rem] text-muted-foreground/70">
-                        {metaBits.join(" · ")}
-                      </p>
-                    )}
-                    {pulling && pull && (
-                      <div className="flex flex-col gap-1.5">
-                        <div className="flex items-center justify-between gap-2 text-[0.6875rem] text-muted-foreground">
-                          <span className="min-w-0 truncate">{pull.status}</span>
-                          <span className="nn-mono shrink-0">
-                            {pull.completed != null && pull.total != null
-                              ? `${gb(pull.completed)} / ${gb(pull.total)}`
-                              : ""}
-                            {pull.percent == null
-                              ? ""
-                              : ` · ${Math.round(pull.percent)}%`}
-                          </span>
-                        </div>
-                        <Progress
-                          aria-label={`Downloading ${c.tag}`}
-                          value={pull.percent ?? 0}
-                        />
-                      </div>
-                    )}
-                    {pullErrors[c.tag] && (
-                      <InlineError>{pullErrors[c.tag]}</InlineError>
-                    )}
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-        </div>
-
-        {/* Installed models: use or delete. */}
-        <div className="flex flex-col gap-2">
-          <h5 id="ai-installed-models" className={LABEL}>
-            Installed on this machine
-          </h5>
-          {installedScan.status === "checking" && (
-            <LoadingRow label="Starting the local runtime…" />
-          )}
-          {installedScan.status === "error" && (
-            <div className="flex flex-col items-start gap-2">
-              <InlineError>{installedScan.message}</InlineError>
-              <button
-                type="button"
-                onClick={() => void refreshInstalled()}
-                className={buttonVariants({ tone: "quiet", size: "sm" })}
-              >
-                <RefreshCw className="size-3.5" aria-hidden />
-                Retry
-              </button>
-            </div>
-          )}
-          {installedScan.status === "ready" && installedScan.models.length === 0 && (
-            <p className="text-[0.75rem] text-muted-foreground">
-              No local models installed yet.
-            </p>
-          )}
-          {installedScan.status === "ready" && installedScan.models.length > 0 && (
-            <ul aria-labelledby="ai-installed-models" className="flex flex-col gap-2">
-              {installedScan.models.map((m) => {
-                const isActiveModel =
-                  localActive && status?.local.activeModelTag === m.tag;
-                const diskBits = [
-                  `${gb(m.sizeBytes)} on disk`,
-                  m.parameterSize,
-                  m.quantization,
-                ].filter((bit): bit is string => bit != null);
-                return (
-                  <li
-                    key={m.tag}
-                    className="flex items-center gap-3 rounded-lg bg-background/50 px-3 py-2.5 ring-1 ring-inset ring-border"
-                  >
-                    <div className="min-w-0 flex-1">
-                      <p className="nn-mono truncate text-[0.8125rem] text-foreground">
-                        {m.tag}
-                      </p>
-                      <p className="text-[0.6875rem] text-muted-foreground">
-                        {diskBits.join(" · ")}
-                      </p>
-                    </div>
-                    {isActiveModel ? (
-                      <ActiveBadge />
-                    ) : (
-                      <button
-                        type="button"
-                        onClick={() => activateLocalModel(m.tag)}
-                        disabled={switching}
-                        className={buttonVariants({ tone: "quiet", size: "sm" })}
-                      >
-                        Use this model
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      aria-label={`Delete ${m.tag}`}
-                      onClick={() => setPendingDelete(m)}
-                      className="grid size-8 shrink-0 place-items-center rounded-lg text-muted-foreground transition-colors hover:bg-destructive/15 hover:text-destructive focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-destructive"
-                    >
-                      <Trash2 className="size-4" aria-hidden />
-                    </button>
-                  </li>
-                );
-              })}
-            </ul>
-          )}
-          {localActionError && <InlineError>{localActionError}</InlineError>}
-        </div>
+        <LocalAiInstalled
+          installedScan={installedScan}
+          localActive={localActive}
+          activeModelTag={status?.local.activeModelTag ?? null}
+          switching={switching}
+          localActionError={localActionError}
+          onRetry={() => void refreshInstalled()}
+          onActivate={activateLocalModel}
+          onRequestDelete={setPendingDelete}
+        />
       </ProviderCard>
 
       {pendingDelete && (
