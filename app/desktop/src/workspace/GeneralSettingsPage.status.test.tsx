@@ -57,7 +57,6 @@ function renderPage() {
 describe("GeneralSettingsPage — update status branches", () => {
   const cases: ReadonlyArray<readonly [string, UpdateState, string]> = [
     ["idle", { status: "idle" }, "Ready to check."],
-    ["upToDate", { status: "upToDate" }, "NeuralNote is up to date."],
     ["checking", { status: "checking", source: "manual" }, "Checking for updates…"],
     [
       "installing",

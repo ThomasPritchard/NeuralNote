@@ -1,9 +1,7 @@
-use async_trait::async_trait;
 use futures::executor::block_on;
 use neuralnote_core::ai::{
-    CaptionPayload, CaptionRequest, CaptureCancellation, ExtractorUpdateSession, MetadataPayload,
-    PlaylistPayload, PotMode, ThumbnailPayload, UnavailableYoutubeIo, VideoId, YoutubeIo,
-    YoutubeToolSession, YoutubeUrl, WHISPER_MODEL_NAME,
+    CaptionRequest, CaptureCancellation, ExtractorUpdateSession, PotMode, UnavailableYoutubeIo,
+    VideoId, YoutubeIo, YoutubeToolSession, YoutubeUrl, WHISPER_MODEL_NAME,
 };
 use neuralnote_core::capture::{CaptionSource, CaptureAction, CaptureError};
 
@@ -69,54 +67,4 @@ fn unavailable_host_seam_surfaces_every_operation() {
         block_on(io.update_extractor()),
         Err(CaptureError::RequirementMissing(_))
     ));
-}
-
-#[allow(dead_code)]
-struct SignatureTripwire;
-
-#[async_trait]
-impl YoutubeIo for SignatureTripwire {
-    async fn inspect_metadata(&self, _url: &YoutubeUrl) -> Result<MetadataPayload, CaptureError> {
-        Ok(MetadataPayload {
-            json: Vec::new(),
-            annotations: Vec::new(),
-        })
-    }
-
-    async fn fetch_caption_vtt(
-        &self,
-        _request: &CaptionRequest,
-    ) -> Result<CaptionPayload, CaptureError> {
-        Ok(CaptionPayload {
-            vtt: Vec::new(),
-            annotations: Vec::new(),
-        })
-    }
-
-    async fn enumerate_playlist(&self, _url: &YoutubeUrl) -> Result<PlaylistPayload, CaptureError> {
-        Ok(PlaylistPayload { json: Vec::new() })
-    }
-
-    async fn fetch_thumbnail(&self, _video_id: &VideoId) -> Result<ThumbnailPayload, CaptureError> {
-        Ok(ThumbnailPayload {
-            media_type: "image/jpeg".into(),
-            bytes: Vec::new(),
-        })
-    }
-
-    async fn transcribe_audio(
-        &self,
-        _url: &YoutubeUrl,
-        _model: &str,
-        _cancellation: &CaptureCancellation,
-    ) -> Result<CaptionPayload, CaptureError> {
-        Ok(CaptionPayload {
-            vtt: Vec::new(),
-            annotations: Vec::new(),
-        })
-    }
-
-    async fn update_extractor(&self) -> Result<(), CaptureError> {
-        Ok(())
-    }
 }

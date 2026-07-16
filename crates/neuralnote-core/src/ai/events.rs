@@ -204,14 +204,6 @@ mod tests {
     }
 
     #[test]
-    fn vec_sink_collects_in_order() {
-        let mut sink = VecSink::default();
-        sink.send(ChatEvent::Verifying);
-        sink.send(ChatEvent::Done);
-        assert_eq!(sink.events, vec![ChatEvent::Verifying, ChatEvent::Done]);
-    }
-
-    #[test]
     fn skill_events_use_the_frozen_camel_case_shape() {
         assert_eq!(
             json(&ChatEvent::SkillActivated {

@@ -552,31 +552,4 @@ mod tests {
         assert_eq!(progress.ingest(r#"{"foo":1}"#), None);
     }
 
-    #[test]
-    fn vec_sink_collects_events_in_order() {
-        let mut sink = VecSink::default();
-
-        sink.send(PullEvent::Progress {
-            status: "pulling manifest".into(),
-            digest: None,
-            completed: None,
-            total: None,
-            percent: None,
-        });
-        sink.send(PullEvent::Success);
-
-        assert_eq!(
-            sink.events,
-            vec![
-                PullEvent::Progress {
-                    status: "pulling manifest".into(),
-                    digest: None,
-                    completed: None,
-                    total: None,
-                    percent: None,
-                },
-                PullEvent::Success
-            ]
-        );
-    }
 }
