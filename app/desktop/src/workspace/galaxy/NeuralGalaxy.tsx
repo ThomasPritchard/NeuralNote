@@ -1,19 +1,17 @@
-import {
-  useCallback,
-  useEffect,
-  useMemo,
-  useReducer,
-  useRef,
-  useState,
-  type ReactNode,
-} from "react";
+import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
 import ForceGraph3D from "react-force-graph-3d";
-import * as THREE from "three";
-import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPass.js";
-import { ChevronRight, Search, Sparkles, X } from "lucide-react";
-import { CLUSTER_PALETTE, type GalaxyLink, type GalaxyNode } from "./graph";
+import type { GalaxyLink, GalaxyNode } from "./graph";
 import { makeStarNode } from "./starNode";
-import { applyFocus, resetRegistry, setHover, updateAll } from "./nodeRegistry";
+import { BG } from "./galaxyForces";
+import { computeLinkColor, PARTICLE_COLOR } from "./galaxyLinks";
+import { nodeLabelHtml } from "./galaxyTooltip";
+import type { ClusterMap } from "./galaxyTypes";
+import { useHoverFocus, type Adjacency } from "./useHoverFocus";
+import { useGalaxyScene } from "./useGalaxyScene";
+import { useGalaxyCamera } from "./useGalaxyCamera";
+import { GalaxyToolbar } from "./GalaxyToolbar";
+import { GalaxyLegend } from "./GalaxyLegend";
+import { GalaxyDetailPanel } from "./GalaxyDetailPanel";
 
 // ── NeuralGalaxy ──────────────────────────────────────────────────────────
 // A 3D "neural map" of the vault: notes are nodes, wikilinks are edges,
@@ -25,142 +23,16 @@ import { applyFocus, resetRegistry, setHover, updateAll } from "./nodeRegistry";
 // Nodes render in the ReactBits-galaxy idiom (twinkling stars) over the app
 // background. The cursor gives subtle life (node hover-glow) — never the
 // galaxy's "everything warps to the pointer".
-const BG = "#0a0913";
+//
+// This file is the composition shell. The cohesive pieces live in siblings:
+//  · galaxyForces / galaxyLinks / galaxyTooltip — pure styling + physics
+//  · useHoverFocus / useGalaxyScene / useGalaxyCamera — stateful lifecycles
+//  · GalaxyToolbar / GalaxyLegend / GalaxyDetailPanel — the DOM overlays
 
-type ViewMode = "3d" | "2d";
-
-const MORPH_MS = 1100;
-const FOV_2D = 20; // narrow lens ≈ orthographic once the dolly-zoom lands
-
-// ── Force profiles ──────────────────────────────────────────────────────────
-// Layout physics + link visibility per view. Tuned headlessly at real-vault
-// scale (~765 notes / ~1435 links) against an "Obsidian-like" bar for the 2D
-// map: one cohesive connected web with readable sub-clusters, islands pulled
-// near the main mass, and the link web visible at overview. The 3D galaxy
-// keeps more spread but must never scatter disconnected islands to infinity.
-// Applied on init and re-applied on every 2D↔3D morph (see applyForceProfile).
-// Hand-tweak values here — everything layout-physics lives in this block.
-export interface ForceProfile {
-  /** forceManyBody repulsion (negative). More negative = airier layout. */
-  chargeStrength: number;
-  /** Repulsion range cap. Without it, disconnected components repel forever
-   *  and drift to the viewport edges; a few hundred units keeps them in orbit. */
-  chargeDistanceMax: number;
-  /** Link rest length — smaller pulls connected notes into a tighter web. */
-  linkDistance: number;
-  /** Positional gravity toward the origin (forceX/Y-style, target 0). The only
-   *  force that pulls disconnected islands/orphans back toward the mass. The
-   *  flat 2D map needs more of it than the 3D galaxy. */
-  gravityStrength: number;
-  /** Normal (same-folder) link styling. Bridges stay pink in both views. */
-  linkAlpha: number;
-  linkWidth: number;
-  /** Cross-folder bridge width — keep > linkWidth so bridges read stronger. */
-  bridgeWidth: number;
-}
-
-export const FORCE_PROFILES: Record<ViewMode, ForceProfile> = {
-  "3d": {
-    chargeStrength: -80,
-    chargeDistanceMax: 500,
-    linkDistance: 45,
-    gravityStrength: 0.04,
-    linkAlpha: 0.3,
-    linkWidth: 0.5,
-    bridgeWidth: 0.8,
-  },
-  "2d": {
-    chargeStrength: -60,
-    chargeDistanceMax: 400,
-    linkDistance: 36,
-    gravityStrength: 0.055,
-    linkAlpha: 0.42,
-    linkWidth: 0.8,
-    bridgeWidth: 1.1,
-  },
-};
-
-// The bridge (cross-folder link) pink. Kept as literals, not var(--…):
-// three.js / force-graph materials can't resolve CSS custom properties. All
-// derivations share the one hue — #f4aaff = rgb(244,170,255).
-const BRIDGE_PINK = "#f4aaff";
-const BRIDGE_COLOR = "rgba(244,170,255,0.85)";
-const PARTICLE_COLOR = () => BRIDGE_PINK;
-
-// For strings interpolated into nodeLabel's raw-HTML tooltip. Everything
-// else in this file renders through JSX (React escapes it). Single quotes are
-// escaped too, so an escaped value stays inert even if a refactor moves it
-// into a single-quoted attribute position.
-const escapeHtml = (s: string) =>
-  s.replace(
-    /[&<>"']/g,
-    (c) =>
-      ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" })[c]!,
-  );
-
-// The tooltip also interpolates a colour into a style attribute. Today it is
-// always a CLUSTER_PALETTE hex (assigned by cluster index, never note data),
-// but the sink is raw HTML — pin it to a strict hex form so a future
-// data-driven colour can never become a style/attribute injection. Anything
-// off-form falls back to the first palette colour.
-const HEX_COLOR = /^#(?:[0-9a-f]{3}|[0-9a-f]{6})$/i;
-const safeHex = (color: string) => (HEX_COLOR.test(color) ? color : CLUSTER_PALETTE[0]);
-
-// ── Hover-focus (Obsidian-style) ─────────────────────────────────────────
-// Hovering a node keeps it + its direct neighbours + their shared links at
-// full styling while everything else fades back, so the local cluster pops.
-// Node brightness dims GPU-side via the registry (starNode's DIM_FACTOR);
-// links fade through these accessor constants. While a node is selected and
-// nothing is hovered, the selection's neighbourhood is the lit set.
-/** Multiplier on a normal link's alpha when it falls outside the lit set. */
-export const LINK_FADE = 0.12;
-/** Faded bridge styling — a dimmed bridge must stop drawing the eye. */
-export const BRIDGE_FADED_COLOR = "rgba(244,170,255,0.08)";
-
-/** Links may hold raw id strings or (post-simulation) node object refs. */
-function endpointId(end: unknown): string {
-  return typeof end === "object" && end !== null ? (end as { id: string }).id : (end as string);
-}
-
-/** Simulation node as d3-force-3d sees it: positions + velocities are live. */
-type SimNode = GalaxyNode & { x: number; y: number; z: number; vx: number; vy: number; vz: number };
-
-// Positional gravity toward the origin — the same math as d3's forceX(0)/
-// forceY(0) (+ forceZ in 3D), written as a tiny custom force so we don't
-// import the untyped, transitive d3-force-3d package. `d3Force(name, fn)`
-// accepts any function force with an `initialize` hook.
-function makeGravity(strength: number, withZ: boolean) {
-  let nodes: SimNode[] = [];
-  const force = (alpha: number) => {
-    const k = strength * alpha;
-    for (const n of nodes) {
-      n.vx -= n.x * k;
-      n.vy -= n.y * k;
-      if (withZ) n.vz -= (n.z ?? 0) * k;
-    }
-  };
-  force.initialize = (ns: SimNode[]) => {
-    nodes = ns;
-  };
-  return force;
-}
-
-/** Point the live simulation at a view's physics (init + every view morph).
- *  z-gravity only exists in 3D: the 2D morph pins fz=0, so a z pull is inert. */
-function applyForceProfile(fg: any, mode: ViewMode) {
-  const p = FORCE_PROFILES[mode];
-  fg.d3Force("charge")?.strength(p.chargeStrength).distanceMax(p.chargeDistanceMax);
-  fg.d3Force("link")?.distance(p.linkDistance);
-  fg.d3Force("gravity", makeGravity(p.gravityStrength, mode === "3d"));
-}
-
-function easeInOut(t: number): number {
-  return t < 0.5 ? 2 * t * t : 1 - (-2 * t + 2) ** 2 / 2;
-}
-
-function plural(n: number, noun: string): string {
-  return `${n} ${noun}${n === 1 ? "" : "s"}`;
-}
+// Re-exported for tests + importers that resolve these from this module: the
+// definitions moved to focused siblings, the public import path did not.
+export { FORCE_PROFILES, type ForceProfile } from "./galaxyForces";
+export { BRIDGE_FADED_COLOR, LINK_FADE } from "./galaxyLinks";
 
 /** Shared with GraphView so notices clear the stacked compact toolbar. */
 export const GALAXY_COMPACT_TOOLBAR_WIDTH = 760;
@@ -172,7 +44,7 @@ export interface NeuralGalaxyProps {
   data: { nodes: GalaxyNode[]; links: GalaxyLink[] };
   /** Legend/label metadata — every node.cluster key must be present.
    *  `drillable` marks clusters with sub-folders (they get the chevron). */
-  clusters: Record<string, { label: string; color: string; drillable: boolean }>;
+  clusters: ClusterMap;
   /** `outsideLinks` > 0 only when a drill-down isolates a folder — the stats
    *  line then appends the muted "N links lead outside" segment. */
   stats: { notes: number; links: number; crossFolderLinks: number; outsideLinks: number };
@@ -200,41 +72,18 @@ export function NeuralGalaxy({
   const compactToolbar = width < GALAXY_COMPACT_TOOLBAR_WIDTH;
   const fgRef = useRef<any>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
-  const hoveredRef = useRef<Set<string>>(new Set());
-
-  // ── Auto-framing: at most ONCE per mount, never against the user ─────────
-  // The layout engine restarts on every morph reheat, profile swap, and drag,
-  // so an engine stop can land seconds into the user's own navigation — an
-  // unguarded zoomToFit there yanks the camera away mid-zoom. One guard is
-  // shared by the initial 1800ms timeout and the engine-stop handler
-  // (whichever fires first wins); the first wheel/pointerdown hands the
-  // camera to the user and kills any pending auto-frame. Deliberate fits are
-  // unaffected: changeView's 2D frame calls zoomToFit directly, and a
-  // drill-down isolation remounts with a fresh guard (auto-fits once again).
-  const framedRef = useRef(false);
-  const frameOnce = useCallback(() => {
-    if (framedRef.current) return;
-    framedRef.current = true;
-    fgRef.current?.zoomToFit(800, 110);
-  }, []);
   const reducedRef = useRef(
     globalThis.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ?? false,
   );
+
   const [selected, setSelected] = useState<GalaxyNode | null>(null);
   const [query, setQuery] = useState("");
-  const [view, setView] = useState<ViewMode>("3d");
-  const morphRaf = useRef(0);
-  const savedCamRef = useRef<{ pos: THREE.Vector3; fov: number } | null>(null);
-  // The RAF tick (mount effect, [] deps) needs the LIVE viewport height for
-  // screen-space label/hit math — a ref sidesteps the stale closure.
-  const heightRef = useRef(height);
-  heightRef.current = height;
 
   // Adjacency for hover-glow and the panel's neighbour list: a node's direct
   // neighbours (with the bridge flag) in both directions. Links may be raw
   // id strings or (post-simulation) node refs — handle both.
-  const adjacency = useMemo(() => {
-    const m = new Map<string, { id: string; bridge: boolean }[]>();
+  const adjacency = useMemo<Adjacency>(() => {
+    const m: Adjacency = new Map();
     const add = (a: string, b: string, bridge: boolean) =>
       m.set(a, [...(m.get(a) ?? []), { id: b, bridge }]);
     for (const l of data.links as any[]) {
@@ -259,142 +108,15 @@ export function NeuralGalaxy({
     });
   }, [selected, adjacency, nodeById]);
 
-  // ── Hover-focus state ────────────────────────────────────────────────────
-  // ONE focus channel, last event wins. Two kinds of focus feed it:
-  //  · node focus  — origin = the hovered node, else the selected node; the
-  //    lit set is the origin + its direct neighbours.
-  //  · cluster preview — hovering a legend row; NO single origin, the lit set
-  //    is the whole cluster (origin: null).
-  // Node dims retarget GPU-side through the registry — no React work per
-  // node. The epoch bump exists ONLY for the links: a re-render hands the
-  // library a fresh linkColor accessor identity, which re-runs its link digest
-  // (recolour in place). fg.refresh() is NOT used — it flushes the node data
-  // mapper, which would rebuild every star object and snap the eased dims.
-  const hoverOriginRef = useRef<string | null>(null);
-  const selectedIdRef = useRef<string | null>(null);
-  const previewClusterRef = useRef<string | null>(null);
-  const focusRef = useRef<{ key: string; origin: string | null; lit: Set<string> } | null>(null);
-  // The canonical React force-update idiom: the counter's value is never read
-  // (dispatch just schedules the re-render the comment above explains).
-  const [, bumpFocusEpoch] = useReducer((n: number) => n + 1, 0);
+  // Hover-focus / dimming state machine (node hover, legend preview, links).
+  const { previewCluster, isLinkLit, onNodeHover } = useHoverFocus({ adjacency, data, selected });
 
-  const refreshFocus = useCallback(() => {
-    const preview = previewClusterRef.current;
-    const origin = preview === null ? (hoverOriginRef.current ?? selectedIdRef.current) : null;
-    // "cluster:"/"node:" prefixes keep the two focus kinds from colliding.
-    let key: string | null;
-    if (preview === null) {
-      key = origin === null ? null : `node:${origin}`;
-    } else {
-      key = `cluster:${preview}`;
-    }
-    if ((focusRef.current?.key ?? null) === key) return;
-    if (key === null) {
-      focusRef.current = null;
-    } else if (preview === null) {
-      const o = origin as string;
-      focusRef.current = {
-        key,
-        origin: o,
-        lit: new Set([o, ...(adjacency.get(o) ?? []).map((nb) => nb.id)]),
-      };
-    } else {
-      focusRef.current = {
-        key,
-        origin: null,
-        lit: new Set(data.nodes.filter((n) => n.cluster === preview).map((n) => n.id)),
-      };
-    }
-    applyFocus(focusRef.current?.lit ?? null);
-    bumpFocusEpoch();
-  }, [adjacency, data]);
+  // Scene lifecycle: bloom pass, the per-frame twinkle loop, and auto-framing.
+  const { frameOnce } = useGalaxyScene({ fgRef, rootRef, width, height, reducedRef });
 
-  useEffect(() => {
-    selectedIdRef.current = selected?.id ?? null;
-    refreshFocus();
-  }, [selected, refreshFocus]);
-
-  /** Legend-row hover preview: lights the whole cluster, dims the rest.
-   *  `null` (pointer leave) falls back to the node-hover/selection focus. */
-  const previewCluster = useCallback(
-    (cluster: string | null) => {
-      previewClusterRef.current = cluster;
-      refreshFocus();
-    },
-    [refreshFocus],
-  );
-
-  /** Node focus: a link keeps full styling only while it touches the origin
-   *  (the hovered↔neighbour links themselves, not neighbour↔neighbour strays).
-   *  Cluster preview: lit while BOTH endpoints sit inside the cluster — the
-   *  preview shows the cluster's internal web, links leaving it fade. */
-  const isLinkLit = useCallback((l: any) => {
-    const f = focusRef.current;
-    if (!f) return true;
-    if (f.origin !== null) {
-      return endpointId(l.source) === f.origin || endpointId(l.target) === f.origin;
-    }
-    return f.lit.has(endpointId(l.source)) && f.lit.has(endpointId(l.target));
-  }, []);
-
-  // Init (once): restrained bloom (only node cores glow) plus a single RAF loop
-  // driving node twinkle and hover-glow easing. The graph is never remounted,
-  // so this scene lives for the component's lifetime.
-  useEffect(() => {
-    const fg = fgRef.current;
-    if (!fg) return;
-
-    const bloom = new UnrealBloomPass(new THREE.Vector2(width, height), 0.4, 0.5, 0.45);
-    fg.postProcessingComposer().addPass(bloom);
-
-    // Layout physics live in FORCE_PROFILES (top of file). The graph mounts
-    // in 3D; changeView re-applies the matching profile on every morph.
-    applyForceProfile(fg, "3d");
-
-    const start = performance.now();
-    let raf = 0;
-    const tick = () => {
-      raf = requestAnimationFrame(tick);
-      const time = reducedRef.current ? 0 : (performance.now() - start) / 1000;
-      // twinkle + hover-glow easing + screen-space chrome (hover works even
-      // if reduced). Labels reveal by each star's PROJECTED radius and hit
-      // proxies keep a minimum projected size (see nodeChrome): pxPerWorld
-      // is the screen px per world unit at distance 1, so a node's apparent
-      // radius is worldR · pxPerWorld / dist. fov comes in via tan(fov/2),
-      // which keeps the 2D dolly-zoom lens (fov 20) equivalent to 3D for
-      // free; fovScale still normalizes the ultra-close label fade.
-      const cam = fg.camera() as THREE.PerspectiveCamera;
-      const tanHalfFov = Math.tan((cam.fov * Math.PI) / 360);
-      const fovScale = tanHalfFov / Math.tan((50 * Math.PI) / 360);
-      const pxPerWorld = heightRef.current / 2 / tanHalfFov;
-      updateAll(time, { camPos: cam.position, fovScale, pxPerWorld });
-    };
-    raf = requestAnimationFrame(tick);
-
-    const framed = setTimeout(frameOnce, 1800);
-
-    // First wheel/pointerdown = the user owns the camera: cancel any pending
-    // auto-frame (both the timeout above and the engine-stop path).
-    const cancelAutoFrame = () => {
-      framedRef.current = true;
-      clearTimeout(framed);
-    };
-    const root = rootRef.current;
-    root?.addEventListener("wheel", cancelAutoFrame, { passive: true });
-    root?.addEventListener("pointerdown", cancelAutoFrame);
-
-    return () => {
-      cancelAnimationFrame(raf);
-      cancelAnimationFrame(morphRaf.current);
-      clearTimeout(framed);
-      root?.removeEventListener("wheel", cancelAutoFrame);
-      root?.removeEventListener("pointerdown", cancelAutoFrame);
-      // StrictMode: the composer outlives this effect's dev double-invoke, so
-      // the bloom pass must come off or two stacked passes wash out the render.
-      fg.postProcessingComposer().removePass(bloom);
-      resetRegistry(); // the node registry is a module singleton
-    };
-  }, []); // eslint-disable-line react-hooks/exhaustive-deps
+  // Camera navigation + 2D↔3D morph; owns the view mode and selection flights.
+  const { view, onNodeClick, dismissSelected, closeSelectedAndReturn, changeView, linkWidth } =
+    useGalaxyCamera({ fgRef, reducedRef, data, setSelected, onNodeHover });
 
   // Search results for the dropdown. No auto-fly while typing — flying to
   // the first match on each keystroke guesses the destination too eagerly;
@@ -405,173 +127,15 @@ export function NeuralGalaxy({
     return data.nodes.filter((n) => n.title.toLowerCase().includes(q));
   }, [query, data]);
 
-  const focus = useCallback((node: any) => {
-    const dist = 90;
-    const r = 1 + dist / Math.hypot(node.x || 1, node.y || 1, node.z || 1);
-    fgRef.current?.cameraPosition(
-      { x: (node.x || 0) * r, y: (node.y || 0) * r, z: (node.z || 0) * r },
-      node,
-      1400,
-    );
-  }, []);
-
-  // Camera pose from before the first click-focus of a selection session, so
-  // the panel's ✕ can fly back out. Traversing neighbours keeps the original
-  // pose; background-click dismisses in place (pose dropped, no flight).
-  const preFocusRef = useRef<{ pos: THREE.Vector3; target: THREE.Vector3 } | null>(null);
-
-  const onNodeClick = useCallback(
-    (node: any) => {
-      const fg = fgRef.current;
-      if (fg && !preFocusRef.current) {
-        const controls: any = fg.controls();
-        preFocusRef.current = {
-          pos: (fg.camera() as THREE.PerspectiveCamera).position.clone(),
-          target: controls.target?.clone() ?? new THREE.Vector3(),
-        };
-      }
-      setSelected(node as GalaxyNode);
-      focus(node);
-    },
-    [focus],
-  );
-
-  const dismissSelected = useCallback(() => {
-    preFocusRef.current = null;
-    setSelected(null);
-  }, []);
-
-  const closeSelectedAndReturn = useCallback(() => {
-    const saved = preFocusRef.current;
-    preFocusRef.current = null;
-    setSelected(null);
-    if (saved) fgRef.current?.cameraPosition(saved.pos, saved.target, reducedRef.current ? 0 : 1200);
-  }, []);
-
   // Picking a search result behaves exactly like clicking the star: select,
   // fly to it, and let the panel's ✕ return to the pre-flight view.
   const pickResult = useCallback(
-    (node: any) => {
+    (node: GalaxyNode) => {
       setQuery("");
       onNodeClick(node);
     },
     [onNodeClick],
   );
-
-  // Hover-glow + hover-focus: brighten the hovered node and its direct
-  // neighbours, and retarget the focus dim (everything else fades back).
-  const onNodeHover = useCallback(
-    (node: any) => {
-      hoveredRef.current.forEach((id) => setHover(id, false));
-      hoveredRef.current.clear();
-      if (node) {
-        setHover(node.id, true);
-        hoveredRef.current.add(node.id);
-        for (const nb of adjacency.get(node.id) ?? []) {
-          setHover(nb.id, true);
-          hoveredRef.current.add(nb.id);
-        }
-      }
-      hoverOriginRef.current = node ? node.id : null;
-      // Shared focus channel: a real node hover takes over from a legend
-      // preview — but a spurious onHover(null) (the sim drifting a node out
-      // from under the last raycast position) must not wipe an active preview.
-      if (node) previewClusterRef.current = null;
-      refreshFocus();
-    },
-    [adjacency, refreshFocus],
-  );
-
-  // ── 2D ↔ 3D morph ────────────────────────────────────────────────────────
-  // One scene for both views. "2D" tweens every node's fz pin to 0 while the
-  // camera flies front-on and dolly-zooms; the sim stays hot so links track
-  // the real coordinates through ordinary ticks. fz is the ONLY pin the morph
-  // ever holds: x/y stay free, so the layout keeps living — a drag tugs the
-  // neighbourhood along in both views (dragend releases fx/fy automatically
-  // because they were never fixed), and returning to 3D deletes fz entirely.
-  // Two rejected flavors, for the record: scaling the graph group's z
-  // exploded under DragControls (inverse parent matrix × 1e-4 scale amplifies
-  // float noise 10⁴×), and pinning fx/fy froze the network so a dragged node
-  // just stretched its links (Tom wants the organic tug).
-  const animateMorph = useCallback(
-    (fov1: number, toFlat: boolean, done?: () => void) => {
-      const fg = fgRef.current;
-      if (!fg) return;
-      const cam = fg.camera() as THREE.PerspectiveCamera;
-      const fov0 = cam.fov;
-      const nodes = data.nodes as any[];
-      if (toFlat) for (const n of nodes) n.__z3d = n.z ?? 0;
-      fg.d3ReheatSimulation(); // keep ticks flowing so objects + links follow the tween
-      const dur = reducedRef.current ? 0 : MORPH_MS;
-      const t0 = performance.now();
-      cancelAnimationFrame(morphRaf.current);
-      const step = () => {
-        const t = dur === 0 ? 1 : Math.min(1, (performance.now() - t0) / dur);
-        const e = easeInOut(t);
-        cam.fov = fov0 + (fov1 - fov0) * e;
-        cam.updateProjectionMatrix();
-        for (const n of nodes) {
-          const z3d = n.__z3d ?? 0;
-          n.fz = toFlat ? z3d * (1 - e) : z3d * e;
-        }
-        if (t < 1) {
-          morphRaf.current = requestAnimationFrame(step);
-        } else {
-          if (!toFlat) for (const n of nodes) delete n.fz; // fully organic 3D
-          done?.();
-        }
-      };
-      step();
-    },
-    [data],
-  );
-
-  const viewRef = useRef<ViewMode>("3d");
-  const changeView = useCallback(
-    (v: ViewMode) => {
-      const fg = fgRef.current;
-      if (v === viewRef.current || !fg) return;
-      viewRef.current = v;
-      setView(v);
-      // The library only re-raycasts on mousemove: a hover parked under the
-      // morphing camera would keep the old neighbourhood lit — drop it.
-      onNodeHover(null);
-      // Swap the layout physics with the view; animateMorph's reheat below
-      // keeps the sim ticking so the new forces take hold through the tween.
-      applyForceProfile(fg, v);
-      preFocusRef.current = null; // a pose saved in the other view's camera regime is wrong
-      const cam = fg.camera() as THREE.PerspectiveCamera;
-      const controls: any = fg.controls();
-      const ms = reducedRef.current ? 0 : MORPH_MS;
-      if (v === "2d") {
-        savedCamRef.current = { pos: cam.position.clone(), fov: cam.fov };
-        controls.noRotate = true;
-        // Fly front-on at a dolly-zoom-compensated distance so the graph
-        // holds its apparent size while the lens narrows toward ortho.
-        const d = cam.position.length();
-        const d2 = (d * Math.tan((cam.fov * Math.PI) / 360)) / Math.tan((FOV_2D * Math.PI) / 360);
-        fg.cameraPosition({ x: 0, y: 0, z: d2 }, { x: 0, y: 0, z: 0 }, ms);
-        animateMorph(FOV_2D, true, () => fg.zoomToFit(600, 100));
-      } else {
-        controls.noRotate = false;
-        const saved = savedCamRef.current;
-        if (saved) fg.cameraPosition(saved.pos, { x: 0, y: 0, z: 0 }, ms);
-        animateMorph(saved?.fov ?? cam.fov, false);
-      }
-    },
-    [animateMorph, onNodeHover],
-  );
-
-  // Stable accessor identities, on purpose: only linkColor changes identity
-  // per render, so the library's link digest recolours materials in place
-  // instead of clearing + rebuilding every link object (its `linkWidth` prop
-  // sits on the recreate-objects list; a fresh identity per render would
-  // reconstruct ~all link meshes on every hover-set change and keystroke).
-  // Width/particles still re-evaluate per digest via viewRef/focusRef.
-  const linkWidth = useCallback((l: any) => {
-    const p = FORCE_PROFILES[viewRef.current];
-    return l.bridge ? p.bridgeWidth : p.linkWidth;
-  }, []);
 
   const linkParticles = useCallback(
     (l: any) => (l.bridge && isLinkLit(l) ? 3 : 0),
@@ -594,22 +158,15 @@ export function NeuralGalaxy({
         // nodeLabel is the ONE raw-innerHTML sink (float-tooltip renders the
         // string unescaped): titles and folder names are untrusted vault
         // content, so both text interpolations MUST go through escapeHtml, and
-        // the colour MUST go through safeHex (strict hex, palette fallback).
-        nodeLabel={(n: any) =>
-          `<div style="font:600 12px Inter,sans-serif;color:#fff;background:rgba(20,18,32,.92);border:1px solid rgba(255,255,255,.12);padding:5px 9px;border-radius:8px">${escapeHtml(n.title)}<span style="color:${safeHex(n.color)};margin-left:8px;font-weight:500">${escapeHtml(clusters[n.cluster]?.label ?? n.cluster)}</span></div>`
-        }
-        // Link styling is view-aware (FORCE_PROFILES): the flat 2D map needs a
-        // clearly visible web at overview; the 3D galaxy stays more subdued.
-        // Under an active hover-focus, links outside the lit neighbourhood
-        // fade well back (alpha only — widths keep their objects stable).
-        linkColor={(l: any) => {
-          if (!isLinkLit(l)) {
-            return l.bridge
-              ? BRIDGE_FADED_COLOR
-              : `rgba(150,150,200,${+(FORCE_PROFILES[view].linkAlpha * LINK_FADE).toFixed(3)})`;
-          }
-          return l.bridge ? BRIDGE_COLOR : `rgba(150,150,200,${FORCE_PROFILES[view].linkAlpha})`;
-        }}
+        // the colour MUST go through safeHex — see galaxyTooltip.
+        nodeLabel={(n: any) => nodeLabelHtml(n, clusters)}
+        // Link styling is view-aware (FORCE_PROFILES) via galaxyLinks: the flat
+        // 2D map needs a clearly visible web; the 3D galaxy stays subdued. Under
+        // an active hover-focus, links outside the lit neighbourhood fade well
+        // back (alpha only — widths keep their objects stable). Inline arrow on
+        // purpose: only linkColor changes identity per render, so the library's
+        // link digest recolours in place instead of rebuilding link objects.
+        linkColor={(l: any) => computeLinkColor(l, view, isLinkLit(l))}
         linkWidth={linkWidth}
         linkDirectionalParticles={linkParticles}
         linkDirectionalParticleWidth={1.6}
@@ -619,200 +176,34 @@ export function NeuralGalaxy({
         onEngineStop={frameOnce}
       />
 
-      {/* ── Top bar: title + view toggle + search ──────────────────────── */}
-      <div
-        data-testid="galaxy-toolbar"
-        data-layout={compactToolbar ? "compact" : "wide"}
-        className={`pointer-events-none absolute inset-x-0 top-0 flex p-5 ${
-          compactToolbar ? "flex-col gap-3" : "items-start justify-between"
-        }`}
-      >
-        <div
-          className={`pointer-events-auto flex items-center ${
-            compactToolbar ? "w-full gap-2" : "gap-3"
-          }`}
-        >
-          <div>
-            <div className="nn-heading flex items-center gap-2 text-lg font-semibold text-foreground">
-              <Sparkles className="size-4 text-primary" /> Neural galaxy
-            </div>
-            <div className="nn-mono text-[0.6875rem] text-muted-foreground">
-              {plural(stats.notes, "note")} · {plural(stats.links, "link")} ·{" "}
-              {plural(stats.crossFolderLinks, "cross-folder link")}
-              {/* Only an isolated folder has links leaving the view (0 at root). */}
-              {stats.outsideLinks > 0 && (
-                <>
-                  {" "}
-                  · {plural(stats.outsideLinks, "link")} lead
-                  {stats.outsideLinks === 1 ? "s" : ""} outside
-                </>
-              )}
-            </div>
-          </div>
-        </div>
+      <GalaxyToolbar
+        compact={compactToolbar}
+        stats={stats}
+        view={view}
+        onChangeView={changeView}
+        query={query}
+        onQueryChange={setQuery}
+        results={results}
+        onPickResult={pickResult}
+        clusters={clusters}
+      />
 
-        <div className="pointer-events-auto flex items-center gap-3">
-          {/* 2D map ↔ 3D galaxy morph */}
-          <fieldset className="m-0 flex min-w-0 items-center gap-1 rounded-lg border border-border bg-card/80 p-1 text-xs backdrop-blur">
-            <legend className="sr-only">Graph dimension</legend>
-            {(["3d", "2d"] as const).map((v) => (
-              <button
-                key={v}
-                type="button"
-                aria-pressed={view === v}
-                onClick={() => changeView(v)}
-                className={`rounded-md px-2.5 py-1 uppercase transition ${
-                  view === v
-                    ? "bg-primary text-primary-foreground"
-                    : "text-muted-foreground hover:text-foreground"
-                }`}
-              >
-                {v}
-              </button>
-            ))}
-          </fieldset>
+      <GalaxyLegend
+        breadcrumb={breadcrumb}
+        clusters={clusters}
+        onPreviewCluster={previewCluster}
+        onClusterSelect={onClusterSelect}
+      />
 
-          <div className={`relative ${compactToolbar ? "min-w-0 flex-1" : "w-72"}`}>
-            <label className="flex items-center gap-2 rounded-lg border border-border bg-card/80 px-3 py-2 text-sm text-muted-foreground backdrop-blur focus-within:border-primary/60">
-              <Search className="size-4 shrink-0" />
-              <input
-                type="search"
-                aria-label="Search the galaxy"
-                value={query}
-                onChange={(e) => setQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter" && results?.length) pickResult(results[0]);
-                  if (e.key === "Escape") setQuery("");
-                }}
-                placeholder="Search the galaxy…"
-                className="w-full bg-transparent text-foreground placeholder:text-muted-foreground/70 focus:outline-none"
-              />
-              {query && (
-                <button type="button" onClick={() => setQuery("")} aria-label="Clear">
-                  <X className="size-3.5 hover:text-foreground" />
-                </button>
-              )}
-            </label>
-
-            {/* Results dropdown — pick a note instead of auto-flying to it */}
-            {results && (
-              <div className="absolute inset-x-0 top-full mt-2 max-h-72 overflow-y-auto rounded-lg border border-border bg-card/95 py-1 backdrop-blur">
-                {results.length === 0 && (
-                  <div className="px-3 py-2 text-xs text-muted-foreground">No notes match “{query}”</div>
-                )}
-                {results.map((n) => (
-                  <button
-                    key={n.id}
-                    type="button"
-                    onClick={() => pickResult(n)}
-                    className="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-foreground transition hover:bg-primary/10"
-                  >
-                    <span className="size-2 shrink-0 rounded-full" style={{ background: n.color }} />
-                    <span className="truncate">{n.title}</span>
-                    <span className="nn-mono ml-auto shrink-0 text-[0.625rem] text-muted-foreground">
-                      {clusters[n.cluster]?.label ?? n.cluster}
-                    </span>
-                  </button>
-                ))}
-              </div>
-            )}
-          </div>
-        </div>
-      </div>
-
-      {/* ── Cluster legend ─────────────────────────────────────────────── */}
-      {/* Interactive (spec §Addendum): hover a row → the whole cluster lights
-          via the shared focus channel; click a folder row → onClusterSelect
-          drills in. The "" row (this folder's own notes) is not a drill target
-          — it's still a native button so keyboard focus can drive the same
-          cluster preview, but it has no click action; the bridge row stays
-          non-interactive. */}
-      <div className="absolute bottom-5 left-5 flex flex-col gap-1.5 rounded-lg border border-border bg-card/80 px-4 py-3 backdrop-blur">
-        {breadcrumb}
-        <div className="nn-mono mb-1 text-[0.625rem] uppercase tracking-wider text-muted-foreground">Clusters</div>
-        {Object.entries(clusters).map(([key, c]) =>
-          key === "" ? (
-            <button
-              key="c:"
-              type="button"
-              onMouseEnter={() => previewCluster("")}
-              onMouseLeave={() => previewCluster(null)}
-              onFocus={() => previewCluster("")}
-              onBlur={() => previewCluster(null)}
-              className="flex items-center gap-2 text-left text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-            >
-              <span className="size-2.5 rounded-full" style={{ background: c.color, boxShadow: `0 0 8px ${c.color}` }} />
-              {c.label}
-            </button>
-          ) : (
-            <button
-              key={`c:${key}`}
-              type="button"
-              onClick={() => onClusterSelect?.(key)}
-              onMouseEnter={() => previewCluster(key)}
-              onMouseLeave={() => previewCluster(null)}
-              className="flex items-center gap-2 text-left text-xs text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
-            >
-              <span className="size-2.5 rounded-full" style={{ background: c.color, boxShadow: `0 0 8px ${c.color}` }} />
-              {c.label}
-              {/* Drill affordance: this folder has sub-folders to unfold into. */}
-              {c.drillable && (
-                <ChevronRight aria-hidden className="ml-auto size-3 shrink-0 text-muted-foreground" />
-              )}
-            </button>
-          ),
-        )}
-        <div className="mt-1.5 flex items-center gap-2 border-t border-border pt-1.5 text-xs text-foreground">
-          <span className="h-0.5 w-4 rounded-full" style={{ background: BRIDGE_PINK, boxShadow: `0 0 8px ${BRIDGE_PINK}` }} />
-          <span>Cross-folder link</span>
-        </div>
-      </div>
-
-      {/* ── Selected-node detail panel ─────────────────────────────────── */}
       {selected && (
-        <div className="absolute right-5 top-24 w-72 rounded-xl border border-border bg-card/90 p-4 backdrop-blur">
-          <div className="flex items-start justify-between gap-2">
-            <span
-              className="nn-mono rounded-full px-2 py-0.5 text-[0.625rem]"
-              style={{ background: `${selected.color}22`, color: selected.color }}
-            >
-              {clusters[selected.cluster]?.label ?? selected.cluster}
-            </span>
-            <button type="button" onClick={closeSelectedAndReturn} aria-label="Close">
-              <X className="size-4 text-muted-foreground hover:text-foreground" />
-            </button>
-          </div>
-          <h3 className="nn-heading mt-2 text-base font-semibold leading-snug text-foreground">{selected.title}</h3>
-          <div className="nn-mono mt-3 text-[0.625rem] uppercase tracking-wider text-muted-foreground">
-            {plural(neighbours.length, "connected note")}
-          </div>
-          <div className="mt-1.5 max-h-56 overflow-y-auto">
-            {neighbours.map(({ node: nb, bridge }) => (
-              <button
-                key={nb.id}
-                type="button"
-                onClick={() => onNodeClick(nb)}
-                onMouseEnter={() => setHover(nb.id, true)}
-                onMouseLeave={() => setHover(nb.id, false)}
-                className="flex w-full items-center gap-2 rounded-md px-2 py-1.5 text-left text-xs text-foreground transition hover:bg-primary/10"
-              >
-                <span className="size-2 shrink-0 rounded-full" style={{ background: nb.color }} />
-                <span className="truncate">{nb.title}</span>
-                {bridge && (
-                  <span className="nn-mono ml-auto shrink-0 text-[0.5625rem]" style={{ color: BRIDGE_PINK }}>
-                    Cross-folder
-                  </span>
-                )}
-              </button>
-            ))}
-          </div>
-          <button
-            onClick={() => onOpenNote(selected.id)}
-            className="mt-3 w-full rounded-lg bg-primary py-2 text-sm font-medium text-primary-foreground transition hover:opacity-90"
-          >
-            Open in reader
-          </button>
-        </div>
+        <GalaxyDetailPanel
+          selected={selected}
+          clusters={clusters}
+          neighbours={neighbours}
+          onNodeClick={onNodeClick}
+          onClose={closeSelectedAndReturn}
+          onOpenNote={onOpenNote}
+        />
       )}
     </div>
   );
