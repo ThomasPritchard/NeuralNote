@@ -73,7 +73,12 @@ pub(crate) fn answer_elicitation(
         let state = crate::lock_state(&state);
         std::sync::Arc::clone(&state.pending_elicitations)
     };
-    pending.answer(&turn_id, &id, choices)
+    // Parse the untrusted IPC run id to its `Uuid` once, here at the command
+    // boundary — the registry keys every run by `Uuid`, so a string that is not a
+    // live run's id simply names no live prompt (the same "not live" rejection a
+    // stale or timed-out id already gets).
+    let turn_id = uuid::Uuid::parse_str(&turn_id).map_err(|_| elicitation::not_live(&id))?;
+    pending.answer(turn_id, &id, choices)
 }
 
 /// Consume one run ledger once every file reaches a terminal result. A vault

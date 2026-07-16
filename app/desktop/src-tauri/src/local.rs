@@ -572,7 +572,19 @@ fn evaluate_pull_disk_space(
 /// `$HOME` — then apply the pure decision. A probe failure is logged and mapped to
 /// "unknown free space" rather than swallowed, so it proceeds-with-warning instead of
 /// masquerading as a verified pass.
-fn preflight_pull_disk_space(models_dir: &Path, expected_bytes: Option<u64>) -> CoreResult<()> {
+///
+/// When the check can't be completed (volume probe failed or the model size is
+/// unknown) the pull still proceeds, but a one-line informational note is emitted
+/// on the sink so the skipped check reaches the user inline rather than only the
+/// log. There is no dedicated "note" `PullEvent`, so this reuses `Progress`'s
+/// `status` — the same human-facing status channel the pipeline already streams
+/// (Ollama's own "pulling manifest" etc.) — with no byte counters, which is honest:
+/// it is progress information, not an error and not a completion.
+fn preflight_pull_disk_space(
+    models_dir: &Path,
+    expected_bytes: Option<u64>,
+    sink: &mut dyn PullSink,
+) -> CoreResult<()> {
     let free_bytes = match free_disk_bytes(Some(models_dir)) {
         Ok(bytes) => Some(bytes),
         Err(error) => {
@@ -584,6 +596,13 @@ fn preflight_pull_disk_space(models_dir: &Path, expected_bytes: Option<u64>) -> 
         log::warn!(
             "proceeding with a model download despite an unverified disk preflight: {reason}"
         );
+        sink.send(PullEvent::Progress {
+            status: format!("Continuing the download without a disk-space check — {reason}."),
+            digest: None,
+            completed: None,
+            total: None,
+            percent: None,
+        });
     }
     Ok(())
 }
@@ -600,7 +619,7 @@ pub(super) async fn pull_local_model(
     // download, so a multi-GB stream never starts only to die mid-flight with a
     // half-written blob. Surfaced through the returned `Err` (the command turns it
     // into the one terminal `PullEvent::Error`).
-    preflight_pull_disk_space(models_dir, expected_bytes)?;
+    preflight_pull_disk_space(models_dir, expected_bytes, sink)?;
     let client = pull_client()?;
     let resp = client
         .post(api_url(port, "/api/pull"))
@@ -969,7 +988,12 @@ mod tests {
         // End-to-end through the real statvfs probe: an exabyte-scale model can't fit
         // any real test volume, so the wrapper refuses before any request.
         let dir = tempfile::tempdir().unwrap();
-        assert!(preflight_pull_disk_space(dir.path(), Some(u64::MAX / 2)).is_err());
+        let mut sink = RecordingSink::default();
+        assert!(preflight_pull_disk_space(dir.path(), Some(u64::MAX / 2), &mut sink).is_err());
+        assert!(
+            sink.events.is_empty(),
+            "a refusal emits no continue-anyway note"
+        );
     }
 
     #[cfg(unix)]
@@ -977,17 +1001,33 @@ mod tests {
     fn preflight_wrapper_allows_a_tiny_model_on_a_real_volume() {
         // A kilobyte "model" fits any working volume that has room for the headroom.
         let dir = tempfile::tempdir().unwrap();
-        assert!(preflight_pull_disk_space(dir.path(), Some(1024)).is_ok());
+        let mut sink = RecordingSink::default();
+        assert!(preflight_pull_disk_space(dir.path(), Some(1024), &mut sink).is_ok());
+        assert!(
+            sink.events.is_empty(),
+            "a verified-sufficient preflight emits no note"
+        );
     }
 
     #[cfg(unix)]
     #[test]
-    fn preflight_wrapper_proceeds_when_the_probe_path_is_missing() {
+    fn preflight_wrapper_proceeds_and_notes_when_the_probe_path_is_missing() {
         // A probe failure (missing path) is surfaced as a warning and proceeds — it is
-        // not treated as zero free space, which would wrongly block a valid pull.
+        // not treated as zero free space, which would wrongly block a valid pull. The
+        // skipped check is now also surfaced inline to the user as one status note.
         let dir = tempfile::tempdir().unwrap();
         let missing = dir.path().join("does-not-exist");
-        assert!(preflight_pull_disk_space(&missing, Some(MODEL_BYTES)).is_ok());
+        let mut sink = RecordingSink::default();
+        assert!(preflight_pull_disk_space(&missing, Some(MODEL_BYTES), &mut sink).is_ok());
+        assert!(
+            matches!(
+                sink.events.as_slice(),
+                [PullEvent::Progress { status, completed: None, total: None, .. }]
+                    if status.contains("disk-space check")
+            ),
+            "the skipped preflight must emit exactly one informational note, got {:?}",
+            sink.events
+        );
     }
 
     #[test]

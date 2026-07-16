@@ -988,6 +988,32 @@ mod tests {
     }
 
     #[test]
+    fn chat_key_routing_surfaces_a_keychain_failure_end_to_end() {
+        // End-to-end through the real `read_api_key` seam: a keychain fault must
+        // reach the chat provider-routing guard as the couldn't-read error event,
+        // never as "no key" (issue #14). Guards `resolve_key_presence` against a
+        // future refactor that collapses the read error to `false`.
+        use neuralnote_core::ai::ChatEvent;
+
+        let _guard = KEYCHAIN_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let keychain = TestKeychain::install();
+        keychain.fail_reads();
+
+        match crate::commands::ai::resolve_key_presence(read_api_key()) {
+            Err(ChatEvent::Error { message }) => {
+                assert!(
+                    message.contains("Couldn't read the API key"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => panic!("a keychain read failure must not route as a key state, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn save_api_key_writes_secret_to_keychain_and_only_model_flag_to_config() {
         let _guard = KEYCHAIN_TEST_LOCK
             .get_or_init(|| StdMutex::new(()))

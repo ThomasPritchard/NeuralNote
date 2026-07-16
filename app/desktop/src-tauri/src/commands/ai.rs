@@ -281,6 +281,30 @@ fn build_ai_status(cfg: neuralnote_core::ai::ProviderConfig, key_present: bool) 
     }
 }
 
+/// The `ChatEvent` surfaced when reading the keychain for provider routing fails.
+/// Shared by the routing decision and the OpenRouter arm so the *one* honest
+/// message ("couldn't read the API key") can never drift between the two sites.
+fn keychain_read_error_event(error: &CoreError) -> neuralnote_core::ai::ChatEvent {
+    neuralnote_core::ai::ChatEvent::Error {
+        message: format!("Couldn't read the API key: {error}"),
+    }
+}
+
+/// Resolve provider-routing key presence from a keychain read. `Ok(key)` maps to
+/// whether a key is present; a read *failure* is returned as the [`ChatEvent`] to
+/// surface, never collapsed to `false`. Collapsing a genuine keychain fault to
+/// "no key" would route the user to "no provider set up" and mask the fault — the
+/// exact regression this pure, `AppHandle`-free helper exists to keep testable
+/// (issue #14, the highest-security provider-routing site).
+///
+/// [`ChatEvent`]: neuralnote_core::ai::ChatEvent
+pub(crate) fn resolve_key_presence(
+    read: Result<Option<String>, CoreError>,
+) -> Result<bool, neuralnote_core::ai::ChatEvent> {
+    read.map(|key| key.is_some())
+        .map_err(|error| keychain_read_error_event(&error))
+}
+
 fn app_data_dir_or_warn(app: &AppHandle, purpose: &str) -> Option<PathBuf> {
     match app.path().app_data_dir() {
         Ok(dir) => Some(dir),
@@ -780,11 +804,8 @@ pub(crate) async fn chat(
             return Ok(run_id);
         }
     };
-    let user_prompt = skills::ShellUserPrompt::new(
-        pending,
-        run_id.clone(),
-        std::sync::Arc::clone(&close_signal),
-    );
+    let user_prompt =
+        skills::ShellUserPrompt::new(pending, turn_id, std::sync::Arc::clone(&close_signal));
     let note_writer = skills::RunNoteWriteBackend::new(std::sync::Arc::clone(&close_signal));
     let canonical_root = match root.canonicalize() {
         Ok(root) => root,
@@ -820,12 +841,10 @@ pub(crate) async fn chat(
     // Key presence (the keychain — the authoritative source, issue #14) resolves the
     // effective OpenRouter provider for a legacy install with no explicit choice. A
     // keychain failure here is surfaced, never silently routed as "no provider".
-    let key_present = match ai::read_api_key() {
-        Ok(key) => key.is_some(),
-        Err(e) => {
-            sink.send(ChatEvent::Error {
-                message: format!("Couldn't read the API key: {e}"),
-            });
+    let key_present = match resolve_key_presence(ai::read_api_key()) {
+        Ok(present) => present,
+        Err(event) => {
+            sink.send(event);
             return Ok(run_id);
         }
     };
@@ -1177,9 +1196,7 @@ async fn chat_via_openrouter(
             return None;
         }
         Err(e) => {
-            run.sink.send(ChatEvent::Error {
-                message: format!("Couldn't read the API key: {e}"),
-            });
+            run.sink.send(keychain_read_error_event(&e));
             return None;
         }
     };
@@ -1479,6 +1496,32 @@ mod tests {
             !persisted.reasoning,
             "a concurrent reasoning opt-out must not be restored from a stale model-selection snapshot"
         );
+    }
+
+    #[test]
+    fn key_presence_maps_a_present_key_to_true_and_an_absent_one_to_false() {
+        assert_eq!(resolve_key_presence(Ok(Some("sk-or-xxx".into()))), Ok(true));
+        assert_eq!(resolve_key_presence(Ok(None)), Ok(false));
+    }
+
+    #[test]
+    fn key_presence_surfaces_a_read_failure_instead_of_collapsing_to_no_key() {
+        // The regression guard for issue #14: a keychain fault must NOT read as
+        // "no key" (which would route to "no provider set up"); it must surface as
+        // the couldn't-read error event. A future `unwrap_or(None).is_some()` would
+        // return `Ok(false)` here and fail this test.
+        let failed = resolve_key_presence(Err(CoreError::Io("keychain read failed: boom".into())));
+        match failed {
+            Err(ChatEvent::Error { message }) => {
+                assert!(
+                    message.contains("Couldn't read the API key"),
+                    "unexpected message: {message}"
+                );
+            }
+            other => {
+                panic!("a keychain read failure must surface as an error event, got {other:?}")
+            }
+        }
     }
 
     #[test]
