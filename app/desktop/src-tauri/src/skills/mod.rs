@@ -168,10 +168,20 @@ fn undo_skill_run_inner_with(
         // Taking before I/O reserves the authority against concurrent callers. Put
         // back only entries whose I/O failed; terminal paths must not regain delete
         // authority if a byte-identical replacement appears before the retry.
+        // A ledger may repeat a path (resolve-to-latest-write dedups it to a single
+        // report line), so the coverage invariant is one line per *distinct* path —
+        // an under-report would silently strip an unreported path of delete authority.
+        let distinct_paths = stored
+            .ledger
+            .entries()
+            .iter()
+            .map(|entry| entry.rel_path.as_str())
+            .collect::<std::collections::HashSet<_>>()
+            .len();
         debug_assert_eq!(
             report.files.len(),
-            stored.ledger.entries().len(),
-            "apply_undo must report every ledger entry"
+            distinct_paths,
+            "apply_undo must report every distinct ledger path exactly once"
         );
         stored.ledger.retain_entries(|entry| {
             report.files.iter().any(|file| {
@@ -278,7 +288,7 @@ mod tests {
     #[test]
     #[cfg_attr(
         debug_assertions,
-        should_panic(expected = "apply_undo must report every ledger entry")
+        should_panic(expected = "apply_undo must report every distinct ledger path exactly once")
     )]
     fn incomplete_failed_undo_report_trips_entry_coverage_assertion() {
         let vault = tempfile::tempdir().unwrap();

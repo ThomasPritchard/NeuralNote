@@ -144,21 +144,41 @@ pub(crate) fn next_chat_run_id() -> String {
     format!("chat-run-{}-{sequence}", std::process::id())
 }
 
-/// Apply one ledger as a best-effort report. Each entry is validated independently,
-/// so an edited or missing note never hides successful deletions of its unchanged
-/// siblings; the command decides whether the report is terminal or retryable.
+/// Each distinct ledger path, in first-seen order.
+///
+/// Duplicate-path policy: **resolve-to-latest-write**. A path can legitimately
+/// appear in a ledger more than once (the run wrote it, it was removed out from
+/// under us, and the run wrote it again). The file now on disk is the *latest*
+/// write, so each path is undone exactly once and validated against the latest
+/// recorded hash for that path (see [`UndoLedger::check_hash`]). Processing every
+/// raw entry instead would emit a spurious second "missing" line and, before this
+/// fix, validated against the *first* recorded hash — letting a stale hash decide
+/// the fate of a newer note.
+fn distinct_rel_paths(ledger: &UndoLedger) -> Vec<&str> {
+    let mut seen = std::collections::HashSet::new();
+    ledger
+        .entries()
+        .iter()
+        .map(|entry| entry.rel_path.as_str())
+        .filter(|rel_path| seen.insert(*rel_path))
+        .collect()
+}
+
+/// Apply one ledger as a best-effort report. Each distinct path is validated
+/// independently, so an edited or missing note never hides successful deletions of
+/// its unchanged siblings; the command decides whether the report is terminal or
+/// retryable.
 #[cfg(unix)]
 pub(crate) fn undo_ledger(root: &Path, ledger: &UndoLedger) -> UndoReport {
     let canonical_root = match root.canonicalize() {
         Ok(root) => root,
         Err(error) => {
             return UndoReport {
-                files: ledger
-                    .entries()
-                    .iter()
-                    .map(|entry| {
+                files: distinct_rel_paths(ledger)
+                    .into_iter()
+                    .map(|rel_path| {
                         UndoFileResult::new(
-                            &entry.rel_path,
+                            rel_path,
                             UndoFileStatus::Failed,
                             Some(format!("vault root is unavailable: {error}")),
                         )
@@ -168,10 +188,9 @@ pub(crate) fn undo_ledger(root: &Path, ledger: &UndoLedger) -> UndoReport {
         }
     };
     UndoReport {
-        files: ledger
-            .entries()
-            .iter()
-            .map(|entry| undo_entry(&canonical_root, ledger, &entry.rel_path))
+        files: distinct_rel_paths(ledger)
+            .into_iter()
+            .map(|rel_path| undo_entry(&canonical_root, ledger, rel_path))
             .collect(),
     }
 }
@@ -181,12 +200,11 @@ pub(crate) fn undo_ledger(root: &Path, ledger: &UndoLedger) -> UndoReport {
 #[cfg(not(unix))]
 pub(crate) fn undo_ledger(_root: &Path, ledger: &UndoLedger) -> UndoReport {
     UndoReport {
-        files: ledger
-            .entries()
-            .iter()
-            .map(|entry| {
+        files: distinct_rel_paths(ledger)
+            .into_iter()
+            .map(|rel_path| {
                 failed(
-                    &entry.rel_path,
+                    rel_path,
                     "secure skill Undo is not supported on this platform".into(),
                 )
             })
@@ -236,7 +254,6 @@ fn undo_entry(canonical_root: &Path, ledger: &UndoLedger, rel_path: &str) -> Und
         Err(error) => return failed(rel_path, error.to_string()),
     };
     let current_hash = note_content_hash(&content);
-    // TODO(undo-dup-paths): duplicate rel_path entries in UndoLedger consult only the first hash.
     match ledger.check_hash(rel_path, &current_hash) {
         UndoCheck::RefusedHashMismatch { .. } => {
             return edited(rel_path, "file changed after the skill wrote it")
@@ -275,46 +292,15 @@ fn undo_unlink_result(rel_path: &str, result: CheckedUnlink) -> UndoFileResult {
     }
 }
 
-// TODO(vault-rel-path): unify validate_note_path (write_policy.rs) and validate_undo_rel_path (skills/undo.rs) behind a core VaultRelPath newtype.
+/// Validate a ledger path through the single shared note grammar
+/// ([`neuralnote_core::paths::parse_note_rel_path`]) — the same gate the write
+/// path uses, so Undo can never be stricter or looser than the code that created
+/// the file. Returns the parent directory and the leaf name to delete.
 #[cfg(unix)]
 fn validate_undo_rel_path(rel_path: &str) -> CoreResult<(PathBuf, String)> {
-    if rel_path.trim().is_empty()
-        || rel_path.starts_with(['/', '\\'])
-        || rel_path.contains('\\')
-        || has_windows_drive_prefix(rel_path)
-    {
-        return Err(CoreError::OutsideVault(rel_path.to_string()));
-    }
-    let components = rel_path.split('/').collect::<Vec<_>>();
-    if components
-        .iter()
-        .any(|part| part.is_empty() || *part == "." || *part == "..")
-    {
-        return Err(CoreError::OutsideVault(rel_path.to_string()));
-    }
-    for component in &components {
-        neuralnote_core::paths::validate_name(component)?;
-    }
-    let leaf = components
-        .last()
-        .expect("validated non-empty undo path has a leaf")
-        .to_string();
-    if !leaf
-        .rsplit_once('.')
-        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("md"))
-    {
-        return Err(CoreError::InvalidName(
-            "undo ledger path must end in .md".into(),
-        ));
-    }
-    let parent = components[..components.len() - 1].iter().collect();
-    Ok((parent, leaf))
-}
-
-#[cfg(unix)]
-fn has_windows_drive_prefix(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+    let path = neuralnote_core::paths::parse_note_rel_path(rel_path)?;
+    let parent: PathBuf = path.parent_components().iter().collect();
+    Ok((parent, path.leaf().to_string()))
 }
 
 fn failed(rel_path: &str, message: String) -> UndoFileResult {
@@ -369,6 +355,109 @@ mod tests {
             .unwrap();
         }
         session.into_ledger()
+    }
+
+    /// Write `rel_path` twice in one run with the file removed between writes, so
+    /// the ledger records the same path twice with different content hashes — the
+    /// duplicate-path shape Issue #10 hardens.
+    fn ledger_with_rewritten_note(
+        root: &Path,
+        rel_path: &str,
+        first: &str,
+        second: &str,
+    ) -> UndoLedger {
+        let backend = FsNoteWriteBackend;
+        let mut session = WriteSession::new(1).unwrap();
+        write_note_policy(
+            root,
+            rel_path,
+            first,
+            NoteKind::Literature,
+            0,
+            &backend,
+            &mut session,
+        )
+        .unwrap();
+        fs::remove_file(root.join(rel_path)).unwrap();
+        write_note_policy(
+            root,
+            rel_path,
+            second,
+            NoteKind::Literature,
+            0,
+            &backend,
+            &mut session,
+        )
+        .unwrap();
+        session.into_ledger()
+    }
+
+    #[test]
+    fn undo_deletes_a_duplicate_path_validated_against_the_latest_write() {
+        let vault = tempfile::tempdir().unwrap();
+        let ledger = ledger_with_rewritten_note(vault.path(), "Dup.md", "first", "second");
+        assert_eq!(
+            ledger.entries().len(),
+            2,
+            "the rewrite must record two entries for one path"
+        );
+
+        let report = undo_ledger(vault.path(), &ledger);
+
+        assert_eq!(report.files.len(), 1, "a duplicate path is reported once");
+        assert_eq!(report.files[0].status, UndoFileStatus::Deleted);
+        assert!(!vault.path().join("Dup.md").exists());
+    }
+
+    #[test]
+    fn undo_refuses_a_duplicate_path_whose_disk_matches_only_a_shadowed_earlier_write() {
+        // The killer case: the on-disk content matches the FIRST recorded hash, not
+        // the latest write. Consulting the first hash (the pre-fix bug) would delete
+        // a note the run no longer owns; resolve-to-latest-write refuses instead.
+        let vault = tempfile::tempdir().unwrap();
+        let ledger = ledger_with_rewritten_note(vault.path(), "Dup.md", "first", "second");
+        fs::write(vault.path().join("Dup.md"), "first").unwrap();
+
+        let report = undo_ledger(vault.path(), &ledger);
+
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].status, UndoFileStatus::SkippedEdited);
+        assert_eq!(
+            fs::read_to_string(vault.path().join("Dup.md")).unwrap(),
+            "first",
+            "a file matching only a shadowed earlier write must be preserved"
+        );
+    }
+
+    #[test]
+    fn undo_refuses_a_recreated_file_with_foreign_content() {
+        let vault = tempfile::tempdir().unwrap();
+        let ledger = ledger_with_notes(vault.path(), &[("Recreated.md", "original")]);
+        fs::write(vault.path().join("Recreated.md"), "user rewrote this").unwrap();
+
+        let report = undo_ledger(vault.path(), &ledger);
+
+        assert_eq!(report.files[0].status, UndoFileStatus::SkippedEdited);
+        assert_eq!(
+            fs::read_to_string(vault.path().join("Recreated.md")).unwrap(),
+            "user rewrote this"
+        );
+    }
+
+    #[test]
+    fn undo_path_validation_now_rejects_non_portable_and_invisible_names() {
+        // The shared note grammar makes Undo at least as strict as the write path:
+        // reserved device names, the portable character class, and invisible
+        // characters are all refused now, not only separators and traversal.
+        for path in [
+            "CON.md",
+            "bad:name.md",
+            "note\u{200b}.md",
+            "Folder /Note.md",
+            "\u{202e}gpj.md",
+        ] {
+            assert!(validate_undo_rel_path(path).is_err(), "{path:?} must fail");
+        }
     }
 
     #[test]

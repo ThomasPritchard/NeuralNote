@@ -5,7 +5,7 @@
 //! primitives; the eventual Tauri implementation therefore stays an I/O husk.
 
 use crate::error::{CoreError, CoreResult};
-use crate::paths::validate_name;
+use crate::paths::parse_note_rel_path;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 use ts_rs::TS;
@@ -149,8 +149,21 @@ impl UndoLedger {
         self.entries.retain(|entry| keep(entry));
     }
 
+    /// Decide whether the current on-disk content of `rel_path` may be undone.
+    ///
+    /// A path can legitimately appear more than once in a ledger (the run wrote it,
+    /// it was removed out from under us, and the run wrote it again). Validation
+    /// resolves to the *latest* recorded write of that path — the write that
+    /// produced the file now on disk — so a stale earlier hash can never authorise
+    /// deleting a newer note. If the file no longer matches that latest hash the
+    /// check refuses, preserving fail-closed behaviour.
     pub fn check_hash(&self, rel_path: &str, current_hash: &str) -> UndoCheck {
-        let Some(entry) = self.entries.iter().find(|entry| entry.rel_path == rel_path) else {
+        let Some(entry) = self
+            .entries
+            .iter()
+            .rev()
+            .find(|entry| entry.rel_path == rel_path)
+        else {
             return UndoCheck::NotRecorded;
         };
         if entry.content_hash == current_hash {
@@ -416,101 +429,10 @@ fn resolve_confined_parent(
     Ok((opened_parent, actual_parent_rel))
 }
 
-// TODO(vault-rel-path): unify validate_note_path (write_policy.rs) and validate_undo_rel_path (skills/undo.rs) behind a core VaultRelPath newtype.
+/// Validate a model-authored note path through the single shared note grammar
+/// ([`parse_note_rel_path`]) and return its components for collision handling.
 fn validate_note_path(rel_path: &str) -> CoreResult<Vec<String>> {
-    if rel_path.trim().is_empty()
-        || rel_path.starts_with('/')
-        || rel_path.starts_with('\\')
-        || rel_path.contains('\\')
-        || has_windows_drive_prefix(rel_path)
-    {
-        return Err(CoreError::OutsideVault(rel_path.to_string()));
-    }
-
-    let raw_components: Vec<&str> = rel_path.split('/').collect();
-    if raw_components
-        .iter()
-        .any(|part| part.is_empty() || *part == "." || *part == "..")
-    {
-        return Err(CoreError::OutsideVault(rel_path.to_string()));
-    }
-
-    for component in &raw_components {
-        validate_name(component)?;
-        validate_portable_component(component)?;
-    }
-    let leaf = raw_components
-        .last()
-        .expect("a non-empty path always has a leaf");
-    if !leaf
-        .rsplit_once('.')
-        .is_some_and(|(_, extension)| extension.eq_ignore_ascii_case("md"))
-    {
-        return Err(CoreError::InvalidName(
-            "write_note rel_path must end in .md".into(),
-        ));
-    }
-
-    Ok(raw_components.into_iter().map(str::to_string).collect())
-}
-
-fn validate_portable_component(component: &str) -> CoreResult<()> {
-    if component.starts_with(' ')
-        || component.ends_with(['.', ' '])
-        || component
-            .chars()
-            .any(|character| matches!(character, '<' | '>' | ':' | '"' | '|' | '?' | '*'))
-    {
-        return Err(CoreError::InvalidName(format!(
-            "'{component}' is not a portable vault path component"
-        )));
-    }
-
-    // Win32 also recognises device names when followed by extensions and treats
-    // the ISO-8859-1 superscript digits as COM/LPT port numbers. Trim a space
-    // immediately before the extension so `CON .md` cannot evade that namespace.
-    let basename = component
-        .split('.')
-        .next()
-        .unwrap_or(component)
-        .trim_end_matches(' ');
-    let reserved = matches!(
-        basename.to_ascii_uppercase().as_str(),
-        "CON"
-            | "PRN"
-            | "AUX"
-            | "NUL"
-            | "COM1"
-            | "COM2"
-            | "COM3"
-            | "COM4"
-            | "COM5"
-            | "COM6"
-            | "COM7"
-            | "COM8"
-            | "COM9"
-            | "COM¹"
-            | "COM²"
-            | "COM³"
-            | "LPT1"
-            | "LPT2"
-            | "LPT3"
-            | "LPT4"
-            | "LPT5"
-            | "LPT6"
-            | "LPT7"
-            | "LPT8"
-            | "LPT9"
-            | "LPT¹"
-            | "LPT²"
-            | "LPT³"
-    );
-    if reserved {
-        return Err(CoreError::InvalidName(format!(
-            "'{component}' uses a reserved Windows device name"
-        )));
-    }
-    Ok(())
+    Ok(parse_note_rel_path(rel_path)?.into_components())
 }
 
 fn joined_rel_path(parent_rel: &str, leaf: &str) -> String {
@@ -519,11 +441,6 @@ fn joined_rel_path(parent_rel: &str, leaf: &str) -> String {
     } else {
         format!("{parent_rel}/{leaf}")
     }
-}
-
-fn has_windows_drive_prefix(path: &str) -> bool {
-    let bytes = path.as_bytes();
-    bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
 }
 
 fn suffixed_markdown_name(name: &str, suffix: usize) -> CoreResult<String> {

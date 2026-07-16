@@ -118,25 +118,20 @@ fn validate_url(url: &str) -> Result<(), CaptureError> {
     }
 }
 
-// TODO(path-safety-unify): replace this local rule set with one shared
-// vault-relative path policy.
+/// Validate the `full_source` vault-relative path: the shared vault-relative
+/// grammar, plus this boundary's byte cap and its stricter rejection of *any*
+/// colon (not just a drive prefix), since a stored source path is never a note
+/// name and must stay portable across filesystems.
 fn validate_relative_source_path(path: &str) -> Result<(), CaptureError> {
-    let invalid = path.is_empty()
-        || path.len() > MAX_SOURCE_PATH_BYTES
-        || path.starts_with(['/', '\\'])
-        || path.contains('\\')
+    if path.len() > MAX_SOURCE_PATH_BYTES
         || path.contains(':')
-        || path.chars().any(char::is_control)
-        || path
-            .split('/')
-            .any(|part| part.is_empty() || matches!(part, "." | ".."));
-    if invalid {
-        Err(invalid_source(
+        || !crate::paths::VaultRelPath::is_valid(path)
+    {
+        return Err(invalid_source(
             "nn.source.full_source must be a bounded vault-relative path",
-        ))
-    } else {
-        Ok(())
+        ));
     }
+    Ok(())
 }
 
 fn validate_content_hash(content_hash: &str) -> Result<(), CaptureError> {
