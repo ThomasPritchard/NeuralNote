@@ -26,6 +26,10 @@ jobs:
   webdriver:
     name: WebdriverIO (${{ matrix.platform }})
     runs-on: ${{ matrix.platform }}
+    # windows-latest is chronically flaky (~50%, timeout/startup race) and Windows
+    # is not a supported release target yet, so its result is informational and must
+    # not block merges. ubuntu-latest stays a hard gate. See issue #78.
+    continue-on-error: ${{ matrix.platform == 'windows-latest' }}
     timeout-minutes: 60
     strategy:
       fail-fast: false

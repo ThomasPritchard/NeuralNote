@@ -99,17 +99,17 @@ jobs:
         run: npm run test:browser
 
       - name: Full test suite and 90 percent line coverage
-        if: github.event_name != 'pull_request' && matrix.node == 24
+        if: matrix.node == 24
         working-directory: app/desktop
         run: npm run coverage
 
       - name: Production build
-        if: github.event_name != 'pull_request' && matrix.node == 24
+        if: matrix.node == 24
         working-directory: app/desktop
         run: npm run build
 
       - name: Audit high-severity npm vulnerabilities
-        if: github.event_name != 'pull_request' && matrix.node == 24
+        if: matrix.node == 24
         working-directory: app/desktop
         run: npm run audit:all
 

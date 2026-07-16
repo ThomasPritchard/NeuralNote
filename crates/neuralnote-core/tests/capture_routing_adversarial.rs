@@ -90,3 +90,27 @@ fn valid_individual_routes_cannot_expand_the_encoded_profile_past_its_bound() {
     })
     .is_err());
 }
+
+/// The saved-folder boundary must reject exactly what its peer boundaries
+/// (frontmatter, routing inventory, vault-scheme classification) reject via the
+/// shared portable-path predicate: reserved Windows device names — bare and with
+/// an extension — and any component with a leading space, including one below the
+/// path root. Before this boundary routed through `parse_portable_rel_path` each
+/// of these was silently accepted here while its peers refused them.
+#[test]
+fn profile_rejects_reserved_device_names_and_leading_space_components() {
+    for folder in ["CON", "notes/PRN", "CON.md", "notes/ child"] {
+        let profile = VaultProfile {
+            schema_version: PROFILE_SCHEMA_VERSION,
+            skills: BTreeMap::from([(
+                "youtube-distil".into(),
+                SkillRoutingProfile {
+                    scheme: PersistedVaultScheme::TopicFolders,
+                    default_folder: Some(folder.into()),
+                    moc_policy: MocPolicy::Never,
+                },
+            )]),
+        };
+        assert!(serialize_vault_profile(&profile).is_err(), "{folder:?}");
+    }
+}

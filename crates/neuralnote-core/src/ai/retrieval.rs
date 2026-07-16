@@ -11,7 +11,7 @@ use crate::error::CoreResult;
 use crate::model::{FileHit, NoteDoc, SearchResponse, TreeNode};
 use crate::note::{content_hash, read_note};
 use crate::search::search_vault_with_content;
-use crate::tree::{markdown_files, read_tree};
+use crate::tree::{read_tree, text_note_files};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -36,8 +36,11 @@ pub struct NoteMeta {
 }
 
 /// A vault folder for the model's `list_folders` tool: its vault-relative path and
-/// how many markdown notes live under it (recursively). Lets the model discover the
-/// vault's shape before scoping a search or listing to one folder.
+/// how many text notes live under it (recursively). "Text note" is the same
+/// vocabulary `list_notes` and search use (`is_text_note_ext`: md/markdown/mdx +
+/// txt/text), so this count matches what the model can actually browse and cite in
+/// that folder — never a markdown-only undercount (issue #72). Lets the model
+/// discover the vault's shape before scoping a search or listing to one folder.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FolderMeta {
@@ -84,9 +87,10 @@ pub struct SearchOutcome {
 /// future stays `Send`. Spans come back with a placeholder `id`; the orchestrator's
 /// [`crate::ai::evidence::EvidenceRegistry`] assigns the real citable id.
 pub trait RetrievalProvider: Send + Sync {
-    /// Every markdown note's title + rel_path (metadata only), plus a count of notes
-    /// that could not be read (discovery honesty). `folder`, when `Some`, scopes the
-    /// listing to notes under that folder and its subfolders.
+    /// Every text note's title + rel_path (metadata only) — the same `is_text_note_ext`
+    /// set search covers (md/markdown/mdx + txt/text, issue #72) — plus a count of
+    /// notes that could not be read (discovery honesty). `folder`, when `Some`, scopes
+    /// the listing to notes under that folder and its subfolders.
     fn list_notes(&self, folder: Option<&str>) -> CoreResult<ListOutcome>;
 
     /// Every folder in the vault (rel_path + recursive note count), so the model can
@@ -336,7 +340,7 @@ impl RetrievalProvider for KeywordRetriever {
         let mut total = 0u32;
         let mut read_count = 0usize;
         let mut truncated = false;
-        for node in markdown_files(&tree) {
+        for node in text_note_files(&tree) {
             if !in_scope(&node.rel_path, folder) {
                 continue; // outside the requested folder
             }
@@ -505,14 +509,15 @@ fn in_scope(rel_path: &str, folder: Option<&str>) -> bool {
             .all(|(f, p)| f.eq_ignore_ascii_case(p))
 }
 
-/// Collect every folder in the tree (nested included) with its recursive markdown
-/// note count, preserving `read_tree`'s folders-first ordering.
+/// Collect every folder in the tree (nested included) with its recursive text-note
+/// count (`text_note_files`, matching what `list_notes`/search cover), preserving
+/// `read_tree`'s folders-first ordering.
 fn collect_folders(nodes: &[TreeNode], out: &mut Vec<FolderMeta>) {
     for node in nodes {
         if let Some(children) = &node.children {
             out.push(FolderMeta {
                 rel_path: node.rel_path.clone(),
-                note_count: markdown_files(children).len() as u32,
+                note_count: text_note_files(children).len() as u32,
             });
             collect_folders(children, out);
         }
@@ -524,6 +529,23 @@ mod tests {
     use super::*;
     use crate::model::SearchMatch;
     use std::fs;
+
+    /// True when the test process runs as root (effective UID 0). Reads `geteuid`
+    /// directly — it is always linked into a unix process, so this needs no `libc`
+    /// crate dependency. Used to skip the chmod-`0o000` permission tests under root
+    /// (issue #74): as root, mode `0o000` does NOT block reads, so their precondition
+    /// (an unreadable file) cannot hold — the file stays readable, the skip never
+    /// fires, and the exact-count assertion flakes on CI's root container. Gating on
+    /// non-root keeps each assertion only where it is actually testable.
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        // SAFETY: `geteuid` takes no arguments, only reads the calling process's
+        // effective UID, and cannot fail — it is always safe to call.
+        unsafe { geteuid() == 0 }
+    }
 
     fn vault() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
@@ -597,6 +619,41 @@ mod tests {
         assert!(!out.truncated);
         assert_eq!(out.notes[0].rel_path, "Research/widgets.md");
         assert_eq!(out.notes[0].title, "Widgets"); // first H1
+    }
+
+    #[test]
+    fn list_notes_enumerates_plain_text_notes_end_to_end() {
+        // MOAT (issue #72): search + the reader were unified on the text-note
+        // vocabulary (md/markdown/mdx + txt/text) in #63/#67, so a `.txt`/`.text`
+        // note is already scanned and citable. `list_notes` — the browse tool —
+        // must enumerate the SAME set, or the model can cite a note it cannot
+        // discover. This proves a `.txt` and a `.text` note surface with their
+        // title + rel_path, while a genuine binary/non-text file stays excluded.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("plain.txt"), "# Plain Note\n\nbody\n").unwrap();
+        fs::write(dir.path().join("other.text"), "just text, no heading\n").unwrap();
+        fs::write(dir.path().join("markdowny.md"), "# Marked\n").unwrap();
+        // A binary asset that is NOT a text note must never be listed.
+        fs::write(dir.path().join("image.png"), [0x89, 0x50, 0x4e, 0x47]).unwrap();
+
+        let r = KeywordRetriever::new(dir.path());
+        let out = r.list_notes(None).unwrap();
+
+        let by_path: HashMap<&str, &str> = out
+            .notes
+            .iter()
+            .map(|n| (n.rel_path.as_str(), n.title.as_str()))
+            .collect();
+        // The `.txt` note is enumerable, with its H1 as the title.
+        assert_eq!(by_path.get("plain.txt"), Some(&"Plain Note"));
+        // The `.text` note surfaces too; with no frontmatter/H1 the title is the stem.
+        assert_eq!(by_path.get("other.text"), Some(&"other"));
+        // Markdown still enumerated (no regression).
+        assert_eq!(by_path.get("markdowny.md"), Some(&"Marked"));
+        // The binary asset is excluded exactly as before — no over-widening.
+        assert!(!by_path.contains_key("image.png"));
+        assert_eq!(out.notes.len(), 3);
+        assert_eq!(out.total, 3, "total counts every browsable text note");
     }
 
     #[test]
@@ -683,6 +740,9 @@ mod tests {
     #[cfg(unix)]
     fn list_notes_counts_unreadable_notes_as_skipped() {
         use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return; // chmod 0o000 can't make a file unreadable to root (issue #74)
+        }
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("open.md"), "readable\n").unwrap();
         fs::write(dir.path().join("locked.md"), "secret\n").unwrap();
@@ -741,6 +801,9 @@ mod tests {
     #[cfg(unix)]
     fn search_counts_skipped_unreadable_files() {
         use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            return; // chmod 0o000 can't make a file unreadable to root (issue #74)
+        }
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("locked.md"), "target here\n").unwrap();
         fs::write(dir.path().join("open.md"), "target here\n").unwrap();
@@ -915,6 +978,12 @@ mod tests {
         // file unreadable AFTER the first query pooled its content: the second query
         // still surfaces the note (so it never re-read disk) and counts no skip.
         use std::os::unix::fs::PermissionsExt;
+        if running_as_root() {
+            // The proof hinges on the note being UNREADABLE after pooling; under root
+            // chmod 0o000 leaves it readable, so a disk read would succeed too and the
+            // test could no longer distinguish reuse from a re-read (issue #74).
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("both.md");
         fs::write(&f, "alpha and beta appear together\n").unwrap();
