@@ -20,7 +20,7 @@
     "test:browser": "vitest run --config vitest.browser.config.ts",
     "typecheck:browser": "tsc --noEmit -p tsconfig.browser.json",
     "test:e2e": "vitest run src/e2e",
-    "coverage": "vitest run --coverage",
+    "coverage": "VITEST_COVERAGE=1 vitest run --coverage",
     "audit:all": "npm audit --audit-level=high && npm --prefix e2e-native audit --audit-level=high",
     "gen:bindings": "cargo test --manifest-path ../../Cargo.toml --workspace export",
     "check:bindings": "npm run gen:bindings && git -C ../.. add --intent-to-add -- app/desktop/src/lib/bindings && git -C ../.. diff --exit-code -- app/desktop/src/lib/bindings",
