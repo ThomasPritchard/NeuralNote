@@ -14,6 +14,18 @@ const viewports = [
   { name: "tablet", width: 768, height: 1024 },
   { name: "desktop", width: 1440, height: 960 },
 ];
+const expectedBrandCopy = [
+  "More knowledge, less setup.",
+  "Built for instant use.",
+  "AI-powered knowledge assistant",
+];
+const staleBrandCopy = [
+  /Obsidian/i,
+  /Your notes\. Your AI\. Your choice\./i,
+  /cited AI/i,
+  /Cited recall/i,
+  /zero setup/i,
+];
 const screenshotDir = process.env.BRAND_SCREENSHOT_DIR
   ? resolve(process.env.BRAND_SCREENSHOT_DIR)
   : null;
@@ -53,6 +65,19 @@ async function waitForServer() {
   throw new Error(`Timed out waiting for Vite.\n${serverOutput}`);
 }
 
+async function revealFullPage(page, viewportHeight) {
+  const pageHeight = await page.evaluate(() => document.documentElement.scrollHeight);
+  const step = Math.max(320, Math.floor(viewportHeight * 0.75));
+
+  for (let y = 0; y < pageHeight; y += step) {
+    await page.evaluate((scrollY) => window.scrollTo(0, scrollY), y);
+    await page.waitForTimeout(80);
+  }
+
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.waitForTimeout(160);
+}
+
 let browser;
 
 try {
@@ -82,6 +107,21 @@ try {
       const fontFamily = await wordmark.evaluate((element) => getComputedStyle(element).fontFamily);
       assert.match(fontFamily, /Geist/i, `${landing}/${viewport.name}: wordmark should render in Geist`);
 
+      const visibleCopy = await page.locator("body").innerText();
+      for (const expected of expectedBrandCopy) {
+        assert.ok(
+          visibleCopy.includes(expected),
+          `${landing}/${viewport.name}: expected visible copy to include ${JSON.stringify(expected)}`,
+        );
+      }
+      for (const stale of staleBrandCopy) {
+        assert.doesNotMatch(
+          visibleCopy,
+          stale,
+          `${landing}/${viewport.name}: visible copy still matches stale branding ${String(stale)}`,
+        );
+      }
+
       const hasHorizontalOverflow = await page.evaluate(
         () => document.documentElement.scrollWidth > document.documentElement.clientWidth,
       );
@@ -92,6 +132,7 @@ try {
       );
 
       if (screenshotDir) {
+        await revealFullPage(page, viewport.height);
         await page.screenshot({
           path: resolve(screenshotDir, `${landing}-${viewport.name}.png`),
           fullPage: true,
