@@ -1,22 +1,21 @@
-// Shared marketing copy for the landing-page directions. Honest to the spec —
-// no fabricated testimonials, logos, or user counts. Claims here are real
-// product positioning (BYO-key, Obsidian-compatible, full-source cited recall).
+// Shared marketing copy for the landing-page directions. Honest to the spec:
+// no fabricated testimonials, logos, or user counts.
 
 export const hero = {
-  eyebrow: "Desktop · bring your own API key",
-  headline: "The second brain that actually read your sources.",
-  sub: "Throw in anything — a YouTube lecture, a PDF, an article, a half-formed thought — and get back one clean, queryable, cited knowledge base. No filing, no setup. Just open your vault.",
+  eyebrow: "Built for instant use.",
+  headline: "More knowledge, less setup.",
+  sub: "Your AI-powered knowledge assistant. Open your Markdown vault and start. NeuralNote helps you capture, organise, search and understand your knowledge without assembling the workflow yourself.",
   ctaPrimary: "Download for desktop",
   ctaSecondary: "See how it works",
-  note: "macOS · Windows · Linux. Free, local-first. Bring your own key.",
+  note: "Works with your existing Markdown vault. macOS · Windows · Linux.",
 };
 
 export const problem = {
-  title: "Obsidian hands you an empty room and a hardware store.",
-  body: "The filing system, the plugins, the capture pipelines — all yours to assemble. That assembly is the hump most people never get over. Neural Note's thesis is simple: the assembly is the product. The AI does the filing you'd otherwise do by hand.",
+  title: "A complete knowledge workflow, built on files you own.",
+  body: "Open your Markdown vault and start. NeuralNote brings capture, organisation, search and understanding together in one ready-made workflow.",
 };
 
-// capture → distil → cite
+// capture -> organise -> understand
 export const loop = [
   {
     step: "01",
@@ -25,56 +24,56 @@ export const loop = [
   },
   {
     step: "02",
-    title: "AI distils & files it",
-    body: "A clean title, summary, tags, and links — inferred for you. The full source is kept, not just the note you typed.",
+    title: "Your assistant organises it",
+    body: "NeuralNote creates a clear title, summary, tags and links while keeping the source connected to your note.",
   },
   {
     step: "03",
-    title: "Ask, with citations",
-    body: "Question your whole library. Every claim links back to the exact chunk or timestamp it came from.",
+    title: "Ask what you know",
+    body: "Ask across your whole library. Every answer stays connected to your notes and sources so you can check the context.",
   },
 ];
 
 export const pillars = [
   {
     key: "capture",
-    title: "Universal capture, zero setup",
-    body: "Any form goes in the same brain — video, article, PDF, typed brain-dump. No macros, no templates, no config. The organising you'd never do by hand is done for you.",
+    title: "Capture anything",
+    body: "Bring videos, articles, PDFs and typed thoughts into one knowledge workflow. Start with useful defaults and shape it as your library grows.",
   },
   {
     key: "recall",
-    title: "Cited recall — the part nobody else nails",
-    body: "Ask across everything you've captured, not one note at a time. Each answer is grounded in the full source and linked to the exact chunk or timestamp. A wrong citation never reaches you — every one is verified before it's shown.",
+    title: "Answers connected to your sources",
+    body: "Ask across everything you've captured, not one note at a time. Each answer stays linked to the relevant source context, with references verified before they are shown.",
     highlight: true,
   },
   {
     key: "own",
-    title: "Your vault, your files",
-    body: "Local-first markdown with YAML frontmatter, fully Obsidian-compatible. Migrating is just opening the folder. Walk away whenever you like and lose nothing.",
+    title: "Markdown files you own",
+    body: "Your library stays in open Markdown with YAML frontmatter. Open an existing vault, keep your familiar structure and take your files with you whenever you like.",
   },
 ];
 
-// Honest differentiation (the three-part moat) — not "we capture the source".
+// Customer-centred differentiation without naming another product.
 export const why = {
-  title: "Why this beats staying in Obsidian",
+  title: "Useful from the first vault",
   points: [
-    "It knows the full sources behind your notes, so it answers questions you never wrote down.",
-    "One opinionated capture → distil → cite loop that swallows any input — no toolkit to assemble.",
-    "Your library lives in your own files on disk, not someone else's cloud.",
+    "A complete knowledge workflow is ready when you open your Markdown vault.",
+    "Your assistant organises what you capture and helps you understand it.",
+    "Answers stay connected to your notes and sources while your library remains in files you own.",
   ],
 };
 
-// Stated honestly, up front (spec Section 3) — a trust signal, not fine print.
+// Stated honestly, up front: a trust signal, not fine print.
 export const privacy = {
   title: "Yours, and honest about it.",
-  body: "“Local-first” describes where your files live, not where your content goes. In this version, source content is sent to the AI and embedding providers you choose, to distil and to answer. Your files stay on disk; we tell you exactly what leaves the machine. Fully-local AI is a later option.",
+  body: "Local-first describes where your files live, not where your content goes. In this version, source content is sent to the AI and embedding providers you choose so your assistant can organise and answer. Your files stay on disk, and we tell you exactly what leaves the machine. Fully local AI is a later option.",
 };
 
 export const finalCta = {
-  title: "Move your brain in. Lose nothing.",
-  sub: "Open your existing Obsidian vault and start asking it questions today.",
+  title: "More knowledge, less setup.",
+  sub: "Open your Markdown vault and start.",
   cta: "Download for desktop",
-  note: "Free and local-first · bring your own API key",
+  note: "AI-powered · Markdown-compatible · local-first · bring your own key",
 };
 
-export const nav = ["How it works", "Cited recall", "Own your data", "Download"];
+export const nav = ["How it works", "Connected answers", "Own your data", "Download"];

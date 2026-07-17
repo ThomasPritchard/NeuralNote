@@ -74,9 +74,19 @@ function Reveal({
   );
 }
 
-function Eyebrow({ children, icon: Icon }: { children: ReactNode; icon?: LucideIcon }) {
+function Eyebrow({
+  children,
+  icon: Icon,
+  preserveCase = false,
+}: {
+  children: ReactNode;
+  icon?: LucideIcon;
+  preserveCase?: boolean;
+}) {
   return (
-    <span className="nn-mono inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.035] px-3.5 py-1.5 text-[10.5px] font-medium uppercase tracking-[0.22em] text-primary backdrop-blur-md">
+    <span
+      className={`nn-mono inline-flex items-center gap-2 rounded-full border border-white/10 bg-white/[0.035] px-3.5 py-1.5 text-[10.5px] font-medium tracking-[0.22em] text-primary backdrop-blur-md ${preserveCase ? "" : "uppercase"}`}
+    >
       {Icon ? (
         <Icon className="size-3" aria-hidden />
       ) : (
@@ -245,7 +255,7 @@ export default function LandingGalaxy() {
 
           <div className="relative z-10 mx-auto flex max-w-3xl flex-col items-center text-center">
             <Reveal>
-              <Eyebrow>{hero.eyebrow}</Eyebrow>
+              <Eyebrow preserveCase>{hero.eyebrow}</Eyebrow>
             </Reveal>
 
             <Reveal delay={90} className="mt-7">
@@ -273,7 +283,7 @@ export default function LandingGalaxy() {
           </div>
         </section>
 
-        {/* ── The loop: capture → distil → cite ──────────────────────────── */}
+        {/* ── The loop: capture -> organise -> understand ────────────────── */}
         <section id="how" className="relative scroll-mt-28 px-6 py-28 sm:py-36">
           <Glow className="left-1/2 top-0 h-72 w-[40rem] -translate-x-1/2 opacity-60" />
           <div className="relative mx-auto max-w-6xl">
@@ -283,13 +293,13 @@ export default function LandingGalaxy() {
               </Reveal>
               <Reveal delay={80} className="mt-6">
                 <h2 className="nn-heading text-3xl font-semibold tracking-[-0.02em] sm:text-4xl lg:text-5xl">
-                  One loop, from anything to answers.
+                  Your assistant is ready when you are.
                 </h2>
               </Reveal>
               <Reveal delay={150} className="mt-5">
                 <p className="text-base leading-relaxed text-muted-foreground sm:text-lg">
-                  No filing, no plugins to wire up. Throw a source in and the work you'd never do by
-                  hand is already done.
+                  Capture a source or thought, and NeuralNote turns it into knowledge you can find,
+                  ask about and understand.
                 </p>
               </Reveal>
             </div>
@@ -330,17 +340,17 @@ export default function LandingGalaxy() {
           </div>
         </section>
 
-        {/* ── Pillars — cited recall is the centrepiece ──────────────────── */}
+        {/* ── Pillars: the assistant is the product; sources build trust ─── */}
         <section id="recall" className="relative scroll-mt-28 px-6 py-28 sm:py-36">
           <Glow className="right-0 top-1/4 h-80 w-80 opacity-50" />
           <div className="relative mx-auto max-w-6xl">
             <div className="max-w-2xl">
               <Reveal>
-                <Eyebrow>Why it's different</Eyebrow>
+                <Eyebrow>Ready from day one</Eyebrow>
               </Reveal>
               <Reveal delay={80} className="mt-6">
                 <h2 className="nn-heading text-3xl font-semibold tracking-[-0.02em] sm:text-4xl lg:text-5xl">
-                  Three things it gets right.
+                  A complete workflow, built in.
                 </h2>
               </Reveal>
             </div>
@@ -362,7 +372,7 @@ export default function LandingGalaxy() {
           </div>
         </section>
 
-        {/* ── Why it beats Obsidian — editorial split ────────────────────── */}
+        {/* ── Customer-centred product value ─────────────────────────────── */}
         <section id="own" className="relative scroll-mt-28 px-6 py-28 sm:py-36">
           <Glow className="left-0 top-1/3 h-72 w-72 opacity-40" />
           <div className="relative mx-auto grid max-w-6xl gap-12 lg:grid-cols-[0.9fr_1.1fr] lg:gap-20">
@@ -466,7 +476,7 @@ export default function LandingGalaxy() {
               <BrandLockup />
             </a>
             <p className="nn-mono text-[11px] uppercase tracking-[0.16em] text-muted-foreground/70">
-              macOS · Windows · Linux — free, local-first, BYO key
+              macOS · Windows · Linux · free · local-first · BYO key
             </p>
           </div>
         </footer>
@@ -475,7 +485,7 @@ export default function LandingGalaxy() {
   );
 }
 
-/* ── Cited-recall centrepiece: the moat, made visible ─────────────────────── */
+/* ── Connected-answer centrepiece: trust made visible ────────────────────── */
 
 function RecallCard() {
   const recall = pillars.find((p) => p.highlight)!;
@@ -489,7 +499,7 @@ function RecallCard() {
               <Quote className="size-5" aria-hidden />
             </span>
             <span className="nn-mono rounded-full border border-primary/25 bg-primary/12 px-3 py-1 text-[10px] uppercase tracking-[0.18em] text-primary">
-              The moat
+              Trust built in
             </span>
           </div>
 
@@ -500,18 +510,18 @@ function RecallCard() {
             {recall.body}
           </p>
 
-          {/* illustrative retrieval visualisation — echoes the app's cited chat */}
+          {/* Illustrative retrieval visualisation showing connected sources. */}
           <div
             aria-hidden
             className="relative mt-auto rounded-[1.4rem] border border-white/10 bg-black/25 p-2 ring-1 ring-white/[0.04]"
           >
             <div className="rounded-[1.05rem] border border-white/[0.06] bg-card/70 p-4 backdrop-blur-md sm:p-5">
               <p className="text-sm leading-relaxed text-foreground/85">
-                Grounded in the exact source it came from
+                Connected to the exact source it came from{" "}
                 <sup className="nn-mono mx-1 inline-grid size-4 -translate-y-px place-items-center rounded bg-primary/20 text-[10px] font-medium text-primary ring-1 ring-inset ring-primary/30">
                   1
                 </sup>
-                — verified before you ever see it.
+                {" "}and verified before you ever see it.
               </p>
               <div className="mt-5 flex flex-col gap-2.5">
                 {[

@@ -1,6 +1,6 @@
 // ── Landing direction · "Product hero" ──────────────────────────────────────
 // Product-led marketing page for NeuralNote. The hero is a stylised app-window
-// mock of the real 3-pane workspace (vault · reader · cited chat), so the
+// mock of the real 3-pane workspace (vault · reader · connected answers), so the
 // product itself carries the page. Editorial minimalism adapted to the project's
 // dark-indigo / violet tokens: big confident type, generous whitespace, flat
 // 1px-bordered cards, restrained accent, the violet glow reserved for the mock
@@ -76,7 +76,7 @@ function TopNav() {
   const links = nav.filter((n) => n !== "Download");
   const anchors: Record<string, string> = {
     "How it works": "#how",
-    "Cited recall": "#recall",
+    "Connected answers": "#recall",
     "Own your data": "#own",
   };
   return (
@@ -129,7 +129,7 @@ function Hero() {
       />
 
       <div className="relative mx-auto max-w-3xl text-center">
-        <span className="lp-rise nn-mono inline-flex items-center gap-2 rounded-full border border-border bg-card/60 px-3 py-1 text-[11px] uppercase tracking-[0.14em] text-muted-foreground">
+        <span className="lp-rise nn-mono inline-flex items-center gap-2 rounded-full border border-border bg-card/60 px-3 py-1 text-[11px] tracking-[0.14em] text-muted-foreground">
           <span className="size-1.5 rounded-full bg-primary shadow-[0_0_8px_1px_var(--color-primary)]" />
           {hero.eyebrow}
         </span>
@@ -244,7 +244,7 @@ function VaultPane() {
         <TreeItem icon={Newspaper} label="Building a Second Brain" />
       </TreeFolder>
       <TreeFolder name="Ideas">
-        <TreeItem icon={Type} label="Why citation fidelity is the moat" />
+        <TreeItem icon={Type} label="Why source connection builds trust" />
       </TreeFolder>
 
       <div className="mt-auto flex items-center gap-2 rounded-md border border-border bg-background/40 px-2.5 py-2 text-[11px] text-muted-foreground">
@@ -331,7 +331,7 @@ function ReaderPane() {
 
       <p className="mt-4 max-w-[52ch] text-[13.5px] leading-6 text-muted-foreground">
         The Transformer drops recurrence entirely, relying only on self-attention to draw global
-        dependencies — so training parallelises across the whole sequence.
+        dependencies, so training parallelises across the whole sequence.
       </p>
 
       <div className="mt-5 overflow-hidden rounded-lg border border-primary/25 border-l-2 border-l-primary bg-accent/30">
@@ -364,7 +364,7 @@ function ChatPane() {
         <span className="grid size-6 place-items-center rounded-md bg-primary text-primary-foreground shadow-[0_0_14px_-3px_var(--color-primary)]">
           <Sparkles className="size-3.5" aria-hidden />
         </span>
-        <span className="nn-heading text-[13px] font-semibold">Cited recall</span>
+        <span className="nn-heading text-[13px] font-semibold">Connected answers</span>
         <span className="ml-auto inline-flex items-center gap-1 rounded-full border border-border bg-background/50 px-2 py-0.5 text-[10px] text-muted-foreground">
           <Database className="size-3 text-primary" aria-hidden />
           168 sources
@@ -487,7 +487,7 @@ function Loop() {
   return (
     <section id="how" className="border-t border-border/60 px-6 py-24">
       <div className="mx-auto max-w-6xl">
-        <SectionHeading eyebrow="How it works" title="One loop, from anything to a cited answer." />
+        <SectionHeading eyebrow="How it works" title="One workflow, with your assistant built in." />
 
         <ol className="mt-12 grid gap-px overflow-hidden rounded-xl border border-border bg-border md:grid-cols-3">
           {loop.map((step, i) => {
@@ -532,12 +532,12 @@ function Pillars() {
       />
       <div className="relative mx-auto max-w-6xl">
         <SectionHeading
-          eyebrow="What you get"
-          title="Three things, done for you — one of them nobody else nails."
+          eyebrow="Ready from day one"
+          title="A complete workflow, built in."
         />
 
         <div className="mt-12 grid gap-5 lg:grid-cols-5">
-          {/* the moat — centrepiece */}
+          {/* source connection is the trust centrepiece */}
           {highlight && (
             <article className="relative overflow-hidden rounded-xl border border-primary/30 bg-card p-8 lg:col-span-3 lg:p-9">
               <div
@@ -553,7 +553,7 @@ function Pillars() {
               <div className="relative">
                 <span className="inline-flex items-center gap-1.5 rounded-full bg-primary/15 px-2.5 py-1 text-[11px] font-medium text-primary ring-1 ring-inset ring-primary/25">
                   <Quote className="size-3" aria-hidden />
-                  The moat
+                  Trust built in
                 </span>
                 <h3 className="nn-heading mt-5 text-[22px] font-semibold leading-tight tracking-tight">
                   {highlight.title}
@@ -593,7 +593,7 @@ function Pillars() {
   );
 }
 
-// Small cited-answer visual proving the moat inside the highlight pillar.
+// Small connected-answer visual showing the trust evidence inside the highlight pillar.
 function CitedAnswerMini() {
   return (
     <div className="mt-7 rounded-lg border border-border bg-background/60 p-4">
@@ -603,7 +603,7 @@ function CitedAnswerMini() {
         <span className="nn-mono ml-auto text-[10px] text-muted-foreground">verified before shown</span>
       </div>
       <p className="text-[13px] leading-6 text-foreground/90">
-        Once training parallelises, you can pour in far more compute — and loss keeps falling as a
+        Once training parallelises, you can pour in far more compute, and loss keeps falling as a
         power law
         <Marker n={3} />.
       </p>
@@ -623,13 +623,13 @@ function CitedAnswerMini() {
   );
 }
 
-/* ─────────────────────────  Why it beats Obsidian  ─────────────────────── */
+/* ─────────────────────────  Customer-centred product value  ───────────── */
 
 function Why() {
   return (
     <section id="own" className="border-t border-border/60 px-6 py-24">
       <div className="mx-auto grid max-w-6xl gap-12 lg:grid-cols-[1fr_1.1fr] lg:items-center">
-        <SectionHeading eyebrow="Versus Obsidian" title={why.title} className="lg:max-w-none" />
+        <SectionHeading eyebrow="Built around your knowledge" title={why.title} className="lg:max-w-none" />
 
         <ul className="flex flex-col divide-y divide-border/70">
           {why.points.map((point) => (
@@ -726,7 +726,7 @@ function Footer() {
       <div className="mx-auto flex max-w-6xl flex-col items-center justify-between gap-4 sm:flex-row">
         <BrandLockup />
         <p className="nn-mono text-[12px] text-muted-foreground/70">
-          Local-first · Obsidian-compatible · bring your own key
+          AI-powered · Markdown-compatible · local-first · bring your own key
         </p>
       </div>
     </footer>

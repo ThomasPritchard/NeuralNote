@@ -16,7 +16,24 @@ Production raster assets derived from the approved note-tab identity board.
 - `icons/` — app icon exports from 16–1024 px
 - `marks/` — transparent mark exports from 16–1024 px
 
-`preview.png` is a visual proof sheet. `reference-brand-board.png` preserves the approved source direction. `build_assets.py` reproducibly derives the pack from a transparent master mark.
+`preview.png` is a visual proof sheet. `reference-brand-board.png` preserves the original approved identity construction and remains a historical source; use the generated brand pack for current messaging. `build_assets.py` reproducibly derives the pack from a transparent master mark.
+
+## Positioning
+
+NeuralNote is an AI-powered knowledge assistant built on files the user owns.
+
+Use this messaging hierarchy:
+
+1. Primary tagline: `More knowledge, less setup.`
+2. Supporting line: `Built for instant use.`
+3. Category: `Your AI-powered knowledge assistant.`
+4. Explainer: `A complete knowledge workflow, built on files you own.`
+5. Trust message: `Every answer stays connected to your notes and sources.`
+6. Compatibility proof: `Works with your existing Markdown vault.`
+
+Public brand copy should make the product's ready-made workflow clear without naming or attacking a competitor. Do not use `zero setup`, `cited AI`, or `cited recall` as primary marketing language. Citations and source links are evidence that the assistant can be trusted, not the product category.
+
+Technical documentation may describe the exact Obsidian-compatible Markdown, YAML, and vault contracts when that detail helps a user or contributor.
 
 ## Palette
 

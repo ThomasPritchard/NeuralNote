@@ -20,7 +20,7 @@ import { finalCta, hero, loop, nav, pillars, privacy, why } from "./content";
 
    The boldest of the three landings: an animated, pure-CSS violet/indigo
    "aurora" hero (layered blurred radial blobs that drift + pulse), big
-   expressive type, then the product payoff (a stylised cited-recall answer
+   expressive type, then the product payoff (a stylised connected answer
    panel) further down. No 3D, no libraries — all motion is CSS keyframes.
 
    Rendered inside [data-direction="neuralnote"], so every colour is a token
@@ -40,7 +40,7 @@ const headlineSweep =
 
 const sectionAnchors: Record<string, string> = {
   "How it works": "#how-it-works",
-  "Cited recall": "#cited-recall",
+  "Connected answers": "#cited-recall",
   "Own your data": "#own-your-data",
 };
 
@@ -176,7 +176,7 @@ function Hero() {
       />
 
       <div className="relative mx-auto flex w-full max-w-5xl flex-col items-center text-center">
-        <p className="lg-rise nn-mono inline-flex items-center gap-2 rounded-full border border-border bg-background/50 px-3.5 py-1.5 text-[11px] uppercase tracking-[0.18em] text-muted-foreground backdrop-blur">
+        <p className="lg-rise nn-mono inline-flex items-center gap-2 rounded-full border border-border bg-background/50 px-3.5 py-1.5 text-[11px] tracking-[0.18em] text-muted-foreground backdrop-blur">
           <Sparkles className="size-3.5 text-primary" aria-hidden />
           {hero.eyebrow}
         </p>
@@ -185,14 +185,13 @@ function Hero() {
           className="lg-rise nn-heading mt-7 max-w-5xl text-balance font-semibold leading-[0.95] tracking-tight"
           style={{ animationDelay: "80ms", fontSize: "clamp(2.75rem, 6.5vw, 5.25rem)" }}
         >
-          The second brain that{" "}
+          More knowledge,{" "}
           <span
             className="bg-clip-text text-transparent"
             style={{ backgroundImage: headlineSweep, WebkitBackgroundClip: "text", backgroundClip: "text" }}
           >
-            actually read
-          </span>{" "}
-          your sources.
+            less setup.
+          </span>
         </h1>
 
         <p
@@ -231,7 +230,7 @@ function Hero() {
 }
 
 /* ───────────────────────────── The loop ───────────────────────────────────
-   capture → distil → cite, three connected steps. */
+   capture -> organise -> understand, three connected steps. */
 
 const loopIcons = [FilePlus2, Sparkles, Quote];
 
@@ -241,8 +240,8 @@ function LoopSection() {
       <div className="mx-auto w-full max-w-6xl">
         <SectionHeading
           kicker="One opinionated loop"
-          title="Throw it in. Get back a queryable brain."
-          intro="No filing system to build, no plugins to wire. Three steps run on everything you capture."
+          title="Your assistant is ready when you are."
+          intro="Capture a source or thought, and NeuralNote turns it into knowledge you can find, ask about and understand."
         />
 
         <ol className="mt-14 flex flex-col gap-4 md:flex-row md:items-stretch md:gap-3">
@@ -281,8 +280,8 @@ function LoopSection() {
 }
 
 /* ─────────────────────────────── Pillars ──────────────────────────────────
-   Gapless bento (ported from the Galaxy direction). Cited-recall — the moat —
-   is the large centrepiece and carries the "grounded in the exact source"
+   Gapless bento (ported from the Galaxy direction). Connected answers are
+   the large centrepiece and carry the "connected to the exact source"
    mini-viz; the two table-stakes pillars fill the right column. Rendered in
    the Gradient token idiom (blob glows, border tokens) so it reads as one page. */
 
@@ -300,14 +299,14 @@ function PillarsSection() {
       />
       <div className="mx-auto w-full max-w-6xl">
         <div className="max-w-2xl">
-          <Eyebrow>Why it's different</Eyebrow>
+          <Eyebrow>Ready from day one</Eyebrow>
           <h2 className="nn-heading mt-5 text-balance text-3xl font-semibold leading-[1.05] tracking-tight sm:text-4xl">
-            Three things it gets right.
+            A complete workflow, built in.
           </h2>
         </div>
 
         <div className="mt-14 grid gap-4 lg:grid-cols-3 lg:grid-rows-2">
-          {/* centrepiece — the moat */}
+          {/* centrepiece: the trust evidence */}
           <article className="group relative flex flex-col overflow-hidden rounded-[1.6rem] border border-primary/35 bg-card/80 p-7 sm:p-9 lg:col-span-2 lg:row-span-2">
             <div
               className="pointer-events-none absolute -right-16 -top-16 h-64 w-64 rounded-full blur-3xl"
@@ -319,7 +318,7 @@ function PillarsSection() {
                 <Quote className="size-5" aria-hidden />
               </span>
               <span className="nn-mono rounded-full bg-primary/15 px-2.5 py-1 text-[10px] font-semibold uppercase tracking-[0.16em] text-primary ring-1 ring-inset ring-primary/25">
-                The moat
+                Trust built in
               </span>
             </div>
 
@@ -353,9 +352,9 @@ function PillarsSection() {
   );
 }
 
-// Illustrative retrieval visualisation — echoes the app's cited chat. Decorative
+// Illustrative retrieval visualisation echoing the app's connected answers. Decorative
 // (percentages are placeholder UI, not real data), so the whole block is hidden
-// from assistive tech; the moat copy above carries the real message.
+// from assistive tech; the copy above carries the real message.
 const vizSources = [
   { n: 1, src: "transcript", score: 96 },
   { n: 2, src: "article", score: 91 },
@@ -369,11 +368,11 @@ function GroundedSourceViz() {
       aria-hidden
     >
       <p className="text-[13px] leading-relaxed text-foreground/90">
-        Grounded in the exact source it came from
+        Connected to the exact source it came from{" "}
         <sup className="nn-mono mx-1 inline-grid size-4 -translate-y-px place-items-center rounded bg-primary/20 text-[10px] font-medium text-primary ring-1 ring-inset ring-primary/30">
           1
         </sup>
-        — verified before you ever see it.
+        {" "}and verified before you ever see it.
       </p>
 
       <div className="flex flex-col gap-2.5">
@@ -400,9 +399,9 @@ function GroundedSourceViz() {
   );
 }
 
-/* ─────────────────────── Why it beats Obsidian ────────────────────────────
+/* ─────────────────────── Customer-centred product value ──────────────────
    Editorial split (ported from the Galaxy direction): big heading left, the
-   three honest points stacked right, each with a circular check. */
+   three product points stacked right, each with a circular check. */
 
 function WhySection() {
   return (
