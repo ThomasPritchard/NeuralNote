@@ -145,7 +145,7 @@ describe("Journey 10: full-text vault search", () => {
     expect(text.indexOf("Zebra alpha.md")).toBeLessThan(text.indexOf("Apple.md"));
   });
 
-  it("surfaces a search failure in the toast and the panel — never silent", async () => {
+  it("surfaces a search failure through the shared toast — never silent", async () => {
     const { user, backend } = await openVault([
       { kind: "file", relPath: "Note.md", content: "searchable body" },
     ]);
@@ -154,11 +154,8 @@ describe("Journey 10: full-text vault search", () => {
     await user.click(screen.getByRole("button", { name: "Search" }));
     await user.type(await screen.findByLabelText("Search vault"), "body");
 
-    // The shared toast carries the backend message …
+    // The shared toast carries the backend message through the real IPC path.
+    // (The panel's inline failed state is pinned in SearchPanel.test.tsx.)
     expect(await screen.findByText("disk exploded")).toBeInTheDocument();
-    // … and the panel shows an inline failed state (not "no results").
-    expect(
-      screen.getByText("Search failed. See the error notice for details."),
-    ).toBeInTheDocument();
   });
 });

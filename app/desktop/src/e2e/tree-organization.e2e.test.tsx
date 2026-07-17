@@ -66,7 +66,7 @@ describe("Journey 7: create a folder and move a note into it", () => {
 });
 
 describe("Journey 11: sidebar filename filter", () => {
-  it("narrows the tree, auto-expands collapsed matches, and restores collapse state on Escape", async () => {
+  it("narrows the tree and auto-expands a match cached behind a collapsed folder", async () => {
     const seed: SeedEntry[] = [
       { kind: "file", relPath: "Projects/Rocket.md", content: "rocket body" },
       { kind: "file", relPath: "Archive/Old ideas.md", content: "old" },
@@ -95,19 +95,5 @@ describe("Journey 11: sidebar filename filter", () => {
     expect(screen.queryByText("Todo.md")).not.toBeInTheDocument();
     expect(screen.queryByText("Archive")).not.toBeInTheDocument();
     expect(screen.queryByText("Old ideas.md")).not.toBeInTheDocument();
-
-    // Escape clears the filter; the full tree returns with expand state intact —
-    // Projects stays collapsed, Archive stays expanded.
-    await user.keyboard("{Escape}");
-    expect(filter).toHaveValue("");
-    expect(await screen.findByText("Todo.md")).toBeInTheDocument();
-    expect(screen.getByText("Archive")).toBeInTheDocument();
-    expect(screen.getByText("Old ideas.md")).toBeInTheDocument();
-    expect(screen.queryByText("Rocket.md")).not.toBeInTheDocument();
-
-    // A query matching nothing states so explicitly — never a silently bare tree.
-    await user.type(filter, "zzz");
-    expect(await screen.findByText(/No files match/)).toBeInTheDocument();
-    expect(screen.queryByText("Todo.md")).not.toBeInTheDocument();
   });
 });

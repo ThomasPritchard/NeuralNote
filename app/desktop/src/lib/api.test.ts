@@ -232,14 +232,6 @@ describe("skills-bank wrappers", () => {
     await expect(result).resolves.toBe("skill-run-7");
   });
 
-  it("returns the run id produced by chat", async () => {
-    mockInvoke.mockResolvedValueOnce("skill-run-7");
-
-    const result: Promise<string> = chat(TURN_ID, "file this", [], vi.fn());
-
-    await expect(result).resolves.toBe("skill-run-7");
-  });
-
   it("defaults chat activeSkills to an empty list", async () => {
     await chat(TURN_ID, "hello", [], vi.fn());
 

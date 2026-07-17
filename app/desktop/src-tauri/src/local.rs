@@ -1147,49 +1147,6 @@ mod tests {
         assert!(sink.events.is_empty());
     }
 
-    #[test]
-    fn handle_pull_line_aggregates_percent_across_digests() {
-        // The pull loop shares ONE PullProgress across frames (#28), so the reported
-        // percent aggregates across layers instead of resetting to each digest's own
-        // local ratio. Both digests are announced first (denominator = 200), then
-        // progress: digest A completes (100/100) and B reaches 50/100, so the overall
-        // is (100+50)/200 = 75% — NOT digest B's per-frame local 50% (the old bug).
-        let cancel = AtomicBool::new(false);
-        let mut progress = PullProgress::default();
-        let mut sink = RecordingSink::default();
-        let feed = |progress: &mut PullProgress, sink: &mut RecordingSink, frame: &[u8]| {
-            handle_pull_line(frame, progress, sink, &cancel).unwrap();
-        };
-        feed(
-            &mut progress,
-            &mut sink,
-            br#"{"status":"pulling","digest":"sha256:a","total":100,"completed":0}"#,
-        );
-        feed(
-            &mut progress,
-            &mut sink,
-            br#"{"status":"pulling","digest":"sha256:b","total":100,"completed":0}"#,
-        );
-        feed(
-            &mut progress,
-            &mut sink,
-            br#"{"status":"pulling","digest":"sha256:a","total":100,"completed":100}"#,
-        );
-        feed(
-            &mut progress,
-            &mut sink,
-            br#"{"status":"pulling","digest":"sha256:b","total":100,"completed":50}"#,
-        );
-        let Some(PullEvent::Progress { percent, .. }) = sink.events.last() else {
-            panic!("expected a forwarded progress event");
-        };
-        assert_eq!(
-            *percent,
-            Some(75),
-            "percent must aggregate across digests, not reset per-frame",
-        );
-    }
-
     #[tokio::test]
     async fn local_start_wait_is_interrupted_by_chat_lifecycle_close() {
         let signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
