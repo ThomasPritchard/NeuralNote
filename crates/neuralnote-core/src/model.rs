@@ -109,6 +109,19 @@ pub struct NoteDoc {
     /// Content is shown rather than hidden, but some bytes became U+FFFD replacement
     /// characters; the reader surfaces a notice so the degradation is never silent.
     pub lossy_text: bool,
+    /// True when the note is larger than the editable limit
+    /// ([`crate::note::MAX_EDITABLE_NOTE_BYTES`]). Like a binary doc, `body`/`raw`
+    /// are empty and the content is never marshalled across the IPC boundary:
+    /// mounting a single multi-megabyte line in the editor freezes the webview
+    /// (issue #82). The file on disk is untouched — the UI shows an explicit,
+    /// recoverable size-limit state keyed off this flag, and editing/saving is
+    /// disabled. Because `raw` is empty, AI citation verification against such a
+    /// note fails closed (the span cannot match), which surfaces as an unverified
+    /// citation rather than a wrong one.
+    pub exceeds_editable_size: bool,
+    /// On-disk size in bytes, populated when `exceeds_editable_size` is true so
+    /// the UI can state the note's actual size; 0 otherwise.
+    pub size_bytes: u64,
 }
 
 /// One markdown template available for note creation.

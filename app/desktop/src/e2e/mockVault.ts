@@ -53,6 +53,7 @@ import {
   extOf,
   hashContent,
   isMarkdownExt,
+  MAX_EDITABLE_NOTE_BYTES,
   normalizeAbsPath,
   parentOf,
   parseFrontmatter,
@@ -93,7 +94,10 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
   const failures = new Map<string, CoreErrorLike>();
   const calls: string[] = [];
   let destroyed = false;
-  let workspaceState: WorkspaceState = { openPaths: [], activePath: null };
+  let workspaceState: WorkspaceState = opts.workspaceState ?? {
+    openPaths: [],
+    activePath: null,
+  };
   const openedYoutubeUrls: string[] = [];
   const now = opts.now ?? new Date(2026, 0, 2, 15, 4, 5);
 
@@ -197,8 +201,30 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
       contentHash: hashContent(raw),
       binary: false,
       lossyText: false,
+      exceedsEditableSize: false,
+      sizeBytes: 0,
     };
   };
+
+  /** Mirror of core `note.rs` build_oversized_doc (issue #82): past the
+   *  editable byte limit the read returns a flagged doc with NO content —
+   *  the editor would freeze mounting it. Nothing is written; the file's
+   *  bytes stay exactly as seeded. */
+  const buildOversizedDoc = (path: string, sizeBytes: number): NoteDoc => ({
+    path,
+    relPath: relOf(path),
+    title: stemOf(path),
+    frontmatter: null,
+    frontmatterRaw: null,
+    frontmatterError: null,
+    body: "",
+    raw: "",
+    contentHash: "",
+    binary: false,
+    lossyText: false,
+    exceedsEditableSize: true,
+    sizeBytes,
+  });
 
   /** Re-key `from` (and, for a folder, every descendant) to `to`, content intact. */
   const rekey = (from: string, to: string): void => {
@@ -347,7 +373,14 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
       }
       case "read_note": {
         const path = a.path as string;
-        return buildDoc(path, requireFile(path).content);
+        const file = requireFile(path);
+        // Mirror of the core read-side cap (issue #82): over the editable
+        // limit, the flagged size-limit doc goes out instead of the content.
+        const sizeBytes = new TextEncoder().encode(file.content).length;
+        if (sizeBytes > MAX_EDITABLE_NOTE_BYTES) {
+          return buildOversizedDoc(path, sizeBytes);
+        }
+        return buildDoc(path, file.content);
       }
       case "write_note": {
         const path = a.path as string;

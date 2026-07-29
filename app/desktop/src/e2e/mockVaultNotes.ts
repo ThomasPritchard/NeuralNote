@@ -31,6 +31,10 @@ export const ensureMd = (name: string): string => {
 export const isMarkdownExt = (ext: string | null): boolean =>
   ext === "md" || ext === "markdown" || ext === "mdx";
 
+/** Mirror of core `note.rs` MAX_EDITABLE_NOTE_BYTES: past this many bytes a
+ *  read returns the flagged, content-free size-limit doc (issue #82). */
+export const MAX_EDITABLE_NOTE_BYTES = 8 * 1024 * 1024;
+
 /** Stable, deterministic fingerprint that changes with content (djb2). */
 export const hashContent = (s: string): string => {
   let h = 5381;

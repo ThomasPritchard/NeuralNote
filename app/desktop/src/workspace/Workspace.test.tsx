@@ -323,6 +323,8 @@ function makeTab(path: string, over: Partial<NoteTab> = {}): NoteTab {
       contentHash: "hash",
       binary: false,
       lossyText: false,
+      exceedsEditableSize: false,
+      sizeBytes: 0,
     },
     sessionHash: "hash",
     loading: false,

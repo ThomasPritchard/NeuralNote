@@ -151,6 +151,90 @@ mod tests {
     }
 
     #[test]
+    fn read_note_keeps_a_note_at_the_exact_editable_limit_editable() {
+        // The boundary is shared with the write side: exactly MAX bytes is a
+        // legitimate editable note and must read through with full content.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("exact.md");
+        let content = "x".repeat(note::MAX_EDITABLE_NOTE_BYTES);
+        fs::write(&f, &content).unwrap();
+
+        let doc = note::read_note(dir.path(), &f).unwrap();
+        assert!(!doc.exceeds_editable_size);
+        assert_eq!(doc.size_bytes, 0);
+        assert_eq!(doc.raw.len(), note::MAX_EDITABLE_NOTE_BYTES);
+        assert!(!doc.content_hash.is_empty());
+    }
+
+    #[test]
+    fn read_note_flags_a_note_over_the_editable_limit_without_marshalling_content() {
+        // Issue #82: one byte past the limit the content must stay OFF the wire —
+        // mounting a single 8 MiB line in the editor freezes the webview. The doc
+        // is flagged with the on-disk size so the UI can show an explicit
+        // size-limit state; the file itself is never touched.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("Oversized editable note.md");
+        let original = vec![b'x'; note::MAX_EDITABLE_NOTE_BYTES + 1];
+        fs::write(&f, &original).unwrap();
+
+        let doc = note::read_note(dir.path(), &f).unwrap();
+        assert!(doc.exceeds_editable_size);
+        assert_eq!(doc.size_bytes as usize, note::MAX_EDITABLE_NOTE_BYTES + 1);
+        assert!(!doc.binary && !doc.lossy_text);
+        assert!(doc.raw.is_empty() && doc.body.is_empty());
+        assert!(doc.content_hash.is_empty(), "no hash of content never read");
+        assert_eq!(doc.title, "Oversized editable note");
+        // The bytes on disk are byte-for-byte intact — reading never rewrites.
+        assert_eq!(fs::read(&f).unwrap(), original);
+    }
+
+    #[test]
+    fn read_note_flags_an_oversized_non_utf8_text_note_as_oversized_not_lossy() {
+        // The size cap is checked before any decode: an oversized non-UTF-8 text
+        // note must not be lossy-decoded into an 8 MiB+ string of U+FFFD.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("latin1-big.md");
+        let mut bytes = vec![0xE9; note::MAX_EDITABLE_NOTE_BYTES]; // Latin-1 é, invalid UTF-8
+        bytes.push(b'x');
+        fs::write(&f, &bytes).unwrap();
+
+        let doc = note::read_note(dir.path(), &f).unwrap();
+        assert!(doc.exceeds_editable_size);
+        assert!(!doc.lossy_text && !doc.binary);
+        assert!(doc.raw.is_empty());
+    }
+
+    #[test]
+    fn read_note_still_treats_an_oversized_binary_attachment_as_binary() {
+        // Precedence: a non-text file that isn't valid UTF-8 stays a no-preview
+        // binary doc regardless of size — the binary branch wins over the size cap.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("big.png");
+        let mut bytes = vec![0xFF; note::MAX_EDITABLE_NOTE_BYTES];
+        bytes.push(0xFE);
+        fs::write(&f, &bytes).unwrap();
+
+        let doc = note::read_note(dir.path(), &f).unwrap();
+        assert!(doc.binary);
+        assert!(!doc.exceeds_editable_size);
+    }
+
+    #[test]
+    fn read_note_flags_an_oversized_valid_utf8_attachment_too() {
+        // The cap applies to ANY document that would otherwise be marshalled as
+        // editable text — a valid-UTF-8 non-note file (e.g. a huge exported
+        // `.json`) would freeze the editor exactly like an oversized note.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("export.json");
+        fs::write(&f, vec![b'x'; note::MAX_EDITABLE_NOTE_BYTES + 1]).unwrap();
+
+        let doc = note::read_note(dir.path(), &f).unwrap();
+        assert!(doc.exceeds_editable_size);
+        assert!(!doc.binary);
+        assert!(doc.raw.is_empty());
+    }
+
+    #[test]
     fn full_document_write_preserves_bom_mixed_endings_tabs_and_trailing_space() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("n.md");

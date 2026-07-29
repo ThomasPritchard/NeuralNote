@@ -51,6 +51,8 @@ fn build_doc(root: &Path, path: &Path, raw: String, lossy: bool) -> NoteDoc {
         raw,
         binary: false,
         lossy_text: lossy,
+        exceeds_editable_size: false,
+        size_bytes: 0,
     }
 }
 
@@ -74,6 +76,37 @@ fn build_binary_doc(root: &Path, path: &Path) -> NoteDoc {
         raw: String::new(),
         binary: true,
         lossy_text: false,
+        exceeds_editable_size: false,
+        size_bytes: 0,
+    }
+}
+
+/// Build a [`NoteDoc`] for a note larger than [`MAX_EDITABLE_NOTE_BYTES`]. Like
+/// a binary doc, the content stays off the wire entirely (`body`/`raw` empty,
+/// no content hash): marshalling a multi-megabyte document — and worse,
+/// mounting it in the editor, where a single gigantic line is pathological for
+/// wrapping and the markdown parse — freezes the webview (issue #82). The file
+/// on disk is never touched; the UI keys an explicit size-limit state off
+/// `exceeds_editable_size` and states the real size from `size_bytes`.
+fn build_oversized_doc(root: &Path, path: &Path, size_bytes: u64) -> NoteDoc {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    NoteDoc {
+        path: path.to_string_lossy().into_owned(),
+        rel_path: rel_path(root, path),
+        title: stem,
+        frontmatter: None,
+        frontmatter_raw: None,
+        frontmatter_error: None,
+        content_hash: String::new(),
+        body: String::new(),
+        raw: String::new(),
+        binary: false,
+        lossy_text: false,
+        exceeds_editable_size: true,
+        size_bytes,
     }
 }
 
@@ -117,6 +150,16 @@ pub fn read_note(root: &Path, target: &Path) -> CoreResult<NoteDoc> {
     // path) skips this validation scan and decodes exactly once below.
     if !is_text_note(&path) && std::str::from_utf8(&bytes).is_err() {
         return Ok(build_binary_doc(root, &path));
+    }
+    // A note past the editable byte limit is flagged and its content kept off
+    // the wire: mounting it in the editor would freeze the webview (issue #82).
+    // Checked BEFORE the lossy decode below so an oversized non-UTF-8 note is
+    // never decoded into a multi-MB string either. The boundary mirrors the
+    // write side exactly (`> MAX_EDITABLE_NOTE_BYTES`), so any doc that would
+    // be rejected on save is never opened editable. Nothing is written — the
+    // file on disk is untouched.
+    if bytes.len() > MAX_EDITABLE_NOTE_BYTES {
+        return Ok(build_oversized_doc(root, &path, bytes.len() as u64));
     }
     // A text note (`.md`/`.txt`) in some other encoding (Windows-1252/Latin-1 from
     // a migrated vault) is decoded lossily so its content is SHOWN, never hidden,

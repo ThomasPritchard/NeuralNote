@@ -47,6 +47,19 @@ function doc(path: string, raw = `# ${path}`): NoteDoc {
     contentHash: `hash:${raw}`,
     binary: false,
     lossyText: false,
+    exceedsEditableSize: false,
+    sizeBytes: 0,
+  };
+}
+
+/** The doc the backend returns for a note over the editable byte limit
+ *  (issue #82): flagged, with the on-disk size, and NO content on the wire. */
+function oversizedDoc(path: string, sizeBytes = 8 * 1024 * 1024 + 1): NoteDoc {
+  return {
+    ...doc(path, ""),
+    contentHash: "",
+    exceedsEditableSize: true,
+    sizeBytes,
   };
 }
 
@@ -513,5 +526,108 @@ describe("useNoteTabs external-change reload", () => {
 
     unmount();
     expect(unlisten).toHaveBeenCalled();
+  });
+});
+
+describe("useNoteTabs oversized notes (issue #82)", () => {
+  it("settles an oversized note into a terminal size-limit state — never stuck loading", async () => {
+    mockInvoke.mockImplementation((command) => {
+      if (command === "read_note") {
+        return Promise.resolve(oversizedDoc("/v/big.md")) as never;
+      }
+      return Promise.resolve(undefined) as never;
+    });
+    const { result } = renderHook(() => useNoteTabs());
+
+    act(() => result.current.open("/v/big.md"));
+    await waitFor(() => expect(result.current.active.loading).toBe(false));
+
+    // Terminal state with NO content on the wire: this is what lets the
+    // workspace-restore gate complete instead of stalling on a frozen tab.
+    const active = result.current.active;
+    expect(active.error).toBeNull();
+    expect(active.note?.exceedsEditableSize).toBe(true);
+    expect(active.note?.raw).toBe("");
+    expect(active.draft).toBe("");
+    expect(active.dirty).toBe(false);
+  });
+
+  it("never issues a write for an oversized note — the file on disk can't be clobbered", async () => {
+    mockInvoke.mockImplementation((command) => {
+      if (command === "read_note") {
+        return Promise.resolve(oversizedDoc("/v/big.md")) as never;
+      }
+      return Promise.resolve(undefined) as never;
+    });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/big.md"));
+    await waitFor(() => expect(result.current.active.loading).toBe(false));
+
+    // Even if a save is triggered, the oversized doc's empty draft must never
+    // reach write_note — it would overwrite the multi-MB file with "".
+    await act(() => result.current.active.save());
+    expect(mockInvoke).not.toHaveBeenCalledWith("write_note", expect.anything());
+  });
+
+  it("adopts the size-limit state on a clean tab whose file grew past the limit externally", async () => {
+    vi.useFakeTimers();
+    let grew = false;
+    mockInvoke.mockImplementation((command) => {
+      if (command === "read_note") {
+        return Promise.resolve(
+          grew ? oversizedDoc("/v/a.md") : doc("/v/a.md", "A"),
+        ) as never;
+      }
+      return Promise.resolve(undefined) as never;
+    });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await drainMicrotasks();
+    expect(result.current.active.draft).toBe("A");
+
+    grew = true; // an external process balloons the file past the limit
+    const handler = treeChangedHandler();
+    await act(async () => {
+      handler();
+      await vi.advanceTimersByTimeAsync(300);
+    });
+
+    // The clean tab follows disk into the terminal size-limit state — no
+    // editor mount, no spinner, and nothing written back.
+    expect(result.current.active.loading).toBe(false);
+    expect(result.current.active.note?.exceedsEditableSize).toBe(true);
+    expect(result.current.active.draft).toBe("");
+    expect(mockInvoke).not.toHaveBeenCalledWith("write_note", expect.anything());
+  });
+
+  it("preserves a dirty draft when the file grew past the limit externally", async () => {
+    vi.useFakeTimers();
+    let grew = false;
+    mockInvoke.mockImplementation((command) => {
+      if (command === "read_note") {
+        return Promise.resolve(
+          grew ? oversizedDoc("/v/a.md") : doc("/v/a.md", "A"),
+        ) as never;
+      }
+      return Promise.resolve(undefined) as never;
+    });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await drainMicrotasks();
+    act(() => result.current.active.setDraft("my unsaved work"));
+
+    grew = true;
+    const handler = treeChangedHandler();
+    await act(async () => {
+      handler();
+      await vi.advanceTimersByTimeAsync(300);
+    });
+
+    // Unsaved work is never clobbered by the flag: same conflict as any
+    // external change, draft intact, the editable base note kept.
+    expect(result.current.active.conflict).toBe(true);
+    expect(result.current.active.draft).toBe("my unsaved work");
+    expect(result.current.active.dirty).toBe(true);
+    expect(result.current.active.note?.exceedsEditableSize).toBe(false);
   });
 });

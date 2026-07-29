@@ -17,6 +17,7 @@ import type {
   RecentVault,
   SkillListing,
   UndoReport,
+  WorkspaceState,
 } from "../lib/types";
 
 export const VAULT_ROOT = "/vault";
@@ -65,6 +66,10 @@ export interface CreateMockVaultOptions {
   pickFolder?: string | null;
   /** What the "new vault location" folder picker returns (null = cancelled). */
   pickNewLocation?: string | null;
+  /** Seed the persisted workspace tab state `load_workspace_state` returns on
+   *  vault open (defaults to no open tabs) — drives the workspace-restore
+   *  journeys as if the app were relaunched with these tabs previously open. */
+  workspaceState?: WorkspaceState;
   /** The AI key status `api_key_status`/`ai_status` report. Defaults to a key
    *  present so a test lands straight in the chat view; pass `{ hasKey: false }`
    *  to exercise the first-run provider picker (and, through it, guided key

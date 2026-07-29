@@ -145,6 +145,12 @@ export function useNoteTabs(): NoteTabsController {
   const persist = useCallback(async (overwrite: boolean) => {
     const tab = stateRef.current.tabs.find((item) => item.id === stateRef.current.activeTabId);
     if (!tab?.note || tab.saving || savingTabIds.current.has(tab.id)) return;
+    // A doc whose content never reached the webview (binary attachment, or a
+    // note over the editable byte limit — issue #82) has an empty draft that
+    // is NOT the file's content; writing it would clobber the file on disk.
+    // These docs never mount an editor, so this is defence in depth behind
+    // the hidden Save button / disabled menu item.
+    if (tab.note.binary || tab.note.exceedsEditableSize) return;
     if (tab.preservationError) {
       const revision = tab.saveRevision + 1;
       dispatch({ type: "save-start", id: tab.id, revision });
