@@ -87,12 +87,18 @@ Marker visibility follows these rules:
 
 1. Reveal all syntax markers for the enclosing construct or active line when
    the caret or selection enters it.
-2. Hide or soften markers only when the complete construct is outside every
+2. A structural delimiter that has a dedicated non-textual rendering is exempt
+   from rule 1 and stays hidden while the caret is inside its construct. This
+   applies only to Markdown table cell delimiters and the table's alignment
+   row. Every such construct must offer a keyboard-reachable command that
+   reveals its literal source on request, and its source must still be produced
+   by copy, cut, and drag under rule 5.
+3. Hide or soften markers only when the complete construct is outside every
    selection.
-3. Never hide malformed, ambiguous, or partially typed syntax.
-4. Copy, cut, paste, drag, undo, redo, and selection operate on source text,
+4. Never hide malformed, ambiguous, or partially typed syntax.
+5. Copy, cut, paste, drag, undo, redo, and selection operate on source text,
    not widget labels.
-5. A decoration failure removes the decoration and leaves the source editable.
+6. A decoration failure removes the decoration and leaves the source editable.
 
 Initial rendered constructs are:
 
@@ -100,7 +106,9 @@ Initial rendered constructs are:
 - emphasis, strong emphasis, strikethrough, and inline code;
 - ordered and unordered lists, task checkboxes, and blockquotes;
 - fenced code, thematic breaks, standard links, and inert image treatments;
-- Markdown tables supported by the maintained parser;
+- Markdown tables supported by the maintained parser, rendered as bordered
+  cells over their own source rather than as a replacement widget, so the
+  table is editable in place;
 - Obsidian wikilinks, aliases, heading and block fragments, and embeds;
 - Obsidian callout markers and block IDs where a conservative decoration is
   possible without changing source.
