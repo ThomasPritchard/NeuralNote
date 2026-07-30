@@ -84,11 +84,18 @@ function toDecorationSet(
   return Decoration.set(ranges, true);
 }
 
-function tableDecorationSet(
+interface TableDecorationResult {
+  readonly decorations: DecorationSet;
+  readonly error: string | null;
+}
+
+function tableDecorationResult(
   state: EditorState,
   visibleRanges: readonly VisibleRange[],
-): DecorationSet {
-  if (visibleRanges.length === 0) return Decoration.none;
+): TableDecorationResult {
+  if (visibleRanges.length === 0) {
+    return { decorations: Decoration.none, error: null };
+  }
   const scanRanges = mergeVisibleRanges(visibleRanges, state.doc.length, TABLE_SCAN_MARGIN);
   const result = safeCollectMarkdownPreview(state, scanRanges);
   const ranges = result.decorations.flatMap((item) => item.table
@@ -98,18 +105,22 @@ function tableDecorationSet(
         block: true,
       }).range(item.from, item.to)]
     : []);
-  return Decoration.set(ranges, true);
+  return {
+    decorations: Decoration.set(ranges, true),
+    error: result.error,
+  };
 }
 
 interface TableDecorationState {
   readonly decorations: DecorationSet;
+  readonly error: string | null;
   readonly visibleRanges: readonly VisibleRange[];
 }
 
 const sourceEditorTableDecorations = StateField.define<TableDecorationState>({
   create(state) {
     const visibleRanges = [{ from: 0, to: Math.min(state.doc.length, INITIAL_TABLE_SCAN_LIMIT) }];
-    return { decorations: tableDecorationSet(state, visibleRanges), visibleRanges };
+    return { ...tableDecorationResult(state, visibleRanges), visibleRanges };
   },
   update(value, transaction) {
     const viewport = transaction.effects.find((effect) => effect.is(updateSourceEditorTableViewport));
@@ -120,14 +131,38 @@ const sourceEditorTableDecorations = StateField.define<TableDecorationState>({
         to: transaction.changes.mapPos(to, 1),
       }));
     }
-    if (!transaction.docChanged && !transaction.selection && !viewport) return value;
+    if (
+      !transaction.docChanged
+      && !transaction.selection
+      && !transaction.reconfigured
+      && !viewport
+    ) return value;
     return {
       visibleRanges,
-      decorations: tableDecorationSet(transaction.state, visibleRanges),
+      ...tableDecorationResult(transaction.state, visibleRanges),
     };
   },
   provide: (field) => EditorView.decorations.from(field, (value) => value.decorations),
 });
+
+type PreviewErrorChannel = "inline" | "table";
+
+function createPreviewErrorReporter(
+  onError: (message: string | null) => void,
+): (channel: PreviewErrorChannel, message: string | null) => void {
+  const errors: Record<PreviewErrorChannel, string | null> = {
+    inline: null,
+    table: null,
+  };
+  let lastReported: string | null | undefined;
+  return (channel, message) => {
+    errors[channel] = message;
+    const combined = errors.table ?? errors.inline;
+    if (combined === lastReported) return;
+    lastReported = combined;
+    onError(combined);
+  };
+}
 
 const sourceEditorTableViewport = ViewPlugin.fromClass(class {
   private rangeKey = "";
@@ -168,6 +203,26 @@ export function sourceEditorDecorations(
   onError: (message: string | null) => void,
   options: SourceEditorDecorationOptions = {},
 ): Extension {
+  const reportError = createPreviewErrorReporter(onError);
+  const tableErrorPlugin = ViewPlugin.fromClass(class {
+    private error: string | null;
+
+    constructor(view: EditorView) {
+      this.error = view.state.field(sourceEditorTableDecorations).error;
+      reportError("table", this.error);
+    }
+
+    update(update: ViewUpdate): void {
+      const error = update.state.field(sourceEditorTableDecorations).error;
+      if (error === this.error) return;
+      this.error = error;
+      reportError("table", error);
+    }
+
+    destroy(): void {
+      reportError("table", null);
+    }
+  });
   const keyboardLinkHandler = Prec.highest(EditorView.domEventHandlers({
     keydown(event) {
       if (
@@ -192,7 +247,11 @@ export function sourceEditorDecorations(
       decorations: DecorationSet;
 
       constructor(view: EditorView) {
-        this.decorations = toDecorationSet(view, onError, options);
+        this.decorations = toDecorationSet(
+          view,
+          (message) => reportError("inline", message),
+          options,
+        );
       }
 
       update(update: ViewUpdate): void {
@@ -206,8 +265,16 @@ export function sourceEditorDecorations(
           || update.focusChanged
           || linksChanged
         ) {
-          this.decorations = toDecorationSet(update.view, onError, options);
+          this.decorations = toDecorationSet(
+            update.view,
+            (message) => reportError("inline", message),
+            options,
+          );
         }
+      }
+
+      destroy(): void {
+        reportError("inline", null);
       }
     },
     {
@@ -241,6 +308,7 @@ export function sourceEditorDecorations(
   return [
     sourceEditorTableDecorations,
     sourceEditorTableViewport,
+    tableErrorPlugin,
     keyboardLinkHandler,
     previewPlugin,
   ];

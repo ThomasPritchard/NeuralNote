@@ -1,12 +1,15 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { EditorSelection, EditorState } from "@codemirror/state";
+import { EditorSelection, EditorState, StateEffect } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import { describe, expect, it, vi } from "vitest";
 
 import {
   collectMarkdownPreview,
   safeCollectMarkdownPreview,
+  sourceEditorDecorations,
   type PreviewDecoration,
 } from "./sourceEditorDecorations";
+import * as previewModule from "./sourceEditorDecorationsPreview";
 
 function state(doc: string, ranges: Array<{ anchor: number; head?: number }> = [{ anchor: doc.length }]) {
   return EditorState.create({
@@ -236,5 +239,83 @@ describe("sourceEditorDecorations", () => {
 
     expect(result.decorations).toEqual([]);
     expect(result.error).toBe("Live preview is temporarily unavailable. Your source is unchanged.");
+  });
+
+  it("reports a table-decoration failure through the preview error callback", async () => {
+    const originalSafeCollect = previewModule.safeCollectMarkdownPreview;
+    const collect = vi.spyOn(previewModule, "safeCollectMarkdownPreview");
+    collect
+      .mockReturnValueOnce({
+        decorations: [],
+        error: "Live preview is temporarily unavailable. Your source is unchanged.",
+      })
+      .mockImplementation(originalSafeCollect);
+    const onError = vi.fn();
+    const view = new EditorView({
+      state: EditorState.create({
+        doc: "| A |\n| - |\n| B |",
+        extensions: [
+          markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+          sourceEditorDecorations(onError),
+        ],
+      }),
+      parent: document.body,
+    });
+
+    try {
+      await Promise.resolve();
+
+      expect(onError).toHaveBeenCalledWith(
+        "Live preview is temporarily unavailable. Your source is unchanged.",
+      );
+
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "\n" } });
+      await Promise.resolve();
+
+      expect(onError).toHaveBeenLastCalledWith(null);
+    } finally {
+      view.destroy();
+      collect.mockRestore();
+    }
+  });
+
+  it("recomputes a retained table error before reporting to reconfigured callbacks", () => {
+    const originalSafeCollect = previewModule.safeCollectMarkdownPreview;
+    const collect = vi.spyOn(previewModule, "safeCollectMarkdownPreview");
+    collect
+      .mockReturnValueOnce({
+        decorations: [],
+        error: "Live preview is temporarily unavailable. Your source is unchanged.",
+      })
+      .mockImplementation(originalSafeCollect);
+    const firstOnError = vi.fn();
+    const view = new EditorView({
+      state: EditorState.create({
+        doc: "| A |\n| - |\n| B |",
+        extensions: [
+          markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+          sourceEditorDecorations(firstOnError),
+        ],
+      }),
+      parent: document.body,
+    });
+
+    try {
+      const nextOnError = vi.fn();
+      view.dispatch({
+        effects: StateEffect.reconfigure.of([
+          markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+          sourceEditorDecorations(nextOnError),
+        ]),
+      });
+
+      expect(nextOnError).not.toHaveBeenCalledWith(
+        "Live preview is temporarily unavailable. Your source is unchanged.",
+      );
+      expect(nextOnError).toHaveBeenLastCalledWith(null);
+    } finally {
+      view.destroy();
+      collect.mockRestore();
+    }
   });
 });
