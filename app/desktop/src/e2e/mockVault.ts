@@ -494,6 +494,17 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     clearFailure(cmd) {
       failures.delete(cmd);
     },
+    applyExternalEdit(relPath, content) {
+      requireFile(resolveVaultPath(relPath)).content = content;
+    },
+    applyExternalDelete(relPath) {
+      const abs = resolveVaultPath(relPath);
+      if (!entries.has(abs)) fail("notFound", `${abs} not found`);
+      // eslint-disable-next-line unicorn/no-useless-spread -- snapshot keys before the loop mutates `entries`, avoiding mutate-during-iteration.
+      for (const key of [...entries.keys()]) {
+        if (key === abs || key.startsWith(`${abs}/`)) entries.delete(key);
+      }
+    },
     expireElicitation() {
       chatRuntime.expireElicitation();
     },

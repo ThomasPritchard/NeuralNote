@@ -150,6 +150,15 @@ export interface MockVault {
   /** Force a command to reject with the given error (until cleared). */
   setFailure: (cmd: string, error: CoreErrorLike) => void;
   clearFailure: (cmd: string) => void;
+  /** Mutate a file OUTSIDE the IPC seam, exactly as another editor (Obsidian,
+   *  a git pull, a sync) would: no command is logged and no event is emitted —
+   *  the test then plays the notify watcher's ping itself with
+   *  `await emit("vault://tree-changed")`. Fails loudly on a missing file: a
+   *  mis-scripted journey must never read as a silent no-op. */
+  applyExternalEdit: (relPath: string, content: string) => void;
+  /** External-deletion counterpart of {@link applyExternalEdit}: removes the
+   *  file (or folder subtree) without logging a command or emitting an event. */
+  applyExternalDelete: (relPath: string) => void;
   /** End the parked run as the shell's elicitation TIMEOUT would — per spec
    *  §3.4 the timeout ends the RUN, not the QUESTION. The question is retired
    *  unanswered (a late `answer_elicitation` on its id rejects notFound,
