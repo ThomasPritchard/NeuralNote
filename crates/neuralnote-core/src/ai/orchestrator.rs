@@ -432,7 +432,8 @@ impl ChatSession<'_> {
         // model can't emit a tool call that streaming would silently swallow.
         // The answer turn carries all accumulated evidence, so it is the send most
         // likely to overflow a small local window — budget it before streaming.
-        let budgeted = fit_prompt_to_window(&messages, self.model);
+        let budgeted =
+            fit_prompt_to_window(&messages, self.model, self.llm.context_window_tokens());
         coverage.truncated |= budgeted.lost;
         let (answer, thinking_count) = {
             let mut counting_sink = ThinkingCounter {
@@ -516,7 +517,8 @@ impl ChatSession<'_> {
             // send, so a dense-script vault can't push the grounding out of a small
             // local window (see `fit_prompt_to_window`). Only the request is trimmed;
             // the persistent `messages` accumulator is left intact for the loop.
-            let budgeted = fit_prompt_to_window(messages, self.model);
+            let budgeted =
+                fit_prompt_to_window(messages, self.model, self.llm.context_window_tokens());
             coverage.truncated |= budgeted.lost;
             // This tool-DECIDING turn is idempotent (no tool has run yet), so a single
             // transient transport failure is retried once rather than aborting the run.
@@ -1211,12 +1213,17 @@ fn prepare_history(history: &[LlmMessage]) -> Vec<LlmMessage> {
 // assembled prompt against the active model's window in *tokens* right before each send,
 // deterministically dropping the OLDEST evidence/history while always preserving the
 // grounding prefix and the newest evidence, and reporting any loss so it is never silent.
+//
+// The window comes from the client (`LlmClient::context_window_tokens`): the local
+// client reports the `num_ctx` it sends to Ollama; a cloud client reports the model's
+// catalogue `context_length` when the shell's cache knows it. An UNKNOWN window (a
+// cloud model the catalogue never listed) is deliberately inert — the char guards
+// remain its ceiling — because a guessed window is worse than none.
 
-/// The local (Ollama) context window in tokens. Mirrors the shell's `OLLAMA_NUM_CTX`
-/// (app/desktop/src-tauri/src/local.rs) — the value the sidecar is told to size its
-/// window to. The core can't import it (host crate), so it is duplicated here with this
-/// cross-reference; every curated local model supports it.
-const LOCAL_CONTEXT_WINDOW_TOKENS: usize = 32_768;
+/// The local (Ollama) context window in tokens — the SAME constant the shell sends
+/// as `num_ctx` ([`crate::ai::local::OLLAMA_NUM_CTX`]), so the budget and the window
+/// Ollama actually enforces can never drift apart.
+const LOCAL_CONTEXT_WINDOW_TOKENS: usize = crate::ai::local::OLLAMA_NUM_CTX as usize;
 
 /// Tokens held back from the window for the streamed answer, which shares the same
 /// `num_ctx`. Mirrors [`crate::ai::openai::ANSWER_MAX_TOKENS`].
@@ -1283,13 +1290,13 @@ fn total_tokens(messages: &[LlmMessage]) -> usize {
     messages.iter().map(message_tokens).sum()
 }
 
-/// The active model's context window in tokens, or `None` when this layer can't (and
-/// needn't) clamp it. Only the local (Ollama) provider has the small fixed window that
-/// silently front-truncates, and the shell refuses any non-curated local tag — so a
-/// curated tag here IS the local path. Cloud (OpenRouter) ids never match the curated
-/// list; their window is large, lives in the OpenRouter catalogue (unreachable from this
-/// network-free core), and their cost is already bounded by the char guards — so cloud
-/// returns `None` and is left to those guards.
+/// The curated-local fallback window, used only when the client did not report one
+/// (a non-shell host running a curated local model). Only the local (Ollama)
+/// provider has the small fixed window that silently front-truncates, and the shell
+/// refuses any non-curated local tag — so a curated tag here IS the local path.
+/// Cloud (OpenRouter) ids never match the curated list: their window is whatever the
+/// client reports from the catalogue (`context_length`), or unknown — and unknown
+/// stays inert under the char guards, never guessed.
 fn context_window_tokens(model: &str) -> Option<usize> {
     crate::ai::local::is_curated_model(model).then_some(LOCAL_CONTEXT_WINDOW_TOKENS)
 }
@@ -1302,14 +1309,24 @@ struct BudgetOutcome {
 }
 
 /// Budget the fully assembled prompt to the active model's context window (see the
-/// section comment above [`LOCAL_CONTEXT_WINDOW_TOKENS`]). Grounding (the leading system
-/// prefix) and the newest evidence are always preserved; the oldest history/evidence is
-/// dropped deterministically as whole protocol units; a lone evidence span larger than
-/// the whole window is head-truncated with an explicit marker rather than allowed to push
-/// grounding out. Cloud models are returned unchanged. The persistent `messages`
+/// section comment above [`LOCAL_CONTEXT_WINDOW_TOKENS`]). The window is the one the
+/// client reports it will actually enforce (`reported_window` — the local `num_ctx`,
+/// or a cloud model's catalogue `context_length`), falling back to the curated-local
+/// default when the client reports none. Grounding (the leading system prefix) and
+/// the newest evidence are always preserved; the oldest history/evidence is dropped
+/// deterministically as whole protocol units; a lone evidence span larger than the
+/// whole window is head-truncated with an explicit marker rather than allowed to push
+/// grounding out. A prompt whose window is unknown (a cloud model absent from the
+/// catalogue cache) is returned unchanged — inert-with-reason, left to the char
+/// guards that bound cloud cost. Trimming only ever REMOVES content, so budgeting
+/// can never increase what a call would have sent. The persistent `messages`
 /// accumulator is never mutated — this returns the trimmed copy for one request.
-fn fit_prompt_to_window(messages: &[LlmMessage], model: &str) -> BudgetOutcome {
-    let Some(window) = context_window_tokens(model) else {
+fn fit_prompt_to_window(
+    messages: &[LlmMessage],
+    model: &str,
+    reported_window: Option<usize>,
+) -> BudgetOutcome {
+    let Some(window) = reported_window.or_else(|| context_window_tokens(model)) else {
         return BudgetOutcome {
             messages: messages.to_vec(),
             lost: false,
@@ -1601,6 +1618,9 @@ mod tests {
         /// streamed answer turn is never retried).
         streaming_error: Mutex<Option<CoreError>>,
         streaming_attempts: std::sync::atomic::AtomicUsize,
+        /// The context window this client reports for the active provider+model
+        /// (None = unknown, like a cloud model absent from the catalogue cache).
+        context_window: Option<usize>,
     }
 
     impl MockLlmClient {
@@ -1618,6 +1638,7 @@ mod tests {
                 pending_complete_errors: Mutex::new(VecDeque::new()),
                 streaming_error: Mutex::new(None),
                 streaming_attempts: std::sync::atomic::AtomicUsize::new(0),
+                context_window: None,
             }
         }
 
@@ -1635,7 +1656,16 @@ mod tests {
                 pending_complete_errors: Mutex::new(VecDeque::new()),
                 streaming_error: Mutex::new(None),
                 streaming_attempts: std::sync::atomic::AtomicUsize::new(0),
+                context_window: None,
             }
+        }
+
+        /// Report `window` as the active model's context window, like a client that
+        /// knows its provider's real limit (the shell's local `num_ctx`, or a cloud
+        /// model's catalogue `context_length`).
+        fn with_context_window(mut self, window: usize) -> Self {
+            self.context_window = Some(window);
+            self
         }
 
         /// Script the first N `complete` calls to fail with these errors (in order),
@@ -1682,6 +1712,10 @@ mod tests {
 
     #[async_trait]
     impl LlmClient for MockLlmClient {
+        fn context_window_tokens(&self) -> Option<usize> {
+            self.context_window
+        }
+
         async fn complete(&self, req: &LlmRequest) -> CoreResult<Completion> {
             let request_chars = serde_json::to_string(&req.messages).unwrap().len();
             self.max_request_chars
@@ -3396,8 +3430,12 @@ mod tests {
     // silently front-truncated — dropping the grounding, breaking cited recall.
     // `fit_prompt_to_window` budgets the assembled prompt in *tokens* before send.
 
-    fn input_budget() -> usize {
-        LOCAL_CONTEXT_WINDOW_TOKENS - ANSWER_RESERVE_TOKENS - PROMPT_OVERHEAD_TOKENS
+    fn input_budget(window: usize) -> usize {
+        window - ANSWER_RESERVE_TOKENS - PROMPT_OVERHEAD_TOKENS
+    }
+
+    fn local_input_budget() -> usize {
+        input_budget(LOCAL_CONTEXT_WINDOW_TOKENS)
     }
 
     fn evidence_round(round: usize, body: String) -> [LlmMessage; 2] {
@@ -3430,16 +3468,93 @@ mod tests {
     }
 
     #[test]
-    fn fit_prompt_to_window_is_inert_for_cloud_models() {
-        // Cloud windows are large and bounded by the char guards; this layer leaves
-        // them untouched so cloud cost ceilings stay intact.
+    fn fit_prompt_to_window_is_inert_for_a_cloud_model_with_unknown_window() {
+        // A cloud model whose window the client could not report is left untouched
+        // (inert-with-reason, never guessed): the char guards remain its cost ceiling,
+        // so budgeting never INCREASES what a cloud call would have sent.
         let messages = vec![
             LlmMessage::system("grounding"),
             LlmMessage::user("配".repeat(1_000_000)),
         ];
-        let out = fit_prompt_to_window(&messages, "anthropic/claude-sonnet-4.5");
+        let out = fit_prompt_to_window(&messages, "anthropic/claude-sonnet-4.5", None);
         assert!(!out.lost);
         assert_eq!(out.messages, messages);
+    }
+
+    #[test]
+    fn fit_prompt_to_window_budgets_a_cloud_model_against_its_reported_window() {
+        // A small-window cloud model with dense CJK evidence: the catalogue-reported
+        // window clamps exactly like the local one — oldest drops, grounding stays.
+        let mut messages = vec![
+            LlmMessage::system(SYSTEM_PROMPT),
+            LlmMessage::user("question"),
+        ];
+        for round in 0..6 {
+            messages.extend(evidence_round(
+                round,
+                format!("round{round} {}", "配".repeat(8_000)),
+            ));
+        }
+        let out = fit_prompt_to_window(&messages, "vendor/small-cloud", Some(32_768));
+
+        assert!(out.lost, "an over-window prompt must report coverage loss");
+        assert_eq!(out.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
+        let joined: String = out
+            .messages
+            .iter()
+            .filter_map(|m| m.content.as_deref())
+            .collect();
+        assert!(
+            joined.contains("round5"),
+            "the newest evidence must survive"
+        );
+        assert!(!joined.contains("round0"), "the oldest evidence must drop");
+        assert!(total_tokens(&out.messages) <= input_budget(32_768));
+    }
+
+    #[test]
+    fn fit_prompt_to_window_leaves_a_large_cloud_window_untouched() {
+        // A large-window cloud model (the common case) is not trimmed — budgeting
+        // must never make a cloud prompt smaller than the char guards already allow,
+        // only ever smaller than the window requires.
+        let mut messages = vec![
+            LlmMessage::system(SYSTEM_PROMPT),
+            LlmMessage::user("question"),
+        ];
+        messages.extend(evidence_round(0, "配".repeat(8_000)));
+
+        let out = fit_prompt_to_window(&messages, "vendor/big-cloud", Some(1_000_000));
+
+        assert!(!out.lost);
+        assert_eq!(out.messages, messages);
+    }
+
+    #[test]
+    fn fit_prompt_to_window_prefers_the_reported_window_over_the_curated_default() {
+        // The client-reported window is authoritative: it is the window the provider
+        // will actually enforce (the local client reports the `num_ctx` it sends).
+        // A host that sizes its local window smaller must see the tighter clamp.
+        let mut messages = vec![
+            LlmMessage::system(SYSTEM_PROMPT),
+            LlmMessage::user("question"),
+        ];
+        messages.extend(evidence_round(0, "配".repeat(20_000)));
+
+        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL, Some(8_192));
+
+        assert!(out.lost);
+        assert!(total_tokens(&out.messages) <= input_budget(8_192));
+    }
+
+    #[test]
+    fn local_budget_window_is_the_shared_ollama_num_ctx() {
+        // Anti-drift tripwire: the token budget and the `num_ctx` the shell sends to
+        // Ollama are the SAME constant (crate::ai::local::OLLAMA_NUM_CTX), so the two
+        // can never disagree about the window Ollama enforces.
+        assert_eq!(
+            LOCAL_CONTEXT_WINDOW_TOKENS,
+            crate::ai::local::OLLAMA_NUM_CTX as usize
+        );
     }
 
     #[test]
@@ -3454,7 +3569,7 @@ mod tests {
                 format!("round{round} {}", "配".repeat(8_000)),
             ));
         }
-        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL);
+        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL, None);
 
         assert!(out.lost, "an over-window prompt must report coverage loss");
         assert_eq!(out.messages[0].role, Role::System);
@@ -3473,7 +3588,7 @@ mod tests {
             "the newest evidence must survive"
         );
         assert!(!joined.contains("round0"), "the oldest evidence must drop");
-        assert!(total_tokens(&out.messages) <= input_budget());
+        assert!(total_tokens(&out.messages) <= local_input_budget());
     }
 
     #[test]
@@ -3486,7 +3601,7 @@ mod tests {
         ];
         messages.extend(evidence_round(0, "配".repeat(60_000)));
 
-        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL);
+        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL, None);
 
         assert!(out.lost);
         assert_eq!(out.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
@@ -3501,7 +3616,7 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("trimmed to fit"));
-        assert!(total_tokens(&out.messages) <= input_budget());
+        assert!(total_tokens(&out.messages) <= local_input_budget());
     }
 
     #[test]
@@ -3514,11 +3629,11 @@ mod tests {
         ];
         messages.extend(evidence_round(0, "#".repeat(40_000)));
 
-        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL);
+        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL, None);
 
         assert!(out.lost);
         assert_eq!(out.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
-        assert!(total_tokens(&out.messages) <= input_budget());
+        assert!(total_tokens(&out.messages) <= local_input_budget());
     }
 
     #[test]
@@ -3527,7 +3642,7 @@ mod tests {
         for round in 0..6 {
             messages.extend(evidence_round(round, "配".repeat(8_000)));
         }
-        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL).messages;
+        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL, None).messages;
 
         for (i, message) in out.iter().enumerate() {
             if message.role == Role::Tool {
@@ -3611,7 +3726,112 @@ mod tests {
             "grounding must stay first, never front-truncated"
         );
         assert_eq!(sent[0].content.as_deref(), Some(SYSTEM_PROMPT));
-        assert!(total_tokens(sent) <= input_budget());
+        assert!(total_tokens(sent) <= local_input_budget());
+    }
+
+    /// Drive one `collect_evidence` turn against `model` with `llm`, over a prompt
+    /// holding one dense 50k-char evidence round, and return what the client was
+    /// sent plus the accumulated coverage. Shared by the cloud-window pair below.
+    fn run_budgeted_turn(model: &str, llm: &MockLlmClient) -> (Vec<Vec<LlmMessage>>, CoverageAcc) {
+        let vault = tempfile::tempdir().unwrap();
+        let provider = KeywordRetriever::new(vault.path());
+        let skills = SkillRegistry::built_in(&[]).unwrap();
+        let environment = SkillEnvironment {
+            hardware: HardwareSpec {
+                total_ram_bytes: 16_000_000_000,
+                cpu_cores: 8,
+                cpu_brand: "test".into(),
+                gpu_label: None,
+                arch: "aarch64".into(),
+                os: "macos".into(),
+                free_disk_bytes: 10_000_000_000,
+            },
+            app_data_bin_dir: PathBuf::from("/app-data/bin"),
+            available_binaries: BTreeSet::new(),
+        };
+        let services = SkillServices::new(
+            &skills,
+            &environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        );
+        let guards = Guards::default();
+        let session = ChatSession {
+            root: vault.path(),
+            model,
+            provider: &provider,
+            llm,
+            skill_services: &services,
+            guards: &guards,
+        };
+        let mut messages = vec![
+            LlmMessage::system(SYSTEM_PROMPT),
+            LlmMessage::user("question"),
+        ];
+        messages.extend(evidence_round(0, "配".repeat(50_000)));
+        let mut active_skills = ActiveSkills::new(guards.max_iterations);
+        let mut writes = WriteSession::new(1).unwrap();
+        let mut youtube_session = YoutubeToolSession::new_with_update_session(
+            services.capture_cancellation.clone(),
+            services.extractor_updates.clone(),
+        );
+        let mut registry = EvidenceRegistry::new();
+        let mut coverage = CoverageAcc::default();
+        let mut sink = VecSink::default();
+
+        block_on(session.collect_evidence(
+            &mut messages,
+            &mut active_skills,
+            &mut writes,
+            &mut youtube_session,
+            &mut registry,
+            &mut coverage,
+            &mut sink,
+        ))
+        .unwrap();
+
+        (llm.completion_requests(), coverage)
+    }
+
+    #[test]
+    fn cloud_run_with_known_window_reports_budget_loss_and_keeps_grounding() {
+        // The issue-#22 gap PA-029 left open: a small-window CLOUD model faced with a
+        // dense-CJK prompt. With the catalogue-reported window wired through the
+        // client, the same deterministic trim + explicit coverage loss applies.
+        let llm = MockLlmClient::new(vec![final_turn()], "answer").with_context_window(32_768);
+        let (requests, coverage) = run_budgeted_turn("vendor/small-cloud", &llm);
+
+        assert!(
+            coverage.truncated,
+            "budget loss must be recorded so the Coverage footer surfaces it"
+        );
+        let sent = &requests[0];
+        assert_eq!(
+            sent[0].role,
+            Role::System,
+            "grounding must stay first, never front-truncated"
+        );
+        assert_eq!(sent[0].content.as_deref(), Some(SYSTEM_PROMPT));
+        assert!(total_tokens(sent) <= input_budget(32_768));
+    }
+
+    #[test]
+    fn cloud_run_with_unknown_window_stays_inert_under_the_char_guards() {
+        // No catalogue entry (a hand-typed id, or the cache was never warmed): the
+        // client reports no window, so budgeting leaves the prompt untouched rather
+        // than guessing — the char guards remain the cloud cost ceiling.
+        let llm = MockLlmClient::new(vec![final_turn()], "answer");
+        let (requests, coverage) = run_budgeted_turn("vendor/uncatalogued-cloud", &llm);
+
+        assert!(!coverage.truncated);
+        let sent = &requests[0];
+        assert!(
+            sent.iter()
+                .filter_map(|m| m.content.as_deref())
+                .any(|c| c.chars().count() == 50_000),
+            "an unbudgeted cloud prompt must be sent whole"
+        );
     }
 
     // ── §4 bounded retry for idempotent tool-decision turns (PA-029) ────────
