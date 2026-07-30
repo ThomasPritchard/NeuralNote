@@ -301,9 +301,9 @@ accessibility debt when phase 2 lands, so it is not rediscovered later as a bug.
   it. Cost: two appearances remain, the switch on caret entry remains, and the
   widget path and its coordinate mapping stay alive.
 
-The spec assumes the first. It is the cleaner engineering answer and the one
-that matches the stated ask most literally, but it trades away the only proper
-screen-reader table semantics in the product.
+The first was chosen (see the decision table above). It is the cleaner
+engineering answer and the one that matches the stated ask most literally, but
+it trades away the only proper screen-reader table semantics in the product.
 
 ---
 
@@ -506,9 +506,18 @@ the Markdown), no compatibility mode, and no second state machine (one
 same class of change as hiding a `##` marker. **No amendment to
 `implementation-plan.md` is proposed.**
 
-A different rule *is* engaged, and it needs a small amendment.
+A different rule *is* engaged, and it needed a small amendment.
 
-### Proposed amendment — `specs/source-native-live-preview-editor.md`
+### Amendment — `specs/source-native-live-preview-editor.md` — APPLIED
+
+**Status: applied on 30 July 2026**, approved by Tom in session (see section 4).
+The diff below is retained for the record and shows the file as it was
+*before* the change; its context lines therefore carry the old rule numbering.
+The live file now reads 1 through 6, with the new rule at position 2 and the
+copy/cut/drag rule at position 5, which is the rule the new rule cross-refers
+to. One defect in the diff as originally drafted was corrected on application:
+it said "renumbering the rest" but did not renumber, which would have produced
+two rule 2s.
 
 The marker-visibility rules at lines 86-95 begin:
 
@@ -564,11 +573,11 @@ question before any of this was recommended:
 > columns across rows for a mixed ASCII/CJK/emoji table, does caret hit-testing
 > still round-trip, and what happens when a row is wider than the container?
 
-The spike lives at
-`app/desktop/src/workspace/SPIKE-DELETE-ME-tablePixelPad.browser.test.tsx`.
-**It is throwaway, uncommitted, and must be deleted** — the phase 1 and phase 5
-tests below replace it. It is picked up by `npm run test:browser` while it
-exists, so delete it before running that lane for real.
+**The spike has been removed from the repository** (30 July 2026). It was
+throwaway and uncommitted, and it was picked up by `npm run test:browser` while
+it existed. It is preserved outside the repo only as a reference for writing the
+phase 1 and phase 5 tests, which replace it. The measurements recorded below are
+unaffected by its removal.
 
 It mounted a bare `EditorView` with an inline throwaway decoration builder and
 no import from any production table module, in the editor's real **proportional**
