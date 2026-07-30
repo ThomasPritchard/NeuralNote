@@ -32,7 +32,7 @@ describe("alpha release configuration", () => {
 
   it("audits both frontend lockfiles through one release gate", () => {
     expect(packageJson.scripts["audit:all"]).toBe(
-      "npm audit --audit-level=high && npm --prefix e2e-native audit --audit-level=high",
+      "npm audit --audit-level=high && node ../../scripts/audit-e2e-native.mjs",
     );
   });
 
