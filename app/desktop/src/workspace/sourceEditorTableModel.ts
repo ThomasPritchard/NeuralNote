@@ -253,9 +253,7 @@ export interface TableDelimiterRange {
   readonly kind: TableDelimiterKind;
   /**
    * Extra columns this gap renders, to bring its neighbouring cells up to their
-   * column width. Folded into the gap rather than emitted as separate padding
-   * widgets, because a widget sitting at the boundary of a replaced range is
-   * not painted at all.
+   * column width.
    */
   readonly padColumns: number;
 }

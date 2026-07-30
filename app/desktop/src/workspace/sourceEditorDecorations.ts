@@ -16,18 +16,18 @@ import {
 } from "@codemirror/view";
 
 import { mergeVisibleRanges } from "./sourceEditorDecorationsRanges";
-import {
-  activeLink,
-  MAX_TABLE_PREVIEW_CHARS,
-  MAX_TABLE_PREVIEW_ROWS,
-  safeCollectMarkdownPreview,
-} from "./sourceEditorDecorationsPreview";
+import { activeLink, safeCollectMarkdownPreview } from "./sourceEditorDecorationsPreview";
 import {
   TableChromeWidget,
   TableWidget,
   TaskWidget,
   TextWidget,
 } from "./sourceEditorDecorationsWidgets";
+import {
+  drawsCellChrome,
+  hiddenTableDelimiters,
+  tableDelimiterGuard,
+} from "./sourceEditorTableDelimiterGuard";
 import {
   tableDelimiterRanges,
   tableModelAt,
@@ -164,23 +164,10 @@ function reportTableError(state: EditorState, message: string | null): void {
  */
 function alignmentRanges(state: EditorState, tablePos: number): Range<Decoration>[] {
   const model = tableModelAt(state, tablePos);
-  if (!model) return [];
-  // Honour the same bounds the rendered preview uses. A table is marked as
-  // source both when the caret is inside it AND when it is too big to preview,
-  // so without this an oversized table would be re-measured on every keystroke
-  // after we had already decided it was too expensive to render.
-  //
-  // Count BODY rows with >=, exactly as `tablePreview` does. Counting
-  // `model.rows` (which also holds the header and delimiter rows) with > put
-  // this bound two rows out of step, so a table with 199 body rows rendered
-  // normally and then appeared completely unaligned, with no message.
-  const bodyRows = model.rows.reduce((total, row) => total + (row.kind === "body" ? 1 : 0), 0);
-  if (
-    model.to - model.from > MAX_TABLE_PREVIEW_CHARS
-    || bodyRows >= MAX_TABLE_PREVIEW_ROWS
-  ) {
-    return [];
-  }
+  // `drawsCellChrome` owns the size bounds, and owns them for the atomic ranges
+  // and the transaction filter too: an oversized table is left as literal
+  // source, so nothing may treat its pipes as hidden.
+  if (!model || !drawsCellChrome(model)) return [];
   // Hide the pipes and draw cell chrome in their place. The whole gap goes, not
   // the bare pipe, so `atomicRanges` has an interior position to work with, and
   // the column padding is folded into the same widget.
@@ -193,17 +180,29 @@ function alignmentRanges(state: EditorState, tablePos: number): Range<Decoration
 }
 
 /**
- * The hidden delimiters, as atomic ranges. This is belt to the braces of the
- * explicit boundary-key commands: it covers pointer selection and any motion
- * path that does consult the facet, while the commands cover the
- * one-character gaps it structurally cannot protect.
+ * The hidden delimiters of every table in `visibleRanges`, as atomic ranges.
+ *
+ * `EditorView.atomicRanges` is a facet of `(view) => RangeSet`, so the ranges
+ * have to be derived from the viewport rather than from the caret: an
+ * `EditorState` has no viewport, and keying on `state.selection.main.head` left
+ * every other table on screen unprotected.
+ *
+ * It refuses nothing. For a non-empty range `deleteBy` runs
+ * `from = skipAtomic(from, false); to = skipAtomic(to, true)`
+ * (`@codemirror/commands/dist/index.js:1173-1180`), which EXPANDS a deletion to
+ * the atomic boundaries rather than declining it — so what stops a cross-cell
+ * edit is `tableDelimiterGuard`, not this.
  */
-export function tableAtomicRanges(state: EditorState): DecorationSet {
-  const model = tableModelAt(state, state.selection.main.head);
-  if (!model) return Decoration.none;
+export function tableAtomicRanges(
+  state: EditorState,
+  visibleRanges: readonly VisibleRange[],
+): DecorationSet {
+  if (visibleRanges.length === 0) return Decoration.none;
+  const scanRanges = mergeVisibleRanges(visibleRanges, state.doc.length, TABLE_SCAN_MARGIN);
   return Decoration.set(
-    tableDelimiterRanges(model).map((delimiter) =>
-      Decoration.replace({}).range(delimiter.from, delimiter.to)),
+    hiddenTableDelimiters(state, scanRanges).flatMap((table) =>
+      table.delimiters.map((delimiter) =>
+        Decoration.replace({}).range(delimiter.from, delimiter.to))),
     true,
   );
 }
@@ -349,6 +348,11 @@ export function sourceEditorDecorations(
     tablePreviewErrorSink.of(onError),
     sourceEditorTableDecorations,
     sourceEditorTableViewport,
+    // Integrity travels with the decorations that create the hazard: this array
+    // is already consumed at `SourceNoteEditor.tsx:139`, and `EditorView.announce`
+    // is rendered by CodeMirror, so neither needs anything of the component.
+    tableDelimiterGuard,
+    EditorView.atomicRanges.of((view) => tableAtomicRanges(view.state, view.visibleRanges)),
     keyboardLinkHandler,
     previewPlugin,
   ];

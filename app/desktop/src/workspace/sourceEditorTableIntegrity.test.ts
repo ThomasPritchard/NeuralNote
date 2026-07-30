@@ -10,6 +10,7 @@
 
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorSelection, EditorState } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
 import {
@@ -17,6 +18,10 @@ import {
   tableCellStep,
   tableRowStep,
 } from "./sourceEditorTableCommands";
+import {
+  hiddenTableDelimiters,
+  tableDelimiterGuard,
+} from "./sourceEditorTableDelimiterGuard";
 
 const FIXTURE = [
   "---",
@@ -76,6 +81,17 @@ function state(doc: string, anchor: number) {
     selection: EditorSelection.cursor(anchor),
     extensions: [
       markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+    ],
+  });
+}
+
+function guardedState(doc: string, anchor: number) {
+  return EditorState.create({
+    doc,
+    selection: EditorSelection.cursor(anchor),
+    extensions: [
+      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+      tableDelimiterGuard,
     ],
   });
 }
@@ -146,5 +162,53 @@ describe("table command integrity against the QA fixture", () => {
     const next = editor.update(spec!).state.doc.toString();
     expect(next).toContain("| set | 1 |");
     expect(next.length).toBeGreaterThan(FIXTURE.length - 12);
+  });
+});
+
+describe("delimiter guard integrity against the QA fixture", () => {
+  // The sweep above asks "can a command destroy the file?". This asks the
+  // opposite question of the guard: "can it refuse something it shouldn't?".
+  // Over-refusal is the failure mode a suite of hand-picked corrupting gestures
+  // cannot see, and the fixture carries the awkward cases — ragged rows, a
+  // blockquote-nested table, a list-nested table, a blank trailing row.
+
+  it("refuses a one-character insertion inside a hidden delimiter, and nowhere else", () => {
+    const hidden = hiddenTableDelimiters(
+      guardedState(FIXTURE, 0),
+      [{ from: 0, to: FIXTURE.length }],
+    ).flatMap((table) => table.delimiters);
+    // Six tables' worth of gaps and rules. A fixture the enumeration failed to
+    // walk would make every assertion below trivially true.
+    expect(hidden.length).toBeGreaterThan(40);
+
+    const insideHidden = (pos: number) =>
+      hidden.some((span) => pos > span.from && pos < span.to);
+
+    const disagreements: string[] = [];
+    let refusals = 0;
+    let applied = 0;
+
+    for (let pos = 0; pos <= FIXTURE.length; pos += 1) {
+      const transaction = guardedState(FIXTURE, pos)
+        .update({ changes: { from: pos, insert: "x" } });
+      const refused = transaction.effects.some((effect) => effect.is(EditorView.announce));
+
+      if (refused) refusals += 1;
+      if (transaction.docChanged) applied += 1;
+      if (refused === transaction.docChanged) {
+        disagreements.push(`pos ${pos}: refused and applied disagree`);
+      }
+      if (refused !== insideHidden(pos)) {
+        disagreements.push(
+          `pos ${pos}: refused=${refused}, but insideHidden=${insideHidden(pos)}`,
+        );
+      }
+    }
+
+    expect(disagreements.slice(0, 8)).toEqual([]);
+    // Both halves must be non-empty, or the property is satisfied vacuously by
+    // a guard that refuses everything, or one that refuses nothing.
+    expect(refusals).toBeGreaterThan(40);
+    expect(applied).toBeGreaterThan(FIXTURE.length / 2);
   });
 });

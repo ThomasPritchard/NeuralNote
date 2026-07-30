@@ -1,10 +1,13 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorSelection, EditorState } from "@codemirror/state";
+import { EditorView, type DecorationSet } from "@codemirror/view";
 import { describe, expect, it, vi } from "vitest";
 
 import {
   collectMarkdownPreview,
   safeCollectMarkdownPreview,
+  sourceEditorDecorations,
+  tableAtomicRanges,
   type PreviewDecoration,
 } from "./sourceEditorDecorations";
 
@@ -236,5 +239,80 @@ describe("sourceEditorDecorations", () => {
 
     expect(result.decorations).toEqual([]);
     expect(result.error).toBe("Live preview is temporarily unavailable. Your source is unchanged.");
+  });
+});
+
+const FIRST_TABLE = ["| aa | bb |", "| --- | --- |", "| cc | dd |"].join("\n");
+const SECOND_TABLE = ["| ee | ff |", "| --- | --- |", "| gg | hh |"].join("\n");
+const TWO_TABLES = `${FIRST_TABLE}\n\nbetween\n\n${SECOND_TABLE}`;
+
+function spans(set: DecorationSet): Array<{ from: number; to: number }> {
+  const found: Array<{ from: number; to: number }> = [];
+  for (const cursor = set.iter(); cursor.value; cursor.next()) {
+    found.push({ from: cursor.from, to: cursor.to });
+  }
+  return found;
+}
+
+describe("tableAtomicRanges", () => {
+  it("covers every table in the visible ranges, not only the one holding the caret", () => {
+    // It used to derive its single table from `state.selection.main.head`, so a
+    // second table on screen was left unprotected.
+    const editor = state(TWO_TABLES, [{ anchor: 3 }]);
+    const secondFrom = TWO_TABLES.indexOf(SECOND_TABLE);
+    const found = spans(tableAtomicRanges(editor, [{ from: 0, to: TWO_TABLES.length }]));
+
+    expect(found.some((span) => span.to <= FIRST_TABLE.length)).toBe(true);
+    expect(found.some((span) => span.from >= secondFrom)).toBe(true);
+    expect(found.every((span) => span.to > span.from)).toBe(true);
+  });
+
+  it("marks nothing for an oversized table, whose pipes are still painted", () => {
+    // The visual path bails above the preview bounds and leaves the source
+    // literal. Making visible pipes atomic would stop the caret on characters
+    // the user can see.
+    const oversized = [
+      "| Key | Value |",
+      "| --- | --- |",
+      ...Array.from({ length: 200 }, (_, index) => `| k${index} | v${index} |`),
+    ].join("\n");
+
+    expect(spans(tableAtomicRanges(state(oversized), [{ from: 0, to: oversized.length }])))
+      .toEqual([]);
+  });
+
+  it("marks nothing when no range is visible", () => {
+    expect(spans(tableAtomicRanges(state(FIRST_TABLE), []))).toEqual([]);
+  });
+});
+
+const withDecorations = (doc: string) => EditorState.create({
+  doc,
+  extensions: [
+    markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+    sourceEditorDecorations(() => {}),
+  ],
+});
+
+describe("sourceEditorDecorations extensions", () => {
+  it("registers the delimiter guard, so the editor component needs no wiring", () => {
+    // The array returned here is already consumed at SourceNoteEditor.tsx:139.
+    // Registering the filter alongside the decorations is what makes the
+    // refusal reach the running editor without touching the component.
+    const editor = withDecorations(FIRST_TABLE);
+    const gap = { from: FIRST_TABLE.indexOf("aa") + 2, to: FIRST_TABLE.indexOf("bb") };
+    const transaction = editor.update({ changes: { from: gap.from, to: gap.to } });
+
+    expect(transaction.effects.some((effect) => effect.is(EditorView.announce))).toBe(true);
+    expect(transaction.state.doc.toString()).toBe(FIRST_TABLE);
+  });
+
+  it("registers an atomic-ranges provider that reads the live viewport", () => {
+    const editor = withDecorations(TWO_TABLES);
+    const providers = editor.facet(EditorView.atomicRanges);
+    expect(providers).toHaveLength(1);
+
+    const viewport = { state: editor, visibleRanges: [{ from: 0, to: TWO_TABLES.length }] };
+    expect(spans(providers[0]!(viewport as unknown as EditorView)).length).toBeGreaterThan(0);
   });
 });

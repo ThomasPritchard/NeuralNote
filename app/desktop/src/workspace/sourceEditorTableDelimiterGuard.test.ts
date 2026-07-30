@@ -1,0 +1,323 @@
+// The cross-cell corruption path, and the exact shape of its refusal.
+//
+// At HEAD `alignmentRanges` hides the whole `" | "` gap between two cells, so a
+// drag-selection across that gap covers characters nothing on screen accounts
+// for. Typing one character then rewrites `| aa | bb |` to `| aabb |`: the row
+// loses a column while the delimiter row still declares two, and nothing warns.
+//
+// Every "refused" assertion below checks the ANNOUNCE EFFECT, not merely that
+// the document is unchanged. A transaction that was never dispatched also leaves
+// the document unchanged, so an unchanged document proves nothing on its own.
+
+import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { history, undo } from "@codemirror/commands";
+import { EditorSelection, EditorState, type Transaction } from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
+import { afterEach, describe, expect, it, vi } from "vitest";
+
+// The model is mocked as a pass-through so one test can make it explode. A
+// throw from a transaction filter is fatal in a way an ordinary throw is not
+// (see the last describe block), so that path needs its own proof.
+vi.mock("./sourceEditorTableModel", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./sourceEditorTableModel")>();
+  return { ...actual, tableModelAt: vi.fn(actual.tableModelAt) };
+});
+
+const { tableModelAt } = await import("./sourceEditorTableModel");
+const { formatTableAt } = await import("./sourceEditorTableCommands");
+const {
+  hiddenTableDelimiters,
+  REFUSED_TABLE_EDIT_ANNOUNCEMENT,
+  tableDelimiterGuard,
+  tableStructuralEdit,
+} = await import("./sourceEditorTableDelimiterGuard");
+
+const realTableModelAt = vi.mocked(tableModelAt).getMockImplementation()!;
+afterEach(() => {
+  vi.mocked(tableModelAt).mockImplementation(realTableModelAt);
+});
+
+// `| aa | bb |` — pipes at 0, 5 and 10, so the hidden divider spans [4, 7).
+const TABLE = ["| aa | bb |", "| --- | --- |", "| cc | dd |"].join("\n");
+
+const DIVIDER = { from: TABLE.indexOf("aa") + 2, to: TABLE.indexOf("bb") };
+
+function guarded(doc: string, ranges: Array<{ anchor: number; head?: number }> = [{ anchor: 0 }]) {
+  return EditorState.create({
+    doc,
+    selection: EditorSelection.create(
+      ranges.map(({ anchor, head }) => EditorSelection.range(anchor, head ?? anchor)),
+    ),
+    extensions: [
+      EditorState.allowMultipleSelections.of(true),
+      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+      tableDelimiterGuard,
+    ],
+  });
+}
+
+/** The announced reason, or null when the transaction was not refused. */
+function announcement(transaction: Transaction): string | null {
+  for (const effect of transaction.effects) {
+    if (effect.is(EditorView.announce)) return effect.value;
+  }
+  return null;
+}
+
+const selectionOf = (state: EditorState) =>
+  state.selection.ranges.map((range) => [range.anchor, range.head]);
+
+describe("the divider is protected exactly where it is invisible", () => {
+  it("refuses a cross-cell selection replacement and announces why", () => {
+    // The live defect: drag from inside `aa` to inside `bb`, type one character.
+    const editor = guarded(TABLE, [{ anchor: 3, head: 8 }]);
+    const before = selectionOf(editor);
+
+    const transaction = editor.update({ changes: { from: 3, to: 8, insert: "x" } });
+
+    expect(announcement(transaction)).toBe(REFUSED_TABLE_EDIT_ANNOUNCEMENT);
+    expect(transaction.docChanged).toBe(false);
+    expect(transaction.state.doc.toString()).toBe(TABLE);
+    expect(selectionOf(transaction.state)).toEqual(before);
+  });
+
+  it("refuses a deletion that covers the hidden gap exactly", () => {
+    // A strict-interior test would miss this one: `from` and `to` sit ON the
+    // boundaries, yet the result is still `| aabb |`.
+    const editor = guarded(TABLE, [{ anchor: DIVIDER.from, head: DIVIDER.to }]);
+    const transaction = editor.update({ changes: { from: DIVIDER.from, to: DIVIDER.to } });
+
+    expect(announcement(transaction)).toBe(REFUSED_TABLE_EDIT_ANNOUNCEMENT);
+    expect(transaction.state.doc.toString()).toBe(TABLE);
+  });
+
+  it("refuses an insertion dropped strictly inside the hidden gap", () => {
+    const onThePipe = DIVIDER.from + 1;
+    const transaction = guarded(TABLE, [{ anchor: onThePipe }])
+      .update({ changes: { from: onThePipe, insert: "x" } });
+
+    expect(announcement(transaction)).toBe(REFUSED_TABLE_EDIT_ANNOUNCEMENT);
+    expect(transaction.state.doc.toString()).toBe(TABLE);
+  });
+
+  it("refuses an edit inside the delimiter row, which is drawn as a rule", () => {
+    const insideRule = TABLE.indexOf("| --- |") + 3;
+    const transaction = guarded(TABLE, [{ anchor: insideRule }])
+      .update({ changes: { from: insideRule, insert: ":" } });
+
+    expect(announcement(transaction)).toBe(REFUSED_TABLE_EDIT_ANNOUNCEMENT);
+    expect(transaction.state.doc.toString()).toBe(TABLE);
+  });
+
+  it("rejects the whole transaction when only one cursor of many is unsafe", () => {
+    // All-or-nothing. The safe insertion must NOT land: a partially applied
+    // multicursor edit is its own silent corruption.
+    const editor = guarded(TABLE, [{ anchor: 3 }, { anchor: DIVIDER.from, head: DIVIDER.to }]);
+    const before = selectionOf(editor);
+
+    const transaction = editor.update({
+      changes: [
+        { from: 3, insert: "z" },
+        { from: DIVIDER.from, to: DIVIDER.to, insert: "z" },
+      ],
+    });
+
+    expect(announcement(transaction)).toBe(REFUSED_TABLE_EDIT_ANNOUNCEMENT);
+    expect(transaction.state.doc.toString()).toBe(TABLE);
+    expect(selectionOf(transaction.state)).toEqual(before);
+  });
+});
+
+describe("ordinary editing is untouched", () => {
+  it("allows typing in the middle of a cell", () => {
+    const transaction = guarded(TABLE, [{ anchor: 3 }])
+      .update({ changes: { from: 3, insert: "x" } });
+
+    expect(announcement(transaction)).toBeNull();
+    expect(transaction.state.doc.toString()).toContain("| axa |");
+  });
+
+  it("allows typing at either boundary of a hidden gap", () => {
+    for (const pos of [DIVIDER.from, DIVIDER.to]) {
+      const transaction = guarded(TABLE, [{ anchor: pos }])
+        .update({ changes: { from: pos, insert: "x" } });
+
+      expect(announcement(transaction)).toBeNull();
+      expect(transaction.docChanged).toBe(true);
+    }
+  });
+
+  it("allows a backspace that stops at the boundary of a hidden gap", () => {
+    const transaction = guarded(TABLE, [{ anchor: DIVIDER.from }])
+      .update({ changes: { from: DIVIDER.from - 1, to: DIVIDER.from } });
+
+    expect(announcement(transaction)).toBeNull();
+    expect(transaction.state.doc.toString().startsWith("| a | bb |")).toBe(true);
+  });
+
+  it("allows edits elsewhere in a note that happens to contain a table", () => {
+    const doc = `# Heading\n\n${TABLE}\n\ntail`;
+    const transaction = guarded(doc, [{ anchor: 2 }])
+      .update({ changes: { from: 2, insert: "x" } });
+
+    expect(announcement(transaction)).toBeNull();
+    expect(transaction.state.doc.toString()).toContain("# xHeading");
+  });
+});
+
+describe("the two exceptions without which ordinary editing breaks", () => {
+  it("allows a change that replaces an affected table entirely (Select All, cut)", () => {
+    // Exception 2. Without it Select-All-and-type, and cutting a table out,
+    // both become impossible.
+    const doc = `# Heading\n\n${TABLE}\n\ntail`;
+    const editor = guarded(doc, [{ anchor: 0, head: doc.length }]);
+    const transaction = editor.update({ changes: { from: 0, to: doc.length, insert: "gone" } });
+
+    expect(announcement(transaction)).toBeNull();
+    expect(transaction.state.doc.toString()).toBe("gone");
+  });
+
+  it("allows cutting a whole table out of the middle of a note", () => {
+    const doc = `# Heading\n\n${TABLE}\n\ntail`;
+    const from = doc.indexOf("| aa");
+    const to = from + TABLE.length;
+    const transaction = guarded(doc, [{ anchor: from, head: to }])
+      .update({ changes: { from, to } });
+
+    expect(announcement(transaction)).toBeNull();
+    expect(transaction.state.doc.toString()).toBe("# Heading\n\n\n\ntail");
+  });
+
+  it("allows an annotated structural table command to rewrite the delimiters", () => {
+    // Exception 1. `formatTableAt` rewrites every row from `row.from` to
+    // `row.to`, which covers every hidden gap in the table.
+    const editor = guarded(TABLE, [{ anchor: 3 }]);
+    const spec = formatTableAt(editor);
+    expect(spec).not.toBeNull();
+
+    const allowed = editor.update(spec!, { annotations: tableStructuralEdit.of(true) });
+
+    expect(announcement(allowed)).toBeNull();
+    expect(allowed.docChanged).toBe(true);
+  });
+
+  it("refuses the identical change when it is NOT annotated", () => {
+    // The negative control for exception 1: without it, the exception could be
+    // vacuous and this suite would never notice.
+    const editor = guarded(TABLE, [{ anchor: 3 }]);
+    const refused = editor.update(formatTableAt(editor)!);
+
+    expect(announcement(refused)).toBe(REFUSED_TABLE_EDIT_ANNOUNCEMENT);
+    expect(refused.state.doc.toString()).toBe(TABLE);
+  });
+});
+
+describe("only tables whose delimiters are actually hidden are protected", () => {
+  const OVERSIZED = [
+    "| Key | Value |",
+    "| --- | --- |",
+    ...Array.from({ length: 200 }, (_, index) => `| k${index} | v${index} |`),
+  ].join("\n");
+
+  it("leaves an oversized table alone, because its pipes are plainly visible", () => {
+    // Above the preview bounds `alignmentRanges` bails and the source renders
+    // literally. Refusing an edit to text the user can see would be a bug.
+    const first = OVERSIZED.indexOf("| k0 | v0 |");
+    const gapFrom = first + "| k0".length;
+    const gapTo = first + "| k0 | ".length;
+
+    const transaction = guarded(OVERSIZED, [{ anchor: gapFrom, head: gapTo }])
+      .update({ changes: { from: gapFrom, to: gapTo } });
+
+    expect(announcement(transaction)).toBeNull();
+    expect(transaction.docChanged).toBe(true);
+  });
+
+  it("reports no hidden delimiters for an oversized table", () => {
+    expect(hiddenTableDelimiters(guarded(OVERSIZED), [{ from: 0, to: OVERSIZED.length }]))
+      .toEqual([]);
+  });
+});
+
+describe("hiddenTableDelimiters", () => {
+  it("groups the hidden spans of every table in the requested ranges", () => {
+    const second = ["| ee | ff |", "| --- | --- |", "| gg | hh |"].join("\n");
+    const doc = `${TABLE}\n\ntext\n\n${second}`;
+    const tables = hiddenTableDelimiters(guarded(doc), [{ from: 0, to: doc.length }]);
+
+    expect(tables).toHaveLength(2);
+    expect(tables[0]).toMatchObject({ from: 0, to: TABLE.length });
+    expect(tables[1]?.from).toBe(doc.indexOf(second));
+    for (const table of tables) {
+      expect(table.delimiters.length).toBeGreaterThan(0);
+      expect(table.delimiters.every((span) => span.to > span.from)).toBe(true);
+    }
+  });
+
+  it("returns nothing for a range with no table in it", () => {
+    expect(hiddenTableDelimiters(guarded("# Heading\n\nplain"), [{ from: 0, to: 5 }])).toEqual([]);
+  });
+});
+
+describe("a table-model failure leaves the source editable", () => {
+  it("allows the change instead of throwing out of the transaction filter", () => {
+    // Spec rule 6. CodeMirror evaluates `state.update(...)` as an ARGUMENT to
+    // `dispatchTransactions`, so a throw from a filter is not caught by the
+    // editor: it loses the keystroke outright. And when the model cannot be
+    // built the painter cannot hide anything either, so there is no invisible
+    // delimiter left to protect.
+    const editor = guarded(TABLE, [{ anchor: DIVIDER.from, head: DIVIDER.to }]);
+    vi.mocked(tableModelAt).mockImplementation(() => {
+      throw new Error("synthetic table model failure");
+    });
+
+    const transaction = editor.update({ changes: { from: DIVIDER.from, to: DIVIDER.to } });
+
+    expect(announcement(transaction)).toBeNull();
+    expect(transaction.state.doc.toString()).toContain("| aabb |");
+  });
+});
+
+describe("the filter cannot protect undo or redo — and does not need to", () => {
+  it("does not run at all for a transaction dispatched with filter:false", () => {
+    // `history` dispatches undo and redo with `filter: false`
+    // (`@codemirror/commands/dist/index.js:536`), and `resolveTransaction`
+    // then skips `filterTransaction` entirely
+    // (`@codemirror/state/dist/index.js:2416-2427`). No transaction filter,
+    // this one included, can protect a history replay.
+    //
+    // If this test ever goes red because the document survived, the filter has
+    // grown a second enforcement path and the reasoning below must be redone.
+    const transaction = guarded(TABLE, [{ anchor: DIVIDER.from, head: DIVIDER.to }])
+      .update({ changes: { from: DIVIDER.from, to: DIVIDER.to }, filter: false });
+
+    expect(announcement(transaction)).toBeNull();
+    expect(transaction.state.doc.toString()).toContain("| aabb |");
+  });
+
+  it("keeps undo safe by keeping the unsafe change out of history in the first place", () => {
+    // The whole safety argument, executable: because the corrupting transaction
+    // is refused before it is applied, it never becomes a history entry, so
+    // there is nothing corrupt for the unfiltered undo path to replay.
+    let editor = EditorState.create({
+      doc: TABLE,
+      selection: EditorSelection.cursor(3),
+      extensions: [
+        history(),
+        markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+        tableDelimiterGuard,
+      ],
+    });
+    const dispatch = (transaction: Transaction) => { editor = transaction.state; };
+
+    editor = editor.update({ changes: { from: 3, insert: "x" } }).state;
+    expect(editor.doc.toString()).toContain("| axa |");
+
+    const refused = editor.update({ changes: { from: DIVIDER.from + 1, to: DIVIDER.to + 1 } });
+    expect(announcement(refused)).toBe(REFUSED_TABLE_EDIT_ANNOUNCEMENT);
+    editor = refused.state;
+
+    expect(undo({ state: editor, dispatch })).toBe(true);
+    expect(editor.doc.toString()).toBe(TABLE);
+  });
+});

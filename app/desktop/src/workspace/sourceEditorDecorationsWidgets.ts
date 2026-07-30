@@ -27,8 +27,6 @@ export class TableChromeWidget extends WidgetType {
     element.className = `nn-lp-cell-chrome nn-lp-cell-chrome-${this.kind}`;
     element.setAttribute("aria-hidden", "true");
     if (this.padColumns > 0) {
-      // Column padding lives here rather than in its own widget: a widget at the
-      // boundary of a replaced range is never painted.
       element.style.setProperty("--nn-cell-pad", `${this.padColumns}ch`);
     }
     return element;

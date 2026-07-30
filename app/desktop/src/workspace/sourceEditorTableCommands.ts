@@ -1,6 +1,7 @@
 import { EditorSelection, type EditorState, type TransactionSpec } from "@codemirror/state";
 import type { Command } from "@codemirror/view";
 
+import { tableStructuralEdit } from "./sourceEditorTableDelimiterGuard";
 import {
   monospaceWidth,
   tableColumnWidths,
@@ -266,11 +267,18 @@ export function formatTableAt(state: EditorState): TransactionSpec | null {
   return { changes, scrollIntoView: true };
 }
 
+/**
+ * The single seam every structural table command dispatches through, and so the
+ * one place the delimiter guard's exemption is declared. These commands rewrite
+ * whole rows and the delimiter row on purpose, with the result on screen;
+ * `tableDelimiterGuard` refuses that same shape of change when it arrives from
+ * ordinary editing, where the bytes would vanish unexplained.
+ */
 function toCommand(build: (state: EditorState) => TransactionSpec | null): Command {
   return (view) => {
     const spec = build(view.state);
     if (!spec) return false;
-    view.dispatch(spec);
+    view.dispatch(spec, { annotations: tableStructuralEdit.of(true) });
     return true;
   };
 }

@@ -1,13 +1,25 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { EditorSelection, EditorState } from "@codemirror/state";
+import {
+  EditorSelection,
+  EditorState,
+  type Transaction,
+  type TransactionSpec,
+} from "@codemirror/state";
+import { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
 import {
+  formatTable,
   formatTableAt,
   guardTableDelimiter,
+  nextTableRow,
   tableCellStep,
   tableRowStep,
 } from "./sourceEditorTableCommands";
+import {
+  tableDelimiterGuard,
+  tableStructuralEdit,
+} from "./sourceEditorTableDelimiterGuard";
 
 const TABLE = [
   "# Notes",
@@ -232,5 +244,64 @@ describe("guardTableDelimiter", () => {
     // Backspace before the opening pipe must fall through to normal editing,
     // or the table becomes impossible to remove.
     expect(guardTableDelimiter(state(DOC, 0), -1)).toBeNull();
+  });
+});
+
+function guardedState(doc: string, anchor: number) {
+  return EditorState.create({
+    doc,
+    selection: EditorSelection.cursor(anchor),
+    extensions: [
+      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+      tableDelimiterGuard,
+    ],
+  });
+}
+
+/** A command target that applies what it is given and keeps the transactions. */
+function target(doc: string, anchor: number) {
+  let editor = guardedState(doc, anchor);
+  const applied: Transaction[] = [];
+  const view = {
+    get state() { return editor; },
+    dispatch: (...specs: TransactionSpec[]) => {
+      const transaction = editor.update(...specs);
+      applied.push(transaction);
+      editor = transaction.state;
+    },
+  };
+  return {
+    view: view as unknown as EditorView,
+    applied,
+    document: () => editor.doc.toString(),
+  };
+}
+
+const refusals = (applied: readonly Transaction[]) =>
+  applied.filter((transaction) =>
+    transaction.effects.some((effect) => effect.is(EditorView.announce)));
+
+describe("structural commands are exempt from the delimiter guard", () => {
+  // Every one of these commands rewrites spans the guard refuses from ordinary
+  // editing — a whole row, or the delimiter row. Without the annotation each is
+  // silently refused in the running editor, which is the regression these pin.
+
+  it("lets formatTable rewrite every row, delimiter row included", () => {
+    const { view, applied, document } = target(TABLE, at("DJ gig"));
+
+    expect(formatTable(view)).toBe(true);
+    expect(applied[0]?.annotation(tableStructuralEdit)).toBe(true);
+    expect(refusals(applied)).toEqual([]);
+    expect(document()).toContain("| ---------- |");
+  });
+
+  it("lets Enter drop a blank trailing row and leave the table", () => {
+    const doc = `${TABLE}\n|  |  |`;
+    const { view, applied, document } = target(doc, doc.length - 4);
+
+    expect(nextTableRow(view)).toBe(true);
+    expect(applied[0]?.annotation(tableStructuralEdit)).toBe(true);
+    expect(refusals(applied)).toEqual([]);
+    expect(document()).toBe(`${TABLE}\n`);
   });
 });
