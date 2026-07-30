@@ -23,13 +23,13 @@ import {
   safeCollectMarkdownPreview,
 } from "./sourceEditorDecorationsPreview";
 import {
-  TablePadWidget,
+  TableChromeWidget,
   TableWidget,
   TaskWidget,
   TextWidget,
 } from "./sourceEditorDecorationsWidgets";
 import {
-  tableAlignmentPads,
+  tableDelimiterRanges,
   tableModelAt,
   tableSegmentWidths,
 } from "./sourceEditorTableModel";
@@ -181,11 +181,31 @@ function alignmentRanges(state: EditorState, tablePos: number): Range<Decoration
   ) {
     return [];
   }
-  const pads = tableAlignmentPads(state, model, tableSegmentWidths(state, model));
-  return pads.map((pad) => Decoration.widget({
-    widget: new TablePadWidget(pad.width, pad.fill),
-    side: pad.side,
-  }).range(pad.pos));
+  // Hide the pipes and draw cell chrome in their place. The whole gap goes, not
+  // the bare pipe, so `atomicRanges` has an interior position to work with, and
+  // the column padding is folded into the same widget.
+  const widths = tableSegmentWidths(state, model);
+  return tableDelimiterRanges(model, state, widths).map((delimiter) =>
+    Decoration.replace({
+      widget: new TableChromeWidget(delimiter.kind, delimiter.padColumns),
+      inclusive: false,
+    }).range(delimiter.from, delimiter.to));
+}
+
+/**
+ * The hidden delimiters, as atomic ranges. This is belt to the braces of the
+ * explicit boundary-key commands: it covers pointer selection and any motion
+ * path that does consult the facet, while the commands cover the
+ * one-character gaps it structurally cannot protect.
+ */
+export function tableAtomicRanges(state: EditorState): DecorationSet {
+  const model = tableModelAt(state, state.selection.main.head);
+  if (!model) return Decoration.none;
+  return Decoration.set(
+    tableDelimiterRanges(model).map((delimiter) =>
+      Decoration.replace({}).range(delimiter.from, delimiter.to)),
+    true,
+  );
 }
 
 interface TableDecorationState {

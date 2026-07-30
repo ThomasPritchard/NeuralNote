@@ -264,13 +264,17 @@ describe("SourceNoteEditor", () => {
     const view = EditorView.findFromDOM(container.querySelector<HTMLElement>(".cm-editor")!)!;
     await userEvent.click(screen.getByRole("cell", { name: "DJ gig" }));
 
-    await waitFor(() => expect(container.querySelectorAll(".nn-lp-table-pad").length).toBeGreaterThan(0));
+    await waitFor(() => expect(container.querySelectorAll(".nn-lp-cell-chrome").length).toBeGreaterThan(0));
+
+    // The headline behaviour: the caret is in the table and no pipe is painted,
+    // while the document still holds every one of them.
+    expect(container.querySelector(".cm-content")?.textContent ?? "").not.toContain("|");
     expect(view.state.doc.toString()).toBe(source);
+    expect(view.state.doc.toString()).toContain("|");
     expect(onChange).not.toHaveBeenCalled();
 
-    const dashes = container.querySelector(".nn-lp-table-pad-dash");
-    expect(dashes).not.toBeNull();
-    expect(dashes).toHaveAttribute("aria-hidden", "true");
+    const chrome = container.querySelector(".nn-lp-cell-chrome");
+    expect(chrome).toHaveAttribute("aria-hidden", "true");
   });
 
   it("skips alignment on a table too large to preview", async () => {
@@ -297,7 +301,7 @@ describe("SourceNoteEditor", () => {
     view.dispatch({ selection: { anchor: source.indexOf("| 3 | v |") + 3 } });
 
     await waitFor(() => expect(container.querySelector(".nn-lp-table-source")).not.toBeNull());
-    expect(container.querySelectorAll(".nn-lp-table-pad")).toHaveLength(0);
+    expect(container.querySelectorAll(".nn-lp-cell-chrome")).toHaveLength(0);
     expect(view.state.doc.toString()).toBe(source);
   });
 
@@ -326,8 +330,7 @@ describe("SourceNoteEditor", () => {
     const view = EditorView.findFromDOM(container.querySelector<HTMLElement>(".cm-editor")!)!;
     view.dispatch({ selection: { anchor: source.indexOf("| 3 | v |") + 3 } });
 
-    await waitFor(() => expect(container.querySelector(".nn-lp-table-source")).not.toBeNull());
-    expect(container.querySelectorAll(".nn-lp-table-pad").length).toBeGreaterThan(0);
+    await waitFor(() => expect(container.querySelectorAll(".nn-lp-cell-chrome").length).toBeGreaterThan(0));
   });
 
   it("moves between table cells with Tab and down a column with Enter", async () => {

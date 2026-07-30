@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 
 import {
   formatTableAt,
+  guardTableDelimiter,
   tableCellStep,
   tableRowStep,
 } from "./sourceEditorTableCommands";
@@ -187,5 +188,49 @@ describe("formatTableAt", () => {
     const result = apply(editor, formatTableAt(editor));
 
     expect(result?.doc.split("\n")).toHaveLength(TABLE.split("\n").length);
+  });
+});
+
+describe("guardTableDelimiter", () => {
+  const DOC = "| a | bb |\n| --- | --- |\n| x | yy |";
+  const cellStart = (needle: string) => DOC.indexOf(needle);
+
+  it("turns Backspace at a cell start into a move, never a deletion", () => {
+    // The delimiter is invisible once drawn as chrome. Deleting it would
+    // silently re-shape the table with nothing on screen to explain it.
+    const pos = cellStart("yy");
+    const editor = state(DOC, pos);
+    const spec = guardTableDelimiter(editor, -1);
+
+    expect(spec).not.toBeNull();
+    expect(spec).not.toHaveProperty("changes");
+    const next = editor.update(spec!).state;
+    expect(next.doc.toString()).toBe(DOC);
+    // Lands at the end of the previous cell's content, past the hidden gap.
+    expect(next.selection.main.head).toBe(DOC.indexOf("| x |") + 3);
+  });
+
+  it("turns Delete at a cell end into a move", () => {
+    const pos = DOC.indexOf("| x |") + 3;
+    const editor = state(DOC, pos);
+    const next = editor.update(guardTableDelimiter(editor, 1)!).state;
+
+    expect(next.doc.toString()).toBe(DOC);
+    expect(next.selection.main.head).toBe(cellStart("yy"));
+  });
+
+  it("stays out of the way in the middle of a cell", () => {
+    expect(guardTableDelimiter(state(DOC, cellStart("yy") + 1), -1)).toBeNull();
+  });
+
+  it("stays out of the way outside a table", () => {
+    const doc = "# Heading\n\nplain text";
+    expect(guardTableDelimiter(state(doc, 5), -1)).toBeNull();
+  });
+
+  it("does not trap the caret at the very start of a table", () => {
+    // Backspace before the opening pipe must fall through to normal editing,
+    // or the table becomes impossible to remove.
+    expect(guardTableDelimiter(state(DOC, 0), -1)).toBeNull();
   });
 });

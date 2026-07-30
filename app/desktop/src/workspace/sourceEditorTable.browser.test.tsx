@@ -1,5 +1,8 @@
 // Real-browser proof that the table alignment actually lines the columns up.
 //
+// Updated for drawn chrome: the pipes are hidden, so alignment is measured from
+// the rendered dividers rather than from pipe glyphs.
+//
 // The jsdom tests already cover the width arithmetic: `sourceEditorTableModel`
 // asserts exact pad widths, so a miscalculated deficit fails there too. What no
 // jsdom test can see is whether those widths survive to the screen, because jsdom
@@ -32,34 +35,15 @@ const SOURCE = [
   "| 2026-11-30 | Rehearsal |",
 ].join("\n");
 
-/**
- * Screen x of the nth `|` rendered inside a line, walking text nodes so that
- * widget-inserted padding counts exactly as the reader sees it.
- */
-function separatorX(line: Element, index: number): number {
-  const walker = document.createTreeWalker(line, NodeFilter.SHOW_TEXT);
-  let seen = 0;
-  let node = walker.nextNode();
-  while (node) {
-    const text = node.textContent ?? "";
-    for (let offset = 0; offset < text.length; offset += 1) {
-      if (text[offset] !== "|") continue;
-      if (seen === index) {
-        const range = document.createRange();
-        range.setStart(node, offset);
-        range.setEnd(node, offset + 1);
-        return range.getBoundingClientRect().left;
-      }
-      seen += 1;
-    }
-    node = walker.nextNode();
-  }
-  return Number.NaN;
+/** Screen x of each drawn cell divider on a line, left to right. */
+function dividerPositions(line: Element): number[] {
+  return [...line.querySelectorAll(".nn-lp-cell-chrome-divider")]
+    .map((element) => element.getBoundingClientRect().left);
 }
 
 function tableLines(container: Element): Element[] {
   return [...container.querySelectorAll(".cm-line")].filter((line) =>
-    (line.textContent ?? "").includes("|"),
+    line.querySelector(".nn-lp-cell-chrome-divider"),
   );
 }
 
@@ -88,13 +72,18 @@ describe("table column alignment", () => {
     await page.getByRole("cell", { name: "DJ gig" }).click();
     await expect.element(page.getByRole("table", { name: "Markdown table" })).not.toBeInTheDocument();
 
-    const lines = tableLines(host);
-    expect(lines).toHaveLength(4);
+    // No pipe is painted anywhere, though every one is still in the document.
+    expect(host.querySelector(".cm-content")?.textContent ?? "").not.toContain("|");
 
-    // Each row must agree on where its 2nd and 3rd separators sit.
-    for (const separator of [1, 2]) {
-      const positions = lines.map((line) => separatorX(line, separator));
-      expect(positions.every((value) => Number.isFinite(value))).toBe(true);
+    const lines = tableLines(host);
+    expect(lines.length).toBeGreaterThanOrEqual(3);
+
+    // Every content row must agree on where each drawn divider sits.
+    const columns = Math.min(...lines.map((line) => dividerPositions(line).length));
+    expect(columns).toBeGreaterThan(0);
+
+    for (let column = 0; column < columns; column += 1) {
+      const positions = lines.map((line) => dividerPositions(line)[column]!);
       const spread = Math.max(...positions) - Math.min(...positions);
       expect(spread).toBeLessThan(1.5);
     }

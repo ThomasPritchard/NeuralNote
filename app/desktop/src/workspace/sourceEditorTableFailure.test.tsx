@@ -83,7 +83,7 @@ describe("a failure in the table decoration path", () => {
     // Rule 6: the editor survives and the exact source is intact.
     expect(editor).toBeInTheDocument();
     expect(view.state.doc.toString()).toBe(NOTE);
-    expect(container.querySelectorAll(".nn-lp-table-pad")).toHaveLength(0);
+    expect(container.querySelectorAll(".nn-lp-cell-chrome")).toHaveLength(0);
     expect(vi.mocked(tableModelAt)).toHaveBeenCalled();
   });
 

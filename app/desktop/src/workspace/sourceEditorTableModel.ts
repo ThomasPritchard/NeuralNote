@@ -4,7 +4,6 @@ import type { EditorState } from "@codemirror/state";
 type SyntaxNode = ReturnType<typeof syntaxTree>["topNode"];
 
 export type ColumnAlignment = "none" | "left" | "center" | "right";
-export type TablePadFill = "space" | "dash";
 export type TableRowKind = "header" | "delimiter" | "body";
 
 /**
@@ -39,14 +38,6 @@ export interface TableModel {
   readonly columnCount: number;
   readonly alignments: readonly ColumnAlignment[];
   readonly rows: readonly TableRowModel[];
-}
-
-/** A purely visual insertion. It carries no range, so it can never edit the document. */
-export interface TablePad {
-  readonly pos: number;
-  readonly width: number;
-  readonly fill: TablePadFill;
-  readonly side: -1 | 1;
 }
 
 const MIN_DELIMITER_WIDTH = 3;
@@ -253,88 +244,123 @@ export function tableColumnWidths(state: EditorState, model: TableModel): number
  * content width, because a cell carrying trailing spaces already renders wider
  * than its content and padding the content alone would push it wider still.
  */
-/** One space, content, one space — how a cell reads once aligned. */
-const CANONICAL_CELL_PADDING = 2;
+export type TableDelimiterKind = "leading" | "divider" | "trailing" | "rule";
+
+/** A span of source to hide and replace with drawn chrome. */
+export interface TableDelimiterRange {
+  readonly from: number;
+  readonly to: number;
+  readonly kind: TableDelimiterKind;
+  /**
+   * Extra columns this gap renders, to bring its neighbouring cells up to their
+   * column width. Folded into the gap rather than emitted as separate padding
+   * widgets, because a widget sitting at the boundary of a replaced range is
+   * not painted at all.
+   */
+  readonly padColumns: number;
+}
 
 /**
- * Rendered width each column should occupy: its widest content plus one space
- * either side.
+ * The spans to hide when a table is drawn as cells rather than as pipes.
  *
- * Measuring the raw pipe-to-pipe span instead would make a row that omits its
- * outer pipes (GFM allows it) sit one character out of step from its
- * neighbours, because that row's segment carries less surrounding whitespace
- * and pads can only add, never re-position.
+ * Deliberately the whole gap between two cells — the trailing space, the pipe
+ * and the leading space — not the bare pipe. `atomicRanges` protects a range
+ * only from a position strictly inside it (`@codemirror/view` index.js:3734 and
+ * `@codemirror/commands` index.js:1197), and a one-character range has none, so
+ * hiding just the pipe would leave Backspace free to delete an invisible
+ * delimiter and silently re-shape the table.
+ *
+ * The delimiter row is returned whole, as a single `rule` range: it carries no
+ * user content and is drawn as the header rule.
+ */
+export function tableDelimiterRanges(
+  model: TableModel,
+  state?: EditorState,
+  widths: readonly number[] = [],
+): TableDelimiterRange[] {
+  const ranges: TableDelimiterRange[] = [];
+
+  /** Columns a cell must gain to reach its column width, split by alignment. */
+  const padding = (slot: TableColumnSlot | undefined) => {
+    if (!slot || !state) return { before: 0, after: 0 };
+    const deficit = (widths[slot.column] ?? 0)
+      - monospaceWidth(state.sliceDoc(slot.from, slot.to));
+    if (deficit <= 0) return { before: 0, after: 0 };
+    switch (model.alignments[slot.column] ?? "none") {
+      case "right":
+        return { before: deficit, after: 0 };
+      case "center": {
+        const before = Math.floor(deficit / 2);
+        return { before, after: deficit - before };
+      }
+      default:
+        return { before: 0, after: deficit };
+    }
+  };
+
+  for (const row of model.rows) {
+    if (row.kind === "delimiter") {
+      if (row.to > row.from) {
+        ranges.push({ from: row.from, to: row.to, kind: "rule", padColumns: 0 });
+      }
+      continue;
+    }
+
+    const slots = [...row.slots].sort((left, right) => left.from - right.from);
+    if (slots.length === 0) continue;
+
+    // Everything before the first cell's content: `| ` when the row opens with
+    // a pipe, nothing when GFM's optional leading pipe was omitted.
+    if (slots[0]!.from > row.from) {
+      ranges.push({
+        from: row.from,
+        to: slots[0]!.from,
+        kind: "leading",
+        padColumns: padding(slots[0]).before,
+      });
+    }
+
+    for (let index = 0; index < slots.length - 1; index += 1) {
+      const gapFrom = slots[index]!.to;
+      const gapTo = slots[index + 1]!.from;
+      if (gapTo <= gapFrom) continue;
+      ranges.push({
+        from: gapFrom,
+        to: gapTo,
+        kind: "divider",
+        padColumns: padding(slots[index]).after + padding(slots[index + 1]).before,
+      });
+    }
+
+    const last = slots.at(-1)!;
+    if (row.to > last.to) {
+      ranges.push({
+        from: last.to,
+        to: row.to,
+        kind: "trailing",
+        padColumns: padding(last).after,
+      });
+    }
+  }
+
+  return ranges;
+}
+
+/**
+ * Width each column must render at: its widest CONTENT.
+ *
+ * Under drawn chrome every pipe and the whitespace around it is hidden, so a
+ * cell renders as content plus padding and nothing else. Measuring the
+ * pipe-to-pipe span would count characters that are no longer painted.
  */
 export function tableSegmentWidths(state: EditorState, model: TableModel): number[] {
   const widths = Array.from({ length: model.columnCount }, () => 0);
   for (const row of model.rows) {
+    if (row.kind === "delimiter") continue;
     for (const slot of row.slots) {
       const content = monospaceWidth(state.sliceDoc(slot.from, slot.to));
       widths[slot.column] = Math.max(widths[slot.column] ?? 0, content);
     }
   }
-  return widths.map((content) => content + CANONICAL_CELL_PADDING);
-}
-
-/** How a single slot currently renders, split into its three parts. */
-function slotMetrics(state: EditorState, slot: TableColumnSlot) {
-  const leading = monospaceWidth(state.sliceDoc(slot.segmentFrom, slot.from));
-  const trailing = monospaceWidth(state.sliceDoc(slot.to, slot.segmentTo));
-  const content = monospaceWidth(state.sliceDoc(slot.from, slot.to));
-  // A cell with no opening space needs one supplied, or its content starts a
-  // column to the left of every other row's.
-  const openingGap = Math.max(0, 1 - leading);
-  return { leading, trailing, content, openingGap };
-}
-
-export function tableAlignmentPads(
-  state: EditorState,
-  model: TableModel,
-  widths: readonly number[],
-): TablePad[] {
-  const pads: TablePad[] = [];
-  for (const row of model.rows) {
-    for (const slot of row.slots) {
-      const { leading, trailing, content, openingGap } = slotMetrics(state, slot);
-      if (openingGap > 0) {
-        pads.push({
-          pos: slot.segmentFrom,
-          width: openingGap,
-          fill: row.kind === "delimiter" ? "dash" : "space",
-          side: -1,
-        });
-      }
-
-      const rendered = leading + openingGap + content + trailing;
-      const deficit = (widths[slot.column] ?? 0) - rendered;
-      if (deficit <= 0) continue;
-
-      if (row.kind === "delimiter") {
-        // Grow the dash run in place, staying inside a trailing alignment colon.
-        const text = state.sliceDoc(slot.from, slot.to);
-        const pos = text.endsWith(":") ? Math.max(slot.from, slot.to - 1) : slot.to;
-        pads.push({ pos, width: deficit, fill: "dash", side: 1 });
-        continue;
-      }
-
-      switch (model.alignments[slot.column] ?? "none") {
-        case "right":
-          pads.push({ pos: slot.segmentFrom, width: deficit, fill: "space", side: -1 });
-          break;
-        case "center": {
-          const before = Math.floor(deficit / 2);
-          if (before > 0) {
-            pads.push({ pos: slot.segmentFrom, width: before, fill: "space", side: -1 });
-          }
-          if (deficit - before > 0) {
-            pads.push({ pos: slot.segmentTo, width: deficit - before, fill: "space", side: 1 });
-          }
-          break;
-        }
-        default:
-          pads.push({ pos: slot.segmentTo, width: deficit, fill: "space", side: 1 });
-      }
-    }
-  }
-  return pads;
+  return widths;
 }

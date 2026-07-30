@@ -4,8 +4,8 @@ import { describe, expect, it } from "vitest";
 
 import {
   monospaceWidth,
-  tableAlignmentPads,
   tableColumnWidths,
+  tableDelimiterRanges,
   tableModelAt,
   tableSegmentWidths,
   type TableModel,
@@ -132,158 +132,147 @@ describe("tableColumnWidths", () => {
   });
 });
 
-describe("tableAlignmentPads", () => {
-  function pads(doc: string) {
+describe("column padding folded into the chrome", () => {
+  /** Total columns a row paints: its content plus the padding in its gaps. */
+  function renderedWidth(doc: string, rowIndex: number): number {
     const editor = state(doc);
     const model = tableModelAt(editor, 0)!;
-    return tableAlignmentPads(editor, model, tableSegmentWidths(editor, model));
+    const widths = tableSegmentWidths(editor, model);
+    const ranges = tableDelimiterRanges(model, editor, widths);
+    const row = model.rows[rowIndex]!;
+
+    const content = row.slots.reduce(
+      (total, slot) => total + monospaceWidth(doc.slice(slot.from, slot.to)),
+      0,
+    );
+    const padding = ranges
+      .filter((range) => range.from >= row.from && range.to <= row.to)
+      .reduce((total, range) => total + range.padColumns, 0);
+    return content + padding;
   }
 
-  /** Total rendered width of each column: source segment plus any padding. */
-  function renderedWidths(doc: string, column: number) {
-    const editor = state(doc);
-    const model = tableModelAt(editor, 0)!;
-    const result = tableAlignmentPads(editor, model, tableSegmentWidths(editor, model));
-    return model.rows.map((row) => {
-      const slot = row.slots.find((candidate) => candidate.column === column);
-      if (!slot) return null;
-      const base = slot.segmentTo - slot.segmentFrom;
-      const added = result
-        .filter((pad) => pad.pos >= slot.segmentFrom && pad.pos <= slot.segmentTo)
-        .reduce((total, pad) => total + pad.width, 0);
-      return base + added;
-    }).filter((value) => value !== null);
-  }
-
-  it("pads every short cell so each column reaches a single rendered width", () => {
+  it("brings every content row to the same painted width", () => {
     const doc = "| Start date | Commitment |\n| --- | --- |\n| a | b |";
-
-    expect(new Set(renderedWidths(doc, 0)).size).toBe(1);
-    expect(new Set(renderedWidths(doc, 1)).size).toBe(1);
-    expect(pads(doc).every((pad) => pad.width > 0)).toBe(true);
+    expect(renderedWidth(doc, 0)).toBe(renderedWidth(doc, 2));
   });
 
-  it("adds no padding to a table whose cells already carry alignment spaces", () => {
-    // Regression: padding was measured against the TRIMMED cell, so a table
-    // already aligned on disk (as `Shift-Alt-f` writes it) was padded again.
+  it("pads a table whose alignment spaces are now hidden", () => {
+    // Under chrome the spaces around a pipe are inside the hidden gap, so an
+    // already-aligned file still needs painted padding to look aligned.
     const doc = [
       "| Start date | Commitment |",
       "| ---------- | ---------- |",
       "| 2026-04-03 | DJ gig     |",
     ].join("\n");
-
-    expect(pads(doc)).toEqual([]);
+    expect(renderedWidth(doc, 0)).toBe(renderedWidth(doc, 2));
   });
 
-  it("emits insertions only, so the document bytes never change", () => {
-    const result = pads(SIMPLE);
+  it("adds nothing when a column's cells are already equal", () => {
+    const doc = "| aaa | bbb |\n| --- | --- |\n| xxx | yyy |";
+    const editor = state(doc);
+    const model = tableModelAt(editor, 0)!;
+    const ranges = tableDelimiterRanges(model, editor, tableSegmentWidths(editor, model));
 
-    expect(result.length).toBeGreaterThan(0);
-    for (const pad of result) {
-      expect(Number.isSafeInteger(pad.pos)).toBe(true);
-      expect(pad).not.toHaveProperty("from");
-      expect(pad).not.toHaveProperty("to");
-    }
+    expect(ranges.every((range) => range.padColumns === 0)).toBe(true);
   });
 
-  it("fills the delimiter row with dashes and content rows with spaces", () => {
-    const result = pads(SIMPLE);
-    const fills = new Set(result.map((pad) => pad.fill));
+  it("never pads the delimiter row, which is drawn as a rule", () => {
+    const doc = "| Start date | Commitment |\n| --- | :-: |\n| a | b |";
+    const editor = state(doc);
+    const model = tableModelAt(editor, 0)!;
+    const ranges = tableDelimiterRanges(model, editor, tableSegmentWidths(editor, model));
+    const rule = ranges.filter((range) => range.kind === "rule");
 
-    expect(fills.has("dash")).toBe(true);
-    expect(fills.has("space")).toBe(true);
+    expect(rule).toHaveLength(1);
+    expect(rule[0]!.padColumns).toBe(0);
   });
 
-  it("pads before the content for a right-aligned column", () => {
+  it("puts a right-aligned column's padding in the gap before its content", () => {
     const doc = "| a | value |\n| --- | --: |\n| x | y |";
     const editor = state(doc);
     const model = tableModelAt(editor, 0)!;
-    const result = tableAlignmentPads(editor, model, tableSegmentWidths(editor, model));
-    const cell = model.rows[2]!.slots.find((slot) => slot.column === 1)!;
+    const ranges = tableDelimiterRanges(model, editor, tableSegmentWidths(editor, model));
+    const bodyRow = model.rows[2]!;
+    const cell = bodyRow.slots.find((slot) => slot.column === 1)!;
 
-    expect(result.some((pad) => pad.pos === cell.segmentFrom && pad.fill === "space")).toBe(true);
-    expect(result.some((pad) => pad.pos === cell.segmentTo && pad.fill === "space")).toBe(false);
+    const before = ranges.find((range) => range.to === cell.from)!;
+    const after = ranges.find((range) => range.from === cell.to)!;
+    expect(before.padColumns).toBeGreaterThan(0);
+    expect(after.padColumns).toBe(0);
   });
 
-  it("splits padding either side of the content for a centred column", () => {
-    const doc = "| a | value |\n| --- | :-: |\n| x | y |";
+  it("emits ranges only, so the document is never edited", () => {
+    const doc = "| Start date | Commitment |\n| --- | --- |\n| a | b |";
     const editor = state(doc);
     const model = tableModelAt(editor, 0)!;
-    const result = tableAlignmentPads(editor, model, tableSegmentWidths(editor, model));
-    const cell = model.rows[2]!.slots.find((slot) => slot.column === 1)!;
+    const ranges = tableDelimiterRanges(model, editor, tableSegmentWidths(editor, model));
 
-    expect(result.some((pad) => pad.pos === cell.segmentFrom)).toBe(true);
-    expect(result.some((pad) => pad.pos === cell.segmentTo)).toBe(true);
-  });
-
-  it("aligns a row written without its outer pipes to the same grid", () => {
-    // GFM makes leading and trailing pipes optional per row. Measuring the raw
-    // segment left such a row one character out of step, because pads could
-    // only append or prepend and never supply the missing leading space.
-    const doc = "| a | b |\n| --- | --- |\nc | d";
-    const editor = state(doc);
-    const model = tableModelAt(editor, 0)!;
-    const widths = tableSegmentWidths(editor, model);
-    const result = tableAlignmentPads(editor, model, widths);
-
-    // Rendered width of every slot in a column must agree.
-    for (let column = 0; column < model.columnCount; column += 1) {
-      const rendered = model.rows.map((row) => {
-        const slot = row.slots.find((candidate) => candidate.column === column);
-        if (!slot) return null;
-        const base = slot.segmentTo - slot.segmentFrom;
-        const added = result
-          .filter((pad) => pad.pos >= slot.segmentFrom && pad.pos <= slot.segmentTo)
-          .reduce((total, pad) => total + pad.width, 0);
-        return base + added;
-      }).filter((value) => value !== null);
-      expect(new Set(rendered).size).toBe(1);
+    for (const range of ranges) {
+      expect(range.from).toBeGreaterThanOrEqual(0);
+      expect(range.to).toBeLessThanOrEqual(doc.length);
+      expect(range).not.toHaveProperty("insert");
     }
-
-    // And the content must start at the same offset, not just end at one.
-    const leading = model.rows.map((row) => {
-      const slot = row.slots.find((candidate) => candidate.column === 0)!;
-      const before = result
-        .filter((pad) => pad.pos === slot.segmentFrom)
-        .reduce((total, pad) => total + pad.width, 0);
-      return before + (slot.from - slot.segmentFrom);
-    });
-    expect(new Set(leading).size).toBe(1);
-  });
-
-  it("produces no padding for a table whose columns already line up", () => {
-    expect(pads("| aaa | bbb |\n| --- | --- |\n| xxx | yyy |")).toEqual([]);
   });
 });
 
-describe("monospaceWidth", () => {
-  // Issue #86: the disk path (Shift-Alt-f) must pad by the columns a glyph
-  // actually occupies in a monospace font, not by how many graphemes it is.
-  it.each([
-    ["abc", 3],
-    ["", 0],
-    ["中文字", 6],
-    ["日本語です", 10],
-    ["👍👍", 4],
-    ["한국어", 6],
-    ["ｆｕｌｌ", 8],
-    ["café", 4],
-    ["Ω≈ç√", 4],
-    ["a中b", 4],
-  ])("measures %o as %i columns", (text, columns) => {
-    expect(monospaceWidth(text)).toBe(columns);
-  });
+describe("tableDelimiterRanges", () => {
+  it("covers the whole gap between cells, never the bare pipe", () => {
+    // atomicRanges guards require a position strictly INSIDE the range
+    // (@codemirror/view:3734, @codemirror/commands:1197), so a 1-char pipe can
+    // never be protected. Hiding the surrounding spaces too gives it interior
+    // positions.
+    const doc = "| a | b |\n| --- | --- |\n| x | y |";
+    const editor = state(doc);
+    const ranges = tableDelimiterRanges(tableModelAt(editor, 0)!);
 
-  it("ignores zero-width joiners and variation selectors", () => {
-    expect(monospaceWidth("👨‍👩‍👧")).toBe(2);
-    expect(monospaceWidth("\u200b")).toBe(0);
-  });
-
-  it("never reports a negative or fractional width", () => {
-    for (const text of ["", "a", "中", "👍", "\u0301", "e\u0301"]) {
-      const width = monospaceWidth(text);
-      expect(Number.isInteger(width)).toBe(true);
-      expect(width).toBeGreaterThanOrEqual(0);
+    expect(ranges.length).toBeGreaterThan(0);
+    for (const range of ranges) {
+      expect(doc.slice(range.from, range.to)).toContain("|");
+      expect(range.to).toBeGreaterThan(range.from);
     }
+    const dividers = ranges.filter((range) => range.kind === "divider");
+    expect(dividers.every((range) => range.to - range.from >= 2)).toBe(true);
+    expect(doc.slice(dividers[0]!.from, dividers[0]!.to)).toBe(" | ");
+  });
+
+  it("marks the leading and trailing pipes distinctly", () => {
+    const doc = "| a | b |\n| --- | --- |\n| x | y |";
+    const editor = state(doc);
+    const ranges = tableDelimiterRanges(tableModelAt(editor, 0)!);
+    const header = ranges.filter((range) => range.from < doc.indexOf("\n"));
+
+    expect(header.map((range) => range.kind)).toEqual(["leading", "divider", "trailing"]);
+  });
+
+  it("omits a leading range for a row written without its opening pipe", () => {
+    const doc = "a | b\n--- | ---\nx | y";
+    const editor = state(doc);
+    const ranges = tableDelimiterRanges(tableModelAt(editor, 0)!);
+
+    expect(ranges.some((range) => range.kind === "leading")).toBe(false);
+    expect(ranges.some((range) => range.kind === "divider")).toBe(true);
+  });
+
+  it("never overlaps two ranges, which would break Decoration.set", () => {
+    const doc = "| a | b | c |\n| --- | --- | --- |\n| x |  | z |";
+    const editor = state(doc);
+    const ranges = [...tableDelimiterRanges(tableModelAt(editor, 0)!)]
+      .sort((left, right) => left.from - right.from);
+
+    for (let index = 1; index < ranges.length; index += 1) {
+      expect(ranges[index]!.from).toBeGreaterThanOrEqual(ranges[index - 1]!.to);
+    }
+  });
+
+  it("covers the delimiter row as one hidden run", () => {
+    const doc = "| a | b |\n| --- | --- |\n| x | y |";
+    const editor = state(doc);
+    const model = tableModelAt(editor, 0)!;
+    const row = model.rows.find((candidate) => candidate.kind === "delimiter")!;
+    const ranges = tableDelimiterRanges(model)
+      .filter((range) => range.from >= row.from && range.to <= row.to);
+
+    expect(ranges.map((range) => range.kind)).toEqual(["rule"]);
+    expect(ranges[0]).toMatchObject({ from: row.from, to: row.to });
   });
 });

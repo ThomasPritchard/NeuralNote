@@ -4,6 +4,7 @@ import type { Command } from "@codemirror/view";
 import {
   monospaceWidth,
   tableColumnWidths,
+  tableDelimiterRanges,
   tableModelAt,
   type TableModel,
   type TableRowModel,
@@ -169,6 +170,49 @@ function isTopLevelRow(state: EditorState, row: TableRowModel): boolean {
   return state.doc.lineAt(row.from).from === row.from;
 }
 
+/**
+ * Backspace, Delete and the arrow keys across a hidden cell delimiter.
+ *
+ * `atomicRanges` cannot do this: both its motion guard
+ * (`@codemirror/view` index.js:3734) and its deletion guard
+ * (`@codemirror/commands` index.js:1197) require a position strictly inside the
+ * range, and a row written `|a|b|` yields a one-character gap that has none. So
+ * the keys are owned here instead of delegated.
+ *
+ * A boundary keystroke MOVES rather than deletes. Removing an invisible
+ * delimiter would silently change the table's shape with nothing on screen to
+ * explain it; emptying the cell first, then deleting, is the honest path. Rows
+ * and columns are removed by their own explicit commands.
+ *
+ * Returns null whenever the caret is not against a delimiter, so ordinary
+ * editing — including deleting the table itself from outside — is untouched.
+ */
+export function guardTableDelimiter(
+  state: EditorState,
+  direction: 1 | -1,
+): TransactionSpec | null {
+  const range = state.selection.main;
+  if (!range.empty) return null;
+
+  const model = activeTableAt(state, range.head);
+  if (!model) return null;
+
+  const adjacent = tableDelimiterRanges(model).find((delimiter) =>
+    direction === -1 ? delimiter.to === range.head : delimiter.from === range.head,
+  );
+  if (!adjacent) return null;
+
+  // A leading delimiter reached backwards, or a trailing one reached forwards,
+  // is the table's outer edge. Falling through lets the user delete the table.
+  if (direction === -1 && adjacent.kind === "leading") return null;
+  if (direction === 1 && adjacent.kind === "trailing") return null;
+
+  return {
+    selection: EditorSelection.cursor(direction === -1 ? adjacent.from : adjacent.to),
+    scrollIntoView: true,
+  };
+}
+
 function delimiterCell(width: number, alignment: string): string {
   if (alignment === "center") return `:${"-".repeat(Math.max(1, width - 2))}:`;
   if (alignment === "left") return `:${"-".repeat(Math.max(1, width - 1))}`;
@@ -231,6 +275,8 @@ function toCommand(build: (state: EditorState) => TransactionSpec | null): Comma
   };
 }
 
+export const guardTableDelimiterBackward = toCommand((state) => guardTableDelimiter(state, -1));
+export const guardTableDelimiterForward = toCommand((state) => guardTableDelimiter(state, 1));
 export const nextTableCell = toCommand((state) => tableCellStep(state, 1));
 export const previousTableCell = toCommand((state) => tableCellStep(state, -1));
 export const nextTableRow = toCommand(tableRowStep);

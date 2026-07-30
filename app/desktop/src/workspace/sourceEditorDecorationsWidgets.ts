@@ -1,36 +1,36 @@
 import { EditorView, WidgetType } from "@codemirror/view";
 
 import type { PreviewDecoration } from "./sourceEditorDecorationsTypes";
-import { tableModelAt, type TablePadFill } from "./sourceEditorTableModel";
+import { tableModelAt, type TableDelimiterKind } from "./sourceEditorTableModel";
 
 /**
- * Visual column padding for a table the caret is inside. It is an insertion
- * widget with no document range, so the source keeps its exact bytes: opening a
- * table never marks the note dirty.
+ * Drawn chrome in place of a hidden cell delimiter. The source keeps its pipes;
+ * this only changes what is painted, so copy, cut and save still yield exactly
+ * the Markdown on disk.
  */
-export class TablePadWidget extends WidgetType {
+export class TableChromeWidget extends WidgetType {
   constructor(
-    private readonly width: number,
-    private readonly fill: TablePadFill,
+    private readonly kind: TableDelimiterKind,
+    private readonly padColumns: number,
   ) {
     super();
   }
 
   eq(other: WidgetType): boolean {
-    return other instanceof TablePadWidget
-      && other.width === this.width
-      && other.fill === this.fill;
+    return other instanceof TableChromeWidget
+      && other.kind === this.kind
+      && other.padColumns === this.padColumns;
   }
 
   toDOM(): HTMLElement {
     const element = document.createElement("span");
-    element.className = this.fill === "dash"
-      ? "nn-lp-table-pad nn-lp-table-pad-dash"
-      : "nn-lp-table-pad";
+    element.className = `nn-lp-cell-chrome nn-lp-cell-chrome-${this.kind}`;
     element.setAttribute("aria-hidden", "true");
-    element.append(
-      document.createTextNode((this.fill === "dash" ? "-" : " ").repeat(this.width)),
-    );
+    if (this.padColumns > 0) {
+      // Column padding lives here rather than in its own widget: a widget at the
+      // boundary of a replaced range is never painted.
+      element.style.setProperty("--nn-cell-pad", `${this.padColumns}ch`);
+    }
     return element;
   }
 
