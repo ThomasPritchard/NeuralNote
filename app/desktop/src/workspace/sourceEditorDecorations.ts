@@ -1,4 +1,5 @@
 import {
+  Facet,
   Prec,
   type Range,
   StateEffect,
@@ -104,24 +105,56 @@ function toDecorationSet(
   return Decoration.set(ranges, true);
 }
 
+/**
+ * Where a table-decoration failure is reported. A `StateField` cannot see the
+ * extension's callbacks, so the sink is supplied through the state itself.
+ */
+export const tablePreviewErrorSink = Facet.define<(message: string | null) => void>();
+
+const TABLE_DECORATION_ERROR =
+  "Table preview is temporarily unavailable. Your source is unchanged.";
+
 function tableDecorationSet(
   state: EditorState,
   visibleRanges: readonly VisibleRange[],
 ): DecorationSet {
   if (visibleRanges.length === 0) return Decoration.none;
-  const scanRanges = mergeVisibleRanges(visibleRanges, state.doc.length, TABLE_SCAN_MARGIN);
-  const result = safeCollectMarkdownPreview(state, scanRanges);
-  const ranges = result.decorations.flatMap((item) => {
-    if (item.table) {
-      return [Decoration.replace({
-        widget: new TableWidget(item),
-        inclusive: false,
-        block: true,
-      }).range(item.from, item.to)];
-    }
-    return item.tableSource ? alignmentRanges(state, item.from) : [];
+  try {
+    const scanRanges = mergeVisibleRanges(visibleRanges, state.doc.length, TABLE_SCAN_MARGIN);
+    const result = safeCollectMarkdownPreview(state, scanRanges);
+    const ranges = result.decorations.flatMap((item) => {
+      if (item.table) {
+        return [Decoration.replace({
+          widget: new TableWidget(item),
+          inclusive: false,
+          block: true,
+        }).range(item.from, item.to)];
+      }
+      return item.tableSource ? alignmentRanges(state, item.from) : [];
+    });
+    reportTableError(state, result.error);
+    return Decoration.set(ranges, true);
+  } catch {
+    // Spec rule 6: a decoration failure removes the decoration and leaves the
+    // source editable. Without this the throw escapes through `state.update()`,
+    // which CodeMirror evaluates as an ARGUMENT to `dispatchTransactions` — so
+    // the editor's own try/catch never sees it, the keystroke is lost, and from
+    // `StateField.create` the editor fails to mount at all.
+    reportTableError(state, TABLE_DECORATION_ERROR);
+    return Decoration.none;
+  }
+}
+
+/**
+ * Deferred so a report never re-enters React from inside a transaction, which
+ * is the same hazard the viewport plugin's `queueMicrotask` guards against.
+ */
+function reportTableError(state: EditorState, message: string | null): void {
+  const sinks = state.facet(tablePreviewErrorSink);
+  if (sinks.length === 0) return;
+  queueMicrotask(() => {
+    for (const sink of sinks) sink(message);
   });
-  return Decoration.set(ranges, true);
 }
 
 /**
@@ -287,6 +320,7 @@ export function sourceEditorDecorations(
     },
   );
   return [
+    tablePreviewErrorSink.of(onError),
     sourceEditorTableDecorations,
     sourceEditorTableViewport,
     keyboardLinkHandler,
