@@ -422,6 +422,22 @@ describe("useNoteTabs external-change reload", () => {
     });
   }
 
+  function mockOutOfOrderReads() {
+    const olderRead = deferred<NoteDoc>();
+    const newerRead = deferred<NoteDoc>();
+    let readCount = 0;
+    mockInvoke.mockImplementation((command, args) => {
+      if (command !== "read_note") return Promise.resolve(undefined) as never;
+      readCount += 1;
+      const path = (args as { path: string }).path;
+      if (readCount === 1) return Promise.resolve(doc(path, "initial")) as never;
+      if (readCount === 2) return olderRead.promise as never;
+      if (readCount === 3) return newerRead.promise as never;
+      throw new Error(`unexpected read ${readCount}`);
+    });
+    return { olderRead, newerRead, readCount: () => readCount };
+  }
+
   it("reloads a clean open note when its file changes externally (debounced once)", async () => {
     vi.useFakeTimers();
     const files = mockDisk({ "/v/a.md": "A" });
@@ -445,6 +461,53 @@ describe("useNoteTabs external-change reload", () => {
     expect(result.current.active.note?.raw).toBe("edited elsewhere");
     const readsAfter = mockInvoke.mock.calls.filter(([c]) => c === "read_note").length;
     expect(readsAfter - readsBefore).toBe(1);
+  });
+
+  it("keeps the newest external reconciliation when an older read resolves last", async () => {
+    vi.useFakeTimers();
+    const reads = mockOutOfOrderReads();
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await drainMicrotasks();
+
+    await fireWatcher();
+    await fireWatcher();
+    expect(reads.readCount()).toBe(3);
+
+    await act(async () => {
+      reads.newerRead.resolve(doc("/v/a.md", "newest"));
+      await reads.newerRead.promise;
+    });
+    expect(result.current.active.draft).toBe("newest");
+
+    await act(async () => {
+      reads.olderRead.resolve(doc("/v/a.md", "older"));
+      await reads.olderRead.promise;
+    });
+    expect(result.current.active.draft).toBe("newest");
+  });
+
+  it("ignores an older missing-file result after a newer reconciliation succeeds", async () => {
+    vi.useFakeTimers();
+    const reads = mockOutOfOrderReads();
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/a.md"));
+    await drainMicrotasks();
+
+    await fireWatcher();
+    await fireWatcher();
+    await act(async () => {
+      reads.newerRead.resolve(doc("/v/a.md", "newest"));
+      await reads.newerRead.promise;
+    });
+
+    await act(async () => {
+      reads.olderRead.reject({ kind: "notFound", message: "temporarily missing" });
+      await reads.olderRead.promise.catch(() => undefined);
+    });
+
+    expect(result.current.active.draft).toBe("newest");
+    expect(result.current.active.externalDeleted).toBe(false);
   });
 
   it("preserves a dirty draft and surfaces a conflict instead of replacing it", async () => {
@@ -495,6 +558,33 @@ describe("useNoteTabs external-change reload", () => {
     expect(result.current.active.path).toBe("/v/b.md");
     expect(result.current.active.draft).toBe("edited at new path");
     expect(result.current.active.dirty).toBe(false);
+  });
+
+  it("ignores a stale missing-file result after the tab's ancestor is remapped", async () => {
+    vi.useFakeTimers();
+    const staleRead = deferred<NoteDoc>();
+    let readCount = 0;
+    mockInvoke.mockImplementation((command, args) => {
+      if (command !== "read_note") return Promise.resolve(undefined) as never;
+      readCount += 1;
+      const path = (args as { path: string }).path;
+      if (readCount === 1) return Promise.resolve(doc(path, "initial")) as never;
+      if (readCount === 2) return staleRead.promise as never;
+      throw new Error(`unexpected read ${readCount}`);
+    });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/f/a.md"));
+    await drainMicrotasks();
+
+    await fireWatcher();
+    act(() => result.current.remap("/v/f", "/v/g", "g"));
+    await act(async () => {
+      staleRead.reject({ kind: "notFound", message: "old path is gone" });
+      await staleRead.promise.catch(() => undefined);
+    });
+
+    expect(result.current.active.path).toBe("/v/g/a.md");
+    expect(result.current.active.externalDeleted).toBe(false);
   });
 
   it("does not reload or conflict after an in-app save fires the watcher (self-write guard)", async () => {

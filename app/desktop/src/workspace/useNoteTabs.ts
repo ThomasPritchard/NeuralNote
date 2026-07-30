@@ -49,6 +49,9 @@ export function useNoteTabs(): NoteTabsController {
   stateRef.current = state;
   const nextId = useRef(0);
   const savingTabIds = useRef(new Set<string>());
+  // Separate watcher bursts may overlap. Only the newest disk read for a tab
+  // may publish, regardless of the order in which those reads settle.
+  const reconcileRevisions = useRef(new Map<string, number>());
 
   const dispatch = useCallback((action: Action) => {
     stateRef.current = noteTabsReducer(stateRef.current, action);
@@ -89,6 +92,7 @@ export function useNoteTabs(): NoteTabsController {
   const activate = useCallback((id: string) => dispatch({ type: "activate", id }), [dispatch]);
   const close = useCallback((id: string) => {
     destroySourceEditorSession(id);
+    reconcileRevisions.current.delete(id);
     dispatch({ type: "close", id });
   }, [dispatch]);
 
@@ -118,10 +122,13 @@ export function useNoteTabs(): NoteTabsController {
     ) {
       return;
     }
+    const revision = (reconcileRevisions.current.get(id) ?? 0) + 1;
+    reconcileRevisions.current.set(id, revision);
     const knownHash = tab.note.contentHash;
     const path = tab.path;
     try {
       const disk = await api.readNote(path);
+      if (reconcileRevisions.current.get(id) !== revision) return;
       // The tab may have closed, been remapped, or begun saving during the read.
       const current = stateRef.current.tabs.find((item) => item.id === id);
       if (!current || current.saving || savingTabIds.current.has(id)) return;
@@ -137,6 +144,9 @@ export function useNoteTabs(): NoteTabsController {
       if (!current.dirty) destroySourceEditorSession(id);
       dispatch({ type: "external-update", id, doc: disk });
     } catch (error) {
+      if (reconcileRevisions.current.get(id) !== revision) return;
+      const current = stateRef.current.tabs.find((item) => item.id === id);
+      if (!current || current.path !== path) return;
       if (isNotFound(error)) {
         dispatch({ type: "external-delete", id });
         return;
@@ -200,12 +210,16 @@ export function useNoteTabs(): NoteTabsController {
   }, [dispatch]);
   const removeDescendants = useCallback((path: string) => {
     for (const tab of stateRef.current.tabs) {
-      if (isPathInside(tab.path, path)) destroySourceEditorSession(tab.id);
+      if (isPathInside(tab.path, path)) {
+        destroySourceEditorSession(tab.id);
+        reconcileRevisions.current.delete(tab.id);
+      }
     }
     dispatch({ type: "remove-descendants", path });
   }, [dispatch]);
   const clear = useCallback(() => {
     clearSourceEditorSessions();
+    reconcileRevisions.current.clear();
     dispatch({ type: "clear" });
   }, [dispatch]);
   const tabsInside = useCallback(

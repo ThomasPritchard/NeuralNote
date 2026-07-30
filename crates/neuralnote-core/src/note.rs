@@ -4,6 +4,7 @@ use crate::error::{CoreError, CoreResult};
 use crate::model::NoteDoc;
 use crate::paths::{ensure_within, rel_path};
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -140,43 +141,40 @@ pub fn read_note(root: &Path, target: &Path) -> CoreResult<NoteDoc> {
     if !path.is_file() {
         return Err(CoreError::NotFound(path.display().to_string()));
     }
-    // A text note whose METADATA already reports more than the editable byte
-    // limit is flagged without its bytes ever being read into memory — a
-    // multi-GiB file must not be loaded whole just to be rejected (the
-    // reconcile path re-reads on every external change). `std::fs::metadata`
-    // follows symlinks, so an oversized target is caught through a link too.
-    // Gated on `is_text_note` to keep binary precedence: a non-text file must
-    // still be read to distinguish a no-preview binary attachment from an
-    // oversized valid-UTF-8 document. Metadata can lie about a shrink/grow
-    // race, so the byte-exact checks below remain the authoritative decision
-    // for anything that gets this far.
-    if is_text_note(&path) {
-        if let Ok(meta) = std::fs::metadata(&path) {
-            if meta.len() > MAX_EDITABLE_NOTE_BYTES as u64 {
-                return Ok(build_oversized_doc(root, &path, meta.len()));
-            }
+    // Any vault file whose METADATA already reports more than the editable byte
+    // limit is flagged without its bytes ever being read into memory. Resource
+    // safety takes precedence over binary/text classification: a multi-GiB
+    // attachment must not be loaded whole merely to choose between two
+    // content-free notices. `std::fs::metadata` follows symlinks, so an
+    // oversized target is caught through a link too. Metadata can lie about a
+    // shrink/grow race, so the byte-exact checks below remain authoritative for
+    // anything that gets this far.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > MAX_EDITABLE_NOTE_BYTES as u64 {
+            return Ok(build_oversized_doc(root, &path, meta.len()));
         }
     }
-    // Read bytes, not a UTF-8 string: a vault's attachments folder is full of
-    // images/PDFs, and `read_to_string` would fail on them, dead-ending the
-    // reader's graceful binary branch.
-    let bytes = std::fs::read(&path)?;
+    // Bound the read as well as the metadata preflight: the file can grow after
+    // metadata is sampled, and metadata itself may be unavailable. Reading one
+    // byte past the cap is enough to make the authoritative size decision
+    // without allowing a path race to allocate the whole file. Read bytes, not
+    // a UTF-8 string, so small images/PDFs still reach the graceful binary path.
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)?
+        .take(MAX_EDITABLE_NOTE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    // The opened file may have grown after metadata was sampled. Decide the
+    // bounded byte result before binary classification so a MAX+1 invalid-UTF-8
+    // attachment cannot hide the resource-limit state behind `binary`.
+    if bytes.len() > MAX_EDITABLE_NOTE_BYTES {
+        return Ok(build_oversized_doc(root, &path, bytes.len() as u64));
+    }
     // An attachment (image/PDF/…) that isn't valid UTF-8 stays a no-preview
     // binary doc — never lossy-decoded, which would bloat a multi-MB image into
     // megabytes of U+FFFD. `is_text_note` short-circuits, so a text note (the hot
     // path) skips this validation scan and decodes exactly once below.
     if !is_text_note(&path) && std::str::from_utf8(&bytes).is_err() {
         return Ok(build_binary_doc(root, &path));
-    }
-    // A note past the editable byte limit is flagged and its content kept off
-    // the wire: mounting it in the editor would freeze the webview (issue #82).
-    // Checked BEFORE the lossy decode below so an oversized non-UTF-8 note is
-    // never decoded into a multi-MB string either. The boundary mirrors the
-    // write side exactly (`> MAX_EDITABLE_NOTE_BYTES`), so any doc that would
-    // be rejected on save is never opened editable. Nothing is written — the
-    // file on disk is untouched.
-    if bytes.len() > MAX_EDITABLE_NOTE_BYTES {
-        return Ok(build_oversized_doc(root, &path, bytes.len() as u64));
     }
     // A text note (`.md`/`.txt`) in some other encoding (Windows-1252/Latin-1 from
     // a migrated vault) is decoded lossily so its content is SHOWN, never hidden,

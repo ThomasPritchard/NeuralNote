@@ -205,9 +205,10 @@ mod tests {
     }
 
     #[test]
-    fn read_note_still_treats_an_oversized_binary_attachment_as_binary() {
-        // Precedence: a non-text file that isn't valid UTF-8 stays a no-preview
-        // binary doc regardless of size — the binary branch wins over the size cap.
+    fn read_note_flags_an_oversized_binary_attachment_without_marshalling_content() {
+        // Resource limits take precedence over attachment classification: a
+        // binary file above the cap must never be allocated merely to prove it
+        // is binary.
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("big.png");
         let mut bytes = vec![0xFF; note::MAX_EDITABLE_NOTE_BYTES];
@@ -215,8 +216,10 @@ mod tests {
         fs::write(&f, &bytes).unwrap();
 
         let doc = note::read_note(dir.path(), &f).unwrap();
-        assert!(doc.binary);
-        assert!(!doc.exceeds_editable_size);
+        assert!(doc.exceeds_editable_size);
+        assert!(!doc.binary);
+        assert_eq!(doc.size_bytes as usize, note::MAX_EDITABLE_NOTE_BYTES + 1);
+        assert!(doc.raw.is_empty() && doc.body.is_empty());
     }
 
     #[test]
@@ -295,6 +298,32 @@ mod tests {
         assert!(doc.exceeds_editable_size);
         assert_eq!(doc.size_bytes as usize, note::MAX_EDITABLE_NOTE_BYTES + 1);
         assert!(doc.raw.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_note_flags_a_huge_attachment_from_metadata_without_reading_it() {
+        // The preflight must protect every vault file, not only recognised text
+        // notes. Prove the attachment bytes are not read: metadata remains
+        // available while an fs::read attempt would fail.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("huge.png");
+        let file = fs::File::create(&f).unwrap();
+        file.set_len(note::MAX_EDITABLE_NOTE_BYTES as u64 + 1)
+            .unwrap();
+        drop(file);
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = note::read_note(dir.path(), &f);
+        // Restore perms first so the TempDir can be cleaned up regardless of assert.
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let doc = result.unwrap();
+        assert!(doc.exceeds_editable_size);
+        assert_eq!(doc.size_bytes as usize, note::MAX_EDITABLE_NOTE_BYTES + 1);
+        assert!(!doc.binary);
+        assert!(doc.raw.is_empty() && doc.body.is_empty());
     }
 
     #[cfg(unix)]

@@ -951,6 +951,22 @@ describe("Workspace — view state (sidebar panel + center view)", () => {
     );
   });
 
+  it("keeps the native Format menu disabled when an oversized text note is open", async () => {
+    const oversizedNote = makeTab("/v/big.md").note;
+    if (!oversizedNote) throw new Error("test note must be loaded");
+    openState.current = makeOpen({
+      path: oversizedNote.path,
+      note: { ...oversizedNote, exceedsEditableSize: true },
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+
+    render(<Workspace />);
+
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("set_menu_editing", { editing: false }),
+    );
+  });
+
   it("the close-vault action closes when there are no unsaved edits", async () => {
     const ctx = vaultCtx();
     openState.current = makeOpen({ dirty: false });
