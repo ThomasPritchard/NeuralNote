@@ -62,6 +62,103 @@ describe("sourceText", () => {
     expect(serializeSourceText(next)).toBe("A\r\nA2\r\nb\nC\rd");
   });
 
+  it("keeps a retyped LF run independent from a distant stray CRLF", () => {
+    const source = loadSourceText("intro\r\nalpha\nbeta\ngamma\ndelta\n");
+    const from = source.text.indexOf("alpha");
+    const to = source.text.indexOf("delta");
+    const changes = ChangeSet.of(
+      { from, to, insert: "A\nB\nC\n" },
+      source.text.length,
+    );
+
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "intro\r\nA\nB\nC\ndelta\n",
+    );
+  });
+
+  it("reuses a separator from the replaced region before the following line", () => {
+    const source = loadSourceText("a\r\nbcd\nef");
+    const changes = ChangeSet.of(
+      { from: 0, to: 4, insert: "XY\nZW" },
+      source.text.length,
+    );
+
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "XY\r\nZWd\nef",
+    );
+  });
+
+  it("maps each retyped boundary to the nearest ending inside a mixed region", () => {
+    const source = loadSourceText("a\r\nb\nc\rd");
+    const changes = ChangeSet.of(
+      { from: 0, to: source.text.length, insert: "A\nB\nC\nD" },
+      source.text.length,
+    );
+
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "A\r\nB\nC\rD",
+    );
+  });
+
+  it("uses the document default for a mid-line insertion, not a later stray ending", () => {
+    const source = loadSourceText("a\nb\nc\r\nd\ne\n");
+    const at = source.text.indexOf("c");
+    const changes = ChangeSet.of(
+      { from: at, insert: "X\nY\n" },
+      source.text.length,
+    );
+
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "a\nb\nX\nY\nc\r\nd\ne\n",
+    );
+  });
+
+  it("keeps separator inheritance isolated across multiple changed ranges", () => {
+    const source = loadSourceText("a\r\nb\nc\rd");
+    const c = source.text.indexOf("c");
+    const changes = ChangeSet.of(
+      [
+        { from: 0, to: 2, insert: "A\n" },
+        { from: c, to: c + 2, insert: "C\n" },
+      ],
+      source.text.length,
+    );
+
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "A\r\nb\nC\rd",
+    );
+  });
+
+  it("keeps adjacent changed ranges separate when mapping their endings", () => {
+    const source = loadSourceText("a\nb\r\nc");
+    const changes = ChangeSet.of(
+      [
+        { from: 0, to: 2, insert: "LONGTEXT\n" },
+        { from: 2, to: 4, insert: "B\n" },
+      ],
+      source.text.length,
+    );
+
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "LONGTEXT\nB\r\nc",
+    );
+  });
+
+  it("falls back to the document default when appending past every boundary", () => {
+    const source = {
+      ...loadSourceText("a\r\nb\r\nc"),
+      defaultSeparator: "\r" as const,
+    };
+    const changes = ChangeSet.of(
+      { from: source.text.length, insert: "\ntail" },
+      source.text.length,
+    );
+
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "a\r\nb\r\nc\rtail",
+    );
+  });
+
   it("uses the dominant separator, then LF, when no nearby boundary exists", () => {
     const dominant = loadSourceText("a\r\nb\r\nc\nd");
     const dominantInsert = ChangeSet.of({ from: 0, insert: "x\ny\n" }, dominant.text.length);
