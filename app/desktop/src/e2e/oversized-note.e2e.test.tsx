@@ -25,8 +25,11 @@ const SEED: SeedEntry[] = [
 const recents = [{ name: "My Brain", path: VAULT_ROOT, lastOpened: 1_700_000_000_000 }];
 
 // The 8 MiB seed makes these journeys slower than the 5s default testTimeout,
-// especially under coverage instrumentation.
-const JOURNEY_TIMEOUT = 20_000;
+// especially under coverage instrumentation. Measured ~4s locally, but the
+// full-suite CI runner (2 cores, parallel workers) ran >5x slower and tripped
+// a 20s budget on Node 24 — keep generous headroom. A real restore-gate hang
+// (the regression this guards) still fails here, just later.
+const JOURNEY_TIMEOUT = 60_000;
 
 describe("Journey: open an oversized note directly (issue #82)", () => {
   it(
