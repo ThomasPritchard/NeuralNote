@@ -9,6 +9,8 @@ export interface PreviewDecoration {
   readonly checked?: boolean;
   readonly href?: string;
   readonly table?: PreviewTable;
+  /** Set on the revealed source of a table the caret is inside. */
+  readonly tableSource?: boolean;
 }
 
 export interface PreviewTable {

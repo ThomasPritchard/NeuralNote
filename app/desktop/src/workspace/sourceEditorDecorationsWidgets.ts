@@ -1,6 +1,43 @@
 import { EditorView, WidgetType } from "@codemirror/view";
 
 import type { PreviewDecoration } from "./sourceEditorDecorationsTypes";
+import { tableModelAt, type TablePadFill } from "./sourceEditorTableModel";
+
+/**
+ * Visual column padding for a table the caret is inside. It is an insertion
+ * widget with no document range, so the source keeps its exact bytes: opening a
+ * table never marks the note dirty.
+ */
+export class TablePadWidget extends WidgetType {
+  constructor(
+    private readonly width: number,
+    private readonly fill: TablePadFill,
+  ) {
+    super();
+  }
+
+  eq(other: WidgetType): boolean {
+    return other instanceof TablePadWidget
+      && other.width === this.width
+      && other.fill === this.fill;
+  }
+
+  toDOM(): HTMLElement {
+    const element = document.createElement("span");
+    element.className = this.fill === "dash"
+      ? "nn-lp-table-pad nn-lp-table-pad-dash"
+      : "nn-lp-table-pad";
+    element.setAttribute("aria-hidden", "true");
+    element.append(
+      document.createTextNode((this.fill === "dash" ? "-" : " ").repeat(this.width)),
+    );
+    return element;
+  }
+
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
 
 export class TextWidget extends WidgetType {
   constructor(
@@ -91,7 +128,8 @@ export class TableWidget extends WidgetType {
 
     const activate = (event: Event) => {
       event.preventDefault();
-      view.dispatch({ selection: { anchor: this.item.from }, scrollIntoView: true });
+      const anchor = this.caretTarget(view, event.target as Element | null);
+      view.dispatch({ selection: { anchor }, scrollIntoView: true });
       view.focus();
     };
     table.addEventListener("click", activate);
@@ -104,6 +142,29 @@ export class TableWidget extends WidgetType {
 
   ignoreEvent(): boolean {
     return true;
+  }
+
+  /**
+   * Source offset for the cell the pointer landed on. Without this every
+   * activation dropped the caret at the start of the table, so clicking a value
+   * in the last row lost your place entirely.
+   */
+  private caretTarget(view: EditorView, target: Element | null): number {
+    const model = tableModelAt(view.state, this.item.from);
+    if (!model) return this.item.from;
+
+    const cell = target?.closest("th, td");
+    const header = model.rows.find((row) => row.kind === "header");
+    if (!cell) return header?.slots[0]?.to ?? this.item.from;
+
+    const isHeader = cell.tagName === "TH";
+    const bodyRows = model.rows.filter((row) => row.kind === "body");
+    const rowElement = cell.closest("tr");
+    const row = isHeader
+      ? header
+      : bodyRows[rowElement instanceof HTMLTableRowElement ? rowElement.sectionRowIndex : 0];
+    const column = cell instanceof HTMLTableCellElement ? cell.cellIndex : 0;
+    return row?.slots.find((slot) => slot.column === column)?.to ?? row?.from ?? this.item.from;
   }
 }
 

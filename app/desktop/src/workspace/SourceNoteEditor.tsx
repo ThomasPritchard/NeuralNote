@@ -32,6 +32,12 @@ import {
 } from "./obsidianLivePreview";
 import { createWikilinkCompletionSource } from "./wikilinkCompletion";
 import { formatSourceSelections } from "./sourceEditorFormatting";
+import {
+  formatTable,
+  nextTableCell,
+  nextTableRow,
+  previousTableCell,
+} from "./sourceEditorTableCommands";
 import type { FormatAction } from "./markdownFormat";
 import {
   refreshSourceTitlePlaceholder,
@@ -176,6 +182,14 @@ export function SourceNoteEditor({
           ),
         },
         ...completionKeymap,
+        // After completionKeymap so an open wikilink popup keeps Enter, and
+        // before defaultKeymap so Enter steps down a column instead of breaking
+        // the table. Each command returns false outside a table, so Tab still
+        // moves focus everywhere else in the editor.
+        { key: "Tab", run: nextTableCell },
+        { key: "Shift-Tab", run: previousTableCell },
+        { key: "Enter", run: nextTableRow },
+        { key: "Shift-Alt-f", run: formatTable },
         ...foldKeymap,
         ...defaultKeymap,
         ...historyKeymap,

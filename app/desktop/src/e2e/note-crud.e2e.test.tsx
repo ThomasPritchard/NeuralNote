@@ -76,7 +76,10 @@ describe("Journey 4: edit and save", () => {
     expect(screen.getByRole("button", { name: "Search for #opsec" })).toBeInTheDocument();
 
     await user.click(screen.getByRole("table", { name: "Markdown table" }));
-    expect(editor.textContent).toContain("| --- | --- |");
+    // The revealed source is column-aligned with widget padding, so the rendered
+    // text carries wider dash runs than the file does. The note must stay clean.
+    expect(screen.queryByRole("table", { name: "Markdown table" })).toBeNull();
+    expect(editor.querySelector(".nn-lp-table-source")).not.toBeNull();
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
     await expect(readNote(`${VAULT_ROOT}/Commitments.md`)).resolves.toMatchObject({ raw: content });
   });

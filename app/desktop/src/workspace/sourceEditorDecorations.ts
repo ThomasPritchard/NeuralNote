@@ -1,4 +1,11 @@
-import { Prec, StateEffect, StateField, type EditorState, type Extension } from "@codemirror/state";
+import {
+  Prec,
+  type Range,
+  StateEffect,
+  StateField,
+  type EditorState,
+  type Extension,
+} from "@codemirror/state";
 import {
   Decoration,
   type DecorationSet,
@@ -8,8 +15,23 @@ import {
 } from "@codemirror/view";
 
 import { mergeVisibleRanges } from "./sourceEditorDecorationsRanges";
-import { activeLink, safeCollectMarkdownPreview } from "./sourceEditorDecorationsPreview";
-import { TableWidget, TaskWidget, TextWidget } from "./sourceEditorDecorationsWidgets";
+import {
+  activeLink,
+  MAX_TABLE_PREVIEW_CHARS,
+  MAX_TABLE_PREVIEW_ROWS,
+  safeCollectMarkdownPreview,
+} from "./sourceEditorDecorationsPreview";
+import {
+  TablePadWidget,
+  TableWidget,
+  TaskWidget,
+  TextWidget,
+} from "./sourceEditorDecorationsWidgets";
+import {
+  tableAlignmentPads,
+  tableColumnWidths,
+  tableModelAt,
+} from "./sourceEditorTableModel";
 import type { VisibleRange } from "./sourceEditorDecorationsTypes";
 
 export type {
@@ -50,11 +72,9 @@ function toDecorationSet(
         return Decoration.replace({}).range(item.from, item.to);
       case "widget":
         return Decoration.replace({
-          widget: item.table
-            ? new TableWidget(item)
-            : item.checked === undefined
-              ? new TextWidget(item.label ?? "", item.className)
-              : new TaskWidget(item),
+          widget: item.checked === undefined
+            ? new TextWidget(item.label ?? "", item.className)
+            : new TaskWidget(item),
           inclusive: false,
         }).range(item.from, item.to);
       case "mark":
@@ -91,14 +111,42 @@ function tableDecorationSet(
   if (visibleRanges.length === 0) return Decoration.none;
   const scanRanges = mergeVisibleRanges(visibleRanges, state.doc.length, TABLE_SCAN_MARGIN);
   const result = safeCollectMarkdownPreview(state, scanRanges);
-  const ranges = result.decorations.flatMap((item) => item.table
-    ? [Decoration.replace({
+  const ranges = result.decorations.flatMap((item) => {
+    if (item.table) {
+      return [Decoration.replace({
         widget: new TableWidget(item),
         inclusive: false,
         block: true,
-      }).range(item.from, item.to)]
-    : []);
+      }).range(item.from, item.to)];
+    }
+    return item.tableSource ? alignmentRanges(state, item.from) : [];
+  });
   return Decoration.set(ranges, true);
+}
+
+/**
+ * Visual-only column alignment for the table the caret is inside. Every range is
+ * a zero-length widget insertion, so the revealed source lines up without a
+ * single byte changing on disk.
+ */
+function alignmentRanges(state: EditorState, tablePos: number): Range<Decoration>[] {
+  const model = tableModelAt(state, tablePos);
+  if (!model) return [];
+  // Honour the same bounds the rendered preview uses. A table is marked as
+  // source both when the caret is inside it AND when it is too big to preview,
+  // so without this an oversized table would be re-measured on every keystroke
+  // after we had already decided it was too expensive to render.
+  if (
+    model.to - model.from > MAX_TABLE_PREVIEW_CHARS
+    || model.rows.length > MAX_TABLE_PREVIEW_ROWS
+  ) {
+    return [];
+  }
+  const pads = tableAlignmentPads(state, model, tableColumnWidths(state, model));
+  return pads.map((pad) => Decoration.widget({
+    widget: new TablePadWidget(pad.width, pad.fill),
+    side: pad.side,
+  }).range(pad.pos));
 }
 
 interface TableDecorationState {

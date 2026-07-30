@@ -632,7 +632,7 @@ html[data-font-family="sourceSerif4"] {
   padding: 0.55rem 0.75rem;
   text-align: start;
   vertical-align: top;
-  white-space: normal;
+  white-space: pre;
 }
 
 .nn-source-editor .nn-lp-table th {
@@ -658,6 +658,21 @@ html[data-font-family="sourceSerif4"] {
   background: color-mix(in oklab, var(--surface-sunken) 82%, transparent);
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
+}
+
+/*
+ * Column alignment for the table under the caret. These are widget insertions
+ * with no document range, so they line the source up without altering a byte.
+ * `pre` keeps the padding runs from collapsing; `user-select: none` keeps them
+ * out of a drag selection.
+ */
+.nn-source-editor .nn-lp-table-pad {
+  white-space: pre;
+  user-select: none;
+}
+
+.nn-source-editor .nn-lp-table-pad-dash {
+  color: color-mix(in oklab, currentcolor 45%, transparent);
 }
 
 .nn-source-editor :where(.nn-lp-link, .nn-lp-wikilink-resolved) {

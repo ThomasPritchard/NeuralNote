@@ -208,7 +208,152 @@ describe("SourceNoteEditor", () => {
     await userEvent.click(table);
 
     await waitFor(() => expect(screen.queryByRole("table", { name: "Markdown table" })).toBeNull());
-    expect(container.querySelector(".cm-content")).toHaveTextContent("| --- | --- |");
+    // The revealed source is visually aligned, so the rendered text carries
+    // padding widgets. Exactness is asserted against the document, not the DOM.
+    const view = EditorView.findFromDOM(container.querySelector<HTMLElement>(".cm-editor")!)!;
+    expect(view.state.doc.toString()).toBe(source);
+    expect(container.querySelector(".nn-lp-table-source")).not.toBeNull();
+  });
+
+  it("places the caret in the cell that was clicked rather than at the table start", async () => {
+    const source = [
+      "# Commitments",
+      "",
+      "| Start date | Commitment |",
+      "| --- | --- |",
+      "| 2026-04-03 | DJ gig |",
+    ].join("\n");
+    const { container } = render(
+      <SourceNoteEditor
+        sessionKey="tab-table-caret"
+        loadedHash="hash-table-caret"
+        value={source}
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+      />,
+    );
+
+    const view = EditorView.findFromDOM(container.querySelector<HTMLElement>(".cm-editor")!)!;
+    await userEvent.click(screen.getByRole("cell", { name: "DJ gig" }));
+
+    await waitFor(() => {
+      expect(view.state.selection.main.head).toBe(source.indexOf("DJ gig") + "DJ gig".length);
+    });
+  });
+
+  it("aligns the revealed table source visually without changing a single byte", async () => {
+    // The heading keeps the initial caret outside the table, so it starts rendered.
+    const source = [
+      "# Commitments",
+      "",
+      "| Start date | Commitment |",
+      "| --- | --- |",
+      "| 2026-04-03 | DJ gig |",
+    ].join("\n");
+    const onChange = vi.fn();
+    const { container } = render(
+      <SourceNoteEditor
+        sessionKey="tab-table-align"
+        loadedHash="hash-table-align"
+        value={source}
+        onChange={onChange}
+        onPreservationError={vi.fn()}
+      />,
+    );
+
+    const view = EditorView.findFromDOM(container.querySelector<HTMLElement>(".cm-editor")!)!;
+    await userEvent.click(screen.getByRole("cell", { name: "DJ gig" }));
+
+    await waitFor(() => expect(container.querySelectorAll(".nn-lp-table-pad").length).toBeGreaterThan(0));
+    expect(view.state.doc.toString()).toBe(source);
+    expect(onChange).not.toHaveBeenCalled();
+
+    const dashes = container.querySelector(".nn-lp-table-pad-dash");
+    expect(dashes).not.toBeNull();
+    expect(dashes).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("skips alignment on a table too large to preview", async () => {
+    // Over MAX_TABLE_PREVIEW_ROWS, so it is already shown as plain source. It
+    // must not be re-measured for alignment on top of that.
+    const source = [
+      "# Commitments",
+      "",
+      "| Key | Value |",
+      "| --- | --- |",
+      ...Array.from({ length: 260 }, (_, index) => `| ${index} | v |`),
+    ].join("\n");
+    const { container } = render(
+      <SourceNoteEditor
+        sessionKey="tab-table-huge"
+        loadedHash="hash-table-huge"
+        value={source}
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+      />,
+    );
+
+    const view = EditorView.findFromDOM(container.querySelector<HTMLElement>(".cm-editor")!)!;
+    view.dispatch({ selection: { anchor: source.indexOf("| 3 | v |") + 3 } });
+
+    await waitFor(() => expect(container.querySelector(".nn-lp-table-source")).not.toBeNull());
+    expect(container.querySelectorAll(".nn-lp-table-pad")).toHaveLength(0);
+    expect(view.state.doc.toString()).toBe(source);
+  });
+
+  it("moves between table cells with Tab and down a column with Enter", async () => {
+    const source = [
+      "# Commitments",
+      "",
+      "| Start date | Commitment |",
+      "| --- | --- |",
+      "| 2026-04-03 | DJ gig |",
+    ].join("\n");
+    const { container } = render(
+      <SourceNoteEditor
+        sessionKey="tab-table-nav"
+        loadedHash="hash-table-nav"
+        value={source}
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+      />,
+    );
+
+    const editor = container.querySelector<HTMLElement>(".cm-editor")!;
+    const view = EditorView.findFromDOM(editor)!;
+    const selected = () => view.state.sliceDoc(view.state.selection.main.from, view.state.selection.main.to);
+
+    view.dispatch({ selection: { anchor: source.indexOf("Start date") } });
+    fireEvent.keyDown(view.contentDOM, { key: "Tab" });
+    await waitFor(() => expect(selected()).toBe("Commitment"));
+
+    fireEvent.keyDown(view.contentDOM, { key: "Enter" });
+    await waitFor(() => expect(selected()).toBe("DJ gig"));
+
+    fireEvent.keyDown(view.contentDOM, { key: "Tab", shiftKey: true });
+    await waitFor(() => expect(selected()).toBe("2026-04-03"));
+
+    expect(view.state.doc.toString()).toBe(source);
+  });
+
+  it("leaves Tab alone outside a table so keyboard focus can still escape", async () => {
+    const source = "# Commitments\n\nplain paragraph";
+    const { container } = render(
+      <SourceNoteEditor
+        sessionKey="tab-table-escape"
+        loadedHash="hash-table-escape"
+        value={source}
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+      />,
+    );
+
+    const view = EditorView.findFromDOM(container.querySelector<HTMLElement>(".cm-editor")!)!;
+    view.dispatch({ selection: { anchor: source.length } });
+    const handled = fireEvent.keyDown(view.contentDOM, { key: "Tab" });
+
+    expect(handled).toBe(true);
+    expect(view.state.doc.toString()).toBe(source);
   });
 
   it("renders inline Markdown as table cell text instead of exposing its source markers", () => {

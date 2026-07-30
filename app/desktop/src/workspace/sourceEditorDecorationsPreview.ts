@@ -32,8 +32,8 @@ const MARKER_NAMES = new Set([
   "LinkMark",
 ]);
 
-const MAX_TABLE_PREVIEW_CHARS = 32_768;
-const MAX_TABLE_PREVIEW_ROWS = 200;
+export const MAX_TABLE_PREVIEW_CHARS = 32_768;
+export const MAX_TABLE_PREVIEW_ROWS = 200;
 
 function active(state: EditorState, from: number, to: number): boolean {
   return state.selection.ranges.some((range) =>
@@ -229,7 +229,7 @@ export function collectMarkdownPreview(
           const table = to - from <= MAX_TABLE_PREVIEW_CHARS ? tablePreview(state, node) : null;
           output.push(table && !active(state, from, to)
             ? { from, to, kind: "widget", className: "nn-lp-table", table }
-            : { from, to, kind: "mark", className: "nn-lp-table-source" });
+            : { from, to, kind: "mark", className: "nn-lp-table-source", tableSource: true });
         }
         return false;
       } else if (MARKER_NAMES.has(name)) {
