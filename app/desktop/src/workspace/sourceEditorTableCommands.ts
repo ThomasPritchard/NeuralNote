@@ -2,7 +2,7 @@ import { EditorSelection, type EditorState, type TransactionSpec } from "@codemi
 import type { Command } from "@codemirror/view";
 
 import {
-  displayWidth,
+  monospaceWidth,
   tableColumnWidths,
   tableModelAt,
   type TableModel,
@@ -185,18 +185,35 @@ export function formatTableAt(state: EditorState): TransactionSpec | null {
   if (!model) return null;
   const widths = tableColumnWidths(state, model);
 
+  // The DELIMITER row defines a GFM table's arity, not the widest row. Sizing
+  // every row to the maximum gave the delimiter row an extra cell, so Obsidian
+  // then rendered a column that had not existed and previously-discarded text
+  // became visible data: formatting changed the document's meaning rather than
+  // its whitespace.
+  const arity = model.rows.find((row) => row.kind === "delimiter")?.slots.length
+    ?? model.columnCount;
+
   // One change per row, so the line boundaries between rows are never rewritten.
   const changes = model.rows.map((row) => {
-    const cells = Array.from({ length: model.columnCount }, (_, column) => {
+    const cells = Array.from({ length: arity }, (_, column) => {
       const slot = row.slots.find((candidate) => candidate.column === column);
       const width = widths[column] ?? 0;
       if (row.kind === "delimiter") {
         return delimiterCell(width, model.alignments[column] ?? "none");
       }
       const text = slot ? state.sliceDoc(slot.from, slot.to) : "";
-      return text + " ".repeat(Math.max(0, width - displayWidth(text)));
+      return text + " ".repeat(Math.max(0, width - monospaceWidth(text)));
     });
-    return { from: row.from, to: row.to, insert: `| ${cells.join(" | ")} |` };
+
+    // Cells beyond the table's arity are left exactly as authored. Renderers
+    // already discard them; deleting the user's text to tidy the file would be
+    // worse than leaving the row ragged.
+    const surplus = row.slots
+      .filter((slot) => slot.column >= arity)
+      .map((slot) => state.sliceDoc(slot.from, slot.to));
+    const tail = surplus.length > 0 ? ` ${surplus.join(" | ")} |` : "";
+
+    return { from: row.from, to: row.to, insert: `| ${cells.join(" | ")} |${tail}` };
   });
 
   if (changes.every((change) => state.sliceDoc(change.from, change.to) === change.insert)) {

@@ -3,6 +3,7 @@ import { EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
 import {
+  monospaceWidth,
   tableAlignmentPads,
   tableColumnWidths,
   tableModelAt,
@@ -113,12 +114,21 @@ describe("tableColumnWidths", () => {
     expect(tableColumnWidths(editor, tableModelAt(editor, 0)!)).toEqual([3, 3]);
   });
 
-  it("counts a multi-code-point emoji as a single column", () => {
-    // Four family emoji: 4 graphemes, 20 code points, 44 UTF-16 code units.
+  it("counts a multi-code-point emoji as the two columns it occupies", () => {
+    // Four family emoji: 4 graphemes, 20 code points, 44 UTF-16 code units,
+    // and 8 monospace columns — emoji are double-width. Issue #86.
     const doc = "| a | b |\n| --- | --- |\n| 👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧👨‍👩‍👧 | y |";
     const editor = state(doc);
 
-    expect(tableColumnWidths(editor, tableModelAt(editor, 0)!)[0]).toBe(4);
+    expect(tableColumnWidths(editor, tableModelAt(editor, 0)!)[0]).toBe(8);
+  });
+
+  it("sizes a CJK column by the columns it occupies, not its character count", () => {
+    const doc = "| a | b |\n| --- | --- |\n| 中文字 | y |";
+    const editor = state(doc);
+
+    // "中文字" is 3 characters but 6 monospace columns.
+    expect(tableColumnWidths(editor, tableModelAt(editor, 0)!)[0]).toBe(6);
   });
 });
 
@@ -206,7 +216,74 @@ describe("tableAlignmentPads", () => {
     expect(result.some((pad) => pad.pos === cell.segmentTo)).toBe(true);
   });
 
+  it("aligns a row written without its outer pipes to the same grid", () => {
+    // GFM makes leading and trailing pipes optional per row. Measuring the raw
+    // segment left such a row one character out of step, because pads could
+    // only append or prepend and never supply the missing leading space.
+    const doc = "| a | b |\n| --- | --- |\nc | d";
+    const editor = state(doc);
+    const model = tableModelAt(editor, 0)!;
+    const widths = tableSegmentWidths(editor, model);
+    const result = tableAlignmentPads(editor, model, widths);
+
+    // Rendered width of every slot in a column must agree.
+    for (let column = 0; column < model.columnCount; column += 1) {
+      const rendered = model.rows.map((row) => {
+        const slot = row.slots.find((candidate) => candidate.column === column);
+        if (!slot) return null;
+        const base = slot.segmentTo - slot.segmentFrom;
+        const added = result
+          .filter((pad) => pad.pos >= slot.segmentFrom && pad.pos <= slot.segmentTo)
+          .reduce((total, pad) => total + pad.width, 0);
+        return base + added;
+      }).filter((value) => value !== null);
+      expect(new Set(rendered).size).toBe(1);
+    }
+
+    // And the content must start at the same offset, not just end at one.
+    const leading = model.rows.map((row) => {
+      const slot = row.slots.find((candidate) => candidate.column === 0)!;
+      const before = result
+        .filter((pad) => pad.pos === slot.segmentFrom)
+        .reduce((total, pad) => total + pad.width, 0);
+      return before + (slot.from - slot.segmentFrom);
+    });
+    expect(new Set(leading).size).toBe(1);
+  });
+
   it("produces no padding for a table whose columns already line up", () => {
     expect(pads("| aaa | bbb |\n| --- | --- |\n| xxx | yyy |")).toEqual([]);
+  });
+});
+
+describe("monospaceWidth", () => {
+  // Issue #86: the disk path (Shift-Alt-f) must pad by the columns a glyph
+  // actually occupies in a monospace font, not by how many graphemes it is.
+  it.each([
+    ["abc", 3],
+    ["", 0],
+    ["中文字", 6],
+    ["日本語です", 10],
+    ["👍👍", 4],
+    ["한국어", 6],
+    ["ｆｕｌｌ", 8],
+    ["café", 4],
+    ["Ω≈ç√", 4],
+    ["a中b", 4],
+  ])("measures %o as %i columns", (text, columns) => {
+    expect(monospaceWidth(text)).toBe(columns);
+  });
+
+  it("ignores zero-width joiners and variation selectors", () => {
+    expect(monospaceWidth("👨‍👩‍👧")).toBe(2);
+    expect(monospaceWidth("\u200b")).toBe(0);
+  });
+
+  it("never reports a negative or fractional width", () => {
+    for (const text of ["", "a", "中", "👍", "\u0301", "e\u0301"]) {
+      const width = monospaceWidth(text);
+      expect(Number.isInteger(width)).toBe(true);
+      expect(width).toBeGreaterThanOrEqual(0);
+    }
   });
 });

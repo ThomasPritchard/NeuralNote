@@ -169,9 +169,15 @@ function alignmentRanges(state: EditorState, tablePos: number): Range<Decoration
   // source both when the caret is inside it AND when it is too big to preview,
   // so without this an oversized table would be re-measured on every keystroke
   // after we had already decided it was too expensive to render.
+  //
+  // Count BODY rows with >=, exactly as `tablePreview` does. Counting
+  // `model.rows` (which also holds the header and delimiter rows) with > put
+  // this bound two rows out of step, so a table with 199 body rows rendered
+  // normally and then appeared completely unaligned, with no message.
+  const bodyRows = model.rows.reduce((total, row) => total + (row.kind === "body" ? 1 : 0), 0);
   if (
     model.to - model.from > MAX_TABLE_PREVIEW_CHARS
-    || model.rows.length > MAX_TABLE_PREVIEW_ROWS
+    || bodyRows >= MAX_TABLE_PREVIEW_ROWS
   ) {
     return [];
   }

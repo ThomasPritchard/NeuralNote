@@ -47,6 +47,12 @@ export class TextWidget extends WidgetType {
     super();
   }
 
+  eq(other: WidgetType): boolean {
+    return other instanceof TextWidget
+      && other.label === this.label
+      && other.className === this.className;
+  }
+
   toDOM(): HTMLElement {
     const element = document.createElement("span");
     element.className = this.className;
@@ -97,6 +103,20 @@ export class TaskWidget extends WidgetType {
 export class TableWidget extends WidgetType {
   constructor(private readonly item: PreviewDecoration) {
     super();
+  }
+
+  /**
+   * Without this, `WidgetType.eq` defaults to false and the whole table is torn
+   * down and rebuilt — every row, cell and event listener — on every doc,
+   * selection or viewport change. That is once per keystroke anywhere in the
+   * note, however far from the table.
+   */
+  eq(other: WidgetType): boolean {
+    return other instanceof TableWidget
+      && other.item.from === this.item.from
+      && other.item.to === this.item.to
+      && other.item.className === this.item.className
+      && tableShapeKey(other.item) === tableShapeKey(this.item);
   }
 
   toDOM(view: EditorView): HTMLElement {
@@ -174,6 +194,14 @@ export class TableWidget extends WidgetType {
     const rendered = row.slots.filter((slot) => slot.from !== slot.to);
     return rendered[index]?.to ?? row.slots[index]?.to ?? row.from;
   }
+}
+
+/** Cheap structural identity: the rendered text, which is all the DOM shows. */
+function tableShapeKey(item: PreviewDecoration): string {
+  const table = item.table;
+  if (!table) return "";
+  return [table.headers.join("\u0000"), ...table.rows.map((row) => row.join("\u0000"))]
+    .join("\u0001");
 }
 
 function toggleTask(event: Event, view: EditorView): boolean {

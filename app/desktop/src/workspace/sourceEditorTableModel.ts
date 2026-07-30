@@ -56,13 +56,71 @@ const segmenter = typeof Intl.Segmenter === "function"
   : null;
 
 /**
- * Monospace column count for a cell. Graphemes rather than code units, so a
- * multi-code-point emoji occupies one column instead of two or more.
+ * Code points that render two columns wide in a monospace font: the East Asian
+ * Wide (W) and Fullwidth (F) classes of Unicode Annex #11, plus emoji. Ranges
+ * rather than a per-character table, because the classes are contiguous blocks.
  */
-export function displayWidth(text: string): number {
-  if (!segmenter) return [...text].length;
+const DOUBLE_WIDTH_RANGES: ReadonlyArray<readonly [number, number]> = [
+  [0x1100, 0x115f], // Hangul Jamo initial consonants
+  [0x2e80, 0x303e], // CJK radicals, Kangxi, CJK symbols and punctuation
+  [0x3041, 0x33ff], // Hiragana, Katakana, Bopomofo, Hangul Compatibility Jamo
+  [0x3400, 0x4dbf], // CJK Unified Ideographs Extension A
+  [0x4e00, 0x9fff], // CJK Unified Ideographs
+  [0xa000, 0xa4cf], // Yi syllables
+  [0xa960, 0xa97f], // Hangul Jamo Extended-A
+  [0xac00, 0xd7a3], // Hangul syllables
+  [0xf900, 0xfaff], // CJK Compatibility Ideographs
+  [0xfe10, 0xfe19], // Vertical forms
+  [0xfe30, 0xfe6f], // CJK Compatibility Forms, small form variants
+  [0xff00, 0xff60], // Fullwidth ASCII variants
+  [0xffe0, 0xffe6], // Fullwidth signs
+  [0x1f300, 0x1f64f], // Emoji: symbols, pictographs, emoticons
+  [0x1f900, 0x1f9ff], // Emoji: supplemental symbols and pictographs
+  [0x17000, 0x18aff], // Tangut
+  [0x1b000, 0x1b12f], // Kana supplement
+  [0x20000, 0x3fffd], // CJK Unified Ideographs Extensions B onward
+];
+
+/** Code points that occupy no column at all: combining marks and joiners. */
+function isZeroWidth(code: number): boolean {
+  return (
+    (code >= 0x0300 && code <= 0x036f) // combining diacritical marks
+    || code === 0x200b // zero-width space
+    || code === 0x200d // zero-width joiner
+    || (code >= 0xfe00 && code <= 0xfe0f) // variation selectors
+    || code === 0x20e3 // combining enclosing keycap
+  );
+}
+
+function isDoubleWidth(code: number): boolean {
+  return DOUBLE_WIDTH_RANGES.some(([low, high]) => code >= low && code <= high);
+}
+
+/**
+ * How many columns a string occupies in a monospace font.
+ *
+ * Counting graphemes is wrong: CJK ideographs, Hangul syllables, fullwidth
+ * forms and emoji all render two columns wide, so a grapheme count pads a CJK
+ * table to visibly ragged columns (issue #86). A grapheme's width is taken from
+ * its FIRST non-zero-width code point, which makes an emoji ZWJ sequence such
+ * as a family emoji count as one glyph of width 2 rather than as its parts.
+ */
+export function monospaceWidth(text: string): number {
+  const clusters = segmenter
+    ? [...segmenter.segment(text)].map((entry) => entry.segment)
+    : [...text];
+
   let width = 0;
-  for (const _ of segmenter.segment(text)) width += 1;
+  for (const cluster of clusters) {
+    let clusterWidth = 0;
+    for (const character of cluster) {
+      const code = character.codePointAt(0);
+      if (code === undefined || isZeroWidth(code)) continue;
+      clusterWidth = isDoubleWidth(code) ? 2 : 1;
+      break;
+    }
+    width += clusterWidth;
+  }
   return width;
 }
 
@@ -182,7 +240,7 @@ export function tableColumnWidths(state: EditorState, model: TableModel): number
   const widths = Array.from({ length: model.columnCount }, () => MIN_DELIMITER_WIDTH);
   for (const row of model.rows) {
     for (const slot of row.slots) {
-      const width = displayWidth(state.sliceDoc(slot.from, slot.to));
+      const width = monospaceWidth(state.sliceDoc(slot.from, slot.to));
       widths[slot.column] = Math.max(widths[slot.column] ?? MIN_DELIMITER_WIDTH, width);
     }
   }
@@ -195,15 +253,38 @@ export function tableColumnWidths(state: EditorState, model: TableModel): number
  * content width, because a cell carrying trailing spaces already renders wider
  * than its content and padding the content alone would push it wider still.
  */
+/** One space, content, one space — how a cell reads once aligned. */
+const CANONICAL_CELL_PADDING = 2;
+
+/**
+ * Rendered width each column should occupy: its widest content plus one space
+ * either side.
+ *
+ * Measuring the raw pipe-to-pipe span instead would make a row that omits its
+ * outer pipes (GFM allows it) sit one character out of step from its
+ * neighbours, because that row's segment carries less surrounding whitespace
+ * and pads can only add, never re-position.
+ */
 export function tableSegmentWidths(state: EditorState, model: TableModel): number[] {
   const widths = Array.from({ length: model.columnCount }, () => 0);
   for (const row of model.rows) {
     for (const slot of row.slots) {
-      const width = displayWidth(state.sliceDoc(slot.segmentFrom, slot.segmentTo));
-      widths[slot.column] = Math.max(widths[slot.column] ?? 0, width);
+      const content = monospaceWidth(state.sliceDoc(slot.from, slot.to));
+      widths[slot.column] = Math.max(widths[slot.column] ?? 0, content);
     }
   }
-  return widths;
+  return widths.map((content) => content + CANONICAL_CELL_PADDING);
+}
+
+/** How a single slot currently renders, split into its three parts. */
+function slotMetrics(state: EditorState, slot: TableColumnSlot) {
+  const leading = monospaceWidth(state.sliceDoc(slot.segmentFrom, slot.from));
+  const trailing = monospaceWidth(state.sliceDoc(slot.to, slot.segmentTo));
+  const content = monospaceWidth(state.sliceDoc(slot.from, slot.to));
+  // A cell with no opening space needs one supplied, or its content starts a
+  // column to the left of every other row's.
+  const openingGap = Math.max(0, 1 - leading);
+  return { leading, trailing, content, openingGap };
 }
 
 export function tableAlignmentPads(
@@ -214,8 +295,18 @@ export function tableAlignmentPads(
   const pads: TablePad[] = [];
   for (const row of model.rows) {
     for (const slot of row.slots) {
-      const segment = state.sliceDoc(slot.segmentFrom, slot.segmentTo);
-      const deficit = (widths[slot.column] ?? 0) - displayWidth(segment);
+      const { leading, trailing, content, openingGap } = slotMetrics(state, slot);
+      if (openingGap > 0) {
+        pads.push({
+          pos: slot.segmentFrom,
+          width: openingGap,
+          fill: row.kind === "delimiter" ? "dash" : "space",
+          side: -1,
+        });
+      }
+
+      const rendered = leading + openingGap + content + trailing;
+      const deficit = (widths[slot.column] ?? 0) - rendered;
       if (deficit <= 0) continue;
 
       if (row.kind === "delimiter") {

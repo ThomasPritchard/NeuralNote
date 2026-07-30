@@ -301,6 +301,35 @@ describe("SourceNoteEditor", () => {
     expect(view.state.doc.toString()).toBe(source);
   });
 
+  it("aligns a table just under the preview row cap, matching the render bound", async () => {
+    // Regression: the render path counted BODY rows with >=, the alignment path
+    // counted ALL rows (header + delimiter included) with >, so a table with
+    // 199 body rows rendered normally but its source came out unaligned with no
+    // message. The two bounds must gate on the same number.
+    const source = [
+      "# Commitments",
+      "",
+      "| Key | Value |",
+      "| --- | --- |",
+      ...Array.from({ length: 199 }, (_, index) => `| ${index} | v |`),
+    ].join("\n");
+    const { container } = render(
+      <SourceNoteEditor
+        sessionKey="tab-table-bound"
+        loadedHash="hash-table-bound"
+        value={source}
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+      />,
+    );
+
+    const view = EditorView.findFromDOM(container.querySelector<HTMLElement>(".cm-editor")!)!;
+    view.dispatch({ selection: { anchor: source.indexOf("| 3 | v |") + 3 } });
+
+    await waitFor(() => expect(container.querySelector(".nn-lp-table-source")).not.toBeNull());
+    expect(container.querySelectorAll(".nn-lp-table-pad").length).toBeGreaterThan(0);
+  });
+
   it("moves between table cells with Tab and down a column with Enter", async () => {
     const source = [
       "# Commitments",

@@ -487,6 +487,17 @@ html[data-font-family="sourceSerif4"] {
   min-height: 50vh;
 }
 
+/*
+ * CodeMirror's base theme declares `line-height: 1.4` directly on
+ * `.cm-scroller`, a descendant of `.cm-editor`. A descendant's own declaration
+ * beats inheritance, so setting the token on `.cm-editor` alone never reached a
+ * single line of text (#92). Target the scroller, with enough specificity to
+ * win regardless of stylesheet injection order.
+ */
+.nn-source-editor .cm-editor .cm-scroller {
+  line-height: 1.8;
+}
+
 .nn-source-editor .cm-editor {
   background: transparent;
   color: color-mix(in oklab, var(--foreground) 90%, transparent);

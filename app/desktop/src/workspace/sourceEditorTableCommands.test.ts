@@ -36,6 +36,9 @@ function apply(editor: EditorState, spec: ReturnType<typeof tableCellStep>) {
 
 const at = (needle: string, offset = 0) => TABLE.indexOf(needle) + offset;
 
+/** Cells a GFM renderer would see in one row. */
+const cellCount = (line: string) => line.split("|").slice(1, -1).length;
+
 describe("tableCellStep", () => {
   it("does nothing when the caret is outside a table", () => {
     expect(tableCellStep(state(TABLE, 2), 1)).toBeNull();
@@ -157,6 +160,21 @@ describe("formatTableAt", () => {
     expect(apply(editor, formatTableAt(editor))?.doc).toBe(
       "| a    | b    | c    |\n| :--- | :--: | ---: |\n| xxxx | yyyy | zzzz |",
     );
+  });
+
+  it("does not add a column when a body row has more cells than the header", () => {
+    // GFM and Obsidian render this as a TWO-column table and discard "z".
+    // Rewriting every row to the widest row gave the delimiter row three cells,
+    // so Obsidian then rendered three columns and "z" became visible data:
+    // formatting changed the document's meaning, not its whitespace. (#87)
+    const doc = "| a | b |\n| --- | --- |\n| x | y | z |";
+    const editor = state(doc, doc.indexOf("x"));
+    const result = apply(editor, formatTableAt(editor));
+    const lines = (result?.doc ?? doc).split("\n");
+
+    expect(cellCount(lines[0]!)).toBe(2);
+    expect(cellCount(lines[1]!)).toBe(2);
+    expect(result?.doc).toContain("z");
   });
 
   it("returns null for a table that is already aligned", () => {
