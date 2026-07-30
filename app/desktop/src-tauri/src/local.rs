@@ -7,6 +7,7 @@
 //! Phase 2 exposes plumbing that the AI commands in `lib.rs` wrap.
 
 use futures_util::StreamExt;
+use neuralnote_core::ai::local::OLLAMA_NUM_CTX;
 use neuralnote_core::ai::{
     ollama_reasoning_support, parse_hf_metadata, parse_installed_models, HardwareSpec, HfModelMeta,
     InstalledModel, PullEvent, PullProgress, PullSink, ReasoningSupport,
@@ -35,13 +36,9 @@ const OLLAMA_MODELS_DIR: &str = "ollama-models";
 const OLLAMA_LIBS_DIR: &str = "ollama-libs";
 const OLLAMA_HEALTH_INTERVAL: Duration = Duration::from_millis(300);
 const OLLAMA_START_TIMEOUT: Duration = Duration::from_secs(30);
-/// Context window (tokens) for the local chat client. Ollama's built-in default is
-/// ~4096 and it **silently truncates from the front**, which would drop the grounding
-/// rules (sent first) and the earliest evidence — breaking cited recall on the Local
-/// path (PA-001). Sized well above the retrieval budget (the orchestrator caps context
-/// at 60_000 chars ≈ ~15k tokens); every curated model in the `ai::local` allowlist
-/// supports a window this large.
-const OLLAMA_NUM_CTX: u32 = 32_768;
+// The local context window (`num_ctx`) is the core's `OLLAMA_NUM_CTX` — imported
+// above — so the window the sidecar is told to enforce and the window the
+// orchestrator budgets against are the same constant by construction.
 /// Cap on the retained sidecar stderr. The only reader is the startup diagnostic,
 /// which wants the TAIL (the most recent lines around a failure) — so we keep the
 /// last N KiB and drop older bytes, bounding what would otherwise grow for the

@@ -151,6 +151,200 @@ mod tests {
     }
 
     #[test]
+    fn read_note_keeps_a_note_at_the_exact_editable_limit_editable() {
+        // The boundary is shared with the write side: exactly MAX bytes is a
+        // legitimate editable note and must read through with full content.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("exact.md");
+        let content = "x".repeat(note::MAX_EDITABLE_NOTE_BYTES);
+        fs::write(&f, &content).unwrap();
+
+        let doc = note::read_note(dir.path(), &f).unwrap();
+        assert!(!doc.exceeds_editable_size);
+        assert_eq!(doc.size_bytes, 0);
+        assert_eq!(doc.raw.len(), note::MAX_EDITABLE_NOTE_BYTES);
+        assert!(!doc.content_hash.is_empty());
+    }
+
+    #[test]
+    fn read_note_flags_a_note_over_the_editable_limit_without_marshalling_content() {
+        // Issue #82: one byte past the limit the content must stay OFF the wire —
+        // mounting a single 8 MiB line in the editor freezes the webview. The doc
+        // is flagged with the on-disk size so the UI can show an explicit
+        // size-limit state; the file itself is never touched.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("Oversized editable note.md");
+        let original = vec![b'x'; note::MAX_EDITABLE_NOTE_BYTES + 1];
+        fs::write(&f, &original).unwrap();
+
+        let doc = note::read_note(dir.path(), &f).unwrap();
+        assert!(doc.exceeds_editable_size);
+        assert_eq!(doc.size_bytes as usize, note::MAX_EDITABLE_NOTE_BYTES + 1);
+        assert!(!doc.binary && !doc.lossy_text);
+        assert!(doc.raw.is_empty() && doc.body.is_empty());
+        assert!(doc.content_hash.is_empty(), "no hash of content never read");
+        assert_eq!(doc.title, "Oversized editable note");
+        // The bytes on disk are byte-for-byte intact — reading never rewrites.
+        assert_eq!(fs::read(&f).unwrap(), original);
+    }
+
+    #[test]
+    fn read_note_flags_an_oversized_non_utf8_text_note_as_oversized_not_lossy() {
+        // The size cap is checked before any decode: an oversized non-UTF-8 text
+        // note must not be lossy-decoded into an 8 MiB+ string of U+FFFD.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("latin1-big.md");
+        let mut bytes = vec![0xE9; note::MAX_EDITABLE_NOTE_BYTES]; // Latin-1 é, invalid UTF-8
+        bytes.push(b'x');
+        fs::write(&f, &bytes).unwrap();
+
+        let doc = note::read_note(dir.path(), &f).unwrap();
+        assert!(doc.exceeds_editable_size);
+        assert!(!doc.lossy_text && !doc.binary);
+        assert!(doc.raw.is_empty());
+    }
+
+    #[test]
+    fn read_note_flags_an_oversized_binary_attachment_without_marshalling_content() {
+        // Resource limits take precedence over attachment classification: a
+        // binary file above the cap must never be allocated merely to prove it
+        // is binary.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("big.png");
+        let mut bytes = vec![0xFF; note::MAX_EDITABLE_NOTE_BYTES];
+        bytes.push(0xFE);
+        fs::write(&f, &bytes).unwrap();
+
+        let doc = note::read_note(dir.path(), &f).unwrap();
+        assert!(doc.exceeds_editable_size);
+        assert!(!doc.binary);
+        assert_eq!(doc.size_bytes as usize, note::MAX_EDITABLE_NOTE_BYTES + 1);
+        assert!(doc.raw.is_empty() && doc.body.is_empty());
+    }
+
+    #[test]
+    fn read_note_flags_an_oversized_valid_utf8_attachment_too() {
+        // The cap applies to ANY document that would otherwise be marshalled as
+        // editable text — a valid-UTF-8 non-note file (e.g. a huge exported
+        // `.json`) would freeze the editor exactly like an oversized note.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("export.json");
+        fs::write(&f, vec![b'x'; note::MAX_EDITABLE_NOTE_BYTES + 1]).unwrap();
+
+        let doc = note::read_note(dir.path(), &f).unwrap();
+        assert!(doc.exceeds_editable_size);
+        assert!(!doc.binary);
+        assert!(doc.raw.is_empty());
+    }
+
+    #[test]
+    fn read_note_flags_a_lossy_decode_that_amplifies_past_the_limit() {
+        // Lossy decode AMPLIFIES: every invalid byte becomes the 3-byte U+FFFD,
+        // so a note of exactly MAX on-disk Latin-1 high bytes decodes to ~3×MAX
+        // bytes. The cap must be re-checked on the DECODED string — the thing
+        // actually marshalled to the webview (#82) and the thing the write side
+        // measures — while size_bytes keeps quoting the on-disk size.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("latin1-at-cap.md");
+        fs::write(&f, vec![0xE9; note::MAX_EDITABLE_NOTE_BYTES]).unwrap();
+
+        let doc = note::read_note(dir.path(), &f).unwrap();
+        assert!(doc.exceeds_editable_size);
+        assert!(!doc.lossy_text && !doc.binary);
+        assert!(doc.raw.is_empty() && doc.body.is_empty());
+        assert!(doc.content_hash.is_empty());
+        assert_eq!(doc.size_bytes as usize, note::MAX_EDITABLE_NOTE_BYTES);
+    }
+
+    #[test]
+    fn read_note_keeps_a_lossy_note_at_the_exact_decoded_limit_editable() {
+        // The decoded-size boundary is the same `> MAX` the write side enforces:
+        // (MAX - 3) ASCII bytes plus one invalid byte decode to EXACTLY MAX
+        // bytes (the bad byte becomes the 3-byte U+FFFD) — at the limit, not
+        // past it, so the note opens lossy-editable and stays savable.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("latin1-boundary.md");
+        let mut bytes = vec![b'x'; note::MAX_EDITABLE_NOTE_BYTES - 3];
+        bytes.push(0xE9);
+        fs::write(&f, &bytes).unwrap();
+
+        let doc = note::read_note(dir.path(), &f).unwrap();
+        assert!(!doc.exceeds_editable_size);
+        assert!(doc.lossy_text);
+        assert_eq!(doc.raw.len(), note::MAX_EDITABLE_NOTE_BYTES);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_note_flags_a_huge_text_note_from_metadata_without_reading_it() {
+        // The metadata pre-check exists so a gigantic file is flagged WITHOUT
+        // its bytes ever being read into memory. Prove no read happens: a
+        // sparse file over the limit with unreadable bytes must still flag as
+        // oversized — an fs::read attempt would fail with an I/O error instead.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("huge.md");
+        let file = fs::File::create(&f).unwrap();
+        file.set_len(note::MAX_EDITABLE_NOTE_BYTES as u64 + 1)
+            .unwrap();
+        drop(file);
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = note::read_note(dir.path(), &f);
+        // Restore perms first so the TempDir can be cleaned up regardless of assert.
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let doc = result.unwrap();
+        assert!(doc.exceeds_editable_size);
+        assert_eq!(doc.size_bytes as usize, note::MAX_EDITABLE_NOTE_BYTES + 1);
+        assert!(doc.raw.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_note_flags_a_huge_attachment_from_metadata_without_reading_it() {
+        // The preflight must protect every vault file, not only recognised text
+        // notes. Prove the attachment bytes are not read: metadata remains
+        // available while an fs::read attempt would fail.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("huge.png");
+        let file = fs::File::create(&f).unwrap();
+        file.set_len(note::MAX_EDITABLE_NOTE_BYTES as u64 + 1)
+            .unwrap();
+        drop(file);
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let result = note::read_note(dir.path(), &f);
+        // Restore perms first so the TempDir can be cleaned up regardless of assert.
+        fs::set_permissions(&f, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let doc = result.unwrap();
+        assert!(doc.exceeds_editable_size);
+        assert_eq!(doc.size_bytes as usize, note::MAX_EDITABLE_NOTE_BYTES + 1);
+        assert!(!doc.binary);
+        assert!(doc.raw.is_empty() && doc.body.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn read_note_flags_an_oversized_symlink_target() {
+        // std::fs::metadata follows the link, so an oversized note reached
+        // through an in-vault symlink is flagged exactly like its target.
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("target.md");
+        fs::write(&target, vec![b'x'; note::MAX_EDITABLE_NOTE_BYTES + 1]).unwrap();
+        let link = dir.path().join("link.md");
+        symlink(&target, &link).unwrap();
+
+        let doc = note::read_note(dir.path(), &link).unwrap();
+        assert!(doc.exceeds_editable_size);
+        assert_eq!(doc.size_bytes as usize, note::MAX_EDITABLE_NOTE_BYTES + 1);
+        assert!(doc.raw.is_empty());
+    }
+
+    #[test]
     fn full_document_write_preserves_bom_mixed_endings_tabs_and_trailing_space() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("n.md");

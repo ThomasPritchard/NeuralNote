@@ -127,7 +127,9 @@ describe("Journey 4: edit and save", () => {
     expect(backend.calls).toContain("write_note");
   });
 
-  it("isolates dirty raw-fallback drafts while switching A → B → A and saving", async () => {
+  // Measured at ~4s on the Node 24 CI runner (80% of the 5s default) even on
+  // main — margin too thin for runner variance, so give it explicit headroom.
+  it("isolates dirty raw-fallback drafts while switching A → B → A and saving", { timeout: 15_000 }, async () => {
     const { user } = await openVault([
       { kind: "file", relPath: "A.md", content: "A links [[Target]]." },
       { kind: "file", relPath: "B.md", content: "B links [[Target]]." },

@@ -37,6 +37,9 @@ struct RawOpenRouterModel {
     // fail open); present-empty = it told us and listed nothing (→ `Unsupported`).
     supported_parameters: Option<Vec<String>>,
     pricing: Option<RawOpenRouterPricing>,
+    // Absent (or zero) means the server never told us the window — skipped by
+    // `parse_openrouter_context_windows`, so budgeting stays inert rather than guessed.
+    context_length: Option<u64>,
 }
 
 #[derive(Deserialize)]
@@ -142,6 +145,24 @@ pub fn parse_openrouter_input_pricing(
     })
 }
 
+/// The context window (`context_length`) of every model in the raw OpenRouter
+/// `/models` body, as `(id, tokens)` pairs. Fail-open like the reasoning probe: a
+/// malformed body yields `None` (the caller's cache just stays unwarmed), and a
+/// record with an absent or zero length is skipped — an unknown window must leave
+/// prompt budgeting inert, never guessed (issue #22).
+pub fn parse_openrouter_context_windows(models_json: &str) -> Option<Vec<(String, u64)>> {
+    let raw: RawOpenRouterModels = serde_json::from_str(models_json).ok()?;
+    Some(
+        raw.data
+            .into_iter()
+            .filter_map(|model| {
+                let context_length = model.context_length.filter(|length| *length > 0)?;
+                Some((model.id, context_length))
+            })
+            .collect(),
+    )
+}
+
 pub fn parse_ollama_capabilities(json: &str) -> CoreResult<Vec<String>> {
     let raw: RawOllamaShow = serde_json::from_str(json)
         .map_err(|e| CoreError::LocalAi(format!("could not parse Ollama capabilities: {e}")))?;
@@ -178,6 +199,54 @@ pub fn effective_reasoning(opt_in: bool, support: ReasoningSupport) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn openrouter_context_windows_parse_positive_lengths_for_every_listed_model() {
+        let json = r#"{"data":[
+            {"id":"vendor/small","context_length":32768},
+            {"id":"vendor/big","context_length":1000000}
+        ]}"#;
+
+        let windows = parse_openrouter_context_windows(json).unwrap();
+
+        assert_eq!(
+            windows,
+            vec![
+                ("vendor/small".to_string(), 32_768),
+                ("vendor/big".to_string(), 1_000_000),
+            ]
+        );
+    }
+
+    #[test]
+    fn openrouter_context_windows_skip_absent_and_zero_lengths_fail_open() {
+        // A missing field means the server never told us, and a zero window is not a
+        // real model — both are skipped (budgeting stays inert) rather than guessed.
+        let json = r#"{"data":[
+            {"id":"vendor/unknown"},
+            {"id":"vendor/zero","context_length":0},
+            {"id":"vendor/known","context_length":65536}
+        ]}"#;
+
+        let windows = parse_openrouter_context_windows(json).unwrap();
+
+        assert_eq!(windows, vec![("vendor/known".to_string(), 65_536)]);
+    }
+
+    #[test]
+    fn openrouter_context_windows_are_none_on_malformed_json() {
+        assert!(parse_openrouter_context_windows(r#"{"data":"#).is_none());
+        // A wholly absent `data` array parses as an empty catalogue, not an error.
+        assert_eq!(parse_openrouter_context_windows("{}"), Some(vec![]));
+    }
+
+    #[test]
+    fn ollama_num_ctx_is_the_window_every_curated_local_model_supports() {
+        // The single source of truth for the local window: the shell sends it as
+        // `num_ctx` and the orchestrator budgets against it. Anchor the value so a
+        // change here is a deliberate, reviewed decision.
+        assert_eq!(crate::ai::local::OLLAMA_NUM_CTX, 32_768);
+    }
 
     #[test]
     fn selected_openrouter_model_pricing_parses_prompt_usd_per_token() {

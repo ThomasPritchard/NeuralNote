@@ -40,8 +40,9 @@ mod youtube_tools;
 
 pub use capabilities::{
     effective_reasoning, ollama_reasoning_support, openrouter_reasoning_support,
-    parse_ollama_capabilities, parse_openrouter_input_pricing, parse_openrouter_models,
-    supports_reasoning, supports_thinking, ModelCapabilities, ReasoningSupport,
+    parse_ollama_capabilities, parse_openrouter_context_windows, parse_openrouter_input_pricing,
+    parse_openrouter_models, supports_reasoning, supports_thinking, ModelCapabilities,
+    ReasoningSupport,
 };
 pub use elicitation::{elicit_user, ElicitationOutcome};
 pub use events::{ChatEvent, ElicitOption, Elicitation, EventSink};

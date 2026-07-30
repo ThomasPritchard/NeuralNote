@@ -109,6 +109,23 @@ async fn transport_authenticates_only_rankings_and_requests_exact_completed_day(
 }
 
 #[tokio::test]
+async fn fetching_the_catalogue_warms_the_context_window_cache() {
+    // Chat never waits on catalogue I/O; the window cache is warmed opportunistically
+    // by this menu fetch (and by the reasoning probe), so a later chat turn can
+    // budget against the model's real `context_length` (issue #22).
+    let transport = FakeTransport::successful(rankings_json(), catalogue_json());
+
+    fetch_validated_catalogue(&transport, DATE, KEY)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        crate::ai::cached_openrouter_context_window("vendor/current"),
+        Some(65_536)
+    );
+}
+
+#[tokio::test]
 async fn provider_failures_and_invalid_bodies_are_sanitized() {
     let transport = FakeTransport {
         requests: Mutex::new(Vec::new()),

@@ -49,6 +49,9 @@ export function useNoteTabs(): NoteTabsController {
   stateRef.current = state;
   const nextId = useRef(0);
   const savingTabIds = useRef(new Set<string>());
+  // Separate watcher bursts may overlap. Only the newest disk read for a tab
+  // may publish, regardless of the order in which those reads settle.
+  const reconcileRevisions = useRef(new Map<string, number>());
 
   const dispatch = useCallback((action: Action) => {
     stateRef.current = noteTabsReducer(stateRef.current, action);
@@ -89,6 +92,7 @@ export function useNoteTabs(): NoteTabsController {
   const activate = useCallback((id: string) => dispatch({ type: "activate", id }), [dispatch]);
   const close = useCallback((id: string) => {
     destroySourceEditorSession(id);
+    reconcileRevisions.current.delete(id);
     dispatch({ type: "close", id });
   }, [dispatch]);
 
@@ -118,18 +122,31 @@ export function useNoteTabs(): NoteTabsController {
     ) {
       return;
     }
+    const revision = (reconcileRevisions.current.get(id) ?? 0) + 1;
+    reconcileRevisions.current.set(id, revision);
     const knownHash = tab.note.contentHash;
     const path = tab.path;
     try {
       const disk = await api.readNote(path);
+      if (reconcileRevisions.current.get(id) !== revision) return;
       // The tab may have closed, been remapped, or begun saving during the read.
       const current = stateRef.current.tabs.find((item) => item.id === id);
       if (!current || current.saving || savingTabIds.current.has(id)) return;
       if (current.path !== path) return;
-      if (disk.contentHash === knownHash) return;
+      if (disk.contentHash === knownHash) {
+        // An oversized doc carries no content hash ("" === ""), so the hash
+        // compare alone can't see an already-oversized file GROWING further:
+        // fall back to the quoted on-disk size or the size-limit notice goes
+        // stale. Non-oversized docs (hash present, or sizeless binary docs
+        // where both sizes are 0) take the hash-only path exactly as before.
+        if (knownHash !== "" || disk.sizeBytes === (current.note?.sizeBytes ?? 0)) return;
+      }
       if (!current.dirty) destroySourceEditorSession(id);
       dispatch({ type: "external-update", id, doc: disk });
     } catch (error) {
+      if (reconcileRevisions.current.get(id) !== revision) return;
+      const current = stateRef.current.tabs.find((item) => item.id === id);
+      if (!current || current.path !== path) return;
       if (isNotFound(error)) {
         dispatch({ type: "external-delete", id });
         return;
@@ -145,6 +162,12 @@ export function useNoteTabs(): NoteTabsController {
   const persist = useCallback(async (overwrite: boolean) => {
     const tab = stateRef.current.tabs.find((item) => item.id === stateRef.current.activeTabId);
     if (!tab?.note || tab.saving || savingTabIds.current.has(tab.id)) return;
+    // A doc whose content never reached the webview (binary attachment, or a
+    // note over the editable byte limit — issue #82) has an empty draft that
+    // is NOT the file's content; writing it would clobber the file on disk.
+    // These docs never mount an editor, so this is defence in depth behind
+    // the hidden Save button / disabled menu item.
+    if (tab.note.binary || tab.note.exceedsEditableSize) return;
     if (tab.preservationError) {
       const revision = tab.saveRevision + 1;
       dispatch({ type: "save-start", id: tab.id, revision });
@@ -187,12 +210,16 @@ export function useNoteTabs(): NoteTabsController {
   }, [dispatch]);
   const removeDescendants = useCallback((path: string) => {
     for (const tab of stateRef.current.tabs) {
-      if (isPathInside(tab.path, path)) destroySourceEditorSession(tab.id);
+      if (isPathInside(tab.path, path)) {
+        destroySourceEditorSession(tab.id);
+        reconcileRevisions.current.delete(tab.id);
+      }
     }
     dispatch({ type: "remove-descendants", path });
   }, [dispatch]);
   const clear = useCallback(() => {
     clearSourceEditorSessions();
+    reconcileRevisions.current.clear();
     dispatch({ type: "clear" });
   }, [dispatch]);
   const tabsInside = useCallback(

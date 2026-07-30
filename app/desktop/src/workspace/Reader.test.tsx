@@ -34,6 +34,8 @@ function doc(overrides: Partial<NoteDoc> = {}): NoteDoc {
     contentHash: "h",
     binary: false,
     lossyText: false,
+    exceedsEditableSize: false,
+    sizeBytes: 0,
     ...overrides,
   };
 }

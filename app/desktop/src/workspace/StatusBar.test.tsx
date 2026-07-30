@@ -34,6 +34,8 @@ function note(body: string): NoteDoc {
     contentHash: "h",
     binary: false,
     lossyText: false,
+    exceedsEditableSize: false,
+    sizeBytes: 0,
   };
 }
 

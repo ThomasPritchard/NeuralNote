@@ -22,9 +22,11 @@ import {
   resetWorkspaceState,
   saveWorkspaceState,
   searchVault,
+  writeNote,
 } from "../lib/api";
 import type { PullEvent } from "../lib/types";
 import { createMockVault, VAULT_ROOT, type SeedEntry } from "./mockVault";
+import { MAX_EDITABLE_NOTE_BYTES } from "./mockVaultNotes";
 
 afterEach(() => {
   clearMocks();
@@ -885,6 +887,53 @@ describe("mockVault unknown commands", () => {
       kind: "io",
       message: "unknown command: bogus_cmd",
     });
+  });
+});
+
+describe("mockVault oversized read mirror (issue #82)", () => {
+  it("mirrors the core read-side cap: flagged, content-free doc past the byte limit", async () => {
+    seedVault([
+      { kind: "file", relPath: "exact.md", content: "x".repeat(MAX_EDITABLE_NOTE_BYTES) },
+      { kind: "file", relPath: "big.md", content: "x".repeat(MAX_EDITABLE_NOTE_BYTES + 1) },
+    ]);
+
+    // Exactly at the limit: full editable content, as the core reads it.
+    const exact = await readNote(`${VAULT_ROOT}/exact.md`);
+    expect(exact.exceedsEditableSize).toBe(false);
+    expect(exact.raw).toHaveLength(MAX_EDITABLE_NOTE_BYTES);
+
+    // One byte past: the flagged size-limit doc with NO content on the wire.
+    const big = await readNote(`${VAULT_ROOT}/big.md`);
+    expect(big).toMatchObject({
+      exceedsEditableSize: true,
+      sizeBytes: MAX_EDITABLE_NOTE_BYTES + 1,
+      raw: "",
+      body: "",
+      contentHash: "",
+      binary: false,
+      lossyText: false,
+      title: "big",
+    });
+  });
+});
+
+describe("mockVault write-side byte cap mirror", () => {
+  it("mirrors the core write_note cap: MAX bytes writes, MAX+1 is refused invalidContent", async () => {
+    seedVault([{ kind: "file", relPath: "n.md", content: "seed" }]);
+
+    // Exactly at the limit: accepted, as the core write side allows.
+    await expect(
+      writeNote(`${VAULT_ROOT}/n.md`, "x".repeat(MAX_EDITABLE_NOTE_BYTES), null),
+    ).resolves.toMatchObject({ exceedsEditableSize: false });
+
+    // One byte past: refused with the same CoreError kind the core uses,
+    // BEFORE mutating the file — the earlier content stays readable.
+    await expect(
+      writeNote(`${VAULT_ROOT}/n.md`, "x".repeat(MAX_EDITABLE_NOTE_BYTES + 1), null),
+    ).rejects.toMatchObject({ kind: "invalidContent" });
+    const after = await readNote(`${VAULT_ROOT}/n.md`);
+    expect(after.exceedsEditableSize).toBe(false);
+    expect(after.raw).toHaveLength(MAX_EDITABLE_NOTE_BYTES);
   });
 });
 

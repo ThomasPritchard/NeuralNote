@@ -48,9 +48,9 @@ export function confirmDialogTitle(intent: PendingIntent): string {
   return `Delete ${entityLabel}?`;
 }
 
-/** A compatible text note is open and directly editable (binary notes are not). */
+/** A compatible text note is open and directly editable. */
 export function isEditableTextNote(note: NoteDoc | null): boolean {
-  return note !== null && !note.binary;
+  return note !== null && !note.binary && !note.exceedsEditableSize;
 }
 
 export function confirmDialogLabel(intent: PendingIntent): string {

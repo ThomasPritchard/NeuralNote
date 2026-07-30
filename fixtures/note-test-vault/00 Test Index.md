@@ -42,7 +42,7 @@ This vault is a disposable manual-QA fixture for the current note experience. Wo
 - [ ] On [[05 Search and graph/Project Alpha]], verify both linked backlinks and the unlinked mention from `Unlinked mention.md`. Open `05 Search and graph/Orphan.md` from the file tree (not through a wikilink) and verify the backlink empty state.
 - [ ] In Graph, verify the isolated node, cross-folder relationships, search, cluster drill-down, and Open in reader.
 - [ ] Open the generated large, invalid-UTF-8, and binary fixtures. Confirm performance remains usable and failures/content substitutions are explicit.
-- [ ] Open generated `Oversized editable note.md`, make an edit, and save. The write is rejected with the 8 MiB limit stated explicitly, the on-disk file is unchanged, and the recoverable draft remains available.
+- [ ] Open generated `Oversized editable note.md`. The app shows the explicit size-limit state (actual size and the 8 MiB limit stated, "file on disk is unchanged") instead of mounting the editor — no freeze, no spinner; closing the tab and switching vaults stay responsive, and the on-disk file is byte-for-byte unchanged. The 8 MiB write-side rejection is unchanged but no longer reachable by hand from this fixture (an oversized note never mounts the editor); it is covered by the core's automated exact-byte/oversized write tests.
 - [ ] With full keyboard access, reduced motion, VoiceOver, an IME, dead keys, and dictation where available, verify the source editor remains operable and announcements are meaningful.
 
 ## Edge and failure journey

@@ -1112,6 +1112,10 @@ impl<'a> RunLlmClient<'a> {
 
 #[async_trait::async_trait]
 impl neuralnote_core::ai::LlmClient for RunLlmClient<'_> {
+    fn context_window_tokens(&self) -> Option<usize> {
+        self.inner.context_window_tokens()
+    }
+
     async fn complete(
         &self,
         request: &neuralnote_core::ai::LlmRequest,
@@ -1205,7 +1209,11 @@ async fn chat_via_openrouter(
     // returns the explicit requirement error only if >20 videos need an estimate.
     let pricing =
         ai::cached_openrouter_pricing(model).map(neuralnote_core::capture::PricingInput::Hosted);
-    let transport = ai::OpenAiChatClient::new(key, reasoning);
+    // The catalogue context window is cached the same opportunistic way (probe /
+    // menu fetch). A miss means "unknown" — the orchestrator then leaves the prompt
+    // to the char guards rather than guessing a window.
+    let context_window = ai::cached_openrouter_context_window(model);
+    let transport = ai::OpenAiChatClient::new(key, reasoning).with_context_window(context_window);
     let client = RunLlmClient::new(
         &transport,
         run.close_signal,
@@ -2532,6 +2540,42 @@ mod tests {
         let (result, started_at) = tokio::join!(run, cancel);
         assert!(result.is_err());
         assert!(started_at.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    struct WindowedLlm;
+
+    #[async_trait::async_trait]
+    impl LlmClient for WindowedLlm {
+        fn context_window_tokens(&self) -> Option<usize> {
+            Some(123_456)
+        }
+
+        async fn complete(&self, _request: &LlmRequest) -> CoreResult<Completion> {
+            unreachable!("window delegation never drives a turn")
+        }
+
+        async fn complete_streaming(
+            &self,
+            _request: &LlmRequest,
+            _sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            unreachable!("window delegation never drives a turn")
+        }
+    }
+
+    #[test]
+    fn run_llm_client_delegates_the_reported_context_window() {
+        // The cancellation wrapper must not hide the inner client's window, or the
+        // orchestrator would budget every run as "window unknown".
+        let signal = ai::ChatRunCloseSignal::default();
+        let inner = WindowedLlm;
+        let client = RunLlmClient::new(
+            &inner,
+            &signal,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+
+        assert_eq!(client.context_window_tokens(), Some(123_456));
     }
 
     struct CloseAfterWriteLlm {
