@@ -126,7 +126,14 @@ export function useNoteTabs(): NoteTabsController {
       const current = stateRef.current.tabs.find((item) => item.id === id);
       if (!current || current.saving || savingTabIds.current.has(id)) return;
       if (current.path !== path) return;
-      if (disk.contentHash === knownHash) return;
+      if (disk.contentHash === knownHash) {
+        // An oversized doc carries no content hash ("" === ""), so the hash
+        // compare alone can't see an already-oversized file GROWING further:
+        // fall back to the quoted on-disk size or the size-limit notice goes
+        // stale. Non-oversized docs (hash present, or sizeless binary docs
+        // where both sizes are 0) take the hash-only path exactly as before.
+        if (knownHash !== "" || disk.sizeBytes === (current.note?.sizeBytes ?? 0)) return;
+      }
       if (!current.dirty) destroySourceEditorSession(id);
       dispatch({ type: "external-update", id, doc: disk });
     } catch (error) {

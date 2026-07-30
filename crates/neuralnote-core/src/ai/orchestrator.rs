@@ -1230,7 +1230,8 @@ const LOCAL_CONTEXT_WINDOW_TOKENS: usize = crate::ai::local::OLLAMA_NUM_CTX as u
 const ANSWER_RESERVE_TOKENS: usize = crate::ai::openai::ANSWER_MAX_TOKENS as usize;
 
 /// Fixed headroom for chat-template special tokens plus the residual imprecision of a
-/// char-classified estimate (rare multi-token CJK scalars / emoji that exceed 1 token).
+/// char-classified estimate (non-BPE merge quirks that can exceed the byte-fallback
+/// weight, e.g. multi-scalar emoji/ZWJ sequences the tokenizer splits unusually).
 /// Over-reserving only trims slightly early; under-reserving risks the silent
 /// front-truncation this whole pass exists to prevent — so we err high.
 const PROMPT_OVERHEAD_TOKENS: usize = 1_024;
@@ -1247,13 +1248,15 @@ const ASCII_CHARS_PER_TOKEN: usize = 4;
 const TRUNCATION_MARKER: &str = "\n\n[older content trimmed to fit the model's context window]";
 
 /// A conservative, script-aware UPPER-BOUND estimate of the BPE token count of `text`.
-/// ASCII letters/digits/whitespace tokenise at ~4 chars/token; every other scalar —
-/// ASCII punctuation/symbols AND all non-ASCII (CJK, etc.) — is counted as a whole
-/// token, because dense scripts and symbol runs tokenise close to 1 token/char, far
-/// above the flat ~4:1 the char budgets assume. We deliberately OVER-count so the budget
-/// errs toward trimming a little early rather than letting Ollama silently front-truncate
-/// the grounding (the moat). Accumulated in quarter-tokens to keep the 4:1 ratio without
-/// floats, then rounded up.
+/// ASCII letters/digits/whitespace tokenise at ~4 chars/token; ASCII punctuation/symbols
+/// are counted as a whole token each; every non-ASCII scalar is weighted by its UTF-8
+/// BYTE length, because byte-level BPE tokenisers (Qwen/Llama via Ollama) fall back to
+/// one token PER BYTE for scalars with no merge rules (rare CJK extensions, cuneiform,
+/// tag blocks, some emoji/ZWJ) — up to 4 tokens for a 4-byte scalar where a flat
+/// 1-token/scalar weight would under-budget ~4× and let Ollama silently front-truncate
+/// the grounding (the moat). We deliberately OVER-count so the budget errs toward
+/// trimming a little early rather than letting that happen. Accumulated in
+/// quarter-tokens to keep the 4:1 ratio without floats, then rounded up.
 fn estimate_tokens(text: &str) -> usize {
     let sub_tokens: usize = text.chars().map(char_sub_tokens).sum();
     sub_tokens.div_ceil(ASCII_CHARS_PER_TOKEN)
@@ -1261,12 +1264,20 @@ fn estimate_tokens(text: &str) -> usize {
 
 /// Sub-token weight of one scalar, in units of 1/[`ASCII_CHARS_PER_TOKEN`] of a token
 /// (see [`estimate_tokens`]): 1 sub-token for easy ASCII (so `ASCII_CHARS_PER_TOKEN` of
-/// them make a token), a whole token's worth for everything denser.
+/// them make a token), a whole token's worth for other ASCII, and one token per UTF-8
+/// byte for non-ASCII (the byte-fallback BPE upper bound).
 fn char_sub_tokens(ch: char) -> usize {
+    // TODO(token-estimate): mergeless random-alnum payloads (base64-ish blobs) can
+    // tokenize denser than the 4:1 weight below (real-world ~1.5-3 chars/token), so a
+    // pathological ASCII blob could still under-budget a small window. Accepted residual
+    // from the #22 adversarial review; tighten to 2:1 or scale PROMPT_OVERHEAD_TOKENS
+    // with prompt size if dense-ASCII vaults prove it out.
     if ch.is_ascii_alphanumeric() || ch.is_ascii_whitespace() {
         1
-    } else {
+    } else if ch.is_ascii() {
         ASCII_CHARS_PER_TOKEN
+    } else {
+        ASCII_CHARS_PER_TOKEN * ch.len_utf8()
     }
 }
 
@@ -3451,11 +3462,27 @@ mod tests {
 
     #[test]
     fn estimate_tokens_counts_dense_scripts_far_heavier_than_latin() {
-        // Latin ~4 chars/token; CJK and symbol runs ~1 token/char. The old flat 4:1
-        // char assumption undercounted the latter by ~4× — the overflow this fixes.
+        // Latin ~4 chars/token; ASCII symbol runs ~1 token/char. Non-ASCII
+        // scalars are weighted by their UTF-8 BYTE length: byte-level BPE
+        // (Qwen/Llama via Ollama) falls back to one token per byte for scalars
+        // with no merge rule, so 配 (3 bytes) is 3 tokens, not 1 — the upper
+        // bound that keeps a dense-script prompt from slipping ~3× past the
+        // window. (These were 100 and 100 under the flat 1-token/scalar weight.)
         assert_eq!(estimate_tokens(&"a".repeat(100)), 25);
-        assert_eq!(estimate_tokens(&"配".repeat(100)), 100);
+        assert_eq!(estimate_tokens(&"配".repeat(100)), 300);
         assert_eq!(estimate_tokens(&"#".repeat(100)), 100);
+    }
+
+    #[test]
+    fn estimate_tokens_weights_rare_script_scalars_by_utf8_bytes() {
+        // 𒀀 (U+12000, cuneiform) is a 4-byte scalar: byte-fallback BPE emits up
+        // to one token PER BYTE for scalars with no merge rules (rare CJK
+        // extensions, cuneiform, tag blocks, some emoji/ZWJ), so the estimate
+        // must say 4 tokens/scalar — 1/scalar would under-budget ~4×.
+        assert_eq!(estimate_tokens(&"\u{12000}".repeat(100)), 400);
+        // Byte-weight boundary sanity: Latin-1 = 2 bytes, BMP CJK = 3 bytes.
+        assert_eq!(estimate_tokens("é"), 2);
+        assert_eq!(estimate_tokens("界"), 3);
     }
 
     #[test]
@@ -3632,6 +3659,27 @@ mod tests {
         let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL, None);
 
         assert!(out.lost);
+        assert_eq!(out.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
+        assert!(total_tokens(&out.messages) <= local_input_budget());
+    }
+
+    #[test]
+    fn fit_prompt_to_window_trims_rare_script_content_the_old_estimate_under_budgeted() {
+        // 10_000 cuneiform scalars (4 bytes each): the old 1-token/scalar
+        // estimate said ~10k tokens — comfortably under the local budget, so
+        // the prompt was sent whole while byte-fallback BPE emits up to ~40k
+        // tokens and Ollama silently front-truncates the grounding. The
+        // byte-weighted estimate sees the real overflow, trims, and reports
+        // the coverage loss instead.
+        let mut messages = vec![
+            LlmMessage::system(SYSTEM_PROMPT),
+            LlmMessage::user("question"),
+        ];
+        messages.extend(evidence_round(0, "\u{12000}".repeat(10_000)));
+
+        let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL, None);
+
+        assert!(out.lost, "rare-script overflow must report coverage loss");
         assert_eq!(out.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
         assert!(total_tokens(&out.messages) <= local_input_budget());
     }

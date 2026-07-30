@@ -600,6 +600,35 @@ describe("useNoteTabs oversized notes (issue #82)", () => {
     expect(mockInvoke).not.toHaveBeenCalledWith("write_note", expect.anything());
   });
 
+  it("refreshes the size-limit notice when an already-oversized file grows externally", async () => {
+    vi.useFakeTimers();
+    const initial = 8 * 1024 * 1024 + 1;
+    const grown = 12 * 1024 * 1024;
+    let size = initial;
+    mockInvoke.mockImplementation((command) => {
+      if (command === "read_note") {
+        return Promise.resolve(oversizedDoc("/v/big.md", size)) as never;
+      }
+      return Promise.resolve(undefined) as never;
+    });
+    const { result } = renderHook(() => useNoteTabs());
+    act(() => result.current.open("/v/big.md"));
+    await drainMicrotasks();
+    expect(result.current.active.note?.sizeBytes).toBe(initial);
+
+    // Oversized docs carry no content hash ("" === ""), so only the quoted
+    // on-disk size can tell the reconcile the notice has gone stale.
+    size = grown;
+    const handler = treeChangedHandler();
+    await act(async () => {
+      handler();
+      await vi.advanceTimersByTimeAsync(300);
+    });
+
+    expect(result.current.active.note?.exceedsEditableSize).toBe(true);
+    expect(result.current.active.note?.sizeBytes).toBe(grown);
+  });
+
   it("preserves a dirty draft when the file grew past the limit externally", async () => {
     vi.useFakeTimers();
     let grew = false;

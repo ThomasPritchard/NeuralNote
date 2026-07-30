@@ -22,6 +22,7 @@ import {
   resetWorkspaceState,
   saveWorkspaceState,
   searchVault,
+  writeNote,
 } from "../lib/api";
 import type { PullEvent } from "../lib/types";
 import { createMockVault, VAULT_ROOT, type SeedEntry } from "./mockVault";
@@ -913,6 +914,26 @@ describe("mockVault oversized read mirror (issue #82)", () => {
       lossyText: false,
       title: "big",
     });
+  });
+});
+
+describe("mockVault write-side byte cap mirror", () => {
+  it("mirrors the core write_note cap: MAX bytes writes, MAX+1 is refused invalidContent", async () => {
+    seedVault([{ kind: "file", relPath: "n.md", content: "seed" }]);
+
+    // Exactly at the limit: accepted, as the core write side allows.
+    await expect(
+      writeNote(`${VAULT_ROOT}/n.md`, "x".repeat(MAX_EDITABLE_NOTE_BYTES), null),
+    ).resolves.toMatchObject({ exceedsEditableSize: false });
+
+    // One byte past: refused with the same CoreError kind the core uses,
+    // BEFORE mutating the file — the earlier content stays readable.
+    await expect(
+      writeNote(`${VAULT_ROOT}/n.md`, "x".repeat(MAX_EDITABLE_NOTE_BYTES + 1), null),
+    ).rejects.toMatchObject({ kind: "invalidContent" });
+    const after = await readNote(`${VAULT_ROOT}/n.md`);
+    expect(after.exceedsEditableSize).toBe(false);
+    expect(after.raw).toHaveLength(MAX_EDITABLE_NOTE_BYTES);
   });
 });
 

@@ -386,6 +386,17 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         const path = a.path as string;
         const content = a.content as string;
         const expected = (a.expectedHash ?? null) as string | null;
+        // Mirror of the core write-side cap (note.rs write_note): past the
+        // editable byte limit the write is refused BEFORE any mutation, with
+        // the same CoreError kind — so a journey can't pass here while the
+        // production backend would reject the same write.
+        const contentBytes = new TextEncoder().encode(content).length;
+        if (contentBytes > MAX_EDITABLE_NOTE_BYTES) {
+          fail(
+            "invalidContent",
+            `note is ${contentBytes} bytes; editable notes are limited to ${MAX_EDITABLE_NOTE_BYTES} bytes`,
+          );
+        }
         const file = requireFile(path);
         if (expected !== null && hashContent(file.content) !== expected) {
           fail("conflict", "this note changed on disk since you opened it");

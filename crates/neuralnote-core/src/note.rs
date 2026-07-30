@@ -140,6 +140,23 @@ pub fn read_note(root: &Path, target: &Path) -> CoreResult<NoteDoc> {
     if !path.is_file() {
         return Err(CoreError::NotFound(path.display().to_string()));
     }
+    // A text note whose METADATA already reports more than the editable byte
+    // limit is flagged without its bytes ever being read into memory — a
+    // multi-GiB file must not be loaded whole just to be rejected (the
+    // reconcile path re-reads on every external change). `std::fs::metadata`
+    // follows symlinks, so an oversized target is caught through a link too.
+    // Gated on `is_text_note` to keep binary precedence: a non-text file must
+    // still be read to distinguish a no-preview binary attachment from an
+    // oversized valid-UTF-8 document. Metadata can lie about a shrink/grow
+    // race, so the byte-exact checks below remain the authoritative decision
+    // for anything that gets this far.
+    if is_text_note(&path) {
+        if let Ok(meta) = std::fs::metadata(&path) {
+            if meta.len() > MAX_EDITABLE_NOTE_BYTES as u64 {
+                return Ok(build_oversized_doc(root, &path, meta.len()));
+            }
+        }
+    }
     // Read bytes, not a UTF-8 string: a vault's attachments folder is full of
     // images/PDFs, and `read_to_string` would fail on them, dead-ending the
     // reader's graceful binary branch.
@@ -164,7 +181,18 @@ pub fn read_note(root: &Path, target: &Path) -> CoreResult<NoteDoc> {
     // A text note (`.md`/`.txt`) in some other encoding (Windows-1252/Latin-1 from
     // a migrated vault) is decoded lossily so its content is SHOWN, never hidden,
     // and flagged so the reader can warn. Same policy search uses, by construction.
+    let on_disk_len = bytes.len() as u64;
     let (raw, lossy) = decode_note_text(bytes);
+    // The cap must also hold for the DECODED string — the thing actually
+    // marshalled to the webview and the thing the write side measures. Lossy
+    // decode AMPLIFIES: every invalid byte becomes the 3-byte U+FFFD, so a note
+    // at the on-disk cap (e.g. Latin-1 text) decodes to ~3× the limit — a doc
+    // that would both freeze the webview (#82) and be unsavable (write_note
+    // rejects > MAX bytes). It takes the same flagged, content-free path;
+    // size_bytes still quotes the ON-DISK size, which is what the UI states.
+    if raw.len() > MAX_EDITABLE_NOTE_BYTES {
+        return Ok(build_oversized_doc(root, &path, on_disk_len));
+    }
     Ok(build_doc(root, &path, raw, lossy))
 }
 
