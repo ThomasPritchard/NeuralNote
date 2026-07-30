@@ -307,6 +307,49 @@ it trades away the only proper screen-reader table semantics in the product.
 
 ---
 
+## 4b. VERIFIED: `atomicRanges` cannot protect a bare pipe (30 July 2026)
+
+The design delegates caret motion and deletion across a hidden pipe to
+`EditorView.atomicRanges`. **That does not work for a one-character range**,
+verified against the installed sources:
+
+| path | guard | file |
+| --- | --- | --- |
+| motion | `if (pos > from && pos < to)` | `@codemirror/view` index.js:3734 |
+| deletion | `if (from < pos && to > pos)` | `@codemirror/commands` index.js:1197 |
+
+Both require a position **strictly inside** the range. A pipe hidden as
+`[from, from + 1)` has no such integer position, so neither guard can ever fire.
+Measured directly:
+
+```
+1-char pipe only:  range [4,5) width=1  interior=[]      => atomicRanges CANNOT fire
+3-char gap " | ":  range [3,6) width=3  interior=[4,5]   => atomicRanges CAN fire
+```
+
+Left unaddressed, Backspace at the start of a cell silently deletes an invisible
+delimiter and the table re-parses with a different shape, with nothing on screen
+to explain it. That is precisely the silent-corruption class the maintainer's
+constraint forbids.
+
+### Resolution — two mechanisms, because one is not always available
+
+1. **Hide the whole inter-cell gap, not the bare pipe.** Decorate ` | ` (the
+   trailing space, the pipe, the leading space) as a single replace range. At
+   three characters it has interior positions, so `atomicRanges` works. This is
+   also what the alignment work already treats as the unit: `TableColumnSlot`
+   carries `segmentFrom`/`segmentTo` for exactly this span.
+2. **Own the boundary keys explicitly anyway.** A row written `|a|b|` with no
+   surrounding spaces still yields a one-character range, so mechanism 1 is not
+   guaranteed. Backspace, Delete, ArrowLeft and ArrowRight must be bound to
+   commands that detect an adjacent hidden delimiter and step over it or refuse,
+   rather than trusting the facet.
+
+Mechanism 2 is a **prerequisite for phase 2**, not a later hardening pass: phase
+2 is what makes the pipes invisible, and it must not ship without it.
+
+---
+
 ## 5. The hard cases
 
 Each is answered for the recommended design.
