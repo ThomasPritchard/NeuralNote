@@ -25,13 +25,32 @@ function locateCell(model: TableModel, pos: number): CellLocation | null {
     if (pos < row.from || pos > row.to) continue;
     const exact = row.slots.find((slot) => pos >= slot.from && pos <= slot.to);
     if (exact) return { rowIndex, column: exact.column };
-    // Caret sits on a pipe or in padding: fall back to the nearest slot start.
+    // Caret sits on a pipe or in a cell's whitespace. Rank by distance to the
+    // whole span: ranking on `from` alone resolved a caret in a cell's trailing
+    // spaces to the NEXT cell, which turned Tab into "append a row".
     const nearest = [...row.slots].sort(
-      (left, right) => Math.abs(left.from - pos) - Math.abs(right.from - pos),
+      (left, right) => distanceToSlot(left, pos) - distanceToSlot(right, pos),
     )[0];
     if (nearest) return { rowIndex, column: nearest.column };
   }
   return null;
+}
+
+/** Distance from a position to a slot's span; zero when inside it. */
+function distanceToSlot(slot: { from: number; to: number }, pos: number): number {
+  return Math.max(slot.from - pos, 0, pos - slot.to);
+}
+
+/**
+ * The model, but only when the caret is genuinely inside the table. `active()`
+ * in the preview layer is exclusive of `to`, so at exactly `table.to` the table
+ * still renders as a read-only widget. The commands must agree, or Enter writes
+ * a row to a table the user sees as rendered.
+ */
+function activeTableAt(state: EditorState, pos: number): TableModel | null {
+  const model = tableModelAt(state, pos);
+  if (!model || pos < model.from || pos >= model.to) return null;
+  return model;
 }
 
 function selectSlot(row: TableRowModel, column: number): TransactionSpec | null {
@@ -76,7 +95,7 @@ function rowIsBlank(state: EditorState, row: TableRowModel): boolean {
  */
 export function tableCellStep(state: EditorState, direction: 1 | -1): TransactionSpec | null {
   const pos = state.selection.main.head;
-  const model = tableModelAt(state, pos);
+  const model = activeTableAt(state, pos);
   if (!model) return null;
   const location = locateCell(model, pos);
   if (!location) return null;
@@ -91,8 +110,11 @@ export function tableCellStep(state: EditorState, direction: 1 | -1): Transactio
   const position = order.indexOf(location.rowIndex);
   const neighbour = order[position + direction];
   if (neighbour === undefined) {
-    // Past the last cell, Tab grows the table; before the first, do nothing.
-    return direction === 1 ? appendRow(model, 0) : null;
+    // At either edge Tab falls through to the browser, so keyboard focus can
+    // always leave the editor (WCAG 2.1.2). Growing the table here would both
+    // trap focus and write to a file the user only navigated through; Enter is
+    // the affordance for adding a row.
+    return null;
   }
   const target = model.rows[neighbour]!;
   return selectSlot(target, direction === 1 ? 0 : target.slots.length - 1);
@@ -105,24 +127,46 @@ export function tableCellStep(state: EditorState, direction: 1 | -1): Transactio
  */
 export function tableRowStep(state: EditorState): TransactionSpec | null {
   const pos = state.selection.main.head;
-  const model = tableModelAt(state, pos);
+  const model = activeTableAt(state, pos);
   if (!model) return null;
   const location = locateCell(model, pos);
   if (!location) return null;
 
   const order = contentRows(model);
   const next = order[order.indexOf(location.rowIndex) + 1];
-  if (next !== undefined) return selectSlot(model.rows[next]!, location.column);
+  if (next !== undefined) {
+    // Clamp rather than bail: a ragged next row missing this column would
+    // otherwise return null and let defaultKeymap split the table mid-row.
+    const target = model.rows[next]!;
+    const column = Math.min(location.column, Math.max(0, target.slots.length - 1));
+    const step = selectSlot(target, column);
+    if (step) return step;
+  }
 
   const row = model.rows[location.rowIndex]!;
-  if (rowIsBlank(state, row) && row.kind === "body") {
+  if (rowIsBlank(state, row) && row.kind === "body" && isTopLevelRow(state, row)) {
+    // Drop the blank row and land below the table. Delete from the END of the
+    // previous line, not `row.from - 1`: inside a blockquote or list item the
+    // character before the row is the block prefix, not a newline, and cutting
+    // there strands an orphaned "> " behind.
+    const line = state.doc.lineAt(row.from);
+    const from = line.number > 1 ? state.doc.line(line.number - 1).to : model.from;
     return {
-      changes: { from: Math.max(model.from, row.from - 1), to: model.to, insert: "\n\n" },
-      selection: EditorSelection.cursor(Math.max(model.from, row.from - 1) + 2),
+      changes: { from, to: model.to, insert: "\n" },
+      selection: EditorSelection.cursor(from + 1),
       scrollIntoView: true,
     };
   }
   return appendRow(model, location.column);
+}
+
+/**
+ * True when the row starts its own line. A table nested in a blockquote or list
+ * carries a prefix (`> `, indentation) that the row node excludes, so range
+ * arithmetic around the row would eat into that prefix.
+ */
+function isTopLevelRow(state: EditorState, row: TableRowModel): boolean {
+  return state.doc.lineAt(row.from).from === row.from;
 }
 
 function delimiterCell(width: number, alignment: string): string {

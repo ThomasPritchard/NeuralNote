@@ -29,8 +29,8 @@ import {
 } from "./sourceEditorDecorationsWidgets";
 import {
   tableAlignmentPads,
-  tableColumnWidths,
   tableModelAt,
+  tableSegmentWidths,
 } from "./sourceEditorTableModel";
 import type { VisibleRange } from "./sourceEditorDecorationsTypes";
 
@@ -142,7 +142,7 @@ function alignmentRanges(state: EditorState, tablePos: number): Range<Decoration
   ) {
     return [];
   }
-  const pads = tableAlignmentPads(state, model, tableColumnWidths(state, model));
+  const pads = tableAlignmentPads(state, model, tableSegmentWidths(state, model));
   return pads.map((pad) => Decoration.widget({
     widget: new TablePadWidget(pad.width, pad.fill),
     side: pad.side,

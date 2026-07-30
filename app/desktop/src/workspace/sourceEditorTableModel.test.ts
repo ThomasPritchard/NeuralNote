@@ -6,6 +6,7 @@ import {
   tableAlignmentPads,
   tableColumnWidths,
   tableModelAt,
+  tableSegmentWidths,
   type TableModel,
 } from "./sourceEditorTableModel";
 
@@ -125,17 +126,43 @@ describe("tableAlignmentPads", () => {
   function pads(doc: string) {
     const editor = state(doc);
     const model = tableModelAt(editor, 0)!;
-    return tableAlignmentPads(editor, model, tableColumnWidths(editor, model));
+    return tableAlignmentPads(editor, model, tableSegmentWidths(editor, model));
   }
 
-  it("pads every short cell so each column reaches a single width", () => {
-    const doc = "| Start date | Commitment |\n| --- | --- |\n| a | b |";
-    const result = pads(doc);
+  /** Total rendered width of each column: source segment plus any padding. */
+  function renderedWidths(doc: string, column: number) {
+    const editor = state(doc);
+    const model = tableModelAt(editor, 0)!;
+    const result = tableAlignmentPads(editor, model, tableSegmentWidths(editor, model));
+    return model.rows.map((row) => {
+      const slot = row.slots.find((candidate) => candidate.column === column);
+      if (!slot) return null;
+      const base = slot.segmentTo - slot.segmentFrom;
+      const added = result
+        .filter((pad) => pad.pos >= slot.segmentFrom && pad.pos <= slot.segmentTo)
+        .reduce((total, pad) => total + pad.width, 0);
+      return base + added;
+    }).filter((value) => value !== null);
+  }
 
-    const forCell = (needle: string) =>
-      result.filter((pad) => pad.pos === doc.indexOf(needle) + needle.length);
-    expect(forCell("| a")[0]?.width).toBe("Start date".length - 1);
-    expect(result.every((pad) => pad.width > 0)).toBe(true);
+  it("pads every short cell so each column reaches a single rendered width", () => {
+    const doc = "| Start date | Commitment |\n| --- | --- |\n| a | b |";
+
+    expect(new Set(renderedWidths(doc, 0)).size).toBe(1);
+    expect(new Set(renderedWidths(doc, 1)).size).toBe(1);
+    expect(pads(doc).every((pad) => pad.width > 0)).toBe(true);
+  });
+
+  it("adds no padding to a table whose cells already carry alignment spaces", () => {
+    // Regression: padding was measured against the TRIMMED cell, so a table
+    // already aligned on disk (as `Shift-Alt-f` writes it) was padded again.
+    const doc = [
+      "| Start date | Commitment |",
+      "| ---------- | ---------- |",
+      "| 2026-04-03 | DJ gig     |",
+    ].join("\n");
+
+    expect(pads(doc)).toEqual([]);
   });
 
   it("emits insertions only, so the document bytes never change", () => {
@@ -161,22 +188,22 @@ describe("tableAlignmentPads", () => {
     const doc = "| a | value |\n| --- | --: |\n| x | y |";
     const editor = state(doc);
     const model = tableModelAt(editor, 0)!;
-    const result = tableAlignmentPads(editor, model, tableColumnWidths(editor, model));
+    const result = tableAlignmentPads(editor, model, tableSegmentWidths(editor, model));
     const cell = model.rows[2]!.slots.find((slot) => slot.column === 1)!;
 
-    expect(result.some((pad) => pad.pos === cell.from && pad.fill === "space")).toBe(true);
-    expect(result.some((pad) => pad.pos === cell.to && pad.fill === "space")).toBe(false);
+    expect(result.some((pad) => pad.pos === cell.segmentFrom && pad.fill === "space")).toBe(true);
+    expect(result.some((pad) => pad.pos === cell.segmentTo && pad.fill === "space")).toBe(false);
   });
 
   it("splits padding either side of the content for a centred column", () => {
     const doc = "| a | value |\n| --- | :-: |\n| x | y |";
     const editor = state(doc);
     const model = tableModelAt(editor, 0)!;
-    const result = tableAlignmentPads(editor, model, tableColumnWidths(editor, model));
+    const result = tableAlignmentPads(editor, model, tableSegmentWidths(editor, model));
     const cell = model.rows[2]!.slots.find((slot) => slot.column === 1)!;
 
-    expect(result.some((pad) => pad.pos === cell.from)).toBe(true);
-    expect(result.some((pad) => pad.pos === cell.to)).toBe(true);
+    expect(result.some((pad) => pad.pos === cell.segmentFrom)).toBe(true);
+    expect(result.some((pad) => pad.pos === cell.segmentTo)).toBe(true);
   });
 
   it("produces no padding for a table whose columns already line up", () => {

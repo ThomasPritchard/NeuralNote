@@ -163,8 +163,16 @@ export class TableWidget extends WidgetType {
     const row = isHeader
       ? header
       : bodyRows[rowElement instanceof HTMLTableRowElement ? rowElement.sectionRowIndex : 0];
-    const column = cell instanceof HTMLTableCellElement ? cell.cellIndex : 0;
-    return row?.slots.find((slot) => slot.column === column)?.to ?? row?.from ?? this.item.from;
+    if (!row) return this.item.from;
+
+    // DOM cellIndex and model column are DIFFERENT coordinate spaces. The
+    // rendered table is built from TableCell nodes, and the parser emits none
+    // for an empty cell, so `| x |  | z |` renders two cells against three
+    // slots. Index the rendered cells against the slots that carry content, or
+    // clicking "z" lands the caret in the empty cell before it.
+    const index = cell instanceof HTMLTableCellElement ? cell.cellIndex : 0;
+    const rendered = row.slots.filter((slot) => slot.from !== slot.to);
+    return rendered[index]?.to ?? row.slots[index]?.to ?? row.from;
   }
 }
 

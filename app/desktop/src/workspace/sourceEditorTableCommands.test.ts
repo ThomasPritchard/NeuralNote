@@ -60,12 +60,33 @@ describe("tableCellStep", () => {
     expect(tableCellStep(state(TABLE, at("Start date")), -1)).toBeNull();
   });
 
-  it("appends a row when tabbing past the final cell", () => {
-    const editor = state(TABLE, at("DJ gig"));
-    const result = apply(editor, tableCellStep(editor, 1));
+  it("falls through at the final cell so Tab can move keyboard focus out", () => {
+    // Regression (WCAG 2.1.2): forward Tab used to append a row and return a
+    // transaction, so preventDefault always fired and focus could never leave
+    // the editor from inside a table — and it wrote to the file to do it.
+    expect(tableCellStep(state(TABLE, at("DJ gig")), 1)).toBeNull();
+  });
 
-    expect(result?.doc.endsWith("\n|  |  |")).toBe(true);
-    expect(result?.selected).toBe("");
+  it("does not act at the very end of a table, where it still renders", () => {
+    // The preview treats `table.to` as outside the table, so it draws the
+    // read-only widget there. Acting would write to a table the user sees
+    // rendered rather than as source.
+    expect(tableCellStep(state(TABLE, TABLE.length), 1)).toBeNull();
+    expect(tableRowStep(state(TABLE, TABLE.length))).toBeNull();
+  });
+
+  it("resolves a caret in a cell's trailing whitespace to that cell", () => {
+    // Regression: nearest-slot ranking used slot.from only, so a caret in the
+    // padding after "DJ gig" resolved to the NEXT cell.
+    const aligned = [
+      "| Start date | Commitment |",
+      "| ---------- | ---------- |",
+      "| 2026-04-03 | DJ gig     |",
+    ].join("\n");
+    const trailing = aligned.indexOf("DJ gig") + "DJ gig  ".length;
+    const editor = state(aligned, trailing);
+
+    expect(apply(editor, tableCellStep(editor, -1))?.selected).toBe("2026-04-03");
   });
 });
 
@@ -88,8 +109,30 @@ describe("tableRowStep", () => {
     const editor = state(doc, doc.length - 4);
     const result = apply(editor, tableRowStep(editor));
 
-    expect(result?.doc).toBe(`${TABLE}\n\n`);
-    expect(result?.head).toBe(TABLE.length + 2);
+    expect(result?.doc).toBe(`${TABLE}\n`);
+    expect(result?.head).toBe(TABLE.length + 1);
+  });
+
+  it("refuses the blank-row exit for a table nested in a blockquote", () => {
+    // Regression: the branch deleted from `row.from - 1`, which inside a
+    // blockquote is the space after ">" rather than a newline, stranding "> ".
+    const doc = "> | a | b |\n> | --- | --- |\n> |  |  |";
+    const editor = state(doc, doc.lastIndexOf("|  |  |") + 2);
+    const result = apply(editor, tableRowStep(editor));
+
+    expect(result?.doc.startsWith(doc)).toBe(true);
+    expect(result?.doc).not.toContain(">\n\n");
+  });
+
+  it("clamps to the last column when the next row is ragged", () => {
+    // Regression: selectSlot returned null for a missing column, so Enter fell
+    // through to defaultKeymap and split the table mid-row.
+    const doc = "| a | b | c |\n| --- | --- | --- |\n| x |\n";
+    const editor = state(doc, doc.indexOf("c"));
+    const result = apply(editor, tableRowStep(editor));
+
+    expect(result).not.toBeNull();
+    expect(result?.doc).toBe(doc);
   });
 });
 

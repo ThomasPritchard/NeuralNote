@@ -126,12 +126,13 @@ function toSlots(
     const text = slice(segment.from, segment.to);
     const leading = text.length - text.trimStart().length;
     const trailing = text.length - text.trimEnd().length;
+    const bounds = { segmentFrom: segment.from, segmentTo: segment.to };
     if (leading + trailing >= text.length) {
       // Blank cell: anchor just inside the opening space so typing reads `| x |`.
       const anchor = Math.min(segment.from + (text.startsWith(" ") ? 1 : 0), segment.to);
-      return { column, from: anchor, to: anchor };
+      return { column, from: anchor, to: anchor, ...bounds };
     }
-    return { column, from: segment.from + leading, to: segment.to - trailing };
+    return { column, from: segment.from + leading, to: segment.to - trailing, ...bounds };
   });
 }
 
@@ -188,6 +189,23 @@ export function tableColumnWidths(state: EditorState, model: TableModel): number
   return widths;
 }
 
+/**
+ * On-screen width of each column as it currently renders: the whole pipe-to-pipe
+ * span, whitespace included. Alignment must target this rather than the trimmed
+ * content width, because a cell carrying trailing spaces already renders wider
+ * than its content and padding the content alone would push it wider still.
+ */
+export function tableSegmentWidths(state: EditorState, model: TableModel): number[] {
+  const widths = Array.from({ length: model.columnCount }, () => 0);
+  for (const row of model.rows) {
+    for (const slot of row.slots) {
+      const width = displayWidth(state.sliceDoc(slot.segmentFrom, slot.segmentTo));
+      widths[slot.column] = Math.max(widths[slot.column] ?? 0, width);
+    }
+  }
+  return widths;
+}
+
 export function tableAlignmentPads(
   state: EditorState,
   model: TableModel,
@@ -196,12 +214,13 @@ export function tableAlignmentPads(
   const pads: TablePad[] = [];
   for (const row of model.rows) {
     for (const slot of row.slots) {
-      const text = state.sliceDoc(slot.from, slot.to);
-      const deficit = (widths[slot.column] ?? 0) - displayWidth(text);
+      const segment = state.sliceDoc(slot.segmentFrom, slot.segmentTo);
+      const deficit = (widths[slot.column] ?? 0) - displayWidth(segment);
       if (deficit <= 0) continue;
 
       if (row.kind === "delimiter") {
         // Grow the dash run in place, staying inside a trailing alignment colon.
+        const text = state.sliceDoc(slot.from, slot.to);
         const pos = text.endsWith(":") ? Math.max(slot.from, slot.to - 1) : slot.to;
         pads.push({ pos, width: deficit, fill: "dash", side: 1 });
         continue;
@@ -209,18 +228,20 @@ export function tableAlignmentPads(
 
       switch (model.alignments[slot.column] ?? "none") {
         case "right":
-          pads.push({ pos: slot.from, width: deficit, fill: "space", side: -1 });
+          pads.push({ pos: slot.segmentFrom, width: deficit, fill: "space", side: -1 });
           break;
         case "center": {
           const before = Math.floor(deficit / 2);
-          if (before > 0) pads.push({ pos: slot.from, width: before, fill: "space", side: -1 });
+          if (before > 0) {
+            pads.push({ pos: slot.segmentFrom, width: before, fill: "space", side: -1 });
+          }
           if (deficit - before > 0) {
-            pads.push({ pos: slot.to, width: deficit - before, fill: "space", side: 1 });
+            pads.push({ pos: slot.segmentTo, width: deficit - before, fill: "space", side: 1 });
           }
           break;
         }
         default:
-          pads.push({ pos: slot.to, width: deficit, fill: "space", side: 1 });
+          pads.push({ pos: slot.segmentTo, width: deficit, fill: "space", side: 1 });
       }
     }
   }

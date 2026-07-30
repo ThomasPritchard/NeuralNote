@@ -46,6 +46,28 @@ const FIXTURE = [
   "| 2026-04-03 | 2026-04-03 | Fri | 18:00-22:30 | DJ gig | Alfred Works, Digbeth | Booked | Paid invoice |",
   "| 2026-04-13 | 2026-04-17 | Mon-Fri | All day | Travel | Annual leave | Unavailable | Family holiday |",
   "",
+  "## Blank trailing row",
+  "",
+  "| Key | Value |",
+  "| --- | --- |",
+  "| set | 1 |",
+  "|  |  |",
+  "",
+  "## Nested in a blockquote",
+  "",
+  "> | Key | Value |",
+  "> | --- | --- |",
+  "> | set | 1 |",
+  "> |  |  |",
+  "",
+  "## Nested in a list",
+  "",
+  "- item",
+  "",
+  "  | Key | Value |",
+  "  | --- | --- |",
+  "  | set | 1 |",
+  "",
 ].join("\n");
 
 function state(doc: string, anchor: number) {
@@ -57,6 +79,13 @@ function state(doc: string, anchor: number) {
     ],
   });
 }
+
+/**
+ * Everything the user actually wrote. Whitespace and pipes move as rows are
+ * padded or added; dashes and colons move because `format` resizes the
+ * delimiter row. Nothing else may change.
+ */
+const content = (text: string) => text.replace(/[\s|:-]/g, "");
 
 const COMMANDS = {
   tab: (editor: EditorState) => tableCellStep(editor, 1),
@@ -78,18 +107,21 @@ describe("table command integrity against the QA fixture", () => {
         applied += 1;
         const next = editor.update(spec).state.doc.toString();
 
-        // Row content may be re-padded and rows may be appended, but no command
-        // may shorten the document or disturb the terminal newline.
-        if (next.length < FIXTURE.length) {
-          damage.push(`pos ${pos}: shortened ${FIXTURE.length} -> ${next.length}`);
+        // Rows may be re-padded, appended, or (when blank) removed, so neither
+        // length nor pipe count is invariant. What must NEVER change is the
+        // user's content: strip whitespace and table punctuation and the
+        // remainder has to survive every command byte for byte.
+        if (content(next) !== content(FIXTURE)) {
+          damage.push(`pos ${pos}: content changed`);
         }
         if (!next.endsWith("\n")) {
           damage.push(`pos ${pos}: lost the trailing newline`);
         }
-        const pipesBefore = (FIXTURE.match(/\|/g) ?? []).length;
-        const pipesAfter = (next.match(/\|/g) ?? []).length;
-        if (pipesAfter < pipesBefore) {
-          damage.push(`pos ${pos}: lost pipes ${pipesBefore} -> ${pipesAfter}`);
+        // A command may add one row or remove one blank row. Anything larger
+        // means a line boundary was destroyed and two lines were merged.
+        const lineDelta = next.split("\n").length - FIXTURE.split("\n").length;
+        if (Math.abs(lineDelta) > 1) {
+          damage.push(`pos ${pos}: line count moved by ${lineDelta}`);
         }
       }
 
@@ -100,15 +132,19 @@ describe("table command integrity against the QA fixture", () => {
     });
   }
 
-  it("treats a row with no parsable cells as unsafe to delete", () => {
-    // `[].every()` is true, so a slot-less row would read as blank and Enter
-    // would delete from it to the end of the table.
-    const doc = "| a | b |\n| --- | --- |\n| x | y |\n|\n";
-    const editor = state(doc, doc.indexOf("|\n", doc.indexOf("| x")) + 1);
-    const spec = tableRowStep(editor);
-    const next = spec ? editor.update(spec).state.doc.toString() : doc;
+  it("exercises the blank-row delete branch that the sweep exists to guard", () => {
+    // The sweep above is only meaningful if this branch actually runs.
+    // Mutating the branch to eat the whole table must turn the sweep red;
+    // before the FIXTURE carried a blank row, that mutation stayed green.
+    const blank = FIXTURE.indexOf("|  |  |");
+    expect(blank).toBeGreaterThan(-1);
 
-    expect(next.length).toBeGreaterThanOrEqual(doc.length - 1);
-    expect(next).toContain("| x | y |");
+    const editor = state(FIXTURE, blank + 2);
+    const spec = tableRowStep(editor);
+    expect(spec).not.toBeNull();
+
+    const next = editor.update(spec!).state.doc.toString();
+    expect(next).toContain("| set | 1 |");
+    expect(next.length).toBeGreaterThan(FIXTURE.length - 12);
   });
 });
