@@ -346,9 +346,20 @@ export interface TableRenderPlan {
 
 export interface TableRenderOptions {
   /**
-   * CT-4's measurement probe. `null` for a cell means "not primed yet", which
-   * is the normal first frame rather than an error, and drops the whole table
-   * to character tracks.
+   * CT-4's measurement probe.
+   *
+   * Two states reach this module as the same answer, and only one of them is
+   * normal. `null` FROM the probe is "not primed yet" — the first frame, before
+   * the text metrics have synced — and drops the whole table to character
+   * tracks. An ABSENT probe is a wiring bug: `tableCellMeasurement` is the only
+   * provider of the `tableCellMetrics` facet, and without it every column
+   * measures `null` for the rest of the session, leaving tracks that look
+   * plausible and are wrong by however far the painted text differs from its
+   * character count. Nothing here can tell the two apart, so the wiring is
+   * pinned a level up instead: "primes the probe from the editor it mounts" and
+   * "stamps tracks in the measured unit, not the character fallback"
+   * (`SourceNoteEditor.tableMetrics.test.tsx`) both go red if the provider is
+   * dropped from the composed extension array.
    */
   readonly measureCell?: (plan: CellPaintPlan) => number | null;
 }
@@ -360,7 +371,20 @@ export function tableRowClassName(kind: TableRowKind, edge: TableRowEdge): strin
   return hooks.join(" ");
 }
 
-/** What one cell paints, as the single projection both widths and text read. */
+/**
+ * What one cell paints, as the single projection both widths and text read.
+ *
+ * KNOWN GAP — `index` and `selectionActive` are not supplied, because nothing
+ * carries them here. `collectObsidianPreview` is handed the vault index and
+ * `view.hasFocus` from `SourceNoteEditor.tsx`'s refs (`obsidianLivePreview.ts`),
+ * and a `StateField` has neither a view nor a facet holding either. Two
+ * consequences, both real and both cosmetic: a RESOLVED wikilink is projected
+ * with the unresolved class, so its column is measured against the wrong
+ * cascade; and in an UNFOCUSED editor with the caret touching a wikilink the
+ * plan projects the `[[...]]` source while the paint layer keeps drawing the
+ * label, so the column is stamped too wide rather than too narrow. Closing it
+ * needs a facet fed from the composing component, which is a wave of its own.
+ */
 function slotPaintPlan(
   state: EditorState,
   row: TableRowModel,
@@ -384,6 +408,14 @@ interface ColumnWidth {
  * `**bold**` is eight source characters and four painted ones, so a width taken
  * from the source belongs to a different string than the user sees — which
  * shows up as column jitter, not as an error.
+ *
+ * That is only true while the paint path hides exactly what the plan drops, and
+ * it was NOT true when this was written: the preview collector refused to
+ * descend into a `Table`, so a column was stamped at `Urgent` while the screen
+ * painted `**Urgent**` and the cell — a grid item in a fixed-pixel track, with
+ * no overflow — spilled over its column rule into the neighbour. The collector
+ * descends now; "paints exactly the text its own paint plan projects"
+ * (`sourceEditorDecorations.test.ts`) is what goes red if it stops.
  */
 function columnWidths(
   state: EditorState,

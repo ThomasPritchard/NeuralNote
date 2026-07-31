@@ -7,24 +7,24 @@
 // that is structure — direct-child order, class names, `grid-column` values,
 // edge hooks — is provable here and is provable nowhere cheaper.
 //
-// Two clauses of CT-1 are knowingly NOT asserted as equality, because both were
-// measured to be wrong rather than unimplemented. Both are reported with the
-// phase:
+// One clause of CT-1 is knowingly NOT asserted as equality, because it was
+// measured to be wrong rather than unimplemented:
 //
-//  1. BUFFER COUNTS. CT-1 applies "one buffer before and one after every
-//     widget-backed child" uniformly. CodeMirror does not: `addInlineWidget`
-//     (`@codemirror/view/dist/index.js:2331-2341`) suppresses the leading buffer
-//     of a `Before`-facing point widget and, via `flushBuffer` (`:2464-2469`),
-//     suppresses the trailing buffer of an `After`-facing one — and elides both
-//     between two adjacent same-facing point widgets. Measured for
-//     `[divider replace][zero-length cell][trailing replace]`: 1 buffer then 2
-//     for `side <= 0`, 2 then 1 for `side > 0`, never CT-1's 2 and 2. Adjacent
-//     fillers get none at all, which answers CT1-Q2.
-//  2. CELL TEXT for a cell carrying inline Markdown. CT-1 freezes `**DJ gig**`
-//     as `DJ gig`, which is what `cellPaintPlan` projects — but the collector
-//     still refuses to descend into a `Table`
-//     (`sourceEditorDecorationsPreview.ts`), so nothing hides those markers yet.
-//     That is the spec's phase 3, not this one.
+//   BUFFER COUNTS. CT-1 applies "one buffer before and one after every
+//   widget-backed child" uniformly. CodeMirror does not: `addInlineWidget`
+//   (`@codemirror/view/dist/index.js:2331-2341`) suppresses the leading buffer
+//   of a `Before`-facing point widget and, via `flushBuffer` (`:2464-2469`),
+//   suppresses the trailing buffer of an `After`-facing one — and elides both
+//   between two adjacent same-facing point widgets. Measured for
+//   `[divider replace][zero-length cell][trailing replace]`: 1 buffer then 2
+//   for `side <= 0`, 2 then 1 for `side > 0`, never CT-1's 2 and 2. Adjacent
+//   fillers get none at all, which answers CT1-Q2.
+//
+// CELL TEXT used to be a second such clause: the collector refused to descend
+// into a `Table`, so `**DJ gig**` painted its markers on screen while
+// `cellPaintPlan` — and therefore the track the column was stamped at —
+// projected `DJ gig`. The collector descends now, and every fixture table's own
+// text is asserted below.
 
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { forceParsing, syntaxTree } from "@codemirror/language";
@@ -372,14 +372,16 @@ describe("CT-1 conformance", () => {
     expect([...body.children].filter(isBuffer)).toHaveLength(5);
   });
 
-  it("shows the contract's cell text wherever no phase-3 markup is in the way", () => {
-    // `one-row` and `ragged` carry no inline Markdown, so their painted text is
-    // already exactly what CT-1 freezes. `full-topology` is excluded knowingly:
-    // its `**DJ gig**` and `` `soundcheck` `` cells still paint their markers
-    // until the collector descends into a Table.
-    for (const name of ["one-row", "ragged"]) {
-      const table = fixture(name);
-      const view = mount(table.source, table.source.indexOf("|") + 1);
+  it("shows the contract's cell text on every fixture table", () => {
+    // `full-topology` is the one that earns this assertion. Its `**DJ gig**`,
+    // `` `soundcheck` `` and `[[Roadmap]]` cells each put fewer characters on
+    // screen than they hold in the source, and the track each is given is
+    // measured from exactly that projection — so a marker still painted here is
+    // a cell wider than its column, spilling over the rule into its neighbour.
+    for (const table of TABLE_CONTRACT_FIXTURE) {
+      const view = mount(table.source, table.source.indexOf("|") + 1, [
+        obsidianLivePreview([], () => {}, () => {}),
+      ]);
 
       const text = rowLines(view).map((line) =>
         cellsOf(line).map((cell) => cell.textContent ?? ""));
@@ -388,7 +390,7 @@ describe("CT-1 conformance", () => {
           && !child.className.includes("chrome"))
           .map((child) => child.text ?? ""));
 
-      expect({ name, text }).toEqual({ name, text: expected });
+      expect({ name: table.name, text }).toEqual({ name: table.name, text: expected });
     }
   });
 });

@@ -43,6 +43,12 @@ import {
  * What a drawn cell occupies inline: the advance of the text it paints, plus the
  * padding its own box adds around that text.
  *
+ * "The text it paints" is `plan.visibleText`, and that is the truth only while
+ * the preview collector hides, inside a drawn cell, exactly what the plan drops.
+ * It did not when this was written, and "paints exactly the text its own paint
+ * plan projects" (`sourceEditorDecorations.test.ts`) is what goes red if it
+ * stops again.
+ *
  * @param plan - the cell's canonical projection (CT-3)
  * @returns the width in CSS pixels, or `null` while the probe is not primed —
  *   the normal first frame, which the render plan answers with character tracks

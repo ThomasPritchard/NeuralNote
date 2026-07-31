@@ -21,17 +21,23 @@ type SyntaxNode = ReturnType<typeof syntaxTree>["topNode"];
  * column jitter, not an error, which is what makes duplicating it tempting and
  * wrong. This module is the one place that decides; everything else consumes it.
  *
- * **The plan is a TARGET, matching the CT-1 fixture.** At HEAD the preview
- * collector refuses to descend into a `Table` node, so a cell's inline markup is
- * painted literally in the revealed-source state. `sourceEditorTableContractFixture.ts`
- * freezes the cell text a drawn cell will show (`**DJ gig**` renders as
- * `DJ gig`), and this module produces exactly that.
+ * **The plan and the paint agree, and two tests say so.** The preview collector
+ * descends into a drawn table (`sourceEditorDecorationsPreview.ts`), so a cell's
+ * inline markup gets the decorations that markup gets anywhere else, and
+ * `sourceEditorTableContractFixture.ts`'s frozen cell text (`**DJ gig**` shows
+ * as `DJ gig`) is what the DOM actually holds. It was NOT so when this module
+ * was written — the collector refused to descend, the column was measured at
+ * `Urgent` while the screen painted `**Urgent**`, and the cell spilled over its
+ * column rule into the neighbour. Two assertions go red if that returns:
+ * "paints exactly the text its own paint plan projects"
+ * (`sourceEditorDecorations.test.ts`) compares the collector against this
+ * projection cell by cell, and "shows the contract's cell text on every fixture
+ * table" (`sourceEditorTableRender.test.ts`) compares the rendered DOM to CT-1.
  *
  * **Three disjoint categories cover every character of a cell**: painted as
  * itself (a `text` run), replaced by drawn chrome (a `widget` run), or hidden
  * outright (a {@link CellPaintPlan.hiddenRanges} entry). The three tile the
- * cell's span exactly, which is what lets the paint path derive its decorations
- * from the same object the measurement path measures.
+ * cell's span exactly.
  */
 
 /** Which half of a table a cell sits in. Header cells paint at their own weight. */
@@ -65,7 +71,17 @@ export interface CellPaintPlan {
   /** Exactly what the paint layer renders, character for character. */
   readonly visibleText: string;
   readonly runs: readonly CellPaintRun[];
-  /** Source spans that reach the screen as nothing at all. */
+  /**
+   * Source spans that reach the screen as nothing at all — the complement of
+   * {@link CellPaintPlan.runs} within the cell.
+   *
+   * No production code reads this. The paint path decorates a cell by walking
+   * the syntax tree, exactly as it walks the rest of the note, rather than by
+   * replaying a list from here. What this field IS is the assertable form of the
+   * tiling above: "emits a hiding decoration over every character the plan
+   * drops" (`sourceEditorDecorations.test.ts`) reads it, and is what turns the
+   * two paths agreeing from a claim into a check.
+   */
   readonly hiddenRanges: readonly CellPaintRange[];
   /**
    * Cache key for a measured width, as `(styleEpoch, signature)`. Derived from

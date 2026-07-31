@@ -9,8 +9,14 @@
 // and `WWWWWWWWWWWW` are the same twelve characters and roughly a factor of
 // three apart in width.
 //
-// Three contracts, each with its own failure mode:
+// Four contracts, each with its own failure mode:
 //
+//  0. THE TRACK IS MEASURED FROM THE PAINTED TEXT. Both arms of the measurement
+//     read `cellPaintPlan`, so a marker the editor still PAINTS is invisible to
+//     every assertion that compares one arm against the other. It shows up here
+//     and only here, as a cell too wide for the track it was stamped into — and
+//     the glyph fixture cannot catch it, because its cells paint their own
+//     source character for character.
 //  1. TRACKS ARE MEASURED. A character-count fallback gives the two columns of
 //     the glyph fixture identical tracks. Measured, it cannot.
 //  2. THE TRACK CARRIES THE CELL'S OWN PADDING. `measuredWidth` reports the text
@@ -56,6 +62,26 @@ const GLYPH_TABLE = [
   "| --- | --- |",
   "| iiiiiiiiiiii | WWWWWWWWWWWW |",
 ].join("\n");
+
+/**
+ * A cell carrying every construct whose source is longer than what it paints.
+ *
+ * The glyph fixture above cannot catch a column measured from the wrong string,
+ * because its cells paint their own source character for character. This one
+ * paints twenty-three characters out of a fifty-two-character cell, so a track
+ * sized from the source is more than twice too wide and a cell that still paints
+ * its markers is more than twice too wide for its track.
+ */
+const MARKUP_TABLE = [
+  "# Formatting",
+  "",
+  "| Plain | Formatted |",
+  "| --- | --- |",
+  "| anchor | **bold** and `code` and [label](https://example.com/a) |",
+].join("\n");
+
+/** What {@link MARKUP_TABLE}'s second body cell puts on screen. */
+const MARKUP_CELL_PAINTED = "bold and code and label";
 
 /** Wider than the pane, so every row of it is a live scroll container. */
 const WIDE_TABLE = [
@@ -219,6 +245,37 @@ describe("the composed editor's measured table tracks", () => {
     expect(off).toEqual([]);
     expect(clippedCells(host!)).toEqual([]);
     expect(distinctPaddings(host!)).toHaveLength(1);
+  });
+
+  it("sizes a column of inline markup from the painted text, not the source", async () => {
+    // The gap the glyph fixture above cannot see. Both arms of the measurement
+    // read `cellPaintPlan`, so a marker the editor still PAINTS is invisible to
+    // every assertion that compares one arm against the other — it shows up only
+    // here, as a cell wider than the track it was stamped into, spilling over
+    // the column rule into its neighbour.
+    const view = await mountRevealed(MARKUP_TABLE, "anchor");
+    const body = rowLines(host!).at(-1)!;
+
+    // The premise, asserted rather than trusted. If the markers were painted,
+    // the equality below would still hold for a track measured from the source —
+    // it is the disagreement between the two that this test exists to catch, and
+    // it needs the two to be genuinely different strings.
+    expect(cellsOf(body)[1]!.textContent).toBe(MARKUP_CELL_PAINTED);
+    expect(MARKUP_CELL_PAINTED.length).toBeLessThan(
+      "**bold** and `code` and [label](https://example.com/a)".length / 2,
+    );
+
+    const off = columns(host!)
+      .filter((column) =>
+        Math.abs(column.track - (column.advance + column.padding + CELL_TRACK_GUTTER_PX))
+          > TOLERANCE_PX)
+      .map((column) =>
+        `track ${column.track} vs advance ${column.advance} + padding ${column.padding}`
+        + ` + gutter ${CELL_TRACK_GUTTER_PX}`);
+
+    expect(off).toEqual([]);
+    expect(clippedCells(host!)).toEqual([]);
+    expect(view.state.doc.toString()).toBe(MARKUP_TABLE);
   });
 
   it("re-derives every track when the font scale changes, and moves no byte", async () => {

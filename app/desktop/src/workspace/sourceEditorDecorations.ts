@@ -18,6 +18,7 @@ import {
 
 import { mergeVisibleRanges } from "./sourceEditorDecorationsRanges";
 import { activeLink, safeCollectMarkdownPreview } from "./sourceEditorDecorationsPreview";
+import { createPreviewErrorReporter } from "./sourceEditorPreviewErrorReporter";
 import type { CellPaintPlan } from "./sourceEditorCellPaintPlan";
 import {
   TableCellWidget,
@@ -83,11 +84,11 @@ interface SourceEditorDecorationOptions {
 
 function toDecorationSet(
   view: EditorView,
-  onError: (message: string | null) => void,
+  reportInlineError: (message: string | null) => void,
   options: SourceEditorDecorationOptions,
 ): DecorationSet {
   const result = safeCollectMarkdownPreview(view.state, view.visibleRanges);
-  onError(result.error);
+  reportInlineError(result.error);
   // A table is the `StateField`'s to decorate, in both of its states: as drawn
   // cells, or — when it is too large to draw — as the literal source backdrop.
   // Emitting a table-wide mark from here as well would wrap every row line's
@@ -221,12 +222,17 @@ function tableDecorationSet(
       structure: Decoration.set(structure, true),
       cells: Decoration.set(cells, true),
     };
-  } catch {
+  } catch (error) {
     // Spec rule 6: a decoration failure removes the decoration and leaves the
     // source editable. Without this the throw escapes through `state.update()`,
     // which CodeMirror evaluates as an ARGUMENT to `dispatchTransactions` — so
     // the editor's own try/catch never sees it, the keystroke is lost, and from
     // `StateField.create` the editor fails to mount at all.
+    //
+    // The banner says the same thing for every cause, so the cause itself only
+    // survives if it is logged here: a `RangeError` off a decoration boundary
+    // and an out-of-memory are one message to the user and two different bugs.
+    console.error("table decoration failed:", error);
     reportTableError(state, TABLE_DECORATION_ERROR);
     return NO_TABLE_DECORATIONS;
   }
@@ -408,10 +414,26 @@ const sourceEditorTableViewport = ViewPlugin.fromClass(class {
   }
 });
 
+/** The note a rendered Markdown link under `event` resolves to, if any. */
+function markdownTargetAt(event: Event): string | undefined {
+  return (event.target as Element | null)
+    ?.closest<HTMLElement>("[data-nn-markdown-target]")
+    ?.dataset.nnMarkdownTarget;
+}
+
 export function sourceEditorDecorations(
   onError: (message: string | null) => void,
   options: SourceEditorDecorationOptions = {},
 ): Extension {
+  const report = createPreviewErrorReporter(onError);
+  const reportInline = (message: string | null): void => { report("inline", message); };
+  const openTargetAt = (event: Event): boolean => {
+    const target = markdownTargetAt(event);
+    if (!target) return false;
+    event.preventDefault();
+    options.onOpenLink?.(target);
+    return true;
+  };
   const keyboardLinkHandler = Prec.highest(EditorView.domEventHandlers({
     keydown(event) {
       if (
@@ -421,14 +443,7 @@ export function sourceEditorDecorations(
         || event.metaKey
         || event.shiftKey
       ) return false;
-      const element = (event.target as Element | null)?.closest<HTMLElement>(
-        "[data-nn-markdown-target]",
-      );
-      const target = element?.dataset.nnMarkdownTarget;
-      if (!target) return false;
-      event.preventDefault();
-      options.onOpenLink?.(target);
-      return true;
+      return openTargetAt(event);
     },
   }));
   const previewPlugin = ViewPlugin.fromClass(
@@ -436,7 +451,7 @@ export function sourceEditorDecorations(
       decorations: DecorationSet;
 
       constructor(view: EditorView) {
-        this.decorations = toDecorationSet(view, onError, options);
+        this.decorations = toDecorationSet(view, reportInline, options);
       }
 
       update(update: ViewUpdate): void {
@@ -451,7 +466,7 @@ export function sourceEditorDecorations(
           || linksChanged
           || reparsed(update.startState, update.state)
         ) {
-          this.decorations = toDecorationSet(update.view, onError, options);
+          this.decorations = toDecorationSet(update.view, reportInline, options);
         }
       }
     },
@@ -459,32 +474,16 @@ export function sourceEditorDecorations(
       decorations: (plugin) => plugin.decorations,
       eventHandlers: {
         mousedown(event) {
-          if (event.button !== 0) return false;
-          const element = (event.target as Element | null)?.closest<HTMLElement>(
-            "[data-nn-markdown-target]",
-          );
-          const target = element?.dataset.nnMarkdownTarget;
-          if (!target) return false;
-          event.preventDefault();
-          options.onOpenLink?.(target);
-          return true;
+          return event.button === 0 && openTargetAt(event);
         },
         click(event) {
-          if (event.detail !== 0) return false;
-          const element = (event.target as Element | null)?.closest<HTMLElement>(
-            "[data-nn-markdown-target]",
-          );
-          const target = element?.dataset.nnMarkdownTarget;
-          if (!target) return false;
-          event.preventDefault();
-          options.onOpenLink?.(target);
-          return true;
+          return event.detail === 0 && openTargetAt(event);
         },
       },
     },
   );
   return [
-    tablePreviewErrorSink.of(onError),
+    tablePreviewErrorSink.of((message) => { report("table", message); }),
     sourceEditorTableDecorations,
     sourceEditorTableViewport,
     // Integrity travels with the decorations that create the hazard: this array

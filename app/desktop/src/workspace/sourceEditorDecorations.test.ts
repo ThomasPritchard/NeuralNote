@@ -4,6 +4,7 @@ import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView, type DecorationSet } from "@codemirror/view";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { MAX_TABLE_PREVIEW_ROWS } from "./sourceEditorDecorationsPreview";
 import {
   collectMarkdownPreview,
   safeCollectMarkdownPreview,
@@ -11,6 +12,7 @@ import {
   tableAtomicRanges,
   type PreviewDecoration,
 } from "./sourceEditorDecorations";
+import { tableModelAt } from "./sourceEditorTableModel";
 
 function state(doc: string, ranges: Array<{ anchor: number; head?: number }> = [{ anchor: doc.length }]) {
   return EditorState.create({
@@ -94,6 +96,21 @@ describe("sourceEditorDecorations", () => {
     expect(headingMarker?.kind).toBe("mark");
     expect(emphasisMarker?.kind).toBe("replace");
     expect(strongMarker?.kind).toBe("mark");
+  });
+
+  it("hides an inactive autolink's angle brackets and reveals them for editing", () => {
+    // `Autolink` belongs in `CONSTRUCT_NAMES` for the same reason every other
+    // name there does. Without it `enclosingConstruct` climbs to the `Document`,
+    // whose span holds the caret wherever the caret is, so the markers rendered
+    // ACTIVE for ever — while `cellPaintPlan` and the read-only table widget
+    // both dropped them.
+    const doc = "See <https://example.org> for more";
+    const open = doc.indexOf("<");
+
+    expect(collectMarkdownPreview(state(doc, [{ anchor: 0 }])))
+      .toContainEqual({ from: open, to: open + 1, kind: "replace", className: "nn-lp-marker" });
+    expect(collectMarkdownPreview(state(doc, [{ anchor: open + 3 }])))
+      .toContainEqual({ from: open, to: open + 1, kind: "mark", className: "nn-lp-marker-active" });
   });
 
   it("keeps heading markers visible while typing at the end of the active line", () => {
@@ -274,6 +291,7 @@ describe("sourceEditorDecorations", () => {
   });
 });
 
+
 const FIRST_TABLE = ["| aa | bb |", "| --- | --- |", "| cc | dd |"].join("\n");
 const SECOND_TABLE = ["| ee | ff |", "| --- | --- |", "| gg | hh |"].join("\n");
 const TWO_TABLES = `${FIRST_TABLE}\n\nbetween\n\n${SECOND_TABLE}`;
@@ -303,14 +321,30 @@ describe("tableAtomicRanges", () => {
     // The visual path bails above the preview bounds and leaves the source
     // literal. Making visible pipes atomic would stop the caret on characters
     // the user can see.
+    //
+    // Sized off the constant, not off a literal. `tablePreview` still renders a
+    // table with exactly MAX_TABLE_PREVIEW_ROWS body rows — it tests the count
+    // BEFORE pushing each row — so a literal 200 named a table that IS drawn,
+    // and this test only passed while `drawsCellChrome` was a row out of step
+    // with the preview it claims to match.
     const oversized = [
       "| Key | Value |",
       "| --- | --- |",
-      ...Array.from({ length: 200 }, (_, index) => `| k${index} | v${index} |`),
+      ...Array.from(
+        { length: MAX_TABLE_PREVIEW_ROWS + 1 },
+        (_, index) => `| k${index} | v${index} |`,
+      ),
     ].join("\n");
+    const editor = state(oversized);
+    // The premise, asserted rather than trusted. `LanguageState.init` parses
+    // only `Work.InitViewport` (3,000) characters and abandons even that after
+    // 20 ms of WALL CLOCK, and this fixture is a shade past 3,000 — so on a busy
+    // machine the tree can hold no `Table` node at all, `tableStarts` finds
+    // nothing, and the assertion below passes against an empty document.
+    const bodyRows = tableModelAt(editor, 0)?.rows.filter((row) => row.kind === "body");
 
-    expect(spans(tableAtomicRanges(state(oversized), [{ from: 0, to: oversized.length }])))
-      .toEqual([]);
+    expect(bodyRows).toHaveLength(MAX_TABLE_PREVIEW_ROWS + 1);
+    expect(spans(tableAtomicRanges(editor, [{ from: 0, to: oversized.length }]))).toEqual([]);
   });
 
   it("marks nothing when no range is visible", () => {
@@ -435,3 +469,4 @@ describe("decorations after a deferred parse", () => {
     expect(drawnTables(view)).toBe(1);
   });
 });
+

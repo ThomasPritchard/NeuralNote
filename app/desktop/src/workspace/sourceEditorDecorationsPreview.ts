@@ -20,7 +20,17 @@ import type { PreviewDecoration, PreviewTable, VisibleRange } from "./sourceEdit
 
 type SyntaxNode = ReturnType<typeof syntaxTree>["topNode"];
 
+/**
+ * The constructs a marker's active state is resolved against. A name missing
+ * here does not fail loudly: {@link enclosingConstruct} simply keeps climbing,
+ * and `caretInside` against the `Document` node is true wherever the caret is —
+ * so the construct's markers stay on screen for ever. `Autolink` was missing,
+ * which is why `<https://example.org>` kept its angle brackets in a drawn cell
+ * while `cellPaintPlan` (and so the column's measured track, and the read-only
+ * table widget) dropped them.
+ */
 const CONSTRUCT_NAMES = new Set([
+  "Autolink",
   "Emphasis",
   "StrongEmphasis",
   "Strikethrough",
@@ -200,18 +210,35 @@ export function collectMarkdownPreview(
           label: imageWidgetLabel(state.sliceDoc(from, to)),
         });
       } else if (name === "Table") {
-        if (intersectsVisibleRanges(from, to, visibleRanges)) {
-          // Only the INACTIVE arm renders `table`, and projecting a 180-row
-          // table's cells costs ~3.5ms — on the keystroke path, for a value the
-          // active arm throws away. The result is unchanged either way: a null
-          // `table` already fell through to the source mark.
-          const drawn = !caretInside(state, from, to) && to - from <= MAX_TABLE_PREVIEW_CHARS;
-          const table = drawn ? tablePreview(state, node) : null;
-          output.push(table
-            ? { from, to, kind: "widget", className: "nn-lp-table", table }
-            : { from, to, kind: "mark", className: "nn-lp-table-source", tableSource: true });
+        if (!intersectsVisibleRanges(from, to, visibleRanges)) return false;
+        // Only the INACTIVE arm renders `table`, and projecting a 180-row
+        // table's cells costs ~3.5ms — on the keystroke path, for a value the
+        // active arm throws away. The result is unchanged either way: a null
+        // `table` already fell through to the source mark.
+        const drawn = !caretInside(state, from, to) && to - from <= MAX_TABLE_PREVIEW_CHARS;
+        const table = drawn ? tablePreview(state, node) : null;
+        if (table) {
+          output.push({ from, to, kind: "widget", className: "nn-lp-table", table });
+          // The widget replaces the table's source WHOLE, so no character inside
+          // it reaches the screen and decorating the interior is pure cost.
+          return false;
         }
-        return false;
+        output.push({ from, to, kind: "mark", className: "nn-lp-table-source", tableSource: true });
+        // Descend. This arm paints the cells' OWN source — as drawn grid cells
+        // when the caret is inside, as the literal backdrop when the table is
+        // too large to draw — so a cell's inline markup has to be decorated
+        // exactly as the same markup is anywhere else in the note. Refusing to
+        // was G3: `cellPaintPlan` projects `**Urgent**` as `Urgent` and sizes the
+        // column to it, while the screen kept the asterisks and the cell spilled
+        // over its column rule into the neighbour. Pinned by "paints exactly the
+        // text its own paint plan projects" in `sourceEditorDecorations.test.ts`.
+        //
+        // The descent is bounded by the ITERATION rather than by the table's
+        // size: `iterate` only enters nodes overlapping `scanRange`, and `push`
+        // drops anything outside `visibleRanges`. "descends no further than the
+        // requested visible range" (`sourceEditorDecorations.test.ts`) is what
+        // goes red if either stops holding.
+        return true;
       } else if (HIDDEN_MARKER_NODES.has(name)) {
         const parent = enclosingConstruct(node);
         if (parent.name === "FencedCode" && !completeFencedCode(parent)) return;
@@ -236,7 +263,11 @@ export function safeCollectMarkdownPreview(
 ): { decorations: PreviewDecoration[]; error: string | null } {
   try {
     return { decorations: collect(state, visibleRanges), error: null };
-  } catch {
+  } catch (error) {
+    // The banner reads the same for every cause, so the cause only survives if
+    // it is logged: a `RangeError` off a decoration boundary and an
+    // out-of-memory are one message to the user and two different bugs.
+    console.error("markdown live preview failed:", error);
     return {
       decorations: [],
       error: "Live preview is temporarily unavailable. Your source is unchanged.",
