@@ -143,11 +143,25 @@ describe("a failure in the table decoration path", () => {
       expect(onPreviewError).toHaveBeenCalledWith(expect.stringContaining("Table preview"));
     });
 
-    onPreviewError.mockClear();
     view.dispatch({ effects: refreshSourceEditorDecorations.of(null) });
     await flushMicrotasks();
 
-    expect(onPreviewError.mock.calls.map(([message]) => message)).not.toContain(null);
+    // Assert over the history FROM the first table failure, not over calls made
+    // after a `mockClear()`. With the channels collapsed the spurious `null` is
+    // emitted before that clear would run, so clearing first left this checking
+    // an empty list — it passed against zero calls, for the wrong reason, while
+    // the defect it names was present.
+    //
+    // A `null` before the table has failed is legitimate: the inline pass really
+    // has nothing to report yet. A `null` after it is the bug — the table is
+    // still raw pipes and the banner has just been taken down.
+    const messages = onPreviewError.mock.calls.map(([message]) => message);
+    const firstTableFailure = messages.findIndex(
+      (message) => typeof message === "string" && message.includes("Table preview"),
+    );
+
+    expect(firstTableFailure).toBeGreaterThanOrEqual(0);
+    expect(messages.slice(firstTableFailure)).not.toContain(null);
   });
 
   it("clears the banner once the table path stops failing", async () => {
