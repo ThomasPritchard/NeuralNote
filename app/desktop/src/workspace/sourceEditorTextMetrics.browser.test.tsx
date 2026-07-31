@@ -13,13 +13,14 @@
 //   catches a probe mounted in the wrong place or configured through the `font`
 //   shorthand.
 //
-//   Arm B — the probe against text CodeMirror actually painted, for the fixture
-//   cells with no digits in them. It ties the measurement back to real paint
-//   rather than to DOM this file built. Digit-bearing cells are excluded on
-//   purpose, not by accident: `styles.css` gives a table row
-//   `font-variant-numeric: tabular-nums` and an ordinary paragraph does not,
-//   which is worth ~1.8px per digit in the editor's sans face. Arm A is where
-//   that case is checked.
+//   Arm B — the probe against text CodeMirror actually painted, for every
+//   fixture cell. It ties the measurement back to real paint rather than to DOM
+//   this file built. Its comparand is a PARAGRAPH and the probe measures a
+//   CELL, so the painted line is first given the one width-bearing declaration
+//   a table row adds over a paragraph — see `alignNumericContext`. Without that
+//   the two sides are two different typographic contexts and any agreement is a
+//   coincidence, which is exactly how this arm came to pass on macOS and fail
+//   on Linux CI.
 //
 // The negative control runs inside the parity sweep, per the phase's own
 // clause: a 0.00px agreement with nothing failing beside it is a probe that
@@ -71,7 +72,6 @@ function fixtureCellSources(): string[] {
 }
 
 const CELL_SOURCES = fixtureCellSources();
-const DIGIT_FREE_CELLS = CELL_SOURCES.filter((cell) => !/\d/.test(cell));
 
 /**
  * The cell sits on its own line with the caret parked two lines above it, so no
@@ -121,6 +121,36 @@ function widthOfContents(element: Element): number {
   const range = document.createRange();
   range.selectNodeContents(element);
   return range.getBoundingClientRect().width;
+}
+
+/**
+ * Put a painted PARAGRAPH line into the numeric context a table row paints a
+ * cell in, so Arm B compares a cell's width against a cell's width.
+ *
+ * `.cm-line.nn-lp-table-row` declares `font-variant-numeric: tabular-nums`
+ * (`styles.css:773`) and an ordinary paragraph does not. The probe carries it
+ * because it measures a CELL, so without this the two sides are two different
+ * typographic contexts. It is the WHOLE of the difference between them: aligned,
+ * the residual over every fixture cell is exactly 0.0000px rather than merely
+ * inside the tolerance — which is also why the agreement survives whatever face
+ * a platform resolves and however it rounds advances.
+ *
+ * The effect is not confined to digits, and assuming it was is what made this
+ * arm flaky. Measured, headless Chromium: `2026-04-03` moves 9.1px, but `Start
+ * date` moves 0.20px, and the two runs of `**DJ gig** at the Bell` move +0.52px
+ * and -0.61px — in OPPOSITE directions, so here they cancel to 0.09px and the
+ * arm passed on a coincidence. CI reported that cell as `live 128 vs probe 125`:
+ * whole pixels, where macOS reports 128.55 and 128.45. That is the signature of
+ * a runner rounding glyph advances to integers, and there the two errors stop
+ * cancelling.
+ *
+ * Aligning rather than skipping the affected cells is what lets this arm sweep
+ * the whole fixture, and the digit-bearing cells it used to exclude are what
+ * keep the alignment honest: drop this call and `2026-11-30` disagrees by
+ * 16.7px on any platform.
+ */
+function alignNumericContext(line: HTMLElement): void {
+  line.style.setProperty("font-variant-numeric", "tabular-nums");
 }
 
 /**
@@ -310,7 +340,7 @@ describe("sourceEditorTextMetrics in a real browser", () => {
     // projection `cellPaintPlan` describes: markers hidden, marks applied,
     // wikilinks replaced by their drawn label. The lead line holds the caret so
     // nothing is revealed by the selection.
-    await mountEditor(["Fixture cells", ...DIGIT_FREE_CELLS].join("\n\n"));
+    await mountEditor(["Fixture cells", ...CELL_SOURCES].join("\n\n"));
     // The preview decorations are built from `view.visibleRanges`, which is
     // empty until CodeMirror's first measure cycle — so a freshly mounted editor
     // paints the raw source for a frame, markers and all. Wait for the
@@ -324,11 +354,12 @@ describe("sourceEditorTextMetrics in a real browser", () => {
 
     const compared: string[] = [];
     const painted: Measurement[] = [];
-    for (const source of DIGIT_FREE_CELLS) {
+    for (const source of CELL_SOURCES) {
       const plan = planFor(source);
       const line = paintedLine(host, plan.visibleText);
       if (!line) continue;
       compared.push(source);
+      alignNumericContext(line);
       const live = widthOfContents(line);
       const probe = measuredWidth(plan)!;
       painted.push({ cell: source, live, probe, delta: Math.abs(live - probe) });
@@ -336,7 +367,7 @@ describe("sourceEditorTextMetrics in a real browser", () => {
     expect(disagreements(painted)).toEqual([]);
 
     // A sweep that silently compared nothing would pass every assertion above.
-    expect(compared).toEqual(DIGIT_FREE_CELLS);
+    expect(compared).toEqual(CELL_SOURCES);
   });
 
   it("measures a header cell at the weight the header rule gives it", async () => {
