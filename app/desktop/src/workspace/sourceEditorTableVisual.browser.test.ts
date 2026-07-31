@@ -279,6 +279,18 @@ const rowsOf = (host: Element): HTMLElement[] => [
 ];
 
 /** The next `.nn-lp-cell` after a chrome element, skipping widget buffers. */
+/**
+ * How far off centre a cell's inline box sits inside its own box: the top gap
+ * minus the bottom gap, unsigned. Zero when the block padding centres it.
+ */
+function asymmetry(target: HTMLElement): number {
+  const box = target.getBoundingClientRect();
+  const inline = document.createRange();
+  inline.selectNodeContents(target);
+  const rect = inline.getBoundingClientRect();
+  return Math.abs((rect.top - box.top) - (box.bottom - rect.bottom));
+}
+
 function cellAfter(chrome: Element): HTMLElement {
   let next = chrome.nextElementSibling;
   while (next && !next.classList.contains("nn-lp-cell")) next = next.nextElementSibling;
@@ -643,12 +655,27 @@ describe("the drawn box — edges, seams and height", () => {
       // absolute gap carries the font's half-leading. What the block padding
       // owns is the SYMMETRY — with no padding the single line box sits hard
       // against the top of the cell and the two gaps diverge by 16px.
+      //
+      // Measured against the SAME cell unpadded, in the same run, rather than
+      // against an absolute. Half-leading is a property of the resolved face,
+      // so a fixed 1px tolerance measures whichever font the platform picked:
+      // this assertion held on macOS and failed on Linux CI while the padding
+      // it claims to test was identical on both.
       const topGap = textRect.top - cellRect.top;
-      const bottomGap = cellRect.bottom - textRect.bottom;
-      expect({ topGap: topGap >= 8, symmetric: Math.abs(topGap - bottomGap) < 1 }).toEqual({
-        topGap: true,
-        symmetric: true,
-      });
+      const padded = asymmetry(cell);
+      const declared = cell.style.paddingBlock;
+      cell.style.paddingBlock = "0";
+      const unpadded = asymmetry(cell);
+      cell.style.paddingBlock = declared;
+
+      expect({
+        topGap: topGap >= 8,
+        // Non-vacuity: strip the padding and the gaps MUST diverge. If they do
+        // not, the comparison below is not measuring the padding at all and
+        // would hold whatever the stylesheet declared.
+        paddingMovesIt: unpadded > 4,
+        centred: padded < unpadded / 2,
+      }).toEqual({ topGap: true, paddingMovesIt: true, centred: true });
     } finally {
       harness.destroy();
     }
