@@ -8,8 +8,8 @@ import {
   clickVisibleTreeNote,
   closeVaultViaNativeMenuAction,
   currentSourceMatches,
-  ensureFixtureWorkspace,
   fixturePaths,
+  resetFixtureWorkspace,
   restoreStartSource,
   saveThroughMacOsKeyboardAccelerator,
 } from "./native-helpers.js";
@@ -33,7 +33,7 @@ async function reopenCleanStartNote(): Promise<string> {
 
 describe("NeuralNote native workspace interaction", () => {
   beforeEach(async () => {
-    await ensureFixtureWorkspace();
+    await resetFixtureWorkspace();
   });
 
   macOsIt("saves through the real macOS keyboard accelerator", async () => {

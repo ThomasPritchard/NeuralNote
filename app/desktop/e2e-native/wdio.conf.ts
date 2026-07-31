@@ -87,6 +87,10 @@ export const config: WebdriverIO.Config = {
     const readiness = path.join(root, "artifacts", "first-test-started");
     if (!existsSync(readiness)) writeFileSync(readiness, "ready\n", { flag: "wx" });
   },
+  afterHook: async (test, _context, result, hookName) => {
+    if (result.passed) return;
+    await captureFailureArtifacts(`${test.title} ${hookName}`, result.error);
+  },
   afterTest: async (test, _context, result) => {
     if (result.passed) return;
     await captureFailureArtifacts(test.title, result.error);

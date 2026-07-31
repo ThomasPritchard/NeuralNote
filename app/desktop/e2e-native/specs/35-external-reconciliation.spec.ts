@@ -6,8 +6,9 @@ import { $, browser, expect } from "@wdio/globals";
 import {
   appendToSourceEditor,
   clickVisibleTreeNote,
-  ensureFixtureWorkspace,
+  currentSourceMatches,
   fixturePaths,
+  resetFixtureWorkspace,
   restoreStartSource,
 } from "./native-helpers.js";
 
@@ -24,11 +25,11 @@ async function editorText(): Promise<string> {
 
 describe("NeuralNote native external reconciliation", () => {
   beforeEach(async () => {
-    await ensureFixtureWorkspace();
-    restoreStartSource();
+    await resetFixtureWorkspace();
+    const source = restoreStartSource();
     await openStartNote();
-    await browser.waitUntil(async () => (await editorText()).includes("Exact source."), {
-      timeout: 10_000,
+    await browser.waitUntil(() => currentSourceMatches(source), {
+      timeout: 30_000,
       interval: 50,
     });
   });

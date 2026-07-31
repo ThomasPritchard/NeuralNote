@@ -27,6 +27,35 @@ test("builds once and runs the main, restart-seed, and restart-assert sessions s
   );
 });
 
+test("wires stateful native UI journeys through fixture reset", () => {
+  const nativeHelpers = readFileSync(
+    new URL("./specs/native-helpers.ts", import.meta.url),
+    "utf8",
+  );
+  const markdownSuite = readFileSync(
+    new URL("./specs/30-markdown-source.spec.ts", import.meta.url),
+    "utf8",
+  );
+  const reconciliationSuite = readFileSync(
+    new URL("./specs/35-external-reconciliation.spec.ts", import.meta.url),
+    "utf8",
+  );
+  const workspaceSuite = readFileSync(
+    new URL("./specs/50-workspace-ui.spec.ts", import.meta.url),
+    "utf8",
+  );
+
+  assert.match(nativeHelpers, /export async function dismissNativeNotifications/u);
+  assert.match(nativeHelpers, /export async function closeOpenNotesDiscardingDrafts/u);
+  assert.match(nativeHelpers, /export async function resetFixtureWorkspace/u);
+  assert.match(markdownSuite, /await resetFixtureWorkspace\(\);\s*writeFileSync/u);
+  assert.match(
+    reconciliationSuite,
+    /await resetFixtureWorkspace\(\);\s*const source = restoreStartSource\(\)/u,
+  );
+  assert.match(workspaceSuite, /await resetFixtureWorkspace\(\);/u);
+});
+
 test("the macOS save probe dispatches one fixed AppKit Command-S event", () => {
   const nativeE2e = readFileSync(
     new URL("../src-tauri/src/native_e2e.rs", import.meta.url),

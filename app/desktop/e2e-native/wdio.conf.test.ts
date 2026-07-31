@@ -47,6 +47,7 @@ test("uses WebdriverIO's embedded Tauri provider against the workspace binary", 
   assert.equal(config.connectionRetryCount, 0);
   assert.equal(config.logLevel, "error");
   assert.equal(typeof config.before, "function");
+  assert.equal(typeof config.afterHook, "function");
   assert.deepEqual(config.specs, [[
     "./specs/00-startup.spec.ts",
     "./specs/10-authority-lifecycle.spec.ts",

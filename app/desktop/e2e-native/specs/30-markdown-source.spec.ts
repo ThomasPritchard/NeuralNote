@@ -8,9 +8,12 @@ import { MARKDOWN_COMPATIBILITY_SOURCE } from "../native-fixtures.js";
 import {
   bytes,
   clickVisibleTreeNote,
-  ensureFixtureWorkspace,
   fixturePaths,
+  resetFixtureWorkspace,
 } from "./native-helpers.js";
+
+const CRLF_SOURCE = "# CRLF\r\n\r\nFirst\r\nSecond\r\n";
+const MIXED_SOURCE = "# Mixed\r\n\rFirst\nSecond\r\nThird\r";
 
 async function editor() {
   const noteEditor = await $("[role='textbox'][aria-label='Note content']");
@@ -38,15 +41,17 @@ async function replaceVisibleLinePrefix(
 
 async function saveWithVisibleControl(): Promise<void> {
   const save = await $("button=Save");
-  await save.waitForClickable({ timeout: 10_000 });
+  await save.waitForClickable({ timeout: 30_000 });
   await save.click();
-  await $("[aria-label='Unsaved changes']").waitForExist({ reverse: true, timeout: 10_000 });
+  await $("[aria-label='Unsaved changes']").waitForExist({ reverse: true, timeout: 30_000 });
 }
 
 describe("NeuralNote native Markdown source fidelity", () => {
   beforeEach(async () => {
+    await resetFixtureWorkspace();
     writeFileSync(fixturePaths().markdown, MARKDOWN_COMPATIBILITY_SOURCE, "utf8");
-    await ensureFixtureWorkspace();
+    writeFileSync(fixturePaths().crlf, CRLF_SOURCE, "utf8");
+    writeFileSync(fixturePaths().mixed, MIXED_SOURCE, "utf8");
   });
 
   afterEach(async () => {

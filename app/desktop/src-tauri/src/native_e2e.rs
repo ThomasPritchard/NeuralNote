@@ -2,6 +2,7 @@ use std::ffi::OsString;
 use std::fs::{self, File};
 use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 use neuralnote_core::CoreError;
 
@@ -14,6 +15,8 @@ const ROOT_PREFIX: &str = "neuralnote-native-e2e-";
 const MARKER_FILE: &str = ".neuralnote-native-e2e-root-v1.json";
 const NATIVE_READ_AUDIT_FILE: &str = "native-read-audit.jsonl";
 const MAX_MARKER_BYTES: u64 = 1_024;
+
+static NATIVE_READ_AUDIT_APPEND_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
 /// Dispatch one fixed Command-S key-down event through this E2E application's
 /// AppKit key window. AppKit must resolve it through the installed Tauri menu
@@ -182,6 +185,10 @@ fn record_note_read_from(
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| invalid_root("a native read path has no UTF-8 file name"))?;
+    let _append_guard = NATIVE_READ_AUDIT_APPEND_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .map_err(|_| CoreError::Io("native E2E read audit append lock is poisoned".into()))?;
     let mut audit = open_native_read_audit(&root)?;
     serde_json::to_writer(&mut audit, file_name).map_err(|error| {
         CoreError::Io(format!(
@@ -345,9 +352,12 @@ fn open_native_read_audit(_root: &Path) -> Result<File, CoreError> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::ffi::OsString;
     use std::fs;
     use std::path::Path;
+    use std::sync::{Arc, Barrier};
+    use std::thread;
 
     use super::{native_e2e_config_dir_from, record_note_read_from};
 
@@ -399,6 +409,70 @@ mod tests {
             fs::read_to_string(root.join("artifacts/native-read-audit.jsonl")).unwrap(),
             "\"Secret note.md\"\n"
         );
+    }
+
+    #[test]
+    fn concurrent_native_read_audit_appends_complete_jsonl_records() {
+        const THREADS: usize = 32;
+        const READS_PER_THREAD: usize = 64;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("neuralnote-native-e2e-concurrent-audit");
+        fs::create_dir(&root).unwrap();
+        fs::write(
+            root.join(".neuralnote-native-e2e-root-v1.json"),
+            r#"{"schemaVersion":1,"sessionId":"test-session"}"#,
+        )
+        .unwrap();
+        fs::create_dir(root.join("config")).unwrap();
+        fs::create_dir(root.join("artifacts")).unwrap();
+
+        let start = Arc::new(Barrier::new(THREADS));
+        let workers = (0..THREADS)
+            .map(|thread_index| {
+                let start = Arc::clone(&start);
+                let root = root.clone();
+                let temp_root = temp.path().to_path_buf();
+                thread::spawn(move || {
+                    start.wait();
+                    for read_index in 0..READS_PER_THREAD {
+                        let file_name = format!(
+                            "thread-{thread_index:02}-read-{read_index:02}-{}.md",
+                            "x".repeat(128)
+                        );
+                        record_note_read_from(
+                            root.clone().into_os_string(),
+                            &temp_root,
+                            Path::new(&file_name),
+                        )
+                        .unwrap();
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        let audit = fs::read_to_string(root.join("artifacts/native-read-audit.jsonl")).unwrap();
+        assert!(audit.ends_with('\n'));
+        let records = audit
+            .lines()
+            .map(serde_json::from_str::<String>)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("every concurrent append must remain one complete JSONL record");
+        let expected = (0..THREADS)
+            .flat_map(|thread_index| {
+                (0..READS_PER_THREAD).map(move |read_index| {
+                    format!(
+                        "thread-{thread_index:02}-read-{read_index:02}-{}.md",
+                        "x".repeat(128)
+                    )
+                })
+            })
+            .collect::<HashSet<_>>();
+        assert_eq!(records.len(), THREADS * READS_PER_THREAD);
+        assert_eq!(records.into_iter().collect::<HashSet<_>>(), expected);
     }
 
     #[test]

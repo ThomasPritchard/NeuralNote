@@ -3,6 +3,10 @@ import path from "node:path";
 
 import { $, browser } from "@wdio/globals";
 
+import {
+  assertCloseTabDiscardDialog,
+  classifyNativeNotifications,
+} from "../native-cleanup-policy.js";
 import { CURRENT_RELEASE_NOTES } from "../../src/whats-new/releaseNotes.js";
 
 export interface NativeCoreError {
@@ -81,6 +85,104 @@ export async function dismissWhatsNewIfPresent(): Promise<void> {
   );
 }
 
+const OPEN_NOTE_CLOSE = "[role='tablist'][aria-label='Open notes'] button[aria-label^='Close ']";
+
+async function elementCount(selector: string): Promise<number> {
+  return browser.execute(
+    (expectedSelector) => document.querySelectorAll(expectedSelector).length,
+    selector,
+  );
+}
+
+async function expectedNativeNotificationLabels(): Promise<string[]> {
+  const notifications = await browser.execute(() =>
+    [
+      ...document.querySelectorAll<HTMLElement>(
+        "[aria-label='Notifications'] [data-testid='toast']",
+      ),
+    ].map((notification) => ({
+      kind: notification.dataset.toastKind ?? "",
+      label: notification.getAttribute("aria-label") ?? "",
+    })),
+  );
+  return classifyNativeNotifications(notifications);
+}
+
+/**
+ * The unsigned E2E build has no updater plugin, direct lifecycle tests can leave
+ * a stale no-vault toast in React, and release-note setup emits one success toast.
+ * Those known notifications can cover toolbar controls at the fixed viewport.
+ * Any other notification is a product failure and must remain visible by failing
+ * cleanup instead of being dismissed.
+ */
+export async function dismissNativeNotifications(): Promise<void> {
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const expectedLabels = await expectedNativeNotificationLabels();
+    if (expectedLabels.length === 0) return;
+    const dismiss = await $(
+      "[aria-label='Notifications'] button[aria-label='Dismiss notification']",
+    );
+    // Classification above proves every current toast is an exact harness
+    // notification, so the freshly acquired first dismiss control is safe.
+    // Avoid WebKit's unreliable clickable/visible heuristics and keep the real
+    // WebDriver pointer click that already succeeds for these fixed controls.
+    await dismiss.click();
+    const before = expectedLabels.length;
+    await browser.waitUntil(
+      async () => (await expectedNativeNotificationLabels()).length < before,
+      { timeout: 10_000, interval: 50 },
+    );
+  }
+  throw new Error("native E2E notification cleanup exceeded its bounded limit");
+}
+
+async function assertNoPendingAlertDialog(): Promise<void> {
+  const dialog = await $("[role='alertdialog']");
+  if (await dialog.isExisting()) {
+    throw new Error("unexpected pending native alert dialog");
+  }
+}
+
+async function discardCloseTabDraftIfPresent(): Promise<void> {
+  const dialog = await $("[role='alertdialog']");
+  if (!(await dialog.isExisting())) return;
+  assertCloseTabDiscardDialog(await dialog.getText());
+  const discard = await $(
+    "//*[@role='alertdialog']//button[normalize-space(.)='Discard']",
+  );
+  await discard.waitForClickable({ timeout: 10_000 });
+  await discard.click();
+  await dialog.waitForExist({ reverse: true, timeout: 10_000 });
+}
+
+/**
+ * UI specs share one packaged-app session. Remove prior synthetic fixture tabs
+ * through the real close/discard controls so a failed test cannot leak a draft,
+ * conflict, or deleted-file state into the next journey.
+ */
+export async function closeOpenNotesDiscardingDrafts(): Promise<void> {
+  await dismissNativeNotifications();
+  await assertNoPendingAlertDialog();
+
+  for (let attempt = 0; attempt < 16; attempt += 1) {
+    const before = await elementCount(OPEN_NOTE_CLOSE);
+    if (before === 0) return;
+    await $(OPEN_NOTE_CLOSE).click();
+    await browser.waitUntil(
+      async () =>
+        (await $("[role='alertdialog']").isExisting()) ||
+        (await elementCount(OPEN_NOTE_CLOSE)) < before,
+      { timeout: 10_000, interval: 50 },
+    );
+    await discardCloseTabDraftIfPresent();
+    await browser.waitUntil(async () => (await elementCount(OPEN_NOTE_CLOSE)) < before, {
+      timeout: 10_000,
+      interval: 50,
+    });
+  }
+  throw new Error("native E2E tab cleanup exceeded its bounded limit");
+}
+
 export async function invokeOutcome<T>(
   command: string,
   args: Record<string, unknown> = {},
@@ -134,6 +236,7 @@ export async function ensureFixtureWorkspace(): Promise<void> {
   if (await tabs.isExisting()) {
     await openFixtureVault();
     await dismissWhatsNewIfPresent();
+    await dismissNativeNotifications();
     return;
   }
 
@@ -142,6 +245,17 @@ export async function ensureFixtureWorkspace(): Promise<void> {
   await recent.waitForDisplayed({ timeout: 30_000 });
   await recent.click();
   await tabs.waitForExist({ timeout: 30_000 });
+  await dismissNativeNotifications();
+}
+
+export async function resetFixtureWorkspace(): Promise<void> {
+  await ensureFixtureWorkspace();
+  await closeOpenNotesDiscardingDrafts();
+  // Re-establish the Rust side after any earlier direct-IPC lifecycle journey.
+  // Closing note tabs does not close the vault, but this fixed idempotent open
+  // makes the boundary explicit before a test rewrites its synthetic fixture.
+  await openFixtureVault();
+  await dismissNativeNotifications();
 }
 
 export async function clickVisibleTreeNote(label: string): Promise<void> {
