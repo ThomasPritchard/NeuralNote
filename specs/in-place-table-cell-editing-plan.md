@@ -550,6 +550,10 @@ Tom delegated this decision explicitly ("answer them proactively and autonomousl
 so it was taken here rather than escalated. G2 stands. The resolution turns 1b from a tolerated
 defect into an unreachable state, without touching CodeMirror's layers.
 
+> **REVERSED 31 July 2026 — see the addendum at the end of this section. The clamp described
+> below was implemented, measured in use, and withdrawn. Read the addendum before implementing
+> anything here.**
+
 **The rule: while the main caret is inside a table, that table's scroll offset is clamped to the
 range that keeps the caret's own character inside the row's client band.**
 
@@ -597,6 +601,43 @@ P3c and P3d are unblocked. P3a and P3b were never blocked — they depend on CT-
 equals its `clientWidth`, so it cannot follow the others (it sat at 0 while six rows moved to
 193px). Every row must be forced to the table's full width or the rows shear. That is CT-2's
 `--nn-table-width`, and K6 is the evidence for why it is load-bearing rather than cosmetic.
+
+> **Superseded 31 July 2026.** `--nn-table-width` proved unnecessary. Every content row's trailing
+> chrome is stamped at the table's last column and the alignment row's rule spans the full track
+> list, so all rows already reach the final track — measured identical 638px scroll widths,
+> alignment row included, with each row proven to accept a scroll offset and the extent asserted
+> above 100px so an all-stuck-at-zero table cannot satisfy it vacuously. K6's shear came from the
+> spike's own harness using a plain-text alignment row, not from the contract shape. Recorded
+> because "the spike measured it" was the reason this clause existed, and the spike was measuring
+> something else.
+
+### CT-7 addendum — the clamp is withdrawn (31 July 2026)
+
+**The clamp above is reversed. Table scrolling is free; the drawn caret is suppressed instead.**
+
+I took the clamp decision. It was wrong, and P3d's implementation is what proved it: with the
+caret in the first cell of a 1200px table in a 400px pane, the table will not scroll past ~21px,
+leaving roughly 780px of the user's own table unreachable until they move the caret or click away.
+That reads as a frozen table, not as a protected caret. The arithmetic was always going to say
+this — if column one must stay inside a 400px band, there is nowhere to scroll to — and I did not
+do it before ratifying the rule.
+
+**Replacement rule:** the scroll offset is unconstrained. When the main caret is inside a drawn
+table and its character is outside that row's visible band, `sourceEditorTableScrollSync` toggles
+the class `nn-table-caret-offscreen` on `view.dom`, and the stylesheet hides the cursor layer under
+it. The caret returns the moment its character does.
+
+This is what an editor already does when your cursor scrolls off screen: nothing is drawn. It only
+needed arranging here because CodeMirror would otherwise draw it somewhere wrong. It is legal where
+clipping is not — the cursor layer already hides itself on blur, so hiding is an established state
+rather than a new mechanism, and nothing reaches into or reparents CodeMirror's layers.
+
+I rejected this option when I ratified the clamp, on the reasoning that "no caret" is worse than a
+hidden one. That was the wrong comparison. The real comparison is a suppressed caret against a
+table you cannot scroll, and free scrolling wins.
+
+`nn-table-caret-offscreen` is the frozen name across the two lanes: the module toggles it, the
+stylesheet consumes it.
 
 ---
 
