@@ -38,16 +38,17 @@ open '/Users/thomaspritchard/Documents/projects/NeuralNote-tables/target/debug/b
 ```
 
 **Confirm you are driving the right build before anything else.** The window title must read
-`NeuralNote-Dev-feat-table-in-place-editing`. Two ways to get this wrong, both of which look
-completely normal:
+`NeuralNote-Dev-feat-table-in-place-editing`, with the branch name on the end.
 
-- A plain `NeuralNote` title means you opened the user's installed production app.
-- **There is a stale `NeuralNote-Dev.app` in that same bundle directory, a day older and built
-  before this work existed.** Its window title is `NeuralNote-Dev`, without the branch suffix. It
-  will launch, open the vault, and behave like a working app — and show you none of the changes
-  under test. Do not open it. The full path above is the one that matters.
+A plain `NeuralNote` or `NeuralNote-Dev` title means you have opened something else — the user's
+installed production app, or an older dev build. Either will launch, open a vault, and behave like
+a perfectly working app while showing you none of the changes under test, so this is not a
+theoretical mix-up: every observation made against the wrong build is worthless and looks entirely
+normal.
 
-Every observation made against the wrong build is worthless.
+A build was made from this branch at the path above and any older bundle beside it was deleted, so
+the directory should hold exactly one `.app`. If it holds more than one, something has rebuilt
+since — check the title.
 
 If the build fails on a missing `binaries/ollama-*` or `yt-dlp` path: those are large gitignored
 sidecars a fresh worktree lacks. Copy them from `/Users/thomaspritchard/Documents/projects/NeuralNote`
