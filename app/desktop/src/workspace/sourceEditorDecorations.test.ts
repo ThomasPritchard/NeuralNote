@@ -1,15 +1,19 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { forceParsing, syntaxTree, syntaxTreeAvailable } from "@codemirror/language";
 import { EditorSelection, EditorState, StateEffect } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
-import { describe, expect, it, vi } from "vitest";
+import { EditorView, type DecorationSet } from "@codemirror/view";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
+import * as previewModule from "./sourceEditorDecorationsPreview";
+import { MAX_TABLE_PREVIEW_ROWS } from "./sourceEditorDecorationsPreview";
 import {
   collectMarkdownPreview,
   safeCollectMarkdownPreview,
   sourceEditorDecorations,
+  tableAtomicRanges,
   type PreviewDecoration,
 } from "./sourceEditorDecorations";
-import * as previewModule from "./sourceEditorDecorationsPreview";
+import { tableModelAt } from "./sourceEditorTableModel";
 
 function state(doc: string, ranges: Array<{ anchor: number; head?: number }> = [{ anchor: doc.length }]) {
   return EditorState.create({
@@ -95,6 +99,21 @@ describe("sourceEditorDecorations", () => {
     expect(strongMarker?.kind).toBe("mark");
   });
 
+  it("hides an inactive autolink's angle brackets and reveals them for editing", () => {
+    // `Autolink` belongs in `CONSTRUCT_NAMES` for the same reason every other
+    // name there does. Without it `enclosingConstruct` climbs to the `Document`,
+    // whose span holds the caret wherever the caret is, so the markers rendered
+    // ACTIVE for ever — while `cellPaintPlan` and the read-only table widget
+    // both dropped them.
+    const doc = "See <https://example.org> for more";
+    const open = doc.indexOf("<");
+
+    expect(collectMarkdownPreview(state(doc, [{ anchor: 0 }])))
+      .toContainEqual({ from: open, to: open + 1, kind: "replace", className: "nn-lp-marker" });
+    expect(collectMarkdownPreview(state(doc, [{ anchor: open + 3 }])))
+      .toContainEqual({ from: open, to: open + 1, kind: "mark", className: "nn-lp-marker-active" });
+  });
+
   it("keeps heading markers visible while typing at the end of the active line", () => {
     const doc = "##";
     const preview = collectMarkdownPreview(state(doc, [{ anchor: doc.length }]));
@@ -133,6 +152,37 @@ describe("sourceEditorDecorations", () => {
         className: "nn-lp-table-source",
       }),
     );
+  });
+
+  it("renders every table cell through the one cell-paint projection", () => {
+    const doc = [
+      "| Note |",
+      "| --- |",
+      "| **DJ gig** at the Bell |",
+      "| [[Roadmap]] |",
+      "| `soundcheck` |",
+    ].join("\n");
+
+    const table = collectMarkdownPreview(state(doc)).find((item) => item.table)?.table;
+
+    // The widget and the drawn cell must show the same characters. A wikilink is
+    // the case the widget used to get wrong on its own: it has no Markdown node,
+    // so a second list of hidden node names never saw it.
+    expect(table?.rows).toEqual([["DJ gig at the Bell"], ["Roadmap"], ["soundcheck"]]);
+  });
+
+  it("does not project a table's cells while the caret is inside it", () => {
+    const doc = ["| a | b |", "| - | - |", "| **c** | d |"].join("\n");
+    const editor = state(doc, [{ anchor: doc.indexOf("**c**") + 2 }]);
+    const sliceDoc = vi.spyOn(editor, "sliceDoc");
+
+    const preview = collectMarkdownPreview(editor);
+
+    expect(preview).toContainEqual(expect.objectContaining({ className: "nn-lp-table-source" }));
+    // The rendered widget is discarded for an active table, so reading any of
+    // its interior is pure cost on the keystroke path.
+    expect(sliceDoc.mock.calls.filter(([from = 0, to = doc.length]) => from > 0 && to < doc.length))
+      .toEqual([]);
   });
 
   it("limits table preview work to the requested visible range", () => {
@@ -319,3 +369,183 @@ describe("sourceEditorDecorations", () => {
     }
   });
 });
+
+
+const FIRST_TABLE = ["| aa | bb |", "| --- | --- |", "| cc | dd |"].join("\n");
+const SECOND_TABLE = ["| ee | ff |", "| --- | --- |", "| gg | hh |"].join("\n");
+const TWO_TABLES = `${FIRST_TABLE}\n\nbetween\n\n${SECOND_TABLE}`;
+
+function spans(set: DecorationSet): Array<{ from: number; to: number }> {
+  const found: Array<{ from: number; to: number }> = [];
+  for (const cursor = set.iter(); cursor.value; cursor.next()) {
+    found.push({ from: cursor.from, to: cursor.to });
+  }
+  return found;
+}
+
+describe("tableAtomicRanges", () => {
+  it("covers every table in the visible ranges, not only the one holding the caret", () => {
+    // It used to derive its single table from `state.selection.main.head`, so a
+    // second table on screen was left unprotected.
+    const editor = state(TWO_TABLES, [{ anchor: 3 }]);
+    const secondFrom = TWO_TABLES.indexOf(SECOND_TABLE);
+    const found = spans(tableAtomicRanges(editor, [{ from: 0, to: TWO_TABLES.length }]));
+
+    expect(found.some((span) => span.to <= FIRST_TABLE.length)).toBe(true);
+    expect(found.some((span) => span.from >= secondFrom)).toBe(true);
+    expect(found.every((span) => span.to > span.from)).toBe(true);
+  });
+
+  it("marks nothing for an oversized table, whose pipes are still painted", () => {
+    // The visual path bails above the preview bounds and leaves the source
+    // literal. Making visible pipes atomic would stop the caret on characters
+    // the user can see.
+    //
+    // Sized off the constant, not off a literal. `tablePreview` still renders a
+    // table with exactly MAX_TABLE_PREVIEW_ROWS body rows — it tests the count
+    // BEFORE pushing each row — so a literal 200 named a table that IS drawn,
+    // and this test only passed while `drawsCellChrome` was a row out of step
+    // with the preview it claims to match.
+    const oversized = [
+      "| Key | Value |",
+      "| --- | --- |",
+      ...Array.from(
+        { length: MAX_TABLE_PREVIEW_ROWS + 1 },
+        (_, index) => `| k${index} | v${index} |`,
+      ),
+    ].join("\n");
+    const editor = state(oversized);
+    // The premise, asserted rather than trusted. `LanguageState.init` parses
+    // only `Work.InitViewport` (3,000) characters and abandons even that after
+    // 20 ms of WALL CLOCK, and this fixture is a shade past 3,000 — so on a busy
+    // machine the tree can hold no `Table` node at all, `tableStarts` finds
+    // nothing, and the assertion below passes against an empty document.
+    const bodyRows = tableModelAt(editor, 0)?.rows.filter((row) => row.kind === "body");
+
+    expect(bodyRows).toHaveLength(MAX_TABLE_PREVIEW_ROWS + 1);
+    expect(spans(tableAtomicRanges(editor, [{ from: 0, to: oversized.length }]))).toEqual([]);
+  });
+
+  it("marks nothing when no range is visible", () => {
+    expect(spans(tableAtomicRanges(state(FIRST_TABLE), []))).toEqual([]);
+  });
+});
+
+const withDecorations = (doc: string) => EditorState.create({
+  doc,
+  extensions: [
+    markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+    sourceEditorDecorations(() => {}),
+  ],
+});
+
+describe("sourceEditorDecorations extensions", () => {
+  it("registers the delimiter guard, so the editor component needs no wiring", () => {
+    // The array returned here is already consumed at SourceNoteEditor.tsx:139.
+    // Registering the filter alongside the decorations is what makes the
+    // refusal reach the running editor without touching the component.
+    const editor = withDecorations(FIRST_TABLE);
+    const gap = { from: FIRST_TABLE.indexOf("aa") + 2, to: FIRST_TABLE.indexOf("bb") };
+    const transaction = editor.update({ changes: { from: gap.from, to: gap.to } });
+
+    expect(transaction.effects.some((effect) => effect.is(EditorView.announce))).toBe(true);
+    expect(transaction.state.doc.toString()).toBe(FIRST_TABLE);
+  });
+
+  it("registers an atomic-ranges provider that reads the live viewport", () => {
+    const editor = withDecorations(TWO_TABLES);
+    const providers = editor.facet(EditorView.atomicRanges);
+    expect(providers).toHaveLength(1);
+
+    const viewport = { state: editor, visibleRanges: [{ from: 0, to: TWO_TABLES.length }] };
+    expect(spans(providers[0]!(viewport as unknown as EditorView)).length).toBeGreaterThan(0);
+  });
+});
+
+// A note whose table sits beyond the parser's first slice. `LanguageState.init`
+// parses only to `Work.InitViewport` (3,000 chars) and gives up after
+// `Work.Apply` (20 ms of wall clock), so on open the tree genuinely has no
+// `Table` node here — CodeMirror finishes the parse afterwards, on an idle
+// callback (`@codemirror/language/dist/index.js:540-545, 601-624`).
+const DEFERRED_PARSE_TABLE = ["| aa | bb |", "| --- | --- |", "| cc | dd |"].join("\n");
+const DEFERRED_PARSE_NOTE = `${"word ".repeat(600)}\n\n${DEFERRED_PARSE_TABLE}`;
+
+const mounted: EditorView[] = [];
+
+afterEach(() => {
+  for (const view of mounted.splice(0)) {
+    view.dom.parentElement?.remove();
+    view.destroy();
+  }
+});
+
+function mountWithDecorations(doc: string): EditorView {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const view = new EditorView({ state: withDecorations(doc), parent: host });
+  mounted.push(view);
+  return view;
+}
+
+const drawnTables = (view: EditorView) => view.dom.querySelectorAll("table.nn-lp-table").length;
+
+const hasTableNode = (parsed: EditorState): boolean => {
+  let found = false;
+  syntaxTree(parsed).iterate({ enter: (node) => { if (node.name === "Table") found = true; } });
+  return found;
+};
+
+describe("decorations after a deferred parse", () => {
+  it("has no table to draw while the parser has not reached one", () => {
+    // The premise the next two tests rest on. Without this the fixture could
+    // stop reproducing the deferred parse — the table would be in the first
+    // slice — and they would pass while proving nothing.
+    const view = mountWithDecorations(DEFERRED_PARSE_NOTE);
+
+    expect(syntaxTreeAvailable(view.state, view.state.doc.length)).toBe(false);
+    expect(hasTableNode(view.state)).toBe(false);
+    expect(drawnTables(view)).toBe(0);
+  });
+
+  it("draws the table once the parse completes, with no edit and no caret move", () => {
+    // `forceParsing` finishes the parse and announces it with a transaction that
+    // carries no change, no selection and no effect — the same shape the idle
+    // `ParseWorker` uses. A field that keys only on those inputs keeps its stale
+    // answer and the table never appears.
+    const view = mountWithDecorations(DEFERRED_PARSE_NOTE);
+    expect(drawnTables(view)).toBe(0);
+
+    forceParsing(view, view.state.doc.length, 5_000);
+
+    expect(hasTableNode(view.state)).toBe(true);
+    expect(drawnTables(view)).toBe(1);
+  });
+
+  it("paints inline preview past the first slice once the parse completes", () => {
+    // The same staleness, one layer up: the preview plugin keys on the same
+    // inputs, so every heading, emphasis and wikilink past the first slice stays
+    // literal too. Fixing only the table would leave the note half-painted.
+    const note = `${"word ".repeat(600)}\n\n**strong text**`;
+    const view = mountWithDecorations(note);
+    expect(view.dom.querySelectorAll(".nn-lp-strong")).toHaveLength(0);
+
+    forceParsing(view, view.state.doc.length, 5_000);
+
+    expect(view.dom.querySelectorAll(".nn-lp-strong")).toHaveLength(1);
+  });
+
+  it("draws it from CodeMirror's own idle parse worker too", async () => {
+    // The journey through the real seam: no test-only parse driver, just the
+    // worker CodeMirror schedules for itself. Polled rather than slept on, so a
+    // busy machine makes this slower and never wrong.
+    const view = mountWithDecorations(DEFERRED_PARSE_NOTE);
+
+    for (let poll = 0; poll < 100 && !hasTableNode(view.state); poll += 1) {
+      await new Promise((resolve) => { setTimeout(resolve, 20); });
+    }
+
+    expect(hasTableNode(view.state)).toBe(true);
+    expect(drawnTables(view)).toBe(1);
+  });
+});
+

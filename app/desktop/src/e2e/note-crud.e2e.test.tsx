@@ -76,7 +76,11 @@ describe("Journey 4: edit and save", () => {
     expect(screen.getByRole("button", { name: "Search for #opsec" })).toBeInTheDocument();
 
     await user.click(screen.getByRole("table", { name: "Markdown table" }));
-    expect(editor.textContent).toContain("| --- | --- |");
+    // The revealed source is drawn as a grid of cells, one line decoration per
+    // row, so the rendered text carries chrome the file does not. The note must
+    // stay clean.
+    expect(screen.queryByRole("table", { name: "Markdown table" })).toBeNull();
+    expect(editor.querySelector(".nn-lp-table-row")).not.toBeNull();
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
     await expect(readNote(`${VAULT_ROOT}/Commitments.md`)).resolves.toMatchObject({ raw: content });
   });

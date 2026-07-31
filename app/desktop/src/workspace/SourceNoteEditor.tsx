@@ -32,6 +32,7 @@ import {
 } from "./obsidianLivePreview";
 import { createWikilinkCompletionSource } from "./wikilinkCompletion";
 import { formatSourceSelections } from "./sourceEditorFormatting";
+import { tableKeymap } from "./sourceEditorTableCommands";
 import type { FormatAction } from "./markdownFormat";
 import {
   refreshSourceTitlePlaceholder,
@@ -41,6 +42,9 @@ import {
   refreshSourceFrontmatterPreview,
   sourceFrontmatterPreview,
 } from "./sourceFrontmatterPreview";
+import { textMetricsPrimer } from "./sourceEditorTextMetrics";
+import { tableCellMeasurement } from "./sourceEditorTableMeasurement";
+import { tableScrollSync } from "./sourceEditorTableScrollSync";
 
 export interface SourceNoteEditorProps {
   sessionKey: string;
@@ -122,6 +126,13 @@ export function SourceNoteEditor({
       EditorState.allowMultipleSelections.of(true),
       foldGutter(),
       markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+      // Declared ahead of the decorations that consume them, because that is the
+      // dependency direction: `textMetricsPrimer` keeps the measurement probe
+      // primed for this view's lifetime, and `tableCellMeasurement` is the only
+      // provider of the facet the table render plan reads. Register neither and
+      // every table column silently falls back to a character-count width.
+      textMetricsPrimer,
+      tableCellMeasurement,
       sourceFrontmatterPreview(
         () => frontmatterRef.current,
         () => frontmatterRawRef.current !== null && frontmatterErrorRef.current === null,
@@ -141,6 +152,11 @@ export function SourceNoteEditor({
       ),
       sourceTitlePlaceholder(() => derivedTitleRef.current),
       drawSelection(),
+      // After both of the things it repairs: the row lines `sourceEditorDecorations`
+      // stamps, which are the scroll containers it keeps on one offset, and the
+      // caret `drawSelection()` paints outside them, which it re-derives once a
+      // row has moved under it.
+      tableScrollSync,
       EditorView.lineWrapping,
       autocompletion({
         override: [(context) => createWikilinkCompletionSource(noteIndexRef.current)(context)],
@@ -176,6 +192,14 @@ export function SourceNoteEditor({
           ),
         },
         ...completionKeymap,
+        // After completionKeymap so an open wikilink popup keeps Enter, and
+        // before defaultKeymap so Enter steps down a column instead of breaking
+        // the table. Each command returns false outside a table, so Tab still
+        // moves focus everywhere else in the editor.
+        // The bindings themselves live beside the commands they run, so their
+        // order is testable against the real array rather than a restatement of
+        // it. See `sourceEditorTableKeymap.test.ts`.
+        ...tableKeymap,
         ...foldKeymap,
         ...defaultKeymap,
         ...historyKeymap,

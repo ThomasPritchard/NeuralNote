@@ -22,6 +22,20 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
 - **An e2e / journey test for any user-facing flow** — the jsdom + `mockIPC` tier in
   `app/desktop/src/e2e/` (drives the app through its real IPC boundary). The native
   WebdriverIO tier (`app/desktop/e2e-native/`) is CI-only (macOS can't run `tauri-driver`).
+- **A browser-tier test for anything whose correctness is geometric** — layout, pixel
+  alignment, CSS stacking and z-index, pointer hit-testing, scroll behaviour, caret and
+  selection position. `npm --prefix app/desktop run test:browser` runs `*.browser.test.tsx`
+  in a real headless Chromium with the app's real Vite + Tailwind pipeline
+  (`app/desktop/vitest.browser.config.ts`); it needs no native driver, only
+  `npx playwright install chromium`. **jsdom has no layout engine** —
+  `getBoundingClientRect()` returns all-zeros there, so a jsdom suite can be fully green
+  while the pixels are wrong. If a change can be wrong on screen and right in the data,
+  it needs this lane, and `npm --prefix app/desktop run typecheck:browser` with it.
+
+  Two things this lane does **not** prove, and must not be read as proving. It runs
+  Chromium; the shipped app runs macOS **WKWebView**, so measurement parity between them
+  is its own question. And it has no input method, no dictation and no dead keys — those
+  are verified by hand in a real build, never by a green suite.
 
 ### Hosted and native quality gates GREEN
 - **Pull request CI** — Oxlint, TypeScript type checking, frontend unit/component tests,
@@ -132,6 +146,7 @@ Baseline (every feature)
 - [ ] Unit tests for changed logic (golden + failure/edge paths)
 - [ ] ≥90% coverage on changed code
 - [ ] e2e/journey test for any user-facing flow (src/e2e/)
+- [ ] Geometric/visual change: browser-tier test green (npm run test:browser + typecheck:browser)
 - [ ] Pull request CI green: lint, typecheck, unit tests, Rust checks, bindings, Gitleaks
 - [ ] Rust gate GREEN — ./scripts/rust-quality-gate.sh (all categories enforced)
 - [ ] typecheck + clippy + fmt clean
@@ -162,7 +177,10 @@ Periodic (milestone / batch / risk-surface — not every feature)
 npm run lint
 npm run typecheck
 npm run test:unit         # unit + component; excludes src/e2e
-npm run test:run          # all tests, including jsdom + mockIPC journeys
+npm run test:run          # all jsdom tests, including mockIPC journeys
+npm run test:browser      # real headless Chromium (*.browser.test.tsx) — the only lane
+                          # that can prove layout, pixels, hit-testing and scroll
+npm run typecheck:browser # the browser tier has its own tsconfig
 npm run coverage          # all tests + 90% line gate; writes coverage/lcov.info
 npm run build
 

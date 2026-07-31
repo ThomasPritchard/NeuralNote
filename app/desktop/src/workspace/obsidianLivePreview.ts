@@ -11,6 +11,12 @@ import {
 
 import type { NoteIndexEntry } from "./linkResolve";
 import { resolveWikilink } from "./linkResolve";
+import {
+  caretTouching,
+  CODE_MASKED_NODES,
+  inlineWikilinks,
+  TAG_MASKED_NODES,
+} from "./sourceEditorCellPaintPlan";
 import type { PreviewDecoration, VisibleRange } from "./sourceEditorDecorations";
 import { sourceFrontmatterRange } from "./sourceFrontmatterPreview";
 import { inlineTagAt } from "./obsidianTag";
@@ -21,12 +27,6 @@ export interface ObsidianPreviewDecoration extends PreviewDecoration {
 }
 
 export const refreshObsidianPreview = StateEffect.define<null>();
-
-function active(state: EditorState, from: number, to: number): boolean {
-  return state.selection.ranges.some((range) =>
-    range.empty ? range.head >= from && range.head <= to : range.from < to && range.to > from,
-  );
-}
 
 const SCAN_MARGIN = 2_048;
 
@@ -51,21 +51,6 @@ function boundedScanRanges(
   }
   return merged;
 }
-
-const TAG_MASKED_NODES = new Set([
-  "Autolink",
-  "CodeBlock",
-  "Escape",
-  "FencedCode",
-  "HTMLTag",
-  "Image",
-  "InlineCode",
-  "Link",
-  "LinkLabel",
-  "LinkReference",
-  "URL",
-]);
-const PREVIEW_MASKED_NODES = new Set(["CodeBlock", "FencedCode", "InlineCode"]);
 
 function syntaxMaskedRanges(
   state: EditorState,
@@ -95,14 +80,6 @@ function insideVisible(from: number, to: number, ranges: readonly VisibleRange[]
   return ranges.some((range) => from >= range.from && to <= range.to);
 }
 
-function displayLabel(rawTarget: string): string {
-  const [beforeAlias, alias] = rawTarget.split("|", 2);
-  if (alias?.trim()) return alias.trim();
-  const note = (beforeAlias ?? rawTarget).split("#", 1)[0]?.trim() ?? rawTarget;
-  const base = note.slice(note.lastIndexOf("/") + 1).replace(/\.(?:md|markdown|mdx)$/i, "");
-  return base || rawTarget;
-}
-
 export function collectObsidianPreview(
   state: EditorState,
   index: readonly NoteIndexEntry[],
@@ -110,22 +87,19 @@ export function collectObsidianPreview(
   selectionActive = true,
 ): ObsidianPreviewDecoration[] {
   const scanRanges = boundedScanRanges(state.doc.length, visibleRanges);
-  const previewMasked = syntaxMaskedRanges(state, scanRanges, PREVIEW_MASKED_NODES);
+  const codeMasked = syntaxMaskedRanges(state, scanRanges, CODE_MASKED_NODES);
   const tagMasked = syntaxMaskedRanges(state, scanRanges, TAG_MASKED_NODES);
   const output: ObsidianPreviewDecoration[] = [];
-  const wikilink = /(!)?\[\[([^\]\r\n]+)\]\]/g;
 
   for (const scan of scanRanges) {
     const source = state.sliceDoc(scan.from, scan.to);
-    for (const match of source.matchAll(wikilink)) {
-      const from = scan.from + match.index;
-      const to = from + match[0].length;
+    // `inlineWikilinks` and the label it carries are CT-3's, so the span this
+    // replaces and the span `cellPaintPlan` projects are one answer, not two.
+    for (const { from, to, embed, rawTarget, label } of inlineWikilinks(source, scan.from)) {
       tagMasked.push({ from, to });
-      if (!insideVisible(from, to, visibleRanges) || overlapsMasked(from, to, previewMasked)) continue;
-      const embed = match[1] === "!";
-      const rawTarget = match[2];
+      if (!insideVisible(from, to, visibleRanges) || overlapsMasked(from, to, codeMasked)) continue;
       const target = resolveWikilink(rawTarget, [...index]);
-      if (selectionActive && active(state, from, to)) {
+      if (selectionActive && caretTouching(state, from, to)) {
         output.push({ from, to, kind: "mark", className: "nn-lp-wikilink-active", target });
       } else {
         output.push({
@@ -137,7 +111,7 @@ export function collectObsidianPreview(
             : target
               ? "nn-lp-wikilink-resolved"
               : "nn-lp-wikilink-unresolved",
-          label: `${embed ? "Embed: " : ""}${displayLabel(rawTarget)}`,
+          label: `${embed ? "Embed: " : ""}${label}`,
           target: embed ? null : target,
         });
       }
@@ -148,7 +122,7 @@ export function collectObsidianPreview(
       const from = scan.from + callout.index;
       const to = from + callout[0].length;
       const realLineStart = from === 0 || state.sliceDoc(from - 1, from) === "\n";
-      if (realLineStart && insideVisible(from, to, visibleRanges) && !overlapsMasked(from, to, previewMasked)) {
+      if (realLineStart && insideVisible(from, to, visibleRanges) && !overlapsMasked(from, to, codeMasked)) {
         output.push({ from, to, kind: "mark", className: "nn-lp-callout" });
       }
     }
@@ -160,7 +134,7 @@ export function collectObsidianPreview(
       const to = from + block[1].length;
       const matchEnd = scan.from + block.index + block[0].length;
       const realLineEnd = matchEnd === state.doc.length || state.sliceDoc(matchEnd, matchEnd + 1) === "\n";
-      if (realLineEnd && insideVisible(from, to, visibleRanges) && !overlapsMasked(from, to, previewMasked)) {
+      if (realLineEnd && insideVisible(from, to, visibleRanges) && !overlapsMasked(from, to, codeMasked)) {
         output.push({ from, to, kind: "mark", className: "nn-lp-block-id" });
       }
     }
