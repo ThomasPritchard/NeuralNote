@@ -153,8 +153,13 @@ export function tableRowStep(state: EditorState): TransactionSpec | null {
     // there strands an orphaned "> " behind.
     const line = state.doc.lineAt(row.from);
     const from = line.number > 1 ? state.doc.line(line.number - 1).to : model.from;
+    // Bound by the blank row's OWN line, never by `model.to`. A blank row in the
+    // middle of a table has rows after it, and deleting to the end of the table
+    // silently destroyed every one of them. It stayed invisible because a blank
+    // row is normally the last thing in a table, which makes the two bounds
+    // identical — so every existing test agreed with the broken arithmetic.
     return {
-      changes: { from, to: model.to, insert: "\n" },
+      changes: { from, to: line.to, insert: "\n" },
       selection: EditorSelection.cursor(from + 1),
       scrollIntoView: true,
     };

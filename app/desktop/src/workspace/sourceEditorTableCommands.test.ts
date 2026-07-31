@@ -129,6 +129,24 @@ describe("tableRowStep", () => {
     expect(result?.head).toBe(TABLE.length + 1);
   });
 
+  it("keeps the rows below when Enter lands on a blank row mid-table", () => {
+    // Regression, and data loss: the blank-row exit deleted to `model.to`, the
+    // end of the whole table, rather than to the end of the blank row's own
+    // line. Every row below vanished with no warning.
+    //
+    // The fixture needs a row AFTER the blank one whose next row yields no
+    // slot, or `tableRowStep` steps down a column and never reaches the exit
+    // branch. A lone `|` is the shape a user leaves while building a table by
+    // hand, and it parses as a row with no cells at all.
+    const doc = "| a | b |\n| - | - |\n|   |   |\n|\n| c | d |\n";
+    const editor = state(doc, doc.indexOf("|   |   |") + 2);
+    const result = apply(editor, tableRowStep(editor));
+
+    expect(result?.doc).toContain("| c | d |");
+    // The blank row goes and nothing else does.
+    expect(result?.doc).toBe("| a | b |\n| - | - |\n\n|\n| c | d |\n");
+  });
+
   it("refuses the blank-row exit for a table nested in a blockquote", () => {
     // Regression: the branch deleted from `row.from - 1`, which inside a
     // blockquote is the space after ">" rather than a newline, stranding "> ".
