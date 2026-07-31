@@ -1,3 +1,4 @@
+import { syntaxTree } from "@codemirror/language";
 import {
   Facet,
   Prec,
@@ -50,6 +51,26 @@ export {
 } from "./sourceEditorDecorationsPreview";
 
 export const refreshSourceEditorDecorations = StateEffect.define<null>();
+
+/**
+ * Whether a newer syntax tree arrived between these two states.
+ *
+ * Every decoration in this file is derived from the tree, and the tree arrives
+ * LATE. `LanguageState.init` parses only the first `Work.InitViewport` (3,000)
+ * characters, and abandons even that slice once `Work.Apply` (20 ms of wall
+ * clock) is spent — so a busy machine, or simply a note longer than 3,000
+ * characters, opens with a tree that stops short of the content below. CodeMirror
+ * finishes the job on an idle callback and announces it with a transaction that
+ * changes no document, moves no selection and carries no effect of ours
+ * (`@codemirror/language/dist/index.js:540-545, 601-624`).
+ *
+ * Without this the cached decorations outlive the tree they were derived from:
+ * a table past the first slice stays raw pipes, and every heading, emphasis and
+ * wikilink below it stays literal, until the user happens to type.
+ */
+function reparsed(before: EditorState, after: EditorState): boolean {
+  return syntaxTree(before) !== syntaxTree(after);
+}
 
 const TABLE_SCAN_MARGIN = 2_048;
 const INITIAL_TABLE_SCAN_LIMIT = 4_096;
@@ -334,7 +355,13 @@ const sourceEditorTableDecorations = StateField.define<TableDecorationState>({
         to: transaction.changes.mapPos(to, 1),
       }));
     }
-    if (!transaction.docChanged && !transaction.selection && !viewport && !remeasure) return value;
+    if (
+      !transaction.docChanged
+      && !transaction.selection
+      && !viewport
+      && !remeasure
+      && !reparsed(transaction.startState, transaction.state)
+    ) return value;
     return { ...tableDecorationSet(transaction.state, visibleRanges), visibleRanges };
   },
   // Two providers over ONE field, at two precedences. A block decoration may not
@@ -422,6 +449,7 @@ export function sourceEditorDecorations(
           || update.selectionSet
           || update.focusChanged
           || linksChanged
+          || reparsed(update.startState, update.state)
         ) {
           this.decorations = toDecorationSet(update.view, onError, options);
         }

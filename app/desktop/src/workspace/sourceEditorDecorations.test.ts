@@ -1,7 +1,8 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { forceParsing, syntaxTree, syntaxTreeAvailable } from "@codemirror/language";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView, type DecorationSet } from "@codemirror/view";
-import { describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import {
   collectMarkdownPreview,
@@ -345,5 +346,92 @@ describe("sourceEditorDecorations extensions", () => {
 
     const viewport = { state: editor, visibleRanges: [{ from: 0, to: TWO_TABLES.length }] };
     expect(spans(providers[0]!(viewport as unknown as EditorView)).length).toBeGreaterThan(0);
+  });
+});
+
+// A note whose table sits beyond the parser's first slice. `LanguageState.init`
+// parses only to `Work.InitViewport` (3,000 chars) and gives up after
+// `Work.Apply` (20 ms of wall clock), so on open the tree genuinely has no
+// `Table` node here — CodeMirror finishes the parse afterwards, on an idle
+// callback (`@codemirror/language/dist/index.js:540-545, 601-624`).
+const DEFERRED_PARSE_TABLE = ["| aa | bb |", "| --- | --- |", "| cc | dd |"].join("\n");
+const DEFERRED_PARSE_NOTE = `${"word ".repeat(600)}\n\n${DEFERRED_PARSE_TABLE}`;
+
+const mounted: EditorView[] = [];
+
+afterEach(() => {
+  for (const view of mounted.splice(0)) {
+    view.dom.parentElement?.remove();
+    view.destroy();
+  }
+});
+
+function mountWithDecorations(doc: string): EditorView {
+  const host = document.createElement("div");
+  document.body.append(host);
+  const view = new EditorView({ state: withDecorations(doc), parent: host });
+  mounted.push(view);
+  return view;
+}
+
+const drawnTables = (view: EditorView) => view.dom.querySelectorAll("table.nn-lp-table").length;
+
+const hasTableNode = (parsed: EditorState): boolean => {
+  let found = false;
+  syntaxTree(parsed).iterate({ enter: (node) => { if (node.name === "Table") found = true; } });
+  return found;
+};
+
+describe("decorations after a deferred parse", () => {
+  it("has no table to draw while the parser has not reached one", () => {
+    // The premise the next two tests rest on. Without this the fixture could
+    // stop reproducing the deferred parse — the table would be in the first
+    // slice — and they would pass while proving nothing.
+    const view = mountWithDecorations(DEFERRED_PARSE_NOTE);
+
+    expect(syntaxTreeAvailable(view.state, view.state.doc.length)).toBe(false);
+    expect(hasTableNode(view.state)).toBe(false);
+    expect(drawnTables(view)).toBe(0);
+  });
+
+  it("draws the table once the parse completes, with no edit and no caret move", () => {
+    // `forceParsing` finishes the parse and announces it with a transaction that
+    // carries no change, no selection and no effect — the same shape the idle
+    // `ParseWorker` uses. A field that keys only on those inputs keeps its stale
+    // answer and the table never appears.
+    const view = mountWithDecorations(DEFERRED_PARSE_NOTE);
+    expect(drawnTables(view)).toBe(0);
+
+    forceParsing(view, view.state.doc.length, 5_000);
+
+    expect(hasTableNode(view.state)).toBe(true);
+    expect(drawnTables(view)).toBe(1);
+  });
+
+  it("paints inline preview past the first slice once the parse completes", () => {
+    // The same staleness, one layer up: the preview plugin keys on the same
+    // inputs, so every heading, emphasis and wikilink past the first slice stays
+    // literal too. Fixing only the table would leave the note half-painted.
+    const note = `${"word ".repeat(600)}\n\n**strong text**`;
+    const view = mountWithDecorations(note);
+    expect(view.dom.querySelectorAll(".nn-lp-strong")).toHaveLength(0);
+
+    forceParsing(view, view.state.doc.length, 5_000);
+
+    expect(view.dom.querySelectorAll(".nn-lp-strong")).toHaveLength(1);
+  });
+
+  it("draws it from CodeMirror's own idle parse worker too", async () => {
+    // The journey through the real seam: no test-only parse driver, just the
+    // worker CodeMirror schedules for itself. Polled rather than slept on, so a
+    // busy machine makes this slower and never wrong.
+    const view = mountWithDecorations(DEFERRED_PARSE_NOTE);
+
+    for (let poll = 0; poll < 100 && !hasTableNode(view.state); poll += 1) {
+      await new Promise((resolve) => { setTimeout(resolve, 20); });
+    }
+
+    expect(hasTableNode(view.state)).toBe(true);
+    expect(drawnTables(view)).toBe(1);
   });
 });

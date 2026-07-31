@@ -27,9 +27,10 @@
 //     That is the spec's phase 3, not this one.
 
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { forceParsing, syntaxTree } from "@codemirror/language";
 import { EditorState, type Extension } from "@codemirror/state";
 import { Decoration, EditorView } from "@codemirror/view";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { obsidianLivePreview } from "./obsidianLivePreview";
 import { sourceEditorDecorations } from "./sourceEditorDecorations";
@@ -54,6 +55,40 @@ afterEach(() => {
   }
 });
 
+/**
+ * Finish the Markdown parse before anything below reads the DOM.
+ *
+ * `LanguageState.init` gives the parser 20 ms of WALL CLOCK and hands back
+ * whatever tree it holds when that runs out
+ * (`@codemirror/language/dist/index.js:540-545`). The budget is checked with
+ * `Date.now()` between two `advance()` calls, so a machine busy enough to
+ * deschedule this process for 20 ms can leave even a three-line table with no
+ * `Table` node — and every assertion in this file would then be measuring the
+ * scheduler rather than the decorations.
+ *
+ * Resumed, never slept on: each pass is CPU-bound parse work picked up where the
+ * last left off, so a busy machine makes this slower and never wrong. It leans
+ * on `sourceEditorDecorations` recomputing when the tree changes — without that
+ * the parse would settle and the decorations would not, and these tests would
+ * fail rather than quietly pass.
+ *
+ * The condition is the span of the tree the decorations READ, not
+ * `syntaxTreeAvailable`: that one reports on the parse context, which
+ * `ensureSyntaxTree` can advance without any transaction carrying the result
+ * into the state.
+ */
+function settleParse(view: EditorView): void {
+  const parsedToEnd = () => syntaxTree(view.state).length >= view.state.doc.length;
+  for (let pass = 0; pass < 50 && !parsedToEnd(); pass += 1) {
+    forceParsing(view, view.state.doc.length, 1_000);
+  }
+  if (!parsedToEnd()) {
+    throw new Error(
+      `Markdown parse settled at ${syntaxTree(view.state).length} of ${view.state.doc.length} characters`,
+    );
+  }
+}
+
 function mount(doc: string, caretAt: number, extra: readonly Extension[] = []): EditorView {
   const host = document.createElement("div");
   document.body.append(host);
@@ -70,6 +105,7 @@ function mount(doc: string, caretAt: number, extra: readonly Extension[] = []): 
     parent: host,
   });
   mounted.push(view);
+  settleParse(view);
   return view;
 }
 
@@ -236,6 +272,31 @@ describe("the states a table is NOT drawn as cells in", () => {
     expect(view.dom.querySelectorAll("table.nn-lp-table")).toHaveLength(1);
     expect(view.dom.querySelectorAll(".nn-lp-cell")).toHaveLength(0);
     expect(rowLines(view)).toEqual([]);
+  });
+
+  it("keeps that widget when the parser gives up on its first slice", () => {
+    // The gate on `settleParse`, and the reason this file's flake was never a
+    // decoration bug. `LanguageState.init` compares `Date.now()` against a 20 ms
+    // deadline between two `advance()` calls, so a machine that deschedules this
+    // process mid-parse yields a tree with no `Table` node at all. A clock that
+    // jumps is exactly what that looks like from inside the parser — measured,
+    // this leaves the tree at `Document@0-10` and the DOM with zero tables.
+    const doc = "# Heading\n\n| a | b |\n| --- | --- |\n| x | y |";
+    const realNow = Date.now.bind(Date);
+    let deadlineTaken = false;
+    const clock = vi.spyOn(Date, "now").mockImplementation(() => {
+      // The parser's first read sets its deadline; every read after it is a
+      // process that has been off the CPU for ten seconds.
+      if (deadlineTaken) return realNow() + 10_000;
+      deadlineTaken = true;
+      return realNow();
+    });
+    try {
+      const view = mount(doc, 0);
+      expect(view.dom.querySelectorAll("table.nn-lp-table")).toHaveLength(1);
+    } finally {
+      clock.mockRestore();
+    }
   });
 
   it("leaves an oversized table as literal source with its pipes painted", () => {
