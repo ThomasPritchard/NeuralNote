@@ -12,6 +12,7 @@ import {
   type MarkdownBrowserExecutionV1,
   type MarkdownCompatibilityCaseV1,
 } from "../test-contracts/markdownCompatibilityV1";
+import { selectBrowserCompatibilityScenarios } from "../test-contracts/markdownCompatibilityBrowserScenarios";
 import type { NoteIndexEntry } from "./linkResolve";
 import { SourceNoteEditor, type SourceNoteEditorProps } from "./SourceNoteEditor";
 import { clearSourceEditorSessions } from "./sourceEditorSession";
@@ -117,12 +118,8 @@ const COMPATIBILITY_INDEX: readonly NoteIndexEntry[] = [
   { relPath: "Areas/Deep Work.md", stem: "deep work" },
 ];
 
-const DECLARED_INTERACTIONS = MARKDOWN_COMPATIBILITY_V1.cases.flatMap((item) =>
-  item.allowedInteractions.map((interaction) => ({
-    item,
-    interaction,
-    execution: item.interactionExecutions[interaction]!,
-  })),
+const BROWSER_SCENARIOS = selectBrowserCompatibilityScenarios(
+  MARKDOWN_COMPATIBILITY_V1.cases,
 );
 
 function editorView(): EditorView {
@@ -339,7 +336,7 @@ async function runDeclaredInteraction(
 // oxlint-enable vitest/no-conditional-expect
 
 describe("MarkdownCompatibilityV1 — browser execution map", () => {
-  it("has a live Chromium and WebKit scenario for every mapped interaction execution", () => {
+  it("implements every mapped Chromium and WebKit execution family", () => {
     const mapped = new Set(
       MARKDOWN_COMPATIBILITY_V1.cases.flatMap((item) =>
         Object.values(item.interactionExecutions)),
@@ -350,7 +347,7 @@ describe("MarkdownCompatibilityV1 — browser execution map", () => {
 
   // Assertions live in the exhaustive interaction driver above.
   // oxlint-disable-next-line vitest/expect-expect
-  it.each(DECLARED_INTERACTIONS)(
+  it.each(BROWSER_SCENARIOS)(
     "$item.id executes $interaction on its exact source",
     async ({ item, interaction }) => runDeclaredInteraction(item, interaction),
   );
