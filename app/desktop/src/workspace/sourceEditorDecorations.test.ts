@@ -135,6 +135,37 @@ describe("sourceEditorDecorations", () => {
     );
   });
 
+  it("renders every table cell through the one cell-paint projection", () => {
+    const doc = [
+      "| Note |",
+      "| --- |",
+      "| **DJ gig** at the Bell |",
+      "| [[Roadmap]] |",
+      "| `soundcheck` |",
+    ].join("\n");
+
+    const table = collectMarkdownPreview(state(doc)).find((item) => item.table)?.table;
+
+    // The widget and the drawn cell must show the same characters. A wikilink is
+    // the case the widget used to get wrong on its own: it has no Markdown node,
+    // so a second list of hidden node names never saw it.
+    expect(table?.rows).toEqual([["DJ gig at the Bell"], ["Roadmap"], ["soundcheck"]]);
+  });
+
+  it("does not project a table's cells while the caret is inside it", () => {
+    const doc = ["| a | b |", "| - | - |", "| **c** | d |"].join("\n");
+    const editor = state(doc, [{ anchor: doc.indexOf("**c**") + 2 }]);
+    const sliceDoc = vi.spyOn(editor, "sliceDoc");
+
+    const preview = collectMarkdownPreview(editor);
+
+    expect(preview).toContainEqual(expect.objectContaining({ className: "nn-lp-table-source" }));
+    // The rendered widget is discarded for an active table, so reading any of
+    // its interior is pure cost on the keystroke path.
+    expect(sliceDoc.mock.calls.filter(([from = 0, to = doc.length]) => from > 0 && to < doc.length))
+      .toEqual([]);
+  });
+
   it("limits table preview work to the requested visible range", () => {
     const first = "| First | Value |\n| --- | --- |\n| one | 1 |";
     const second = "| Second | Value |\n| --- | --- |\n| two | 2 |";
