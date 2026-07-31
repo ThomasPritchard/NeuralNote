@@ -97,11 +97,58 @@ function guardedState(doc: string, anchor: number) {
 }
 
 /**
- * Everything the user actually wrote. Whitespace and pipes move as rows are
- * padded or added; dashes and colons move because `format` resizes the
- * delimiter row. Nothing else may change.
+ * A GFM alignment row: pipes, dashes, colons and whitespace, with at least one
+ * dash. The frontmatter fence `---` is not one — it carries no pipe.
  */
-const content = (text: string) => text.replace(/[\s|:-]/g, "");
+const isAlignmentRow = (line: string) => line.includes("|") && /^[\s>|:-]*-[\s>|:-]*$/.test(line);
+
+/** The block prefix a line carries: blockquote markers and list indentation. */
+const blockPrefix = (line: string) => /^[\s>]*/.exec(line)?.[0] ?? "";
+
+/**
+ * Everything the user actually wrote. Whitespace and pipes move as rows are
+ * padded or added, `format` resizes the alignment rows, and an appended row
+ * repeats the block prefix of the row above it — so those three are dropped
+ * whole. Every other byte must survive.
+ *
+ * A dash or a colon ANYWHERE ELSE is content: the fixture's dates
+ * (`2026-04-03`) and times (`18:00-22:30`) are made of them, and stripping the
+ * two globally left every one of them unprotected — and made a command that
+ * deleted an entire alignment row invisible to this sweep. The two things that
+ * disappeared with them are asserted on their own terms below instead.
+ */
+const content = (text: string) =>
+  text
+    .split("\n")
+    .filter((line) => !isAlignmentRow(line))
+    .map((line) => line.slice(blockPrefix(line).length))
+    .join("")
+    .replace(/[\s|]/g, "");
+
+/** How many alignment rows the document declares. Losing one loses a table. */
+const alignmentRows = (text: string) => text.split("\n").filter(isAlignmentRow).length;
+
+/**
+ * The first table row whose block prefix differs from the row above it, or null.
+ *
+ * A row appended without its neighbour's prefix leaves the blockquote or list
+ * item the table is nested in, and Obsidian renders the orphan as a paragraph
+ * reading `|  |  |`. `content` cannot see that — the prefix is structure, not
+ * text — and neither could the line count or the trailing newline.
+ */
+function escapedRow(text: string): string | null {
+  const lines = text.split("\n");
+  for (let index = 1; index < lines.length; index += 1) {
+    const line = lines[index]!;
+    const above = lines[index - 1]!;
+    if (!line.includes("|") || !above.includes("|")) continue;
+    if (blockPrefix(line) !== blockPrefix(above)) {
+      return `line ${index + 1} escaped its block: `
+        + `${JSON.stringify(blockPrefix(above))} -> ${JSON.stringify(blockPrefix(line))}`;
+    }
+  }
+  return null;
+}
 
 const COMMANDS = {
   tab: (editor: EditorState) => tableCellStep(editor, 1),
@@ -132,6 +179,16 @@ describe("table command integrity against the QA fixture", () => {
         }
         if (!next.endsWith("\n")) {
           damage.push(`pos ${pos}: lost the trailing newline`);
+        }
+        if (alignmentRows(next) !== alignmentRows(FIXTURE)) {
+          damage.push(
+            `pos ${pos}: alignment rows went from `
+            + `${alignmentRows(FIXTURE)} to ${alignmentRows(next)}`,
+          );
+        }
+        const escaped = escapedRow(next);
+        if (escaped) {
+          damage.push(`pos ${pos}: ${escaped}`);
         }
         // A command may add one row or remove one blank row. Anything larger
         // means a line boundary was destroyed and two lines were merged.
@@ -172,13 +229,17 @@ describe("delimiter guard integrity against the QA fixture", () => {
   // cannot see, and the fixture carries the awkward cases — ragged rows, a
   // blockquote-nested table, a list-nested table, a blank trailing row.
 
-  it("refuses a one-character insertion inside a hidden delimiter, and nowhere else", () => {
+  it("refuses a one-character insertion inside hidden structure, and nowhere else", () => {
+    // Row boundaries belong in this enumeration alongside the delimiters: they
+    // are protected by the same filter, and inside a nested table the boundary
+    // is `"\n> "` — three characters with an interior a one-character insertion
+    // can land in.
     const hidden = hiddenTableDelimiters(
       guardedState(FIXTURE, 0),
       [{ from: 0, to: FIXTURE.length }],
-    ).flatMap((table) => table.delimiters);
-    // Six tables' worth of gaps and rules. A fixture the enumeration failed to
-    // walk would make every assertion below trivially true.
+    ).flatMap((table) => [...table.delimiters, ...table.rowBoundaries]);
+    // Six tables' worth of gaps, rules and row boundaries. A fixture the
+    // enumeration failed to walk would make every assertion below trivially true.
     expect(hidden.length).toBeGreaterThan(40);
 
     const insideHidden = (pos: number) =>

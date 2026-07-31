@@ -1,6 +1,6 @@
 // The cross-cell corruption path, and the exact shape of its refusal.
 //
-// At HEAD `alignmentRanges` hides the whole `" | "` gap between two cells, so a
+// At HEAD `tableRanges` hides the whole `" | "` gap between two cells, so a
 // drag-selection across that gap covers characters nothing on screen accounts
 // for. Typing one character then rewrites `| aa | bb |` to `| aabb |`: the row
 // loses a column while the delimiter row still declares two, and nothing warns.
@@ -26,6 +26,11 @@ vi.mock("./sourceEditorTableModel", async (importOriginal) => {
 const { tableModelAt } = await import("./sourceEditorTableModel");
 const { formatTableAt } = await import("./sourceEditorTableCommands");
 const {
+  collectMarkdownPreview,
+  MAX_TABLE_PREVIEW_ROWS,
+} = await import("./sourceEditorDecorationsPreview");
+const {
+  drawsCellChrome,
   hiddenTableDelimiters,
   REFUSED_TABLE_EDIT_ANNOUNCEMENT,
   tableDelimiterGuard,
@@ -54,6 +59,17 @@ function guarded(doc: string, ranges: Array<{ anchor: number; head?: number }> =
       tableDelimiterGuard,
     ],
   });
+}
+
+/** A table with `count` body rows, after a heading so the caret can sit outside it. */
+function tableWithBodyRows(count: number): string {
+  return [
+    "# Head",
+    "",
+    "| Key | Value |",
+    "| --- | --- |",
+    ...Array.from({ length: count }, (_, index) => `| k${index} | v${index} |`),
+  ].join("\n");
 }
 
 /** The announced reason, or null when the transaction was not refused. */
@@ -125,6 +141,48 @@ describe("the divider is protected exactly where it is invisible", () => {
     expect(announcement(transaction)).toBe(REFUSED_TABLE_EDIT_ANNOUNCEMENT);
     expect(transaction.state.doc.toString()).toBe(TABLE);
     expect(selectionOf(transaction.state)).toEqual(before);
+  });
+});
+
+describe("the line boundaries between a drawn table's rows are protected too", () => {
+  // The alignment row is hidden whole and drawn as a rule, so the caret can sit
+  // at its start with nothing on screen to say the character behind it is what
+  // holds the table together. One Backspace there produced
+  // `| aa | bb || --- | --- |` and the construct stopped parsing as a table.
+  //
+  // `guardTableDelimiter` is the first line of defence, but it only sees single
+  // cursors and single keystrokes; paste, drag and multicursor arrive here.
+
+  const RULE = TABLE.indexOf("| --- |");
+  const BODY = TABLE.indexOf("| cc");
+
+  it("refuses a Backspace that would merge the header into the alignment row", () => {
+    const transaction = guarded(TABLE, [{ anchor: RULE }])
+      .update({ changes: { from: RULE - 1, to: RULE } });
+
+    expect(announcement(transaction)).toBe(REFUSED_TABLE_EDIT_ANNOUNCEMENT);
+    expect(transaction.state.doc.toString()).toBe(TABLE);
+  });
+
+  it("refuses a Delete that would merge two body rows", () => {
+    const transaction = guarded(TABLE, [{ anchor: BODY - 1 }])
+      .update({ changes: { from: BODY - 1, to: BODY } });
+
+    expect(announcement(transaction)).toBe(REFUSED_TABLE_EDIT_ANNOUNCEMENT);
+    expect(transaction.state.doc.toString()).toBe(TABLE);
+  });
+
+  it("still allows typing at the start and the end of a row", () => {
+    // The boundary between two top-level rows is one newline, which has no
+    // interior — so an insertion at either end of a row, which is what typing
+    // at a row's edge is, stays ordinary editing.
+    for (const pos of [RULE - 1, BODY]) {
+      const transaction = guarded(TABLE, [{ anchor: pos }])
+        .update({ changes: { from: pos, insert: "x" } });
+
+      expect(announcement(transaction)).toBeNull();
+      expect(transaction.docChanged).toBe(true);
+    }
   });
 });
 
@@ -213,14 +271,10 @@ describe("the two exceptions without which ordinary editing breaks", () => {
 });
 
 describe("only tables whose delimiters are actually hidden are protected", () => {
-  const OVERSIZED = [
-    "| Key | Value |",
-    "| --- | --- |",
-    ...Array.from({ length: 200 }, (_, index) => `| k${index} | v${index} |`),
-  ].join("\n");
+  const OVERSIZED = tableWithBodyRows(MAX_TABLE_PREVIEW_ROWS + 1);
 
   it("leaves an oversized table alone, because its pipes are plainly visible", () => {
-    // Above the preview bounds `alignmentRanges` bails and the source renders
+    // Above the preview bounds `tableRanges` bails and the source renders
     // literally. Refusing an edit to text the user can see would be a bug.
     const first = OVERSIZED.indexOf("| k0 | v0 |");
     const gapFrom = first + "| k0".length;
@@ -233,9 +287,60 @@ describe("only tables whose delimiters are actually hidden are protected", () =>
     expect(transaction.docChanged).toBe(true);
   });
 
+  it("leaves the line boundary between two of its rows alone as well", () => {
+    const boundary = OVERSIZED.indexOf("| k1 | v1 |");
+
+    const transaction = guarded(OVERSIZED, [{ anchor: boundary }])
+      .update({ changes: { from: boundary - 1, to: boundary } });
+
+    expect(announcement(transaction)).toBeNull();
+    expect(transaction.docChanged).toBe(true);
+  });
+
   it("reports no hidden delimiters for an oversized table", () => {
     expect(hiddenTableDelimiters(guarded(OVERSIZED), [{ from: 0, to: OVERSIZED.length }]))
       .toEqual([]);
+  });
+});
+
+describe("drawsCellChrome agrees with the preview at the exact bound", () => {
+  // `drawsCellChrome`'s comment claims it matches `tablePreview` exactly, and
+  // that claim is load-bearing: with the caret OUTSIDE, the preview decides
+  // whether the table is a drawn widget; with the caret INSIDE, this bound
+  // decides whether it is drawn as cells or left as literal pipes. At HEAD they
+  // were one row apart, so at exactly MAX_TABLE_PREVIEW_ROWS body rows the same
+  // table appeared two different ways depending on where the caret was — the
+  // flip this whole feature exists to remove.
+
+  /** Whether the preview draws the table as a widget, with the caret outside. */
+  function previewDrawsWidget(doc: string): boolean {
+    const outside = EditorState.create({
+      doc,
+      selection: EditorSelection.cursor(0),
+      extensions: [markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false })],
+    });
+    const table = collectMarkdownPreview(outside).find((item) => item.className.startsWith("nn-lp-table"));
+    expect(table).toBeDefined();
+    return table!.kind === "widget";
+  }
+
+  const chromeDrawn = (doc: string) =>
+    drawsCellChrome(tableModelAt(guarded(doc), doc.indexOf("| Key"))!);
+
+  for (const rows of [1, MAX_TABLE_PREVIEW_ROWS - 1, MAX_TABLE_PREVIEW_ROWS]) {
+    it(`draws ${rows} body rows both ways`, () => {
+      const doc = tableWithBodyRows(rows);
+      expect(previewDrawsWidget(doc)).toBe(true);
+      expect(chromeDrawn(doc)).toBe(true);
+    });
+  }
+
+  it(`draws ${MAX_TABLE_PREVIEW_ROWS + 1} body rows neither way`, () => {
+    // The negative control: without it "they agree" is satisfied by a bound
+    // that never bites.
+    const doc = tableWithBodyRows(MAX_TABLE_PREVIEW_ROWS + 1);
+    expect(previewDrawsWidget(doc)).toBe(false);
+    expect(chromeDrawn(doc)).toBe(false);
   });
 });
 

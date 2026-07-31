@@ -12,7 +12,7 @@
 // SourceNoteEditor. It kills the keystroke, and from `create` it prevents the
 // editor mounting at all.
 //
-// These tests throw from inside `alignmentRanges` instead, by making the table
+// These tests throw from inside `tableRanges` instead, by making the table
 // model explode.
 
 import { render, screen, waitFor } from "@testing-library/react";
@@ -29,6 +29,7 @@ vi.mock("./sourceEditorTableModel", async (importOriginal) => {
 });
 
 const { tableModelAt } = await import("./sourceEditorTableModel");
+const { refreshSourceEditorDecorations } = await import("./sourceEditorDecorations");
 const { SourceNoteEditor } = await import("./SourceNoteEditor");
 
 const NOTE = [
@@ -46,7 +47,7 @@ function explode() {
 }
 
 /**
- * alignmentRanges only runs for a table the caret is INSIDE. Mounting with the
+ * tableRanges only runs for a table the caret is INSIDE. Mounting with the
  * default caret at offset 0 leaves the table rendered as an inactive widget and
  * the failing path is never entered — which would make every assertion here a
  * false green.
@@ -56,6 +57,9 @@ function caretIntoTable(container: HTMLElement): EditorView {
   view.dispatch({ selection: { anchor: NOTE.indexOf("DJ gig") } });
   return view;
 }
+
+/** Long enough for the deferred report `tablePreviewErrorSink` queues. */
+const flushMicrotasks = (): Promise<void> => new Promise((resolve) => { setTimeout(resolve, 0); });
 
 describe("a failure in the table decoration path", () => {
   beforeEach(() => {
@@ -110,6 +114,73 @@ describe("a failure in the table decoration path", () => {
         expect.stringContaining("Your source is unchanged"),
       );
     });
+  });
+
+  it("keeps the table failure reported when an unrelated preview succeeds", async () => {
+    // The two preview passes have different triggers. The table field recomputes
+    // on a document, selection, viewport, remeasure or reparse; the inline
+    // plugin also on focus and on the refresh effect a vault-index rebuild
+    // dispatches (`SourceNoteEditor.tsx:303-304`). Sharing one callback lets the
+    // inline pass's success clear a banner raised by the table pass — and every
+    // table on screen is still raw pipes when it does.
+    explode();
+    const onPreviewError = vi.fn();
+
+    const { container } = render(
+      <SourceNoteEditor
+        sessionKey="table-throw-channel"
+        loadedHash="table-throw-channel"
+        value={NOTE}
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onPreviewError={onPreviewError}
+      />,
+    );
+
+    await screen.findByRole("textbox", { name: "Note content" });
+    const view = caretIntoTable(container);
+    await waitFor(() => {
+      expect(onPreviewError).toHaveBeenCalledWith(expect.stringContaining("Table preview"));
+    });
+
+    onPreviewError.mockClear();
+    view.dispatch({ effects: refreshSourceEditorDecorations.of(null) });
+    await flushMicrotasks();
+
+    expect(onPreviewError.mock.calls.map(([message]) => message)).not.toContain(null);
+  });
+
+  it("clears the banner once the table path stops failing", async () => {
+    // The other half of the same contract. A reporter that never clears would
+    // pass the test above while leaving a stale banner on screen for the rest of
+    // the session.
+    explode();
+    const onPreviewError = vi.fn();
+
+    const { container } = render(
+      <SourceNoteEditor
+        sessionKey="table-throw-recovery"
+        loadedHash="table-throw-recovery"
+        value={NOTE}
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+        onPreviewError={onPreviewError}
+      />,
+    );
+
+    await screen.findByRole("textbox", { name: "Note content" });
+    const view = caretIntoTable(container);
+    await waitFor(() => {
+      expect(onPreviewError).toHaveBeenCalledWith(expect.stringContaining("Table preview"));
+    });
+
+    // `mockReset` restores the implementation `vi.fn(actual.tableModelAt)` was
+    // built with, so the real model is back; the selection move is what asks the
+    // field for a fresh answer.
+    vi.mocked(tableModelAt).mockReset();
+    view.dispatch({ selection: { anchor: NOTE.indexOf("Commitment") } });
+
+    await waitFor(() => { expect(onPreviewError).toHaveBeenLastCalledWith(null); });
   });
 
   it("does not report a preservation failure on a byte-clean note", async () => {

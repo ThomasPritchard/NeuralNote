@@ -8,10 +8,12 @@ import {
 import { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
+import { MAX_TABLE_PREVIEW_ROWS } from "./sourceEditorDecorationsPreview";
 import {
   formatTable,
   formatTableAt,
   guardTableDelimiter,
+  guardTableDelimiterBackward,
   nextTableRow,
   tableCellStep,
   tableRowStep,
@@ -29,13 +31,26 @@ const TABLE = [
   "| 2026-04-03 | DJ gig |",
 ].join("\n");
 
+const MARKDOWN = markdown({
+  base: markdownLanguage,
+  completeHTMLTags: false,
+  pasteURLAsLink: false,
+});
+
 function state(doc: string, anchor: number) {
   return EditorState.create({
     doc,
     selection: EditorSelection.cursor(anchor),
-    extensions: [
-      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
-    ],
+    extensions: [MARKDOWN],
+  });
+}
+
+/** The editor as the app configures it, where several cursors are allowed. */
+function multiCursorState(doc: string, anchors: readonly number[]) {
+  return EditorState.create({
+    doc,
+    selection: EditorSelection.create(anchors.map((anchor) => EditorSelection.cursor(anchor))),
+    extensions: [EditorState.allowMultipleSelections.of(true), MARKDOWN],
   });
 }
 
@@ -89,6 +104,22 @@ describe("tableCellStep", () => {
     // rendered rather than as source.
     expect(tableCellStep(state(TABLE, TABLE.length), 1)).toBeNull();
     expect(tableRowStep(state(TABLE, TABLE.length))).toBeNull();
+  });
+
+  it("falls through when there is more than one cursor", () => {
+    // Every command in this module answers for `selection.main` alone and
+    // returns a single-cursor selection, and `toCommand` then reports the key as
+    // handled — so a multicursor Tab dropped every cursor but one, moved
+    // nothing, and the default binding never ran either. Falling through hands
+    // the keystroke to the default keymap and to `tableDelimiterFilter`, which
+    // vets a multicursor change whole.
+    const anchors = [at("Commitment"), at("2026-04-03")];
+    // Non-vacuity: the identical gesture with ONE cursor still acts.
+    expect(tableCellStep(state(TABLE, anchors[0]!), 1)).not.toBeNull();
+    expect(tableCellStep(state(TABLE, anchors[0]!), -1)).not.toBeNull();
+
+    expect(tableCellStep(multiCursorState(TABLE, anchors), 1)).toBeNull();
+    expect(tableCellStep(multiCursorState(TABLE, anchors), -1)).toBeNull();
   });
 
   it("resolves a caret in a cell's trailing whitespace to that cell", () => {
@@ -150,12 +181,50 @@ describe("tableRowStep", () => {
   it("refuses the blank-row exit for a table nested in a blockquote", () => {
     // Regression: the branch deleted from `row.from - 1`, which inside a
     // blockquote is the space after ">" rather than a newline, stranding "> ".
+    //
+    // The assertions are EXACT on purpose. This test used to assert only
+    // `startsWith(doc)` and `not.toContain(">\n\n")`, and both of those are
+    // equally true of an appended row that escapes the blockquote entirely —
+    // which is precisely the defect that then shipped underneath it.
     const doc = "> | a | b |\n> | --- | --- |\n> |  |  |";
     const editor = state(doc, doc.lastIndexOf("|  |  |") + 2);
     const result = apply(editor, tableRowStep(editor));
 
-    expect(result?.doc.startsWith(doc)).toBe(true);
-    expect(result?.doc).not.toContain(">\n\n");
+    expect(result?.doc).toBe(`${doc}\n> |  |  |`);
+  });
+
+  it("keeps an appended row inside the blockquote the table is nested in", () => {
+    // `appendRow` wrote a bare `\n|  |  |` at the table's end, so the new line
+    // carried no `> ` and left the quote. Obsidian renders that orphan as a
+    // paragraph reading `|  |  |`: the bytes changed meaning, which is the most
+    // serious class of defect here.
+    const doc = "> | a | b |\n> | --- | --- |\n> | x | y |";
+    const editor = state(doc, doc.indexOf("y"));
+    const result = apply(editor, tableRowStep(editor));
+
+    expect(result?.doc).toBe(`${doc}\n> |  |  |`);
+    // Every line of the table still carries the same block prefix.
+    for (const line of (result?.doc ?? "").split("\n")) {
+      expect(line.startsWith("> ")).toBe(true);
+    }
+    // The caret lands in the appended row's second cell, past the prefix.
+    expect(result?.head).toBe((result?.doc ?? "").lastIndexOf("|  |  |") + 5);
+  });
+
+  it("keeps an appended row indented inside the list item the table is nested in", () => {
+    const doc = "- item\n\n  | a | b |\n  | --- | --- |\n  | x | y |";
+    const editor = state(doc, doc.indexOf("x"));
+    const result = apply(editor, tableRowStep(editor));
+
+    expect(result?.doc).toBe(`${doc}\n  |  |  |`);
+    expect(result?.head).toBe((result?.doc ?? "").lastIndexOf("|  |  |") + 2);
+  });
+
+  it("falls through when there is more than one cursor", () => {
+    const anchors = [at("Commitment"), at("2026-04-03")];
+    expect(tableRowStep(state(TABLE, anchors[0]!))).not.toBeNull();
+
+    expect(tableRowStep(multiCursorState(TABLE, anchors))).toBeNull();
   });
 
   it("clamps to the last column when the next row is ragged", () => {
@@ -274,22 +343,94 @@ describe("guardTableDelimiter", () => {
     // or the table becomes impossible to remove.
     expect(guardTableDelimiter(state(DOC, 0), -1)).toBeNull();
   });
+
+  it("turns Backspace at the start of the hidden alignment row into a move", () => {
+    // The alignment row is hidden whole and drawn as a 1px rule, and atomic
+    // ranges snap the caret to its start — a position whose INTERIOR is
+    // protected while its edge was not. One Backspace there merged the header
+    // into the alignment row (`| a | bb || --- | --- |`) and the construct
+    // stopped parsing as a table at all, which is exactly what this guard's own
+    // doc comment says it exists to prevent.
+    const rule = DOC.indexOf("| --- |");
+    const editor = state(DOC, rule);
+    const spec = guardTableDelimiter(editor, -1);
+
+    expect(spec).not.toBeNull();
+    expect(spec).not.toHaveProperty("changes");
+    const next = editor.update(spec!).state;
+    expect(next.doc.toString()).toBe(DOC);
+    expect(next.selection.main.head).toBe(rule - 1);
+  });
+
+  it("turns Delete at the end of a row into a move, never a row merge", () => {
+    const rule = DOC.indexOf("| --- |");
+    const editor = state(DOC, rule - 1);
+    const next = editor.update(guardTableDelimiter(editor, 1)!).state;
+
+    expect(next.doc.toString()).toBe(DOC);
+    expect(next.selection.main.head).toBe(rule);
+  });
+
+  it("guards the line boundary between two body rows too", () => {
+    const bodyRow = DOC.indexOf("| x | yy |");
+    const editor = state(DOC, bodyRow);
+    const next = editor.update(guardTableDelimiter(editor, -1)!).state;
+
+    expect(next.doc.toString()).toBe(DOC);
+    expect(next.selection.main.head).toBe(bodyRow - 1);
+  });
+
+  it("stays out of the way in a table too large to draw as cells", () => {
+    // Above `drawsCellChrome`'s bound the source renders literally and every
+    // pipe is on screen. Refusing to delete three characters the user is
+    // looking at — and jumping the caret three positions back to do it — is a
+    // bug, which is why every other consumer of that bound checks it first.
+    const oversized = [
+      "| Key | Value |",
+      "| --- | --- |",
+      ...Array.from(
+        { length: MAX_TABLE_PREVIEW_ROWS + 1 },
+        (_, index) => `| k${index} | v${index} |`,
+      ),
+    ].join("\n");
+    const row = oversized.indexOf("| k7 | v7 |");
+
+    expect(guardTableDelimiter(state(oversized, row + "| k7 | ".length), -1)).toBeNull();
+    expect(guardTableDelimiter(state(oversized, row + "| k7".length), 1)).toBeNull();
+
+    // Non-vacuity: the identical gesture inside a DRAWN table is still guarded.
+    expect(guardTableDelimiter(state(DOC, cellStart("yy")), -1)).not.toBeNull();
+  });
+
+  it("falls through when there is more than one cursor", () => {
+    // Backspace at two cell starts, then Delete at two cell ends: single-cursor
+    // gestures the guard answers, so a null here can only come from the cursor
+    // count.
+    const cellStarts = [cellStart("yy"), cellStart("bb")];
+    const cellEnds = [DOC.indexOf("| x |") + 3, DOC.indexOf("| a |") + 3];
+    expect(guardTableDelimiter(state(DOC, cellStarts[0]!), -1)).not.toBeNull();
+    expect(guardTableDelimiter(state(DOC, cellEnds[0]!), 1)).not.toBeNull();
+
+    expect(guardTableDelimiter(multiCursorState(DOC, cellStarts), -1)).toBeNull();
+    expect(guardTableDelimiter(multiCursorState(DOC, cellEnds), 1)).toBeNull();
+  });
 });
 
-function guardedState(doc: string, anchor: number) {
+function guardedState(doc: string, anchors: readonly number[]) {
   return EditorState.create({
     doc,
-    selection: EditorSelection.cursor(anchor),
+    selection: EditorSelection.create(anchors.map((anchor) => EditorSelection.cursor(anchor))),
     extensions: [
-      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+      EditorState.allowMultipleSelections.of(true),
+      MARKDOWN,
       tableDelimiterGuard,
     ],
   });
 }
 
 /** A command target that applies what it is given and keeps the transactions. */
-function target(doc: string, anchor: number) {
-  let editor = guardedState(doc, anchor);
+function target(doc: string, ...anchors: number[]) {
+  let editor = guardedState(doc, anchors);
   const applied: Transaction[] = [];
   const view = {
     get state() { return editor; },
@@ -332,5 +473,30 @@ describe("structural commands are exempt from the delimiter guard", () => {
     expect(applied[0]?.annotation(tableStructuralEdit)).toBe(true);
     expect(refusals(applied)).toEqual([]);
     expect(document()).toBe(`${TABLE}\n`);
+  });
+});
+
+describe("the keymap layer leaves multicursor editing to the filter", () => {
+  // `toCommand` returning true means the default binding never runs. With
+  // several cursors these commands answered for `selection.main` and returned a
+  // single-cursor selection, so Backspace dropped every other cursor AND
+  // deleted nothing — the keystroke was swallowed whole. The filter below
+  // already vets a multicursor change correctly and is tested for it; the
+  // keymap above it has to let the change reach it.
+
+  it("reports Backspace as handled with one cursor", () => {
+    const { view, applied } = target(TABLE, at("Commitment"));
+
+    expect(guardTableDelimiterBackward(view)).toBe(true);
+    expect(applied).toHaveLength(1);
+  });
+
+  it("reports Backspace as unhandled with several, dispatching nothing", () => {
+    const { view, applied, document } = target(TABLE, at("Commitment"), at("DJ gig"));
+
+    expect(guardTableDelimiterBackward(view)).toBe(false);
+    expect(applied).toEqual([]);
+    expect(document()).toBe(TABLE);
+    expect(view.state.selection.ranges).toHaveLength(2);
   });
 });

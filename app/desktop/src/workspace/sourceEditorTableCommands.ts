@@ -1,12 +1,23 @@
-import { EditorSelection, type EditorState, type TransactionSpec } from "@codemirror/state";
+import {
+  EditorSelection,
+  type EditorState,
+  type SelectionRange,
+  type TransactionSpec,
+} from "@codemirror/state";
 import type { Command } from "@codemirror/view";
 
-import { tableStructuralEdit } from "./sourceEditorTableDelimiterGuard";
+import {
+  drawsCellChrome,
+  tableRowBoundaries,
+  tableStructuralEdit,
+  type TableRowBoundary,
+} from "./sourceEditorTableDelimiterGuard";
 import {
   monospaceWidth,
   tableColumnWidths,
   tableDelimiterRanges,
   tableModelAt,
+  type TableDelimiterRange,
   type TableModel,
   type TableRowModel,
 } from "./sourceEditorTableModel";
@@ -14,6 +25,21 @@ import {
 interface CellLocation {
   readonly rowIndex: number;
   readonly column: number;
+}
+
+/**
+ * The one selection range these commands act on, or null when the user has
+ * several.
+ *
+ * Every command below answers for `selection.main` and returns a single-cursor
+ * selection, and `toCommand` then reports the key as handled — so with more
+ * than one cursor the other cursors were dropped AND the default binding never
+ * ran: the keystroke did nothing at all. Falling through hands it to the
+ * default keymap and to `tableDelimiterFilter`, which is the layer that vets a
+ * multicursor change, whole, and is tested for exactly that.
+ */
+function soleRange(state: EditorState): SelectionRange | null {
+  return state.selection.ranges.length === 1 ? state.selection.main : null;
 }
 
 /** Rows a caret can occupy. The delimiter row is structural, never tabbed into. */
@@ -76,11 +102,25 @@ function emptyRow(columnCount: number): { text: string; cellOffsets: number[] } 
   return { text, cellOffsets };
 }
 
-function appendRow(model: TableModel, column: number): TransactionSpec {
+/**
+ * The block prefix a row's line carries before the row itself starts: `> `
+ * inside a blockquote, indentation inside a list item, nothing at top level.
+ */
+function linePrefix(state: EditorState, row: TableRowModel): string {
+  return state.sliceDoc(state.doc.lineAt(row.from).from, row.from);
+}
+
+function appendRow(state: EditorState, model: TableModel, column: number): TransactionSpec {
   const { text, cellOffsets } = emptyRow(model.columnCount);
-  const anchor = model.to + 1 + (cellOffsets[column] ?? cellOffsets[0] ?? 1);
+  // Carry the last row's prefix into the new line. Without it the appended row
+  // leaves the blockquote or list item the table is nested in, and Obsidian
+  // renders the orphan as a paragraph reading `|  |  |` — the bytes changed
+  // meaning, not just their layout. `isTopLevelRow` already guards the deletion
+  // branch below for the same reason.
+  const prefix = linePrefix(state, model.rows.at(-1)!);
+  const anchor = model.to + 1 + prefix.length + (cellOffsets[column] ?? cellOffsets[0] ?? 1);
   return {
-    changes: { from: model.to, insert: `\n${text}` },
+    changes: { from: model.to, insert: `\n${prefix}${text}` },
     selection: EditorSelection.cursor(anchor),
     scrollIntoView: true,
   };
@@ -96,10 +136,11 @@ function rowIsBlank(state: EditorState, row: TableRowModel): boolean {
  * which is what keeps Tab available for escaping the editor.
  */
 export function tableCellStep(state: EditorState, direction: 1 | -1): TransactionSpec | null {
-  const pos = state.selection.main.head;
-  const model = activeTableAt(state, pos);
+  const range = soleRange(state);
+  if (!range) return null;
+  const model = activeTableAt(state, range.head);
   if (!model) return null;
-  const location = locateCell(model, pos);
+  const location = locateCell(model, range.head);
   if (!location) return null;
 
   const row = model.rows[location.rowIndex]!;
@@ -128,10 +169,11 @@ export function tableCellStep(state: EditorState, direction: 1 | -1): Transactio
  * table. That gives a way out without stranding an empty row behind.
  */
 export function tableRowStep(state: EditorState): TransactionSpec | null {
-  const pos = state.selection.main.head;
-  const model = activeTableAt(state, pos);
+  const range = soleRange(state);
+  if (!range) return null;
+  const model = activeTableAt(state, range.head);
   if (!model) return null;
-  const location = locateCell(model, pos);
+  const location = locateCell(model, range.head);
   if (!location) return null;
 
   const order = contentRows(model);
@@ -164,7 +206,7 @@ export function tableRowStep(state: EditorState): TransactionSpec | null {
       scrollIntoView: true,
     };
   }
-  return appendRow(model, location.column);
+  return appendRow(state, model, location.column);
 }
 
 /**
@@ -177,7 +219,7 @@ function isTopLevelRow(state: EditorState, row: TableRowModel): boolean {
 }
 
 /**
- * Backspace, Delete and the arrow keys across a hidden cell delimiter.
+ * Backspace, Delete and the arrow keys across hidden table structure.
  *
  * `atomicRanges` cannot do this: both its motion guard
  * (`@codemirror/view` index.js:3734) and its deletion guard
@@ -190,33 +232,52 @@ function isTopLevelRow(state: EditorState, row: TableRowModel): boolean {
  * explain it; emptying the cell first, then deleting, is the honest path. Rows
  * and columns are removed by their own explicit commands.
  *
- * Returns null whenever the caret is not against a delimiter, so ordinary
- * editing — including deleting the table itself from outside — is untouched.
+ * Returns null whenever the caret is not against one of those spans, so
+ * ordinary editing — including deleting the table itself from outside — is
+ * untouched.
  */
 export function guardTableDelimiter(
   state: EditorState,
   direction: 1 | -1,
 ): TransactionSpec | null {
-  const range = state.selection.main;
-  if (!range.empty) return null;
+  const range = soleRange(state);
+  if (!range?.empty) return null;
 
   const model = activeTableAt(state, range.head);
-  if (!model) return null;
+  // Nothing is hidden in a table too large to draw as cells: it renders as
+  // literal source, every pipe on screen. Refusing to delete a character the
+  // user is plainly looking at — and jumping the caret past it — is a bug, and
+  // this is the bound every other consumer already checks.
+  if (!model || !drawsCellChrome(model)) return null;
 
-  const adjacent = tableDelimiterRanges(model).find((delimiter) =>
-    direction === -1 ? delimiter.to === range.head : delimiter.from === range.head,
+  const adjacent = guardedSpans(model, direction).find((span) =>
+    direction === -1 ? span.to === range.head : span.from === range.head,
   );
   if (!adjacent) return null;
-
-  // A leading delimiter reached backwards, or a trailing one reached forwards,
-  // is the table's outer edge. Falling through lets the user delete the table.
-  if (direction === -1 && adjacent.kind === "leading") return null;
-  if (direction === 1 && adjacent.kind === "trailing") return null;
 
   return {
     selection: EditorSelection.cursor(direction === -1 ? adjacent.from : adjacent.to),
     scrollIntoView: true,
   };
+}
+
+/**
+ * The spans a keystroke in `direction` may not eat: every hidden delimiter, and
+ * every line boundary between two rows.
+ *
+ * The table's outer edge is deliberately excluded — a leading delimiter reached
+ * backwards, or a trailing one reached forwards — because falling through there
+ * is what lets the user delete the table.
+ */
+function guardedSpans(
+  model: TableModel,
+  direction: 1 | -1,
+): ReadonlyArray<TableDelimiterRange | TableRowBoundary> {
+  const outerEdge = direction === -1 ? "leading" : "trailing";
+  return [
+    ...tableDelimiterRanges(model).filter((delimiter) => delimiter.kind !== outerEdge),
+    ...tableRowBoundaries(model),
+  ];
 }
 
 function delimiterCell(width: number, alignment: string): string {
@@ -227,15 +288,22 @@ function delimiterCell(width: number, alignment: string): string {
 }
 
 /**
- * Write the visual alignment into the file for real. This is the one path that
- * changes bytes, and only ever on an explicit request.
+ * Write the visual alignment into the file for real. This is the one command
+ * here that REWRITES existing bytes — `tableRowStep` inserts a row and deletes a
+ * blank one, but never touches text the user wrote — and only ever on an
+ * explicit request (Shift-Alt-f).
+ *
+ * Unlike the keystroke commands it does not fall through on a multicursor
+ * selection: it is an explicit request, it formats the table holding the
+ * primary cursor, and it returns no selection of its own, so every cursor is
+ * mapped through the change and survives.
  */
 export function formatTableAt(state: EditorState): TransactionSpec | null {
   // `activeTableAt`, not `tableModelAt`: at exactly `table.to` the preview layer
   // still draws the read-only widget, and `tableCellStep` and `tableRowStep`
-  // already refuse there. This is the one command that rewrites bytes, so it
-  // disagreeing meant Format table could reformat a table the user was looking
-  // at as rendered output.
+  // already refuse there. This is the one command that rewrites existing bytes,
+  // so it disagreeing meant Format table could reformat a table the user was
+  // looking at as rendered output.
   const model = activeTableAt(state, state.selection.main.head);
   if (!model) return null;
   const widths = tableColumnWidths(state, model);
