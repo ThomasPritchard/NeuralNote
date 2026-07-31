@@ -226,7 +226,12 @@ function delimiterCell(width: number, alignment: string): string {
  * changes bytes, and only ever on an explicit request.
  */
 export function formatTableAt(state: EditorState): TransactionSpec | null {
-  const model = tableModelAt(state, state.selection.main.head);
+  // `activeTableAt`, not `tableModelAt`: at exactly `table.to` the preview layer
+  // still draws the read-only widget, and `tableCellStep` and `tableRowStep`
+  // already refuse there. This is the one command that rewrites bytes, so it
+  // disagreeing meant Format table could reformat a table the user was looking
+  // at as rendered output.
+  const model = activeTableAt(state, state.selection.main.head);
   if (!model) return null;
   const widths = tableColumnWidths(state, model);
 

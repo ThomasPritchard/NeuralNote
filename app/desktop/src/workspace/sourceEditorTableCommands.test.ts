@@ -201,6 +201,17 @@ describe("formatTableAt", () => {
 
     expect(result?.doc.split("\n")).toHaveLength(TABLE.split("\n").length);
   });
+
+  it("refuses at the table's end boundary, where the table renders read-only", () => {
+    // `active()` in the preview layer is exclusive of `to`, so at exactly
+    // `table.to` the user is looking at the rendered widget, not the source.
+    // `tableCellStep` and `tableRowStep` already refuse there. This is the one
+    // command that changes bytes, which makes it agreeing matter more, not less.
+    const ragged = "| a | b |\n| --- | --- |\n|   c   |   d   |";
+    const editor = state(ragged, ragged.length);
+
+    expect(formatTableAt(editor)).toBeNull();
+  });
 });
 
 describe("guardTableDelimiter", () => {
