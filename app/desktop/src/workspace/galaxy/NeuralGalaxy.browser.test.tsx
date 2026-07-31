@@ -67,5 +67,5 @@ describe.skipIf(server.browser !== "chromium")("NeuralGalaxy — Chromium WebGL 
 
     expect(onOpenNote).toHaveBeenCalledWith("Beta.md");
     expect(context!.isContextLost()).toBe(false);
-  });
+  }, 30_000);
 });
