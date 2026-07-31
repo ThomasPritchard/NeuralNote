@@ -4,8 +4,9 @@
  * Two passes decorate a note and they fail independently: the inline collector
  * (`safeCollectMarkdownPreview`, run by the preview `ViewPlugin`) and the table
  * `StateField`. Their triggers differ — the field recomputes on a document,
- * selection, viewport, remeasure or reparse, while the plugin ALSO recomputes on
- * a focus change and on the refresh effect a vault-index rebuild dispatches — so
+ * selection, viewport, remeasure, reparse or reconfiguration, while the plugin
+ * ALSO recomputes on a focus change and on the refresh effect a vault-index
+ * rebuild dispatches — so
  * one shared callback let the inline pass's routine success clear a banner the
  * table pass had raised, with every table on screen still raw pipes. The
  * project's rule is that failures are never silent, and a banner that vanishes

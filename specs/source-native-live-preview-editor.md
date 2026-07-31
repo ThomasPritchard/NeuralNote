@@ -258,8 +258,11 @@ selections, nested delimiters, Unicode, and selections crossing line endings.
 - Invalid UTF-8 retains the current visible lossy-text warning. Saving remains
   an explicit destructive choice because exact recovery of unreadable bytes is
   impossible in a text editor.
-- Oversized notes surface a clear resource-limit error and retain their source;
-  the limit is not presented as a Markdown compatibility failure.
+- Oversized notes (past the 8 MiB editable limit) surface a clear
+  resource-limit state and retain their source: the read path flags them
+  without loading content into the webview (mounting a note that large would
+  freeze it), saving stays disabled, and the limit is not presented as a
+  Markdown compatibility failure.
 - Save, conflict, and I/O failures keep the draft recoverable and visible.
 
 ## Security and trust boundaries

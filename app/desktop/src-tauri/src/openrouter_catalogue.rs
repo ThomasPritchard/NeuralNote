@@ -248,6 +248,10 @@ pub(crate) async fn fetch_validated_catalogue<T: CatalogueTransport + ?Sized>(
         .fetch(CatalogueEndpoint::Models, None)
         .await
         .map_err(transport_error)?;
+    // Warm the chat-time context-window cache from the same body (issue #22) — the
+    // menu fetch is the one catalogue touch most sessions make, so a picked model's
+    // window is known before its first chat turn without any extra I/O.
+    crate::ai::cache_openrouter_model_windows(&catalogue);
 
     neuralnote_core::ai::rank_openrouter_models(&rankings, &catalogue, date)
         .map_err(|_| CoreError::Llm("OpenRouter returned invalid model data.".into()))

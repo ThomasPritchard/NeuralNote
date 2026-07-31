@@ -126,6 +126,20 @@ pub struct LlmRequest {
 /// from its worker pool and the orchestrator's future stays `Send`.
 #[async_trait]
 pub trait LlmClient: Send + Sync {
+    /// The context window (tokens) the provider will actually enforce for the active
+    /// model, when the client knows it: the local client reports the `num_ctx` it
+    /// sends to Ollama; a cloud client reports the model's catalogue
+    /// `context_length`. The orchestrator budgets the assembled prompt against this
+    /// before each send (`fit_prompt_to_window`).
+    ///
+    /// `None` (the default) means UNKNOWN: budgeting stays inert and the char guards
+    /// remain the only bound — never a guessed window. A client must never
+    /// OVER-report (that re-opens the silent front-truncation this protects against);
+    /// under-reporting only trims a little early.
+    fn context_window_tokens(&self) -> Option<usize> {
+        None
+    }
+
     /// A tool-deciding turn: return the model's [`Completion`] (content and/or tool
     /// calls). Not streamed, so `tool_calls` parse cleanly.
     async fn complete(&self, req: &LlmRequest) -> CoreResult<Completion>;

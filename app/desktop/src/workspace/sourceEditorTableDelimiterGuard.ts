@@ -150,11 +150,11 @@ function drawnTables(state: EditorState, ranges: readonly VisibleRange[]): Table
     });
   } catch {
     // Spec rule 6: a decoration failure removes the decoration and leaves the
-    // source editable. Nothing is hidden here either — `tableDecorationSet`
+    // source editable. Nothing is hidden here either — `tableDecorationResult`
     // catches the same failure and drops every decoration — so no invisible
     // delimiter is left to protect, and refusing edits anyway would freeze the
-    // whole note. The failure is already surfaced, once, through
-    // `tablePreviewErrorSink`.
+    // whole note. The failure is already surfaced, once, by the error
+    // `tableDecorationResult` puts on the field for `tableErrorPlugin` to report.
     //
     // Both callers make this mandatory rather than tidy. A throw from a
     // transaction filter escapes through `state.update()`, which CodeMirror

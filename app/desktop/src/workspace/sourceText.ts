@@ -85,7 +85,7 @@ export function applySourceChanges(source: SourceText, changes: ChangeSet): Sour
   const changedRanges: Array<{ oldFrom: number; oldTo: number; newFrom: number; newTo: number }> = [];
   changes.iterChanges((oldFrom, oldTo, newFrom, newTo) => {
     changedRanges.push({ oldFrom, oldTo, newFrom, newTo });
-  });
+  }, true);
 
   const nextText = changes.apply(Text.of(source.text.split("\n"))).toString();
   const separators = newlinePositions(nextText).map((position) => {
@@ -95,35 +95,43 @@ export function applySourceChanges(source: SourceText, changes: ChangeSet): Sour
     const range = changedRanges.find(
       ({ newFrom, newTo }) => position >= newFrom && position < Math.max(newFrom + 1, newTo),
     );
-    const estimatedOldPosition = range
-      ? range.oldFrom + Math.min(position - range.newFrom, range.oldTo - range.oldFrom)
-      : position;
 
-    // A boundary the user just typed inherits from the region they edited, in
-    // this order. Absolute byte proximity across the whole document is NOT a
-    // candidate: it let a retyped run of LF lines inherit CRLF from an
-    // unrelated stray line, writing bytes the user never typed.
-    //
-    // 1. A separator inside the range this edit replaced — those are precisely
-    //    the endings being overwritten, so reusing them is lossless.
     if (range) {
+      const oldSpan = range.oldTo - range.oldFrom;
+      const newSpan = range.newTo - range.newFrom;
+      const projectedOldPosition =
+        oldSpan > 0 && newSpan > 0
+          ? range.oldFrom + ((position - range.newFrom) / newSpan) * oldSpan
+          : range.oldFrom;
+      let nearest:
+        | { distance: number; position: number; separator: LineSeparator }
+        | undefined;
+
       for (const [index, oldPosition] of oldPositions.entries()) {
-        if (oldPosition >= range.oldFrom && oldPosition < range.oldTo) {
-          return source.separators[index] ?? source.defaultSeparator;
+        const isInsideReplacement =
+          oldPosition >= range.oldFrom && oldPosition < range.oldTo;
+        const isInsertionAtBoundary =
+          oldSpan === 0 && oldPosition === range.oldFrom;
+        if (!isInsideReplacement && !isInsertionAtBoundary) continue;
+
+        const candidate = {
+          distance: Math.abs(oldPosition - projectedOldPosition),
+          position: oldPosition,
+          separator: source.separators[index] ?? source.defaultSeparator,
+        };
+        if (
+          !nearest ||
+          candidate.distance < nearest.distance ||
+          (candidate.distance === nearest.distance &&
+            candidate.position < nearest.position)
+        ) {
+          nearest = candidate;
         }
       }
+
+      if (nearest) return nearest.separator;
     }
 
-    // 2. The separator terminating the line the edit landed in — a pure
-    //    insertion splits an existing line, so it should end the way that line
-    //    already ends.
-    const following = oldPositions.findIndex((oldPosition) => oldPosition >= estimatedOldPosition);
-    if (following !== -1) return source.separators[following] ?? source.defaultSeparator;
-
-    // 3. The document's prevailing ending (LF when it has none). This is the
-    //    plan's documented fallback, and it is now genuinely reachable: the
-    //    previous implementation could never get here, so `dominantSeparator`
-    //    influenced nothing.
     return source.defaultSeparator;
   });
 

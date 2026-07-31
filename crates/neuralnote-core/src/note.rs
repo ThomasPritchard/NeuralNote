@@ -4,6 +4,7 @@ use crate::error::{CoreError, CoreResult};
 use crate::model::NoteDoc;
 use crate::paths::{ensure_within, rel_path};
 use std::hash::{Hash, Hasher};
+use std::io::Read;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -51,6 +52,8 @@ fn build_doc(root: &Path, path: &Path, raw: String, lossy: bool) -> NoteDoc {
         raw,
         binary: false,
         lossy_text: lossy,
+        exceeds_editable_size: false,
+        size_bytes: 0,
     }
 }
 
@@ -74,6 +77,37 @@ fn build_binary_doc(root: &Path, path: &Path) -> NoteDoc {
         raw: String::new(),
         binary: true,
         lossy_text: false,
+        exceeds_editable_size: false,
+        size_bytes: 0,
+    }
+}
+
+/// Build a [`NoteDoc`] for a note larger than [`MAX_EDITABLE_NOTE_BYTES`]. Like
+/// a binary doc, the content stays off the wire entirely (`body`/`raw` empty,
+/// no content hash): marshalling a multi-megabyte document — and worse,
+/// mounting it in the editor, where a single gigantic line is pathological for
+/// wrapping and the markdown parse — freezes the webview (issue #82). The file
+/// on disk is never touched; the UI keys an explicit size-limit state off
+/// `exceeds_editable_size` and states the real size from `size_bytes`.
+fn build_oversized_doc(root: &Path, path: &Path, size_bytes: u64) -> NoteDoc {
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    NoteDoc {
+        path: path.to_string_lossy().into_owned(),
+        rel_path: rel_path(root, path),
+        title: stem,
+        frontmatter: None,
+        frontmatter_raw: None,
+        frontmatter_error: None,
+        content_hash: String::new(),
+        body: String::new(),
+        raw: String::new(),
+        binary: false,
+        lossy_text: false,
+        exceeds_editable_size: true,
+        size_bytes,
     }
 }
 
@@ -107,10 +141,34 @@ pub fn read_note(root: &Path, target: &Path) -> CoreResult<NoteDoc> {
     if !path.is_file() {
         return Err(CoreError::NotFound(path.display().to_string()));
     }
-    // Read bytes, not a UTF-8 string: a vault's attachments folder is full of
-    // images/PDFs, and `read_to_string` would fail on them, dead-ending the
-    // reader's graceful binary branch.
-    let bytes = std::fs::read(&path)?;
+    // Any vault file whose METADATA already reports more than the editable byte
+    // limit is flagged without its bytes ever being read into memory. Resource
+    // safety takes precedence over binary/text classification: a multi-GiB
+    // attachment must not be loaded whole merely to choose between two
+    // content-free notices. `std::fs::metadata` follows symlinks, so an
+    // oversized target is caught through a link too. Metadata can lie about a
+    // shrink/grow race, so the byte-exact checks below remain authoritative for
+    // anything that gets this far.
+    if let Ok(meta) = std::fs::metadata(&path) {
+        if meta.len() > MAX_EDITABLE_NOTE_BYTES as u64 {
+            return Ok(build_oversized_doc(root, &path, meta.len()));
+        }
+    }
+    // Bound the read as well as the metadata preflight: the file can grow after
+    // metadata is sampled, and metadata itself may be unavailable. Reading one
+    // byte past the cap is enough to make the authoritative size decision
+    // without allowing a path race to allocate the whole file. Read bytes, not
+    // a UTF-8 string, so small images/PDFs still reach the graceful binary path.
+    let mut bytes = Vec::new();
+    std::fs::File::open(&path)?
+        .take(MAX_EDITABLE_NOTE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    // The opened file may have grown after metadata was sampled. Decide the
+    // bounded byte result before binary classification so a MAX+1 invalid-UTF-8
+    // attachment cannot hide the resource-limit state behind `binary`.
+    if bytes.len() > MAX_EDITABLE_NOTE_BYTES {
+        return Ok(build_oversized_doc(root, &path, bytes.len() as u64));
+    }
     // An attachment (image/PDF/…) that isn't valid UTF-8 stays a no-preview
     // binary doc — never lossy-decoded, which would bloat a multi-MB image into
     // megabytes of U+FFFD. `is_text_note` short-circuits, so a text note (the hot
@@ -121,7 +179,18 @@ pub fn read_note(root: &Path, target: &Path) -> CoreResult<NoteDoc> {
     // A text note (`.md`/`.txt`) in some other encoding (Windows-1252/Latin-1 from
     // a migrated vault) is decoded lossily so its content is SHOWN, never hidden,
     // and flagged so the reader can warn. Same policy search uses, by construction.
+    let on_disk_len = bytes.len() as u64;
     let (raw, lossy) = decode_note_text(bytes);
+    // The cap must also hold for the DECODED string — the thing actually
+    // marshalled to the webview and the thing the write side measures. Lossy
+    // decode AMPLIFIES: every invalid byte becomes the 3-byte U+FFFD, so a note
+    // at the on-disk cap (e.g. Latin-1 text) decodes to ~3× the limit — a doc
+    // that would both freeze the webview (#82) and be unsavable (write_note
+    // rejects > MAX bytes). It takes the same flagged, content-free path;
+    // size_bytes still quotes the ON-DISK size, which is what the UI states.
+    if raw.len() > MAX_EDITABLE_NOTE_BYTES {
+        return Ok(build_oversized_doc(root, &path, on_disk_len));
+    }
     Ok(build_doc(root, &path, raw, lossy))
 }
 

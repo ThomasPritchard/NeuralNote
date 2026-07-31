@@ -7,6 +7,7 @@ import { lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
   AlertTriangle,
   FileText,
+  FileWarning,
   Loader2,
   RotateCw,
   Save,
@@ -16,6 +17,7 @@ import type { NoteIndexEntry } from "./linkResolve";
 import { NoteDocumentFrame, Reader } from "./Reader";
 import { sourceTitleMode } from "./sourceDocumentTitle";
 import type { OpenNote } from "./useOpenNote";
+import type { NoteDoc } from "../lib/types";
 
 const SourceNoteEditor = lazy(() =>
   import("./SourceNoteEditor").then((module) => ({
@@ -140,6 +142,40 @@ function SaveNotices({ open }: Readonly<{ open: OpenNote }>) {
         </div>
       )}
     </>
+  );
+}
+
+/** The explicit, recoverable state for a note over the editable byte limit
+ *  (issue #82). Takes precedence over BOTH the editor and the Reader: a single
+ *  multi-megabyte line is as pathological for markdown rendering as it is for
+ *  CodeMirror, and the content was never marshalled to the webview anyway.
+ *  The file on disk is untouched — the user shrinks it in another editor (or
+ *  leaves it as-is) and reloads; close-tab and switch-vault stay fully
+ *  responsive because no heavy view ever mounted. */
+function OversizedNoteNotice({
+  note,
+  onReload,
+}: Readonly<{ note: NoteDoc; onReload: () => void }>) {
+  const mib = (note.sizeBytes / (1024 * 1024)).toFixed(1);
+  return (
+    <div className="grid flex-1 place-items-center px-6">
+      <div className="flex max-w-sm flex-col items-center gap-3 text-center">
+        <FileWarning className="size-6 text-warning" aria-hidden />
+        <p className="text-[0.8125rem] leading-relaxed text-muted-foreground">
+          This note is too large to edit in NeuralNote — {mib} MiB, past the
+          8 MiB limit. The file on disk is unchanged: make it smaller in
+          another editor, then reload. You can also close this tab or switch
+          vaults — nothing here blocks the app.
+        </p>
+        <button
+          type="button"
+          onClick={onReload}
+          className="inline-flex items-center gap-1.5 rounded-md bg-muted px-3 py-1.5 text-[0.8125rem] font-medium text-foreground transition-colors hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary"
+        >
+          <RotateCw className="size-3.5" aria-hidden /> Reload
+        </button>
+      </div>
+    </div>
   );
 }
 
@@ -276,7 +312,10 @@ export function NotePane({
           {note.relPath}
         </div>
         <div className="flex shrink-0 items-center gap-2">
-          {!note.binary && (
+          {/* Saving stays impossible for docs with no editable content on the
+              wire (binary, oversized) — an empty draft must never be written
+              back over the real file. */}
+          {!note.binary && !note.exceedsEditableSize && (
             <button
               type="button"
               onClick={() => void open.save()}
@@ -318,6 +357,8 @@ export function NotePane({
           onOpenLink={onOpenLink}
           onSearchTag={onSearchTag}
         />
+      ) : note.exceedsEditableSize ? (
+        <OversizedNoteNotice note={note} onReload={open.reload} />
       ) : (
         <TextNoteBody
           open={open}

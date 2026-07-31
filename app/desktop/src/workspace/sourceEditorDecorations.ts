@@ -134,12 +134,6 @@ function toDecorationSet(
   return Decoration.set(ranges, true);
 }
 
-/**
- * Where a table-decoration failure is reported. A `StateField` cannot see the
- * extension's callbacks, so the sink is supplied through the state itself.
- */
-export const tablePreviewErrorSink = Facet.define<(message: string | null) => void>();
-
 const TABLE_DECORATION_ERROR =
   "Table preview is temporarily unavailable. Your source is unchanged.";
 
@@ -195,11 +189,24 @@ const NO_TABLE_DECORATIONS: TableDecorations = {
   cells: Decoration.none,
 };
 
-function tableDecorationSet(
+/**
+ * What one table pass produced, and whichever failure it hit — `null` when it
+ * succeeded.
+ *
+ * The error travels ON the field rather than through a callback because a
+ * `StateField` is defined once at module scope and never sees an extension's
+ * closure. Reporting it is the view layer's job: `tableErrorPlugin` reads this
+ * and hands it to the channel reporter.
+ */
+interface TableDecorationResult extends TableDecorations {
+  readonly error: string | null;
+}
+
+function tableDecorationResult(
   state: EditorState,
   visibleRanges: readonly VisibleRange[],
-): TableDecorations {
-  if (visibleRanges.length === 0) return NO_TABLE_DECORATIONS;
+): TableDecorationResult {
+  if (visibleRanges.length === 0) return { ...NO_TABLE_DECORATIONS, error: null };
   try {
     const scanRanges = mergeVisibleRanges(visibleRanges, state.doc.length, TABLE_SCAN_MARGIN);
     const result = safeCollectMarkdownPreview(state, scanRanges);
@@ -218,10 +225,10 @@ function tableDecorationSet(
         cells.push(...drawn.cells);
       }
     }
-    reportTableError(state, result.error);
     return {
       structure: Decoration.set(structure, true),
       cells: Decoration.set(cells, true),
+      error: result.error,
     };
   } catch (error) {
     // Spec rule 6: a decoration failure removes the decoration and leaves the
@@ -234,21 +241,8 @@ function tableDecorationSet(
     // survives if it is logged here: a `RangeError` off a decoration boundary
     // and an out-of-memory are one message to the user and two different bugs.
     console.error("table decoration failed:", error);
-    reportTableError(state, TABLE_DECORATION_ERROR);
-    return NO_TABLE_DECORATIONS;
+    return { ...NO_TABLE_DECORATIONS, error: TABLE_DECORATION_ERROR };
   }
-}
-
-/**
- * Deferred so a report never re-enters React from inside a transaction, which
- * is the same hazard the viewport plugin's `queueMicrotask` guards against.
- */
-function reportTableError(state: EditorState, message: string | null): void {
-  const sinks = state.facet(tablePreviewErrorSink);
-  if (sinks.length === 0) return;
-  queueMicrotask(() => {
-    for (const sink of sinks) sink(message);
-  });
 }
 
 /**
@@ -342,14 +336,14 @@ export function tableAtomicRanges(
   );
 }
 
-interface TableDecorationState extends TableDecorations {
+interface TableDecorationState extends TableDecorationResult {
   readonly visibleRanges: readonly VisibleRange[];
 }
 
 const sourceEditorTableDecorations = StateField.define<TableDecorationState>({
   create(state) {
     const visibleRanges = [{ from: 0, to: Math.min(state.doc.length, INITIAL_TABLE_SCAN_LIMIT) }];
-    return { ...tableDecorationSet(state, visibleRanges), visibleRanges };
+    return { ...tableDecorationResult(state, visibleRanges), visibleRanges };
   },
   update(value, transaction) {
     const viewport = transaction.effects.find((effect) => effect.is(updateSourceEditorTableViewport));
@@ -365,11 +359,16 @@ const sourceEditorTableDecorations = StateField.define<TableDecorationState>({
     if (
       !transaction.docChanged
       && !transaction.selection
+      // A reconfiguration installs fresh callbacks that have never heard of a
+      // failure this field is still holding, so the field has to recompute and
+      // let the new `tableErrorPlugin` re-report — otherwise reopening a note
+      // tab clears the banner with every table on screen still raw pipes.
+      && !transaction.reconfigured
       && !viewport
       && !remeasure
       && !reparsed(transaction.startState, transaction.state)
     ) return value;
-    return { ...tableDecorationSet(transaction.state, visibleRanges), visibleRanges };
+    return { ...tableDecorationResult(transaction.state, visibleRanges), visibleRanges };
   },
   // Two providers over ONE field, at two precedences. A block decoration may not
   // come from a plugin (`@codemirror/view/dist/index.js:2743`), so demoting the
@@ -426,8 +425,8 @@ export function sourceEditorDecorations(
   onError: (message: string | null) => void,
   options: SourceEditorDecorationOptions = {},
 ): Extension {
-  const report = createPreviewErrorReporter(onError);
-  const reportInline = (message: string | null): void => { report("inline", message); };
+  const reportError = createPreviewErrorReporter(onError);
+  const reportInlineError = (message: string | null): void => { reportError("inline", message); };
   const openTargetAt = (event: Event): boolean => {
     const target = markdownTargetAt(event);
     if (!target) return false;
@@ -435,6 +434,27 @@ export function sourceEditorDecorations(
     options.onOpenLink?.(target);
     return true;
   };
+  // The table pass runs in a `StateField`, which cannot reach `onError`. This
+  // carries its verdict out to the banner, and only when it changes.
+  const tableErrorPlugin = ViewPlugin.fromClass(class {
+    private error: string | null;
+
+    constructor(view: EditorView) {
+      this.error = view.state.field(sourceEditorTableDecorations).error;
+      reportError("table", this.error);
+    }
+
+    update(update: ViewUpdate): void {
+      const error = update.state.field(sourceEditorTableDecorations).error;
+      if (error === this.error) return;
+      this.error = error;
+      reportError("table", error);
+    }
+
+    destroy(): void {
+      reportError("table", null);
+    }
+  });
   const keyboardLinkHandler = Prec.highest(EditorView.domEventHandlers({
     keydown(event) {
       if (
@@ -452,7 +472,7 @@ export function sourceEditorDecorations(
       decorations: DecorationSet;
 
       constructor(view: EditorView) {
-        this.decorations = toDecorationSet(view, reportInline, options);
+        this.decorations = toDecorationSet(view, reportInlineError, options);
       }
 
       update(update: ViewUpdate): void {
@@ -467,8 +487,12 @@ export function sourceEditorDecorations(
           || linksChanged
           || reparsed(update.startState, update.state)
         ) {
-          this.decorations = toDecorationSet(update.view, reportInline, options);
+          this.decorations = toDecorationSet(update.view, reportInlineError, options);
         }
+      }
+
+      destroy(): void {
+        reportError("inline", null);
       }
     },
     {
@@ -484,9 +508,9 @@ export function sourceEditorDecorations(
     },
   );
   return [
-    tablePreviewErrorSink.of((message) => { report("table", message); }),
     sourceEditorTableDecorations,
     sourceEditorTableViewport,
+    tableErrorPlugin,
     // Integrity travels with the decorations that create the hazard: this array
     // is already consumed at `SourceNoteEditor.tsx:139`, and `EditorView.announce`
     // is rendered by CodeMirror, so neither needs anything of the component.

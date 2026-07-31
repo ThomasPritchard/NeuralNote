@@ -62,11 +62,28 @@ describe("sourceText", () => {
     expect(serializeSourceText(next)).toBe("A\r\nA2\r\nb\nC\rd");
   });
 
-  it("takes a retyped line's ending from the region it replaced, not a distant stray", () => {
+  it("keeps a retyped LF run independent from a distant stray CRLF", () => {
     // Regression: separators were chosen by absolute byte proximity across the
     // WHOLE document, so retyping three LF lines inherited CRLF from an
-    // unrelated line four lines away. The plan requires the "nearest edited
-    // region" — the endings actually being overwritten.
+    // unrelated line four lines away. Only the endings actually being
+    // overwritten are candidates.
+    const source = loadSourceText("intro\r\nalpha\nbeta\ngamma\ndelta\n");
+    const from = source.text.indexOf("alpha");
+    const to = source.text.indexOf("delta");
+    const changes = ChangeSet.of(
+      { from, to, insert: "A\nB\nC\n" },
+      source.text.length,
+    );
+
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "intro\r\nA\nB\nC\ndelta\n",
+    );
+  });
+
+  it("takes a retyped line's ending from the region it replaced, not a distant stray", () => {
+    // The same regression with the trailing separator left OUTSIDE the replaced
+    // region, so the run's last boundary is a preserved old one rather than a
+    // remapped new one. The test above replaces it; this one does not.
     const original = "intro\r\nalpha\nbeta\ngamma\ndelta\n";
     const source = loadSourceText(original);
     const from = source.text.indexOf("alpha");
@@ -97,29 +114,95 @@ describe("sourceText", () => {
     }
   });
 
-  it("reuses the ending it overwrote, not the one after the edit", () => {
+  it("reuses a separator from the replaced region before the following line", () => {
     // The replaced region held a CRLF and the text after it ends with LF. The
-    // newline the user typed replaces the CRLF, so it should be CRLF. Distinct
-    // from the line-terminator rule, which would reach past the edit for LF.
+    // newline the user typed replaces the CRLF, so it should be CRLF — not the
+    // LF that terminates the line the edit landed in.
     const source = loadSourceText("a\r\nbcd\nef");
-    const changes = ChangeSet.of({ from: 0, to: 4, insert: "XY\nZW" }, source.text.length);
+    const changes = ChangeSet.of(
+      { from: 0, to: 4, insert: "XY\nZW" },
+      source.text.length,
+    );
 
-    expect(serializeSourceText(applySourceChanges(source, changes))).toBe("XY\r\nZWd\nef");
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "XY\r\nZWd\nef",
+    );
   });
 
-  it("actually reaches the dominant-separator fallback", () => {
-    // The previous implementation could never reach its own `?? defaultSeparator`
-    // branch, so `dominantSeparator` influenced no real document. Poison it and
-    // assert the sentinel appears, or this fallback is dead code again.
-    const source = { ...loadSourceText("a\r\nb\r\nc"), defaultSeparator: "\r" as const };
-    // Append past the final boundary: nothing was replaced and no boundary
-    // follows, which is the only route to the fallback.
+  it("maps each retyped boundary to the nearest ending inside a mixed region", () => {
+    const source = loadSourceText("a\r\nb\nc\rd");
+    const changes = ChangeSet.of(
+      { from: 0, to: source.text.length, insert: "A\nB\nC\nD" },
+      source.text.length,
+    );
+
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "A\r\nB\nC\rD",
+    );
+  });
+
+  it("uses the document default for a mid-line insertion, not a later stray ending", () => {
+    const source = loadSourceText("a\nb\nc\r\nd\ne\n");
+    const at = source.text.indexOf("c");
+    const changes = ChangeSet.of(
+      { from: at, insert: "X\nY\n" },
+      source.text.length,
+    );
+
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "a\nb\nX\nY\nc\r\nd\ne\n",
+    );
+  });
+
+  it("keeps separator inheritance isolated across multiple changed ranges", () => {
+    const source = loadSourceText("a\r\nb\nc\rd");
+    const c = source.text.indexOf("c");
+    const changes = ChangeSet.of(
+      [
+        { from: 0, to: 2, insert: "A\n" },
+        { from: c, to: c + 2, insert: "C\n" },
+      ],
+      source.text.length,
+    );
+
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "A\r\nb\nC\rd",
+    );
+  });
+
+  it("keeps adjacent changed ranges separate when mapping their endings", () => {
+    const source = loadSourceText("a\nb\r\nc");
+    const changes = ChangeSet.of(
+      [
+        { from: 0, to: 2, insert: "LONGTEXT\n" },
+        { from: 2, to: 4, insert: "B\n" },
+      ],
+      source.text.length,
+    );
+
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "LONGTEXT\nB\r\nc",
+    );
+  });
+
+  it("falls back to the document default when appending past every boundary", () => {
+    // Poison the default and assert the sentinel appears, or this branch is dead
+    // code: an earlier implementation could never reach its own
+    // `?? defaultSeparator`, so `dominantSeparator` influenced no real document.
+    const source = {
+      ...loadSourceText("a\r\nb\r\nc"),
+      defaultSeparator: "\r" as const,
+    };
+    // Appending past the final boundary replaces nothing and has no boundary
+    // following it, which is the only route to the fallback.
     const changes = ChangeSet.of(
       { from: source.text.length, insert: "\ntail" },
       source.text.length,
     );
 
-    expect(serializeSourceText(applySourceChanges(source, changes))).toBe("a\r\nb\r\nc\rtail");
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "a\r\nb\r\nc\rtail",
+    );
   });
 
   it("uses the dominant separator, then LF, when no nearby boundary exists", () => {

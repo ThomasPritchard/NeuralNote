@@ -81,7 +81,13 @@ request check plus:
 4. Rust LCOV generation with the existing 90 percent line coverage threshold.
 5. A mandatory `cargo audit` run with network access.
 6. A mandatory high-severity npm dependency audit across both the desktop and
-   native-WebDriver lockfiles.
+   native-WebDriver lockfiles. The desktop lockfile is audited directly with
+   `npm audit --audit-level=high`; the native-WebDriver lockfile (CI-only dev
+   tooling, no shipped artifact) goes through `scripts/audit-e2e-native.mjs`, a
+   fail-closed wrapper that exits non-zero on any high/critical advisory except
+   explicitly accepted residuals recorded inline in its `ACCEPTED` map (each bound
+   to one package, with rationale and a removal trigger), and exits 2 whenever the
+   audit cannot run or its report schema is not understood.
 
 Native Tauri end-to-end tests remain in `.github/workflows/e2e.yml`. That workflow
 runs on pushes to `main` and by manual dispatch, using its existing Linux and Windows
@@ -295,7 +301,9 @@ bindings and coverage reports are verification outputs, not hand-edited source f
 - Oxlint is installed, configured, and green in the desktop package.
 - Frontend unit tests are separable from mockIPC journey tests.
 - Frontend and Rust line coverage gates both enforce 90 percent on `main`.
-- Dependency audits fail when they find disallowed advisories or vulnerabilities.
+- Dependency audits fail when they find disallowed advisories or vulnerabilities;
+  accepted residuals live only in `scripts/audit-e2e-native.mjs`'s `ACCEPTED` map
+  with per-advisory justification and removal triggers.
 - Gitleaks scans full history in hosted CI.
 - Every referenced action is pinned to a full commit SHA.
 - `docker compose -f compose.sonar.yml up -d` starts a loopback-only local SonarQube

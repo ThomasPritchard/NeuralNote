@@ -12,6 +12,16 @@ pub mod tags;
 
 pub const DEFAULT_LOCAL_MODEL: &str = "qwen3.5:9b";
 
+/// Context window (tokens) the host is asked to size a local (Ollama) chat to —
+/// the single source of truth shared by the shell (which sends it as `num_ctx`)
+/// and the orchestrator (which budgets the assembled prompt against it). Ollama's
+/// built-in default is ~4096 and it **silently truncates from the front**, which
+/// would drop the grounding rules (sent first) and the earliest evidence — breaking
+/// cited recall on the Local path (PA-001). Sized well above the retrieval budget
+/// (the orchestrator caps context at 60_000 chars ≈ ~15k tokens); every curated
+/// model in this allowlist supports a window this large.
+pub const OLLAMA_NUM_CTX: u32 = 32_768;
+
 // ── POLICY (tunable) ──
 // Fraction of total RAM we treat as usable for the model. 0.70 is conservative for
 // Apple-Silicon unified memory (the GPU can address most of it) and stays a safe

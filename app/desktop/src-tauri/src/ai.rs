@@ -12,8 +12,9 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use neuralnote_core::ai::{openai, provider_config};
 use neuralnote_core::ai::{
-    openrouter_reasoning_support, parse_openrouter_input_pricing, ChatEvent, Completion, EventSink,
-    LlmClient, LlmMessage, LlmRequest, ReasoningSupport, RetryDelay, Role,
+    openrouter_reasoning_support, parse_openrouter_context_windows, parse_openrouter_input_pricing,
+    ChatEvent, Completion, EventSink, LlmClient, LlmMessage, LlmRequest, ReasoningSupport,
+    RetryDelay, Role,
 };
 use neuralnote_core::capture::ModelPricing;
 use neuralnote_core::CoreError;
@@ -53,6 +54,11 @@ struct CacheState {
 // save/clear before their next provider request.
 static API_KEY_CACHE: OnceLock<Mutex<CacheState>> = OnceLock::new();
 static OPENROUTER_PRICING_CACHE: OnceLock<Mutex<BTreeMap<String, ModelPricing>>> = OnceLock::new();
+/// Catalogue `context_length` per model id, warmed opportunistically from the public
+/// `/models` body (reasoning probe, model-menu fetch). Read at chat time to budget
+/// the prompt against the cloud model's real window (issue #22); a miss means
+/// "unknown" and budgeting stays inert — never guessed.
+static OPENROUTER_CONTEXT_WINDOW_CACHE: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
 
 /* ─────────────────────────────  Keychain  ──────────────────────────────── */
 
@@ -383,6 +389,7 @@ pub async fn probe_openrouter_reasoning(model: &str) -> ReasoningSupport {
     };
 
     cache_openrouter_pricing(&body, model);
+    cache_openrouter_model_windows(&body);
     openrouter_reasoning_support(&body, model)
 }
 
@@ -410,6 +417,35 @@ pub fn cached_openrouter_pricing(model: &str) -> Option<ModelPricing> {
         .cloned()
 }
 
+/// Warm the context-window cache from a validated public `/models` body. Tolerant:
+/// an unparseable body warms nothing (the cache simply stays stale), matching the
+/// fail-open probe above — chat must never fail because an opportunistic cache didn't.
+pub fn cache_openrouter_model_windows(models_json: &str) {
+    let Some(windows) = parse_openrouter_context_windows(models_json) else {
+        return;
+    };
+    let mut cache = OPENROUTER_CONTEXT_WINDOW_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for (id, context_length) in windows {
+        if let Ok(tokens) = usize::try_from(context_length) {
+            cache.insert(id, tokens);
+        }
+    }
+}
+
+/// The selected model's catalogue window, when a warmed cache knows it. `None` =
+/// unknown (a hand-typed id, or no catalogue fetch has run yet this session).
+pub fn cached_openrouter_context_window(model: &str) -> Option<usize> {
+    OPENROUTER_CONTEXT_WINDOW_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(model)
+        .copied()
+}
+
 /* ─────────────────────────────  LLM client  ────────────────────────────── */
 
 /// OpenAI-compatible [`LlmClient`]. Holds one reusable HTTP client and endpoint
@@ -423,6 +459,11 @@ pub struct OpenAiChatClient {
     /// Ollama doesn't fall back to ~4096 and silently truncate the grounding rules
     /// + earliest evidence — protecting cited recall on the Local path (PA-001).
     num_ctx: Option<u32>,
+    /// The cloud model's catalogue window (`context_length`), looked up from the
+    /// warmed cache when the client is built. Reported to the orchestrator so it
+    /// budgets the assembled prompt against the real window (issue #22); `None`
+    /// means unknown and budgeting stays inert.
+    context_window_tokens: Option<usize>,
     /// Whether to request streamed reasoning tokens on the answer turn. The caller
     /// combines the user's opt-in with the selected model's capability before client
     /// construction, for both OpenRouter and Ollama.
@@ -458,8 +499,17 @@ impl OpenAiChatClient {
             bearer,
             title,
             num_ctx,
+            context_window_tokens: None,
             reasoning,
         }
+    }
+
+    /// Report the cloud model's catalogue context window to the orchestrator's
+    /// prompt budgeting. Local clients need nothing here — their window is already
+    /// the `num_ctx` they send.
+    pub fn with_context_window(mut self, context_window_tokens: Option<usize>) -> Self {
+        self.context_window_tokens = context_window_tokens;
+        self
     }
 
     pub fn new(api_key: String, reasoning: bool) -> Self {
@@ -538,6 +588,14 @@ impl OpenAiChatClient {
 
 #[async_trait]
 impl LlmClient for OpenAiChatClient {
+    fn context_window_tokens(&self) -> Option<usize> {
+        // The window this client will actually see enforced: the local `num_ctx`
+        // sent to Ollama, else the cloud model's catalogue window (if known).
+        self.num_ctx
+            .map(|num_ctx| num_ctx as usize)
+            .or(self.context_window_tokens)
+    }
+
     async fn complete(&self, req: &LlmRequest) -> Result<Completion, CoreError> {
         // No reasoning on tool-deciding turns: they aren't streamed and their content
         // is parsed for tool_calls, so reasoning tokens here would be invisible cost.
@@ -859,6 +917,67 @@ mod tests {
         assert!(!request
             .headers()
             .contains_key(reqwest::header::AUTHORIZATION));
+    }
+
+    #[test]
+    fn context_window_cache_warms_from_catalogue_body_and_misses_unknown_models() {
+        let id = TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let known = format!("test/window-known-{id}");
+        let unknown = format!("test/window-unknown-{id}");
+        assert_eq!(cached_openrouter_context_window(&known), None);
+
+        cache_openrouter_model_windows(
+            &serde_json::json!({
+                "data": [
+                    { "id": known, "context_length": 65_536 },
+                    { "id": format!("test/window-zero-{id}"), "context_length": 0 },
+                    { "id": format!("test/window-absent-{id}") }
+                ]
+            })
+            .to_string(),
+        );
+
+        assert_eq!(cached_openrouter_context_window(&known), Some(65_536));
+        assert_eq!(cached_openrouter_context_window(&unknown), None);
+        // Absent/zero lengths never warm the cache — an unknown window stays inert.
+        assert_eq!(
+            cached_openrouter_context_window(&format!("test/window-zero-{id}")),
+            None
+        );
+        assert_eq!(
+            cached_openrouter_context_window(&format!("test/window-absent-{id}")),
+            None
+        );
+
+        // A malformed body warms nothing and leaves the cache intact (fail-open).
+        cache_openrouter_model_windows("{not json");
+        assert_eq!(cached_openrouter_context_window(&known), Some(65_536));
+    }
+
+    #[test]
+    fn chat_client_reports_the_window_it_will_enforce() {
+        // Local: the window is the `num_ctx` sent to Ollama — the shared core
+        // constant, so the budget and the enforced window can never drift.
+        let local = OpenAiChatClient::new_with(
+            "http://127.0.0.1:1/v1/chat/completions".into(),
+            None,
+            None,
+            Duration::from_secs(1),
+            Duration::from_secs(1),
+            Some(neuralnote_core::ai::local::OLLAMA_NUM_CTX),
+            false,
+        );
+        assert_eq!(
+            local.context_window_tokens(),
+            Some(neuralnote_core::ai::local::OLLAMA_NUM_CTX as usize)
+        );
+
+        // OpenRouter: unknown until the catalogue cache warms (inert-with-reason),
+        // then the catalogue `context_length`.
+        let cloud = OpenAiChatClient::new("sk-test".into(), false);
+        assert_eq!(cloud.context_window_tokens(), None);
+        let cloud = cloud.with_context_window(Some(200_000));
+        assert_eq!(cloud.context_window_tokens(), Some(200_000));
     }
 
     #[test]

@@ -118,13 +118,12 @@ describe("the preview error channels", () => {
     // heard of the failure the field is still holding — so the banner would
     // disappear with every table on screen still raw pipes.
     //
-    // It does not, and NOT because the field watches for a reconfiguration: it
-    // does not. The rebuilt extension array carries a fresh `markdown()`
-    // Language, so the field either recomputes on `reparsed` or is created
-    // afresh, and re-reports either way. That makes this a characterisation of a
-    // real journey resting on an incidental mechanism: memoise the language
-    // extension and the banner starts vanishing on every tab switch, and this is
-    // what would say so.
+    // It does not, because the field recomputes on `transaction.reconfigured`
+    // and the freshly built `tableErrorPlugin` reports what it finds. That is a
+    // deliberate mechanism rather than an incidental one: the rebuilt extension
+    // array also carries a fresh `markdown()` Language, so `reparsed` would
+    // cover this case today too — but memoise the language extension and only
+    // the `reconfigured` check is left holding it up.
     const failing = { current: true };
     const { view } = mountWithFailingTableMetrics(
       FIRST_TABLE,

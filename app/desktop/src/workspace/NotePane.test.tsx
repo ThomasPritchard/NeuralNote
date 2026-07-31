@@ -27,6 +27,8 @@ function note(overrides: Partial<NoteDoc> = {}): NoteDoc {
     contentHash: "hash-1",
     binary: false,
     lossyText: false,
+    exceedsEditableSize: false,
+    sizeBytes: 0,
     ...overrides,
   };
 }
@@ -220,6 +222,34 @@ describe("NotePane", () => {
     render(<NotePane open={openNote({ note: note({ binary: true, raw: "", body: "" }) })} />);
     expect(screen.queryByRole("textbox", { name: "Note content" })).not.toBeInTheDocument();
     expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+  });
+
+  it("shows an explicit, recoverable size-limit state for an oversized note without mounting the editor", async () => {
+    const open = openNote({
+      note: note({
+        title: "Oversized editable note",
+        raw: "",
+        body: "",
+        contentHash: "",
+        exceedsEditableSize: true,
+        sizeBytes: 8 * 1024 * 1024 + 1,
+      }),
+      draft: "",
+    });
+    render(<NotePane open={open} />);
+
+    // The limit is explicit: real size, the limit, and the promise that the
+    // file on disk is untouched — never a silent empty note.
+    expect(screen.getByText(/too large to edit/i)).toBeInTheDocument();
+    expect(screen.getByText(/8\.0 MiB/)).toBeInTheDocument();
+    expect(screen.getByText(/file on disk is unchanged/i)).toBeInTheDocument();
+    // The editor (and Reader) never mount: no 8 MiB string reaches CodeMirror.
+    expect(screen.queryByRole("textbox", { name: "Note content" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Save" })).not.toBeInTheDocument();
+
+    // Recoverable: reload re-reads (after the user shrinks the file elsewhere).
+    await userEvent.click(screen.getByRole("button", { name: /Reload/i }));
+    expect(open.reload).toHaveBeenCalled();
   });
 
   it("keeps lossy-text, frontmatter, conflict, overwrite, reload, and save errors visible", async () => {

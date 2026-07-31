@@ -58,7 +58,7 @@ function caretIntoTable(container: HTMLElement): EditorView {
   return view;
 }
 
-/** Long enough for the deferred report `tablePreviewErrorSink` queues. */
+/** Long enough for React to settle after `tableErrorPlugin` reports. */
 const flushMicrotasks = (): Promise<void> => new Promise((resolve) => { setTimeout(resolve, 0); });
 
 describe("a failure in the table decoration path", () => {
