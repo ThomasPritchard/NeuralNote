@@ -29,7 +29,7 @@ import {
 } from "@codemirror/view";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { tableScrollSync } from "./sourceEditorTableScrollSync";
+import { CARET_OFFSCREEN_CLASS, tableScrollSync } from "./sourceEditorTableScrollSync";
 
 const SOURCE = [
   "Intro paragraph, long enough that it has to wrap inside the pane.",
@@ -209,8 +209,18 @@ function contentX(view: EditorView, pos: number): number {
 
 const maxOffset = (row: HTMLElement): number => row.scrollWidth - row.clientWidth;
 
-/** The painted cursor. `display: none` until the view has focus, which would
- *  otherwise make every comparison below a comparison of zeros. */
+/** Whether the module is telling the stylesheet not to draw the cursor. */
+const caretFlagged = (view: EditorView): boolean =>
+  view.dom.classList.contains(CARET_OFFSCREEN_CLASS);
+
+/**
+ * The painted cursor. `display: none` until the view has focus, which would
+ * otherwise make every comparison below a comparison of zeros.
+ *
+ * Only ever called with the flag down. Under the flag the stylesheet's own rule
+ * takes the cursor out of the layout, so a test that measured it there would
+ * start throwing the day that rule lands.
+ */
 function drawnCaret(view: EditorView): DOMRect {
   const cursor = view.scrollDOM.querySelector(".cm-cursor-primary");
   if (!cursor) throw new Error("no drawn cursor");
@@ -288,13 +298,15 @@ describe("table row scroll synchronisation", () => {
     rows[3]!.scrollLeft = 200;
     await settle();
 
-    // Nothing propagated and nothing was dispatched. Re-dispatching the
-    // selection beside a composing text node can abort the composition, and a
-    // caret briefly in the wrong place costs less than a lost keystroke.
+    // Nothing propagated, nothing was dispatched, and the caret signal was not
+    // touched either. Re-dispatching the selection beside a composing text node
+    // can abort the composition, and a caret briefly in the wrong place — drawn
+    // or suppressed — costs less than a lost keystroke.
     for (const row of rows.filter((candidate) => candidate !== rows[3])) {
       expect(row.scrollLeft).toBe(0);
     }
     expect(harness.refreshes()).toBe(dispatched);
+    expect(caretFlagged(view)).toBe(false);
 
     view.contentDOM.dispatchEvent(new CompositionEvent("compositionend"));
     expect(view.compositionStarted).toBe(false);
@@ -346,94 +358,164 @@ describe("the drawn caret under a scrolling row", () => {
     // `margin-left: -0.6px`, which is the -0.59px K1 measured after the rescue.
     const drift = drawnCaret(view).left - view.coordsAtPos(LAST_CELL_END)!.left;
     expect(Math.abs(drift)).toBeLessThanOrEqual(1);
+    // In band, so nothing is suppressed: the rescue is what keeps the caret
+    // honest here, and it has to survive the clamp's removal intact.
+    expect(caretFlagged(view)).toBe(false);
     // Byte fidelity, and an undo stack that never saw the refresh.
     expect(view.state.doc.toString()).toBe(before);
     expect(undoDepth(view.state)).toBe(0);
   });
 
-  it("holds the offset where the caret would leave the row's inline end", async () => {
+  it("runs to the full extent with the caret inside the table", async () => {
     const { view } = mount(SOURCE);
     view.dispatch({ selection: EditorSelection.cursor(FIRST_CELL) });
     await settle();
 
     const rows = tableRowsFor(view, FIRST_CELL);
-    const caretX = contentX(view, FIRST_CELL);
+    // Neither half of this is vacuous: the fixture genuinely overflows, and the
+    // caret sits in column one. That is the configuration the withdrawn clamp
+    // pinned at ~21px, leaving ~780px of the table unreachable.
+    const extent = maxOffset(rows[3]!);
+    expect(extent).toBeGreaterThan(400);
+    expect(contentX(view, FIRST_CELL)).toBeLessThan(50);
+
     rows[3]!.scrollLeft = 9999;
     await settle();
 
-    // The clamp stopped it, not the row's own extent: those are different
-    // numbers, and only the first of them tracks the caret.
-    expect(maxOffset(rows[3]!)).toBeGreaterThan(caretX + 50);
-    for (const row of rows) {
-      expect(row.scrollLeft).toBeLessThan(maxOffset(row) - 50);
-      // Within the caret marker's own width of the bound the clamp names.
-      expect(Math.abs(row.scrollLeft - caretX)).toBeLessThanOrEqual(2);
-    }
+    // Reached the end, not merely moved.
+    for (const row of rows) expect(row.scrollLeft).toBeCloseTo(maxOffset(row), 0);
+
+    rows[3]!.scrollLeft = 0;
+    await settle();
+
+    for (const row of rows) expect(row.scrollLeft).toBeCloseTo(0, 0);
   });
 
-  it("holds the offset where the caret would leave the row's inline start", async () => {
+  it("flags the caret out of band and clears the flag when it comes back", async () => {
     const { view } = mount(SOURCE);
-    view.dispatch({ selection: EditorSelection.cursor(LAST_CELL_END) });
+    view.dispatch({ selection: EditorSelection.cursor(FIRST_CELL) });
+    await settle();
+    expect(caretFlagged(view)).toBe(false);
+
+    const rows = tableRowsFor(view, FIRST_CELL);
+    rows[3]!.scrollLeft = 9999;
     await settle();
 
-    const rows = tableRowsFor(view, LAST_CELL_END);
-    rows[2]!.scrollLeft = 9999;
-    await settle();
-    const caretX = contentX(view, LAST_CELL_END);
-    const band = rows[2]!.clientWidth;
+    expect(caretFlagged(view)).toBe(true);
 
-    rows[2]!.scrollLeft = 0;
+    rows[3]!.scrollLeft = 0;
     await settle();
 
-    // Scrolling back to column one would take the caret off the inline start.
-    for (const row of rows) {
-      expect(row.scrollLeft).toBeGreaterThan(0);
-      expect(Math.abs(row.scrollLeft - (caretX - band))).toBeLessThanOrEqual(2);
-    }
+    expect(caretFlagged(view)).toBe(false);
   });
 
-  it("keeps the drawn cursor inside the row it belongs to", async () => {
+  it("never paints the drawn caret outside its row", async () => {
+    // The property the clamp used to buy, and the reason it can go: at every
+    // offset the row can hold, either the caret is inside the row it belongs to
+    // or the stylesheet has been told not to draw it. Nothing in between.
     const { view } = mount(SOURCE);
-    view.dispatch({ selection: EditorSelection.cursor(LAST_CELL_END) });
+    view.dispatch({ selection: EditorSelection.cursor(FIRST_CELL) });
     await settle();
-    const row = rowFor(view, LAST_CELL_END);
+    const row = rowFor(view, FIRST_CELL);
+    const extent = maxOffset(row);
+    expect(extent).toBeGreaterThan(400);
 
-    for (const attempt of [9999, 0, 9999]) {
-      row.scrollLeft = attempt;
+    let suppressed = 0;
+    let painted = 0;
+    for (const offset of [0, 60, 200, extent / 2, extent, 200, 0]) {
+      row.scrollLeft = offset;
       await settle();
+      if (caretFlagged(view)) {
+        suppressed += 1;
+        continue;
+      }
+      painted += 1;
       const caret = drawnCaret(view);
       const box = row.getBoundingClientRect();
       expect(caret.left).toBeGreaterThanOrEqual(box.left - 1);
       expect(caret.right).toBeLessThanOrEqual(box.right + 1);
     }
+    // A sweep that never suppressed, or never painted, proves half of nothing.
+    expect(suppressed).toBeGreaterThan(0);
+    expect(painted).toBeGreaterThan(0);
   });
 
-  it("runs to the full extent when the caret is outside the table", async () => {
+  it("clears the flag when the caret leaves the table", async () => {
     const { view } = mount(SOURCE);
+    view.dispatch({ selection: EditorSelection.cursor(FIRST_CELL) });
+    await settle();
+    const rows = tableRowsFor(view, FIRST_CELL);
+    rows[3]!.scrollLeft = 9999;
+    await settle();
+    expect(caretFlagged(view)).toBe(true);
+
+    // A bare selection change: no row moves and no byte changes, so this is the
+    // only path that can notice. The table stays where the user left it.
     view.dispatch({ selection: EditorSelection.cursor(OUTSIDE) });
     await settle();
 
-    const rows = tableRowsFor(view, FIRST_CELL);
-    rows[0]!.scrollLeft = 9999;
-    await settle();
-
-    expect(maxOffset(rows[0]!)).toBeGreaterThan(400);
-    for (const row of rows) expect(row.scrollLeft).toBeCloseTo(maxOffset(row), 0);
+    expect(caretFlagged(view)).toBe(false);
+    expect(rows[3]!.scrollLeft).toBeGreaterThan(300);
   });
 
-  it("runs to the full extent when the caret is in a different table", async () => {
-    // The clamp is per table, not per editor. A caret two tables away has no
-    // claim on this one's offset, and the caret it does own has not moved.
+  it("clears the flag when the caret moves to a cell still in band", async () => {
     const { view } = mount(SOURCE);
-    view.dispatch({ selection: EditorSelection.cursor(SECOND_TABLE_CELL) });
+    view.dispatch({ selection: EditorSelection.cursor(FIRST_CELL) });
     await settle();
-
     const rows = tableRowsFor(view, FIRST_CELL);
-    rows[0]!.scrollLeft = 9999;
+    const target = contentX(view, LAST_CELL_END);
+
+    rows[3]!.scrollLeft = target - 100;
     await settle();
 
-    for (const row of rows) expect(row.scrollLeft).toBeCloseTo(maxOffset(row), 0);
-    for (const row of tableRowsFor(view, SECOND_TABLE_CELL)) expect(row.scrollLeft).toBe(0);
+    // Column one has left the band; the cell the caret is about to move to is
+    // inside it. Both stated, so a fixture that drifted would say so.
+    expect(caretFlagged(view)).toBe(true);
+    expect(target).toBeGreaterThan(rows[3]!.scrollLeft);
+    expect(target).toBeLessThan(rows[3]!.scrollLeft + rows[3]!.clientWidth);
+
+    view.dispatch({ selection: EditorSelection.cursor(LAST_CELL_END) });
+    await settle();
+
+    expect(caretFlagged(view)).toBe(false);
+  });
+
+  it("re-stamps the flag after a focus round trip", async () => {
+    // CodeMirror rewrites `view.dom`'s whole class attribute whenever its own
+    // editor attributes change, and focus is one of them
+    // (`@codemirror/view/dist/index.js:8250`). That rewrite runs *after* the
+    // plugin's own update (`:8005`), so the flag cannot be restored from there
+    // — it has to be re-stamped from a measure.
+    const { view } = mount(SOURCE);
+    view.dispatch({ selection: EditorSelection.cursor(FIRST_CELL) });
+    await settle();
+    tableRowsFor(view, FIRST_CELL)[3]!.scrollLeft = 9999;
+    await settle();
+    expect(caretFlagged(view)).toBe(true);
+
+    view.contentDOM.blur();
+    await settle();
+    view.focus();
+    await settle();
+
+    expect(view.hasFocus).toBe(true);
+    expect(caretFlagged(view)).toBe(true);
+  });
+
+  it("drops the flag when the view is torn down", async () => {
+    const harness = mount(SOURCE);
+    const { view } = harness;
+    view.dispatch({ selection: EditorSelection.cursor(FIRST_CELL) });
+    await settle();
+    tableRowsFor(view, FIRST_CELL)[3]!.scrollLeft = 9999;
+    await settle();
+    expect(caretFlagged(view)).toBe(true);
+
+    // A reconfiguration destroys and rebuilds this plugin around the same
+    // `view.dom`. A flag left behind there is a cursor that never comes back.
+    unmount(harness);
+
+    expect(caretFlagged(view)).toBe(false);
   });
 });
 

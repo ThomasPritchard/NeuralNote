@@ -4,21 +4,25 @@
 // number nothing honours. The behaviour that needs a real scroller lives in
 // `sourceEditorTableScrollSync.browser.test.ts` and is provable only there.
 //
-// Splitting the module this way is deliberate: the clamp that CT-7 turns on is
-// four comparisons, and four comparisons deserve a test that runs in 4ms rather
-// than one that needs a browser.
+// Splitting the module this way is deliberate: deciding whether a caret is
+// still in its row's band is four comparisons, and four comparisons deserve a
+// test that runs in 4ms rather than one that needs a browser.
 
 import { describe, expect, it } from "vitest";
 
 import { TABLE_CONTRACT_FIXTURE } from "./sourceEditorTableContractFixture";
 import {
+  CARET_OFFSCREEN_CLASS,
   TABLE_ROW_SELECTOR,
   clampOffset,
+  isSpanInBand,
+  offsetAfter,
   offsetsKeepingVisible,
   scrollableRange,
   tableOffset,
   tableRowsAt,
   type RowGeometry,
+  type Span,
 } from "./sourceEditorTableScrollSync";
 
 /** A 400px band over 1200px of content, its content box starting at x=100. */
@@ -99,6 +103,52 @@ describe("offsetsKeepingVisible", () => {
   });
 });
 
+describe("isSpanInBand", () => {
+  /**
+   * A caret is a point — `coordsAtPos` flattens a position to zero width
+   * (`@codemirror/view/dist/index.js:514`) — so these are the couple of pixels
+   * the drawn cursor marker occupies around one, at a content offset.
+   */
+  const caretAt = (offset: number): Span => ({
+    left: WIDE_ROW.contentOrigin + offset - 1,
+    right: WIDE_ROW.contentOrigin + offset + 1,
+  });
+
+  it("holds a caret inside the band the row will show", () => {
+    expect(isSpanInBand(WIDE_ROW, caretAt(500), 400)).toBe(true);
+  });
+
+  it("rejects a caret the band has scrolled past", () => {
+    // Column one with the table 400px along: the exact case the withdrawn
+    // clamp prevented by refusing to let the table scroll there at all.
+    expect(isSpanInBand(WIDE_ROW, caretAt(16), 400)).toBe(false);
+  });
+
+  it("rejects a caret the band has not reached yet", () => {
+    expect(isSpanInBand(WIDE_ROW, caretAt(900), 400)).toBe(false);
+  });
+
+  it("answers about an offset the row has not been written to yet", () => {
+    // The span is read at the row's *current* scroll position and the offset is
+    // the one the caller is about to apply, so a plan can ask before it writes.
+    // Here: a row sitting at 700 with the caret 200px off its inline start.
+    const scrolled: RowGeometry = { ...WIDE_ROW, scrollLeft: 700 };
+    const span: Span = {
+      left: scrolled.contentOrigin - 200,
+      right: scrolled.contentOrigin - 198,
+    };
+    expect(isSpanInBand(scrolled, span, 700)).toBe(false);
+    expect(isSpanInBand(scrolled, span, 400)).toBe(true);
+  });
+
+  it("still counts a caret straddling either edge of the band", () => {
+    // Overlap, not containment. Half a caret at the edge is what an editor
+    // draws everywhere else; blinking it away over half a pixel is not.
+    expect(isSpanInBand(WIDE_ROW, caretAt(400), 400)).toBe(true);
+    expect(isSpanInBand(WIDE_ROW, caretAt(800), 400)).toBe(true);
+  });
+});
+
 describe("tableOffset", () => {
   const scrollable = (scrollLeft: number): RowGeometry => ({ ...WIDE_ROW, scrollLeft });
   const stuck: RowGeometry = { ...WIDE_ROW, scrollWidth: 400, scrollLeft: 0 };
@@ -115,6 +165,25 @@ describe("tableOffset", () => {
 
   it("is zero when no row can scroll", () => {
     expect(tableOffset([stuck, stuck])).toBe(0);
+  });
+});
+
+describe("offsetAfter", () => {
+  it("takes the offset a row is about to be written to", () => {
+    // The case the browser lane cannot see: the caret's row is planned onto a
+    // new offset but still sits at the old one, so reading `scrollLeft` here
+    // would answer the caret question against a position already superseded.
+    const row = rowElement();
+    row.scrollLeft = 0;
+
+    expect(offsetAfter(row, [{ row, offset: 808 }])).toBe(808);
+  });
+
+  it("falls back to where a row already sits when nothing will move it", () => {
+    const row = rowElement();
+    row.scrollLeft = 150;
+
+    expect(offsetAfter(row, [{ row: rowElement(), offset: 808 }])).toBe(150);
   });
 });
 
@@ -160,5 +229,15 @@ describe("TABLE_ROW_SELECTOR", () => {
 
   it("does not match an ordinary line", () => {
     expect(rowElement("cm-line").matches(TABLE_ROW_SELECTOR)).toBe(false);
+  });
+});
+
+describe("CARET_OFFSCREEN_CLASS", () => {
+  it("is the literal the stylesheet keys its rule on", () => {
+    // Deliberately the one place in either test file that spells the class out.
+    // Everything else goes through the constant, so a rename would stay green
+    // everywhere while the stylesheet's rule silently stopped matching — this
+    // is what would go red instead.
+    expect(CARET_OFFSCREEN_CLASS).toBe("nn-table-caret-offscreen");
   });
 });

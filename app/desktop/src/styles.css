@@ -897,6 +897,24 @@ html[data-font-family="sourceSerif4"] {
   display: none;
 }
 
+/* Hide the drawn caret while the character it sits on is scrolled out of its
+   row (CT-7 addendum). The cursor layer is appended to `.cm-scroller`, a
+   sibling of the content and outside every row, so no overflow on a row can
+   clip it — left alone it paints up to 369.92px beyond the row's edge, over
+   whatever happens to be there.
+
+   `sourceEditorTableScrollSync.ts` owns the class; this rule is the whole of
+   its effect, and the two names are a frozen contract between them.
+
+   Hiding rather than clipping is deliberate: reaching into or reparenting
+   CodeMirror's own layers is a kill criterion, and the layer already hides
+   itself on blur, so this is an established state rather than a new mechanism.
+   It is also what every text field does once your cursor scrolls off screen —
+   nothing is drawn. */
+.nn-source-editor .cm-editor.nn-table-caret-offscreen .cm-cursorLayer {
+  display: none;
+}
+
 .nn-source-editor :where(.nn-lp-link, .nn-lp-wikilink-resolved) {
   color: var(--primary);
   cursor: pointer;

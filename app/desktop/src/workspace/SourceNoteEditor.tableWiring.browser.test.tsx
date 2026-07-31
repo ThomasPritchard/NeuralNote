@@ -264,4 +264,40 @@ describe("the composed editor's table row scrolling", () => {
     expect(offsets).toEqual([offsets[0], offsets[0], offsets[0], offsets[0]]);
     expect(view.state.doc.toString()).toBe(WIDE_TABLE);
   });
+
+  // `sourceEditorTableScrollSync` stamps the class; `styles.css` is the whole of
+  // its effect. Both halves are asserted here because either alone is only a
+  // claim: a class nothing consumes hides no caret, and a rule nothing stamps
+  // never fires. The module's own suite proves the stamping happens; this
+  // proves the stamping does something.
+  it("stops drawing the caret once its character scrolls out of the row", async () => {
+    // The FIRST column deliberately. Revealing a last-column cell and then
+    // scrolling right brings the caret INTO view, so the flag never raises and
+    // the test passes while proving nothing.
+    const view = await mountRevealed(WIDE_TABLE, "2026-04-03");
+    const editor = host!.querySelector<HTMLElement>(".cm-editor")!;
+    const cursorLayer = editor.querySelector<HTMLElement>(".cm-cursorLayer")!;
+
+    // The premise, asserted rather than assumed. If the layer were already
+    // hidden — unfocused, or never built — every assertion below would pass
+    // against a caret that was never drawn in the first place.
+    expect(editor.classList.contains("nn-table-caret-offscreen")).toBe(false);
+    expect(getComputedStyle(cursorLayer).display).not.toBe("none");
+
+    const rows = [...host!.querySelectorAll<HTMLElement>(".cm-content .nn-lp-table-row")];
+    expect(rows[0]!.scrollWidth - rows[0]!.clientWidth).toBeGreaterThan(20);
+
+    rows[0]!.scrollLeft = rows[0]!.scrollWidth;
+    await settle();
+
+    expect(editor.classList.contains("nn-table-caret-offscreen")).toBe(true);
+    expect(getComputedStyle(cursorLayer).display).toBe("none");
+
+    rows[0]!.scrollLeft = 0;
+    await settle();
+
+    expect(editor.classList.contains("nn-table-caret-offscreen")).toBe(false);
+    expect(getComputedStyle(cursorLayer).display).not.toBe("none");
+    expect(view.state.doc.toString()).toBe(WIDE_TABLE);
+  });
 });

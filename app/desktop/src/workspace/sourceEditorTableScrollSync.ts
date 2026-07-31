@@ -23,18 +23,31 @@
  * (`:9557`). Re-dispatching the selection makes it true, and recovered the
  * drift to -0.59px at a per-frame cost indistinguishable from baseline.
  *
- * **The offset is clamped to keep the caret visible.** CT-7's rule: while the
- * main caret is inside a table, that table's offset stays in the range that
- * keeps the caret's own character inside the row's band. Without it the drawn
- * caret paints outside the row (measured: 369.92px past the inline-end edge)
- * over unrelated text, and clipping CodeMirror's own layers is kill criterion
- * 13. The clamp costs one comparison on coordinates this module already holds.
+ * **A caret that scrolls out of its row is suppressed, not chased.** Because
+ * the layers sit outside the row, no overflow can clip them, and the caret
+ * paints outside the row (measured: 369.92px past the inline-end edge) over
+ * unrelated text; clipping or reparenting CodeMirror's layers is kill criterion
+ * 13. The first answer was to clamp the table's offset to whatever kept the
+ * caret's character in band, and the arithmetic killed it: with the caret in
+ * column one of a 1200px table in a 400px pane the clamp pins the table at
+ * ~21px against an ~808px extent (measured), leaving ~780px unreachable. That
+ * reads as a frozen table, not as a protected caret.
  *
- * Revealing a cell rides the same clamp. `scrollRectIntoView` is called on
- * `.cm-scroller` (`:3449`) and only ever walks *up*, so it cannot descend into
- * a row: P0 K6 measured the off-screen cell moving 0px. A scroll handler that
- * reads layout inline throws ("Reading the editor layout isn't allowed during
- * an update"), so the read is deferred to `view.requestMeasure`.
+ * So the table scrolls freely and the *caret* gives way instead: while the main
+ * caret's character is outside its row's band, `CARET_OFFSCREEN_CLASS` is
+ * stamped on `view.dom` and the stylesheet declines to draw the cursor layer.
+ * That is what an editor does when your cursor scrolls off screen anywhere
+ * else, and CodeMirror's own cursor already hides itself when the view loses
+ * focus (`@codemirror/view/dist/index.js:8250` rewrites the class attribute
+ * that does it) — hiding is a state the cursor has, not a hack.
+ *
+ * Revealing a cell is the one path that still computes where the caret would be
+ * visible, as a one-shot scroll on navigation rather than a standing rule.
+ * `scrollRectIntoView` is called on `.cm-scroller` (`:3449`) and only ever
+ * walks *up*, so it cannot descend into a row: P0 K6 measured the off-screen
+ * cell moving 0px. A scroll handler that reads layout inline throws ("Reading
+ * the editor layout isn't allowed during an update"), so the read is deferred
+ * to `view.requestMeasure`.
  *
  * **Nothing here changes the document.** The only transaction it dispatches
  * carries a selection and nothing else, annotated out of the undo history.
@@ -47,6 +60,14 @@ import { EditorView, ViewPlugin, type PluginValue, type ViewUpdate } from "@code
 export const TABLE_ROW_SELECTOR = ".nn-lp-table-row";
 
 /**
+ * Stamped on `view.dom` while the main caret's character sits outside its row's
+ * visible band. P3c's stylesheet hides the cursor layer under it, so this
+ * string is a contract with the stylesheet rather than an internal detail —
+ * which is why the arithmetic test pins the literal.
+ */
+export const CARET_OFFSCREEN_CLASS = "nn-table-caret-offscreen";
+
+/**
  * Below this, a difference is device-pixel snapping rather than a scroll: a row
  * written to 193 can read back 192.5. Writing anyway would make every sibling's
  * scroll event a fresh correction, and the corrections would never settle.
@@ -54,8 +75,11 @@ export const TABLE_ROW_SELECTOR = ".nn-lp-table-row";
 const SYNC_EPSILON_PX = 1;
 
 /**
- * The drawn cursor is a marker with a `margin-left: -0.6px` of its own, so the
- * caret's character is kept this far inside the band rather than flush with it.
+ * `coordsAtPos` flattens a caret to a zero-width point (`:514`), but the drawn
+ * cursor is a marker with a border and a `margin-left: -0.6px` of its own. This
+ * is the half-width handed to that marker: enough that revealing a cell leaves
+ * the caret inside the band rather than flush with it, and enough that a caret
+ * straddling an edge counts as inside rather than blinking away over a pixel.
  */
 const CARET_MARGIN_PX = 1;
 
@@ -89,6 +113,22 @@ export function scrollableRange(row: RowGeometry): OffsetRange {
 
 export function clampOffset(offset: number, range: OffsetRange): number {
   return Math.min(Math.max(offset, range.min), range.max);
+}
+
+/**
+ * Whether `span` still falls inside the band `row` shows once it sits at
+ * `offset`. Both are taken into the row's content coordinates, where `span` is
+ * read at the row's *current* `scrollLeft` — so a caller can ask about an
+ * offset it has planned but not yet written, and does not have to re-measure
+ * after writing it.
+ *
+ * Overlap rather than containment: a caret half over an edge draws half a
+ * caret, which is what an editor does everywhere else.
+ */
+export function isSpanInBand(row: RowGeometry, span: Span, offset: number): boolean {
+  const left = span.left - row.contentOrigin + row.scrollLeft;
+  const right = span.right - row.contentOrigin + row.scrollLeft;
+  return right >= offset && left <= offset + row.clientWidth;
 }
 
 /**
@@ -157,17 +197,19 @@ function tableRuns(content: Element): (readonly Element[])[] {
 }
 
 /** One row that is not where its table wants it, and where that is. */
-interface RowWrite {
+export interface RowWrite {
   readonly row: Element;
   readonly offset: number;
 }
 
-/** What a table is being asked to scroll to, and what must stay visible. */
-interface SyncRequest {
-  readonly rows: readonly Element[];
-  readonly desired: number;
-  /** The document position whose character the offset is clamped around. */
-  readonly caret: number;
+/**
+ * What one measure pass decided: where the rows go, and whether the drawn caret
+ * has left the row it belongs to. The two travel together because the second is
+ * a question about the offsets in the first — asked before they are written.
+ */
+interface SyncPlan {
+  readonly writes: readonly RowWrite[];
+  readonly caretOffscreen: boolean;
 }
 
 function readRow(row: Element): RowGeometry {
@@ -188,30 +230,34 @@ function rowAt(view: EditorView, pos: number): Element | null {
   return element?.closest(TABLE_ROW_SELECTOR) ?? null;
 }
 
-/**
- * CT-7's clamp: the offsets this table may hold while the caret is inside it.
- * Null when the caret is somewhere else, which is what scopes the rule — move
- * the caret out of the table and it scrolls to its full extent again.
- */
-function caretClamp(view: EditorView, request: SyncRequest): OffsetRange | null {
-  const row = rowAt(view, request.caret);
-  if (!row || !request.rows.includes(row)) return null;
-  const coords = view.coordsAtPos(request.caret);
-  if (!coords) return null;
-  return offsetsKeepingVisible(readRow(row), {
-    left: coords.left - CARET_MARGIN_PX,
-    right: coords.right + CARET_MARGIN_PX,
-  });
+/** The span the drawn cursor occupies around a caret position. */
+function caretSpan(coords: Span): Span {
+  return { left: coords.left - CARET_MARGIN_PX, right: coords.right + CARET_MARGIN_PX };
 }
 
-/** Reads layout; writes nothing. Safe inside a `requestMeasure` read phase. */
-function planSync(view: EditorView, request: SyncRequest): readonly RowWrite[] {
-  const clamp = caretClamp(view, request);
-  const target = clamp ? clampOffset(request.desired, clamp) : request.desired;
+/**
+ * The offset `row` holds once `writes` are applied — which is not where it sits
+ * while the plan is being made. Asking about the pending offset keeps one plan
+ * internally consistent: without it a pass can stamp "the caret is in band" in
+ * the same write phase that scrolls the caret's row out of band.
+ *
+ * Worth one frame, not more. Writing a row's `scrollLeft` fires its own scroll
+ * event, which re-plans against the settled position — so the browser lane
+ * cannot tell the two apart and this is pinned by unit test instead.
+ */
+export function offsetAfter(row: Element, writes: readonly RowWrite[]): number {
+  return writes.find((write) => write.row === row)?.offset ?? row.scrollLeft;
+}
+
+/**
+ * Put every row of one table on `desired`, as far as each can reach. Reads
+ * layout; writes nothing, so it is safe inside a `requestMeasure` read phase.
+ */
+function planSync(rows: readonly Element[], desired: number): readonly RowWrite[] {
   const writes: RowWrite[] = [];
-  for (const row of request.rows) {
+  for (const row of rows) {
     const geometry = readRow(row);
-    const offset = clampOffset(target, scrollableRange(geometry));
+    const offset = clampOffset(desired, scrollableRange(geometry));
     if (Math.abs(geometry.scrollLeft - offset) >= SYNC_EPSILON_PX) writes.push({ row, offset });
   }
   return writes;
@@ -224,19 +270,22 @@ function applySync(writes: readonly RowWrite[]): boolean {
 }
 
 /**
- * The three entry points — a row's `scroll` event, an editor update, and a
- * scroll target — all funnel into one plan-then-apply pair, so the clamp is
- * written once. Every one of them fails open: a throw inside a measure callback
- * is caught and reported by CodeMirror (`@codemirror/view/dist/index.js:8167`,
- * `:8195`) and one inside the `scroll` listener never reaches the editor, so
- * the worst outcome is a caret in the wrong place, never a lost keystroke.
+ * The four entry points — a row's `scroll` event, an editor update, a bare
+ * caret move, and a scroll target — all funnel into one plan-then-apply pair,
+ * so the caret question is answered in one place. Every one of them fails open:
+ * a throw inside a measure callback is caught and reported by CodeMirror
+ * (`@codemirror/view/dist/index.js:8167`, `:8195`) and one inside the `scroll`
+ * listener never reaches the editor, so the worst outcome is a caret drawn in
+ * the wrong place, never a lost keystroke.
  */
 class TableScrollSync implements PluginValue {
   /** Distinct keys, so a reveal and a restore never replace each other. */
   private readonly restoreKey = {};
   private readonly revealKey = {};
+  private readonly caretKey = {};
   private redrawPending = false;
   private stopped = false;
+  private caretOffscreen = false;
 
   constructor(private readonly view: EditorView) {
     // Capture, because a `scroll` event on an element does not bubble. Passive,
@@ -245,19 +294,28 @@ class TableScrollSync implements PluginValue {
   }
 
   update(update: ViewUpdate): void {
-    // Not on a bare selection change: that is what the reveal path is for, and
-    // it is also what this module's own refresh transaction looks like.
-    if (!update.docChanged && !update.viewportChanged && !update.geometryChanged) return;
-    this.view.requestMeasure({
-      key: this.restoreKey,
-      read: () => this.planTables(),
-      write: (writes) => { this.commit(writes); },
-    });
+    if (update.docChanged || update.viewportChanged || update.geometryChanged) {
+      this.measure(this.restoreKey, () => this.planTables());
+      return;
+    }
+    // A caret crosses its row's edge with no row moving at all — clicking a
+    // cell that is off band — and CodeMirror rewrites `view.dom`'s whole class
+    // attribute on a focus change (`:8250`), taking the flag with it. Neither
+    // plans a write, so this asks the caret question alone. Skipped when the
+    // selection did not move, which is what this module's own refresh
+    // transaction looks like.
+    if (update.focusChanged || !update.state.selection.eq(update.startState.selection)) {
+      this.measure(this.caretKey, () => this.plan([]));
+    }
   }
 
   destroy(): void {
     this.stopped = true;
     this.view.scrollDOM.removeEventListener("scroll", this.onScroll, { capture: true });
+    // The view outlives this plugin across a reconfiguration. A flag left
+    // behind on it is a cursor that never comes back.
+    this.caretOffscreen = false;
+    this.stampCaret();
   }
 
   /**
@@ -266,41 +324,79 @@ class TableScrollSync implements PluginValue {
    * throws.
    */
   reveal(range: SelectionRange): void {
-    this.view.requestMeasure({
-      key: this.revealKey,
-      read: () => this.planReveal(range.head),
-      write: (writes) => { this.commit(writes); },
-    });
+    this.measure(this.revealKey, () => this.planReveal(range.head));
+  }
+
+  private measure(key: object, read: () => SyncPlan): void {
+    this.view.requestMeasure({ key, read, write: (plan) => { this.commit(plan); } });
   }
 
   private readonly onScroll = (event: Event): void => {
     const { target } = event;
     const row = target instanceof Element ? target.closest(TABLE_ROW_SELECTOR) : null;
     if (!row) return;
-    this.commit(planSync(this.view, {
-      rows: tableRowsAt(row),
-      desired: row.scrollLeft,
-      caret: this.view.state.selection.main.head,
-    }));
+    this.commit(this.plan(planSync(tableRowsAt(row), row.scrollLeft)));
   };
 
   /** Every table back onto its own offset — the one its rows still agree on. */
-  private planTables(): readonly RowWrite[] {
-    const caret = this.view.state.selection.main.head;
-    return tableRuns(this.view.contentDOM).flatMap((rows) =>
-      planSync(this.view, { rows, desired: tableOffset(rows.map(readRow)), caret }));
+  private planTables(): SyncPlan {
+    return this.plan(tableRuns(this.view.contentDOM)
+      .flatMap((rows) => planSync(rows, tableOffset(rows.map(readRow)))));
   }
 
-  private planReveal(pos: number): readonly RowWrite[] {
+  /**
+   * Bring `pos` into its row's band. The only path that still asks which
+   * offsets keep a position visible, and it asks once, on navigation — rather
+   * than standing over every scroll the way the withdrawn clamp did.
+   */
+  private planReveal(pos: number): SyncPlan {
     const row = rowAt(this.view, pos);
-    if (!row) return [];
+    if (!row) return this.plan([]);
     const rows = tableRowsAt(row);
-    return planSync(this.view, { rows, desired: tableOffset(rows.map(readRow)), caret: pos });
+    const current = tableOffset(rows.map(readRow));
+    const coords = this.view.coordsAtPos(pos);
+    const desired = coords
+      ? clampOffset(current, offsetsKeepingVisible(readRow(row), caretSpan(coords)))
+      : current;
+    return this.plan(planSync(rows, desired));
   }
 
-  private commit(writes: readonly RowWrite[]): void {
+  /** `writes`, plus the caret question the offsets they carry imply. */
+  private plan(writes: readonly RowWrite[]): SyncPlan {
+    return { writes, caretOffscreen: this.isCaretOffscreen(writes) };
+  }
+
+  /**
+   * Whether the main caret's character sits outside its row's band, once
+   * `writes` are applied. False whenever the question cannot be answered — the
+   * caret is not in a table, or its position has no coordinates — because a
+   * caret drawn in the wrong place is recoverable and a cursor nobody can find
+   * is not.
+   */
+  private isCaretOffscreen(writes: readonly RowWrite[]): boolean {
+    const caret = this.view.state.selection.main.head;
+    const row = rowAt(this.view, caret);
+    if (!row) return false;
+    const coords = this.view.coordsAtPos(caret);
+    if (!coords) return false;
+    return !isSpanInBand(readRow(row), caretSpan(coords), offsetAfter(row, writes));
+  }
+
+  private commit(plan: SyncPlan): void {
     if (this.suspended) return;
-    if (applySync(writes)) this.scheduleRedraw();
+    this.caretOffscreen = plan.caretOffscreen;
+    this.stampCaret();
+    if (applySync(plan.writes)) this.scheduleRedraw();
+  }
+
+  /**
+   * Write the signal onto the editor. Separate from deciding it because
+   * CodeMirror reassigns `view.dom`'s class attribute wholesale (`:8250`), and
+   * it does so *after* this plugin's own `update` (`:8005`) — so the flag has
+   * to be re-stamped from a measure, which runs later still.
+   */
+  private stampCaret(): void {
+    this.view.dom.classList.toggle(CARET_OFFSCREEN_CLASS, this.caretOffscreen);
   }
 
   /**
