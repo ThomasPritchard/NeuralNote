@@ -62,8 +62,14 @@ const contractRules = (): string => REQUIRED_STYLESHEET_RULES
   .map((rule) => `${rule.selector} { ${rule.declarations} }`)
   .join("\n");
 
+/**
+ * The rendered row lines, scoped to `.cm-content` rather than to the host. CT-4's
+ * measurement probe lives inside the editor host and wears CT-1's own row
+ * classes — that is how it reproduces a cell's cascade — so an unscoped query
+ * counts it as one more row of the table.
+ */
 const rowLines = (host: Element): HTMLElement[] =>
-  [...host.querySelectorAll<HTMLElement>(".cm-line.nn-lp-table-row")];
+  [...host.querySelectorAll<HTMLElement>(".cm-content .cm-line.nn-lp-table-row")];
 
 const cellsOf = (line: Element): HTMLElement[] =>
   [...line.querySelectorAll<HTMLElement>(":scope > .nn-lp-cell")];

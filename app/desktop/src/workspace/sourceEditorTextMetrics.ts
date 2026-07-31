@@ -138,12 +138,16 @@ interface MetricsState {
   detach: (() => void) | null;
   /** Measured widths for the current epoch, keyed by `CellPaintPlan.signature`. */
   readonly widths: Map<string, number>;
+  /** The cell box's own inline padding for the current epoch, once measured. */
+  padding: number | null;
 }
 
 let state: MetricsState | null = null;
 let epoch = 0;
 /** The copied style values behind the current epoch, joined. */
 let styleSignature: string | null = null;
+/** Notified after the epoch moves. Module-scoped, because the epoch is. */
+const epochListeners = new Set<() => void>();
 
 /**
  * The style generation every cached width belongs to.
@@ -153,6 +157,27 @@ let styleSignature: string | null = null;
  */
 export function metricsEpoch(): number {
   return epoch;
+}
+
+/**
+ * Be told when {@link metricsEpoch} moves, so derived geometry can be rebuilt.
+ *
+ * A consumer has no other way to learn that the width it is holding is stale:
+ * the epoch moves when a webfont settles or the typography changes, and neither
+ * is an editor update. Polling cannot see them either — a font arriving after
+ * first paint produces no transaction to poll on.
+ *
+ * @param listener - called once the epoch has moved and the cache is cold.
+ *   SYNCHRONOUSLY, and the epoch can move from inside a state update, because
+ *   the probe syncs its styles the first time a width is asked for. A listener
+ *   that dispatches must defer.
+ * @returns a function that unsubscribes
+ */
+export function onMetricsEpochChange(listener: () => void): () => void {
+  epochListeners.add(listener);
+  return () => {
+    epochListeners.delete(listener);
+  };
 }
 
 /**
@@ -170,7 +195,7 @@ export function primeTextMetrics(from: Element): void {
     return;
   }
   releaseTextMetrics();
-  state = { source: from, probe: null, detach: null, widths: new Map() };
+  state = { source: from, probe: null, detach: null, widths: new Map(), padding: null };
   ensureProbe();
 }
 
@@ -201,6 +226,29 @@ export function measuredWidth(plan: CellPaintPlan): number | null {
   const width = layOut(probe, plan);
   state.widths.set(plan.signature, width);
   return width;
+}
+
+/**
+ * The inline padding a drawn cell's own box adds around the advance
+ * {@link measuredWidth} reports, in CSS pixels.
+ *
+ * Measured rather than read from `--nn-table-cell-pad` (`styles.css`): the value
+ * is authored in `rem` and the font-scale preference moves the root font size
+ * (`preferences.tsx:applyPreferences`), so the only dependable answer is the one
+ * the engine computes for this cell at this epoch. Taken as the difference
+ * between the cell's box and its contents — an inline box holding nothing is its
+ * padding and nothing else — so it needs no knowledge of which longhands the
+ * stylesheet happened to use.
+ *
+ * @returns the start plus end padding, or `null` while nothing is primed — the
+ *   same "not primed yet" {@link measuredWidth} reports, for the same reason
+ */
+export function measuredCellPadding(): number | null {
+  const probe = ensureProbe();
+  if (!probe || !state) return null;
+
+  state.padding ??= layOutPadding(probe);
+  return state.padding;
 }
 
 /**
@@ -245,6 +293,10 @@ function buildProbe(document: Document, host: Element): Probe {
 
   const root = applyStyle(document.createElement("div"), PROBE_STYLE);
   const row = document.createElement("div");
+  // Never class-less, even before the first `layOut`. A cell takes its inline
+  // padding from a custom property the ROW declares, so a probe measured with a
+  // bare row would report a cell that has no padding at all.
+  row.className = `${ROW_CLASS_PREFIX}body`;
   const cell = document.createElement("span");
   cell.className = CELL_CLASS;
 
@@ -282,7 +334,11 @@ function syncStyles(): boolean {
 
 function bumpEpoch(): void {
   epoch += 1;
-  state?.widths.clear();
+  if (state) {
+    state.widths.clear();
+    state.padding = null;
+  }
+  for (const listener of epochListeners) listener();
 }
 
 /**
@@ -333,14 +389,26 @@ function layOut(probe: Probe, plan: CellPaintPlan): number {
   probe.cell.replaceChildren(
     ...plan.runs.map((run) => runElement(probe.cell.ownerDocument, run)),
   );
+  return contentsWidth(probe.cell);
+}
 
-  // The cell's CONTENTS, not its box: under CT-2 the cell is a grid item whose
-  // track is sized by the caller, so its box says what the track says rather
-  // than what the text needs. A range over the runs also keeps each run's own
-  // padding — inline code is 6.4px of it — which the screen shows too.
-  const range = probe.cell.ownerDocument.createRange();
-  range.selectNodeContents(probe.cell);
+/**
+ * The cell's CONTENTS, not its box: under CT-2 the cell is a grid item whose
+ * track is sized by the caller, so its box says what the track says rather than
+ * what the text needs. A range over the runs also keeps each run's own padding —
+ * inline code is 6.4px of it — which the screen shows too.
+ */
+function contentsWidth(cell: HTMLElement): number {
+  const range = cell.ownerDocument.createRange();
+  range.selectNodeContents(cell);
   return range.getBoundingClientRect().width;
+}
+
+/** The one thing the cell's box adds that its contents do not: its padding. */
+function layOutPadding(probe: Probe): number {
+  // Clamped: an engine with no layout answers zero to both, and sub-pixel noise
+  // must never take width away from a track.
+  return Math.max(0, probe.cell.getBoundingClientRect().width - contentsWidth(probe.cell));
 }
 
 function runElement(document: Document, run: CellPaintRun): HTMLElement {

@@ -131,6 +131,21 @@ const TABLE_DECORATION_ERROR =
 export const tableCellMetrics = Facet.define<(plan: CellPaintPlan) => number | null>();
 
 /**
+ * Re-derive every drawn table's tracks from measurements taken afresh.
+ *
+ * The widths a track was stamped from belong to a style generation
+ * (`sourceEditorTextMetrics.ts`'s epoch), and that generation moves when a
+ * webfont settles or the typography changes — neither of which is a document
+ * change, a selection change or a viewport change, so nothing above would
+ * otherwise ask this field for a new answer. A webfont landing after first paint
+ * would leave every column sized against the fallback face until the next
+ * keystroke.
+ *
+ * It carries no changes. `sourceEditorTableMeasurement.ts` is what dispatches it.
+ */
+export const refreshSourceEditorTableMetrics = StateEffect.define<null>();
+
+/**
  * The two decoration sets a table produces, kept apart because they need
  * opposite precedence.
  *
@@ -310,6 +325,8 @@ const sourceEditorTableDecorations = StateField.define<TableDecorationState>({
   },
   update(value, transaction) {
     const viewport = transaction.effects.find((effect) => effect.is(updateSourceEditorTableViewport));
+    const remeasure = transaction.effects.some((effect) =>
+      effect.is(refreshSourceEditorTableMetrics));
     let visibleRanges = viewport?.value ?? value.visibleRanges;
     if (transaction.docChanged && !viewport) {
       visibleRanges = visibleRanges.map(({ from, to }) => ({
@@ -317,7 +334,7 @@ const sourceEditorTableDecorations = StateField.define<TableDecorationState>({
         to: transaction.changes.mapPos(to, 1),
       }));
     }
-    if (!transaction.docChanged && !transaction.selection && !viewport) return value;
+    if (!transaction.docChanged && !transaction.selection && !viewport && !remeasure) return value;
     return { ...tableDecorationSet(transaction.state, visibleRanges), visibleRanges };
   },
   // Two providers over ONE field, at two precedences. A block decoration may not
