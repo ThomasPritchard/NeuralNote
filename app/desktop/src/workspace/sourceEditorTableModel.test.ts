@@ -2,13 +2,16 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
+import type { CellPaintPlan } from "./sourceEditorCellPaintPlan";
 import {
-  monospaceWidth,
+  CELL_TRACK_GUTTER_CH,
+  CELL_TRACK_GUTTER_PX,
   tableColumnWidths,
   tableDelimiterRanges,
   tableModelAt,
-  tableSegmentWidths,
+  tableRenderPlan,
   type TableModel,
+  type TableRenderPlan,
 } from "./sourceEditorTableModel";
 
 function state(doc: string) {
@@ -132,86 +135,176 @@ describe("tableColumnWidths", () => {
   });
 });
 
-describe("column padding folded into the chrome", () => {
-  /** Total columns a row paints: its content plus the padding in its gaps. */
-  function renderedWidth(doc: string, rowIndex: number): number {
+const columnsOf = (plan: TableRenderPlan, row: number): number[] =>
+  plan.rows[row]!.cells.map((cell) => cell.column);
+
+/** A probe standing in for P3a's: ten pixels per painted character. */
+const tenPixelsPerCharacter = (plan: CellPaintPlan): number => plan.visibleText.length * 10;
+
+/** The same probe, unprimed for one column — CT-4's normal first frame. */
+const unprimedForCcc = (plan: CellPaintPlan): number | null =>
+  plan.visibleText === "ccc" ? null : tenPixelsPerCharacter(plan);
+
+describe("tableRenderPlan", () => {
+
+  it("gives every content row one cell per declared column, numbered from one", () => {
+    const doc = "| a | b | c |\n| --- | --- | --- |\n| x | y | z |";
     const editor = state(doc);
-    const model = tableModelAt(editor, 0)!;
-    const widths = tableSegmentWidths(editor, model);
-    const ranges = tableDelimiterRanges(model, editor, widths);
-    const row = model.rows[rowIndex]!;
+    const plan = tableRenderPlan(editor, tableModelAt(editor, 0)!);
 
-    const content = row.slots.reduce(
-      (total, slot) => total + monospaceWidth(doc.slice(slot.from, slot.to)),
-      0,
-    );
-    const padding = ranges
-      .filter((range) => range.from >= row.from && range.to <= row.to)
-      .reduce((total, range) => total + range.padColumns, 0);
-    return content + padding;
-  }
-
-  it("brings every content row to the same painted width", () => {
-    const doc = "| Start date | Commitment |\n| --- | --- |\n| a | b |";
-    expect(renderedWidth(doc, 0)).toBe(renderedWidth(doc, 2));
+    expect(plan.rows.map((row) => row.kind)).toEqual(["header", "delimiter", "body"]);
+    expect(columnsOf(plan, 0)).toEqual([1, 2, 3]);
+    expect(columnsOf(plan, 2)).toEqual([1, 2, 3]);
+    expect(plan.rows[1]!.cells).toEqual([]);
   });
 
-  it("pads a table whose alignment spaces are now hidden", () => {
-    // Under chrome the spaces around a pipe are inside the hidden gap, so an
-    // already-aligned file still needs painted padding to look aligned.
-    const doc = [
-      "| Start date | Commitment |",
-      "| ---------- | ---------- |",
-      "| 2026-04-03 | DJ gig     |",
-    ].join("\n");
-    expect(renderedWidth(doc, 0)).toBe(renderedWidth(doc, 2));
+  it("marks a declared-but-blank cell as empty, with a zero-length range", () => {
+    const doc = "| a | b | c |\n| --- | --- | --- |\n| x |  | z |";
+    const editor = state(doc);
+    const plan = tableRenderPlan(editor, tableModelAt(editor, 0)!);
+    const cells = plan.rows[2]!.cells;
+
+    expect(cells.map((cell) => cell.kind)).toEqual(["content", "empty", "content"]);
+    expect(cells[1]!.from).toBe(cells[1]!.to);
   });
 
-  it("adds nothing when a column's cells are already equal", () => {
-    const doc = "| aaa | bbb |\n| --- | --- |\n| xxx | yyy |";
+  it("fills a ragged row's missing columns at the last declared cell's end", () => {
+    const doc = "| Task | Owner | Due |\n| --- | --- | --- |\n| Ship v0.3 | Tom |";
     const editor = state(doc);
     const model = tableModelAt(editor, 0)!;
-    const ranges = tableDelimiterRanges(model, editor, tableSegmentWidths(editor, model));
+    const plan = tableRenderPlan(editor, model);
+    const cells = plan.rows[2]!.cells;
+    const lastDeclared = model.rows[2]!.slots.at(-1)!;
 
-    expect(ranges.every((range) => range.padColumns === 0)).toBe(true);
+    expect(cells.map((cell) => cell.kind)).toEqual(["content", "content", "filler"]);
+    expect(cells.at(-1)).toMatchObject({ column: 3, from: lastDeclared.to, to: lastDeclared.to });
   });
 
-  it("never pads the delimiter row, which is drawn as a rule", () => {
-    const doc = "| Start date | Commitment |\n| --- | :-: |\n| a | b |";
+  it("gives a row missing two columns one filler each, at the same offset", () => {
+    // CT1-Q2's shape: two adjacent zero-length widgets.
+    const doc = "| a | b | c |\n| --- | --- | --- |\n| only |";
     const editor = state(doc);
-    const model = tableModelAt(editor, 0)!;
-    const ranges = tableDelimiterRanges(model, editor, tableSegmentWidths(editor, model));
-    const rule = ranges.filter((range) => range.kind === "rule");
+    const plan = tableRenderPlan(editor, tableModelAt(editor, 0)!);
+    const fillers = plan.rows[2]!.cells.filter((cell) => cell.kind === "filler");
 
-    expect(rule).toHaveLength(1);
-    expect(rule[0]!.padColumns).toBe(0);
+    expect(fillers.map((cell) => cell.column)).toEqual([2, 3]);
+    expect(new Set(fillers.map((cell) => cell.from)).size).toBe(1);
   });
 
-  it("puts a right-aligned column's padding in the gap before its content", () => {
-    const doc = "| a | value |\n| --- | --: |\n| x | y |";
+  it("places chrome at the column it opens, and the trailing chrome at the last column", () => {
+    const doc = "| a | b | c |\n| --- | --- | --- |\n| x | y | z |";
     const editor = state(doc);
-    const model = tableModelAt(editor, 0)!;
-    const ranges = tableDelimiterRanges(model, editor, tableSegmentWidths(editor, model));
-    const bodyRow = model.rows[2]!;
-    const cell = bodyRow.slots.find((slot) => slot.column === 1)!;
+    const plan = tableRenderPlan(editor, tableModelAt(editor, 0)!);
 
-    const before = ranges.find((range) => range.to === cell.from)!;
-    const after = ranges.find((range) => range.from === cell.to)!;
-    expect(before.padColumns).toBeGreaterThan(0);
-    expect(after.padColumns).toBe(0);
+    expect(plan.rows[0]!.chrome.map((chrome) => [chrome.kind, chrome.gridColumn])).toEqual([
+      ["leading", "1"],
+      ["divider", "2"],
+      ["divider", "3"],
+      ["trailing", "3"],
+    ]);
   });
 
-  it("emits ranges only, so the document is never edited", () => {
-    const doc = "| Start date | Commitment |\n| --- | --- |\n| a | b |";
+  it("keeps a ragged row's trailing chrome out of the columns it never declared", () => {
+    // K7d: the closing edge belongs at the table's last column, not the row's.
+    const doc = "| a | b | c |\n| --- | --- | --- |\n| only |";
     const editor = state(doc);
-    const model = tableModelAt(editor, 0)!;
-    const ranges = tableDelimiterRanges(model, editor, tableSegmentWidths(editor, model));
+    const plan = tableRenderPlan(editor, tableModelAt(editor, 0)!);
+    const trailing = plan.rows[2]!.chrome.find((chrome) => chrome.kind === "trailing")!;
 
-    for (const range of ranges) {
-      expect(range.from).toBeGreaterThanOrEqual(0);
-      expect(range.to).toBeLessThanOrEqual(doc.length);
-      expect(range).not.toHaveProperty("insert");
+    expect(trailing.gridColumn).toBe("3");
+  });
+
+  it("draws the alignment row as one rule spanning every column", () => {
+    const doc = "| a | b |\n| --- | --- |\n| x | y |";
+    const editor = state(doc);
+    const plan = tableRenderPlan(editor, tableModelAt(editor, 0)!);
+
+    expect(plan.rows[1]!.chrome.map((chrome) => [chrome.kind, chrome.gridColumn]))
+      .toEqual([["rule", "1 / -1"]]);
+  });
+
+  it("names each row's kind and stamps the table edges on two different lines", () => {
+    // A one-row table is the case where first and last cannot be the same line.
+    const doc = "| Key | Value |\n| --- | --- |";
+    const editor = state(doc);
+    const plan = tableRenderPlan(editor, tableModelAt(editor, 0)!);
+
+    expect(plan.rows.map((row) => row.className)).toEqual([
+      "nn-lp-table-row nn-lp-table-row-header nn-lp-table-row-first",
+      "nn-lp-table-row nn-lp-table-row-delimiter nn-lp-table-row-last",
+    ]);
+  });
+
+  it("marks the first and last line of a three-row table and nothing between", () => {
+    const doc = "| a | b |\n| --- | --- |\n| x | y |";
+    const editor = state(doc);
+    const plan = tableRenderPlan(editor, tableModelAt(editor, 0)!);
+
+    expect(plan.rows.map((row) => row.edge)).toEqual(["first", null, "last"]);
+  });
+
+  it("anchors each row's line decoration at the start of its line", () => {
+    const doc = "text\n\n| a | b |\n| --- | --- |\n| x | y |";
+    const editor = state(doc);
+    const plan = tableRenderPlan(editor, tableModelAt(editor, doc.indexOf("| a"))!);
+
+    for (const row of plan.rows) {
+      expect(editor.doc.lineAt(row.lineFrom).from).toBe(row.lineFrom);
     }
+  });
+
+  it("sizes a track from what the cell PAINTS, not from its source characters", () => {
+    // G3: the width belongs to the string the user sees. `**bold**` is eight
+    // source characters and four painted ones; measuring the source serves the
+    // column a width that belongs to a different string.
+    const doc = "| **bold** | b |\n| --- | --- |\n| x | y |";
+    const editor = state(doc);
+    const plan = tableRenderPlan(editor, tableModelAt(editor, 0)!);
+
+    expect(plan.trackTemplate.split(" ")[0]).toBe(`${4 + CELL_TRACK_GUTTER_CH}ch`);
+  });
+
+  it("sizes each track to the widest cell in its column", () => {
+    const doc = "| a | bb |\n| --- | --- |\n| ccc | d |";
+    const editor = state(doc);
+    const plan = tableRenderPlan(editor, tableModelAt(editor, 0)!);
+
+    expect(plan.trackTemplate).toBe(
+      `${3 + CELL_TRACK_GUTTER_CH}ch ${2 + CELL_TRACK_GUTTER_CH}ch`,
+    );
+  });
+
+  it("stamps measured pixels once every column has been measured", () => {
+    const doc = "| a | bb |\n| --- | --- |\n| ccc | d |";
+    const editor = state(doc);
+    const plan = tableRenderPlan(editor, tableModelAt(editor, 0)!, {
+      measureCell: tenPixelsPerCharacter,
+    });
+
+    expect(plan.trackTemplate)
+      .toBe(`${30 + CELL_TRACK_GUTTER_PX}px ${20 + CELL_TRACK_GUTTER_PX}px`);
+  });
+
+  it("falls back to character tracks for every column while any one is unmeasured", () => {
+    // CT-4: a null width is "not primed yet", the normal first frame. Mixing
+    // units across columns would leave the table aligned to neither.
+    const doc = "| a | bb |\n| --- | --- |\n| ccc | d |";
+    const editor = state(doc);
+    const plan = tableRenderPlan(editor, tableModelAt(editor, 0)!, {
+      measureCell: unprimedForCcc,
+    });
+
+    expect(plan.trackTemplate)
+      .toBe(`${3 + CELL_TRACK_GUTTER_CH}ch ${2 + CELL_TRACK_GUTTER_CH}ch`);
+  });
+
+  it("reports the table's own bounds, so a caller never re-derives them", () => {
+    const doc = "| a | b |\n| --- | --- |\n| x | y |";
+    const editor = state(doc);
+    const model = tableModelAt(editor, 0)!;
+    const plan = tableRenderPlan(editor, model);
+
+    expect({ from: plan.from, to: plan.to }).toEqual({ from: model.from, to: model.to });
   });
 });
 

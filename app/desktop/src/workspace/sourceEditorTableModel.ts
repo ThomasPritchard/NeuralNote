@@ -1,6 +1,8 @@
 import { syntaxTree } from "@codemirror/language";
 import type { EditorState } from "@codemirror/state";
 
+import { cellPaintPlan, type CellPaintPlan } from "./sourceEditorCellPaintPlan";
+
 type SyntaxNode = ReturnType<typeof syntaxTree>["topNode"];
 
 export type ColumnAlignment = "none" | "left" | "center" | "right";
@@ -15,14 +17,6 @@ export interface TableColumnSlot {
   readonly column: number;
   readonly from: number;
   readonly to: number;
-  /**
-   * The full pipe-to-pipe span, including the whitespace around the content.
-   * Alignment must be measured against this, not the trimmed content: a cell
-   * that already carries trailing spaces renders wider than its content, so
-   * padding the content alone over-pads an already-aligned table.
-   */
-  readonly segmentFrom: number;
-  readonly segmentTo: number;
 }
 
 export interface TableRowModel {
@@ -175,13 +169,12 @@ function toSlots(
     const text = slice(segment.from, segment.to);
     const leading = text.length - text.trimStart().length;
     const trailing = text.length - text.trimEnd().length;
-    const bounds = { segmentFrom: segment.from, segmentTo: segment.to };
     if (leading + trailing >= text.length) {
       // Blank cell: anchor just inside the opening space so typing reads `| x |`.
       const anchor = Math.min(segment.from + (text.startsWith(" ") ? 1 : 0), segment.to);
-      return { column, from: anchor, to: anchor, ...bounds };
+      return { column, from: anchor, to: anchor };
     }
-    return { column, from: segment.from + leading, to: segment.to - trailing, ...bounds };
+    return { column, from: segment.from + leading, to: segment.to - trailing };
   });
 }
 
@@ -238,12 +231,6 @@ export function tableColumnWidths(state: EditorState, model: TableModel): number
   return widths;
 }
 
-/**
- * On-screen width of each column as it currently renders: the whole pipe-to-pipe
- * span, whitespace included. Alignment must target this rather than the trimmed
- * content width, because a cell carrying trailing spaces already renders wider
- * than its content and padding the content alone would push it wider still.
- */
 export type TableDelimiterKind = "leading" | "divider" | "trailing" | "rule";
 
 /** A span of source to hide and replace with drawn chrome. */
@@ -251,11 +238,6 @@ export interface TableDelimiterRange {
   readonly from: number;
   readonly to: number;
   readonly kind: TableDelimiterKind;
-  /**
-   * Extra columns this gap renders, to bring its neighbouring cells up to their
-   * column width.
-   */
-  readonly padColumns: number;
 }
 
 /**
@@ -271,36 +253,12 @@ export interface TableDelimiterRange {
  * The delimiter row is returned whole, as a single `rule` range: it carries no
  * user content and is drawn as the header rule.
  */
-export function tableDelimiterRanges(
-  model: TableModel,
-  state?: EditorState,
-  widths: readonly number[] = [],
-): TableDelimiterRange[] {
+export function tableDelimiterRanges(model: TableModel): TableDelimiterRange[] {
   const ranges: TableDelimiterRange[] = [];
-
-  /** Columns a cell must gain to reach its column width, split by alignment. */
-  const padding = (slot: TableColumnSlot | undefined) => {
-    if (!slot || !state) return { before: 0, after: 0 };
-    const deficit = (widths[slot.column] ?? 0)
-      - monospaceWidth(state.sliceDoc(slot.from, slot.to));
-    if (deficit <= 0) return { before: 0, after: 0 };
-    switch (model.alignments[slot.column] ?? "none") {
-      case "right":
-        return { before: deficit, after: 0 };
-      case "center": {
-        const before = Math.floor(deficit / 2);
-        return { before, after: deficit - before };
-      }
-      default:
-        return { before: 0, after: deficit };
-    }
-  };
 
   for (const row of model.rows) {
     if (row.kind === "delimiter") {
-      if (row.to > row.from) {
-        ranges.push({ from: row.from, to: row.to, kind: "rule", padColumns: 0 });
-      }
+      if (row.to > row.from) ranges.push({ from: row.from, to: row.to, kind: "rule" });
       continue;
     }
 
@@ -310,55 +268,252 @@ export function tableDelimiterRanges(
     // Everything before the first cell's content: `| ` when the row opens with
     // a pipe, nothing when GFM's optional leading pipe was omitted.
     if (slots[0]!.from > row.from) {
-      ranges.push({
-        from: row.from,
-        to: slots[0]!.from,
-        kind: "leading",
-        padColumns: padding(slots[0]).before,
-      });
+      ranges.push({ from: row.from, to: slots[0]!.from, kind: "leading" });
     }
 
     for (let index = 0; index < slots.length - 1; index += 1) {
       const gapFrom = slots[index]!.to;
       const gapTo = slots[index + 1]!.from;
-      if (gapTo <= gapFrom) continue;
-      ranges.push({
-        from: gapFrom,
-        to: gapTo,
-        kind: "divider",
-        padColumns: padding(slots[index]).after + padding(slots[index + 1]).before,
-      });
+      if (gapTo > gapFrom) ranges.push({ from: gapFrom, to: gapTo, kind: "divider" });
     }
 
     const last = slots.at(-1)!;
-    if (row.to > last.to) {
-      ranges.push({
-        from: last.to,
-        to: row.to,
-        kind: "trailing",
-        padColumns: padding(last).after,
-      });
-    }
+    if (row.to > last.to) ranges.push({ from: last.to, to: row.to, kind: "trailing" });
   }
 
   return ranges;
 }
 
+/* ------------------------------------------------------------------------- *
+ * CT-2 — the render plan: which grid column every drawn element belongs to,
+ * and the track list each row line stamps.
+ * ------------------------------------------------------------------------- */
+
 /**
- * Width each column must render at: its widest CONTENT.
+ * Breathing room inside a track, past the text it holds. It belongs to the
+ * producer rather than the stylesheet because CT-2 reserves
+ * `grid-template-columns` for `var(--nn-table-tracks)` alone: a gutter authored
+ * in CSS would have to be a literal template, which fights the stamp.
  *
- * Under drawn chrome every pipe and the whitespace around it is hidden, so a
- * cell renders as content plus padding and nothing else. Measuring the
- * pipe-to-pipe span would count characters that are no longer painted.
+ * Two constants, one intent, because the two track modes measure in different
+ * units — {@link CELL_TRACK_GUTTER_PX} pairs with a measured pixel width and
+ * {@link CELL_TRACK_GUTTER_CH} with the character fallback.
  */
-export function tableSegmentWidths(state: EditorState, model: TableModel): number[] {
-  const widths = Array.from({ length: model.columnCount }, () => 0);
+export const CELL_TRACK_GUTTER_PX = 16;
+export const CELL_TRACK_GUTTER_CH = 2;
+
+/**
+ * Why a cell exists. `content` has source a `Decoration.mark` can cover;
+ * `empty` is a column the row declares and leaves blank; `filler` is a column
+ * the table declares and this row never wrote. The last two carry no source at
+ * all, so they can only be zero-length widgets — a mark may not be empty.
+ */
+export type TableCellKind = "content" | "empty" | "filler";
+
+/** Which end of the table a row line sits at. Stamped, never inferred (CT-1). */
+export type TableRowEdge = "first" | "last" | null;
+
+export interface TableRenderCell {
+  /** The stamped `grid-column`, counting from one. */
+  readonly column: number;
+  readonly from: number;
+  readonly to: number;
+  readonly kind: TableCellKind;
+}
+
+export interface TableRenderChrome extends TableDelimiterRange {
+  /** The stamped `grid-column`: the column this chrome opens, or the rule's span. */
+  readonly gridColumn: string;
+}
+
+export interface TableRenderRow {
+  readonly kind: TableRowKind;
+  readonly edge: TableRowEdge;
+  /** Start of the line the row occupies, where its `Decoration.line` anchors. */
+  readonly lineFrom: number;
+  readonly className: string;
+  readonly cells: readonly TableRenderCell[];
+  readonly chrome: readonly TableRenderChrome[];
+}
+
+export interface TableRenderPlan {
+  readonly from: number;
+  readonly to: number;
+  /** The `--nn-table-tracks` value: one track per declared column. */
+  readonly trackTemplate: string;
+  readonly rows: readonly TableRenderRow[];
+}
+
+export interface TableRenderOptions {
+  /**
+   * CT-4's measurement probe. `null` for a cell means "not primed yet", which
+   * is the normal first frame rather than an error, and drops the whole table
+   * to character tracks.
+   */
+  readonly measureCell?: (plan: CellPaintPlan) => number | null;
+}
+
+/** The row line's own classes, in the order CT-1 freezes them. */
+export function tableRowClassName(kind: TableRowKind, edge: TableRowEdge): string {
+  const hooks = ["nn-lp-table-row", `nn-lp-table-row-${kind}`];
+  if (edge) hooks.push(`nn-lp-table-row-${edge}`);
+  return hooks.join(" ");
+}
+
+/** What one cell paints, as the single projection both widths and text read. */
+function slotPaintPlan(
+  state: EditorState,
+  row: TableRowModel,
+  slot: TableColumnSlot,
+): CellPaintPlan {
+  return cellPaintPlan(state, { from: slot.from, to: slot.to }, {
+    context: row.kind === "header" ? "header" : "body",
+  });
+}
+
+interface ColumnWidth {
+  /** Measured pixels, or `null` once any cell in the column is unmeasured. */
+  readonly px: number | null;
+  readonly ch: number;
+}
+
+/**
+ * How wide each column's widest cell PAINTS.
+ *
+ * Deliberately read off {@link cellPaintPlan} rather than the source text. G3:
+ * `**bold**` is eight source characters and four painted ones, so a width taken
+ * from the source belongs to a different string than the user sees — which
+ * shows up as column jitter, not as an error.
+ */
+function columnWidths(
+  state: EditorState,
+  model: TableModel,
+  measureCell: TableRenderOptions["measureCell"],
+): ColumnWidth[] {
+  const widths: ColumnWidth[] = Array.from(
+    { length: model.columnCount },
+    () => ({ px: 0, ch: 0 }),
+  );
   for (const row of model.rows) {
     if (row.kind === "delimiter") continue;
     for (const slot of row.slots) {
-      const content = monospaceWidth(state.sliceDoc(slot.from, slot.to));
-      widths[slot.column] = Math.max(widths[slot.column] ?? 0, content);
+      const current = widths[slot.column];
+      if (!current) continue;
+      const plan = slotPaintPlan(state, row, slot);
+      const measured = measureCell?.(plan) ?? null;
+      widths[slot.column] = {
+        px: current.px === null || measured === null ? null : Math.max(current.px, measured),
+        ch: Math.max(current.ch, monospaceWidth(plan.visibleText)),
+      };
     }
   }
   return widths;
+}
+
+/**
+ * The stamped track list. Pixels once every column has been measured, and
+ * character widths until then — never a mix, because two columns sized in
+ * different units are aligned to neither.
+ */
+function trackTemplate(
+  state: EditorState,
+  model: TableModel,
+  measureCell: TableRenderOptions["measureCell"],
+): string {
+  const widths = columnWidths(state, model, measureCell);
+  return widths.every((width) => width.px !== null)
+    ? widths.map((width) => `${width.px! + CELL_TRACK_GUTTER_PX}px`).join(" ")
+    : widths.map((width) => `${width.ch + CELL_TRACK_GUTTER_CH}ch`).join(" ");
+}
+
+/**
+ * Every cell of one row, including the columns it never declared.
+ *
+ * A filler is anchored at the last declared cell's `to` — the offset the
+ * trailing chrome also starts at — so the closing edge stays the row's last
+ * stamped child while the filler still holds its column open (CT-1).
+ */
+function renderCells(row: TableRowModel, columnCount: number): TableRenderCell[] {
+  const cells: TableRenderCell[] = row.slots.map((slot) => ({
+    column: slot.column + 1,
+    from: slot.from,
+    to: slot.to,
+    kind: slot.from === slot.to ? "empty" : "content",
+  }));
+  const last = row.slots.at(-1);
+  if (!last) return cells;
+  for (let column = row.slots.length; column < columnCount; column += 1) {
+    cells.push({ column: column + 1, from: last.to, to: last.to, kind: "filler" });
+  }
+  return cells;
+}
+
+/**
+ * The row's hidden spans, each stamped with the column it opens.
+ *
+ * Looked up by the exact offset {@link tableDelimiterRanges} keys them on, so
+ * the drawn chrome and the spans the delimiter guard protects can never be two
+ * different answers. A gap that produced no range — the omitted leading pipe of
+ * a GFM row, say — simply has no chrome, because there is nothing there to hide.
+ */
+function renderChrome(
+  row: TableRowModel,
+  columnCount: number,
+  rangeFrom: ReadonlyMap<number, TableDelimiterRange>,
+): TableRenderChrome[] {
+  const chrome: TableRenderChrome[] = [];
+  const at = (from: number, gridColumn: string) => {
+    const range = rangeFrom.get(from);
+    if (range) chrome.push({ ...range, gridColumn });
+  };
+
+  if (row.kind === "delimiter") {
+    at(row.from, "1 / -1");
+    return chrome;
+  }
+
+  at(row.from, "1");
+  for (let index = 1; index < row.slots.length; index += 1) {
+    at(row.slots[index - 1]!.to, String(index + 1));
+  }
+  const last = row.slots.at(-1);
+  // K7d: the closing edge belongs at the table's last column even on a ragged
+  // row, or it lands inside the content columns.
+  if (last) at(last.to, String(columnCount));
+  return chrome;
+}
+
+/**
+ * Project a table onto what the editor draws for it: one cell per declared
+ * column on every row, the chrome that hides each delimiter, and the track list
+ * every row line stamps.
+ *
+ * @param state - the editor state the table belongs to
+ * @param model - the table, as {@link tableModelAt} reports it
+ * @param options - the measurement probe, when one has been primed
+ * @returns the rows in document order, each with its cells, chrome and hooks
+ */
+export function tableRenderPlan(
+  state: EditorState,
+  model: TableModel,
+  options: TableRenderOptions = {},
+): TableRenderPlan {
+  const rangeFrom = new Map(tableDelimiterRanges(model).map((range) => [range.from, range]));
+  const lastRow = model.rows.length - 1;
+  return {
+    from: model.from,
+    to: model.to,
+    trackTemplate: trackTemplate(state, model, options.measureCell),
+    rows: model.rows.map((row, index) => {
+      const edge: TableRowEdge = index === 0 ? "first" : index === lastRow ? "last" : null;
+      return {
+        kind: row.kind,
+        edge,
+        lineFrom: state.doc.lineAt(row.from).from,
+        className: tableRowClassName(row.kind, edge),
+        cells: row.kind === "delimiter" ? [] : renderCells(row, model.columnCount),
+        chrome: renderChrome(row, model.columnCount, rangeFrom),
+      };
+    }),
+  };
 }

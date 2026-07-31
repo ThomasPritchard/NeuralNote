@@ -208,11 +208,17 @@ describe("SourceNoteEditor", () => {
     await userEvent.click(table);
 
     await waitFor(() => expect(screen.queryByRole("table", { name: "Markdown table" })).toBeNull());
-    // The revealed source is visually aligned, so the rendered text carries
-    // padding widgets. Exactness is asserted against the document, not the DOM.
+    // The revealed source is drawn as a grid of cells, so the rendered text
+    // carries chrome widgets. Exactness is asserted against the document, not
+    // the DOM.
     const view = EditorView.findFromDOM(container.querySelector<HTMLElement>(".cm-editor")!)!;
     expect(view.state.doc.toString()).toBe(source);
-    expect(container.querySelector(".nn-lp-table-source")).not.toBeNull();
+    // Each row is its own line decoration now. The table-wide `nn-lp-table-source`
+    // mark it replaces made every row's children ITS children, leaving the row's
+    // grid one item to place; that mark survives only for a table too large to
+    // draw, which the "skips alignment on a table too large to preview" case
+    // still covers.
+    expect(container.querySelector(".nn-lp-table-row")).not.toBeNull();
   });
 
   it("places the caret in the cell that was clicked rather than at the table start", async () => {

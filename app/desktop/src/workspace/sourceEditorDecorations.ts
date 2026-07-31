@@ -17,7 +17,9 @@ import {
 
 import { mergeVisibleRanges } from "./sourceEditorDecorationsRanges";
 import { activeLink, safeCollectMarkdownPreview } from "./sourceEditorDecorationsPreview";
+import type { CellPaintPlan } from "./sourceEditorCellPaintPlan";
 import {
+  TableCellWidget,
   TableChromeWidget,
   TableWidget,
   TaskWidget,
@@ -29,9 +31,9 @@ import {
   tableDelimiterGuard,
 } from "./sourceEditorTableDelimiterGuard";
 import {
-  tableDelimiterRanges,
   tableModelAt,
-  tableSegmentWidths,
+  tableRenderPlan,
+  type TableRenderCell,
 } from "./sourceEditorTableModel";
 import type { VisibleRange } from "./sourceEditorDecorationsTypes";
 
@@ -65,7 +67,11 @@ function toDecorationSet(
 ): DecorationSet {
   const result = safeCollectMarkdownPreview(view.state, view.visibleRanges);
   onError(result.error);
-  const ranges = result.decorations.filter((item) => !item.table).map((item) => {
+  // A table is the `StateField`'s to decorate, in both of its states: as drawn
+  // cells, or — when it is too large to draw — as the literal source backdrop.
+  // Emitting a table-wide mark from here as well would wrap every row line's
+  // children in one element, and a grid has exactly one item to place after that.
+  const ranges = result.decorations.filter((item) => !item.table && !item.tableSource).map((item) => {
     switch (item.kind) {
       case "line":
         return Decoration.line({ class: item.className }).range(item.from);
@@ -114,26 +120,71 @@ export const tablePreviewErrorSink = Facet.define<(message: string | null) => vo
 const TABLE_DECORATION_ERROR =
   "Table preview is temporarily unavailable. Your source is unchanged.";
 
+/**
+ * CT-4's measurement probe, as a facet so the `StateField` can reach it — a
+ * field is defined once at module scope and never sees an extension's closure.
+ *
+ * The probe is P3a's; this is the seam it lands in. Until one is registered,
+ * every column measures `null`, which CT-4 defines as "not primed yet" and the
+ * render plan answers with character-width tracks rather than an error.
+ */
+export const tableCellMetrics = Facet.define<(plan: CellPaintPlan) => number | null>();
+
+/**
+ * The two decoration sets a table produces, kept apart because they need
+ * opposite precedence.
+ *
+ * `structure` holds the block widget, the row lines and the drawn chrome, and
+ * runs at ordinary precedence. `cells` holds the per-cell marks and runs BELOW
+ * the preview plugins (`Prec.low`), because the lowest-precedence mark is the
+ * OUTERMOST element: promote it and every inner mark boundary splits the cell
+ * into a second element, which the grid then places as a second item in the
+ * column (`@codemirror/view/dist/index.js:242-248`).
+ */
+interface TableDecorations {
+  readonly structure: DecorationSet;
+  readonly cells: DecorationSet;
+}
+
+/** The same two sets before they are sorted into range sets. */
+interface TableDecorationRanges {
+  readonly structure: readonly Range<Decoration>[];
+  readonly cells: readonly Range<Decoration>[];
+}
+
+const NO_TABLE_DECORATIONS: TableDecorations = {
+  structure: Decoration.none,
+  cells: Decoration.none,
+};
+
 function tableDecorationSet(
   state: EditorState,
   visibleRanges: readonly VisibleRange[],
-): DecorationSet {
-  if (visibleRanges.length === 0) return Decoration.none;
+): TableDecorations {
+  if (visibleRanges.length === 0) return NO_TABLE_DECORATIONS;
   try {
     const scanRanges = mergeVisibleRanges(visibleRanges, state.doc.length, TABLE_SCAN_MARGIN);
     const result = safeCollectMarkdownPreview(state, scanRanges);
-    const ranges = result.decorations.flatMap((item) => {
+    const structure: Range<Decoration>[] = [];
+    const cells: Range<Decoration>[] = [];
+    for (const item of result.decorations) {
       if (item.table) {
-        return [Decoration.replace({
+        structure.push(Decoration.replace({
           widget: new TableWidget(item),
           inclusive: false,
           block: true,
-        }).range(item.from, item.to)];
+        }).range(item.from, item.to));
+      } else if (item.tableSource) {
+        const drawn = tableRanges(state, item);
+        structure.push(...drawn.structure);
+        cells.push(...drawn.cells);
       }
-      return item.tableSource ? alignmentRanges(state, item.from) : [];
-    });
+    }
     reportTableError(state, result.error);
-    return Decoration.set(ranges, true);
+    return {
+      structure: Decoration.set(structure, true),
+      cells: Decoration.set(cells, true),
+    };
   } catch {
     // Spec rule 6: a decoration failure removes the decoration and leaves the
     // source editable. Without this the throw escapes through `state.update()`,
@@ -141,7 +192,7 @@ function tableDecorationSet(
     // the editor's own try/catch never sees it, the keystroke is lost, and from
     // `StateField.create` the editor fails to mount at all.
     reportTableError(state, TABLE_DECORATION_ERROR);
-    return Decoration.none;
+    return NO_TABLE_DECORATIONS;
   }
 }
 
@@ -158,25 +209,66 @@ function reportTableError(state: EditorState, message: string | null): void {
 }
 
 /**
- * Visual-only column alignment for the table the caret is inside. Every range is
- * a zero-length widget insertion, so the revealed source lines up without a
- * single byte changing on disk.
+ * Draw one table as a grid of cells: a `Decoration.line` per row carrying the
+ * track list, drawn chrome over every hidden delimiter, and a per-cell mark at
+ * an explicit column.
+ *
+ * Nothing here can change a byte. The chrome replaces source that stays in the
+ * document, and an empty cell is a zero-length insertion of DOM, not of text.
+ *
+ * A table too large to draw keeps its pipes and gets the source backdrop
+ * instead. `drawsCellChrome` owns that bound for the atomic ranges and the
+ * transaction filter too: painting a delimiter the filter does not protect
+ * reopens the corruption path, and protecting one the user can plainly see
+ * refuses a legitimate edit.
  */
-function alignmentRanges(state: EditorState, tablePos: number): Range<Decoration>[] {
-  const model = tableModelAt(state, tablePos);
-  // `drawsCellChrome` owns the size bounds, and owns them for the atomic ranges
-  // and the transaction filter too: an oversized table is left as literal
-  // source, so nothing may treat its pipes as hidden.
-  if (!model || !drawsCellChrome(model)) return [];
-  // Hide the pipes and draw cell chrome in their place. The whole gap goes, not
-  // the bare pipe, so `atomicRanges` has an interior position to work with, and
-  // the column padding is folded into the same widget.
-  const widths = tableSegmentWidths(state, model);
-  return tableDelimiterRanges(model, state, widths).map((delimiter) =>
-    Decoration.replace({
-      widget: new TableChromeWidget(delimiter.kind, delimiter.padColumns),
-      inclusive: false,
-    }).range(delimiter.from, delimiter.to));
+function tableRanges(state: EditorState, table: VisibleRange): TableDecorationRanges {
+  const model = tableModelAt(state, table.from);
+  if (!model || !drawsCellChrome(model)) {
+    return {
+      structure: [],
+      cells: [Decoration.mark({ class: "nn-lp-table-source" }).range(table.from, table.to)],
+    };
+  }
+
+  const plan = tableRenderPlan(state, model, { measureCell: state.facet(tableCellMetrics)[0] });
+  const tracks = { style: `--nn-table-tracks: ${plan.trackTemplate}` };
+  return {
+    structure: plan.rows.flatMap((row) => [
+      Decoration.line({ class: row.className, attributes: tracks }).range(row.lineFrom),
+      ...row.chrome.map((chrome) => Decoration.replace({
+        widget: new TableChromeWidget(chrome.kind, chrome.gridColumn),
+        inclusive: false,
+      }).range(chrome.from, chrome.to)),
+    ]),
+    cells: plan.rows.flatMap((row) => row.cells.map(cellRange)),
+  };
+}
+
+/**
+ * One cell, as the only decoration that can carry its content.
+ *
+ * The mark is INCLUSIVE, which is load-bearing rather than a default. A
+ * non-inclusive mark opens at `startSide` 5e8 while a non-inclusive replace
+ * opens at 5e8-1 (`@codemirror/view/dist/index.js:268-278`), so a replacement
+ * covering the cell — every `[[wikilink]]` that fills one — sorts BEFORE the
+ * mark opens: measured, the cell element is then never built at all and the
+ * widget becomes an unplaced item in a column of its own. That is the same
+ * boundary-sorting bug this phase removes at table scale, one level down.
+ */
+function cellRange(cell: TableRenderCell): Range<Decoration> {
+  const attributes = { style: `grid-column: ${cell.column}` };
+  if (cell.kind === "content") {
+    return Decoration.mark({ class: "nn-lp-cell", inclusive: true, attributes })
+      .range(cell.from, cell.to);
+  }
+  // `side: 1` puts the widget after an inclusive cell mark closing at the same
+  // offset — which is exactly where a filler sits — and before the trailing
+  // chrome, so the closing edge stays the row's last stamped child.
+  return Decoration.widget({
+    widget: new TableCellWidget(cell.kind, String(cell.column)),
+    side: 1,
+  }).range(cell.from);
 }
 
 /**
@@ -207,15 +299,14 @@ export function tableAtomicRanges(
   );
 }
 
-interface TableDecorationState {
-  readonly decorations: DecorationSet;
+interface TableDecorationState extends TableDecorations {
   readonly visibleRanges: readonly VisibleRange[];
 }
 
 const sourceEditorTableDecorations = StateField.define<TableDecorationState>({
   create(state) {
     const visibleRanges = [{ from: 0, to: Math.min(state.doc.length, INITIAL_TABLE_SCAN_LIMIT) }];
-    return { decorations: tableDecorationSet(state, visibleRanges), visibleRanges };
+    return { ...tableDecorationSet(state, visibleRanges), visibleRanges };
   },
   update(value, transaction) {
     const viewport = transaction.effects.find((effect) => effect.is(updateSourceEditorTableViewport));
@@ -227,12 +318,15 @@ const sourceEditorTableDecorations = StateField.define<TableDecorationState>({
       }));
     }
     if (!transaction.docChanged && !transaction.selection && !viewport) return value;
-    return {
-      visibleRanges,
-      decorations: tableDecorationSet(transaction.state, visibleRanges),
-    };
+    return { ...tableDecorationSet(transaction.state, visibleRanges), visibleRanges };
   },
-  provide: (field) => EditorView.decorations.from(field, (value) => value.decorations),
+  // Two providers over ONE field, at two precedences. A block decoration may not
+  // come from a plugin (`@codemirror/view/dist/index.js:2743`), so demoting the
+  // whole field is not available: the cells are demoted, the block widget is not.
+  provide: (field) => [
+    EditorView.decorations.from(field, (value) => value.structure),
+    Prec.low(EditorView.decorations.from(field, (value) => value.cells)),
+  ],
 });
 
 const sourceEditorTableViewport = ViewPlugin.fromClass(class {

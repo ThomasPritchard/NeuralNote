@@ -524,7 +524,19 @@ html[data-font-family="sourceSerif4"] {
   border-left-color: var(--primary) !important;
 }
 
+/*
+ * The clamp is load-bearing, and not only for tidiness (plan §2 K4b).
+ * `.cm-content` is a flex item of `.cm-scroller`, so its `min-width: auto`
+ * resolves to min-content and a non-wrapping table line drags the whole
+ * document wide: measured 881.78px against a 400px pane, note-level horizontal
+ * scrolling appearing, and ordinary paragraphs no longer wrapping. Worse, at
+ * that width **no row is narrower than its own content**, so no table row can
+ * become a scroll container and the per-row scrolling has nothing to scroll —
+ * 0 of 7 rows overflowed inline unclamped, 6 of 7 clamped. No phase may
+ * remove this.
+ */
 .nn-source-editor .cm-content {
+  max-width: 100%;
   padding: 0;
   caret-color: var(--primary);
 }
@@ -707,6 +719,182 @@ html[data-font-family="sourceSerif4"] {
   width: 100%;
   height: 0;
   border-block-start: 1px solid var(--border);
+}
+
+/*
+ * ---------------------------------------------------------------------------
+ * The drawn table box (P3c of `specs/in-place-table-cell-editing-plan.md`).
+ *
+ * A table keeps ONE appearance whether or not the caret is inside it, so
+ * nothing below may key off focus, and the box is drawn over live editable
+ * source rather than over a read-only widget.
+ *
+ * Every hook is stamped by the producer — CT-1,
+ * `app/desktop/src/workspace/sourceEditorTableContractFixture.ts`. Table rows
+ * are `.cm-line` siblings among unrelated paragraph lines, so `:first-child`
+ * and `:last-child` cannot find a table's edges: `nn-lp-table-row-first` and
+ * `-last` are explicit classes for exactly that reason.
+ *
+ * CT-2: the column template is measured and stamped inline as
+ * `--nn-table-tracks`. This file may only wire that custom property through —
+ * authoring a literal `grid-template-columns` here would fight the stamp and
+ * desynchronise the columns from the measured widths.
+ *
+ * Widths this stylesheet contributes to a cell's measured text, which the
+ * measurement probe (CT-4) must reproduce: `var(--font-sans)` at 1rem,
+ * `line-height: 1.5`, `font-variant-numeric: tabular-nums`, `font-weight: 600`
+ * on header cells only, and `2 x var(--nn-table-cell-pad)` of inline padding
+ * inside every cell.
+ * ---------------------------------------------------------------------------
+ */
+.nn-source-editor .cm-line.nn-lp-table-row {
+  --nn-table-cell-pad: 0.5rem;
+
+  display: grid;
+  grid-template-columns: var(--nn-table-tracks);
+  /* CT-5: the border box lands on an integer, and NOTHING here may introduce a
+     margin — CodeMirror measures the border box
+     (`@codemirror/view/dist/index.js:3296`), so a margin is invisible to the
+     height map and every position below it drifts by that amount. The height
+     itself is declared on the cell, not here — see `.nn-lp-cell` below. */
+  border-inline: 1px solid var(--border);
+  border-block-end: 1px solid var(--border);
+  /* The trailing gap that keeps the last column clear of the closing edge at
+     maximum scroll. Grid items in a scroll container classically lose the
+     container's end padding; measured honoured here. */
+  padding-inline: 0 0.5rem;
+  /* The fill must stay TRANSLUCENT, permanently. `drawSelection`'s selection
+     layer is a child of `.cm-scroller` at z-index -2
+     (`@codemirror/view/dist/index.js:9432`), which paints below every in-flow
+     line background, so an opaque row fill erases the selection on every table
+     row. This is a standing constraint on the design system, not a setting. */
+  background: color-mix(in oklab, var(--surface-sunken) 55%, transparent);
+  line-height: 1.5;
+  font-variant-numeric: tabular-nums;
+  /* A table line does not wrap; its overflow belongs to the row, not to the
+     document. The `.cm-content { max-width: 100% }` clamp above is what makes
+     that possible at all. */
+  white-space: pre;
+  /* Written as the two-value shorthand deliberately. As longhands each is inert
+     given the other — a non-`visible` value on one axis computes the other from
+     `visible` to `auto` — so removing either changes nothing and neither can be
+     shown to matter. */
+  overflow: auto hidden;
+  overscroll-behavior-inline: contain;
+}
+
+/* K3: CodeMirror brackets every inline widget with `<img class="cm-widgetBuffer">`
+   (`@codemirror/view/dist/index.js:2338-2340`, `:2464-2469`). In a grid
+   container those are unplaced items that auto-flow into implicit rows —
+   measured 128.78px rows against a 19.59px line box, 6.4x too tall, while every
+   hit-testing probe still passed. Nothing can stamp them inline, because
+   CodeMirror creates them. */
+.nn-source-editor .nn-lp-table-row > * {
+  grid-row: 1;
+}
+
+.nn-source-editor .nn-lp-table-row > .cm-widgetBuffer {
+  grid-column: 1;
+}
+
+/* The row's height budget lives here rather than on the row, because a cell is
+   the only child a row is guaranteed to have and the only one whose size is the
+   design's to choose: 1rem text on a 1.5 line box between 0.5rem of block
+   padding is 8 + 24 + 8 = 40px, and the row adds 1px per drawn edge. Stated as
+   a floor as well as as padding so that a row of zero-length (empty) cells,
+   which has no line box to size it, still lands on the same budget. Border-box
+   sizing is in force, so the floor includes the padding. */
+.nn-source-editor .nn-lp-table-row .nn-lp-cell {
+  min-block-size: 2.5rem;
+  padding-block: 0.5rem;
+  padding-inline: var(--nn-table-cell-pad);
+  color: var(--foreground);
+}
+
+/*
+ * Chrome drawn where a cell delimiter used to be. The pipes are still in the
+ * file — only the painting changes. Under the grid each divider shares its
+ * cell's track (CT-1), so it is pinned to the track's leading edge and draws
+ * the column rule at full row height; the cell's own inline padding is what
+ * keeps the text clear of it. The `ch`-width mechanism the aligned-monospace
+ * path used does not carry over: the tracks do all of the alignment.
+ */
+.nn-source-editor .nn-lp-table-row .nn-lp-cell-chrome {
+  /* Both resets are load-bearing, not tidiness. The aligned-monospace path
+     sizes this chrome in `ch` and separates it with `margin-inline: 0.5ch`;
+     under the grid that margin pushes each divider 5.03px off its own track
+     origin (measured, fallback face at 16px) and shortens the leading and
+     trailing chrome by the same amount, so the column rules stop coinciding
+     with their columns. The border reset is what keeps the leading and
+     trailing chrome from drawing a second vertical line just inside the row's
+     own inline edges. */
+  inline-size: auto;
+  margin: 0;
+  border: 0;
+}
+
+.nn-source-editor .nn-lp-table-row .nn-lp-cell-chrome-divider {
+  justify-self: start;
+  border-inline-start: 1px solid var(--border);
+}
+
+.nn-source-editor .cm-line.nn-lp-table-row-header .nn-lp-cell {
+  font-weight: 600;
+}
+
+/* The header and the alignment row read as one block: same fill, and the
+   header's own bottom edge is suppressed so the two never draw two rules a few
+   pixels apart. A header row is always followed by an alignment row, so this
+   never leaves a table open. */
+.nn-source-editor .cm-line.nn-lp-table-row-header,
+.nn-source-editor .cm-line.nn-lp-table-row-delimiter {
+  background: color-mix(in oklab, var(--surface-raised) 70%, transparent);
+}
+
+.nn-source-editor .cm-line.nn-lp-table-row-header {
+  border-block-end-width: 0;
+}
+
+/* The alignment row carries no user content, so it collapses to the rule that
+   closes the header — a shaded skirt with the divider on its bottom edge. */
+.nn-source-editor .cm-line.nn-lp-table-row-delimiter {
+  border-block-end-color: var(--input);
+}
+
+/* The skirt's height. 1rem is not a free choice: the row's other children are
+   CodeMirror's own `cm-widgetBuffer` elements at `height: 1em`
+   (`@codemirror/view/dist/index.js:7011`), which this cannot go below without
+   the buffers holding the row open anyway. Measured: a 17px border box. */
+.nn-source-editor .nn-lp-table-row-delimiter .nn-lp-cell-chrome-rule {
+  min-block-size: 1rem;
+}
+
+/* C3: a table's edges are stamped, never inferred. A one-row table (header plus
+   alignment row, no body) puts first and last on two different lines, which is
+   the case the corner radii have to compose over — hence the corner longhands
+   rather than a `border-radius` shorthand that would round all four. */
+.nn-source-editor .cm-line.nn-lp-table-row-first {
+  border-block-start: 1px solid var(--border);
+  border-start-start-radius: 0.375rem;
+  border-start-end-radius: 0.375rem;
+}
+
+.nn-source-editor .cm-line.nn-lp-table-row-last {
+  border-end-start-radius: 0.375rem;
+  border-end-end-radius: 0.375rem;
+}
+
+/* One scroll affordance per table, owned by its last row (CT-7, decision 2).
+   The engine uses overlay scrollbars — the measured gutter was 0px on every row
+   in all three spike arms — so this reserves no layout space either way and is
+   purely a visual call. A bar under every row reads as damage; one bar beneath
+   the last row reads as the table's own scrollbar. */
+.nn-source-editor .nn-lp-table-row:not(.nn-lp-table-row-last) {
+  scrollbar-width: none;
+}
+
+.nn-source-editor .nn-lp-table-row:not(.nn-lp-table-row-last)::-webkit-scrollbar {
+  display: none;
 }
 
 .nn-source-editor :where(.nn-lp-link, .nn-lp-wikilink-resolved) {

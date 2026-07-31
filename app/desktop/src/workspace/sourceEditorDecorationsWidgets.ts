@@ -4,14 +4,29 @@ import type { PreviewDecoration } from "./sourceEditorDecorationsTypes";
 import { tableModelAt, type TableDelimiterKind } from "./sourceEditorTableModel";
 
 /**
+ * The stamped `grid-column`, written as an attribute rather than through
+ * `element.style`. Both routes reach the same computed value, but only the
+ * attribute survives verbatim, and CT-1 pins the attribute.
+ */
+function stampColumn(element: HTMLElement, gridColumn: string): void {
+  element.setAttribute("style", `grid-column: ${gridColumn}`);
+}
+
+/**
  * Drawn chrome in place of a hidden cell delimiter. The source keeps its pipes;
  * this only changes what is painted, so copy, cut and save still yield exactly
  * the Markdown on disk.
+ *
+ * It carries its column explicitly because a row line is a `.cm-line` sibling
+ * among unrelated paragraph lines, so no CSS selector can work out where a table
+ * starts or ends (CT-1 C1). Column widths are the track list's job now, which is
+ * why the old `--nn-cell-pad` run of columns is gone: a track sized in pixels
+ * and a pad counted in characters cannot both decide where a column ends.
  */
 export class TableChromeWidget extends WidgetType {
   constructor(
     private readonly kind: TableDelimiterKind,
-    private readonly padColumns: number,
+    private readonly gridColumn: string,
   ) {
     super();
   }
@@ -19,16 +34,51 @@ export class TableChromeWidget extends WidgetType {
   eq(other: WidgetType): boolean {
     return other instanceof TableChromeWidget
       && other.kind === this.kind
-      && other.padColumns === this.padColumns;
+      && other.gridColumn === this.gridColumn;
   }
 
   toDOM(): HTMLElement {
     const element = document.createElement("span");
     element.className = `nn-lp-cell-chrome nn-lp-cell-chrome-${this.kind}`;
+    stampColumn(element, this.gridColumn);
     element.setAttribute("aria-hidden", "true");
-    if (this.padColumns > 0) {
-      element.style.setProperty("--nn-cell-pad", `${this.padColumns}ch`);
-    }
+    return element;
+  }
+
+  ignoreEvent(): boolean {
+    return true;
+  }
+}
+
+/** A cell with no source to mark: declared and blank, or never written at all. */
+export type TableCellVariant = "empty" | "filler";
+
+/**
+ * A cell that holds its column open with nothing in it.
+ *
+ * It can only be a zero-length widget: `Decoration.mark` throws on an empty
+ * range (`@codemirror/view/dist/index.js:316`), and without something at the
+ * column the row's grid would close up and every later column would shift left
+ * against the rows above.
+ */
+export class TableCellWidget extends WidgetType {
+  constructor(
+    private readonly variant: TableCellVariant,
+    private readonly gridColumn: string,
+  ) {
+    super();
+  }
+
+  eq(other: WidgetType): boolean {
+    return other instanceof TableCellWidget
+      && other.variant === this.variant
+      && other.gridColumn === this.gridColumn;
+  }
+
+  toDOM(): HTMLElement {
+    const element = document.createElement("span");
+    element.className = `nn-lp-cell nn-lp-cell-${this.variant}`;
+    stampColumn(element, this.gridColumn);
     return element;
   }
 
