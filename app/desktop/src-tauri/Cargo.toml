@@ -15,6 +15,15 @@ edition = "2021"
 name = "desktop_lib"
 crate-type = ["staticlib", "cdylib", "rlib"]
 
+[features]
+native-e2e = [
+  "dep:objc2",
+  "dep:objc2-app-kit",
+  "dep:objc2-foundation",
+  "dep:tauri-plugin-wdio",
+  "dep:tauri-plugin-wdio-webdriver",
+]
+
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
 
@@ -59,6 +68,10 @@ tauri-plugin-process = "2.3.1"
 # Caller-generated chat turn ids are parsed and canonicalised at the native IPC
 # boundary. Generation remains in the webview, so no RNG feature is required.
 uuid = "1"
+# Native automation is an explicit debug-only feature. Both plugins are absent
+# from the default dependency graph and production capability set.
+tauri-plugin-wdio = { version = "=1.2.0", optional = true }
+tauri-plugin-wdio-webdriver = { version = "=1.2.0", optional = true }
 
 [dev-dependencies]
 # Behavioural-eval integration test (tests/behavioural_eval.rs): a temp fixture
@@ -70,3 +83,8 @@ image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]
 tauri-plugin-autostart = "2.5.1"
 tauri-plugin-updater = "2.10.1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { version = "0.6.4", optional = true }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSEvent", "NSGraphicsContext", "NSResponder", "NSWindow"], optional = true }
+objc2-foundation = { version = "0.3.2", optional = true }

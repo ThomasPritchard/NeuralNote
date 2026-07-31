@@ -1458,14 +1458,14 @@ describe("ChatPane — composer reasoning toggle", () => {
 describe("ChatPane — reasoning backstop notice", () => {
   const BACKSTOP = /Reasoning was on, but the model didn't return any/;
 
-  it("stays quiet when reasoning was on but no thinking arrived", async () => {
+  it("shows the requested-reasoning backstop exactly once when no thinking arrived", async () => {
     await askInChat(
       "q",
       [{ type: "answer", delta: "an answer" }, { type: "done" }],
       openRouterActive(DEFAULT_MODEL, { reasoning: true }),
     );
 
-    expect(screen.queryByText(BACKSTOP)).not.toBeInTheDocument();
+    expect(screen.getAllByText(BACKSTOP)).toHaveLength(1);
     expect(document.querySelector("details")).toBeNull();
   });
 
@@ -1507,7 +1507,7 @@ describe("ChatPane — reasoning backstop notice", () => {
     expect(screen.queryByText(BACKSTOP)).not.toBeInTheDocument();
   });
 
-  it("stays quiet when the reasoning opt-in changes mid-stream", async () => {
+  it("keeps the turn's requested-reasoning backstop when the opt-in changes mid-stream", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive(DEFAULT_MODEL, { reasoning: true }));
     const { user } = setup();
     await screen.findByLabelText("Ask across your vault");
@@ -1530,15 +1530,15 @@ describe("ChatPane — reasoning backstop notice", () => {
       ).toHaveAttribute("aria-pressed", "false"),
     );
 
-    // The in-flight turn finishes with zero thinking. That remains an omitted
-    // implementation detail, regardless of the opt-in transition.
+    // The in-flight turn pinned effective reasoning at send time, so its
+    // missing-thinking notice remains accurate after the global opt-in changes.
     await act(async () => {
       emit({ type: "answer", delta: "an answer" });
       emit({ type: "done" });
       gate.resolve(TURN_ID);
       await gate.promise;
     });
-    expect(screen.queryByText(BACKSTOP)).not.toBeInTheDocument();
+    expect(screen.getAllByText(BACKSTOP)).toHaveLength(1);
   });
 });
 

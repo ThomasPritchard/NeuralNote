@@ -1,0 +1,583 @@
+{
+  "version": 1,
+  "constants": {
+    "maxEditableNoteBytes": 8388608,
+    "maxTotalMatches": 200,
+    "maxMatchesPerFile": 50,
+    "maxQueryChars": 256,
+    "snippetMaxChars": 200
+  },
+  "errors": {
+    "notFound": {
+      "kind": "notFound",
+      "message": "fixture"
+    },
+    "alreadyExists": {
+      "kind": "alreadyExists",
+      "message": "fixture"
+    },
+    "outsideVault": {
+      "kind": "outsideVault",
+      "message": "fixture"
+    },
+    "invalidName": {
+      "kind": "invalidName",
+      "message": "fixture"
+    },
+    "invalidContent": {
+      "kind": "invalidContent",
+      "message": "fixture"
+    },
+    "conflict": {
+      "kind": "conflict",
+      "message": "fixture"
+    },
+    "io": {
+      "kind": "io",
+      "message": "fixture"
+    },
+    "frontmatter": {
+      "kind": "frontmatter",
+      "message": "fixture"
+    },
+    "llm": {
+      "kind": "llm",
+      "message": "fixture"
+    },
+    "localAi": {
+      "kind": "localAi",
+      "message": "fixture"
+    }
+  },
+  "scenarios": {
+    "backlinks-feature": [
+      {
+        "command": "read_backlinks",
+        "arguments": {
+          "path": "/vault/Target.md"
+        },
+        "result": {
+          "linked": [
+            {
+              "line": 1,
+              "snippet": "Go to [[Target]].",
+              "sourceRel": "Link Hub.md",
+              "sourceTitle": "Link Hub"
+            },
+            {
+              "line": 1,
+              "snippet": "This links [Target](Target.md) from markdown.",
+              "sourceRel": "Source Md.md",
+              "sourceTitle": "Source Md"
+            },
+            {
+              "line": 1,
+              "snippet": "This links [[Target]] from wiki.",
+              "sourceRel": "Source Wiki.md",
+              "sourceTitle": "Source Wiki"
+            }
+          ],
+          "skippedFiles": 0,
+          "unlinked": [
+            {
+              "line": 1,
+              "snippet": "A plain Target mention without a link.",
+              "sourceRel": "Plain Mention.md",
+              "sourceTitle": "Plain Mention"
+            }
+          ]
+        }
+      }
+    ],
+    "backlinks-missing-target": [
+      {
+        "command": "read_backlinks",
+        "arguments": {
+          "path": "/vault/Missing.md"
+        },
+        "error": {
+          "kind": "notFound",
+          "message": "Missing.md"
+        }
+      }
+    ],
+    "fixture-validation": [
+      {
+        "command": "search_vault",
+        "arguments": {
+          "query": "neural"
+        },
+        "result": {
+          "hits": [],
+          "skippedFiles": 0,
+          "truncated": false
+        }
+      }
+    ],
+    "graph-linked": [
+      {
+        "command": "read_link_graph",
+        "arguments": {},
+        "result": {
+          "links": [
+            {
+              "bridge": true,
+              "source": "essays/Gamma.md",
+              "target": "notes/Alpha.md"
+            },
+            {
+              "bridge": false,
+              "source": "notes/Alpha.md",
+              "target": "notes/Beta.md"
+            }
+          ],
+          "nodes": [
+            {
+              "cluster": "essays",
+              "id": "essays/Gamma.md",
+              "title": "Gamma"
+            },
+            {
+              "cluster": "notes",
+              "id": "notes/Alpha.md",
+              "title": "Alpha"
+            },
+            {
+              "cluster": "notes",
+              "id": "notes/Beta.md",
+              "title": "Beta"
+            }
+          ],
+          "skippedFiles": 0
+        }
+      }
+    ],
+    "note-read-binary": [
+      {
+        "command": "read_note",
+        "arguments": {
+          "path": "/vault/binary.png"
+        },
+        "result": {
+          "binary": true,
+          "body": "",
+          "contentHash": "",
+          "exceedsEditableSize": false,
+          "frontmatter": null,
+          "frontmatterError": null,
+          "frontmatterRaw": null,
+          "lossyText": false,
+          "path": "/vault/binary.png",
+          "raw": "",
+          "relPath": "binary.png",
+          "sizeBytes": 0,
+          "title": "binary"
+        }
+      }
+    ],
+    "note-read-lossy": [
+      {
+        "command": "read_note",
+        "arguments": {
+          "path": "/vault/lossy.md"
+        },
+        "result": {
+          "binary": false,
+          "body": "�",
+          "contentHash": "6459982057640680904",
+          "exceedsEditableSize": false,
+          "frontmatter": null,
+          "frontmatterError": null,
+          "frontmatterRaw": null,
+          "lossyText": true,
+          "path": "/vault/lossy.md",
+          "raw": "�",
+          "relPath": "lossy.md",
+          "sizeBytes": 0,
+          "title": "lossy"
+        }
+      }
+    ],
+    "note-read-malformed": [
+      {
+        "command": "read_note",
+        "arguments": {
+          "path": "/vault/malformed.md"
+        },
+        "result": {
+          "binary": false,
+          "body": "---\ntitle: broken\nno closing fence",
+          "contentHash": "423598519892908406",
+          "exceedsEditableSize": false,
+          "frontmatter": null,
+          "frontmatterError": "frontmatter block was opened with `---` but never closed",
+          "frontmatterRaw": null,
+          "lossyText": false,
+          "path": "/vault/malformed.md",
+          "raw": "---\ntitle: broken\nno closing fence",
+          "relPath": "malformed.md",
+          "sizeBytes": 0,
+          "title": "malformed"
+        }
+      }
+    ],
+    "note-read-normal": [
+      {
+        "command": "read_note",
+        "arguments": {
+          "path": "/vault/normal.md"
+        },
+        "result": {
+          "binary": false,
+          "body": "# Normal\n\nbody",
+          "contentHash": "13327470559663711484",
+          "exceedsEditableSize": false,
+          "frontmatter": null,
+          "frontmatterError": null,
+          "frontmatterRaw": null,
+          "lossyText": false,
+          "path": "/vault/normal.md",
+          "raw": "# Normal\n\nbody",
+          "relPath": "normal.md",
+          "sizeBytes": 0,
+          "title": "Normal"
+        }
+      }
+    ],
+    "note-read-oversized": [
+      {
+        "command": "read_note",
+        "arguments": {
+          "path": "/vault/oversized.md"
+        },
+        "result": {
+          "binary": false,
+          "body": "",
+          "contentHash": "",
+          "exceedsEditableSize": true,
+          "frontmatter": null,
+          "frontmatterError": null,
+          "frontmatterRaw": null,
+          "lossyText": false,
+          "path": "/vault/oversized.md",
+          "raw": "",
+          "relPath": "oversized.md",
+          "sizeBytes": 8388609,
+          "title": "oversized"
+        }
+      }
+    ],
+    "search-alpha": [
+      {
+        "command": "search_vault",
+        "arguments": {
+          "query": "alpha"
+        },
+        "result": {
+          "hits": [
+            {
+              "matches": [],
+              "nameMatch": true,
+              "path": "/vault/Zebra alpha.md",
+              "relPath": "Zebra alpha.md",
+              "title": "Zebra alpha"
+            },
+            {
+              "matches": [
+                {
+                  "line": 1,
+                  "ranges": [
+                    [
+                      0,
+                      5
+                    ]
+                  ],
+                  "snippet": "alpha mention inside."
+                }
+              ],
+              "nameMatch": false,
+              "path": "/vault/Apple.md",
+              "relPath": "Apple.md",
+              "title": "Apple"
+            }
+          ],
+          "skippedFiles": 0,
+          "truncated": false
+        }
+      }
+    ],
+    "search-hello": [
+      {
+        "command": "search_vault",
+        "arguments": {
+          "query": "hello"
+        },
+        "result": {
+          "hits": [
+            {
+              "matches": [
+                {
+                  "line": 1,
+                  "ranges": [
+                    [
+                      0,
+                      5
+                    ]
+                  ],
+                  "snippet": "hello"
+                }
+              ],
+              "nameMatch": false,
+              "path": "/vault/Note.md",
+              "relPath": "Note.md",
+              "title": "Note"
+            }
+          ],
+          "skippedFiles": 0,
+          "truncated": false
+        }
+      }
+    ],
+    "search-inline-tags": [
+      {
+        "command": "search_vault",
+        "arguments": {
+          "query": "tag:#SaaS"
+        },
+        "result": {
+          "hits": [
+            {
+              "matches": [
+                {
+                  "line": 1,
+                  "ranges": [
+                    [
+                      5,
+                      10
+                    ]
+                  ],
+                  "snippet": "Uses #SaaS"
+                }
+              ],
+              "nameMatch": false,
+              "path": "/vault/Exact.md",
+              "relPath": "Exact.md",
+              "title": "Exact"
+            },
+            {
+              "matches": [
+                {
+                  "line": 1,
+                  "ranges": [
+                    [
+                      5,
+                      16
+                    ]
+                  ],
+                  "snippet": "Uses #SaaS/cloud"
+                }
+              ],
+              "nameMatch": false,
+              "path": "/vault/Nested.md",
+              "relPath": "Nested.md",
+              "title": "Nested"
+            },
+            {
+              "matches": [
+                {
+                  "line": 2,
+                  "ranges": [
+                    [
+                      7,
+                      11
+                    ]
+                  ],
+                  "snippet": "tags: [SaaS]"
+                }
+              ],
+              "nameMatch": false,
+              "path": "/vault/Property.md",
+              "relPath": "Property.md",
+              "title": "Property"
+            },
+            {
+              "matches": [
+                {
+                  "line": 1,
+                  "ranges": [
+                    [
+                      0,
+                      5
+                    ]
+                  ],
+                  "snippet": "#SaaS overview"
+                }
+              ],
+              "nameMatch": false,
+              "path": "/vault/Source.md",
+              "relPath": "Source.md",
+              "title": "Source"
+            }
+          ],
+          "skippedFiles": 0,
+          "truncated": false
+        }
+      }
+    ],
+    "search-property-tags": [
+      {
+        "command": "search_vault",
+        "arguments": {
+          "query": "tag:#SaaS"
+        },
+        "result": {
+          "hits": [
+            {
+              "matches": [
+                {
+                  "line": 1,
+                  "ranges": [
+                    [
+                      5,
+                      10
+                    ]
+                  ],
+                  "snippet": "Uses #SaaS"
+                }
+              ],
+              "nameMatch": false,
+              "path": "/vault/Exact.md",
+              "relPath": "Exact.md",
+              "title": "Exact"
+            },
+            {
+              "matches": [
+                {
+                  "line": 2,
+                  "ranges": [
+                    [
+                      7,
+                      17
+                    ]
+                  ],
+                  "snippet": "tags: [SaaS/cloud]"
+                }
+              ],
+              "nameMatch": false,
+              "path": "/vault/Nested.md",
+              "relPath": "Nested.md",
+              "title": "Nested"
+            },
+            {
+              "matches": [
+                {
+                  "line": 2,
+                  "ranges": [
+                    [
+                      7,
+                      11
+                    ]
+                  ],
+                  "snippet": "tags: [SaaS]"
+                }
+              ],
+              "nameMatch": false,
+              "path": "/vault/Property source.md",
+              "relPath": "Property source.md",
+              "title": "Property source"
+            }
+          ],
+          "skippedFiles": 0,
+          "truncated": false
+        }
+      }
+    ],
+    "search-recipe": [
+      {
+        "command": "search_vault",
+        "arguments": {
+          "query": "recipe"
+        },
+        "result": {
+          "hits": [
+            {
+              "matches": [],
+              "nameMatch": true,
+              "path": "/vault/Recipes.md",
+              "relPath": "Recipes.md",
+              "title": "Recipes"
+            },
+            {
+              "matches": [
+                {
+                  "line": 1,
+                  "ranges": [
+                    [
+                      12,
+                      18
+                    ]
+                  ],
+                  "snippet": "Tried a new recipe today."
+                }
+              ],
+              "nameMatch": false,
+              "path": "/vault/Journal.md",
+              "relPath": "Journal.md",
+              "title": "Journal"
+            }
+          ],
+          "skippedFiles": 0,
+          "truncated": false
+        }
+      }
+    ],
+    "templates-feature": [
+      {
+        "command": "list_templates",
+        "arguments": {},
+        "result": [
+          {
+            "name": "Starter",
+            "relPath": "Templates/Starter.md"
+          }
+        ]
+      },
+      {
+        "command": "create_note_from_template",
+        "arguments": {
+          "name": "Project Plan",
+          "parentPath": "/vault",
+          "template": "Templates/Starter.md"
+        },
+        "result": {
+          "children": null,
+          "ext": "md",
+          "kind": "file",
+          "name": "Project Plan.md",
+          "path": "/vault/Project Plan.md",
+          "relPath": "Project Plan.md"
+        },
+        "mutation": {
+          "write": {
+            "content": "Template body for Project Plan.",
+            "relPath": "Project Plan.md"
+          }
+        }
+      }
+    ],
+    "workspace-corrupt": [
+      {
+        "command": "load_workspace_state",
+        "arguments": {},
+        "result": {
+          "recoveredFromCorrupt": true,
+          "recoveryMessage": "could not parse workspace state at /vault/.neuralnote/workspace-state.json: key must be a string at line 1 column 2",
+          "state": {
+            "activePath": null,
+            "openPaths": []
+          }
+        }
+      }
+    ]
+  }
+}

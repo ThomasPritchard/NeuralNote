@@ -114,6 +114,40 @@ describe("Journey 7: cited chat — no API key", () => {
     // We're in setup, so the chat composer isn't rendered.
     expect(screen.queryByLabelText("Ask across your vault")).not.toBeInTheDocument();
   });
+
+  it("can skip onboarding without accidentally enabling chat", async () => {
+    const { user } = await openWorkspace({ apiKey: { hasKey: false } });
+
+    await user.click(await screen.findByRole("button", { name: "Skip for now" }));
+
+    expect(screen.getByText("Cited chat is off")).toBeInTheDocument();
+    expect(screen.queryByLabelText("Ask across your vault")).not.toBeInTheDocument();
+    await user.click(screen.getByRole("button", { name: "Connect a model" }));
+    expect(screen.getByRole("button", { name: /connect an openrouter key/i })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /set up local ai/i })).toBeInTheDocument();
+  });
+
+  it("saves the entered provider key and model before enabling chat", async () => {
+    const { user, backend } = await openWorkspace({
+      apiKey: { hasKey: false },
+      expectedApiKey: "sk-or-test-secret",
+    });
+    await user.click(await screen.findByRole("button", { name: /connect an openrouter key/i }));
+    await user.type(screen.getByLabelText("OpenRouter API key"), "sk-or-test-secret");
+    const model = screen.getByLabelText("Model");
+    await user.clear(model);
+    await user.type(model, "openai/gpt-5.2");
+    await user.click(screen.getByRole("button", { name: /save & start chatting/i }));
+
+    expect(await screen.findByLabelText("Ask across your vault")).toBeInTheDocument();
+    expect(
+      screen.getByRole("button", { name: /choose ai model, current gpt-5\.2/i }),
+    ).toBeInTheDocument();
+    expect(backend.calls.filter((call) => call === "save_api_key")).toHaveLength(1);
+    expect(backend.apiKeySaveAttempts).toEqual([
+      { keyMatchesExpected: true, model: "openai/gpt-5.2" },
+    ]);
+  });
 });
 
 describe("Journey 7: chat model selection", () => {
@@ -134,13 +168,58 @@ describe("Journey 7: chat model selection", () => {
 });
 
 describe("Journey 7: cited chat — streamed run", () => {
+  it("renders each progressive phase before the answer and terminal frame", async () => {
+    const { user, advanceNextFrame } = await openWorkspace({
+      chatScript: [
+        { type: "searching", query: "photosynthesis" },
+        { type: "answer", delta: "Plants need light." },
+        { type: "done" },
+      ],
+    });
+
+    await ask(user, "How do plants grow?");
+    expect(screen.queryByText("Plants need light.")).not.toBeInTheDocument();
+
+    expect(await advanceNextFrame()).toBe(true);
+    expect(screen.getByText("searching")).toBeInTheDocument();
+    expect(screen.queryByText("Plants need light.")).not.toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop response" })).toBeInTheDocument();
+
+    expect(await advanceNextFrame()).toBe(true);
+    expect(screen.getByText("Plants need light.")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Stop response" })).toBeInTheDocument();
+
+    expect(await advanceNextFrame()).toBe(true);
+    expect(await advanceNextFrame()).toBe(true);
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Send" })).toBeInTheDocument(),
+    );
+  });
+
+  it("renders a greeting-only answer without research chrome", async () => {
+    const { user, advanceAllFrames } = await openWorkspace({
+      chatScript: [
+        { type: "answer", delta: "Hello — what would you like to explore?" },
+        { type: "done" },
+      ],
+    });
+
+    await ask(user, "hello");
+    await advanceAllFrames();
+
+    expect(await screen.findByText("Hello — what would you like to explore?")).toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Search activity" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Nothing in your vault covers this")).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Cited sources" })).not.toBeInTheDocument();
+  });
   it("renders the harness trace, the streamed answer, a source chip and coverage", async () => {
-    const { user } = await openWorkspace({
+    const { user, advanceAllFrames } = await openWorkspace({
       seed: [{ kind: "file", relPath: NOTE_REL, content: NOTE_BODY }],
       chatScript: successScript,
     });
 
     await ask(user, "How does photosynthesis work?");
+    await advanceAllFrames();
 
     // The finished run collapses to one summary line (collapsed by default), not
     // the row wall — so the answer sits right under the prompt.
@@ -175,12 +254,13 @@ describe("Journey 7: cited chat — streamed run", () => {
   });
 
   it("folds reasoning into its own disclosure and never into the cited answer", async () => {
-    const { user } = await openWorkspace({
+    const { user, advanceAllFrames } = await openWorkspace({
       seed: [{ kind: "file", relPath: NOTE_REL, content: NOTE_BODY }],
       chatScript: reasoningScript,
     });
 
     await ask(user, "How does photosynthesis work?");
+    await advanceAllFrames();
 
     // The answer is exactly what the `answer` deltas carried. If reasoning ever
     // leaked into it, the cited text would no longer match the verified span.
@@ -208,12 +288,13 @@ describe("Journey 7: cited chat — streamed run", () => {
   });
 
   it("opens the cited note in the reader when its source chip is clicked", async () => {
-    const { user } = await openWorkspace({
+    const { user, advanceAllFrames } = await openWorkspace({
       seed: [{ kind: "file", relPath: NOTE_REL, content: NOTE_BODY }],
       chatScript: successScript,
     });
 
     await ask(user, "explain it");
+    await advanceAllFrames();
 
     const sources = await screen.findByRole("list", { name: "Cited sources" });
     await user.click(within(sources).getByRole("button", { name: /Photosynthesis\.md:12/ }));
@@ -232,9 +313,10 @@ describe("Journey 7: cited chat — surfaced error", () => {
       { type: "searching", query: "quantum gravity" },
       { type: "error", message: "The model provider is unreachable." },
     ];
-    const { user } = await openWorkspace({ chatScript: errorScript });
+    const { user, advanceAllFrames } = await openWorkspace({ chatScript: errorScript });
 
     await ask(user, "anything");
+    await advanceAllFrames();
 
     expect(
       await screen.findByText("The model provider is unreachable."),
@@ -243,5 +325,25 @@ describe("Journey 7: cited chat — surfaced error", () => {
     await waitFor(() =>
       expect(screen.getByLabelText("Ask across your vault")).toBeEnabled(),
     );
+  });
+
+  it("keeps the stopped state authoritative when late provider frames arrive", async () => {
+    const { user, advanceAllFrames } = await openWorkspace({
+      chatScript: [{ type: "processing" }],
+      cancelChatAfterEvents: 1,
+      cancelChatTail: [
+        { type: "answer", delta: "late provider answer" },
+        { type: "done" },
+      ],
+    });
+    await ask(user, "stop this");
+    await advanceAllFrames();
+    await user.click(await screen.findByRole("button", { name: "Stop response" }));
+    expect(await screen.findByText("Stopped")).toBeInTheDocument();
+
+    await advanceAllFrames();
+
+    expect(screen.getByText("Stopped")).toBeInTheDocument();
+    expect(screen.queryByText("late provider answer")).not.toBeInTheDocument();
   });
 });

@@ -35,9 +35,10 @@ const ACCEPTED = new Map([
         "3.x/5.x/9.x consumers here (function-call import) breaks them at runtime " +
         "(verified against the published tarballs). " +
         "Reachability: the expansion path is only reachable through glob patterns, " +
-        "and the only pattern in e2e-native is the static string " +
-        "`specs: [\"./specs/**/*.spec.ts\"]` in wdio.conf.ts — no untrusted input " +
-        "reaches it, and the package is CI-only dev tooling that ships no artifact. " +
+        "and e2e-native passes only fixed spec paths selected by the internal " +
+        "`nativeSpecsForPhase` allowlist in wdio.conf.ts. The phase is accepted only " +
+        "when it exactly matches a fixed value, so no untrusted input reaches glob " +
+        "expansion. The package is CI-only dev tooling that ships no artifact. " +
         "Removal trigger: when minimatch/mocha/webdriverio releases pull a patched " +
         "brace-expansion within compatible ranges, `npm audit fix` and delete this entry.",
     },

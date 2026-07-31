@@ -18,7 +18,7 @@
 // the real mockIPC event bridge, so the app's genuine onTreeChanged
 // subscriptions (store tree refresh + useNoteTabs reconcile) both run.
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { act, screen, waitFor } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
 import { TREE_CHANGED } from "../lib/bindings/events";
@@ -33,8 +33,8 @@ const SEED: SeedEntry[] = [
   { kind: "file", relPath: "Beta.md", content: "Beta body." },
 ];
 
-// The reconcile debounce is 300 ms; negative assertions wait well past it.
-const PAST_DEBOUNCE_MS = 600;
+// Source of truth: useNoteTabs.EXTERNAL_RELOAD_DEBOUNCE_MS.
+const RECONCILE_DEBOUNCE_MS = 300;
 
 /** Open the recent vault and wait until the workspace tree has rendered. */
 async function openVault(seed: SeedEntry[] = SEED): Promise<RenderAppResult> {
@@ -51,6 +51,27 @@ async function fireWatcher(times = 1): Promise<void> {
   });
 }
 
+/** Emit a watcher burst and advance the real frontend debounce without wall
+ * clock time. `beforeExpiry` observes the 299 ms boundary when supplied. */
+async function fireWatcherAfterDebounce(
+  times = 1,
+  beforeExpiry?: () => void,
+): Promise<void> {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    await fireWatcher(times);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(RECONCILE_DEBOUNCE_MS - 1);
+    });
+    beforeExpiry?.();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+}
+
 const readNoteCalls = (backend: RenderAppResult["backend"]) =>
   backend.calls.filter((cmd) => cmd === "read_note").length;
 
@@ -61,7 +82,7 @@ const noteEditor = () => screen.findByRole("textbox", { name: "Note content" });
  *  element reference goes stale — always re-query. */
 const getEditor = () => screen.getByRole("textbox", { name: "Note content" });
 
-describe("Journey: external edit reloads a clean open note (issue #31)", () => {
+describe("Frontend reconciliation only: external edit reloads a clean open note (issue #31)", () => {
   it("updates the reader, coalescing a watcher burst into one reconcile read", async () => {
     const { user, backend } = await openVault();
     await user.click(await screen.findByRole("button", { name: "Alpha.md" }));
@@ -69,7 +90,10 @@ describe("Journey: external edit reloads a clean open note (issue #31)", () => {
     expect(readNoteCalls(backend)).toBe(1); // the initial open
 
     backend.applyExternalEdit("Alpha.md", "edited elsewhere");
-    await fireWatcher(3); // a git-pull-style burst must collapse into one read
+    await fireWatcherAfterDebounce(3, () => {
+      expect(getEditor()).toHaveTextContent("Alpha body.");
+      expect(readNoteCalls(backend)).toBe(1);
+    }); // a git-pull-style burst must collapse into one read
 
     await waitFor(() => expect(getEditor()).toHaveTextContent("edited elsewhere"), {
       timeout: 3000,
@@ -82,14 +106,14 @@ describe("Journey: external edit reloads a clean open note (issue #31)", () => {
   });
 });
 
-describe("Journey: external deletion of an open note (issue #31)", () => {
+describe("Frontend reconciliation only: external deletion of an open note (issue #31)", () => {
   it("surfaces the deletion notice and keeps the note and draft on screen", async () => {
     const { user, backend } = await openVault();
     await user.click(await screen.findByRole("button", { name: "Alpha.md" }));
     expect(await noteEditor()).toHaveTextContent("Alpha body.");
 
     backend.applyExternalDelete("Alpha.md");
-    await fireWatcher();
+    await fireWatcherAfterDebounce();
 
     expect(
       await screen.findByText(/deleted on disk/, undefined, { timeout: 3000 }),
@@ -102,7 +126,7 @@ describe("Journey: external deletion of an open note (issue #31)", () => {
   });
 });
 
-describe("Journey: external edit under a dirty draft (issue #31)", () => {
+describe("Frontend reconciliation only: external edit under a dirty draft (issue #31)", () => {
   it("surfaces the conflict, preserves the draft, and Reload resolves it explicitly", async () => {
     const { user, backend } = await openVault();
     await user.click(await screen.findByRole("button", { name: "Alpha.md" }));
@@ -113,7 +137,7 @@ describe("Journey: external edit under a dirty draft (issue #31)", () => {
     await screen.findByLabelText("Unsaved changes");
 
     backend.applyExternalEdit("Alpha.md", "changed under me");
-    await fireWatcher();
+    await fireWatcherAfterDebounce();
 
     // The conflict surfaces — and the draft is never clobbered.
     expect(
@@ -150,8 +174,7 @@ describe("Journey: in-app save does not self-trigger a reload (issue #31)", () =
 
     // The save wrote the file, which fires the watcher: the reconcile reads it
     // back, finds the hash unchanged, and leaves the tab exactly as saved.
-    await fireWatcher();
-    await act(() => new Promise((resolve) => setTimeout(resolve, PAST_DEBOUNCE_MS)));
+    await fireWatcherAfterDebounce();
 
     expect(editor).toHaveTextContent("saved in app");
     expect(screen.queryByText(/changed on disk/)).not.toBeInTheDocument();
@@ -179,7 +202,7 @@ describe("Journey: rename of an open note (issue #31)", () => {
 
     // An external edit landing at the NEW path reloads the same tab.
     backend.applyExternalEdit("New.md", "edited at the new path");
-    await fireWatcher();
+    await fireWatcherAfterDebounce();
     await waitFor(() => expect(getEditor()).toHaveTextContent("edited at the new path"), {
       timeout: 3000,
     });
@@ -201,13 +224,12 @@ describe("Journey: vault close tears down the reconcile listener (issue #31)", (
 
     // A watcher ping after close must reach no listener: no reconcile read.
     backend.applyExternalEdit("Alpha.md", "edited while closed");
-    await fireWatcher();
-    await act(() => new Promise((resolve) => setTimeout(resolve, PAST_DEBOUNCE_MS)));
+    await fireWatcherAfterDebounce();
     expect(readNoteCalls(backend)).toBe(readsWhileOpen);
   });
 });
 
-describe("Journey: external change grows a clean note past the editable limit (#31 × #82)", () => {
+describe("Frontend reconciliation only: external change grows a clean note past the editable limit (#31 × #82)", () => {
   it(
     "lands on the explicit size-limit state — the oversized content never mounts an editor",
     { timeout: 20_000 },
@@ -220,7 +242,7 @@ describe("Journey: external change grows a clean note past the editable limit (#
 
       // Another editor inflates the file past 8 MiB; the watcher pings.
       backend.applyExternalEdit("Grow.md", "x".repeat(MAX_EDITABLE_NOTE_BYTES + 1));
-      await fireWatcher();
+      await fireWatcherAfterDebounce();
 
       // The flagged read-side doc flows through the SAME reconcile path: the
       // tab lands on the size-limit notice, never in CodeMirror.

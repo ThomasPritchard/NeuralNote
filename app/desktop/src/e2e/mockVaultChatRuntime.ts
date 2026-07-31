@@ -16,6 +16,7 @@ import {
 } from "./mockVaultTypes";
 import { channelSender } from "./mockVaultChannel";
 import { DEFAULT_REQUIREMENT_DOWNLOAD_SCRIPT } from "./mockVaultDefaults";
+import type { MockScheduledTask, MockScheduler } from "./mockScheduler";
 
 type CommandHandler = (a: Record<string, unknown>) => unknown;
 
@@ -26,7 +27,10 @@ export interface ChatRuntime {
   readonly profileFolder: string | null;
 }
 
-export const createChatRuntime = (opts: CreateMockVaultOptions): ChatRuntime => {
+export const createChatRuntime = (
+  opts: CreateMockVaultOptions,
+  scheduler: MockScheduler,
+): ChatRuntime => {
   const chatScript = opts.chatScript ?? [];
 
   const chatCalls: ChatCallRecord[] = [];
@@ -52,7 +56,7 @@ export const createChatRuntime = (opts: CreateMockVaultOptions): ChatRuntime => 
   }
   let pausedChat: PausedChat | null = null;
   let pendingRequirementDownload: {
-    timer: ReturnType<typeof setTimeout>;
+    tasks: MockScheduledTask[];
     send: (message: unknown) => void;
     finish: () => void;
   } | null = null;
@@ -67,9 +71,11 @@ export const createChatRuntime = (opts: CreateMockVaultOptions): ChatRuntime => 
     runId: string,
     finish: () => void,
   ): void => {
+    let queuedFrame = false;
     for (let i = 0; i < events.length; i++) {
       const event = events[i];
       send(event);
+      queuedFrame = true;
       if (event.type === "noteWritten") {
         const written = writtenByRun.get(runId) ?? [];
         written.push(event.relPath);
@@ -88,7 +94,11 @@ export const createChatRuntime = (opts: CreateMockVaultOptions): ChatRuntime => 
         return;
       }
     }
-    finish();
+    // The native command cannot resolve before its terminal event has crossed
+    // the Channel. Queue completion after the final frame so manual journeys
+    // observe the same ordering and React cannot batch the whole run away.
+    if (queuedFrame) scheduler.schedule(finish);
+    else finish();
   };
 
   const handlers: Record<string, CommandHandler> = {
@@ -102,7 +112,7 @@ export const createChatRuntime = (opts: CreateMockVaultOptions): ChatRuntime => 
         prompt: a.prompt as string,
         activeSkills: [...((a.activeSkills as string[] | undefined) ?? [])],
       });
-      const send = channelSender(a.onEvent);
+      const send = channelSender(a.onEvent, scheduler);
       return new Promise<string>((resolve) => {
         const finish = () => {
           completedChatRuns.add(runId);
@@ -133,14 +143,14 @@ export const createChatRuntime = (opts: CreateMockVaultOptions): ChatRuntime => 
       // scheduling the tail in the next task preserves that causal order and
       // prevents a terminal tail from clearing the active turn before the UI
       // can apply the matching `cancelled` outcome.
-      setTimeout(() => {
+      scheduler.scheduleManual(() => {
         advanceChatScript(
           paused.send,
           opts.cancelChatTail ?? [],
           paused.runId,
           paused.finish,
         );
-      }, 0);
+      });
       return { turnId, status: "cancelled" };
     },
     answer_elicitation: (a) => {
@@ -214,39 +224,50 @@ export const createChatRuntime = (opts: CreateMockVaultOptions): ChatRuntime => 
       }
       const script = opts.requirementDownloadScript ?? DEFAULT_REQUIREMENT_DOWNLOAD_SCRIPT;
       if (script.length === 0) return undefined;
-      const send = channelSender(a.onEvent);
       if (pendingRequirementDownload !== null) {
+        const send = channelSender(a.onEvent, scheduler);
         send({
           type: "error",
           message: "a skill requirement download is already in progress",
         } satisfies PullEvent);
         return undefined;
       }
-      send(script[0]);
-      if (script.length === 1) return undefined;
       return new Promise<void>((resolve) => {
-        const timer = setTimeout(() => {
-          script.slice(1).forEach(send);
-          pendingRequirementDownload = null;
-          resolve();
-        }, 50);
-        pendingRequirementDownload = {
-          timer,
-          send,
+        const state: NonNullable<typeof pendingRequirementDownload> = {
+          tasks: [],
+          send: () => {},
           finish: resolve,
         };
+        const send = channelSender(a.onEvent, scheduler, (message) => {
+          const event = message as PullEvent;
+          if (
+            pendingRequirementDownload === state
+            && (event.type === "success" || event.type === "error")
+          ) {
+            pendingRequirementDownload = null;
+            state.finish();
+          }
+        });
+        state.send = send;
+        state.tasks.push(send(script[0]));
+        if (script.length > 1) {
+          state.tasks.push(
+            scheduler.scheduleManual(() => {
+              state.tasks.push(...script.slice(1).map(send));
+            }),
+          );
+        }
+        pendingRequirementDownload = state;
       });
     },
     cancel_requirement_download: () => {
       const pending = pendingRequirementDownload;
       if (pending !== null) {
-        clearTimeout(pending.timer);
+        pending.tasks.forEach((task) => scheduler.cancel(task));
         pending.send({
           type: "error",
           message: "Download cancelled.",
         } satisfies PullEvent);
-        pendingRequirementDownload = null;
-        pending.finish();
       }
       return undefined;
     },

@@ -9,8 +9,8 @@
 // Three properties, each a way the pane could mislead the user:
 //   1. On a model verified to lack reasoning, the chip is inert AND says why —
 //      visibly, not on hover — so the user is never left with a dead control.
-//   2. When reasoning was asked for and none came back, the pane stays quiet;
-//      an empty implementation detail is not useful conversation content.
+//   2. When reasoning was asked for and none came back, one explicit notice
+//      prevents the UI from implying that hidden reasoning was returned.
 //   3. When a search genuinely finds nothing, the pane says "nothing covers
 //      this" — and (asserted in the unit suite) never when a note WAS read.
 
@@ -66,12 +66,12 @@ describe("Journey 10: chat-pane reasoning affordances", () => {
     expect(chip).toHaveAccessibleDescription(/can't return reasoning/i);
   });
 
-  it("stays quiet when reasoning was on but none arrived", async () => {
+  it("shows the requested-reasoning notice exactly once when none arrived", async () => {
     const noThinking: ChatEvent[] = [
       { type: "answer", delta: "A plain answer, no reasoning." },
       { type: "done" },
     ];
-    const { user } = await openWorkspace({
+    const { user, advanceAllFrames } = await openWorkspace({
       apiKey: {
         hasKey: true,
         model: "anthropic/claude-sonnet-4.5",
@@ -82,8 +82,9 @@ describe("Journey 10: chat-pane reasoning affordances", () => {
     });
 
     await ask(user, "anything");
+    await advanceAllFrames();
 
-    expect(screen.queryByText(BACKSTOP)).not.toBeInTheDocument();
+    expect(screen.getAllByText(BACKSTOP)).toHaveLength(1);
     expect(document.querySelector("details")).toBeNull();
   });
 
@@ -101,12 +102,13 @@ describe("Journey 10: chat-pane reasoning affordances", () => {
       },
       { type: "done" },
     ];
-    const { user } = await openWorkspace({
+    const { user, advanceAllFrames } = await openWorkspace({
       apiKey: { hasKey: true, model: "anthropic/claude-sonnet-4.5" },
       chatScript: nothingFound,
     });
 
     await ask(user, "What do my notes say about the Fibonacci trading strategy?");
+    await advanceAllFrames();
 
     expect(
       await screen.findByText("Nothing in your vault covers this"),

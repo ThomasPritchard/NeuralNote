@@ -1,6 +1,6 @@
 # NeuralNote threat model
 
-Date: 2026-07-15
+Date: 2026-07-31
 
 ## Scope and assumptions
 
@@ -9,6 +9,9 @@ multi-tenant backend. It reads and writes a user-selected local markdown vault, 
 OpenRouter or an app-owned loopback Ollama sidecar, optionally reads curated Hugging Face metadata,
 and runs app-owned capture helpers for YouTube. Mobile, sync, billing, managed cloud AI, and the
 future full-source capture pipeline are out of scope.
+
+The native E2E harness is in scope because its test-only WebdriverIO plugins can execute code inside
+the application process and its configuration-root override redirects privileged persistence.
 
 The host OS, signed NeuralNote bundle, OS keychain, updater public key embedded in a release build,
 and user-approved vault selection are trusted. The updater signing private key is a release asset
@@ -55,6 +58,7 @@ responses, downloaded requirement bytes, helper output, and webview IPC argument
 | Requirement installer | malicious archive/binary, race, partial install | compiled HTTPS URL and digest, streamed SHA-256, archive entry/type/size limits, install locks, atomic publication |
 | Application updater | manifest spoofing, malicious or downgraded archive, signing-key loss/theft | HTTPS production endpoint, mandatory Tauri artifact signature, embedded public key, strictly newer version comparison, explicit review/install consent, minimal updater/process capabilities |
 | Local updater harness | replacement of the real app, private-key leak, exposed local files, insecure transport escaping to production | distinct bundle identity, unique ignored target, owner-only key path, allowlisted build environment, exact loopback binding/routes, generated-only HTTP override, valid and one-byte-tampered archive journeys |
+| Native E2E automation | test-only direct execution escaping into production, arbitrary config-root replacement, cleanup outside the fixture root, production-keychain access, vault or credential disclosure in artifacts | optional `native-e2e` dependencies, release-profile compile guard, explicit production capability allowlist, distinct bundle and keychain identities, canonical marked temporary root, inherited `HOME`, post-exit marker-checked cleanup, content-redacted failure artifacts |
 | Contributor CI | mutable dependency execution, secret misuse | full action commit hashes, exact locked Rust tools, read-only token, no workflow secrets |
 | Release pipeline | signing-key exfiltration, write-token misuse, tag/ref race, artifact substitution, updater-key mismatch, trust-mode mislabelling | protected signing environment, secret-free preflight, protected immutable release tags, repeated remote tag-to-commit validation, read-only build token, signing-secret-free write publisher, fixed checksum-bound artifact set, updater signature verified with the configured public key before upload, exact-asset recovery check, explicit signing-mode notes, manifest published last |
 
@@ -90,6 +94,21 @@ keeps the title external. Modifier-key wikilink and Markdown-link navigation can
 returned by the existing vault resolver; the native open path remains independently guarded. Every
 save uses the existing expected-hash, serialized-mutation, vault-contained atomic write path.
 
+The native E2E root override accepts only a canonical real directory created directly under the
+process temporary directory, with the expected prefix and a small non-symlink ownership marker.
+The runner records a per-session identifier in that marker and cleanup revalidates the same root,
+marker and identifier only after every embedded-driver child returns normally and the app has
+exited. A signalled child leaves the marked root intact because app exit is unproven. The harness
+never replaces `HOME`. Feature builds address the separate `com.neuralnote.desktop.e2e` /
+`openrouter-api-key-e2e` keychain namespace, so merely mounting the native fixture cannot read,
+overwrite or clear the production OpenRouter credential.
+The same debug-only feature records only `read_note` file names in the marked root so inert-image
+tests can prove that decoration never requests an image or embed from native storage. The artifacts
+directory must be a canonical direct child of that root; directory-relative no-follow opens on Unix
+and locked reparse-point-aware handles on Windows prevent the audit append from following links.
+The audit is absent from production builds, contains no note body or parent path, and is deleted
+with the marked root after a confirmed app exit.
+
 ### Repudiation
 
 NeuralNote is single-user and has no audit-log identity system. User-visible progress, explicit
@@ -102,6 +121,9 @@ The API key stays in the OS keychain and error bodies are redacted. Editor image
 contain no `src` or network action, the webview cannot load remote images, model-authored image URIs are rejected, helper error details are bounded and path-free before
 model exposure, and the production bundle emits no source maps. Vault content is intentionally sent
 to the selected model only through chat/retrieval flows initiated by the user.
+Native E2E failure capture clones and redacts editable DOM content before writing page source, hides
+editable content while taking screenshots, redacts credential-shaped log values and the temporary
+root, and uploads only the resulting artifact directory rather than seeded vault fixtures.
 
 ### Denial of service
 
@@ -117,6 +139,23 @@ The webview has minimal Tauri capabilities and no shell/filesystem plugin access
 still privileged, so their validators are the security boundary. External tools receive fixed argv,
 sanitised environments, app-owned workspaces, and no ambient yt-dlp plugins. Model calls gain tools
 only through explicit skill activation and can never bypass Rust write or citation policy.
+
+The WebdriverIO execution and WebDriver plugins are intentionally high-authority test principals.
+They are optional dependencies activated only by the `native-e2e` Cargo feature, registered behind
+that feature, and granted only by the E2E capability/config using the distinct
+`com.neuralnote.desktop.e2e` identity. Enabling the feature in Cargo's release profile, including a
+release profile with debug assertions forced on, is a compile-time error, while production config
+explicitly selects only the default capability. The E2E frontend's minimal automation bridge is
+likewise imported only by the E2E build; a
+post-build marker scan fails both production bundles containing the bridge and E2E bundles missing
+it. The bridge exposes only bounded document mutations and the fixed `close-vault` menu event
+required where embedded WKWebView cannot deliver WebDriver input. It returns no note source and
+accepts no arbitrary command name. On macOS, one feature-gated IPC command accepts no serialized
+arguments and dispatches a fixed Command-S `NSEvent` through the active AppKit window so the
+installed Tauri menu key equivalent is exercised. It cannot choose another key or command and never
+emits the save event or writes a note directly. The E2E capability adds only window-fullscreen
+mutation beyond the production capability so the native titlebar transition can be exercised and
+reversed.
 
 ## Abuse cases retained as regression targets
 
@@ -137,6 +176,10 @@ only through explicit skill activation and can never bypass Rust write or citati
 - Spoofed, malformed, equal-version, downgraded, empty-signature, and wrong-signature updater manifests.
 - Local updater traversal requests, config/signature/key-file requests, non-loopback endpoints, and
   harness app paths that resolve outside the unique session.
+- Native E2E roots that are relative, outside the process temp directory, symlinked, unmarked,
+  forged, oversized, or replaced before cleanup; release-profile automation builds; note content,
+  credentials, or absolute fixture roots in failure artifacts; and late failures retried after the
+  first-test readiness sentinel.
 - Release dispatch from a non-main ref, missing or moved tag, tag/main mismatch, missing mode-specific
   credentials, absent ad-hoc acknowledgement, duplicate release or manifest, unexpected transferred
   artifact, checksum mismatch, and an ad-hoc build labelled as notarized.
@@ -148,6 +191,9 @@ only through explicit skill activation and can never bypass Rust write or citati
   origin, downgrade support, background installation, or key rotation.
 - Any new Tauri command, capability, external origin, helper binary, archive format, or model tool must
   be added to the boundary table and receive adversarial tests.
+- Any expansion of native automation beyond debug E2E builds, or any new direct-execution
+  permission, must re-open this review. The automation plugins must never enter production features,
+  capabilities, bundles, or release profiles.
 - Gatekeeper friction is accepted for ad-hoc alpha builds until Developer ID credentials are
   available. The release notes and runbook must not describe an ad-hoc build as Apple-verified.
 - A future Linux release should re-evaluate Tauri's GTK/WebKit dependency chain and RustSec

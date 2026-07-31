@@ -66,6 +66,7 @@ const TAG_MASKED_NODES = new Set([
   "URL",
 ]);
 const PREVIEW_MASKED_NODES = new Set(["CodeBlock", "FencedCode", "InlineCode"]);
+const WIKILINK_CONTAINER_NODES = new Set(["Image", "Link"]);
 
 function syntaxMaskedRanges(
   state: EditorState,
@@ -91,6 +92,18 @@ function overlapsMasked(from: number, to: number, ranges: readonly { from: numbe
   return ranges.some((range) => from < range.to && to > range.from);
 }
 
+function enclosedByMaskedContainer(
+  from: number,
+  to: number,
+  ranges: readonly { from: number; to: number }[],
+): boolean {
+  return ranges.some((range) =>
+    range.from <= from
+    && range.to >= to
+    && (range.from < from || range.to > to)
+  );
+}
+
 function insideVisible(from: number, to: number, ranges: readonly VisibleRange[]): boolean {
   return ranges.some((range) => from >= range.from && to <= range.to);
 }
@@ -111,6 +124,7 @@ export function collectObsidianPreview(
 ): ObsidianPreviewDecoration[] {
   const scanRanges = boundedScanRanges(state.doc.length, visibleRanges);
   const previewMasked = syntaxMaskedRanges(state, scanRanges, PREVIEW_MASKED_NODES);
+  const wikilinkContainers = syntaxMaskedRanges(state, scanRanges, WIKILINK_CONTAINER_NODES);
   const tagMasked = syntaxMaskedRanges(state, scanRanges, TAG_MASKED_NODES);
   const output: ObsidianPreviewDecoration[] = [];
   const wikilink = /(!)?\[\[([^\]\r\n]+)\]\]/g;
@@ -121,7 +135,11 @@ export function collectObsidianPreview(
       const from = scan.from + match.index;
       const to = from + match[0].length;
       tagMasked.push({ from, to });
-      if (!insideVisible(from, to, visibleRanges) || overlapsMasked(from, to, previewMasked)) continue;
+      if (
+        !insideVisible(from, to, visibleRanges)
+        || overlapsMasked(from, to, previewMasked)
+        || enclosedByMaskedContainer(from, to, wikilinkContainers)
+      ) continue;
       const embed = match[1] === "!";
       const rawTarget = match[2];
       const target = resolveWikilink(rawTarget, [...index]);
@@ -254,10 +272,10 @@ function build(view: EditorView, index: readonly NoteIndexEntry[]): DecorationSe
           class: item.className,
           attributes: item.tag
             ? {
-              "data-nn-tag": item.tag,
+                "data-nn-tag": item.tag,
                 role: "link",
                 "aria-label": `Search for ${item.tag}`,
-                "aria-keyshortcuts": "Meta+Enter Control+Enter",
+                "aria-keyshortcuts": "Enter Meta+Enter Control+Enter",
                 title: `Search for ${item.tag}`,
               }
             : undefined,

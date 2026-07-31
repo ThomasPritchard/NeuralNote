@@ -35,6 +35,24 @@ const OPENROUTER_MODELS_URL: &str = "https://openrouter.ai/api/v1/models";
 /// Keychain identity for the secret API key.
 const KEYCHAIN_SERVICE: &str = "com.neuralnote.desktop";
 const KEY_ACCOUNT: &str = "openrouter-api-key";
+const E2E_KEYCHAIN_SERVICE: &str = "com.neuralnote.desktop.e2e";
+const E2E_KEY_ACCOUNT: &str = "openrouter-api-key-e2e";
+
+const fn keychain_service() -> &'static str {
+    if cfg!(feature = "native-e2e") {
+        E2E_KEYCHAIN_SERVICE
+    } else {
+        KEYCHAIN_SERVICE
+    }
+}
+
+const fn keychain_account() -> &'static str {
+    if cfg!(feature = "native-e2e") {
+        E2E_KEY_ACCOUNT
+    } else {
+        KEY_ACCOUNT
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
 #[serde(rename_all = "camelCase")]
@@ -98,7 +116,7 @@ fn clear_api_key_cache() {
 }
 
 fn entry(account: &str) -> Result<keyring::Entry, CoreError> {
-    keyring::Entry::new(KEYCHAIN_SERVICE, account)
+    keyring::Entry::new(keychain_service(), account)
         .map_err(|e| CoreError::Io(format!("keychain unavailable: {e}")))
 }
 
@@ -124,7 +142,7 @@ pub fn read_api_key() -> Result<Option<String>, CoreError> {
         state.generation
     };
 
-    let key = normalized_api_key(read_secret(KEY_ACCOUNT)?);
+    let key = normalized_api_key(read_secret(keychain_account())?);
     {
         let mut state = cache_guard();
         if state.generation == generation && state.value.is_none() {
@@ -177,7 +195,7 @@ pub fn set_keychain_api_key(key: &str) -> Result<(), CoreError> {
     if key.is_empty() {
         return Err(CoreError::InvalidName("API key cannot be empty".into()));
     }
-    entry(KEY_ACCOUNT)?
+    entry(keychain_account())?
         .set_password(key)
         .map_err(|e| CoreError::Io(format!("could not store API key in the keychain: {e}")))?;
     set_api_key_cache(Some(key.to_string()));
@@ -192,7 +210,7 @@ pub fn set_keychain_api_key(key: &str) -> Result<(), CoreError> {
 /// delete is about to remove.
 pub fn clear_keychain_api_key() -> Result<(), CoreError> {
     clear_api_key_cache();
-    match entry(KEY_ACCOUNT)?.delete_credential() {
+    match entry(keychain_account())?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(CoreError::Io(format!(
             "could not remove API key from the keychain: {e}"
@@ -687,6 +705,21 @@ mod tests {
     use std::sync::{Arc, Barrier, Mutex as StdMutex, OnceLock};
 
     #[test]
+    fn native_e2e_uses_a_distinct_keychain_namespace() {
+        assert_eq!(KEYCHAIN_SERVICE, "com.neuralnote.desktop");
+        assert_eq!(KEY_ACCOUNT, "openrouter-api-key");
+        if cfg!(feature = "native-e2e") {
+            assert_eq!(keychain_service(), "com.neuralnote.desktop.e2e");
+            assert_eq!(keychain_account(), "openrouter-api-key-e2e");
+            assert_ne!(keychain_service(), KEYCHAIN_SERVICE);
+            assert_ne!(keychain_account(), KEY_ACCOUNT);
+        } else {
+            assert_eq!(keychain_service(), KEYCHAIN_SERVICE);
+            assert_eq!(keychain_account(), KEY_ACCOUNT);
+        }
+    }
+
+    #[test]
     fn chat_turn_maps_roles_and_defaults_to_user() {
         let a: LlmMessage = ChatTurn {
             role: "assistant".into(),
@@ -1064,7 +1097,7 @@ mod tests {
             r#"{"model":"openai/gpt-4.1","keyConfigured":false}"#,
         )
         .unwrap();
-        keychain.set(KEYCHAIN_SERVICE, KEY_ACCOUNT, "sk-or-present");
+        keychain.set(keychain_service(), keychain_account(), "sk-or-present");
 
         let status = api_key_status(&config_dir).unwrap();
 
@@ -1162,7 +1195,9 @@ mod tests {
         .unwrap();
 
         assert_eq!(
-            keychain.get(KEYCHAIN_SERVICE, KEY_ACCOUNT).as_deref(),
+            keychain
+                .get(keychain_service(), keychain_account())
+                .as_deref(),
             Some(key)
         );
         let raw = read_config_text(&config_dir);
@@ -1205,7 +1240,9 @@ mod tests {
                 CoreError::InvalidName(msg) if msg == "API key cannot be empty"
             ));
             assert_eq!(
-                keychain.get(KEYCHAIN_SERVICE, KEY_ACCOUNT).as_deref(),
+                keychain
+                    .get(keychain_service(), keychain_account())
+                    .as_deref(),
                 Some("sk-or-original")
             );
             assert_eq!(read_config_text(&config_dir), original_config);
@@ -1258,7 +1295,9 @@ mod tests {
             ),
         }
         assert_eq!(
-            keychain.get(KEYCHAIN_SERVICE, KEY_ACCOUNT).as_deref(),
+            keychain
+                .get(keychain_service(), keychain_account())
+                .as_deref(),
             Some("sk-or-session")
         );
         assert_eq!(
@@ -1327,7 +1366,7 @@ mod tests {
             // The keychain write completed while the gate was held by another thread.
             keychain_written.wait();
             assert_eq!(
-                keychain.get(KEYCHAIN_SERVICE, KEY_ACCOUNT).as_deref(),
+                keychain.get(keychain_service(), keychain_account()).as_deref(),
                 Some("sk-or-unblocked"),
                 "keychain write landed while the config gate was held elsewhere: the lock does not span keychain I/O"
             );
@@ -1343,7 +1382,9 @@ mod tests {
             "the config step must still land once the gate is free"
         );
         assert_eq!(
-            keychain.get(KEYCHAIN_SERVICE, KEY_ACCOUNT).as_deref(),
+            keychain
+                .get(keychain_service(), keychain_account())
+                .as_deref(),
             Some("sk-or-unblocked"),
             "the key stays in the keychain — the authoritative key-configured source"
         );
@@ -1362,7 +1403,7 @@ mod tests {
 
         clear_api_key_in(&config_dir, &gate).unwrap();
 
-        assert!(!keychain.contains(KEYCHAIN_SERVICE, KEY_ACCOUNT));
+        assert!(!keychain.contains(keychain_service(), keychain_account()));
         let status = api_key_status(&config_dir).unwrap();
         assert!(!status.has_key);
         assert_eq!(status.model, "openai/gpt-4.1");
@@ -1407,7 +1448,7 @@ mod tests {
             other => panic!("expected corrupt config to surface as CoreError::Io, got {other:?}"),
         }
         assert!(
-            !keychain.contains(KEYCHAIN_SERVICE, KEY_ACCOUNT),
+            !keychain.contains(keychain_service(), keychain_account()),
             "the keychain delete already succeeded and should stay deleted"
         );
         assert_eq!(
@@ -1427,7 +1468,7 @@ mod tests {
         let keychain = TestKeychain::install();
         let config_dir = temp_config_dir("cache-clear-race");
         write_provider_config(&config_dir, &provider_config("openai/gpt-4.1")).unwrap();
-        keychain.set(KEYCHAIN_SERVICE, KEY_ACCOUNT, "sk-or-old");
+        keychain.set(keychain_service(), keychain_account(), "sk-or-old");
         let clear_config_dir = config_dir.clone();
         let clear_gate = ProviderConfigMutationGate::default();
         keychain.after_next_read(move || {
@@ -1435,7 +1476,7 @@ mod tests {
         });
 
         assert_eq!(read_api_key().unwrap().as_deref(), Some("sk-or-old"));
-        assert!(!keychain.contains(KEYCHAIN_SERVICE, KEY_ACCOUNT));
+        assert!(!keychain.contains(keychain_service(), keychain_account()));
         assert_eq!(read_api_key().unwrap(), None);
         assert_eq!(
             keychain.reads.load(Ordering::SeqCst),
@@ -1451,7 +1492,7 @@ mod tests {
             .lock()
             .unwrap();
         let keychain = TestKeychain::install();
-        keychain.set(KEYCHAIN_SERVICE, KEY_ACCOUNT, "sk-or-cached");
+        keychain.set(keychain_service(), keychain_account(), "sk-or-cached");
 
         assert_eq!(read_api_key().unwrap().as_deref(), Some("sk-or-cached"));
         assert_eq!(read_api_key().unwrap().as_deref(), Some("sk-or-cached"));

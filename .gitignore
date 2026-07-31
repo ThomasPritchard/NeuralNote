@@ -18,6 +18,8 @@ app/desktop/src-tauri/ollama-libs
 
 # Coverage + SonarQube scanner artifacts
 coverage/
+/app/desktop/artifacts/
+/app/desktop/e2e-native/artifacts/
 # Unanchored so it ignores the generated report anywhere (the root one Sonar reads,
 # and a stray app/lcov-rust.info that a root-anchored `/lcov-rust.info` let slip in).
 lcov-rust.info

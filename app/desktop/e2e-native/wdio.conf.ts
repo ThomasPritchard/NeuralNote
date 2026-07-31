@@ -1,35 +1,12 @@
-// @ts-nocheck — CI-only scaffold. Its deps (webdriverio, @types/node, mocha) are
-// installed by `npm install` inside this folder in CI, not in the parent app, so
-// type-checking is suppressed here to keep the main editor clean. wdio runs it
-// transpile-only anyway. See README.md.
-// Native WebDriver config: drives the REAL NeuralNote window via tauri-driver
-// (which proxies to the platform WebView driver — WebKitWebDriver on Linux,
-// Edge WebView2 driver on Windows). This is the genuine native end-to-end tier
-// that the jsdom + mockIPC suite (src/e2e/) cannot be: it runs the actual Rust
-// backend behind the actual webview.
-//
-// IMPORTANT: tauri-driver supports Linux and Windows only — there is NO macOS
-// WebView2/WKWebView WebDriver. This config therefore runs in CI (see
-// .github/workflows/e2e.yml), never on a Mac. See README.md.
-//
-// Mirrors the official Tauri WebdriverIO example:
-// https://v2.tauri.app/develop/tests/webdriver/example/webdriverio
-
-import os from "node:os";
+import { existsSync, writeFileSync } from "node:fs";
 import path from "node:path";
-import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { fileURLToPath } from "node:url";
 
-import { assertTauriBuildSucceeded, getTauriBuildInvocation } from "./wdio-build.js";
+import { captureFailureArtifacts } from "./native-artifacts.js";
+import { assertNativeFrontendReady } from "./tauri-bootstrap.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const isWindows = process.platform === "win32";
-const exe = isWindows ? ".exe" : "";
-
-// The compiled debug binary. `mainBinaryName` is unset in tauri.conf.json, so the
-// CLI keeps the Cargo crate name (`desktop`) — NOT the productName ("NeuralNote").
-// If a `mainBinaryName` is ever added to the Tauri config, update this to match.
-const BINARY_NAME = "desktop";
 const application = path.resolve(
   here,
   "..",
@@ -37,86 +14,81 @@ const application = path.resolve(
   "..",
   "target",
   "debug",
-  `${BINARY_NAME}${exe}`,
+  `desktop${isWindows ? ".exe" : ""}`,
 );
 
-const tauriDriverBin = path.resolve(
-  os.homedir(),
-  ".cargo",
-  "bin",
-  `tauri-driver${exe}`,
-);
+const serviceOptions = {
+  appBinaryPath: application,
+  driverProvider: "embedded" as const,
+  embeddedPort: 4445,
+  startTimeout: 60_000,
+  statusPollTimeout: 5_000,
+  // Note bodies and credentials must not enter uploaded logs. The harness writes
+  // its own redacted failure metadata instead of forwarding application output.
+  captureBackendLogs: false,
+  captureFrontendLogs: false,
+};
 
-// Track the tauri-driver child so we can tear it down deterministically.
-let tauriDriver: ChildProcess | undefined;
-let exiting = false;
+export function nativeSpecsForPhase(
+  phase = process.env.NEURALNOTE_E2E_RESTART_PHASE,
+): string[][] {
+  if (phase === "seed") return [["./specs/60-workspace-restart-seed.spec.ts"]];
+  if (phase === "assert") return [["./specs/61-workspace-restart-assert.spec.ts"]];
+  if (phase) throw new Error(`unknown NEURALNOTE_E2E_RESTART_PHASE '${phase}'`);
+  return [[
+    "./specs/00-startup.spec.ts",
+    "./specs/10-authority-lifecycle.spec.ts",
+    "./specs/20-vault-disk.spec.ts",
+    "./specs/30-markdown-source.spec.ts",
+    "./specs/35-external-reconciliation.spec.ts",
+    "./specs/40-window.spec.ts",
+    "./specs/50-workspace-ui.spec.ts",
+  ]];
+}
 
 export const config: WebdriverIO.Config = {
-  host: "127.0.0.1",
-  port: 4444,
-  specs: ["./specs/**/*.spec.ts"],
+  // Embedded mode owns one native app process. Grouping keeps every native spec
+  // in one worker/session instead of deleting the only WKWebView session between
+  // files while still executing the journeys serially in this fixed order.
+  specs: nativeSpecsForPhase(),
   maxInstances: 1,
+  specFileRetries: 0,
+  connectionRetryCount: 0,
   capabilities: [
     {
+      browserName: "tauri",
       maxInstances: 1,
-      // tauri-driver matches this vendor capability directly. Advertising a
-      // browserName makes session negotiation fail before the app can start.
       "tauri:options": { application },
     } as WebdriverIO.Capabilities,
   ],
+  services: [["@wdio/tauri-service", serviceOptions]],
   reporters: ["spec"],
   framework: "mocha",
+  // WebDriver command payloads can include page text. Keep stdout at failures
+  // only; the harness writes its own bounded, redacted artifacts.
+  logLevel: "error",
+  waitforTimeout: 10_000,
   mochaOpts: {
     ui: "bdd",
     timeout: 120_000,
   },
-
-  // Build the debug binary the WebDriver sessions expect to exist. Runs from the
-  // desktop app root; `--no-bundle` skips installer packaging (we only need the
-  // raw binary), `--debug` keeps it fast and unsigned. The E2E config removes
-  // local-AI sidecars and resources that this smoke test does not exercise.
-  onPrepare: () => {
-    const invocation = getTauriBuildInvocation(here);
-    const result = spawnSync(invocation.command, invocation.args, {
-      cwd: path.resolve(here, ".."),
-      stdio: "inherit",
-      shell: false,
-    });
-
-    assertTauriBuildSucceeded(result);
+  before: async () => {
+    // Fail with the exact bootstrap fault before invoking the plugin-backed
+    // browser.tauri surface. This is a one-shot assertion, not a timing sleep.
+    await assertNativeFrontendReady(browser);
+    // Select the only E2E window through raw WebDriver. The plugin-backed
+    // switch helper first asks for broader list-windows authority we do not
+    // need to grant to this harness.
+    await browser.switchToWindow("main");
   },
-
-  // Start tauri-driver before each session so it can proxy WebDriver requests.
-  beforeSession: () => {
-    tauriDriver = spawn(tauriDriverBin, [], {
-      stdio: [null, process.stdout, process.stderr],
-    });
-    tauriDriver.on("error", (error) => {
-      console.error("tauri-driver error:", error);
-      process.exit(1);
-    });
-    tauriDriver.on("exit", (code) => {
-      if (!exiting) {
-        console.error("tauri-driver exited unexpectedly with code:", code);
-        process.exit(1);
-      }
-    });
+  beforeTest: () => {
+    const root = process.env.NEURALNOTE_E2E_ROOT;
+    if (!root) throw new Error("NEURALNOTE_E2E_ROOT is required");
+    const readiness = path.join(root, "artifacts", "first-test-started");
+    if (!existsSync(readiness)) writeFileSync(readiness, "ready\n", { flag: "wx" });
   },
-
-  // afterSession may not run if the session never started, so we also clean up on
-  // process shutdown (registered below).
-  afterSession: () => {
-    closeTauriDriver();
+  afterTest: async (test, _context, result) => {
+    if (result.passed) return;
+    await captureFailureArtifacts(test.title, result.error);
   },
 };
-
-function closeTauriDriver(): void {
-  exiting = true;
-  tauriDriver?.kill();
-}
-
-for (const signal of ["exit", "SIGINT", "SIGTERM", "SIGHUP", "SIGBREAK"] as const) {
-  process.on(signal, () => {
-    closeTauriDriver();
-  });
-}

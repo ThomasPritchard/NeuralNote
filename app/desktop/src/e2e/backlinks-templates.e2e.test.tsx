@@ -24,8 +24,11 @@ const FEATURE_SEED: SeedEntry[] = [
   { kind: "file", relPath: "Templates/Starter.md", content: "Template body for {{title}}." },
 ];
 
-async function openVault(seed: SeedEntry[]): Promise<RenderAppResult> {
-  const result = renderApp({ seed, recents });
+async function openVault(
+  seed: SeedEntry[],
+  mockIpcScenario?: string,
+): Promise<RenderAppResult> {
+  const result = renderApp({ seed, recents, mockIpcScenario });
   await result.user.click(await screen.findByRole("button", { name: "Open My Brain" }));
   await screen.findByLabelText("Filter files by name");
   return result;
@@ -73,7 +76,7 @@ describe("Journey 15: unresolved wikilink preview", () => {
 
 describe("Journey 16: backlinks panel", () => {
   it("shows linked and unlinked mentions, and opens a linked source row", async () => {
-    const { user } = await openVault(FEATURE_SEED);
+    const { user } = await openVault(FEATURE_SEED, "backlinks-feature");
 
     await user.click(await screen.findByRole("button", { name: "Target.md" }));
     expect(await screen.findByRole("heading", { name: "Target", level: 1 })).toBeInTheDocument();
@@ -128,7 +131,7 @@ describe("Journey 17: editor wikilink autocomplete", () => {
 
 describe("Journey 18: create from template", () => {
   it("creates a note from the chosen template and renders {{title}} into the body", async () => {
-    const { user, backend } = await openVault(FEATURE_SEED);
+    const { user, backend } = await openVault(FEATURE_SEED, "templates-feature");
 
     await user.click(screen.getByRole("button", { name: "Insert from template" }));
     const picker = await screen.findByRole("dialog", { name: "Insert from template" });

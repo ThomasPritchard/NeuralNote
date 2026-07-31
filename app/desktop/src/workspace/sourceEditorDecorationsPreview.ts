@@ -110,9 +110,20 @@ function renderedInlineText(state: EditorState, node: SyntaxNode): string {
 function tableCells(state: EditorState, row: SyntaxNode): string[] {
   const cells: string[] = [];
   for (let child = row.firstChild; child; child = child.nextSibling) {
-    if (child.name === "TableCell") cells.push(renderedInlineText(state, child).trim());
+    if (child.name === "TableCell") {
+      cells.push(renderedInlineText(state, child).replaceAll("\\|", "|").trim());
+    }
   }
   return cells;
+}
+
+function imageLabel(state: EditorState, image: SyntaxNode): string {
+  for (let child = image.firstChild; child; child = child.nextSibling) {
+    if (child.name === "LinkMark" && state.sliceDoc(child.from, child.to) === "]") {
+      return state.sliceDoc(image.from + 2, child.from) || "image";
+    }
+  }
+  return "image";
 }
 
 function tablePreview(state: EditorState, table: SyntaxNode): PreviewTable | null {
@@ -214,16 +225,26 @@ export function collectMarkdownPreview(
           kind: constructActive ? "mark" : "replace",
           className: constructActive ? "nn-lp-marker-active" : "nn-lp-marker",
         });
-      } else if (name === "Image" && !constructActive) {
-        const source = state.sliceDoc(from, to);
-        const label = /^!\[([^\]]*)\]/.exec(source)?.[1] || "image";
-        push(output, visibleRanges, {
-          from,
-          to,
-          kind: "widget",
-          className: "nn-lp-image",
-          label: `Image: ${label}`,
-        });
+      } else if (name === "Image") {
+        if (!constructActive) {
+          const source = state.sliceDoc(from, to);
+          // Lezer parses Obsidian embeds as standard Markdown images. Leave
+          // those ranges untouched here so the dedicated Obsidian extension
+          // can provide its inert "Embed:" label without overlapping widgets.
+          if (!source.startsWith("![[")) {
+            push(output, visibleRanges, {
+              from,
+              to,
+              kind: "widget",
+              className: "nn-lp-image",
+              label: `Image: ${imageLabel(state, node)}`,
+            });
+          }
+        }
+        // The image owns its whole source range. Descendant link-like syntax
+        // must not add an overlapping decoration or remain interactive while
+        // the complete image source is revealed.
+        return false;
       } else if (name === "Table") {
         if (intersectsVisibleRanges(from, to, visibleRanges)) {
           const table = to - from <= MAX_TABLE_PREVIEW_CHARS ? tablePreview(state, node) : null;

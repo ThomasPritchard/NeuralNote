@@ -21,8 +21,8 @@
 // only window command the app issues and is recorded here.
 //
 // The command surface is split across cohesive sibling modules: pure note/path
-// helpers (mockVaultNotes), the search / link-graph / template mirrors
-// (mockVaultSearch, mockVaultLinks, mockVaultTemplates), and two self-contained
+// infrastructure (mockVaultNotes), Rust-generated analytical command replays,
+// and two self-contained
 // stateful sub-backends — AI/provider/skills (mockVaultAi) and chat/skill-run
 // (mockVaultChatRuntime) — wired into the one dispatch table below.
 
@@ -44,7 +44,6 @@ import type {
   CoreErrorLike,
   CreateMockVaultOptions,
   Entry,
-  MdFile,
   MockVault,
 } from "./mockVaultTypes";
 import {
@@ -60,11 +59,14 @@ import {
   stemOf,
   titleFrom,
 } from "./mockVaultNotes";
-import { searchFiles } from "./mockVaultSearch";
-import { buildBacklinks, buildLinkGraph } from "./mockVaultLinks";
-import { createTemplateResolver, renderTemplate } from "./mockVaultTemplates";
 import { createAiBackend } from "./mockVaultAi";
 import { createChatRuntime } from "./mockVaultChatRuntime";
+import {
+  createMockIpcReplay,
+  MOCK_IPC_CONTRACT_V1,
+  validateMockCoreErrorV1,
+} from "./mockIpcContract";
+import { MockScheduler } from "./mockScheduler";
 
 export {
   DEFAULT_CHAT_MODEL,
@@ -99,12 +101,12 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     activePath: null,
   };
   const openedYoutubeUrls: string[] = [];
-  const now = opts.now ?? new Date(2026, 0, 2, 15, 4, 5);
+  const scheduler = opts.scheduler ?? new MockScheduler();
 
   // The two self-contained stateful sub-backends. Each owns its slice of state
   // and returns a command→handler map that the dispatch table below merges.
-  const aiBackend = createAiBackend(opts);
-  const chatRuntime = createChatRuntime(opts);
+  const aiBackend = createAiBackend(opts, scheduler);
+  const chatRuntime = createChatRuntime(opts, scheduler);
   const delegatedHandlers: Record<string, (a: Record<string, unknown>) => unknown> = {
     ...aiBackend.handlers,
     ...chatRuntime.handlers,
@@ -242,11 +244,11 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
 
   const requireFile = (path: string): Entry & { kind: "file" } => {
     const e = entries.get(path);
-    if (!e) throw { kind: "notFound", message: `${path} not found` } satisfies CoreErrorLike;
+    if (!e) return fail("notFound", `${path} not found`);
     if (e.kind !== "file") {
-      throw { kind: "notFound", message: `${path} not found` } satisfies CoreErrorLike;
+      return fail("notFound", `${path} not found`);
     }
-    if (e.unreadable) throw { kind: "io", message: `${path} unreadable` } satisfies CoreErrorLike;
+    if (e.unreadable) fail("io", `${path} unreadable`);
     return e;
   };
 
@@ -258,41 +260,20 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     return toNode(target);
   };
 
-  /** Mirror of core `markdown_files` + `collect_markdown` (tree.rs): every
-   *  markdown note in TREE-WALK order — within each folder, subfolders first
-   *  (recursed depth-first), then files, each group case-insensitive by name —
-   *  so search hits and graph nodes inherit the read_tree scan order. */
-  const markdownFiles = (): MdFile[] => {
-    const out: MdFile[] = [];
-    const collect = (nodes: TreeNode[]): void => {
-      for (const node of nodes) {
-        if (node.children !== null) {
-          collect(node.children);
-        } else if (isMarkdownExt(node.ext)) {
-          const entry = entries.get(node.path);
-          if (entry?.kind === "file") {
-            out.push({
-              path: node.path,
-              rel: node.relPath,
-              content: entry.content,
-              unreadable: entry.unreadable,
-            });
-          }
+  const contract = MOCK_IPC_CONTRACT_V1;
+  const replay = opts.mockIpcScenario
+    ? createMockIpcReplay(contract, opts.mockIpcScenario, (mutation) => {
+        const write = (mutation as { write?: { relPath?: unknown; content?: unknown } } | null)?.write;
+        const relPath = write?.relPath;
+        const content = write?.content;
+        if (typeof relPath !== "string" || typeof content !== "string") {
+          return fail("io", "MockIpcContractV1 supplied an invalid filesystem mutation");
         }
-      }
-    };
-    collect(childrenOf(root));
-    return out;
-  };
-
-  // Template folder inference + resolution against the live vault filesystem.
-  const templates = createTemplateResolver({
-    entries,
-    getRoot: () => root,
-    resolveVaultPath,
-    relOf,
-    childrenOf,
-  });
+        const path = resolveVaultPath(relPath);
+        ensureAncestors(path);
+        entries.set(path, { kind: "file", content });
+      })
+    : null;
 
   // ── The IPC handler: one stateful backend for the whole journey ───────────
   const handler = (cmd: string, payload?: InvokeArgs): unknown => {
@@ -303,10 +284,23 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
       return null;
     }
 
+    const a = (payload ?? {}) as Record<string, unknown>;
+
+    // A selected Rust scenario owns every command named anywhere in its
+    // exchange sequence, including already-consumed and not-yet-reached ones.
+    // Validate those invocations before any fallible override or semantic
+    // handler. An explicit scripted failure may replace the exact next
+    // exchange without consuming it, allowing a later retry to replay Rust.
+    // Bootstrap and other commands not owned by the scenario continue below.
+    if (replay?.ownsCommand(cmd)) {
+      replay.assertNextInvocation(cmd, a);
+      const failure = failures.get(cmd);
+      if (failure) throw failure;
+      return replay.invoke(cmd, a);
+    }
+
     const failure = failures.get(cmd);
     if (failure) throw failure;
-
-    const a = (payload ?? {}) as Record<string, unknown>;
 
     // The AI/provider and chat/skill-run commands live in their own backends;
     // they see the same pre-dispatch `calls`/`setFailure` treatment as the
@@ -434,31 +428,15 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
         return undefined;
       }
       case "search_vault":
-        return searchFiles(markdownFiles(), a.query as string);
+        return { hits: [], truncated: false, skippedFiles: 0 };
       case "read_link_graph":
-        return buildLinkGraph(markdownFiles());
-      case "read_backlinks": {
-        const path = resolveVaultPath(a.path as string);
-        return buildBacklinks(markdownFiles(), relOf(path));
-      }
+        return { nodes: [], links: [], skippedFiles: 0 };
+      case "read_backlinks":
+        return { linked: [], unlinked: [], skippedFiles: 0 };
       case "list_templates":
-        return templates.templateInfos();
-      case "create_note_from_template": {
-        const parentPath = resolveVaultPath(a.parentPath as string);
-        const name = a.name as string;
-        const template = (a.template ?? null) as string | null;
-        const settings = templates.inferTemplateSettings();
-        const templateContent =
-          template === null
-            ? null
-            : requireFile(templates.resolveTemplateFile(settings, template)).content;
-        const node = createNoteNode(parentPath, name);
-        if (templateContent !== null) {
-          const file = requireFile(node.path);
-          file.content = renderTemplate(templateContent, stemOf(node.name), now, settings);
-        }
-        return node;
-      }
+        return [];
+      case "create_note_from_template":
+        return fail("io", "create_note_from_template requires a MockIpcContractV1 scenario");
       case "open_youtube_timestamp": {
         const value = a.url as string;
         const parsed = new URL(value);
@@ -500,7 +478,10 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
       mockIPC(handler, { shouldMockEvents: true });
     },
     setFailure(cmd, error) {
-      failures.set(cmd, error);
+      failures.set(
+        cmd,
+        validateMockCoreErrorV1(contract, error, `scripted failure for '${cmd}'`),
+      );
     },
     clearFailure(cmd) {
       failures.delete(cmd);
@@ -524,9 +505,22 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     },
     calls,
     chatCalls: chatRuntime.chatCalls,
+    apiKeySaveAttempts: aiBackend.apiKeySaveAttempts,
     get profileFolder() {
       return chatRuntime.profileFolder;
     },
     openedYoutubeUrls,
+    remainingContractExchanges() {
+      return replay?.remaining() ?? 0;
+    },
+    assertContractConsumed() {
+      const remaining = replay?.remaining() ?? 0;
+      if (remaining > 0) {
+        throw new Error(
+          `MockIpcContractV1 scenario '${opts.mockIpcScenario}' left ${remaining} exchange(s) unconsumed; next expected command is '${replay?.nextCommand()}'`,
+        );
+      }
+    },
+    scheduler,
   };
 }

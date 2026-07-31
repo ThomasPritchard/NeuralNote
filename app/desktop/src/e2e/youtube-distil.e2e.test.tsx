@@ -50,7 +50,7 @@ describe("Journey 9: YouTube distil failures and fallbacks", () => {
       { type: "skillStep", message: missingRequirement },
       { type: "done" },
     ];
-    const { user, backend } = await openWorkspace({
+    const { user, backend, advanceNextFrame, advanceAllFrames } = await openWorkspace({
       chatScript: script,
       requirementDownloadScript: [
         {
@@ -66,11 +66,14 @@ describe("Journey 9: YouTube distil failures and fallbacks", () => {
     });
 
     await startDistil(user, "distil https://youtu.be/jNQXAC9IVRw");
+    await advanceAllFrames();
 
     const card = await screen.findByRole("region", { name: "Set up YouTube imports" });
     await user.click(within(card).getByRole("button", { name: "Download yt-dlp" }));
+    await advanceNextFrame();
     expect(await within(card).findByText("Downloading verified yt-dlp…")).toBeInTheDocument();
     expect(within(card).getByRole("progressbar", { name: "Downloading yt-dlp" })).toHaveValue(40);
+    await advanceAllFrames();
     expect(await within(card).findByText(/yt-dlp is ready/i)).toBeInTheDocument();
     expect(backend.calls).toContain("download_requirement");
   });
@@ -85,9 +88,10 @@ describe("Journey 9: YouTube distil failures and fallbacks", () => {
           "YouTube is blocking caption downloads right now (HTTP 403). Try again later; yt-dlp updates automatically. Whisper was not started.",
       },
     ];
-    const { user } = await openWorkspace({ chatScript: script });
+    const { user, advanceAllFrames } = await openWorkspace({ chatScript: script });
 
     await startDistil(user, "distil https://youtu.be/jNQXAC9IVRw");
+    await advanceAllFrames();
 
     expect(await screen.findByRole("alert")).toHaveTextContent("HTTP 403");
     expect(screen.getByRole("alert")).toHaveTextContent("Try again later");
@@ -131,14 +135,16 @@ describe("Journey 9: YouTube distil failures and fallbacks", () => {
       },
       { type: "done" },
     ];
-    const { user, backend } = await openWorkspace({ chatScript: script });
+    const { user, backend, advanceAllFrames } = await openWorkspace({ chatScript: script });
 
     await startDistil(user, "distil the quiet talk");
+    await advanceAllFrames();
 
     expect(await screen.findByText(/compiles whisper-cli locally from pinned source/i)).toBeInTheDocument();
     expect(screen.getByText(/first-time setup can take several minutes/i)).toBeInTheDocument();
     expect(screen.getByText(/Transcription also takes minutes, not seconds/i)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Compile and transcribe/ }));
+    await advanceAllFrames();
 
     expect(await screen.findByText("Compiling whisper-cli locally…")).toBeInTheDocument();
     expect(await screen.findByText(/Transcribing locally with whisper:small\.en/)).toBeInTheDocument();
@@ -185,7 +191,7 @@ describe("Journey 10: YouTube playlist selection", () => {
       { type: "noteWritten", relPath: "Literature/Agent talk 1.md", kind: "literature" },
       { type: "noteWritten", relPath: "Transcripts/Agent talk 1 transcript.md", kind: "transcript" },
     ];
-    const { user, backend } = await openWorkspace({
+    const { user, backend, advanceAllFrames } = await openWorkspace({
       chatScript: script,
       cancelChatAfterEvents: 6,
       cancelChatTail: [
@@ -200,17 +206,20 @@ describe("Journey 10: YouTube playlist selection", () => {
     });
 
     await startDistil(user, "distil the Agent talks playlist");
+    await advanceAllFrames();
 
     expect(await screen.findByText("0 selected on this page")).toBeInTheDocument();
     expect(document.querySelectorAll('img[src^="data:image/png"]').length).toBeGreaterThan(0);
     await user.click(screen.getByRole("button", { name: "Select page" }));
     expect(screen.getByText("21 selected on this page")).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Confirm selection" }));
+    await advanceAllFrames();
 
     expect(await screen.findByText(/You selected 21 videos/)).toBeInTheDocument();
     expect(screen.getByText(/189,000 input tokens/)).toBeInTheDocument();
     expect(screen.getByText(/Method: selected duration/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Continue/ }));
+    await advanceAllFrames();
 
     expect(await screen.findByText(/Video 1 of 21/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: "Stop response" }));
@@ -226,6 +235,8 @@ describe("Journey 10: YouTube playlist selection", () => {
     expect(screen.getByText("captions:en-auto")).toBeInTheDocument();
     expect(screen.getByText("Agent talk 1.md")).toBeInTheDocument();
     expect(screen.queryByText("Agent talk 2.md")).not.toBeInTheDocument();
+    await advanceAllFrames();
+    expect(screen.queryByText(/The playlist was cancelled\. Kept the completed video/)).not.toBeInTheDocument();
     expect(backend.calls.filter((call) => call === "answer_elicitation")).toHaveLength(2);
     expect(backend.calls.filter((call) => call === "cancel_chat_run")).toHaveLength(1);
   });
@@ -250,14 +261,16 @@ describe("Journey 11: unknown vault routing", () => {
       { type: "answer", delta: "I'll use Research/AI for this vault from now on." },
       { type: "done" },
     ];
-    const { user, backend } = await openWorkspace({
+    const { user, backend, advanceAllFrames } = await openWorkspace({
       chatScript: script,
       profileFolderElicitationId: "youtube-route-folder",
     });
 
     await startDistil(user, "distil this into my unknown vault");
+    await advanceAllFrames();
     expect(await screen.findByText(/couldn't confidently identify/)).toBeInTheDocument();
     await user.click(screen.getByRole("button", { name: /Research \/ AI/ }));
+    await advanceAllFrames();
 
     expect(await screen.findByText(/Saved Research\/AI to \.neuralnote\/profile\.json/)).toBeInTheDocument();
     expect(backend.profileFolder).toBe("Research/AI");

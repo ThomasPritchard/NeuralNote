@@ -75,7 +75,7 @@ describe("Journey 8: local AI — download then chat locally", () => {
   ];
 
   it("downloads the recommended model, makes it active, and chats locally", async () => {
-    const { user } = await openWorkspace({
+    const { user, advanceAllFrames } = await openWorkspace({
       apiKey: { hasKey: false }, // → first-run picker
       chatScript: successScript,
       // hardware/recommendation/candidates/pullScript all default to the supported
@@ -94,6 +94,7 @@ describe("Journey 8: local AI — download then chat locally", () => {
     const qwenRow = within(catalogue).getByText("qwen2.5:7b").closest("li");
     expect(qwenRow).not.toBeNull();
     await user.click(within(qwenRow!).getByRole("button", { name: /Download/ }));
+    await advanceAllFrames();
 
     // The stream ends in success → the model installs and becomes the active
     // provider. It now appears under "Installed on this machine" as Active.
@@ -112,9 +113,29 @@ describe("Journey 8: local AI — download then chat locally", () => {
     // A real cited-chat turn runs against the local provider.
     await user.type(composer, "what is the mitochondrion?");
     await user.click(screen.getByRole("button", { name: "Send" }));
+    await advanceAllFrames();
     expect(
       await screen.findByText(/powerhouse of the cell\./),
     ).toBeInTheDocument();
+  });
+
+  it("drops every queued local-AI event after cancellation", async () => {
+    const { user, backend, advanceAllFrames } = await openWorkspace({
+      apiKey: { hasKey: false },
+    });
+    await user.click(await screen.findByRole("button", { name: /Set up Local AI/ }));
+    const dialog = await screen.findByRole("dialog");
+    const catalogue = await within(dialog).findByRole("list", { name: "Model catalogue" });
+    const row = within(catalogue).getByText("qwen2.5:7b").closest("li");
+    expect(row).not.toBeNull();
+    await user.click(within(row!).getByRole("button", { name: /Download/ }));
+    await user.click(await within(row!).findByRole("button", { name: "Cancel" }));
+
+    await advanceAllFrames();
+
+    expect(backend.calls.filter((call) => call === "cancel_pull")).toHaveLength(1);
+    expect(within(dialog).queryByText("Active")).not.toBeInTheDocument();
+    expect(within(dialog).queryByRole("progressbar")).not.toBeInTheDocument();
   });
 });
 

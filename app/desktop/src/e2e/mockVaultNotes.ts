@@ -2,6 +2,8 @@
 // crates/neuralnote-core/src/note.rs. Pure functions shared by the search,
 // link-graph, template, and dispatch layers.
 
+import { MOCK_IPC_CONTRACT_V1 } from "./mockIpcContract";
+
 // ── Path helpers (POSIX `/`, absolute paths keyed in the entries map) ─────────
 export const basename = (p: string): string => p.slice(p.lastIndexOf("/") + 1);
 export const parentOf = (p: string): string => p.slice(0, p.lastIndexOf("/"));
@@ -31,9 +33,10 @@ export const ensureMd = (name: string): string => {
 export const isMarkdownExt = (ext: string | null): boolean =>
   ext === "md" || ext === "markdown" || ext === "mdx";
 
-/** Mirror of core `note.rs` MAX_EDITABLE_NOTE_BYTES: past this many bytes a
+/** Rust-generated `note.rs` MAX_EDITABLE_NOTE_BYTES: past this many bytes a
  *  read returns the flagged, content-free size-limit doc (issue #82). */
-export const MAX_EDITABLE_NOTE_BYTES = 8 * 1024 * 1024;
+export const MAX_EDITABLE_NOTE_BYTES =
+  MOCK_IPC_CONTRACT_V1.constants.maxEditableNoteBytes;
 
 /** Stable, deterministic fingerprint that changes with content (djb2). */
 export const hashContent = (s: string): string => {

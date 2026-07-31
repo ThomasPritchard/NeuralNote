@@ -165,6 +165,15 @@ describe("obsidianLivePreview", () => {
     expect(preview.every((item) => !("src" in item) && !("href" in item))).toBe(true);
   });
 
+  it("does not make wikilink-shaped text inside a standard image navigable", () => {
+    const preview = collectObsidianPreview(
+      state("![prefix [[Daily]] suffix](local.png)"),
+      INDEX,
+    );
+
+    expect(preview.filter((item) => item.className.includes("wikilink"))).toEqual([]);
+  });
+
   it("does not copy or scan the complete document for a narrow viewport", () => {
     const doc = `${"outside\n".repeat(50_000)}[[Daily]] visible`;
     const editor = state(doc, 0);
