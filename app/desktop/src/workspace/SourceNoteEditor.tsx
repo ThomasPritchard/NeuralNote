@@ -32,14 +32,7 @@ import {
 } from "./obsidianLivePreview";
 import { createWikilinkCompletionSource } from "./wikilinkCompletion";
 import { formatSourceSelections } from "./sourceEditorFormatting";
-import {
-  formatTable,
-  guardTableDelimiterBackward,
-  guardTableDelimiterForward,
-  nextTableCell,
-  nextTableRow,
-  previousTableCell,
-} from "./sourceEditorTableCommands";
+import { tableKeymap } from "./sourceEditorTableCommands";
 import type { FormatAction } from "./markdownFormat";
 import {
   refreshSourceTitlePlaceholder,
@@ -203,16 +196,10 @@ export function SourceNoteEditor({
         // before defaultKeymap so Enter steps down a column instead of breaking
         // the table. Each command returns false outside a table, so Tab still
         // moves focus everywhere else in the editor.
-        // Before defaultKeymap's delete commands: a hidden delimiter must move
-        // the caret, never be deleted. See guardTableDelimiter.
-        { key: "Backspace", run: guardTableDelimiterBackward },
-        { key: "Delete", run: guardTableDelimiterForward },
-        { key: "ArrowLeft", run: guardTableDelimiterBackward },
-        { key: "ArrowRight", run: guardTableDelimiterForward },
-        { key: "Tab", run: nextTableCell },
-        { key: "Shift-Tab", run: previousTableCell },
-        { key: "Enter", run: nextTableRow },
-        { key: "Shift-Alt-f", run: formatTable },
+        // The bindings themselves live beside the commands they run, so their
+        // order is testable against the real array rather than a restatement of
+        // it. See `sourceEditorTableKeymap.test.ts`.
+        ...tableKeymap,
         ...foldKeymap,
         ...defaultKeymap,
         ...historyKeymap,

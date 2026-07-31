@@ -194,6 +194,45 @@ Still scrolled right, click on a character in a visible cell and type `Z`.
 - **FAIL** — it lands in the cell that *would* have been there unscrolled, i.e. the click is being
   resolved against the wrong horizontal position.
 
+### 11b. The keyboard shortcuts actually fire (suspected broken — read before running)
+
+**This is a live suspicion, not a regression check.**
+
+Two commands are bound to Option chords: `Shift-Option-F` reformats a table's source, and
+`Shift-Option-\` reveals its hidden pipes so column alignment can be edited.
+
+There is reason to think **neither reaches the editor on macOS**. CodeMirror skips its base-key
+fallback for any Option combination without Control or Command
+(`@codemirror/view/dist/index.js:9189`, whose own comment reads *"Alt-combinations on macOS tend to
+be typed characters"*), so a binding must match the character the OS reports — and macOS turns
+Option+Shift+`\` into `»` and Option+Shift+`F` into `Ï`. No automated tier can settle it: the suites
+invoke these commands directly and never press the keys.
+
+With the caret inside a table:
+
+1. Press **Shift-Option-\**. Expected: the `|` pipes and the `| --- | --- |` alignment row become
+   visible as literal text. Press again — they should hide.
+2. Press **Shift-Option-F**. Expected: the source is reformatted so the columns line up.
+
+- **PASS** — both do what they say.
+- **FAIL** — nothing happens, or a stray character (`»`, `Ï`) is inserted into the cell.
+
+**A stray character appearing in the cell is the most informative outcome**, so report exactly what
+you see rather than only whether it worked. If either fails, say whether the *other* did too:
+`Shift-Option-F` shipped some time ago, and the same defect would mean it has never worked from the
+keyboard.
+
+### 11c. Column alignment can be edited
+
+With the pipes revealed above, change a column's alignment marker — `| --- |` to `| ---: |` — then
+move the caret out of the table.
+
+- **PASS** — the edit is accepted and the table redraws.
+- **FAIL** — the edit is refused, or accepted but the drawn table ignores it.
+
+If 11b failed, report this **not run** rather than reaching for another route. It depends on that
+reveal.
+
 ### 12. Obsidian still opens it
 
 ```bash

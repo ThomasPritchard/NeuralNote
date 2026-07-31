@@ -29,7 +29,11 @@ import {
 } from "@codemirror/view";
 import { afterEach, describe, expect, it } from "vitest";
 
-import { CARET_OFFSCREEN_CLASS, tableScrollSync } from "./sourceEditorTableScrollSync";
+import {
+  CARET_OFFSCREEN_CLASS,
+  SELECTION_OFFSCREEN_CLASS,
+  tableScrollSync,
+} from "./sourceEditorTableScrollSync";
 
 const SOURCE = [
   "Intro paragraph, long enough that it has to wrap inside the pane.",
@@ -229,9 +233,45 @@ function drawnCaret(view: EditorView): DOMRect {
   return rect;
 }
 
+/** Whether the module is telling the stylesheet not to draw the selection. */
+const selectionFlagged = (view: EditorView): boolean =>
+  view.dom.classList.contains(SELECTION_OFFSCREEN_CLASS);
+
+/**
+ * The rectangles `drawSelection` painted, whichever rows they landed on.
+ *
+ * Unlike the drawn caret these need no focus — the base theme only colours them
+ * differently for a focused editor (`@codemirror/view/dist/index.js:6864`) —
+ * and unlike the caret they are still painted while the flag is up, because the
+ * rule that consumes it is P3c's and this harness deliberately does not carry
+ * it. That is what lets the sweep below check the flag against where the
+ * rectangles actually are rather than against itself.
+ */
+function drawnSelection(view: EditorView): DOMRect[] {
+  const pieces = [...view.scrollDOM.querySelectorAll(".cm-selectionBackground")];
+  if (pieces.length === 0) throw new Error("no drawn selection");
+  return pieces.map((piece) => piece.getBoundingClientRect());
+}
+
+/** Those of them lying over `row` — in view or not. */
+function selectionPiecesOver(view: EditorView, row: HTMLElement): DOMRect[] {
+  const box = row.getBoundingClientRect();
+  return drawnSelection(view).filter((rect) => rect.top < box.bottom && rect.bottom > box.top);
+}
+
+/** Whether any rectangle over `row` is inside the band it is showing. */
+function selectionVisibleIn(view: EditorView, row: HTMLElement): boolean {
+  const box = row.getBoundingClientRect();
+  const pieces = selectionPiecesOver(view, row);
+  if (pieces.length === 0) throw new Error("nothing is painted over that row");
+  // Inclusive, because the module counts a span touching an edge as in band.
+  return pieces.some((rect) => rect.right >= box.left && rect.left <= box.right);
+}
+
 const at = (text: string): number => SOURCE.indexOf(text);
 
 const FIRST_CELL = at("alpha one two three");
+const FIRST_CELL_END = FIRST_CELL + "alpha one two three".length;
 const LAST_CELL_END = at("charlie one two thr") + "charlie one two thr".length;
 const SECOND_TABLE_CELL = at("delta body");
 const OUTSIDE = at("Between the tables.");
@@ -519,6 +559,204 @@ describe("the drawn caret under a scrolling row", () => {
   });
 });
 
+describe("the drawn selection under a scrolling row", () => {
+  /** One cell's text: narrow enough to fit the band, and to leave it whole. */
+  const ONE_CELL = EditorSelection.range(FIRST_CELL, FIRST_CELL_END);
+
+  it("flags a selection its row has scrolled past, and clears it coming back", async () => {
+    const { view } = mount(SOURCE);
+    view.dispatch({ selection: ONE_CELL });
+    await settle();
+    const rows = tableRowsFor(view, FIRST_CELL);
+    const row = rowFor(view, FIRST_CELL);
+    // Neither half vacuous: the fixture genuinely overflows, and the selection
+    // starts inside the band it is about to be scrolled out of.
+    expect(maxOffset(row)).toBeGreaterThan(400);
+    expect(selectionVisibleIn(view, row)).toBe(true);
+    expect(selectionFlagged(view)).toBe(false);
+
+    rows[3]!.scrollLeft = 9999;
+    await settle();
+
+    expect(selectionFlagged(view)).toBe(true);
+    // The defect the flag exists for, measured rather than inferred: with the
+    // row's box at [0, 400] and the table at full scroll the rectangle painted
+    // at left -786.41px — a block of highlight over whatever is there instead.
+    const box = row.getBoundingClientRect();
+    const pieces = selectionPiecesOver(view, row);
+    expect(pieces).not.toHaveLength(0);
+    for (const rect of pieces) expect(rect.right).toBeLessThan(box.left);
+
+    rows[3]!.scrollLeft = 0;
+    await settle();
+
+    expect(selectionFlagged(view)).toBe(false);
+  });
+
+  it("never leaves a selection painted outside its row unflagged", async () => {
+    // The caret's sweep, for the other layer: at every offset the row can hold,
+    // either a rectangle is in the row or the stylesheet has been told not to
+    // draw the layer. The two are asserted as one biconditional, so a flag
+    // raised too eagerly fails it just as loudly as one never raised.
+    const { view } = mount(SOURCE);
+    view.dispatch({ selection: ONE_CELL });
+    await settle();
+    const row = rowFor(view, FIRST_CELL);
+    const extent = maxOffset(row);
+    expect(extent).toBeGreaterThan(400);
+
+    let suppressed = 0;
+    let painted = 0;
+    for (const offset of [0, 60, 200, extent / 2, extent, 200, 0]) {
+      row.scrollLeft = offset;
+      await settle();
+      const flagged = selectionFlagged(view);
+      expect(selectionVisibleIn(view, row)).toBe(!flagged);
+      if (flagged) suppressed += 1;
+      else painted += 1;
+    }
+    // A sweep that never suppressed, or never painted, proves half of nothing.
+    expect(suppressed).toBeGreaterThan(0);
+    expect(painted).toBeGreaterThan(0);
+  });
+
+  it("leaves a selection straddling the band's edges painted", async () => {
+    // The trap. A selection can be half in the band and half scrolled away, and
+    // suppressing it there erases something the user can see — a worse defect
+    // than the one being fixed. So this is the case the flag must decline.
+    const { view } = mount(SOURCE);
+    view.dispatch({ selection: EditorSelection.range(FIRST_CELL, LAST_CELL_END) });
+    await settle();
+    const row = rowFor(view, FIRST_CELL);
+    const start = contentX(view, FIRST_CELL);
+    const finish = contentX(view, LAST_CELL_END);
+    // The selection has to outrun the band for both of its ends to sit outside
+    // it. A fixture where it did not would satisfy the next two vacuously.
+    expect(finish - start).toBeGreaterThan(row.clientWidth);
+
+    // Centre the band inside the selection: both ends out, the middle in.
+    row.scrollLeft = start + (finish - start - row.clientWidth) / 2;
+    await settle();
+
+    expect(start).toBeLessThan(row.scrollLeft);
+    expect(finish).toBeGreaterThan(row.scrollLeft + row.clientWidth);
+    expect(selectionFlagged(view)).toBe(false);
+    // And there is something there to protect.
+    expect(selectionVisibleIn(view, row)).toBe(true);
+    // The caret sits at the head, which is out of band, so the two signals
+    // disagree here. That disagreement is the whole reason there are two.
+    expect(caretFlagged(view)).toBe(true);
+  });
+
+  it("leaves a selection spanning two rows painted", async () => {
+    // Past one visual line the painter stops drawing the text's own width and
+    // anchors a piece to each content edge, so something stays in view however
+    // far the rows are scrolled. That is the whole reason a selection crossing
+    // a row boundary is left alone, and it is asserted here rather than taken
+    // from the reading — both ends sit in column one, so anything that measured
+    // this selection as one rectangle would find it far out of band.
+    const { view } = mount(SOURCE);
+    const secondRowCell = at("alpha four five six");
+    view.dispatch({ selection: EditorSelection.range(FIRST_CELL, secondRowCell + 5) });
+    await settle();
+    const first = rowFor(view, FIRST_CELL);
+    const second = rowFor(view, secondRowCell);
+    expect(second).not.toBe(first);
+
+    first.scrollLeft = maxOffset(first);
+    await settle();
+
+    // Both ends have genuinely scrolled away, and both rows still show part of
+    // the selection: the first piece runs to the content's right edge, the last
+    // starts at its left one.
+    expect(contentX(view, FIRST_CELL)).toBeLessThan(first.scrollLeft);
+    expect(contentX(view, secondRowCell)).toBeLessThan(second.scrollLeft);
+    expect(selectionFlagged(view)).toBe(false);
+    expect(selectionVisibleIn(view, first)).toBe(true);
+    expect(selectionVisibleIn(view, second)).toBe(true);
+  });
+
+  it("leaves a selection running out of the table painted", async () => {
+    // The other half of the row-boundary case: a selection covering rows that
+    // scroll and lines that cannot. Nothing outside a row is clipped by one, so
+    // the answer is the same.
+    const { view } = mount(SOURCE);
+    view.dispatch({
+      selection: EditorSelection.range(FIRST_CELL, OUTSIDE + "Between".length),
+    });
+    await settle();
+    const row = rowFor(view, FIRST_CELL);
+    row.scrollLeft = maxOffset(row);
+    await settle();
+
+    // The in-table end of it has genuinely scrolled away.
+    expect(contentX(view, FIRST_CELL)).toBeLessThan(row.scrollLeft);
+    expect(selectionFlagged(view)).toBe(false);
+    expect(selectionVisibleIn(view, row)).toBe(true);
+  });
+
+  it("says nothing about a bare caret", async () => {
+    // An empty range paints no background at all (`:9570-9575`), so there is
+    // nothing here to suppress — and the caret's own signal is untouched.
+    const { view } = mount(SOURCE);
+    view.dispatch({ selection: EditorSelection.cursor(FIRST_CELL) });
+    await settle();
+    tableRowsFor(view, FIRST_CELL)[3]!.scrollLeft = 9999;
+    await settle();
+
+    expect(caretFlagged(view)).toBe(true);
+    expect(selectionFlagged(view)).toBe(false);
+  });
+
+  it("says nothing about a selection outside a table", async () => {
+    const { view } = mount(SOURCE);
+    view.dispatch({ selection: EditorSelection.range(at("Intro"), at("Intro") + 5) });
+    await settle();
+    const rows = tableRowsFor(view, FIRST_CELL);
+    rows[3]!.scrollLeft = 9999;
+    await settle();
+
+    // The table really is scrolled away. The selection is simply not in it, and
+    // nothing outside a row can be clipped by one.
+    expect(rows[3]!.scrollLeft).toBeGreaterThan(300);
+    expect(selectionFlagged(view)).toBe(false);
+  });
+
+  it("re-stamps the flag after a focus round trip", async () => {
+    // Same rewrite that takes the caret's flag off `view.dom` (`:8250`) takes
+    // this one, and it runs after the plugin's own update.
+    const { view } = mount(SOURCE);
+    view.dispatch({ selection: ONE_CELL });
+    await settle();
+    tableRowsFor(view, FIRST_CELL)[3]!.scrollLeft = 9999;
+    await settle();
+    expect(selectionFlagged(view)).toBe(true);
+
+    view.contentDOM.blur();
+    await settle();
+    view.focus();
+    await settle();
+
+    expect(view.hasFocus).toBe(true);
+    expect(selectionFlagged(view)).toBe(true);
+  });
+
+  it("drops the flag when the view is torn down", async () => {
+    const harness = mount(SOURCE);
+    harness.view.dispatch({ selection: ONE_CELL });
+    await settle();
+    tableRowsFor(harness.view, FIRST_CELL)[3]!.scrollLeft = 9999;
+    await settle();
+    expect(selectionFlagged(harness.view)).toBe(true);
+
+    // A reconfiguration rebuilds this plugin around the same `view.dom`. A flag
+    // left behind there is a selection that never comes back.
+    unmount(harness);
+
+    expect(selectionFlagged(harness.view)).toBe(false);
+  });
+});
+
 describe("revealing a cell the caret moves to", () => {
   it("scrolls the row rather than the note", async () => {
     const { view } = mount(SOURCE);
@@ -606,6 +844,33 @@ describe("what the synchronisation costs", () => {
       .toBeLessThan(percentile(baselineFrames, 0.95) + 16);
     // One selection refresh per scrolled frame. More than that is a loop
     // feeding itself; the microtask coalescing is what prevents it.
+    expect(refreshesPerFrame).toBeLessThanOrEqual(1.1);
+  });
+
+  it("stays within a frame of one without it with a selection to measure too", async () => {
+    // The frame above carries a bare caret, which costs one comparison to rule
+    // out of the selection question. This one carries a range wider than the
+    // band, so every scrolled frame measures both signals in full: two
+    // `coordsAtPos` reads and a row rectangle on top of the caret's own.
+    const baseline = mount(SOURCE, []);
+    const baselineFrames = await scrollFrames(baseline.view, 60);
+    unmount(baseline);
+
+    const synced = mount(SOURCE);
+    synced.view.dispatch({ selection: EditorSelection.range(FIRST_CELL, LAST_CELL_END) });
+    await settle();
+    const before = synced.refreshes();
+    const syncedFrames = await scrollFrames(synced.view, 60);
+    const refreshesPerFrame = (synced.refreshes() - before) / syncedFrames.length;
+
+    console.log("p3d frame intervals ms, selection measured", JSON.stringify({
+      baseline: [0.5, 0.95, 1].map((p) => percentile(baselineFrames, p).toFixed(2)),
+      synced: [0.5, 0.95, 1].map((p) => percentile(syncedFrames, p).toFixed(2)),
+      refreshesPerFrame,
+    }));
+
+    expect(percentile(syncedFrames, 0.95))
+      .toBeLessThan(percentile(baselineFrames, 0.95) + 16);
     expect(refreshesPerFrame).toBeLessThanOrEqual(1.1);
   });
 });

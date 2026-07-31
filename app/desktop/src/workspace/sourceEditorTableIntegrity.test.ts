@@ -8,6 +8,7 @@
 //
 // If any command can eat a trailing pipe or newline, this goes red.
 
+import { ensureSyntaxTree } from "@codemirror/language";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -86,7 +87,7 @@ function state(doc: string, anchor: number) {
 }
 
 function guardedState(doc: string, anchor: number) {
-  return EditorState.create({
+  const editor = EditorState.create({
     doc,
     selection: EditorSelection.cursor(anchor),
     extensions: [
@@ -94,6 +95,21 @@ function guardedState(doc: string, anchor: number) {
       tableDelimiterGuard,
     ],
   });
+  // Parse the WHOLE document before anyone reads the tree.
+  //
+  // `LanguageState.init` parses only `Work.InitViewport` (3,000) characters and
+  // abandons even that after 20ms of WALL CLOCK, so on a busy machine two states
+  // built from the same text can hold different trees. This test derives its
+  // expected set from one state and its observed behaviour from another, so that
+  // divergence showed up as the guard "failing to refuse" at a position it had
+  // never parsed — a flake in the one test that guards byte fidelity.
+  //
+  // Production cannot hit this: the filter and the paint path read the SAME
+  // state, so they agree by construction whatever the parse has reached.
+  if (!ensureSyntaxTree(editor, doc.length, 30_000)) {
+    throw new Error("the fixture did not parse in full; every assertion below would be unsound");
+  }
+  return editor;
 }
 
 /**
@@ -266,6 +282,16 @@ describe("delimiter guard integrity against the QA fixture", () => {
       }
     }
 
+    // WHAT THIS DOES NOT COVER — measured, not assumed. Both arms derive from
+    // `hiddenTableDelimiters`, so a mutation to the ENUMERATION moves them
+    // together and this test stays green: emptying `rowBoundaries` shrinks the
+    // expected set AND stops the guard refusing, and the two still agree. A
+    // mutation to the FILTER (never refuse) reds it immediately.
+    //
+    // So this is a differential test between the filter and the enumeration,
+    // not an absolute one. Errors inside the enumeration are caught next door in
+    // `sourceEditorTableDelimiterGuard.test.ts`, where that same `rowBoundaries`
+    // mutation reds two tests.
     expect(disagreements.slice(0, 8)).toEqual([]);
     // Both halves must be non-empty, or the property is satisfied vacuously by
     // a guard that refuses everything, or one that refuses nothing.

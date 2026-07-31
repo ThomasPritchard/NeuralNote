@@ -32,6 +32,7 @@ const {
 const {
   drawsCellChrome,
   hiddenTableDelimiters,
+  REFUSED_ALIGNMENT_ROW_ANNOUNCEMENT,
   REFUSED_TABLE_EDIT_ANNOUNCEMENT,
   tableDelimiterGuard,
   tableStructuralEdit,
@@ -116,12 +117,15 @@ describe("the divider is protected exactly where it is invisible", () => {
     expect(transaction.state.doc.toString()).toBe(TABLE);
   });
 
-  it("refuses an edit inside the delimiter row, which is drawn as a rule", () => {
+  it("refuses an edit inside the delimiter row, naming the alignment row", () => {
+    // The refusal stands; only the WORDING changed. The alignment row is the
+    // one hidden span with a command that reveals it, so it gets a message that
+    // names it and points there rather than the generic structural refusal.
     const insideRule = TABLE.indexOf("| --- |") + 3;
     const transaction = guarded(TABLE, [{ anchor: insideRule }])
       .update({ changes: { from: insideRule, insert: ":" } });
 
-    expect(announcement(transaction)).toBe(REFUSED_TABLE_EDIT_ANNOUNCEMENT);
+    expect(announcement(transaction)).toBe(REFUSED_ALIGNMENT_ROW_ANNOUNCEMENT);
     expect(transaction.state.doc.toString()).toBe(TABLE);
   });
 
@@ -325,7 +329,7 @@ describe("drawsCellChrome agrees with the preview at the exact bound", () => {
   }
 
   const chromeDrawn = (doc: string) =>
-    drawsCellChrome(tableModelAt(guarded(doc), doc.indexOf("| Key"))!);
+    drawsCellChrome(guarded(doc), tableModelAt(guarded(doc), doc.indexOf("| Key"))!);
 
   for (const rows of [1, MAX_TABLE_PREVIEW_ROWS - 1, MAX_TABLE_PREVIEW_ROWS]) {
     it(`draws ${rows} body rows both ways`, () => {

@@ -13,15 +13,19 @@ import { describe, expect, it } from "vitest";
 import { TABLE_CONTRACT_FIXTURE } from "./sourceEditorTableContractFixture";
 import {
   CARET_OFFSCREEN_CLASS,
+  SELECTION_OFFSCREEN_CLASS,
   TABLE_ROW_SELECTOR,
   clampOffset,
+  isSelectionInBand,
   isSpanInBand,
   offsetAfter,
   offsetsKeepingVisible,
   scrollableRange,
   tableOffset,
   tableRowsAt,
+  type MeasuredRect,
   type RowGeometry,
+  type SelectionEnds,
   type Span,
 } from "./sourceEditorTableScrollSync";
 
@@ -149,6 +153,89 @@ describe("isSpanInBand", () => {
   });
 });
 
+describe("isSelectionInBand", () => {
+  const LINE_HEIGHT = 20;
+
+  /** One end of a selection: the character box `coordsAtPos` measures there. */
+  const end = (offset: number, line = 0): MeasuredRect => ({
+    left: WIDE_ROW.contentOrigin + offset,
+    right: WIDE_ROW.contentOrigin + offset + 8,
+    top: line * LINE_HEIGHT,
+    bottom: (line + 1) * LINE_HEIGHT,
+  });
+
+  /** A selection running from content x `from` to `to`, all on one line. */
+  const within = (from: number, to: number): SelectionEnds => ({ from: end(from), to: end(to) });
+
+  it("holds a selection inside the band the row will show", () => {
+    expect(isSelectionInBand(WIDE_ROW, within(450, 500), 400)).toBe(true);
+  });
+
+  it("rejects a selection the band has scrolled past", () => {
+    // The measured defect: row box at [0, 400] with the table at full scroll,
+    // and `.cm-selectionBackground` painted at left -786.41px — a block of
+    // highlight over whatever unrelated text happens to be there.
+    expect(isSelectionInBand(WIDE_ROW, within(16, 100), 400)).toBe(false);
+  });
+
+  it("rejects a selection the band has not reached yet", () => {
+    expect(isSelectionInBand(WIDE_ROW, within(900, 1000), 400)).toBe(false);
+  });
+
+  it("holds a selection straddling the band's inline start", () => {
+    // Half scrolled away, half still drawn. Suppressing this would erase a
+    // selection the user can see, which is the worse defect of the two.
+    expect(isSelectionInBand(WIDE_ROW, within(200, 500), 400)).toBe(true);
+  });
+
+  it("holds a selection straddling the band's inline end", () => {
+    expect(isSelectionInBand(WIDE_ROW, within(700, 900), 400)).toBe(true);
+  });
+
+  it("holds a selection wider than the band at both edges", () => {
+    // Nothing of either end is in band; the middle of it fills the band.
+    expect(isSelectionInBand(WIDE_ROW, within(100, 1100), 400)).toBe(true);
+  });
+
+  it("holds a selection whose ends sit on different visual lines", () => {
+    // Both ends are out of band and it is still visible, because past one
+    // visual line `drawSelection` stops painting the text's own width: the
+    // first piece runs to the content's right edge, the last starts at its left
+    // one, and any piece between spans both (`:9327-9335`, `:9361`). Those
+    // edges are inside every row's band. Adjacent line boxes touch exactly —
+    // 0..20 then 20..40 — so this is also the boundary of that comparison.
+    expect(isSelectionInBand(WIDE_ROW, { from: end(16), to: end(16, 1) }, 400)).toBe(true);
+  });
+
+  it("measures a selection whose ends differ in height", () => {
+    // Two differently-sized spans of one line: the boxes overlap rather than
+    // match. Still the one rectangle the painter draws, so it is still measured
+    // — and here it is out of band.
+    const taller: MeasuredRect = { ...end(100), top: -4, bottom: LINE_HEIGHT + 4 };
+    expect(isSelectionInBand(WIDE_ROW, { from: end(16), to: taller }, 400)).toBe(false);
+  });
+
+  it("takes the outer edges when the ends are measured the other way round", () => {
+    // A bidi run can put the end of a selection to the left of its start. Read
+    // as `from.left`..`to.right` that inverts into a span with no width, and an
+    // inverted span is out of every band — so the outer edges are what is read.
+    expect(isSelectionInBand(WIDE_ROW, { from: end(500), to: end(16) }, 400)).toBe(true);
+  });
+
+  it("answers about an offset the row has not been written to yet", () => {
+    // The same pending-offset question the caret asks, so one plan cannot stamp
+    // "still visible" in the write phase that scrolls it away.
+    const scrolled: RowGeometry = { ...WIDE_ROW, scrollLeft: 700 };
+    const ends: SelectionEnds = {
+      from: { left: scrolled.contentOrigin - 200, right: scrolled.contentOrigin - 192, top: 0, bottom: 20 },
+      to: { left: scrolled.contentOrigin - 150, right: scrolled.contentOrigin - 142, top: 0, bottom: 20 },
+    };
+
+    expect(isSelectionInBand(scrolled, ends, 700)).toBe(false);
+    expect(isSelectionInBand(scrolled, ends, 400)).toBe(true);
+  });
+});
+
 describe("tableOffset", () => {
   const scrollable = (scrollLeft: number): RowGeometry => ({ ...WIDE_ROW, scrollLeft });
   const stuck: RowGeometry = { ...WIDE_ROW, scrollWidth: 400, scrollLeft: 0 };
@@ -239,5 +326,19 @@ describe("CARET_OFFSCREEN_CLASS", () => {
     // everywhere while the stylesheet's rule silently stopped matching — this
     // is what would go red instead.
     expect(CARET_OFFSCREEN_CLASS).toBe("nn-table-caret-offscreen");
+  });
+});
+
+describe("SELECTION_OFFSCREEN_CLASS", () => {
+  it("is the literal the stylesheet keys its rule on", () => {
+    expect(SELECTION_OFFSCREEN_CLASS).toBe("nn-table-selection-offscreen");
+  });
+
+  it("is not the caret's class", () => {
+    // Two signals, two rules. Answering the caret's question for the selection
+    // hides a selection that straddles the band's edge, which is why the
+    // stylesheet needs a second name rather than a second selector on the
+    // first one.
+    expect(SELECTION_OFFSCREEN_CLASS).not.toBe(CARET_OFFSCREEN_CLASS);
   });
 });

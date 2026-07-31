@@ -915,6 +915,21 @@ html[data-font-family="sourceSerif4"] {
   display: none;
 }
 
+/* The same defect one layer over, for a selection rather than a caret, and
+   deliberately NOT a second selector on the rule above.
+
+   The two signals are not interchangeable. A caret is a single point, so it is
+   either in the row's band or out of it. A selection is a LIST of painted
+   rectangles and can straddle the band — part scrolled away, part in plain view
+   — and hiding all of it would then erase a selection the user can see, which is
+   a worse defect than the stray paint this fixes.
+   `sourceEditorTableScrollSync.ts` raises this class only when no rectangle of
+   the selection is in view, and a test asserts the two classes disagree in
+   exactly that case. */
+.nn-source-editor .cm-editor.nn-table-selection-offscreen .cm-selectionLayer {
+  display: none;
+}
+
 .nn-source-editor :where(.nn-lp-link, .nn-lp-wikilink-resolved) {
   color: var(--primary);
   cursor: pointer;

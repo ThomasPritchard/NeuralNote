@@ -37,6 +37,7 @@ import {
   tableRenderPlan,
   type TableRenderCell,
 } from "./sourceEditorTableModel";
+import { revealedTableSource } from "./sourceEditorTableReveal";
 import type { VisibleRange } from "./sourceEditorDecorationsTypes";
 
 export type {
@@ -266,7 +267,7 @@ function reportTableError(state: EditorState, message: string | null): void {
  */
 function tableRanges(state: EditorState, table: VisibleRange): TableDecorationRanges {
   const model = tableModelAt(state, table.from);
-  if (!model || !drawsCellChrome(model)) {
+  if (!model || !drawsCellChrome(state, model)) {
     return {
       structure: [],
       cells: [Decoration.mark({ class: "nn-lp-table-source" }).range(table.from, table.to)],
@@ -489,6 +490,11 @@ export function sourceEditorDecorations(
     // Integrity travels with the decorations that create the hazard: this array
     // is already consumed at `SourceNoteEditor.tsx:139`, and `EditorView.announce`
     // is rendered by CodeMirror, so neither needs anything of the component.
+    // Registered with the guard that reads it: `drawsCellChrome` asks this
+    // field whether a table is showing its literal source, and a table the user
+    // can see whole must not have its delimiters painted over, made atomic, or
+    // protected against editing.
+    revealedTableSource,
     tableDelimiterGuard,
     EditorView.atomicRanges.of((view) => tableAtomicRanges(view.state, view.visibleRanges)),
     keyboardLinkHandler,

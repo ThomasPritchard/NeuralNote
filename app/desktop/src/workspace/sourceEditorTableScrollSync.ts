@@ -41,6 +41,18 @@
  * focus (`@codemirror/view/dist/index.js:8250` rewrites the class attribute
  * that does it) — hiding is a state the cursor has, not a hack.
  *
+ * **The drawn selection has the same defect and not the same answer.** Its
+ * layer is a sibling of the cursor's and just as unclippable — measured on a
+ * row box of [0, 400] at full scroll, `.cm-selectionBackground` painted at
+ * -786.41px, a block of highlight over unrelated text. So it gets a signal of
+ * its own, `SELECTION_OFFSCREEN_CLASS`. What it does not get is the caret's
+ * rule: a caret is a point and is in the band or out of it, while a selection
+ * can straddle the edge with half of it still drawn, and hiding that half would
+ * erase something the user can see — a worse defect than the one being fixed.
+ * It is suppressed only with no visible presence at all, decided per painted
+ * rectangle; `isSelectionInBand` carries what that means and why it reduces to
+ * one case.
+ *
  * Revealing a cell is the one path that still computes where the caret would be
  * visible, as a one-shot scroll on navigation rather than a standing rule.
  * `scrollRectIntoView` is called on `.cm-scroller` (`:3449`) and only ever
@@ -66,6 +78,19 @@ export const TABLE_ROW_SELECTOR = ".nn-lp-table-row";
  * which is why the arithmetic test pins the literal.
  */
 export const CARET_OFFSCREEN_CLASS = "nn-table-caret-offscreen";
+
+/**
+ * Stamped on `view.dom` while the main selection is drawn entirely outside its
+ * row's visible band. P3c's stylesheet hides the selection layer under it, so
+ * this string is the same kind of contract as the caret's, pinned the same way.
+ *
+ * A second name rather than a second selector on the caret's rule. The two
+ * questions have different answers: a caret is a point and is either in the
+ * band or not, while a selection can straddle the band's edge with half of it
+ * still drawn. Hiding that half is a worse defect than the one being fixed, so
+ * the stylesheet has to be able to hide one layer without the other.
+ */
+export const SELECTION_OFFSCREEN_CLASS = "nn-table-selection-offscreen";
 
 /**
  * Below this, a difference is device-pixel snapping rather than a scroll: a row
@@ -106,6 +131,21 @@ export interface Span {
   readonly right: number;
 }
 
+/**
+ * A `Span` that also knows its vertical extent. Satisfied by a `DOMRect` and by
+ * the rectangle `coordsAtPos` returns.
+ */
+export interface MeasuredRect extends Span {
+  readonly top: number;
+  readonly bottom: number;
+}
+
+/** The two ends of a drawn selection, each measured on the side it lies on. */
+export interface SelectionEnds {
+  readonly from: MeasuredRect;
+  readonly to: MeasuredRect;
+}
+
 /** The offsets a row can actually hold. */
 export function scrollableRange(row: RowGeometry): OffsetRange {
   return { min: 0, max: Math.max(0, row.scrollWidth - row.clientWidth) };
@@ -129,6 +169,59 @@ export function isSpanInBand(row: RowGeometry, span: Span, offset: number): bool
   const left = span.left - row.contentOrigin + row.scrollLeft;
   const right = span.right - row.contentOrigin + row.scrollLeft;
   return right >= offset && left <= offset + row.clientWidth;
+}
+
+/**
+ * Whether two measured ends sit on one visual line. Their boxes overlap
+ * vertically; adjacent line boxes only touch, which is why the comparison is
+ * strict. Overlap rather than equal tops, so two differently-sized spans of one
+ * line stay together — and any error here falls the safe way, because ends read
+ * as two lines leave the selection painted.
+ */
+function sharesVisualLine(from: MeasuredRect, to: MeasuredRect): boolean {
+  return from.bottom > to.top && to.bottom > from.top;
+}
+
+/**
+ * The single rectangle the painter draws for ends that share a visual line.
+ * Outermost edges rather than `from.left`..`to.right`: identical under LTR, and
+ * where a bidi run puts the ends the other way round it errs wide, which leaves
+ * the selection painted rather than hiding one that is visible.
+ */
+function paintedSpan(ends: SelectionEnds): Span {
+  return {
+    left: Math.min(ends.from.left, ends.to.left),
+    right: Math.max(ends.from.right, ends.to.right),
+  };
+}
+
+/**
+ * Whether the selection between `ends` still has any visible presence in the
+ * band `row` shows at `offset`.
+ *
+ * **"In band" is decided per painted rectangle** — not per range, and never
+ * over the range's union. `drawSelection` does not paint a selection, it paints
+ * a list of rectangles (`RectangleMarker.forRange`, `:9276`), and a rectangle
+ * is the thing a row can scroll away. Over the union the answer goes wrong in
+ * the expensive direction: a selection from column one of one row to column one
+ * of the next unions into a narrow span nowhere near the band and reads as
+ * hidden, while both of the rectangles actually drawn for it are in view. The
+ * browser lane holds that case against this.
+ *
+ * Per rectangle, the question collapses to one case. Past a single visual line
+ * the painter stops drawing the text's own width: the first piece runs to the
+ * content's right edge, the last starts at its left edge, and any piece between
+ * spans both (`:9327-9335`, `:9361`). Every row line is as wide as the content,
+ * so those edges are inside every row's band — a selection crossing a visual
+ * line always has a rectangle in view, however far its rows are scrolled,
+ * including the rows that cannot scroll at all. So the only selection that can
+ * be entirely out of band is one whose ends share a visual line, drawn as a
+ * single rectangle of its own text's width (`:9323-9325`), and that is the one
+ * this measures.
+ */
+export function isSelectionInBand(row: RowGeometry, ends: SelectionEnds, offset: number): boolean {
+  if (!sharesVisualLine(ends.from, ends.to)) return true;
+  return isSpanInBand(row, paintedSpan(ends), offset);
 }
 
 /**
@@ -204,12 +297,16 @@ export interface RowWrite {
 
 /**
  * What one measure pass decided: where the rows go, and whether the drawn caret
- * has left the row it belongs to. The two travel together because the second is
- * a question about the offsets in the first — asked before they are written.
+ * and the drawn selection have left the rows they belong to. All three travel
+ * together because the last two are questions about the offsets in the first —
+ * asked before they are written. The two signals are decided independently and
+ * routinely disagree: a selection straddling the band's edge is visible while
+ * the caret at its head is not.
  */
 interface SyncPlan {
   readonly writes: readonly RowWrite[];
   readonly caretOffscreen: boolean;
+  readonly selectionOffscreen: boolean;
 }
 
 function readRow(row: Element): RowGeometry {
@@ -286,6 +383,7 @@ class TableScrollSync implements PluginValue {
   private redrawPending = false;
   private stopped = false;
   private caretOffscreen = false;
+  private selectionOffscreen = false;
 
   constructor(private readonly view: EditorView) {
     // Capture, because a `scroll` event on an element does not bubble. Passive,
@@ -313,9 +411,10 @@ class TableScrollSync implements PluginValue {
     this.stopped = true;
     this.view.scrollDOM.removeEventListener("scroll", this.onScroll, { capture: true });
     // The view outlives this plugin across a reconfiguration. A flag left
-    // behind on it is a cursor that never comes back.
+    // behind on it is a cursor, or a selection, that never comes back.
     this.caretOffscreen = false;
-    this.stampCaret();
+    this.selectionOffscreen = false;
+    this.stampSignals();
   }
 
   /**
@@ -361,9 +460,13 @@ class TableScrollSync implements PluginValue {
     return this.plan(planSync(rows, desired));
   }
 
-  /** `writes`, plus the caret question the offsets they carry imply. */
+  /** `writes`, plus the two questions the offsets they carry imply. */
   private plan(writes: readonly RowWrite[]): SyncPlan {
-    return { writes, caretOffscreen: this.isCaretOffscreen(writes) };
+    return {
+      writes,
+      caretOffscreen: this.isCaretOffscreen(writes),
+      selectionOffscreen: this.isSelectionOffscreen(writes),
+    };
   }
 
   /**
@@ -382,21 +485,55 @@ class TableScrollSync implements PluginValue {
     return !isSpanInBand(readRow(row), caretSpan(coords), offsetAfter(row, writes));
   }
 
+  /**
+   * Whether the main selection is drawn entirely outside its row's band, once
+   * `writes` are applied. False whenever the question does not arise or cannot
+   * be answered — an empty range paints no background at all (`:9570-9575`),
+   * and a selection outside a table, outside the viewport, or without
+   * coordinates is not one any row can clip — because a selection drawn in the
+   * wrong place is recoverable and one nobody can see is not.
+   *
+   * The main range only, like the caret above it. A second cursor's range is
+   * painted too (`:9571`), but the class is one signal over one stylesheet
+   * rule, and suppressing every range because a secondary one scrolled away
+   * would hide the one the user is looking at.
+   */
+  private isSelectionOffscreen(writes: readonly RowWrite[]): boolean {
+    const { main } = this.view.state.selection;
+    if (main.empty) return false;
+    const row = rowAt(this.view, main.from);
+    if (!row) return false;
+    // Each end measured on the side the selection lies on, which is the side
+    // the painter reads its own from (`:9354-9355`). It passes a magnitude of
+    // 2 there, a kludge for the far side of a block widget; the published type
+    // admits only ±1 and the sign is the half that picks the side, so this
+    // stays inside the declared API. The two agree on a text position, and a
+    // row line is one.
+    const from = this.view.coordsAtPos(main.from, 1);
+    const to = this.view.coordsAtPos(main.to, -1);
+    if (!from || !to) return false;
+    return !isSelectionInBand(readRow(row), { from, to }, offsetAfter(row, writes));
+  }
+
   private commit(plan: SyncPlan): void {
     if (this.suspended) return;
     this.caretOffscreen = plan.caretOffscreen;
-    this.stampCaret();
+    this.selectionOffscreen = plan.selectionOffscreen;
+    this.stampSignals();
     if (applySync(plan.writes)) this.scheduleRedraw();
   }
 
   /**
-   * Write the signal onto the editor. Separate from deciding it because
+   * Write both signals onto the editor. Separate from deciding them because
    * CodeMirror reassigns `view.dom`'s class attribute wholesale (`:8250`), and
-   * it does so *after* this plugin's own `update` (`:8005`) — so the flag has
-   * to be re-stamped from a measure, which runs later still.
+   * it does so *after* this plugin's own `update` (`:8005`) — so the flags have
+   * to be re-stamped from a measure, which runs later still. One write site,
+   * two independent flags: they are decided apart and often differ.
    */
-  private stampCaret(): void {
-    this.view.dom.classList.toggle(CARET_OFFSCREEN_CLASS, this.caretOffscreen);
+  private stampSignals(): void {
+    const { classList } = this.view.dom;
+    classList.toggle(CARET_OFFSCREEN_CLASS, this.caretOffscreen);
+    classList.toggle(SELECTION_OFFSCREEN_CLASS, this.selectionOffscreen);
   }
 
   /**

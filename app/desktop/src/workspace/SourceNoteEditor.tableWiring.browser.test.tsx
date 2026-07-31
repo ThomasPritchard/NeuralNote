@@ -357,4 +357,41 @@ describe("the composed editor's table row scrolling", () => {
     expect(getComputedStyle(cursorLayer).display).not.toBe("none");
     expect(view.state.doc.toString()).toBe(WIDE_TABLE);
   });
+
+  // The selection half of the same contract, and only the half the stylesheet
+  // owns: that the class has an EFFECT. Whether it is raised at the right moment
+  // — and specifically that a selection straddling the band keeps it clear — is
+  // pinned next door in `sourceEditorTableScrollSync.browser.test.ts`. Either
+  // half alone is a claim: a class nothing consumes hides nothing, and a rule
+  // nothing raises never fires.
+  //
+  // Toggled by hand rather than driven through a real out-of-band selection,
+  // because the module's own suite already drives that geometry and this
+  // assertion is about the cascade, not about when the flag rises.
+  it("hides the selection layer, and only under its own class", async () => {
+    await mountRevealed(WIDE_TABLE, WIDE_TABLE_CELL);
+    const editor = host!.querySelector<HTMLElement>(".cm-editor")!;
+    const selectionLayer = editor.querySelector<HTMLElement>(".cm-selectionLayer")!;
+
+    // The premise. A layer that was never built, or was already hidden, would
+    // satisfy every assertion below without the rule existing at all.
+    expect(selectionLayer).not.toBeNull();
+    expect(getComputedStyle(selectionLayer).display).not.toBe("none");
+
+    // The caret's class must NOT reach the selection layer — they are separate
+    // rules on purpose, because a selection can straddle the band where a caret
+    // cannot.
+    editor.classList.add("nn-table-caret-offscreen");
+    await settle(1);
+    expect(getComputedStyle(selectionLayer).display).not.toBe("none");
+    editor.classList.remove("nn-table-caret-offscreen");
+
+    editor.classList.add("nn-table-selection-offscreen");
+    await settle(1);
+    expect(getComputedStyle(selectionLayer).display).toBe("none");
+
+    editor.classList.remove("nn-table-selection-offscreen");
+    await settle(1);
+    expect(getComputedStyle(selectionLayer).display).not.toBe("none");
+  });
 });

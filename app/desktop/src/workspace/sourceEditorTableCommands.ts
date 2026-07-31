@@ -4,7 +4,7 @@ import {
   type SelectionRange,
   type TransactionSpec,
 } from "@codemirror/state";
-import type { Command } from "@codemirror/view";
+import type { Command, KeyBinding } from "@codemirror/view";
 
 import {
   drawsCellChrome,
@@ -21,6 +21,7 @@ import {
   type TableModel,
   type TableRowModel,
 } from "./sourceEditorTableModel";
+import { setRevealedTableSource, tableSourceRevealed } from "./sourceEditorTableReveal";
 
 interface CellLocation {
   readonly rowIndex: number;
@@ -248,7 +249,7 @@ export function guardTableDelimiter(
   // literal source, every pipe on screen. Refusing to delete a character the
   // user is plainly looking at — and jumping the caret past it — is a bug, and
   // this is the bound every other consumer already checks.
-  if (!model || !drawsCellChrome(model)) return null;
+  if (!model || !drawsCellChrome(state, model)) return null;
 
   const adjacent = guardedSpans(model, direction).find((span) =>
     direction === -1 ? span.to === range.head : span.from === range.head,
@@ -367,3 +368,67 @@ export const nextTableCell = toCommand((state) => tableCellStep(state, 1));
 export const previousTableCell = toCommand((state) => tableCellStep(state, -1));
 export const nextTableRow = toCommand(tableRowStep);
 export const formatTable = toCommand(formatTableAt);
+
+/**
+ * Show the literal source of the table at the caret, or hide it again.
+ *
+ * This is the command the parent spec's hidden-delimiter exemption is
+ * conditional on (`specs/source-native-live-preview-editor.md:90-95`): the
+ * `" | "` gaps and the alignment row may only be hidden because this exists to
+ * bring them back. It is also the only route to editing a column's alignment,
+ * and the route for anyone who genuinely wants to type a structural pipe.
+ *
+ * It changes NO bytes — revealing is a rendering change — and it is never
+ * invoked on the user's behalf. The integrity guard refuses a blind edit and
+ * says so; it does not reveal the source as a silent fallback
+ * (`specs/in-place-table-cell-editing.md:763-770`).
+ */
+export function revealTableSourceAt(state: EditorState): TransactionSpec | null {
+  const model = activeTableAt(state, state.selection.main.head);
+  if (!model) return null;
+  const revealed = tableSourceRevealed(state, model);
+  return {
+    effects: setRevealedTableSource.of(revealed ? null : { from: model.from, to: model.to }),
+  };
+}
+
+/**
+ * Deliberately NOT built with `toCommand`: that seam annotates every
+ * transaction as a structural table edit so the delimiter guard lets it
+ * through, and this one has no document change for the guard to vet. Claiming
+ * an exemption it does not need would make the annotation meaningless where it
+ * does.
+ */
+export const revealTableSource: Command = (view) => {
+  const spec = revealTableSourceAt(view.state);
+  if (!spec) return false;
+  view.dispatch(spec);
+  return true;
+};
+
+/**
+ * The table block of `SourceNoteEditor`'s keymap, in registration order.
+ *
+ * It lives here, with the commands, so the binding order is testable against
+ * the real thing rather than restated in a test. Its POSITION in the editor's
+ * keymap is load-bearing and documented at the splice site: after
+ * `completionKeymap`, so an open completion popup keeps Enter, and before
+ * `foldKeymap` and `defaultKeymap`, so a table command beats the default.
+ *
+ * `Shift-Alt-\` sits immediately after `Shift-Alt-f` as the spec asks
+ * (`specs/in-place-table-cell-editing.md:1133-1135`), and
+ * `sourceEditorTableKeymap.test.ts` proves nothing else in the editor claims it.
+ */
+export const tableKeymap: readonly KeyBinding[] = [
+  // Before defaultKeymap's delete commands: a hidden delimiter must move the
+  // caret, never be deleted. See guardTableDelimiter.
+  { key: "Backspace", run: guardTableDelimiterBackward },
+  { key: "Delete", run: guardTableDelimiterForward },
+  { key: "ArrowLeft", run: guardTableDelimiterBackward },
+  { key: "ArrowRight", run: guardTableDelimiterForward },
+  { key: "Tab", run: nextTableCell },
+  { key: "Shift-Tab", run: previousTableCell },
+  { key: "Enter", run: nextTableRow },
+  { key: "Shift-Alt-f", run: formatTable },
+  { key: "Shift-Alt-\\", run: revealTableSource },
+];

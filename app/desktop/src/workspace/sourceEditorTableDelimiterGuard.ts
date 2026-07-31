@@ -16,6 +16,7 @@ import {
   type TableDelimiterRange,
   type TableModel,
 } from "./sourceEditorTableModel";
+import { tableSourceRevealed } from "./sourceEditorTableReveal";
 
 /**
  * Announced when a change is refused. `EditorView.announce` is rendered by
@@ -24,6 +25,21 @@ import {
  */
 export const REFUSED_TABLE_EDIT_ANNOUNCEMENT =
   "Edit refused: it would delete hidden table structure. The note is unchanged.";
+
+/**
+ * The alignment row's own refusal, because the generic one names the wrong
+ * thing and offers no way forward.
+ *
+ * The alignment row is hidden whole and drawn as the header rule, so a user
+ * changing a column's alignment to `:---` is editing something they cannot see
+ * and gets refused for reasons the generic message does not explain. Naming the
+ * construct and the command that reveals it turns a wall into a route — which
+ * is the parent spec's condition for hiding the row at all
+ * (`specs/source-native-live-preview-editor.md:90-95`).
+ */
+export const REFUSED_ALIGNMENT_ROW_ANNOUNCEMENT =
+  "Edit refused: the table's alignment row is hidden. "
+  + "Press Shift-Alt-\\ to show the table's source, then edit it. The note is unchanged.";
 
 /**
  * Marks a transaction as one of the explicit structural table commands — add a
@@ -55,7 +71,13 @@ export const tableStructuralEdit = Annotation.define<boolean>();
  * exact bound" in `sourceEditorTableDelimiterGuard.test.ts`, which drives the
  * real preview rather than restating this arithmetic.
  */
-export function drawsCellChrome(model: TableModel): boolean {
+export function drawsCellChrome(state: EditorState, model: TableModel): boolean {
+  // Reveal belongs in THIS predicate rather than beside its three callers. A
+  // revealed table is simply not a drawn table, so the paint path renders its
+  // source, the atomic ranges stop covering delimiters that are now on screen,
+  // and the filter stops refusing edits to them — all from one decision, which
+  // is the only way the three cannot drift apart.
+  if (tableSourceRevealed(state, model)) return false;
   const bodyRows = model.rows.reduce((total, row) => total + (row.kind === "body" ? 1 : 0), 0);
   return model.to - model.from <= MAX_TABLE_PREVIEW_CHARS && bodyRows <= MAX_TABLE_PREVIEW_ROWS;
 }
@@ -124,7 +146,7 @@ function drawnTables(state: EditorState, ranges: readonly VisibleRange[]): Table
   try {
     return tableStarts(state, ranges).flatMap((start) => {
       const model = tableModelAt(state, start);
-      return model && drawsCellChrome(model) ? [model] : [];
+      return model && drawsCellChrome(state, model) ? [model] : [];
     });
   } catch {
     // Spec rule 6: a decoration failure removes the decoration and leaves the
@@ -160,8 +182,12 @@ function tableStarts(state: EditorState, ranges: readonly VisibleRange[]): numbe
 }
 
 /**
- * Whether replacing `[from, to)` would edit structure the user cannot see: a
- * hidden delimiter, or the line boundary between two rows of a drawn table.
+ * Why replacing `[from, to)` must be refused, or null when it is safe.
+ *
+ * Returns the ANNOUNCEMENT rather than a bare boolean so the reason survives to
+ * the user. The alignment row and a `" | "` gap are refused by the same rule but
+ * are not the same problem: only one of them has a command that reveals it, so
+ * only one of them can point the user anywhere.
  *
  * Overlap, not strict containment: a selection drawn exactly around the hidden
  * `" | "` destroys it just as thoroughly as one drawn through it. For a pure
@@ -169,14 +195,23 @@ function tableStarts(state: EditorState, ranges: readonly VisibleRange[]): numbe
  * typing at either edge of a gap — which is what typing at a cell boundary is,
  * and what typing at either end of a row is — stays untouched.
  */
-function editsHiddenTableStructure(state: EditorState, from: number, to: number): boolean {
-  return hiddenTableDelimiters(state, [{ from, to }]).some((table) => {
+function refusalFor(state: EditorState, from: number, to: number): string | null {
+  for (const table of hiddenTableDelimiters(state, [{ from, to }])) {
     // Removing or replacing a table WHOLE is not blind editing: the user can see
     // everything they selected. Select All, and cutting a table out, keep working.
-    if (from <= table.from && to >= table.to) return false;
-    return [...table.delimiters, ...table.rowBoundaries]
-      .some((span) => from < span.to && to > span.from);
-  });
+    if (from <= table.from && to >= table.to) continue;
+    const struck = [...table.delimiters, ...table.rowBoundaries]
+      .filter((span) => from < span.to && to > span.from);
+    if (struck.length === 0) continue;
+    // The alignment row is the whole `rule` span. A row boundary carries no
+    // `kind`, so it falls to the generic message, which is right: joining two
+    // rows is not an alignment edit and revealing the source does not describe
+    // the fix.
+    return struck.some((span) => "kind" in span && span.kind === "rule")
+      ? REFUSED_ALIGNMENT_ROW_ANNOUNCEMENT
+      : REFUSED_TABLE_EDIT_ANNOUNCEMENT;
+  }
+  return null;
 }
 
 /**
@@ -205,15 +240,15 @@ export function tableDelimiterFilter(
   if (transaction.annotation(tableStructuralEdit)) return transaction;
 
   const before = transaction.startState;
-  let refused = false;
+  let refusal: string | null = null;
   transaction.changes.iterChangedRanges((from, to) => {
-    if (!refused) refused = editsHiddenTableStructure(before, from, to);
+    if (!refusal) refusal = refusalFor(before, from, to);
   }, true);
-  if (!refused) return transaction;
+  if (!refusal) return transaction;
 
   // No changes and no selection: the document and every cursor are left exactly
   // as `startState` had them, and the reason is the only thing that survives.
-  return { effects: EditorView.announce.of(REFUSED_TABLE_EDIT_ANNOUNCEMENT) };
+  return { effects: EditorView.announce.of(refusal) };
 }
 
 /**
