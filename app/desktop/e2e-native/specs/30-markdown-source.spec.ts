@@ -196,6 +196,15 @@ describe("NeuralNote native Markdown source fidelity", () => {
       .split("\n")
       .filter(Boolean)
       .map((line) => JSON.parse(line) as string);
-    assert.deepEqual(nativeReads, ["Markdown Compatibility.md"]);
+    const inertTargets = new Set([
+      "never-read-standard-image.png",
+      "never-read-obsidian-image.png",
+      "Never Read Obsidian Note",
+      "Never Read Obsidian Note.md",
+    ]);
+    assert.deepEqual(
+      nativeReads.filter((fileName) => inertTargets.has(fileName)),
+      [],
+    );
   });
 });

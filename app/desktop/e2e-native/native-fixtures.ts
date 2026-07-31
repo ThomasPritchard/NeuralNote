@@ -60,14 +60,14 @@ tilde fence
 [External](https://example.com)
 [Unsafe](javascript:alert(1))
 ![Remote alt](http://127.0.0.1:9/native-e2e-image.png)
-![](missing-alt.png)
+![](never-read-standard-image.png)
 
 | Left | Center | Right | Escaped |
 | :--- | :----: | ----: | ------- |
 | *one* | **two** | three | pipe \\| literal |
 
 [[Start]] [[Start|Alias]] [[Start#Heading]] [[Start#^block-id]] [[Missing]]
-![[image.png]] ![[Start]]
+![[never-read-obsidian-image.png]] ![[Never Read Obsidian Note]]
 
 #tag #nested/tag #Unicode-東京 #emoji/🧠
 
