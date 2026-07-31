@@ -5,10 +5,10 @@ tags: [qa/markdown, qa/tables]
 
 ## Simple table
 
-| Name | State | Notes |
-| --- | :---: | ---: |
-| Alpha | Active | 12 |
-| Beta | Paused | 4 |
+| Name  | State  | Notes |
+| ----- | :----: | ----: |
+| Alpha | Active |    12 |
+| Beta  | Paused |     4 |
 
 ## Inline formatting in cells
 

@@ -34,3 +34,10 @@ lcov-rust.info
 
 # Production-audit working artifact (never committed; deleted on remediation)
 /production-audit-report.md
+
+# Vault app-state directories. Created inside any vault the apps open — including
+# the QA fixture vault — and they hold machine-local paths and UI state, so they
+# are never source. `prepare-note-test-vault.mjs` copies a vault wholesale, so
+# leaving these tracked would seed a fresh manual vault with another machine's state.
+.neuralnote/
+.obsidian/
