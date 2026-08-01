@@ -52,11 +52,15 @@ export default defineConfig({
         mode: "retain-on-failure",
         tracesDir: `artifacts/browser/${requestedBrowser}/traces`,
       },
-      provider: playwright({
-        contextOptions: {
-          reducedMotion: "reduce",
-        },
-      }),
+      // No `contextOptions: { reducedMotion: "reduce" }`. Emulating it made the
+      // measurement probe read HEADER cells at regular weight instead of bold:
+      // live advance came out 1-3px wider than the probe on every header cell,
+      // and "measures a header cell at the weight the header rule gives it"
+      // inverted to `header <= body`. Six geometry assertions failed with it and
+      // pass without it, bisected one option at a time. The reduced-motion rule
+      // this would have matched is `styles.css`'s animation/transition reset; it
+      // buys this suite nothing, and this suite exists to measure text advance.
+      provider: playwright(),
       headless: true,
       instances: [
         {

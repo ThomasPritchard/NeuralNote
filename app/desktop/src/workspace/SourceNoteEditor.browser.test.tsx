@@ -542,7 +542,12 @@ describe("SourceNoteEditor — real-browser block and widget preview", () => {
     expect(mounted.source()).toBe(source);
   });
 
-  it("renders a semantic overflowing table and returns to exact source with Enter", async () => {
+  // Activating a table used to swap the read-only widget for raw pipe source,
+  // and this asserted the pipes came back as literal text. #99 replaced that
+  // swap with a grid drawn OVER the editable source, so the pipes are hidden and
+  // painted as chrome instead. The overflow and keyboard-activation coverage
+  // this test exists for is unchanged; only the post-activation contract moved.
+  it("renders a semantic overflowing table and keeps it drawn once activated", async () => {
     const source = [
       "plain",
       "",
@@ -565,8 +570,16 @@ describe("SourceNoteEditor — real-browser block and widget preview", () => {
     await userEvent.keyboard("{Enter}");
 
     await expect.poll(() => mounted.host.querySelector("table.nn-lp-table")).toBeNull();
-    expect(mounted.host.querySelector(".cm-content")?.textContent).toContain("Alpha heading");
-    expect(mounted.host.querySelector(".cm-content")?.textContent).toContain("one | two | three");
+    await expect.poll(
+      () => mounted.host.querySelectorAll(".cm-content .cm-line.nn-lp-table-row").length,
+    ).toBe(3);
+
+    const drawnText = mounted.host.querySelector(".cm-content")?.textContent ?? "";
+    expect(drawnText).toContain("Alpha heading");
+    expect(drawnText).toContain("three");
+    // The delimiters are chrome now, not characters. Asserting their absence is
+    // what would go red if the widget ever fell back to painting raw source.
+    expect(drawnText).not.toContain("one | two | three");
     expect(mounted.source()).toBe(source);
   });
 
