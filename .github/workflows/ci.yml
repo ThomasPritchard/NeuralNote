@@ -123,12 +123,20 @@ jobs:
         run: npm run audit:all
 
   browser:
-    name: Browser / ${{ matrix.browser }} / ${{ matrix.os }}
+    name: Browser / ${{ matrix.browser }} / ${{ matrix.os }}${{ matrix.informational && ' (informational)' || '' }}
     runs-on: ${{ matrix.os }}
     # The hosted macOS runner drives WebKit several times slower than a local
     # machine: the whole suite is ~15s here and minutes there. A per-test budget
     # is worthless under a job cap that expires first, so the two move together.
     timeout-minutes: 30
+    # WebKit is informational until #100 lands. Its real defects are fixed - it
+    # caught a genuine WKWebView font bug on its first run - but what is left is
+    # the runner, and it is not deterministic: consecutive runs of identical code
+    # expired on entirely different tests, all at the 60s cap, while the suite
+    # runs green in ~15s locally. A lane that reds on a different test each time
+    # cannot gate a merge; it can only teach you to ignore it. Chromium stays
+    # required and covers everything here that is not engine-specific.
+    continue-on-error: ${{ matrix.informational || false }}
     strategy:
       fail-fast: false
       matrix:
@@ -137,6 +145,7 @@ jobs:
             browser: chromium
           - os: macos-latest
             browser: webkit
+            informational: true
     steps:
       - name: Check out source
         uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
