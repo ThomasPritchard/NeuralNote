@@ -4,6 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 
 import type { NoteIndexEntry } from "./linkResolve";
 import { collectObsidianPreview } from "./obsidianLivePreview";
+import { cellPaintPlan } from "./sourceEditorCellPaintPlan";
 
 const INDEX: NoteIndexEntry[] = [
   { relPath: "Daily.md", stem: "daily" },
@@ -37,6 +38,27 @@ describe("obsidianLivePreview", () => {
     }));
     expect(preview).toContainEqual(expect.objectContaining({ className: "nn-lp-callout" }));
     expect(preview).toContainEqual(expect.objectContaining({ className: "nn-lp-block-id" }));
+  });
+
+
+  it("paints a wikilink inside a table cell exactly as the cell-paint plan projects it", () => {
+    const cellText = "[[Areas/Deep Work.md#Focus|deep]]";
+    const doc = ["| Note |", "| --- |", `| ${cellText} |`].join("\n");
+    const from = doc.indexOf(cellText);
+    const editor = state(doc, 0);
+
+    const painted = collectObsidianPreview(editor, INDEX).find((item) => item.kind === "widget");
+    const plan = cellPaintPlan(editor, { from, to: from + cellText.length }, {
+      context: "body",
+      index: INDEX,
+    });
+
+    // Both sides read `inlineWikilinks`, so this goes red the moment either one
+    // grows a second answer to "what does this wikilink paint as".
+    expect(painted?.label).toBe("deep");
+    expect(painted?.className).toBe("nn-lp-wikilink-resolved");
+    expect(plan.visibleText).toBe(painted?.label);
+    expect(plan.runs[0]?.classNames).toEqual([painted?.className]);
   });
 
   it("keeps unresolved links distinct and non-navigating", () => {

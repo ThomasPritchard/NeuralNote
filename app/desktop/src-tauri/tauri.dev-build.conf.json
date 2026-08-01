@@ -1,0 +1,23 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "NeuralNote-Dev",
+  "identifier": "com.neuralnote.desktop.dev",
+  "app": {
+    "windows": [
+      {
+        "title": "NeuralNote-Dev",
+        "width": 1280,
+        "height": 820,
+        "minWidth": 920,
+        "minHeight": 600,
+        "titleBarStyle": "Overlay",
+        "hiddenTitle": true,
+        "trafficLightPosition": { "x": 16, "y": 23 }
+      }
+    ]
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "targets": ["app"]
+  }
+}
