@@ -86,7 +86,7 @@ const LINKED_SEED: SeedEntry[] = [
 ];
 
 async function openVault(seed: SeedEntry[]): Promise<RenderAppResult> {
-  const result = renderApp({ seed, recents });
+  const result = renderApp({ seed, recents, mockIpcScenario: "graph-linked" });
   await result.user.click(await screen.findByRole("button", { name: "Open My Brain" }));
   await screen.findByLabelText("Filter files by name"); // workspace is up
   return result;

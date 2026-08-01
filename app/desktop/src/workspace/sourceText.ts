@@ -147,3 +147,36 @@ export function serializeSourceText(source: SourceText): string {
   }
   return serialized;
 }
+
+export function serializeSourceRange(
+  source: SourceText,
+  from: number,
+  to: number,
+): string {
+  assertValid(source);
+  if (
+    !Number.isSafeInteger(from) ||
+    !Number.isSafeInteger(to) ||
+    from < 0 ||
+    from > to ||
+    to > source.text.length
+  ) {
+    throw new SourcePreservationError(
+      `Cannot preserve source range: [${from}, ${to}) is outside logical length ${source.text.length}.`,
+    );
+  }
+
+  const selected: string[] = [];
+  let separatorIndex = 0;
+  for (let index = 0; index < source.text.length; index += 1) {
+    const character = source.text[index];
+    if (character === "\n") {
+      const separator = source.separators[separatorIndex];
+      separatorIndex += 1;
+      if (index >= from && index < to) selected.push(separator);
+    } else if (index >= from && index < to) {
+      selected.push(character);
+    }
+  }
+  return selected.join("");
+}

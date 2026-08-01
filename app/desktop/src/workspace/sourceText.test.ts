@@ -4,6 +4,7 @@ import { describe, expect, it } from "vitest";
 import {
   applySourceChanges,
   loadSourceText,
+  serializeSourceRange,
   serializeSourceText,
   SourcePreservationError,
   type SourceText,
@@ -21,6 +22,18 @@ describe("sourceText", () => {
     ["whitespace and Unicode", "\uFEFF\t café  \r\n漢字\t\r"]
   ])("rebuilds an unchanged %s document byte for byte", (_name, source) => {
     expect(serializeSourceText(loadSourceText(source))).toBe(source);
+  });
+
+  it("serializes a logical selection with its exact original source bytes", () => {
+    const original = "\uFEFFa\r\nb\nc\rd e\u0301";
+    const source = loadSourceText(original);
+
+    expect(serializeSourceRange(source, 0, source.text.length)).toBe(original);
+    expect(serializeSourceRange(source, 1, 7)).toBe("a\r\nb\nc\r");
+    expect(() => serializeSourceRange(source, -1, 1)).toThrow(SourcePreservationError);
+    expect(() => serializeSourceRange(source, 2, source.text.length + 1)).toThrow(
+      SourcePreservationError,
+    );
   });
 
   it("retains unchanged separators and inherits the nearest separator for inserted lines", () => {

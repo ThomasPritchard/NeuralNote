@@ -14,6 +14,7 @@
 // poking `channel.onmessage` directly — exercises that real dispatch path.
 
 import type { CoreErrorLike } from "./mockVaultTypes";
+import type { MockScheduledTask, MockScheduler } from "./mockScheduler";
 
 interface TauriChannelLike {
   id: number;
@@ -27,7 +28,11 @@ interface TauriInternalsLike {
  *  stream, so a script parked on an elicitation and resumed later must NOT
  *  restart at zero. Throws loudly if the channel isn't wired to the mock IPC —
  *  a dropped stream is never silent. */
-export const channelSender = (channel: unknown): ((message: unknown) => void) => {
+export const channelSender = (
+  channel: unknown,
+  scheduler: MockScheduler,
+  onDelivery: (message: unknown) => void = () => {},
+): ((message: unknown) => MockScheduledTask) => {
   const id = (channel as TauriChannelLike | null)?.id;
   const runCallback = (window as unknown as {
     __TAURI_INTERNALS__?: TauriInternalsLike;
@@ -40,14 +45,23 @@ export const channelSender = (channel: unknown): ((message: unknown) => void) =>
   }
   let nextIndex = 0;
   return (message) => {
-    runCallback(id, { index: nextIndex, message });
+    const index = nextIndex;
     nextIndex += 1;
+    return scheduler.schedule(() => {
+      onDelivery(message);
+      runCallback(id, { index, message });
+    });
   };
 };
 
 /** Stream a scripted event array to the invoke's Channel exactly as the Rust
  *  core would: one in-order `{ index, message }` frame per event. */
-export const emitToChannel = (channel: unknown, events: readonly unknown[]): void => {
-  const send = channelSender(channel);
-  events.forEach(send);
+export const emitToChannel = (
+  channel: unknown,
+  events: readonly unknown[],
+  scheduler: MockScheduler,
+  onDelivery: (message: unknown) => void = () => {},
+): MockScheduledTask[] => {
+  const send = channelSender(channel, scheduler, onDelivery);
+  return events.map(send);
 };

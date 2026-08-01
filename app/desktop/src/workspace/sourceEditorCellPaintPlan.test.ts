@@ -137,6 +137,29 @@ describe("cellPaintPlan", () => {
     ]);
   });
 
+  it("hides an escape's backslash and paints the character it protects", () => {
+    // GFM reads `\|` in a table cell as a literal pipe rather than a column
+    // break, and the `Escape` node spans BOTH characters — so hiding it whole
+    // would drop the very character the escape exists to produce.
+    const { plan, doc } = planFor("a \\| b");
+
+    expect(plan.visibleText).toBe("a | b");
+    expect(runShape(plan)).toEqual([
+      { kind: "text", text: "a ", classNames: [] },
+      { kind: "text", text: "| b", classNames: [] },
+    ]);
+    const backslash = doc.indexOf("\\|");
+    expect(plan.hiddenRanges).toEqual([{ from: backslash, to: backslash + 1 }]);
+  });
+
+  it("leaves an escape inside inline code as literal source", () => {
+    // Nothing is inline-parsed inside a code span, so there is no `Escape` node
+    // to hide and the backslash is content the user typed.
+    expect(runShape(planFor("`a \\| b`").plan)).toEqual([
+      { kind: "text", text: "a \\| b", classNames: ["nn-lp-inline-code"] },
+    ]);
+  });
+
   it("leaves a tag inside a revealed wikilink unmarked", () => {
     const { plan } = planFor("[[Roadmap #soon]]", { anchorOn: "Roadmap #soon", anchorOffset: 2 });
 
@@ -330,6 +353,16 @@ describe("cellPaintPlan widget-backed content", () => {
     expect(runShape(plan)).toEqual([
       { kind: "widget", text: "Image: diagram", classNames: ["nn-lp-image"] },
     ]);
+  });
+
+  it("keeps nested brackets whole in an image's drawn label", () => {
+    // Matching the first `]` cut the label short, so the column was sized to a
+    // label the screen never showed. Deliberately NOT a `[[wikilink]]` in the
+    // alt text: a drawn wikilink replaces the image widget outright, so that
+    // fixture would pass whether the bracket counting works or not.
+    const { plan } = planFor("![prefix [Daily] suffix](a.png)");
+
+    expect(plan.visibleText).toBe("Image: prefix [Daily] suffix");
   });
 
   it("reveals an image's source while the caret is inside it", () => {

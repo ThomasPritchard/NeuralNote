@@ -1,5 +1,29 @@
 {
+  "productName": "NeuralNote E2E",
+  "identifier": "com.neuralnote.desktop.e2e",
+  "build": {
+    "beforeBuildCommand": "npm run build:native-e2e"
+  },
+  "app": {
+    "withGlobalTauri": true,
+    "security": {
+      "capabilities": [
+        "default",
+        {
+          "identifier": "native-e2e",
+          "description": "Test-only WebdriverIO capabilities for the native E2E build.",
+          "windows": ["main"],
+          "permissions": [
+            "wdio:allow-execute",
+            "wdio-webdriver:default",
+            "core:window:allow-set-fullscreen"
+          ]
+        }
+      ]
+    }
+  },
   "bundle": {
+    "createUpdaterArtifacts": false,
     "externalBin": [],
     "resources": []
   }

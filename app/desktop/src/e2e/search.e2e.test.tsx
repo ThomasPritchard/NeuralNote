@@ -6,20 +6,46 @@
 //   c. A file whose NAME matches ranks before content-only hits.
 //   d. A backend failure surfaces in the toast AND the panel — never silent.
 //
-// Real timers throughout: the panel's 200 ms debounce is ridden out with
-// findBy* queries, exactly as a user would wait.
+// The panel's 200 ms debounce is driven by a fake clock so each journey waits
+// on the real boundary without spending wall-clock time or hiding timer drift.
 
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, vi } from "vitest";
 import { act, fireEvent, screen, waitFor, within } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
 import { renderApp, type RenderAppResult } from "./renderApp";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
 
 const recents = [{ name: "My Brain", path: VAULT_ROOT, lastOpened: 1_700_000_000_000 }];
+const SEARCH_DEBOUNCE_MS = 200;
+
+async function triggerDebouncedSearch(
+  trigger: () => void,
+  beforeExpiry?: () => void,
+): Promise<void> {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    await act(async () => {
+      trigger();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(SEARCH_DEBOUNCE_MS - 1);
+    });
+    beforeExpiry?.();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+  } finally {
+    vi.useRealTimers();
+  }
+}
 
 /** Open the recent vault and wait until the workspace has rendered. */
-async function openVault(seed: SeedEntry[]): Promise<RenderAppResult> {
-  const result = renderApp({ seed, recents });
+async function openVault(
+  seed: SeedEntry[],
+  mockIpcScenario?: string,
+): Promise<RenderAppResult> {
+  const result = renderApp({ seed, recents, mockIpcScenario });
   await result.user.click(await screen.findByRole("button", { name: "Open My Brain" }));
   await screen.findByLabelText("Filter files by name"); // files sidebar = workspace up
   return result;
@@ -34,11 +60,14 @@ describe("Journey 10: full-text vault search", () => {
       { kind: "file", relPath: "Prefix.md", content: "Uses #SaaSExtra" },
       { kind: "file", relPath: "Code.md", content: "`#SaaS`" },
       { kind: "file", relPath: "Property.md", content: "---\ntags: [SaaS]\n---\nBody" },
-    ]);
+    ], "search-inline-tags");
 
     await user.click(screen.getByRole("button", { name: "Source.md" }));
     await screen.findByRole("textbox", { name: "Note content" });
-    fireEvent.mouseDown(document.querySelector(".nn-lp-tag")!);
+    await triggerDebouncedSearch(
+      () => fireEvent.mouseDown(document.querySelector(".nn-lp-tag")!),
+      () => expect(screen.queryByRole("list", { name: "Search results" })).toBeNull(),
+    );
 
     const input = await screen.findByLabelText("Search vault");
     await waitFor(() => expect(input).toHaveValue("tag:#SaaS"));
@@ -57,10 +86,11 @@ describe("Journey 10: full-text vault search", () => {
       { kind: "file", relPath: "Exact.md", content: "Uses #SaaS" },
       { kind: "file", relPath: "Nested.md", content: "---\ntags: [SaaS/cloud]\n---\nBody" },
       { kind: "file", relPath: "Prefix.md", content: "Uses #SaaSExtra" },
-    ]);
+    ], "search-property-tags");
 
     await user.click(screen.getByRole("button", { name: "Property source.md" }));
-    await user.click(await screen.findByRole("button", { name: "Search for #SaaS" }));
+    const tagButton = await screen.findByRole("button", { name: "Search for #SaaS" });
+    await triggerDebouncedSearch(() => fireEvent.click(tagButton));
 
     const input = await screen.findByLabelText("Search vault");
     await waitFor(() => expect(input).toHaveValue("tag:#SaaS"));
@@ -81,18 +111,20 @@ describe("Journey 10: full-text vault search", () => {
         relPath: "Journal.md",
         content: "Tried a new recipe today.\n\nMore notes tomorrow.",
       },
-    ]);
+    ], "search-recipe");
 
     // Ribbon Search → the panel replaces the file tree, input focused.
     await user.click(screen.getByRole("button", { name: "Search" }));
     const input = await screen.findByLabelText("Search vault");
-    expect(input).toHaveFocus();
+    await waitFor(() => expect(input).toHaveFocus());
     expect(
       screen.getByLabelText("Filter files by name").closest(".nn-primary-sidebar-panel"),
     ).toHaveAttribute("hidden");
 
-    // Type a ≥2-char query and ride out the 200 ms debounce.
-    await user.type(input, "recipe");
+    // Enter a ≥2-char query and advance the exact 200 ms debounce.
+    await triggerDebouncedSearch(() =>
+      fireEvent.change(input, { target: { value: "recipe" } }),
+    );
     const results = await screen.findByRole("list", { name: "Search results" });
 
     // Grouped: both file headers (title + rel path) are present …
@@ -133,10 +165,13 @@ describe("Journey 10: full-text vault search", () => {
       // put the name hit on top.
       { kind: "file", relPath: "Apple.md", content: "alpha mention inside." },
       { kind: "file", relPath: "Zebra alpha.md", content: "stripes and stars." },
-    ]);
+    ], "search-alpha");
 
     await user.click(screen.getByRole("button", { name: "Search" }));
-    await user.type(await screen.findByLabelText("Search vault"), "alpha");
+    const input = await screen.findByLabelText("Search vault");
+    await triggerDebouncedSearch(() =>
+      fireEvent.change(input, { target: { value: "alpha" } }),
+    );
 
     const results = await screen.findByRole("list", { name: "Search results" });
     const text = results.textContent ?? "";
@@ -152,7 +187,10 @@ describe("Journey 10: full-text vault search", () => {
     backend.setFailure("search_vault", { kind: "io", message: "disk exploded" });
 
     await user.click(screen.getByRole("button", { name: "Search" }));
-    await user.type(await screen.findByLabelText("Search vault"), "body");
+    const input = await screen.findByLabelText("Search vault");
+    await triggerDebouncedSearch(() =>
+      fireEvent.change(input, { target: { value: "body" } }),
+    );
 
     // The shared toast carries the backend message …
     expect(await screen.findByText("disk exploded")).toBeInTheDocument();

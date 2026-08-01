@@ -6,6 +6,14 @@ interface BuildResult {
   status: number | null;
 }
 
+export const NATIVE_E2E_FRONTEND_FLAG = "VITE_NEURALNOTE_NATIVE_E2E";
+
+export function nativeE2eBuildEnvironment(
+  inherited: NodeJS.ProcessEnv,
+): NodeJS.ProcessEnv {
+  return { ...inherited, [NATIVE_E2E_FRONTEND_FLAG]: "1" };
+}
+
 export function getTauriBuildInvocation(
   e2eDirectory: string,
 ): { command: string; args: string[] } {
@@ -16,6 +24,8 @@ export function getTauriBuildInvocation(
       "build",
       "--debug",
       "--no-bundle",
+      "--features",
+      "native-e2e",
       "--config",
       path.join(e2eDirectory, "tauri.e2e.conf.json"),
     ],

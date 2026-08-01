@@ -400,6 +400,7 @@ const sourceEditorTableViewport = ViewPlugin.fromClass(class {
         measuredView.state.doc.length,
       ),
       write: (ranges, measuredView) => {
+        if (ranges.length === 0) return;
         const key = ranges.map(({ from, to }) => `${from}:${to}`).join(",");
         if (key === this.rangeKey) return;
         this.rangeKey = key;

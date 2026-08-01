@@ -15,5 +15,5 @@
       "expect-webdriverio"
     ]
   },
-  "include": ["wdio-build.ts", "wdio.conf.ts", "wdio.conf.test.ts", "specs/**/*.ts"]
+  "include": ["*.ts", "specs/**/*.ts"]
 }

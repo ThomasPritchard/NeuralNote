@@ -19,6 +19,11 @@ import type {
   UndoReport,
   WorkspaceState,
 } from "../lib/types";
+import {
+  MOCK_IPC_CONTRACT_V1,
+  validateMockCoreErrorV1,
+} from "./mockIpcContract";
+import type { MockScheduler } from "./mockScheduler";
 
 export const VAULT_ROOT = "/vault";
 export const NEW_VAULT_PARENT = "/parent";
@@ -36,16 +41,12 @@ export interface CoreErrorLike {
 
 /** Throw a `CoreError`-shaped rejection (never returns). */
 export const fail = (kind: CoreErrorLike["kind"], message: string): never => {
-  throw { kind, message } satisfies CoreErrorLike;
+  throw validateMockCoreErrorV1(
+    MOCK_IPC_CONTRACT_V1,
+    { kind, message } satisfies CoreErrorLike,
+    "mock backend failure",
+  );
 };
-
-/** A markdown note handed to the search/graph mirrors. */
-export interface MdFile {
-  path: string;
-  rel: string;
-  content: string;
-  unreadable?: boolean;
-}
 
 /** An in-memory vault entry: a folder, or a file with its full raw contents. */
 export type Entry =
@@ -70,6 +71,14 @@ export interface CreateMockVaultOptions {
    *  vault open (defaults to no open tabs) — drives the workspace-restore
    *  journeys as if the app were relaunched with these tabs previously open. */
   workspaceState?: WorkspaceState;
+  /** Rust-generated command replay selected by stable scenario id. Analytical
+   * commands not covered by a scenario return an explicit empty response. */
+  mockIpcScenario?: string;
+  /** Deterministic scheduler used by streamed mock commands. */
+  scheduler?: MockScheduler;
+  /** Expected fake provider key for the secret-safe save probe. The backend
+   * records only whether the submitted key matched, never the key itself. */
+  expectedApiKey?: string;
   /** The AI key status `api_key_status`/`ai_status` report. Defaults to a key
    *  present so a test lands straight in the chat view; pass `{ hasKey: false }`
    *  to exercise the first-run provider picker (and, through it, guided key
@@ -106,8 +115,6 @@ export interface CreateMockVaultOptions {
    *  deleting cleanly; seed explicit per-file outcomes (kept-edited, failed…)
    *  to exercise the report card's honesty about partial undos. */
   undoReport?: UndoReport;
-  /** Fixed clock for template rendering. Defaults to the Rust test fixture time. */
-  now?: Date;
   // ── Local-AI provider (ai_status / detect_hardware / recommend / pull / …) ──
   /** Explicit `active_provider` for `ai_status`. Defaults to the keyState
    *  derivation (`effective_provider`: key → "openRouter", else null). */
@@ -144,6 +151,11 @@ export interface ChatCallRecord {
   activeSkills: readonly string[];
 }
 
+export interface ApiKeySaveAttempt {
+  readonly keyMatchesExpected: boolean;
+  readonly model: string;
+}
+
 export interface MockVault {
   /** Install the IPC + window mocks. Call before rendering <App/>. */
   install: () => void;
@@ -174,8 +186,16 @@ export interface MockVault {
   readonly calls: readonly string[];
   /** Every `chat` invoke, with the `activeSkills` it carried. */
   readonly chatCalls: readonly ChatCallRecord[];
+  /** Secret-safe provider-save probes. Submitted key material is never kept. */
+  readonly apiKeySaveAttempts: readonly ApiKeySaveAttempt[];
   /** Folder persisted by the scripted unknown-scheme picker, if answered. */
   readonly profileFolder: string | null;
   /** Native YouTube timestamp opens, after the real frontend wrapper. */
   readonly openedYoutubeUrls: readonly string[];
+  /** Unconsumed generated exchanges; must be zero at the end of a contract test. */
+  remainingContractExchanges: () => number;
+  /** Fail if a Rust-generated replay was not fully exercised by the journey. */
+  assertContractConsumed: () => void;
+  /** Scheduler used by this backend for channel and cancellation work. */
+  readonly scheduler: MockScheduler;
 }

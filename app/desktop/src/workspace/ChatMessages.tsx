@@ -93,7 +93,11 @@ function AssistantTurn({
           Stopped
         </p>
       )}
-      <Reasoning text={turn.thinking} />
+      <Reasoning
+        text={turn.thinking}
+        requested={turn.reasoningRequested}
+        showMissing={turn.done && turn.error === null && !turn.stopped && answering}
+      />
       {turn.pendingElicitation !== null && turn.turnId !== null && (
         // Keyed by elicitation id: a follow-up question in the same turn is a
         // fresh card (fresh focus, fresh state), never a half-answered reuse.

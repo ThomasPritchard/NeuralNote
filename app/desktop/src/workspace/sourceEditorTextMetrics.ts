@@ -326,7 +326,7 @@ function syncStyles(): boolean {
     if (value) probe.root.style.setProperty(property, value);
   }
 
-  const next = values.join(" ");
+  const next = values.join("\u0000");
   const changed = next !== styleSignature;
   styleSignature = next;
   return changed;
@@ -370,6 +370,17 @@ function attachTriggers(owner: MetricsState): () => void {
     attributeFilter: ["class", "style", "data-theme", "data-font-family"],
   });
   document.fonts?.addEventListener("loadingdone", onFontsSettled);
+  // WebKit never fires `loadingdone` — not for `add()` + `FontFace.load()`, and
+  // not for a CSS-driven layout-demanded load either, though its `status` does
+  // reach "loaded". Both were measured directly against Chromium and WebKit. So
+  // on WKWebView, which is every macOS build we ship, `loadingdone` alone leaves
+  // the epoch stuck on the fallback face's widths for the life of the document —
+  // the double-digit error this epoch exists to prevent. `loading` DOES fire on
+  // both engines, so pair it with `ready` to close the gap.
+  const onFontsLoading = () => {
+    if (current()) void document.fonts.ready.then(onFontsSettled);
+  };
+  document.fonts?.addEventListener("loading", onFontsLoading);
   // Only when something is actually in flight: `ready` on an already-settled
   // set resolves immediately and would move the epoch for no reason. Note this
   // reads `status`, not `check()` — `check()` reports a family as present while
@@ -380,6 +391,7 @@ function attachTriggers(owner: MetricsState): () => void {
   return () => {
     observer.disconnect();
     document.fonts?.removeEventListener("loadingdone", onFontsSettled);
+    document.fonts?.removeEventListener("loading", onFontsLoading);
     view?.removeEventListener("resize", onStyleMayHaveMoved);
   };
 }

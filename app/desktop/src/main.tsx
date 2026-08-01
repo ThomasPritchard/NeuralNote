@@ -10,6 +10,11 @@ import App from "./App";
 import { bootstrapPreferences } from "./preferences/preferences";
 
 async function mount() {
+  if (import.meta.env.VITE_NEURALNOTE_NATIVE_E2E === "1") {
+    await import("@wdio/tauri-plugin");
+    const { installNativeE2eBridge } = await import("./nativeE2eBridge");
+    installNativeE2eBridge();
+  }
   const initialPreferences = await bootstrapPreferences();
   ReactDOM.createRoot(document.getElementById("root") as HTMLElement).render(
     <React.StrictMode>

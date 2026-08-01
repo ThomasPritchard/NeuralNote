@@ -23,8 +23,8 @@ async function fireMenu(action: string, extra: Record<string, unknown> = {}) {
 }
 
 /** Open the recent vault via the welcome screen and wait for the workspace. */
-async function openVault(): Promise<RenderAppResult> {
-  const result = renderApp({ seed: SEED, recents });
+async function openVault(mockIpcScenario?: string): Promise<RenderAppResult> {
+  const result = renderApp({ seed: SEED, recents, mockIpcScenario });
   await result.user.click(await screen.findByRole("button", { name: "Open My Brain" }));
   await screen.findByLabelText("Filter files by name");
   return result;
@@ -77,11 +77,12 @@ describe("Native menu → app actions", () => {
   });
 
   it("Toggle Navigation Sidebar compacts and expands navigation without resetting search", async () => {
-    const { user } = await openVault();
+    const { user, backend } = await openVault("search-hello");
     await fireMenu("view-search");
     const input = await screen.findByLabelText("Search vault");
     await user.type(input, "hello");
     await screen.findByRole("list", { name: "Search results" });
+    backend.assertContractConsumed();
 
     await fireMenu("toggle-sidebar");
     expect(screen.getByLabelText("Search vault")).toBe(input);

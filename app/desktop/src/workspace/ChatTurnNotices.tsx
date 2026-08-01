@@ -6,8 +6,19 @@
 import { ChevronRight, SearchX } from "lucide-react";
 import type { CoverageView } from "./chatMessage";
 
-export function Reasoning({ text }: Readonly<{ text: string }>) {
-  if (text.trim() === "") return null;
+export function Reasoning({
+  text,
+  requested = false,
+  showMissing = false,
+}: Readonly<{ text: string; requested?: boolean; showMissing?: boolean }>) {
+  if (text.trim() === "") {
+    if (!requested || !showMissing) return null;
+    return (
+      <p className="rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-[0.6875rem] leading-snug text-muted-foreground">
+        Reasoning was on, but the model didn&apos;t return any.
+      </p>
+    );
+  }
   return (
     <details className="group rounded-lg border border-border/60 bg-background/30 px-2.5 py-1.5 text-[0.6875rem] text-muted-foreground">
       <summary className="flex cursor-pointer list-none select-none items-center gap-1.5 font-medium text-muted-foreground/90 [&::-webkit-details-marker]:hidden">

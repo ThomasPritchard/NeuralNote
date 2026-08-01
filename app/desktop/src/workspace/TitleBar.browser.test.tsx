@@ -45,6 +45,7 @@ afterEach(() => {
 });
 
 async function mountTitleBar(overrides: Partial<TitleBarProps> = {}): Promise<void> {
+  await document.fonts.ready;
   const props: TitleBarProps = {
     navigationExpanded: false,
     onToggleNavigation: () => {},
@@ -63,6 +64,7 @@ async function mountTitleBar(overrides: Partial<TitleBarProps> = {}): Promise<vo
   // A fixed-width host so the titlebar grid lays out at a realistic window size.
   host = document.createElement("div");
   host.style.width = "900px";
+  host.style.height = "48px";
   document.body.appendChild(host);
   root = createRoot(host);
   await act(async () => {
@@ -107,5 +109,63 @@ describe("TitleBar — real-browser drag-layer hit test", () => {
     await userEvent.click(page.getByRole("button", { name: NAV_TOGGLE_LABEL }));
 
     expect(onToggleNavigation).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps note tabs, close, chat, and settings controls above the drag layer", async () => {
+    const onActivateTab = vi.fn();
+    const onCloseTab = vi.fn();
+    const onToggleChat = vi.fn();
+    const onOpenSettings = vi.fn();
+    await mountTitleBar({
+      tabs: [{
+        id: "daily",
+        title: "Daily",
+        path: "/vault/Daily.md",
+        dirty: false,
+        loading: false,
+        error: null,
+      }],
+      activeTabId: "daily",
+      onActivateTab,
+      onCloseTab,
+      onToggleChat,
+      onOpenSettings,
+    });
+
+    await userEvent.click(page.getByRole("tab", { name: "Daily" }));
+    await userEvent.click(page.getByRole("button", { name: "Close Daily" }));
+    await userEvent.click(page.getByRole("button", { name: "Toggle chat panel" }));
+    await userEvent.click(page.getByRole("button", { name: "Settings" }));
+
+    expect(onActivateTab).toHaveBeenCalledWith("daily");
+    expect(onCloseTab).toHaveBeenCalledWith("daily");
+    expect(onToggleChat).toHaveBeenCalledTimes(1);
+    expect(onOpenSettings).toHaveBeenCalledTimes(1);
+
+    const close = document.querySelector<HTMLElement>('[aria-label="Close Daily"]')!;
+    expect(close.getBoundingClientRect().width).toBeGreaterThanOrEqual(24);
+    expect(close.getBoundingClientRect().height).toBeGreaterThanOrEqual(24);
+
+    await userEvent.keyboard("{Shift>}{Tab}{/Shift}");
+    const keyboardFocused = document.activeElement as HTMLElement;
+    expect(document.querySelector(".nn-titlebar")?.contains(keyboardFocused)).toBe(true);
+    expect(getComputedStyle(keyboardFocused).boxShadow).not.toBe("none");
+  });
+
+  it("leaves the empty chrome above the tab strip available as a drag region", async () => {
+    await mountTitleBar();
+    const titlebar = document.querySelector<HTMLElement>(".nn-titlebar")!;
+    const tabStrip = document.querySelector<HTMLElement>(".nn-tab-strip")!;
+    const dragLayer = document.querySelector<HTMLElement>("[data-tauri-drag-region]")!;
+    const titlebarRect = titlebar.getBoundingClientRect();
+    const tabStripRect = tabStrip.getBoundingClientRect();
+
+    expect(tabStripRect.top).toBeGreaterThan(titlebarRect.top);
+    const emptyChrome = document.elementFromPoint(
+      tabStripRect.left + tabStripRect.width / 2,
+      titlebarRect.top + (tabStripRect.top - titlebarRect.top) / 2,
+    );
+
+    expect(emptyChrome).toBe(dragLayer);
   });
 });

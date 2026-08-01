@@ -81,6 +81,22 @@ describe("sourceEditorDecorations", () => {
     expect(found).toContain("nn-lp-heading-2");
   });
 
+  it("leaves Obsidian embeds to the dedicated inert embed preview", () => {
+    const preview = collectMarkdownPreview(state("![[Secret note]]"));
+
+    expect(preview.some((item) => item.className === "nn-lp-image")).toBe(false);
+  });
+
+  it("keeps complete bracketed alt text in an inert image label", () => {
+    const preview = collectMarkdownPreview(state("![prefix [[Daily]] suffix](local.png)"));
+
+    expect(preview).toContainEqual(expect.objectContaining({
+      kind: "widget",
+      className: "nn-lp-image",
+      label: "Image: prefix [[Daily]] suffix",
+    }));
+  });
+
   it("replaces syntax markers only when their complete construct is outside every selection", () => {
     const doc = "# Heading\n\n*em* and **strong**";
     const headingCaret = state(doc, [{ anchor: 3 }, { anchor: doc.indexOf("strong") + 2 }]);

@@ -394,6 +394,8 @@ pub(crate) async fn list_dir(
 
 #[tauri::command]
 pub(crate) async fn read_note(state: SharedState<'_>, path: String) -> Result<NoteDoc, CoreError> {
+    #[cfg(feature = "native-e2e")]
+    crate::native_e2e::record_note_read(Path::new(&path))?;
     neuralnote_core::note::read_note(&root_of(&state)?, Path::new(&path))
 }
 

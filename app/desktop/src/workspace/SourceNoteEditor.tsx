@@ -1,8 +1,13 @@
-import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
+import {
+  defaultKeymap,
+  history,
+  historyKeymap,
+  invertedEffects,
+} from "@codemirror/commands";
 import { autocompletion, completionKeymap } from "@codemirror/autocomplete";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { foldGutter, foldKeymap } from "@codemirror/language";
-import { EditorState } from "@codemirror/state";
+import { EditorState, StateEffect } from "@codemirror/state";
 import { EditorView, drawSelection, keymap } from "@codemirror/view";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import { useEffect, useRef } from "react";
@@ -15,8 +20,10 @@ import {
 } from "./sourceEditorSession";
 import {
   applySourceChanges,
+  serializeSourceRange,
   serializeSourceText,
   SourcePreservationError,
+  type SourceText,
 } from "./sourceText";
 import {
   openResolvedMarkdownLinkAtCaret,
@@ -65,6 +72,49 @@ export interface SourceNoteEditorProps {
 }
 
 const EMPTY_NOTE_INDEX: readonly NoteIndexEntry[] = [];
+const preserveExactSourceHistory = StateEffect.define<null>();
+const restoreExactSourceHistory = StateEffect.define<SourceText>();
+
+function exactSourceHistory(source: () => SourceText) {
+  return invertedEffects.of((transaction) => {
+    const preservesSource = transaction.effects.some((effect) =>
+      effect.is(preserveExactSourceHistory) || effect.is(restoreExactSourceHistory));
+    return preservesSource ? [restoreExactSourceHistory.of(source())] : [];
+  });
+}
+
+function exactSourceClipboard(source: () => SourceText) {
+  function writeSelection(event: ClipboardEvent, view: EditorView): boolean {
+    if (!event.clipboardData || view.state.selection.ranges.every((range) => range.empty)) {
+      return false;
+    }
+    const currentSource = source();
+    const selectedSource = view.state.selection.ranges
+      .map((range) => serializeSourceRange(currentSource, range.from, range.to))
+      .join("\n");
+    event.preventDefault();
+    event.clipboardData.setData("text/plain", selectedSource);
+    return true;
+  }
+
+  return EditorView.domEventHandlers({
+    copy(event, view) {
+      return writeSelection(event, view);
+    },
+    cut(event, view) {
+      if (!writeSelection(event, view)) return false;
+      view.dispatch(
+        view.state.replaceSelection(""),
+        {
+          effects: preserveExactSourceHistory.of(null),
+          userEvent: "delete.cut",
+          scrollIntoView: true,
+        },
+      );
+      return true;
+    },
+  });
+}
 
 export function SourceNoteEditor({
   sessionKey,
@@ -123,7 +173,9 @@ export function SourceNoteEditor({
     let session: SourceEditorSession;
     const extensions = [
       history(),
+      exactSourceHistory(() => session.source),
       EditorState.allowMultipleSelections.of(true),
+      exactSourceClipboard(() => session.source),
       foldGutter(),
       markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
       // Declared ahead of the decorations that consume them, because that is the
@@ -169,6 +221,10 @@ export function SourceNoteEditor({
         (tag) => searchTagRef.current?.(tag),
       ),
       keymap.of([
+        {
+          key: "Enter",
+          run: openTagSearchAtCaret((tag) => searchTagRef.current?.(tag)),
+        },
         {
           key: "Mod-Enter",
           run: openTagSearchAtCaret((tag) => searchTagRef.current?.(tag)),
@@ -220,6 +276,17 @@ export function SourceNoteEditor({
         try {
           for (const transaction of transactions) {
             if (transaction.docChanged) source = applySourceChanges(source, transaction.changes);
+            const restoredSource = transaction.effects.find((effect) =>
+              effect.is(restoreExactSourceHistory));
+            if (restoredSource?.is(restoreExactSourceHistory)) {
+              serializeSourceText(restoredSource.value);
+              if (restoredSource.value.text !== transaction.newDoc.toString()) {
+                throw new SourcePreservationError(
+                  "Cannot restore exact source history: the snapshot does not match the editor document.",
+                );
+              }
+              source = restoredSource.value;
+            }
           }
           editorView.update(transactions);
           session = {

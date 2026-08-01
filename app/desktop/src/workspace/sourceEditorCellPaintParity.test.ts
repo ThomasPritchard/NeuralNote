@@ -48,6 +48,11 @@ const INLINE_CELL_TABLE = [
   // (`SourceNoteEditor.test.tsx`, "preserves bare URLs and autolinks"), so the
   // two renderings of one table disagreed.
   "| autolink | <https://example.org> |",
+  // A GFM escaped pipe. The plan hides the backslash and paints the `|` it
+  // protects, so the collector has to hide exactly the same one character —
+  // otherwise the column is measured at `a | b` and painted `a \| b`, and the
+  // cell overruns its track by a character.
+  "| escape | a \\| b |",
 ].join("\n");
 
 /**

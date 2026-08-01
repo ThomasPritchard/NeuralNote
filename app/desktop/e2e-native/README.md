@@ -1,104 +1,82 @@
-# Tier-2 native WebDriver tests (CI only)
+# Native Tauri end-to-end tests
 
-These tests drive the **real** NeuralNote desktop window — the actual Rust backend
-behind the actual system webview — using [WebdriverIO] + [`tauri-driver`].
+This tier drives the real NeuralNote Rust backend, system webview, filesystem,
+watcher, persistence, window and native-menu boundaries. It uses WebdriverIO's
+[embedded Tauri provider] rather than the standalone `tauri-driver` harness, so
+the same suite runs on Linux, macOS and Windows.
 
-## This tier does NOT run on macOS
+Ubuntu and macOS are required pull-request gates. Windows runs only on `main` or
+manual dispatch and remains informational until issue #78 is resolved.
 
-`tauri-driver` proxies to the platform's native WebView WebDriver:
+## Run locally
 
-- **Linux** → `WebKitWebDriver` (package `webkit2gtk-driver`)
-- **Windows** → the Edge WebView2 driver (`msedgedriver`)
-- **macOS** → **not supported.** There is no WebDriver for the macOS WKWebView, so
-  `tauri-driver` officially supports Linux and Windows only.
-
-So you **cannot run this suite on a Mac.** It exists purely for **Linux/Windows CI**
-(`.github/workflows/e2e.yml`, `ubuntu-latest` + `windows-latest`).
-
-### What to run locally instead
-
-Use the **Tier-1 mockIPC suite**, which runs the real `<App/>` in jsdom over a
-stateful in-memory vault driven through the genuine Tauri IPC boundary — it runs and
-passes on macOS:
+Use the repository-supported Node and Rust toolchains, then install both locked
+dependency trees:
 
 ```bash
-cd app/desktop
-npm run test:e2e        # full-journey e2e (src/e2e/*.e2e.test.tsx)
-npm run test:run        # the whole unit + e2e suite
+npm --prefix app/desktop ci
+npm --prefix app/desktop/e2e-native ci
+npm --prefix app/desktop/e2e-native test
 ```
 
-## Running this tier (Linux / Windows)
+Linux also needs the Tauri GTK/WebKit packages and a display. CI runs the suite
+under `xvfb-run`; macOS needs no external WebDriver installation.
 
-```bash
-# 1. tauri-driver (one-time)
-cargo install tauri-driver --locked
+The wrapper type-checks and tests the harness, builds one debug/no-bundle app
+with `--features native-e2e`, then runs every native spec serially. A failed app
+or driver startup may be retried once only before the first-test readiness
+sentinel. Test failures are never retried.
 
-# 2. system WebView driver
-#    Linux (Debian/Ubuntu):
-sudo apt-get install -y webkit2gtk-driver xvfb
-#    Windows: msedgedriver matching your WebView2 runtime, on PATH
+## Isolation and security
 
-# 3. deps
-cd app/desktop && npm ci
-cd e2e-native && npm ci
+- The E2E build uses `com.neuralnote.desktop.e2e` and the test-only
+  `native-e2e` capability.
+- Rust automation plugins are optional exact `1.2.0` dependencies. Production
+  config allows only `default`, and a release-profile `native-e2e` build fails
+  at compile time.
+- The E2E frontend also exposes a minimal bridge for bounded CodeMirror mutations
+  and the fixed close-vault menu event because embedded WKWebView does not
+  deliver those WebDriver inputs reliably. On macOS, a separate no-argument,
+  feature-gated command dispatches one fixed Command-S event through the active
+  AppKit window and native Tauri menu key equivalent. Linux does not relabel
+  WebDriver's webview key events as native accelerator coverage.
+  Production bundle scanning rejects both that bridge and the WebdriverIO
+  bootstrap; browser-engine suites retain responsibility for keyboard input.
+- Each attempt creates an owner-only, marked root directly under the process
+  temporary directory. `NEURALNOTE_E2E_ROOT` redirects only app config; `HOME`
+  is inherited unchanged.
+- Cleanup revalidates the exact root and session marker and runs only after the
+  embedded service returns and the app has exited.
+- Failure page source and screenshots hide editable contents; logs and metadata
+  redact the temporary root and credential-shaped values. CI uploads only this
+  artifact directory, never the temporary vault.
 
-# 4. run (the wdio onPrepare hook builds `tauri build --debug --no-bundle` first)
-npm test                # Windows
-xvfb-run npm test       # Linux (headless display)
-```
+## Coverage
+
+The specs cover startup and a pre-authorised recent vault; direct IPC authority;
+real watcher shutdown; create/edit/save/rename/move and persistence; stale-save,
+external-delete and oversized-file handling; workspace restoration; exact
+Markdown, CRLF and mixed-ending fidelity; inert image/embed markup; native save
+accelerators and dirty-close guards; and macOS fullscreen/titlebar behaviour.
+
+The Markdown fixture is synthetic and version-controlled in
+`native-fixtures.ts`. Opening and closing it must not write; a local edit must
+leave every untouched byte unchanged.
 
 ## Layout
 
-| File | Purpose |
+| File | Responsibility |
 | --- | --- |
-| `wdio-build.ts` | Cross-platform, no-shell Tauri build invocation and explicit build-result validation. |
-| `wdio.conf.ts` | WebdriverIO config: `tauri:options.application` pointing at the debug binary; spawns/stops `tauri-driver`; builds the app in `onPrepare`. |
-| `tauri.e2e.conf.json` | Build overlay that removes the Ollama sidecars and resources; the smoke test does not exercise local AI. |
-| `specs/smoke.spec.ts` | Smoke test: the window boots and the welcome brand heading + vault entry points are visible. |
+| `run-native.ts` | Build-once runner, isolated attempts, readiness-only retry and cleanup. |
+| `native-root.ts` | Marked temporary-root lifecycle and environment isolation. |
+| `native-fixtures.ts` | Exact synthetic vault, Markdown and line-ending fixtures. |
+| `native-artifacts.ts` | Redacted page source, screenshot, logs and fixture metadata. |
+| `wdio.conf.ts` | Serial embedded-provider WebdriverIO configuration. |
+| `tauri.e2e.conf.json` | E2E identity, capability and bundle overlay. |
+| `specs/` | Small native journeys grouped by boundary. |
 
-### Binary name
+The debug binary is the workspace target `target/debug/desktop` (`desktop.exe`
+on Windows). If Tauri's binary name changes, update the path in `wdio.conf.ts`.
 
-`wdio.conf.ts` points at the workspace-level `../../../target/debug/desktop` (`.exe`
-on Windows), because Cargo builds every workspace member into the root target directory.
-`mainBinaryName` is unset in `tauri.conf.json`, so the binary keeps the Cargo crate
-name (`desktop`), not the `productName` (`NeuralNote`). If a `mainBinaryName` is added
-to the Tauri config later, update `BINARY_NAME` in `wdio.conf.ts` to match.
-
-## Dependency hygiene
-
-The `@wdio/*` stack is already pinned to the latest published line (`9.29.1`), so the
-deprecated packages that surface in this tree are all transitive and upstream-owned.
-`package.json` (`overrides`) is the only lever we have; comments can't live in JSON, so
-the rationale lives here.
-
-**Removed** via `overrides.mocha = "^11.7.6"` (mocha ships as a `@wdio/mocha-framework`
-dependency, not a direct dep, so the override is how we advance it):
-
-- `glob@8` (< 9 — the version class carrying the publicised ReDoS/security advisories).
-- `inflight@1.0.6` (the memory-leaking request-coalescer). Both arrived through
-  `mocha@10 → glob@8 → inflight`. mocha 11 uses `glob@10`, which dropped `inflight`
-  entirely. `@wdio/mocha-framework@9.29.1` declares `mocha@^10.3.0`, but the adapter only
-  touches mocha's stable programmatic API (`new Mocha`, `addFile`, `loadFilesAsync`,
-  `run`, `suite`, `unloadFiles`, `reporter`, `options`, `fullTrace`) — all unchanged in
-  mocha 11 — so the override is safe. `@types/mocha` stays at `^10` because no `@types/mocha@11`
-  is published and mocha's test-authoring API is unchanged.
-
-**Upstream blockers** (left in place deliberately — no safe local fix):
-
-- `glob@10.5.0` — the maintainer blanket-deprecates every non-latest major, but `glob@10`
-  is modern: no `inflight`, not the < 9 vulnerability class. It's pinned by `@wdio/config`
-  (`^10.2.2`), `archiver-utils` (`^10.0.0`), and mocha 11 (`^10.4.5`). Forcing `glob@13`
-  (the only non-deprecated line) would rewrite the spec-glob resolver `@wdio/config` uses
-  to expand `specs: ["./specs/**/*.spec.ts"]` and archiver's file walk — runtime paths
-  that only execute in the Linux/Windows wdio run and can't be validated on macOS.
-  Removal waits on WebdriverIO adopting `glob@11+` upstream (WDIO v10).
-- `whatwg-encoding@3.1.1` — the *latest* published version is itself deprecated (points to
-  `@exodus/bytes`), so there is no non-deprecated version to override to. Chain:
-  `webdriverio → cheerio → encoding-sniffer → whatwg-encoding`. Removal waits on
-  `encoding-sniffer`/`cheerio` migrating off it.
-
-Re-check on any `@wdio/*` bump: `npm install` and confirm the warning set with
-`npm ls glob inflight whatwg-encoding`.
-
-[WebdriverIO]: https://webdriver.io
-[`tauri-driver`]: https://v2.tauri.app/develop/tests/webdriver/
+[embedded Tauri provider]: https://webdriver.io/docs/desktop-testing/tauri/plugin-setup/
+[Tauri WebDriver guidance]: https://v2.tauri.app/develop/tests/webdriver/

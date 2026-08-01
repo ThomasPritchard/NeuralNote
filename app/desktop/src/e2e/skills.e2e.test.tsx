@@ -12,7 +12,7 @@
 // `set_skill_enabled` seam and the reopened picker no longer offers it.
 
 import { describe, it, expect } from "vitest";
-import { act, screen, waitFor, within } from "@testing-library/react";
+import { screen, waitFor, within } from "@testing-library/react";
 import { renderApp } from "./renderApp";
 import { VAULT_ROOT, type CreateMockVaultOptions } from "./mockVault";
 import type { ChatEvent } from "../lib/types";
@@ -100,7 +100,7 @@ async function sendWithSkill(
 
 describe("Journey 8: skill run — activate via @, elicit, write, undo", () => {
   it("runs the full doing-loop and reports per-file undo outcomes", async () => {
-    const { user, backend } = await openWorkspace({
+    const { user, backend, advanceAllFrames } = await openWorkspace({
       chatScript: happyScript,
       undoReport: {
         files: [
@@ -115,6 +115,7 @@ describe("Journey 8: skill run — activate via @, elicit, write, undo", () => {
     });
 
     await sendWithSkill(user, "run the fixture workflow");
+    await advanceAllFrames();
 
     // The chips fed activeSkills across the real IPC boundary.
     expect(backend.chatCalls).toHaveLength(1);
@@ -137,6 +138,7 @@ describe("Journey 8: skill run — activate via @, elicit, write, undo", () => {
 
     // Answer through the real answer_elicitation command → the run resumes.
     await user.click(screen.getByRole("button", { name: /Yes, write it/ }));
+    await advanceAllFrames();
     expect(await screen.findByText("Answered.")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Yes, write it/ })).toBeDisabled();
 
@@ -166,9 +168,12 @@ describe("Journey 8: skill run — activate via @, elicit, write, undo", () => {
   });
 
   it("timed-out consent (§3.4): the card goes dormant but stays clickable, and a late click is an ordinary chat turn", async () => {
-    const { user, backend } = await openWorkspace({ chatScript: timeoutScript });
+    const { user, backend, advanceAllFrames } = await openWorkspace({
+      chatScript: timeoutScript,
+    });
 
     await sendWithSkill(user, "run the fixture workflow");
+    await advanceAllFrames();
 
     // The stream parks on the consent question.
     expect(
@@ -177,7 +182,8 @@ describe("Journey 8: skill run — activate via @, elicit, write, undo", () => {
 
     // The shell's 5-minute timer fires: the run ends, the question is retired
     // UNANSWERED (timeout ends the RUN, not the QUESTION).
-    act(() => backend.expireElicitation());
+    backend.expireElicitation();
+    await advanceAllFrames();
 
     // The run settled — composer frees — and the card is dormant: never
     // permanently disabled, every option stays clickable.
@@ -204,13 +210,17 @@ describe("Journey 8: skill run — activate via @, elicit, write, undo", () => {
   it("declined consent: the skill explains and stops — nothing written, no report card", async () => {
     // Asserts the SCRIPTED remainder resumes after the park — the frontend
     // loop, not real model branching (that lives in the Rust behavioural eval).
-    const { user, backend } = await openWorkspace({ chatScript: declinedScript });
+    const { user, backend, advanceAllFrames } = await openWorkspace({
+      chatScript: declinedScript,
+    });
 
     await sendWithSkill(user, "run the fixture workflow");
+    await advanceAllFrames();
 
     await user.click(
       await screen.findByRole("button", { name: /No, stop here/ }),
     );
+    await advanceAllFrames();
 
     // The model's honest close streams after the answer resolves the park.
     expect(

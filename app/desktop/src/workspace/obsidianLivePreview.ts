@@ -52,6 +52,13 @@ function boundedScanRanges(
   return merged;
 }
 
+/**
+ * Constructs that own their entire span, so a `[[wikilink]]` nested strictly
+ * inside one is the enclosing construct's business to paint. Without this, an
+ * image or link wrapping a wikilink draws two widgets over the same characters.
+ */
+const WIKILINK_CONTAINER_NODES = new Set(["Image", "Link"]);
+
 function syntaxMaskedRanges(
   state: EditorState,
   scanRanges: readonly VisibleRange[],
@@ -76,6 +83,18 @@ function overlapsMasked(from: number, to: number, ranges: readonly { from: numbe
   return ranges.some((range) => from < range.to && to > range.from);
 }
 
+function enclosedByMaskedContainer(
+  from: number,
+  to: number,
+  ranges: readonly { from: number; to: number }[],
+): boolean {
+  return ranges.some((range) =>
+    range.from <= from
+    && range.to >= to
+    && (range.from < from || range.to > to)
+  );
+}
+
 function insideVisible(from: number, to: number, ranges: readonly VisibleRange[]): boolean {
   return ranges.some((range) => from >= range.from && to <= range.to);
 }
@@ -88,6 +107,7 @@ export function collectObsidianPreview(
 ): ObsidianPreviewDecoration[] {
   const scanRanges = boundedScanRanges(state.doc.length, visibleRanges);
   const codeMasked = syntaxMaskedRanges(state, scanRanges, CODE_MASKED_NODES);
+  const wikilinkContainers = syntaxMaskedRanges(state, scanRanges, WIKILINK_CONTAINER_NODES);
   const tagMasked = syntaxMaskedRanges(state, scanRanges, TAG_MASKED_NODES);
   const output: ObsidianPreviewDecoration[] = [];
 
@@ -97,7 +117,11 @@ export function collectObsidianPreview(
     // replaces and the span `cellPaintPlan` projects are one answer, not two.
     for (const { from, to, embed, rawTarget, label } of inlineWikilinks(source, scan.from)) {
       tagMasked.push({ from, to });
-      if (!insideVisible(from, to, visibleRanges) || overlapsMasked(from, to, codeMasked)) continue;
+      if (
+        !insideVisible(from, to, visibleRanges)
+        || overlapsMasked(from, to, codeMasked)
+        || enclosedByMaskedContainer(from, to, wikilinkContainers)
+      ) continue;
       const target = resolveWikilink(rawTarget, [...index]);
       if (selectionActive && caretTouching(state, from, to)) {
         output.push({ from, to, kind: "mark", className: "nn-lp-wikilink-active", target });
@@ -228,10 +252,10 @@ function build(view: EditorView, index: readonly NoteIndexEntry[]): DecorationSe
           class: item.className,
           attributes: item.tag
             ? {
-              "data-nn-tag": item.tag,
+                "data-nn-tag": item.tag,
                 role: "link",
                 "aria-label": `Search for ${item.tag}`,
-                "aria-keyshortcuts": "Meta+Enter Control+Enter",
+                "aria-keyshortcuts": "Enter Meta+Enter Control+Enter",
                 title: `Search for ${item.tag}`,
               }
             : undefined,

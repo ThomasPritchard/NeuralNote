@@ -6,6 +6,9 @@
 //! AI/provider verbs in [`commands::ai`]. All path logic and data safety live in the
 //! core crate; this shell only wires it to the webview.
 
+#[cfg(all(feature = "native-e2e", native_e2e_release_profile))]
+compile_error!("native-e2e cannot be enabled in a release profile");
+
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
@@ -15,6 +18,9 @@ use tauri::{AppHandle, Manager, State};
 
 use crate::provider_config_mutation::ProviderConfigMutationGate;
 use crate::vault_mutation::{VaultMutationContext, VaultMutationGate};
+
+#[cfg(feature = "native-e2e")]
+mod native_e2e;
 
 mod ai;
 mod authorized_paths;
@@ -161,6 +167,10 @@ pub(crate) fn vault_mutation_of(state: &SharedState) -> Result<VaultMutationCont
 }
 
 pub(crate) fn config_dir(app: &AppHandle) -> Result<PathBuf, CoreError> {
+    #[cfg(feature = "native-e2e")]
+    if let Some(config_dir) = native_e2e::native_e2e_config_dir()? {
+        return Ok(config_dir);
+    }
     app.path()
         .app_config_dir()
         .map_err(|e| CoreError::Io(format!("no config dir: {e}")))
@@ -174,6 +184,17 @@ fn updater_public_key_is_configured(config: &tauri::Config) -> bool {
         .and_then(|updater| updater.get("pubkey"))
         .and_then(serde_json::Value::as_str)
         .is_some_and(|key| !key.trim().is_empty())
+}
+
+const fn log_plugin_enabled() -> bool {
+    !cfg!(feature = "native-e2e")
+}
+
+fn production_log_targets() -> Vec<tauri_plugin_log::Target> {
+    vec![
+        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
+        tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir { file_name: None }),
+    ]
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -196,31 +217,31 @@ fn exit_request_disposition(code: Option<i32>) -> ExitRequestDisposition {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     let context = tauri::generate_context!();
-    tauri::Builder::default()
-        // Persist backend diagnostics to stdout AND a file in the OS log dir, so a
-        // silent watcher/recents failure leaves a trace in a bundled build where
-        // stderr reaches no one (PA-007).
-        .plugin(
+    let builder = tauri::Builder::default();
+    #[cfg(feature = "native-e2e")]
+    let builder = builder
+        .plugin(tauri_plugin_wdio::init())
+        .plugin(tauri_plugin_wdio_webdriver::init());
+    let builder = if log_plugin_enabled() {
+        builder.plugin(
             tauri_plugin_log::Builder::new()
-                .targets([
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::Stdout),
-                    tauri_plugin_log::Target::new(tauri_plugin_log::TargetKind::LogDir {
-                        file_name: None,
-                    }),
-                ])
-                // Bound on-disk log growth and verbosity explicitly rather than relying on
-                // the plugin's defaults (PA-030): ship Info-and-above in release while
-                // keeping Debug in dev, cap each file, and keep only a few rotated files so
-                // this long-lived desktop process can't grow the LogDir without limit.
+                .targets(production_log_targets())
                 .level(if cfg!(debug_assertions) {
                     log::LevelFilter::Debug
                 } else {
                     log::LevelFilter::Info
                 })
-                .max_file_size(5_000_000) // 5 MB per file
+                .max_file_size(5_000_000)
                 .rotation_strategy(tauri_plugin_log::RotationStrategy::KeepSome(3))
                 .build(),
         )
+    } else {
+        // The embedded WebDriver installs its own logger first. More importantly,
+        // E2E diagnostics may contain fixture paths and must not persist in the
+        // platform LogDir outside the marked, post-run-cleaned test root.
+        builder
+    };
+    builder
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_shell::init())
@@ -311,6 +332,8 @@ pub fn run() {
             skills::undo_skill_run,
             requirement_download::download_requirement,
             requirement_download::cancel_requirement_download,
+            #[cfg(all(feature = "native-e2e", target_os = "macos"))]
+            native_e2e::native_e2e_post_save_accelerator,
         ])
         .build(context)
         .expect("error while building tauri application")
@@ -350,8 +373,22 @@ pub fn run() {
 #[cfg(test)]
 mod updater_config_tests {
     use super::{
-        exit_request_disposition, updater_public_key_is_configured, ExitRequestDisposition,
+        exit_request_disposition, log_plugin_enabled, updater_public_key_is_configured,
+        ExitRequestDisposition,
     };
+
+    #[test]
+    fn native_automation_never_writes_the_os_log_directory() {
+        if cfg!(feature = "native-e2e") {
+            assert!(
+                !log_plugin_enabled(),
+                "native E2E must not register the file logger"
+            );
+        } else {
+            assert!(log_plugin_enabled(), "production keeps its bounded logger");
+            assert_eq!(super::production_log_targets().len(), 2);
+        }
+    }
 
     #[test]
     fn native_exit_requests_are_guarded_but_confirmed_programmatic_exits_are_allowed() {

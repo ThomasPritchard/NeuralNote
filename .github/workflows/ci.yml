@@ -83,35 +83,109 @@ jobs:
         working-directory: app/desktop
         run: npm run test:unit
 
-      # Tier-1.5 real-browser hit test (issue #30): runs the titlebar in headless
-      # Chromium so CSS stacking / pointer interception is exercised for real —
-      # the drag-layer regression jsdom can't see. Node 24 only (one Chromium
-      # download); runs on PRs too, since its job is to block the regression
-      # before merge, not just on main.
-      - name: Install Playwright Chromium
-        if: matrix.node == 24
-        working-directory: app/desktop
-        run: npx playwright install --with-deps chromium
+  frontend-hardening:
+    name: Frontend / Node 24 / MockIPC, Markdown, coverage, build, and audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out source
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
 
-      - name: Real-browser titlebar hit test
-        if: matrix.node == 24
+      - name: Set up Node 24
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/desktop/package-lock.json
+
+      - name: Install locked dependencies
         working-directory: app/desktop
-        run: npm run test:browser
+        run: npm ci
+
+      - name: Full MockIPC application journeys
+        working-directory: app/desktop
+        run: npm run test:e2e
+
+      - name: Markdown compatibility contract
+        working-directory: app/desktop
+        run: npm run test:markdown-contract
 
       - name: Full test suite and 90 percent line coverage
-        if: matrix.node == 24
         working-directory: app/desktop
         run: npm run coverage
 
       - name: Production build
-        if: matrix.node == 24
         working-directory: app/desktop
         run: npm run build
 
       - name: Audit high-severity npm vulnerabilities
-        if: matrix.node == 24
         working-directory: app/desktop
         run: npm run audit:all
+
+  browser:
+    name: Browser / ${{ matrix.browser }} / ${{ matrix.os }}${{ matrix.informational && ' (informational)' || '' }}
+    runs-on: ${{ matrix.os }}
+    # The hosted macOS runner drives WebKit several times slower than a local
+    # machine: the whole suite is ~15s here and minutes there. A per-test budget
+    # is worthless under a job cap that expires first, so the two move together.
+    timeout-minutes: 30
+    # WebKit is informational until #100 lands. Its real defects are fixed - it
+    # caught a genuine WKWebView font bug on its first run - but what is left is
+    # the runner, and it is not deterministic: consecutive runs of identical code
+    # expired on entirely different tests, all at the 60s cap, while the suite
+    # runs green in ~15s locally. A lane that reds on a different test each time
+    # cannot gate a merge; it can only teach you to ignore it. Chromium stays
+    # required and covers everything here that is not engine-specific.
+    continue-on-error: ${{ matrix.informational || false }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            browser: chromium
+          - os: macos-latest
+            browser: webkit
+            informational: true
+    steps:
+      - name: Check out source
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+
+      - name: Set up Node 24
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/desktop/package-lock.json
+
+      - name: Install locked dependencies
+        working-directory: app/desktop
+        run: npm ci
+
+      - name: Install Chromium with system dependencies
+        if: matrix.browser == 'chromium'
+        working-directory: app/desktop
+        run: npx playwright install --with-deps chromium
+
+      - name: Install WebKit
+        if: matrix.browser == 'webkit'
+        working-directory: app/desktop
+        run: npx playwright install webkit
+
+      - name: Run real-browser journeys
+        working-directory: app/desktop
+        run: npm run test:browser:${{ matrix.browser }}
+
+      # These browser jobs mount only version-controlled synthetic fixtures;
+      # they never open a user vault or load credentials. Retained traces and
+      # screenshots are therefore safe to preserve for a failed CI journey.
+      - name: Upload synthetic browser failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: browser-${{ matrix.browser }}-${{ matrix.os }}
+          path: app/desktop/artifacts/browser/${{ matrix.browser }}/
+          if-no-files-found: warn
+          retention-days: 7
 
   rust:
     name: Rust / test, lint, format, and bindings
@@ -146,6 +220,16 @@ jobs:
 
       - name: Test workspace
         run: cargo test --workspace --locked
+
+      - name: Test native E2E feature boundary
+        run: cargo test -p desktop --features native-e2e --locked
+
+      - name: Reject native automation in release profiles
+        run: |
+          if cargo check -p desktop --release --features native-e2e --locked; then
+            echo "native-e2e unexpectedly compiled in the release profile" >&2
+            exit 1
+          fi
 
       - name: Clippy
         run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings

@@ -1090,7 +1090,7 @@ describe("SourceNoteEditor", () => {
     expect(tag).toHaveAttribute("data-nn-tag", "#SaaS");
     expect(tag).toHaveAttribute("role", "link");
     expect(tag).toHaveAttribute("aria-label", "Search for #SaaS");
-    expect(tag).toHaveAttribute("aria-keyshortcuts", "Meta+Enter Control+Enter");
+    expect(tag).toHaveAttribute("aria-keyshortcuts", "Enter Meta+Enter Control+Enter");
     expect(screen.queryByRole("heading", { name: /SaaS/i })).toBeNull();
     expect(screen.getByRole("textbox", { name: "Note content" })).toHaveTextContent(
       "#SaaS Software As A Service:",

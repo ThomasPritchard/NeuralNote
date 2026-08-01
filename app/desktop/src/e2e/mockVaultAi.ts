@@ -15,6 +15,7 @@ import type {
 import {
   DEFAULT_CHAT_MODEL,
   fail,
+  type ApiKeySaveAttempt,
   type CreateMockVaultOptions,
 } from "./mockVaultTypes";
 import {
@@ -25,14 +26,20 @@ import {
   DEFAULT_SKILLS,
 } from "./mockVaultDefaults";
 import { emitToChannel } from "./mockVaultChannel";
+import type { MockScheduler } from "./mockScheduler";
+import type { MockScheduledTask } from "./mockScheduler";
 
 type CommandHandler = (a: Record<string, unknown>) => unknown;
 
 export interface AiBackend {
   handlers: Record<string, CommandHandler>;
+  readonly apiKeySaveAttempts: readonly ApiKeySaveAttempt[];
 }
 
-export const createAiBackend = (opts: CreateMockVaultOptions): AiBackend => {
+export const createAiBackend = (
+  opts: CreateMockVaultOptions,
+  scheduler: MockScheduler,
+): AiBackend => {
   // AI key state (mutated by save/clear, reported by api_key_status) + the
   // reasoning verdict. Per-test overridable via opts.
   const keyState = {
@@ -48,6 +55,7 @@ export const createAiBackend = (opts: CreateMockVaultOptions): AiBackend => {
   };
   // The verdict the mount-time probe persists when it runs (see the option doc).
   const probedSupport = opts.apiKey?.probedSupport;
+  const apiKeySaveAttempts: ApiKeySaveAttempt[] = [];
 
   // The built-in skill catalogue, deep-copied so `set_skill_enabled` mutates
   // backend state without aliasing the caller's fixture (mirrors the Rust
@@ -96,6 +104,8 @@ export const createAiBackend = (opts: CreateMockVaultOptions): AiBackend => {
     ["mistralai/mistral-large-2512", "Mistral Large", 262_144],
   ] as const;
   let offeredOpenRouterModels = new Set<string>();
+  let pendingPullTasks: MockScheduledTask[] = [];
+  let finishPendingPull: (() => void) | null = null;
 
   const buildOpenRouterMenu = (): OpenRouterModelMenu => {
     const models = rankedOpenRouterModels.map(([id, name, contextLength], index) => ({
@@ -168,33 +178,49 @@ export const createAiBackend = (opts: CreateMockVaultOptions): AiBackend => {
       if (aiState.localActiveTag === tag) aiState.localActiveTag = null;
       return undefined;
     },
-    cancel_pull: () =>
-      // The stream is delivered synchronously below, so there's nothing in-flight
-      // to interrupt here; a cancel is exercised via a pullScript ending in an
-      // error frame. No-op, matching the fire-and-forget command.
-      undefined,
+    cancel_pull: () => {
+      pendingPullTasks.forEach((task) => scheduler.cancel(task));
+      pendingPullTasks = [];
+      finishPendingPull?.();
+      finishPendingPull = null;
+      return undefined;
+    },
     pull_local_model: (a) => {
       const tag = a.tag as string;
       const script = opts.pullScript ?? DEFAULT_PULL_SCRIPT;
-      emitToChannel(a.onEvent, script);
-      // A successful pull leaves the model installed, exactly as Ollama would, so
-      // the subsequent list_local_models / set_active_provider reflect it.
-      const succeeded = script.some((e) => (e as PullEvent).type === "success");
-      if (succeeded && !aiState.installed.some((m) => m.tag === tag)) {
-        aiState.installed.push({
-          tag,
-          sizeBytes: 4_700_000_000,
-          family: null,
-          parameterSize: null,
-          quantization: null,
+      pendingPullTasks.forEach((task) => scheduler.cancel(task));
+      finishPendingPull?.();
+      return new Promise<void>((resolve) => {
+        finishPendingPull = resolve;
+        pendingPullTasks = emitToChannel(a.onEvent, script, scheduler, (message) => {
+          const event = message as PullEvent;
+          if (event.type === "success" && !aiState.installed.some((m) => m.tag === tag)) {
+            aiState.installed.push({
+              tag,
+              sizeBytes: 4_700_000_000,
+              family: null,
+              parameterSize: null,
+              quantization: null,
+            });
+          }
+          if (event.type === "success" || event.type === "error") {
+            pendingPullTasks = [];
+            finishPendingPull?.();
+            finishPendingPull = null;
+          }
         });
-      }
-      return undefined;
+      });
     },
     save_api_key: (a) => {
       // The key itself never crosses back; only presence + model are reported.
+      const model = (a.model as string) || keyState.model;
+      apiKeySaveAttempts.push({
+        keyMatchesExpected:
+          typeof a.key === "string" && a.key === opts.expectedApiKey,
+        model,
+      });
       keyState.hasKey = true;
-      keyState.model = (a.model as string) || keyState.model;
+      keyState.model = model;
       return undefined;
     },
     clear_api_key: () => {
@@ -222,5 +248,5 @@ export const createAiBackend = (opts: CreateMockVaultOptions): AiBackend => {
     },
   };
 
-  return { handlers };
+  return { handlers, apiKeySaveAttempts };
 };

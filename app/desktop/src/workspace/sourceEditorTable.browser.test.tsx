@@ -172,28 +172,27 @@ describe("a drawn table as a grid", () => {
       .map((cell) => `${cell.textContent}: ${cell.scrollWidth} > ${cell.clientWidth}`);
     expect(clipped).toEqual([]);
 
-    // 5. CT-1 freezes the stamped attribute as `style="grid-column: N"`. The
-    //    runtime is that string exactly where this app writes the DOM itself
-    //    (`setAttribute` in a `WidgetType.toDOM`), and that string plus a
-    //    trailing semicolon everywhere CodeMirror writes it for us: it applies a
-    //    decoration's `style` attribute as `dom.style.cssText = value`
+    // 5. CT-1 stamps every child into an explicit grid column, alternating the
+    //    app's own chrome widget with CodeMirror's cell mark.
+    //
+    //    The COLUMN is the invariant; the bytes are not. Where this app writes
+    //    the DOM itself (`setAttribute` in a `WidgetType.toDOM`) the attribute is
+    //    exactly what we passed. Where CodeMirror writes it for us it applies the
+    //    decoration's `style` as `dom.style.cssText = value`
     //    (`@codemirror/view/dist/index.js:94-95`), and assigning `cssText`
-    //    re-serialises. Same computed value, different bytes, and no lever in
-    //    the decoration spec to change it — the only alternative is a per-column
-    //    class, which CT-1 forbids. Recorded here rather than left to be
-    //    rediscovered as a snapshot mismatch.
-    const stamped = [...contentRows[0]!.children]
-      .filter((child) => !child.classList.contains("cm-widgetBuffer"))
-      .map((child) => child.getAttribute("style"));
-    expect(stamped).toEqual([
-      "grid-column: 1",   // chrome widget: this app's own setAttribute
-      "grid-column: 1;",  // cell mark: CodeMirror's cssText assignment
-      "grid-column: 2",
-      "grid-column: 2;",
-      "grid-column: 3",
-      "grid-column: 3;",
-      "grid-column: 3",
-    ]);
+    //    re-serialises — engine-dependently. Chromium keeps the shorthand
+    //    (`grid-column: 1;`); WebKit expands it to
+    //    `grid-column-start: 1; grid-column-end: auto;`. Pinning either spelling
+    //    asserts a CSSOM implementation detail and reds the other engine's lane
+    //    while the layout is identical, so read the resolved column instead.
+    const stampedChildren = [...contentRows[0]!.children]
+      .filter((child) => !child.classList.contains("cm-widgetBuffer"));
+    expect(stampedChildren.map((child) => getComputedStyle(child).gridColumnStart))
+      .toEqual(["1", "1", "2", "2", "3", "3", "3"]);
+    // The app's own widgets are the ones we hand-write, so their bytes ARE
+    // deterministic and stay frozen — that is the half CT-1 actually owns.
+    expect(stampedChildren.filter((_, index) => index % 2 === 0).map((c) => c.getAttribute("style")))
+      .toEqual(["grid-column: 1", "grid-column: 2", "grid-column: 3", "grid-column: 3"]);
     expect(contentRows[0]!.getAttribute("style")).toMatch(/^--nn-table-tracks: .+;$/);
 
     injected?.remove();

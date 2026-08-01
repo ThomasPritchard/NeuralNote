@@ -137,6 +137,25 @@ export const TAG_MASKED_NODES: ReadonlySet<string> = new Set([
   "URL",
 ]);
 
+/**
+ * The part of an `Escape` node that never reaches the screen: its leading
+ * backslash, and only that. The node spans both characters, so hiding it whole
+ * would drop the very character the escape exists to produce — `\|` in a table
+ * cell is GFM for a literal pipe.
+ *
+ * Unconditional, unlike {@link HIDDEN_MARKER_NODES}, which reveal themselves
+ * from the caret's enclosing construct. An escape's enclosing construct is
+ * usually a `TableCell` or a `Paragraph`, and the paint layer resolves neither —
+ * it would climb to `Document`, whose span contains the caret wherever it is, so
+ * a reveal rule there is true always and the backslash would never hide at all.
+ * A rule with no state is the only version both layers can provably share.
+ *
+ * @param node - the `Escape` node's own span
+ */
+export function escapeMarkerRange(node: CellPaintRange): CellPaintRange {
+  return { from: node.from, to: node.from + 1 };
+}
+
 /** The mark class each inline construct paints over its own span. */
 export const CELL_MARK_CLASS_BY_NODE: ReadonlyMap<string, string> = new Map([
   ["Emphasis", "nn-lp-emphasis"],
@@ -201,9 +220,30 @@ export function inlineWikilinks(source: string, base = 0): InlineWikilink[] {
   }));
 }
 
+/**
+ * The alt text between an image's brackets, with nested brackets kept whole.
+ *
+ * Depth-counted rather than matched to the first `]`, which truncated
+ * `![prefix [[Daily]] suffix]` to `prefix [[Daily` — an alt text carrying a
+ * wikilink lost its tail, and with it the end of the drawn label and of the
+ * column width measured from that label.
+ */
+function imageAltText(source: string): string {
+  if (!source.startsWith("![")) return "";
+  let depth = 0;
+  for (let index = 1; index < source.length; index += 1) {
+    if (source[index] === "[") depth += 1;
+    else if (source[index] === "]") {
+      depth -= 1;
+      if (depth === 0) return source.slice(2, index);
+    }
+  }
+  return "";
+}
+
 /** The label an inactive image paints in place of its source. */
 export function imageWidgetLabel(source: string): string {
-  return `Image: ${/^!\[([^\]]*)\]/.exec(source)?.[1] || "image"}`;
+  return `Image: ${imageAltText(source) || "image"}`;
 }
 
 interface MarkSpan extends CellPaintRange {
@@ -257,6 +297,10 @@ function scanCellSyntax(state: EditorState, cell: CellPaintRange): CellSyntax {
       if (markClass) {
         syntax.marks.push({ from, to, className: markClass });
         return true;
+      }
+      if (name === "Escape") {
+        syntax.hidden.push(escapeMarkerRange({ from, to }));
+        return false;
       }
       if (name === "Image" && !constructRevealed(state, node)) {
         syntax.widgets.push({

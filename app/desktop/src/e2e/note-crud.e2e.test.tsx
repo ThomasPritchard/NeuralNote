@@ -6,6 +6,7 @@
 
 import { describe, it, expect } from "vitest";
 import { screen, waitFor, within } from "@testing-library/react";
+import { EditorView } from "@codemirror/view";
 import { renderApp } from "./renderApp";
 import { readNote } from "../lib/api";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
@@ -129,6 +130,30 @@ describe("Journey 4: edit and save", () => {
     expect(screen.getByRole("button", { name: "Save" })).toBeDisabled();
 
     expect(backend.calls).toContain("write_note");
+  });
+
+  it("retains the exact dirty draft after a failed save and succeeds on retry", async () => {
+    const exactDraft = "# Draft\n\nTabs\tstay.  \nUnicode: café 🧠";
+    const { user, backend } = await openVault([
+      { kind: "file", relPath: "Retry.md", content: "original" },
+    ]);
+    await user.click(await screen.findByRole("button", { name: "Retry.md" }));
+    const editor = await screen.findByRole("textbox", { name: "Note content" });
+    await user.click(editor);
+    await user.keyboard("{Control>}a{/Control}{Backspace}");
+    await user.type(editor, exactDraft);
+    backend.setFailure("write_note", { kind: "io", message: "disk full" });
+
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    expect(await screen.findAllByText("Couldn't save: disk full")).toHaveLength(2);
+    expect(screen.getByLabelText("Unsaved changes")).toBeInTheDocument();
+    expect(EditorView.findFromDOM(editor)!.state.doc.toString()).toBe(exactDraft);
+    await expect(readNote(`${VAULT_ROOT}/Retry.md`)).resolves.toMatchObject({ raw: "original" });
+
+    backend.clearFailure("write_note");
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(() => expect(screen.queryByLabelText("Unsaved changes")).not.toBeInTheDocument());
+    await expect(readNote(`${VAULT_ROOT}/Retry.md`)).resolves.toMatchObject({ raw: exactDraft });
   });
 
   // Measured at ~4s on the Node 24 CI runner (80% of the 5s default) even on

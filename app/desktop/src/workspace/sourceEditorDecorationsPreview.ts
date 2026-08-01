@@ -7,6 +7,7 @@ import {
   caretInside,
   caretTouching,
   cellPaintPlan,
+  escapeMarkerRange,
   HIDDEN_MARKER_NODES,
   imageWidgetLabel,
   type CellPaintContext,
@@ -201,14 +202,26 @@ export function collectMarkdownPreview(
           kind: constructActive ? "mark" : "replace",
           className: constructActive ? "nn-lp-marker-active" : "nn-lp-marker",
         });
-      } else if (name === "Image" && !constructActive) {
-        push(output, visibleRanges, {
-          from,
-          to,
-          kind: "widget",
-          className: "nn-lp-image",
-          label: imageWidgetLabel(state.sliceDoc(from, to)),
-        });
+      } else if (name === "Image") {
+        if (!constructActive) {
+          const source = state.sliceDoc(from, to);
+          // Lezer parses Obsidian embeds as standard Markdown images. Leave
+          // those ranges untouched here so the dedicated Obsidian extension
+          // can provide its inert "Embed:" label without overlapping widgets.
+          if (!source.startsWith("![[")) {
+            push(output, visibleRanges, {
+              from,
+              to,
+              kind: "widget",
+              className: "nn-lp-image",
+              label: imageWidgetLabel(source),
+            });
+          }
+        }
+        // The image owns its whole source range. Descendant link-like syntax
+        // must not add an overlapping decoration or remain interactive while
+        // the complete image source is revealed.
+        return false;
       } else if (name === "Table") {
         if (!intersectsVisibleRanges(from, to, visibleRanges)) return false;
         // Only the INACTIVE arm renders `table`, and projecting a 180-row
@@ -239,6 +252,19 @@ export function collectMarkdownPreview(
         // requested visible range" (`sourceEditorDecorations.test.ts`) is what
         // goes red if either stops holding.
         return true;
+      } else if (name === "Escape") {
+        // Hide the backslash and paint the character it protects, exactly as
+        // `cellPaintPlan` projects it — the shared rule is `escapeMarkerRange`,
+        // so the drawn cell, the read-only table widget and the measured column
+        // track cannot disagree about how wide `a \| b` is.
+        const marker = escapeMarkerRange({ from, to });
+        push(output, visibleRanges, {
+          from: marker.from,
+          to: marker.to,
+          kind: "replace",
+          className: "nn-lp-marker",
+        });
+        return false;
       } else if (HIDDEN_MARKER_NODES.has(name)) {
         const parent = enclosingConstruct(node);
         if (parent.name === "FencedCode" && !completeFencedCode(parent)) return;
