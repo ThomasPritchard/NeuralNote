@@ -81,6 +81,27 @@ export function fixturePaths() {
   };
 }
 
+/**
+ * Send the first-run AI provider picker away so the editor gets the full pane.
+ *
+ * Not cosmetic. On a fresh profile the picker occupies the right-hand pane and
+ * squeezes the note column to roughly a fifth of the window; CodeMirror then
+ * renders only the handful of lines that fit, and a journey looking for a line
+ * further down the note fails with "the bridge did not find the expected source
+ * span" - the span is in the document, just never rendered. This never fired
+ * locally, where the profile has already answered the picker, and failed every
+ * time on a CI runner, where nothing has. Captured in the failure screenshot for
+ * `changes one local span and preserves every untouched Markdown byte`.
+ */
+export async function dismissAiOnboardingIfPresent(): Promise<void> {
+  const skip = await $("button=Skip for now");
+  if (!(await skip.isExisting())) return;
+
+  await skip.waitForClickable({ timeout: nativeWait(30_000) });
+  await skip.click();
+  await skip.waitForExist({ reverse: true, timeout: nativeWait(10_000) });
+}
+
 export async function dismissWhatsNewIfPresent(): Promise<void> {
   const continuation = await $("button=Continue to NeuralNote");
   if (!(await continuation.isExisting())) return;
@@ -254,15 +275,18 @@ export async function ensureFixtureWorkspace(): Promise<void> {
   if (await tabs.isExisting()) {
     await openFixtureVault();
     await dismissWhatsNewIfPresent();
+    await dismissAiOnboardingIfPresent();
     await dismissNativeNotifications();
     return;
   }
 
   await dismissWhatsNewIfPresent();
+  await dismissAiOnboardingIfPresent();
   const recent = await $("button[aria-label='Open Native Fixture']");
   await recent.waitForDisplayed({ timeout: nativeWait(30_000) });
   await recent.click();
   await tabs.waitForExist({ timeout: nativeWait(30_000) });
+  await dismissAiOnboardingIfPresent();
   await dismissNativeNotifications();
 }
 
