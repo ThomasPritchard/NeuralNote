@@ -8,6 +8,7 @@ import {
   fixturePaths,
   invoke,
   invokeOutcome,
+  nativeWait,
   openFixtureVault,
 } from "./native-helpers.js";
 
@@ -55,7 +56,7 @@ describe("NeuralNote native authority and watcher lifecycle", () => {
             (globalThis as typeof globalThis & { nativeE2eTreeEvents?: number })
               .nativeE2eTreeEvents ?? 0,
         )) > 0,
-      { timeout: 10_000, interval: 50 },
+      { timeout: nativeWait(10_000), interval: 50 },
     );
 
     await invoke("close_vault");
@@ -75,7 +76,7 @@ describe("NeuralNote native authority and watcher lifecycle", () => {
               (globalThis as typeof globalThis & { nativeE2eTreeEvents?: number })
                 .nativeE2eTreeEvents ?? 0,
           )) > countAfterClose,
-        { timeout: 750, interval: 50 },
+        { timeout: nativeWait(750), interval: 50 },
       );
       eventAfterClose = true;
     } catch {

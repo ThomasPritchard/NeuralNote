@@ -10,6 +10,7 @@ import {
   clickVisibleTreeNote,
   ensureFixtureWorkspace,
   fixturePaths,
+  nativeWait,
 } from "./native-helpers.js";
 
 describe("NeuralNote native workspace restart seed", () => {
@@ -21,11 +22,11 @@ describe("NeuralNote native workspace restart seed", () => {
     await clickVisibleTreeNote("Start.md");
     const startSource = readFileSync(fixturePaths().start, "utf8");
     await appendToSourceEditor("\nUnsaved restart-tab sentinel.");
-    await $("[aria-label='Unsaved changes']").waitForExist({ timeout: 10_000 });
+    await $("[aria-label='Unsaved changes']").waitForExist({ timeout: nativeWait(10_000) });
     // Opening another note while the first tab is dirty exercises the normal
     // UI rule that preserves the first tab instead of replacing it.
     await clickVisibleTreeNote("Markdown Compatibility.md");
-    await $("[role='textbox'][aria-label='Note content']").waitForExist({ timeout: 30_000 });
+    await $("[role='textbox'][aria-label='Note content']").waitForExist({ timeout: nativeWait(30_000) });
 
     const statePath = path.join(fixturePaths().vault, ".neuralnote", "workspace-state.json");
     await browser.waitUntil(() => {
@@ -39,7 +40,7 @@ describe("NeuralNote native workspace restart seed", () => {
       } catch {
         return false;
       }
-    }, { timeout: 10_000, interval: 50 });
+    }, { timeout: nativeWait(10_000), interval: 50 });
 
     const active = await $("[role='tab'][aria-selected='true']");
     assert.match((await active.getAttribute("aria-label")) ?? "", /Markdown Compatibility/u);

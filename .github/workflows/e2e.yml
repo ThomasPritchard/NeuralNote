@@ -29,7 +29,10 @@ jobs:
   required-native:
     name: Native Tauri (${{ matrix.label }})
     runs-on: ${{ matrix.platform }}
-    timeout-minutes: 15
+    # Matches the widened per-wait budget in `nativeWait`: this suite passes
+    # locally and expired on the hosted macOS runner, and a per-wait budget the
+    # job cap outlives is no budget at all.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

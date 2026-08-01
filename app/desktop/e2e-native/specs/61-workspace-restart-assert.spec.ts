@@ -6,6 +6,7 @@ import { MARKDOWN_COMPATIBILITY_SOURCE } from "../native-fixtures.js";
 import {
   currentSourceMatches,
   ensureFixtureWorkspace,
+  nativeWait,
 } from "./native-helpers.js";
 
 describe("NeuralNote native workspace restoration after process restart", () => {
@@ -17,14 +18,14 @@ describe("NeuralNote native workspace restoration after process restart", () => 
       for (const tab of tabs) labels.push(await tab.getAttribute("aria-label"));
       return labels.includes("Native start")
         && labels.includes("Native Markdown Compatibility");
-    }, { timeout: 30_000, interval: 50 });
+    }, { timeout: nativeWait(30_000), interval: 50 });
 
     const active = await $("[role='tab'][aria-selected='true']");
     assert.equal(await active.getAttribute("aria-label"), "Native Markdown Compatibility");
     const editor = await $("[role='textbox'][aria-label='Note content']");
-    await editor.waitForDisplayed({ timeout: 30_000 });
+    await editor.waitForDisplayed({ timeout: nativeWait(30_000) });
     await browser.waitUntil(() => currentSourceMatches(MARKDOWN_COMPATIBILITY_SOURCE), {
-      timeout: 10_000,
+      timeout: nativeWait(10_000),
       interval: 50,
     });
   });

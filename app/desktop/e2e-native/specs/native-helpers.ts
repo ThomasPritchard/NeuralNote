@@ -9,6 +9,24 @@ import {
 } from "../native-cleanup-policy.js";
 import { CURRENT_RELEASE_NOTES } from "../../src/whats-new/releaseNotes.js";
 
+/**
+ * Wall-clock budget for a native wait, widened on CI.
+ *
+ * GitHub's hosted macOS runner drives this app several times slower than a
+ * local machine: the same journeys pass here and time out there, and the CI log
+ * carried nothing but timeout expiries - no assertion ever disagreed. These
+ * bound how long we are willing to WAIT, not how precise a measurement has to
+ * be, so a slower machine genuinely deserves a larger number; widening an
+ * assertion tolerance to chase the same green would be hiding a defect.
+ */
+const CI_WAIT_SCALE = process.env.CI ? 4 : 1;
+
+/** @param ms - the local budget, in milliseconds */
+export function nativeWait(ms: number): number {
+  return ms * CI_WAIT_SCALE;
+}
+
+
 export interface NativeCoreError {
   kind?: string;
   message?: string;
@@ -67,9 +85,9 @@ export async function dismissWhatsNewIfPresent(): Promise<void> {
   const continuation = await $("button=Continue to NeuralNote");
   if (!(await continuation.isExisting())) return;
 
-  await continuation.waitForClickable({ timeout: 30_000 });
+  await continuation.waitForClickable({ timeout: nativeWait(30_000) });
   await continuation.click();
-  await continuation.waitForExist({ reverse: true, timeout: 10_000 });
+  await continuation.waitForExist({ reverse: true, timeout: nativeWait(10_000) });
   await browser.waitUntil(
     async () => {
       try {
@@ -81,7 +99,7 @@ export async function dismissWhatsNewIfPresent(): Promise<void> {
         return false;
       }
     },
-    { timeout: 10_000, interval: 50 },
+    { timeout: nativeWait(10_000), interval: 50 },
   );
 }
 
@@ -130,7 +148,7 @@ export async function dismissNativeNotifications(): Promise<void> {
     const before = expectedLabels.length;
     await browser.waitUntil(
       async () => (await expectedNativeNotificationLabels()).length < before,
-      { timeout: 10_000, interval: 50 },
+      { timeout: nativeWait(10_000), interval: 50 },
     );
   }
   throw new Error("native E2E notification cleanup exceeded its bounded limit");
@@ -150,9 +168,9 @@ async function discardCloseTabDraftIfPresent(): Promise<void> {
   const discard = await $(
     "//*[@role='alertdialog']//button[normalize-space(.)='Discard']",
   );
-  await discard.waitForClickable({ timeout: 10_000 });
+  await discard.waitForClickable({ timeout: nativeWait(10_000) });
   await discard.click();
-  await dialog.waitForExist({ reverse: true, timeout: 10_000 });
+  await dialog.waitForExist({ reverse: true, timeout: nativeWait(10_000) });
 }
 
 /**
@@ -172,11 +190,11 @@ export async function closeOpenNotesDiscardingDrafts(): Promise<void> {
       async () =>
         (await $("[role='alertdialog']").isExisting()) ||
         (await elementCount(OPEN_NOTE_CLOSE)) < before,
-      { timeout: 10_000, interval: 50 },
+      { timeout: nativeWait(10_000), interval: 50 },
     );
     await discardCloseTabDraftIfPresent();
     await browser.waitUntil(async () => (await elementCount(OPEN_NOTE_CLOSE)) < before, {
-      timeout: 10_000,
+      timeout: nativeWait(10_000),
       interval: 50,
     });
   }
@@ -242,9 +260,9 @@ export async function ensureFixtureWorkspace(): Promise<void> {
 
   await dismissWhatsNewIfPresent();
   const recent = await $("button[aria-label='Open Native Fixture']");
-  await recent.waitForDisplayed({ timeout: 30_000 });
+  await recent.waitForDisplayed({ timeout: nativeWait(30_000) });
   await recent.click();
-  await tabs.waitForExist({ timeout: 30_000 });
+  await tabs.waitForExist({ timeout: nativeWait(30_000) });
   await dismissNativeNotifications();
 }
 
@@ -263,7 +281,7 @@ export async function clickVisibleTreeNote(label: string): Promise<void> {
   // WKWebView's WebDriver hit-test intermittently reports visible tree rows as
   // not clickable even though the following real click succeeds. Visibility is
   // the stable readiness condition; click remains the interaction assertion.
-  await note.waitForDisplayed({ timeout: 30_000 });
+  await note.waitForDisplayed({ timeout: nativeWait(30_000) });
   await note.click();
   await browser.waitUntil(
     async () =>
@@ -274,13 +292,13 @@ export async function clickVisibleTreeNote(label: string): Promise<void> {
           ),
         label,
       ),
-    { timeout: 10_000, interval: 50 },
+    { timeout: nativeWait(10_000), interval: 50 },
   );
 }
 
 export async function appendToSourceEditor(text: string): Promise<void> {
   const editor = await $("[role='textbox'][aria-label='Note content']");
-  await editor.waitForExist({ timeout: 30_000 });
+  await editor.waitForExist({ timeout: nativeWait(30_000) });
   await browser.execute((insertedText) => {
     const bridge = window.NEURALNOTE_NATIVE_E2E_BRIDGE_V1;
     if (typeof bridge?.append !== "function") {

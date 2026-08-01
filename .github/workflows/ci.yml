@@ -125,7 +125,10 @@ jobs:
   browser:
     name: Browser / ${{ matrix.browser }} / ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 15
+    # The hosted macOS runner drives WebKit several times slower than a local
+    # machine: the whole suite is ~15s here and minutes there. A per-test budget
+    # is worthless under a job cap that expires first, so the two move together.
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:

@@ -44,6 +44,16 @@ export default defineConfig({
     include: ["src/**/*.browser.test.{ts,tsx}"],
     setupFiles: ["./src/test/browserSetup.ts"],
     retry: 0,
+    // Browser mode's own defaults are 15s and 30s. They hold locally, where the
+    // whole suite runs in ~15s, and expire on GitHub's hosted macOS runner,
+    // which drives WebKit several times slower: 52 tests there died on
+    // "Test timed out in 15000ms" while the ones that finished took ~2.7s
+    // against ~0.3s here. Every failure was an expiry - no assertion ever
+    // disagreed - so the budget was measuring the runner. These bound how long
+    // we WAIT, not how exact a measurement has to be, which is why widening
+    // them is honest where widening a geometry tolerance would not be.
+    testTimeout: process.env.CI ? 60_000 : 15_000,
+    hookTimeout: process.env.CI ? 60_000 : 30_000,
     browser: {
       enabled: true,
       screenshotFailures: true,

@@ -8,6 +8,7 @@ import {
   clickVisibleTreeNote,
   currentSourceMatches,
   fixturePaths,
+  nativeWait,
   resetFixtureWorkspace,
   restoreStartSource,
 } from "./native-helpers.js";
@@ -15,7 +16,7 @@ import {
 async function openStartNote(): Promise<void> {
   await clickVisibleTreeNote("Start.md");
   await $("[role='textbox'][aria-label='Note content']").waitForExist({
-    timeout: 30_000,
+    timeout: nativeWait(30_000),
   });
 }
 
@@ -29,7 +30,7 @@ describe("NeuralNote native external reconciliation", () => {
     const source = restoreStartSource();
     await openStartNote();
     await browser.waitUntil(() => currentSourceMatches(source), {
-      timeout: 30_000,
+      timeout: nativeWait(30_000),
       interval: 50,
     });
   });
@@ -39,7 +40,7 @@ describe("NeuralNote native external reconciliation", () => {
     writeFileSync(fixturePaths().start, external, "utf8");
 
     await browser.waitUntil(async () => (await editorText()).includes("Clean external edit."), {
-      timeout: 10_000,
+      timeout: nativeWait(10_000),
       interval: 50,
     });
     await expect($("[aria-label='Unsaved changes']")).not.toBeExisting();
@@ -49,14 +50,14 @@ describe("NeuralNote native external reconciliation", () => {
   it("keeps a dirty draft on conflict and reloads only after confirmation", async () => {
     const draft = "Local unsaved draft.";
     await appendToSourceEditor(draft);
-    await $("[aria-label='Unsaved changes']").waitForExist({ timeout: 10_000 });
+    await $("[aria-label='Unsaved changes']").waitForExist({ timeout: nativeWait(10_000) });
 
     const external = "# Native start\n\nChanged underneath the draft.\n";
     writeFileSync(fixturePaths().start, external, "utf8");
     const conflict = await $(
       "//div[@role='alert'][contains(., 'changed on disk since you opened it')]",
     );
-    await conflict.waitForExist({ timeout: 20_000 });
+    await conflict.waitForExist({ timeout: nativeWait(20_000) });
 
     assert.equal((await editorText()).includes(draft), true);
     assert.equal(readFileSync(fixturePaths().start, "utf8"), external);
@@ -66,7 +67,7 @@ describe("NeuralNote native external reconciliation", () => {
         const text = await editorText();
         return text.includes("Changed underneath the draft.") && !text.includes(draft);
       },
-      { timeout: 10_000, interval: 50 },
+      { timeout: nativeWait(10_000), interval: 50 },
     );
     await expect($("[aria-label='Unsaved changes']")).not.toBeExisting();
   });
@@ -74,7 +75,7 @@ describe("NeuralNote native external reconciliation", () => {
   it("surfaces an external deletion without dropping the open source", async () => {
     unlinkSync(fixturePaths().start);
     await $("//div[@role='alert'][contains(., 'deleted on disk')]").waitForExist({
-      timeout: 20_000,
+      timeout: nativeWait(20_000),
     });
     assert.equal((await editorText()).includes("Exact source."), true);
   });

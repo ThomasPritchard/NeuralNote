@@ -9,6 +9,7 @@ import {
   bytes,
   clickVisibleTreeNote,
   fixturePaths,
+  nativeWait,
   resetFixtureWorkspace,
 } from "./native-helpers.js";
 
@@ -17,7 +18,7 @@ const MIXED_SOURCE = "# Mixed\r\n\rFirst\nSecond\r\nThird\r";
 
 async function editor() {
   const noteEditor = await $("[role='textbox'][aria-label='Note content']");
-  await noteEditor.waitForExist({ timeout: 30_000 });
+  await noteEditor.waitForExist({ timeout: nativeWait(30_000) });
   return noteEditor;
 }
 
@@ -27,7 +28,7 @@ async function replaceVisibleLinePrefix(
   replacement: string,
 ): Promise<void> {
   const line = await $(`.cm-line*=${lineText}`);
-  await line.waitForDisplayed({ timeout: 30_000 });
+  await line.waitForDisplayed({ timeout: nativeWait(30_000) });
   await line.scrollIntoView();
   const changed = await browser.execute(
     (expected, insertedText) =>
@@ -36,14 +37,14 @@ async function replaceVisibleLinePrefix(
     replacement,
   );
   if (!changed) throw new Error("native E2E editor bridge did not find the expected source span");
-  await $("[aria-label='Unsaved changes']").waitForExist({ timeout: 10_000 });
+  await $("[aria-label='Unsaved changes']").waitForExist({ timeout: nativeWait(10_000) });
 }
 
 async function saveWithVisibleControl(): Promise<void> {
   const save = await $("button=Save");
-  await save.waitForClickable({ timeout: 30_000 });
+  await save.waitForClickable({ timeout: nativeWait(30_000) });
   await save.click();
-  await $("[aria-label='Unsaved changes']").waitForExist({ reverse: true, timeout: 30_000 });
+  await $("[aria-label='Unsaved changes']").waitForExist({ reverse: true, timeout: nativeWait(30_000) });
 }
 
 describe("NeuralNote native Markdown source fidelity", () => {
@@ -76,9 +77,9 @@ describe("NeuralNote native Markdown source fidelity", () => {
     await clickVisibleTreeNote("Markdown Compatibility.md");
     await editor();
     const close = await $("button[aria-label='Close Native Markdown Compatibility']");
-    await close.waitForDisplayed({ timeout: 10_000 });
+    await close.waitForDisplayed({ timeout: nativeWait(10_000) });
     await close.click();
-    await close.waitForExist({ reverse: true, timeout: 10_000 });
+    await close.waitForExist({ reverse: true, timeout: nativeWait(10_000) });
 
     assert.deepEqual(bytes(fixturePaths().markdown), before);
   });
@@ -92,7 +93,7 @@ describe("NeuralNote native Markdown source fidelity", () => {
     const changed = MARKDOWN_COMPATIBILITY_SOURCE.replace("Paragraph one", "Paragraph one edited");
     await browser.waitUntil(
       () => readFileSync(fixturePaths().markdown, "utf8") === changed,
-      { timeout: 10_000, interval: 50 },
+      { timeout: nativeWait(10_000), interval: 50 },
     );
 
     assert.equal(readFileSync(fixturePaths().markdown, "utf8"), changed);
@@ -111,7 +112,7 @@ describe("NeuralNote native Markdown source fidelity", () => {
       await saveWithVisibleControl();
       const changed = before.replace("First", "First edited");
       await browser.waitUntil(() => readFileSync(pathname, "utf8") === changed, {
-        timeout: 10_000,
+        timeout: nativeWait(10_000),
         interval: 50,
       });
       const after = readFileSync(pathname, "utf8");
@@ -124,7 +125,7 @@ describe("NeuralNote native Markdown source fidelity", () => {
     const existingClose = await $("button[aria-label='Close Native Markdown Compatibility']");
     if (await existingClose.isExisting()) {
       await existingClose.click();
-      await existingClose.waitForExist({ reverse: true, timeout: 10_000 });
+      await existingClose.waitForExist({ reverse: true, timeout: nativeWait(10_000) });
     }
     const auditPath = path.join(fixturePaths().root, "artifacts", "native-read-audit.jsonl");
     writeFileSync(auditPath, "", "utf8");
@@ -159,7 +160,7 @@ describe("NeuralNote native Markdown source fidelity", () => {
     // the inert constructs.
     await clickVisibleTreeNote("Markdown Compatibility.md");
     const noteEditor = await $("[role='textbox'][aria-label='Note content']");
-    await noteEditor.waitForExist({ timeout: 30_000 });
+    await noteEditor.waitForExist({ timeout: nativeWait(30_000) });
     await noteEditor.click();
     await browser.execute(() => {
       const scroller = document.querySelector<HTMLElement>(".cm-scroller");
@@ -170,7 +171,7 @@ describe("NeuralNote native Markdown source fidelity", () => {
     await browser.waitUntil(
       async () =>
         (await browser.execute(() => document.querySelectorAll(".nn-lp-image, .nn-lp-embed").length)) > 0,
-      { timeout: 10_000, interval: 50 },
+      { timeout: nativeWait(10_000), interval: 50 },
     );
     await expect($("img[src*='native-e2e-image']")).not.toBeExisting();
     assert.equal(

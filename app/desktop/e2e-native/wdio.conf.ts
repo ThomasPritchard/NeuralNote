@@ -3,6 +3,7 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { captureFailureArtifacts } from "./native-artifacts.js";
+import { nativeWait } from "./specs/native-helpers.js";
 import { assertNativeFrontendReady } from "./tauri-bootstrap.js";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
@@ -67,10 +68,10 @@ export const config: WebdriverIO.Config = {
   // WebDriver command payloads can include page text. Keep stdout at failures
   // only; the harness writes its own bounded, redacted artifacts.
   logLevel: "error",
-  waitforTimeout: 10_000,
+  waitforTimeout: nativeWait(10_000),
   mochaOpts: {
     ui: "bdd",
-    timeout: 120_000,
+    timeout: nativeWait(120_000),
   },
   before: async () => {
     // Fail with the exact bootstrap fault before invoking the plugin-backed
