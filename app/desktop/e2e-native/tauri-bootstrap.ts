@@ -16,6 +16,7 @@ declare global {
     NEURALNOTE_NATIVE_E2E_BRIDGE_V1?: {
       replaceFirst?(expected: string, replacement: string): boolean;
       matchesDocument?(expected: string): boolean;
+      scrollTextIntoView?(expected: string): boolean;
       append?(text: string): void;
       closeVaultViaNativeMenuAction?(): Promise<void>;
     };
@@ -34,6 +35,7 @@ function readBootstrapState(): NativeBootstrapState {
     editorBridge:
       typeof window.NEURALNOTE_NATIVE_E2E_BRIDGE_V1?.replaceFirst === "function" &&
       typeof window.NEURALNOTE_NATIVE_E2E_BRIDGE_V1?.matchesDocument === "function" &&
+      typeof window.NEURALNOTE_NATIVE_E2E_BRIDGE_V1?.scrollTextIntoView === "function" &&
       typeof window.NEURALNOTE_NATIVE_E2E_BRIDGE_V1?.append === "function" &&
       typeof window.NEURALNOTE_NATIVE_E2E_BRIDGE_V1?.closeVaultViaNativeMenuAction === "function",
     originalInvoke: typeof originalCore?.invoke === "function",

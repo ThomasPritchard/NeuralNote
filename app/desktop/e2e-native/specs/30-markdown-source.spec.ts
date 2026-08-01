@@ -27,9 +27,20 @@ async function replaceVisibleLinePrefix(
   sourcePrefix: string,
   replacement: string,
 ): Promise<void> {
+  // Scroll from the DOCUMENT before asking the DOM for the line. CodeMirror only
+  // builds lines near its viewport, so on a display that leaves the note column
+  // narrow this line is never rendered and waiting for it measures the screen
+  // rather than the editor: a 1024x768 CI runner clamps the app's requested
+  // 1280x820 window, and between the file tree and the assistant pane the editor
+  // lands around 180px. `scrollTextIntoView` resolves the position against the
+  // document, so it is exact whatever the pane ends up being.
+  const scrolled = await browser.execute(
+    (text) => window.NEURALNOTE_NATIVE_E2E_BRIDGE_V1?.scrollTextIntoView?.(text) ?? false,
+    lineText,
+  );
+  if (!scrolled) throw new Error(`native E2E editor bridge could not locate the line ${lineText}`);
   const line = await $(`.cm-line*=${lineText}`);
   await line.waitForDisplayed({ timeout: nativeWait(30_000) });
-  await line.scrollIntoView();
   const changed = await browser.execute(
     (expected, insertedText) =>
       window.NEURALNOTE_NATIVE_E2E_BRIDGE_V1?.replaceFirst?.(expected, insertedText) ?? false,

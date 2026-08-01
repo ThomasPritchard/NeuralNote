@@ -19,6 +19,7 @@ test("accepts a frontend with both Tauri and the WebdriverIO bootstrap", async (
     NEURALNOTE_NATIVE_E2E_BRIDGE_V1: {
       replaceFirst: () => true,
       matchesDocument: () => true,
+      scrollTextIntoView: () => true,
       append: () => undefined,
       closeVaultViaNativeMenuAction: async () => undefined,
     },

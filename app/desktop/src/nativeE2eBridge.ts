@@ -6,6 +6,7 @@ import { MENU_ACTION } from "./lib/bindings/events";
 interface NativeE2eEditorBridge {
   replaceFirst(expected: string, replacement: string): boolean;
   matchesDocument(expected: string): boolean;
+  scrollTextIntoView(expected: string): boolean;
   append(text: string): void;
   closeVaultViaNativeMenuAction(): Promise<void>;
 }
@@ -40,6 +41,20 @@ export function installNativeE2eBridge(): void {
     },
     matchesDocument(expected) {
       return currentEditor().state.doc.toString() === expected;
+    },
+    // CodeMirror only builds DOM for the lines near its viewport, so whether a
+    // given line exists to be queried is a function of how tall and wide the
+    // editor happens to be. A journey that waits for one to appear is therefore
+    // asserting the window size unless it scrolls there first: the same note on
+    // a 1024x768 CI display never rendered the line a 1280x820 desktop did.
+    // Positions come from the document, not the DOM, so this is exact wherever
+    // the pane ends up.
+    scrollTextIntoView(expected) {
+      const view = currentEditor();
+      const from = view.state.doc.toString().indexOf(expected);
+      if (from < 0) return false;
+      view.dispatch({ effects: EditorView.scrollIntoView(from, { y: "center" }) });
+      return true;
     },
     append(text) {
       const view = currentEditor();
