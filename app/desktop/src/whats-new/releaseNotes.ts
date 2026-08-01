@@ -12,49 +12,55 @@ export interface ReleaseNotes {
   readonly groups: readonly ReleaseNotesGroup[];
 }
 
+// One release only. The workflow contract greps this WHOLE file for `items:`
+// and compares the result with the single-version `.md`, so a superseded entry
+// left behind here fails the release, not just this file's own test.
 const RELEASE_NOTES: Readonly<Record<string, ReleaseNotes>> = {
-  "0.2.1": {
-    version: "0.2.1",
-    title: "What's new in NeuralNote 0.2.1",
+  "0.3.0": {
+    version: "0.3.0",
+    title: "What's new in NeuralNote 0.3.0",
     introduction:
-      "NeuralNote 0.2.1 is a reliability and polish release. Search reaches more of your vault, open notes stay in step with changes made outside the app, the assistant is more honest about cut-off answers and evidence, and keyboard and screen-reader access improve. The vault format and your saved settings are unchanged.",
+      "NeuralNote 0.3.0 makes Markdown tables editable in place: a table stays drawn as a table while you type in it, instead of flipping to raw pipe-delimited source. Large notes open without freezing the window, the assistant budgets context for cloud models as well as local ones, and a run of long-standing editor defects are fixed. The vault format and your saved settings are unchanged.",
     groups: [
       {
-        title: "Editing and search",
+        title: "Tables you can edit in place",
         items: [
-          "Search now covers plain-text notes, so a .txt or .text file is found and cited on the exact line the reader shows.",
-          "Vault search matches accented and non-Latin text consistently, using full Unicode-aware case folding.",
-          "Notes saved in non-UTF-8 encodings read and search the same way, with no mismatch between the reader and search results.",
-          "Open notes reload safely when their file changes outside NeuralNote, keeping your place instead of showing stale text.",
-          "Fixes to the Markdown source editor correct rendering and interaction glitches during live-preview editing.",
+          "Markdown tables now stay drawn as a table while you type in them, instead of switching to raw pipe-delimited text the moment the caret enters.",
+          "Columns are sized from the measured width of what is actually drawn, so a cell containing bold text or a wikilink no longer spills past its column rule.",
+          "Table columns re-measure once the app's fonts finish loading, so a table opened during startup is no longer sized against a fallback typeface.",
+          "A wide table scrolls inside its own rows rather than dragging the whole note sideways.",
+          "Pressing Enter on a blank table row no longer deletes every row below it.",
+          "Selecting across a cell boundary no longer silently merges two cells.",
+          "Backspace at a table's hidden alignment row no longer destroys the table.",
+          "An edit that would delete a hidden table delimiter is refused with an explanation instead of quietly corrupting the table.",
+          "A table's literal Markdown source can be revealed on demand, and its column alignment written back into the file, without leaving the editor.",
+        ],
+      },
+      {
+        title: "Editing and Markdown",
+        items: [
+          "Notes longer than a few thousand characters now render fully as soon as they open, instead of showing raw Markdown below the first screenful until you typed.",
+          "Retyped lines keep the line endings you typed in notes that mix Windows and Unix endings, instead of borrowing a separator from elsewhere in the file.",
+          "An escaped pipe inside a table cell displays as a literal pipe character everywhere that cell appears.",
+          "Image labels keep their complete alt text, including nested brackets.",
+          "A wikilink written inside an image or link is left to the surrounding construct, so the two no longer draw overlapping labels.",
+          "The source editor applies its intended line height.",
         ],
       },
       {
         title: "Neural Assistant AI",
         items: [
-          "When a provider stops an answer at its length limit, NeuralNote now flags the answer as truncated instead of presenting it as complete.",
-          "Cited answers stay trustworthy: reused note text is re-verified before it is cited, so a stale span is dropped rather than attributed to the wrong line.",
-          "A citation's supporting evidence widens automatically when a later step needs more surrounding context.",
-          "The local AI option is now clearly labelled best-effort for citation fidelity, and points you to the API-key path when reliable citations matter most.",
-          "Transient failures in the assistant's tool steps retry with a short backoff instead of surfacing as an error.",
+          "Context budgeting now covers cloud models as well as local ones, using each model's real context window, so a long conversation is trimmed deliberately instead of being cut off by the provider.",
+          "Text in non-Latin scripts is measured accurately when a conversation is trimmed, closing a case where rare-script content could be silently dropped.",
         ],
       },
       {
-        title: "Accessibility and interface",
+        title: "Large notes and reliability",
         items: [
-          "File-tree entries gain a keyboard-accessible Move to action, so notes can be reorganised without a pointer.",
-          "Settings pages, the pane splitter, the ribbon, and the title bar expose clearer, more semantic roles to screen readers.",
-          "The title bar's drag region is hit-tested accurately, so window dragging responds where you expect.",
-        ],
-      },
-      {
-        title: "Reliability and release readiness",
-        items: [
-          "Undo history recovers cleanly after an unexpected shutdown, restoring quarantined entries instead of losing them.",
-          "Undo records resolve to the latest write for a note, so a stale entry can never authorise deleting newer content.",
-          "Local-model downloads check free disk space first and report accurate overall progress across multi-part model pulls.",
-          "Vault paths are validated through one stricter, shared check, closing edge cases around unusual path components.",
-          "Application packages, updater checks, and the upgrade journey are aligned on version 0.2.1.",
+          "Opening or restoring a very large note no longer freezes the window. NeuralNote shows the file's size, the editing limit, and a Reload action, and the file on disk is left untouched.",
+          "Saving is refused for a note past the editing limit, so a stray save can no longer replace the file with empty content.",
+          "Live-preview failures are reported in the existing non-blocking notice, and one preview channel can no longer clear another's error.",
+          "Application packages, updater checks, and the upgrade journey are aligned on version 0.3.0.",
         ],
       },
     ],
