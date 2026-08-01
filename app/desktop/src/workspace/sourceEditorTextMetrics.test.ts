@@ -284,6 +284,33 @@ describe("sourceEditorTextMetrics", () => {
     expect(measure).toHaveBeenCalledTimes(2);
   });
 
+  it("bumps the epoch from `loading` alone, because WebKit never sends loadingdone", async () => {
+    // Measured, not assumed: on WebKit `loading` fires and `loadingdone` does
+    // not — for `add()` + `FontFace.load()` AND for a CSS-driven layout-demanded
+    // load — while `status` still reaches "loaded". Every macOS build runs on
+    // WKWebView, so a `loadingdone`-only subscription leaves the epoch pinned to
+    // the fallback face's widths for the life of the document. `loading` + the
+    // `ready` promise is the pair that holds on both engines.
+    let settle!: () => void;
+    const ready = new Promise<void>((resolve) => { settle = resolve; });
+    const fonts = Object.assign(new EventTarget(), { ready, status: "loaded" });
+    Object.defineProperty(document, "fonts", { value: fonts, configurable: true });
+
+    primeTextMetrics(host.querySelector(".cm-content")!);
+    const before = metricsEpoch();
+
+    fonts.dispatchEvent(new Event("loading"));
+    // Still nothing: the faces are in flight, and bumping now would cache widths
+    // measured against the very fallback this exists to replace.
+    expect(metricsEpoch()).toBe(before);
+
+    settle();
+    await ready;
+    await Promise.resolve();
+
+    expect(metricsEpoch()).toBeGreaterThan(before);
+  });
+
   it("bumps the epoch when the font scale changes the measured styles", async () => {
     const content = host.querySelector<HTMLElement>(".cm-content")!;
     primeTextMetrics(content);

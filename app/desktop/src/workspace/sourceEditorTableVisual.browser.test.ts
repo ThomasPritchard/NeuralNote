@@ -388,6 +388,24 @@ function stripDelta(a: Frame, b: Frame, x0: number, x1: number, y: number): numb
   return count === 0 ? 0 : total / count;
 }
 
+/**
+ * The strongest scanline in a band below a line's top edge.
+ *
+ * A single scanline at a hand-picked offset measures the ENGINE, not the fill:
+ * Chromium and WebKit start a selection rectangle at different sub-pixel offsets
+ * within the line box, so an offset tuned until Chromium went green read 0 on
+ * WebKit and reported the control invisible. Scanning a band and keeping the
+ * maximum answers "does the selection reach this line at all", which is the
+ * actual question, without pinning where either engine chooses to start it.
+ */
+function bandDelta(a: Frame, b: Frame, x0: number, x1: number, top: number, depth: number): number {
+  let strongest = 0;
+  for (let offset = 1; offset <= depth; offset += 1) {
+    strongest = Math.max(strongest, stripDelta(a, b, x0, x1, top + offset));
+  }
+  return strongest;
+}
+
 // ---------------------------------------------------------------------------
 // Fixtures
 // ---------------------------------------------------------------------------
@@ -854,22 +872,25 @@ describe("the drawn box — a selection reads through every row", () => {
       await nextFrame();
       const controlSelected = await grabFrame();
 
-      // Sample a strip 3px below each line's top edge: inside the selection
-      // rectangle, above the glyph tops, so the delta is the selection's own
-      // contribution rather than antialiasing on the text.
-      const rowDelta = stripDelta(
+      // Scan a band below each line's top edge rather than one hand-picked
+      // scanline, and read both the row and the control by the SAME rule — the
+      // asymmetry that used to be here (+12 against +3) was two different
+      // instruments being compared as if they were one.
+      const rowDelta = bandDelta(
         before,
         rowSelected,
         bodyRect.left + 4,
         bodyRect.left + 150,
-        bodyRect.top + 12,
+        bodyRect.top,
+        14,
       );
-      const controlDelta = stripDelta(
+      const controlDelta = bandDelta(
         before,
         controlSelected,
         controlRect.left + 4,
         controlRect.left + 150,
-        controlRect.top + 3,
+        controlRect.top,
+        14,
       );
 
       // The control has no fill above the selection layer at all, so it is the
@@ -879,7 +900,10 @@ describe("the drawn box — a selection reads through every row", () => {
         // ceiling; a fully opaque row fill drives the row's delta to 0.
         controlVisible: controlDelta > 4,
         rowVisible: rowDelta > 3,
-        rowReadsAgainstControl: rowDelta / controlDelta > 0.3,
+        // `controlDelta > 0` is not redundant with `controlVisible`: without it
+        // a dead control divides to Infinity and this reads TRUE precisely when
+        // the reference it is measured against has stopped working.
+        rowReadsAgainstControl: controlDelta > 0 && rowDelta / controlDelta > 0.3,
         measured: { rowDelta, controlDelta },
       }).toEqual({
         controlVisible: true,
