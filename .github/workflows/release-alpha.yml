@@ -649,14 +649,32 @@ jobs:
           git init "$MANIFEST_WORKTREE"
           git -C "$MANIFEST_WORKTREE" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
           gh auth setup-git
-          # Exact-ref probe: `--heads <full-ref>` is a version-dependent footgun that
-          # can match nothing, sending the second-ever release down the orphan path and
-          # failing the push non-fast-forward (issue: 0.2.1 publish). Full ref, no --heads.
-          if git ls-remote --exit-code origin refs/heads/release-manifests >/dev/null 2>&1; then
+          # Probe INSIDE the manifest worktree. This job performs no checkout by
+          # design, so the job's own working directory is not a git repository and
+          # knows no `origin` - a bare `git ls-remote origin ...` there fails for
+          # that reason alone. Both 0.2.1 and 0.3.0 published their release and
+          # then failed this push: the probe errored, `2>/dev/null` hid why, and
+          # `if` read "cannot reach the remote" as "branch does not exist", so a
+          # rootless history was pushed at a branch that already existed. #83
+          # changed `--heads <ref>` to an exact ref and asserted the new string;
+          # the ref syntax was never the problem, and asserting a command's SHAPE
+          # does not run it.
+          #
+          # `--exit-code` returns 2 for "no matching refs" and other non-zero
+          # values for real failures, so the two are kept apart here. Anything
+          # that is not a clean yes or a clean no stops the release rather than
+          # guessing, because guessing wrong destroys the branch clients poll.
+          probe_status=0
+          git -C "$MANIFEST_WORKTREE" ls-remote --exit-code origin \
+            refs/heads/release-manifests >/dev/null || probe_status=$?
+          if [ "$probe_status" -eq 0 ]; then
             git -C "$MANIFEST_WORKTREE" fetch --depth=1 origin refs/heads/release-manifests
             git -C "$MANIFEST_WORKTREE" checkout -b release-manifests FETCH_HEAD
-          else
+          elif [ "$probe_status" -eq 2 ]; then
             git -C "$MANIFEST_WORKTREE" checkout --orphan release-manifests
+          else
+            echo "::error::Could not determine whether release-manifests exists (git ls-remote exit $probe_status)"
+            exit 1
           fi
           cp "$RELEASE_MANIFEST" "$MANIFEST_WORKTREE/latest-alpha.json"
           git -C "$MANIFEST_WORKTREE" config user.name "github-actions[bot]"

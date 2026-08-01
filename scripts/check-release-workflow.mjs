@@ -286,15 +286,27 @@ test("the publisher can safely resume after release or manifest publication", ()
   assert.match(publishRelease, /RELEASE_ALREADY_PUBLISHED/);
   assert.match(publishRelease, /--json isImmutable/);
   assert.match(publishRelease, /"\$RELEASE_IS_IMMUTABLE"\s*!=\s*"true"/);
-  // Exact-ref probe (no --heads): `--heads <full-ref>` is a version-dependent
-  // footgun that sent the second-ever release down the orphan path and failed the
-  // non-fast-forward push (0.2.1 manifest publish). Assert the fixed form is present
-  // and guard the buggy `--heads ... release-manifests` form from ever returning.
+  // The probe must run INSIDE the manifest worktree. This job performs no
+  // checkout, so its own working directory is not a git repository and knows no
+  // `origin`; a bare `git ls-remote origin ...` fails there for that reason
+  // alone, and both the 0.2.1 and 0.3.0 releases published and then failed this
+  // push because that failure was read as "branch does not exist".
+  //
+  // The previous version of this test asserted the exact-ref STRING and passed
+  // the whole time the command was broken, which is why it is now pinned to the
+  // `-C <worktree>` form instead: the missing `-C` was the defect.
   assert.match(
     publishManifest,
-    /git ls-remote --exit-code origin refs\/heads\/release-manifests/,
+    /git -C "\$MANIFEST_WORKTREE" ls-remote --exit-code origin/,
   );
+  assert.doesNotMatch(publishManifest, /^\s*git ls-remote/m);
   assert.doesNotMatch(publishManifest, /git ls-remote[^\n]*--heads[^\n]*release-manifests/);
+  // A probe that cannot answer must stop the release, not fall through to the
+  // orphan path: `--exit-code` reserves 2 for "no matching refs", so anything
+  // else has to be distinguished rather than treated as absence.
+  assert.match(publishManifest, /probe_status/);
+  assert.match(publishManifest, /-eq 2/);
+  assert.doesNotMatch(publishManifest, /ls-remote[^\n]*2>\/dev\/null/);
   assert.match(publishManifest, /release-manifests already contains this manifest/);
   assert.doesNotMatch(publishManifest, /already contains this manifest[\s\S]*?exit 1/);
 });
