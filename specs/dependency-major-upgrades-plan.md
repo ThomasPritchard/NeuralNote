@@ -266,6 +266,16 @@ Everything PR #107 knowingly left undone. Grouped by whether it is ours to fix.
   on an idle re-run. It was not identified before it recovered, so it is recorded here rather
   than diagnosed. If a jsdom test starts failing only under parallel load, this is the first
   place to look.
+- **`DEFER(overflow-stderr-race)`** — `youtube::process::tests::stdout_overflow_is_bounded_and_stops_the_child`
+  failed once on Ubuntu CI (2026-08-10) and passed on re-run against identical code. Narrowed but
+  **not solved**: `stdout.len() == 64` is guaranteed by construction (`read_bounded` caps each
+  append at `limit - retained.len()`), so `stderr.is_empty()` is the only clause that can fail —
+  yet the child is SIGKILLed as a process group, which should leave it no opportunity to write.
+  What produced stderr output is unexplained. Note `/bin/sh` is dash on Ubuntu and bash on macOS,
+  which is the most likely source of the divergence and would explain why it never reproduces
+  locally. The assertion has been destructured so the next occurrence prints the offending bytes;
+  it was deliberately not relaxed, because weakening an assertion whose cause is unknown trades a
+  diagnosable flake for a permanent blind spot. Re-open when the message arrives.
 - `production-dependencies.test.ts` deliberately keeps `v1.2.0` and `desktop v0.2.1` in its
   fixture strings. They are synthetic inputs proving the rejection is version-independent, not
   pins — do not "fix" them to match the real versions.
