@@ -243,21 +243,21 @@ Everything PR #107 knowingly left undone. Grouped by whether it is ours to fix.
 
 ### Ours, scheduled
 
-- **`DEFER(vite-8)`** — steps 4 and 5 above (`vite` 8.2.x + `@vitejs/plugin-react` 6.0.5).
+- **`DEFER(vite-8)`** (#112) — steps 4 and 5 above (`vite` 8.2.x + `@vitejs/plugin-react` 6.0.5).
   Needs a clear window, not a release run-up. The risk is concentrated in
   `scripts/assert-production-bundle.mjs`, which holds only because the bundler's dead-code
   elimination drops the `import.meta.env`-guarded native-e2e imports; Rolldown's DCE is a
   different implementation and no documentation can answer whether it behaves identically.
-- **`DEFER(codemirror-pins)`** — `@codemirror/lang-markdown` (6.5.1, 6.5.2 available) and
+- **`DEFER(codemirror-pins)`** (#114) — `@codemirror/lang-markdown` (6.5.1, 6.5.2 available) and
   `@codemirror/view` (6.43.6, 6.43.8 available) are pinned to exact versions, so routine patches
   do not flow. Almost certainly deliberate given how much editor behaviour is tuned against
   CodeMirror internals, but the intent is not written down anywhere, so it reads as an accident.
   Confirm and record, or unpin.
-- **`DEFER(typescript-split)`** — TS `7.0.2` in `app/desktop` vs `~5.8.3` in `e2e-native`.
+- **`DEFER(typescript-split)`** (#114) — TS `7.0.2` in `app/desktop` vs `~5.8.3` in `e2e-native`.
 
 ### Ours, verification gaps rather than changes
 
-- **`DEFER(wdio-native-tier)`** — the `@wdio/tauri-*` 1.3.0 bump could not be exercised locally:
+- **`DEFER(wdio-native-tier)`** (#101) — the `@wdio/tauri-*` 1.3.0 bump could not be exercised locally:
   the native tier needs a built binary on macOS CI. 1.3.0 adds ~300 lines of macOS/WebKit
   DirectEval handling plus a new `eval_channel.rs` under the execution path that suite drives,
   and this repo has already shipped one WKWebView-specific bug (58a1664). Watch that lane across
@@ -266,7 +266,7 @@ Everything PR #107 knowingly left undone. Grouped by whether it is ours to fix.
   on an idle re-run. It was not identified before it recovered, so it is recorded here rather
   than diagnosed. If a jsdom test starts failing only under parallel load, this is the first
   place to look.
-- **`DEFER(overflow-stderr-race)`** — `youtube::process::tests::stdout_overflow_is_bounded_and_stops_the_child`
+- **`DEFER(overflow-stderr-race)`** (#115) — `youtube::process::tests::stdout_overflow_is_bounded_and_stops_the_child`
   failed once on Ubuntu CI (2026-08-10) and passed on re-run against identical code. Narrowed but
   **not solved**: `stdout.len() == 64` is guaranteed by construction (`read_bounded` caps each
   append at `limit - retained.len()`), so `stderr.is_empty()` is the only clause that can fail —
@@ -294,7 +294,7 @@ Everything PR #107 knowingly left undone. Grouped by whether it is ours to fix.
 
 ### Blocked upstream
 
-- **`DEFER(jsdom-30)`** — step 6 above. Two independent blockers: jsdom 30's `engines`
+- **`DEFER(jsdom-30)`** (#113) — step 6 above. Two independent blockers: jsdom 30's `engines`
   (`^22.22.2 || ^24.15.0 || >=26.0.0`) exclude versions our declared range admits in both arms,
   and 30.0.1 ships a `querySelectorAll` regression (jsdom#4227) whose fix landed by bumping
   `@asamuzakjp/dom-selector` **outside 30.0.1's own declared `^8.3.0` range**, so a fresh install
@@ -316,7 +316,7 @@ Everything PR #107 knowingly left undone. Grouped by whether it is ours to fix.
   geometry assertions against a runner whose frames measured ~40x slower than healthy. Worth its
   own issue: the lane is informational, so it fails quietly and permanently, and a gate nobody
   trusts is not a gate.
-- **The Native Tauri macOS lane fails on `main` too, and cannot be diagnosed from CI output.**
+- **The Native Tauri macOS lane fails on `main` too, and cannot be diagnosed from CI output** (#101 — which already documents the redaction problem and identifies the 1024x768 display clamp as the cause; the notes below were re-derived independently before that issue was found).
   Verified against `main` at `4d87df3` (2026-08-01): the same lane failed there, in a run that was
   overall green because the lane is informational. The failure shape is identical on both — build
   succeeds, ~2.5 minutes pass, then `Spec Files: 0 passed, 1 failed, 0 skipped, 1 total` with no
