@@ -7,9 +7,14 @@
 //   1. One rail, not a list. State reads from the glyph column before any text.
 //   2. The whole process folds the moment the answer starts streaming — a
 //      24-second trace must never push the answer off screen.
-//   3. While it streams it is a BOUNDED window (a few freshest nodes, height
-//      reserved) so the block cannot grow and shrink as nodes roll. A live
-//      region that resizes every 300ms reads as flicker, not as work.
+//   3. Every dispatched node stays on the rail, live and settled. The rail is
+//      the complete, ordered account of what the agent did; one that silently
+//      dropped steps WHILE they were happening would break the audit at exactly
+//      the moment the user is watching it. Restraint is enforced per node
+//      instead — a bounded argument hint (`MAX_HINT_CHARS`) keeps one verbose
+//      model-written argument from wrapping over seven lines and swamping the
+//      timeline — and the pane's own scroll port already keeps the newest node
+//      in view without anything being taken off the record.
 //
 // Presentational only: every count comes from the reducer's own selectors and
 // every label from the backend, so nothing here composes or matches prose.
@@ -116,12 +121,6 @@ function TimelineEntryNode({
       return <DroppedNode reason={entry.reason} last={last} />;
   }
 }
-
-// How many nodes stay on screen while a run streams. A thorough run dispatches
-// 15–20 calls, so a small cap keeps the "watch it work" feel without a 20-row
-// wall; the head's tally accounts for the hidden ones, and the window's height
-// is reserved so it cannot jitter as nodes roll.
-const LIVE_WINDOW_CAP = 3;
 
 /** The one-line account the head shows once the process has settled.
  *
@@ -248,11 +247,10 @@ export function ChatTimeline({
   // Nothing happened and nothing is happening: say nothing at all.
   if (entries.length === 0 && !live) return null;
 
-  // Key over the WHOLE list, then window it: a node must keep its identity as
-  // the window slides, or every roll remounts the visible rows — restarting the
-  // in-flight spinner and discarding any disclosure the user had opened.
-  const all = keyed(entries);
-  const rows = live ? all.slice(-LIVE_WINDOW_CAP) : all;
+  // Keyed by kind + occurrence, so a node keeps its identity as the list grows:
+  // a re-key would remount the visible rows, restarting the in-flight spinner
+  // and discarding any disclosure the user had opened.
+  const rows = keyed(entries);
   const lastRow = rows.length - 1;
   return (
     <section aria-label="What the assistant did" className="min-w-0">
@@ -274,9 +272,10 @@ export function ChatTimeline({
           )}
         </summary>
         {rows.length > 0 && (
-          // Reserve the window's height while live so the block never grows or
-          // shrinks as nodes roll; `justify-end` tails new nodes in at the
-          // bottom and lets the oldest scroll off the top.
+          // A floor under the live rail, not a ceiling: the first node or two
+          // sit in a reserved footprint so the block does not jolt a row taller
+          // on every dispatch. Past that it simply grows, and the transcript's
+          // own pin keeps the newest node in view.
           <ol
             className={
               live

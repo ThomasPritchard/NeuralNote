@@ -128,7 +128,19 @@ const HINT_FIELDS = [
   "question",
 ] as const;
 
-const MAX_HINT_CHARS = 120;
+/** How much of the argument the rail will show.
+ *
+ *  This is the rail's only restraint now that every dispatched node stays on it,
+ *  so it has to do real work. The hint is mono at 11px in a ~320px column — call
+ *  it 45 characters a line at the shipped pane width, fewer in a narrow window —
+ *  and a model that writes its own search queries will happily write two hundred
+ *  characters of them. At the old 120 one query wrapped over seven lines and
+ *  became the tallest thing in the timeline; at 64 it costs a line or two, which
+ *  is what a hint is worth beside the title it qualifies. Nothing is lost by
+ *  cutting it: the hint only says what a call is DOING, and the moment it
+ *  settles the Rust-composed summary beside it becomes the authoritative
+ *  account. */
+const MAX_HINT_CHARS = 64;
 
 export function argumentHint(argumentsJson: string): string | null {
   let parsed: unknown;

@@ -167,13 +167,16 @@ describe("ChatTimeline — tool node statuses", () => {
   });
 
   it("bounds an overlong argument label instead of letting it run away", () => {
+    // A model writes its own search queries and will write two hundred
+    // characters of them. Unbounded, one of those wraps over seven lines and
+    // becomes the tallest thing on the rail — and now that no node is ever
+    // dropped, this bound is the rail's only restraint.
     renderTimeline({
       toolCalls: [call("c1", null, { arguments: JSON.stringify({ query: "q".repeat(200) }) })],
     });
 
     const hint = within(rail()).getByText(/^· q+…$/);
-    expect(hint).toHaveTextContent(`· ${"q".repeat(120)}…`);
-    expect(hint.textContent).toBe(` · ${"q".repeat(120)}…`);
+    expect(hint.textContent).toBe(` · ${"q".repeat(64)}…`);
   });
 });
 
@@ -248,8 +251,13 @@ describe("ChatTimeline — the fold head", () => {
   });
 });
 
-describe("ChatTimeline — the live window stays bounded", () => {
-  it("shows only the freshest nodes while streaming, and counts the rest", () => {
+describe("ChatTimeline — the rail is the whole record", () => {
+  it("keeps every dispatched node on the rail while the run is still streaming", () => {
+    // The rail used to window down to the three freshest nodes while live, so a
+    // dispatched call visibly VANISHED as the next one landed and only came back
+    // after the run settled. A timeline that drops steps while they are
+    // happening is not a timeline: it breaks the audit at the one moment the
+    // user is watching it happen.
     renderTimeline({
       phase: "reading",
       toolCalls: Array.from({ length: 8 }, (_, i) =>
@@ -261,10 +269,11 @@ describe("ChatTimeline — the live window stays bounded", () => {
       ),
     });
 
-    expect(within(rail()).getAllByRole("listitem")).toHaveLength(3);
+    expect(within(rail()).getAllByRole("listitem")).toHaveLength(8);
     expect(screen.getByText(/8 steps/)).toBeInTheDocument();
-    expect(screen.getByText(/Note-7\.md:1–4/)).toBeInTheDocument();
-    expect(screen.queryByText(/Note-0\.md/)).not.toBeInTheDocument();
+    for (let i = 0; i < 8; i += 1) {
+      expect(screen.getByText(`· Note-${i}.md:1–4`)).toBeInTheDocument();
+    }
   });
 
   it("shows every node once settled, so the run stays auditable", async () => {

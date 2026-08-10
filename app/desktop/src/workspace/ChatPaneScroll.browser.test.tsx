@@ -24,13 +24,25 @@
 // One caveat the Definition of Done insists on: Chromium is not WKWebView, which
 // has no scroll anchoring at all. A green run here still owes a hands-on check
 // in a real build.
+//
+// And the caveat has teeth. The last test in this file is red in WebKit and
+// green in Chromium against the SAME broken hook: the bug is a `scroll` event
+// the engine defers past the next commit, and Chromium does not defer it. So
+// `test:browser` (Chromium) certifies that defect as absent. Both engines are in
+// the CI matrix; `test:browser:webkit` is the lane that lane's evidence lives in.
 
 import { afterEach, describe, expect, it } from "vitest";
 import { page, userEvent } from "vitest/browser";
 import { createRoot, type Root } from "react-dom/client";
+import { flushSync } from "react-dom";
 import { act } from "react";
 import { ChatTranscript } from "./ChatTranscript";
-import { emptyAssistant, type AssistantMessage, type ChatMessage } from "./chatMessage";
+import {
+  emptyAssistant,
+  type AssistantMessage,
+  type ChatMessage,
+  type ToolCallView,
+} from "./chatMessage";
 import "../styles.css";
 
 /** Roughly the docked pane's shipped width (`--chat-width`). */
@@ -73,6 +85,50 @@ function transcript(turns: number, tailSentences = 1): ChatMessage[] {
   return messages;
 }
 
+/** One dispatched, still-in-flight tool call carrying the kind of verbose,
+ *  model-written argument a real run produces. The marker leads the string so it
+ *  survives the hint's character bound, which is what lets a test name the node
+ *  it is looking for. */
+function inFlightCall(n: number): ToolCallView {
+  return {
+    id: `call-${n}`,
+    name: "search_notes",
+    title: "Search notes",
+    arguments: JSON.stringify({
+      query: `marker-${n} nested lists inside lists hierarchy sublevels indented bulleted numbered subsections subitems parent child items`,
+    }),
+    status: null,
+    summary: null,
+    detail: null,
+  };
+}
+
+/** A turn mid-run: `steps` dispatched calls and an answer of `answerSentences`
+ *  sentences (0 = the answer has not started, so the process rail is open and
+ *  carrying the live view). */
+function liveTurn(steps: number, answerSentences: number): AssistantMessage {
+  return {
+    ...emptyAssistant(false, "turn-live"),
+    phase: "reading",
+    toolCalls: Array.from({ length: steps }, (_, i) => inFlightCall(i)),
+    answer: Array.from(
+      { length: answerSentences },
+      (_, i) => `Answer ${i + 1}: retrieval practice beats rereading, reliably.`,
+    ).join(" "),
+    done: false,
+  };
+}
+
+/** Settled history, then a live turn — the shape the pane is in while a run
+ *  streams: everything above is static and only the last turn changes height. */
+function liveTranscript(steps: number, answerSentences = 0): ChatMessage[] {
+  return [
+    ...transcript(3),
+    { role: "user", content: "Read that note and explain the nested list examples." },
+    liveTurn(steps, answerSentences),
+  ];
+}
+
 let root: Root | null = null;
 let host: HTMLElement | null = null;
 
@@ -95,6 +151,16 @@ function distanceFromBottom(el: HTMLElement): number {
 
 const jumpControl = () => page.getByRole("button", { name: "Jump to latest" });
 
+/** The rail nodes of the newest turn — the live one in every test below. */
+function liveRailNodes(): HTMLElement[] {
+  const rails = host!.querySelectorAll<HTMLElement>(
+    '[aria-label="What the assistant did"]',
+  );
+  const rail = rails[rails.length - 1];
+  if (rail === undefined) throw new Error("the process rail did not render");
+  return [...rail.querySelectorAll<HTMLElement>("li")];
+}
+
 // Every follow decision happens in a ResizeObserver callback, and observer
 // delivery rides the rendering update — which the browser throttles hard for a
 // backgrounded frame. When the whole browser suite runs, several test iframes
@@ -110,18 +176,22 @@ async function settle(): Promise<void> {
   });
 }
 
+function transcriptTree(messages: ChatMessage[]) {
+  return (
+    <ChatTranscript
+      messages={messages}
+      onOpenCitation={() => {}}
+      onOpenNote={() => {}}
+      onSendFollowUp={() => {}}
+      busy={false}
+      runIds={{}}
+    />
+  );
+}
+
 async function render(messages: ChatMessage[]): Promise<void> {
   await act(async () => {
-    root!.render(
-      <ChatTranscript
-        messages={messages}
-        onOpenCitation={() => {}}
-        onOpenNote={() => {}}
-        onSendFollowUp={() => {}}
-        busy={false}
-        runIds={{}}
-      />,
-    );
+    root!.render(transcriptTree(messages));
   });
   await settle();
 }
@@ -164,6 +234,21 @@ async function waitForScrollEnd(port: HTMLElement): Promise<void> {
   });
 }
 
+/** Wait until the scroll position holds still across a settle interval.
+ *
+ *  `scrollend` is not enough on its own. It fires once for a scroll that is
+ *  still queued behind another, so a caller can be handed a position the pane is
+ *  about to leave. Two equal samples 150ms apart mean nothing is in flight. */
+async function waitForScrollToRest(port: HTMLElement): Promise<void> {
+  await expect
+    .poll(async () => {
+      const before = port.scrollTop;
+      await settle();
+      return port.scrollTop === before;
+    }, POLL)
+    .toBe(true);
+}
+
 /** Scroll the transcript up by a real key press. Doubles as the keyboard
  *  reachability check: a scroll container a keyboard user cannot move is a WCAG
  *  2.1.1 failure, and WebKit does not make one focusable on its own. */
@@ -180,11 +265,20 @@ async function scrollUpByKeyboard(port: HTMLElement): Promise<void> {
   // Retry DELIVERY, not the assertion. The condition below is the same one the
   // old code asserted once, so a hook that genuinely stopped releasing on scroll
   // still fails — it just no longer fails because a keypress went missing.
+  //
+  // Every press is allowed to come to REST before the next one is considered.
+  // Without that, a press issued while the previous scroll was still travelling
+  // stacked a second one that landed after the caller had already recorded where
+  // the user parked — the caller then measured a ~300px move nobody made. It
+  // failed every WebKit run and roughly one Chromium run in five, and both
+  // reported the same fingerprint: an expected position that varied per run
+  // against an actual position that never did.
   await expect
     .poll(async () => {
       if (distanceFromBottom(port) <= BOTTOM_THRESHOLD_PX) {
         await userEvent.keyboard("{PageUp}");
         await waitForScrollEnd(port);
+        await waitForScrollToRest(port);
       }
       return distanceFromBottom(port);
     }, POLL)
@@ -280,5 +374,66 @@ describe("chat transcript — real-browser scroll follow", () => {
     // Parked above the bottom by their own gesture: the pin releases and the
     // way back is offered rather than taken for them.
     await expect.poll(() => jumpControl().query(), POLL).not.toBeNull();
+  });
+});
+
+describe("chat transcript — the live process rail", () => {
+  it("keeps every dispatched tool node on the rail while the run is live", async () => {
+    // Five steps: more than the three the rail used to window down to, which is
+    // how a dispatched call went missing mid-turn in a real build. The rail is
+    // the complete, ordered account of what the agent did — a timeline that
+    // drops steps while they are happening destroys the audit at exactly the
+    // moment the user is watching it.
+    await mount(liveTranscript(5));
+
+    expect(liveRailNodes()).toHaveLength(5);
+    for (let n = 0; n < 5; n += 1) {
+      const present = liveRailNodes().some((node) =>
+        node.textContent?.includes(`marker-${n}`),
+      );
+      expect(present, `the node for call ${n} should still be on the rail`).toBe(true);
+    }
+  });
+
+  it("keeps following when the rail changes height above the viewport", async () => {
+    // No synthetic user scroll anywhere in this test. The only thing that moves
+    // is the run: steps land on the rail, then the answer starts, which folds
+    // the whole process away — several hundred pixels REMOVED above the
+    // viewport — and the answer keeps streaming underneath it.
+    const port = await mount(liveTranscript(2));
+    await expect
+      .poll(() => distanceFromBottom(port), POLL)
+      .toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+
+    for (const steps of [3, 4, 5, 6, 7]) {
+      await render(liveTranscript(steps));
+    }
+    await expect
+      .poll(() => distanceFromBottom(port), POLL)
+      .toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+
+    // The answer's first tokens and the ones after them, with no frame between
+    // and a layout read in the middle. That reproduces the frame the pin used to
+    // die in: the engine lays out the folded-away rail, clamps `scrollTop` down
+    // to the new maximum on its own, and queues the resulting `scroll` event —
+    // which is delivered only after the answer has grown the transcript back, by
+    // which point the position it reports is nowhere near the bottom and reads
+    // exactly like a user scrolling up (issue #109).
+    //
+    // Engine note: this goes red in WebKit, the family this app ships on, and
+    // NOT in Chromium, which dispatches the clamp's scroll event before the
+    // second commit lands. A green Chromium run is not evidence about this bug;
+    // `test:browser:webkit` is.
+    await act(async () => {
+      flushSync(() => root!.render(transcriptTree(liveTranscript(7, 1))));
+      void port.scrollHeight;
+      flushSync(() => root!.render(transcriptTree(liveTranscript(7, 24))));
+    });
+    await settle();
+
+    await expect
+      .poll(() => distanceFromBottom(port), POLL)
+      .toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+    expect(jumpControl().query()).toBeNull();
   });
 });

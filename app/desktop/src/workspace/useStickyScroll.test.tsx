@@ -144,6 +144,41 @@ describe("useStickyScroll", () => {
     expect(jumpControl()).not.toBeInTheDocument();
   });
 
+  it("re-pins inside the commit, without waiting for the observer", () => {
+    const { view, port, layout } = mountPinned();
+    expect(port.scrollTop).toBe(700);
+
+    // The transcript grows and re-renders; no resize is delivered. The observer
+    // is a frame behind by construction, and a pin that only exists inside it
+    // leaves a window the engine can move `scrollTop` in on its own.
+    layout.setScrollHeight(1600);
+    view.rerender(<Harness turnCount={1} />);
+
+    expect(port.scrollTop).toBe(1300);
+    expect(jumpControl()).not.toBeInTheDocument();
+  });
+
+  it("does not mistake the engine's own clamp for the user scrolling away", () => {
+    const { view, port, layout } = mountPinned();
+
+    // Content ABOVE the viewport is removed — the process rail folding itself
+    // away the moment the answer starts. The engine drags `scrollTop` down to
+    // the new maximum by itself and queues a scroll event for the next frame;
+    // by the time that event is delivered the answer has grown the transcript
+    // back, so the position it reports is nowhere near the bottom and has the
+    // exact fingerprint of a scroll up.
+    layout.setScrollHeight(600);
+    view.rerender(<Harness turnCount={1} />);
+    layout.setScrollHeight(1600);
+    view.rerender(<Harness turnCount={1} />);
+
+    fireEvent.scroll(port); // the deferred event, at last
+
+    // Nobody scrolled. The pane is still following, with nothing to jump to.
+    expect(jumpControl()).not.toBeInTheDocument();
+    expect(port.scrollTop).toBe(1300);
+  });
+
   it("releases the moment the user scrolls up, and offers the jump control", () => {
     const { port, layout } = mountPinned();
 

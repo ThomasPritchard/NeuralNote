@@ -11,6 +11,13 @@
 //     mistaken for user intent. Nothing here leans on CSS scroll anchoring
 //     (`overflow-anchor`), which reached WebKit only in Safari 27 — the shipped
 //     WKWebView cannot be assumed to have it.
+//   • Content REMOVED above the viewport — the process rail folding itself away
+//     the moment the answer starts, and (next) a note-edit card whose diff
+//     shrinks as it is rewritten. This one is not symmetrical with the case
+//     above: the engine lowers `scrollTop` by itself to the new maximum, so a
+//     scroll event DOES fire for a scroll nobody performed. The pin survives it
+//     because the position is re-asserted inside the commit that shrank the
+//     content; see `useLayoutEffect` below for why a frame later is too late.
 //   • A `<details>` the user expands. At the ResizeObserver that growth is
 //     indistinguishable from a streamed delta, so the ACTIVATING GESTURE is the
 //     signal — a capture-phase click on the `<summary>`, which is also what a
@@ -26,11 +33,20 @@
 //     `behavior: "auto"`), so the query is read here rather than left to the
 //     stylesheet.
 //
-// This only ever scrolls DOWNWARD, which is why there is no "was that scroll
-// mine?" flag: the release test is an upward move, and a programmatic scroll
-// can never produce one.
+// Nothing here ever scrolls UPWARD, which is why there is no "was that scroll
+// mine?" flag: the release test is an upward move and no scroll this hook
+// performs can produce one. The engine can, though — it drags `scrollTop` down
+// to a shrinking content's new maximum — and absorbing that is the whole job of
+// the commit-time pin.
 
-import { useCallback, useEffect, useRef, useState, type RefObject } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useState,
+  type RefObject,
+} from "react";
 
 /** Within this many pixels of the bottom counts as pinned. Wide enough to
  *  absorb the sub-pixel rounding a fractional device-pixel ratio introduces,
@@ -102,6 +118,29 @@ export function useStickyScroll({
     scrollToBottom(true);
     setShowJump(false);
   }, [scrollToBottom]);
+
+  // Re-assert the pin inside the commit that changed the content, rather than a
+  // frame later when the ResizeObserver reports it. The observer still covers
+  // growth React never sees (fonts, images, a markdown block that reflows), but
+  // it cannot be the only follower, for a reason that is a correctness bug and
+  // not a smoothness one:
+  //
+  // When content ABOVE the viewport shrinks, the engine clamps `scrollTop` down
+  // to the new maximum on its own and queues the resulting `scroll` event for
+  // the next rendering opportunity. By the time that event is delivered the
+  // streamed answer has already grown the transcript back, so `scrollTop` sits
+  // well above the bottom: the "am I still at the bottom?" test below can no
+  // longer absorb the move, and what is left looks exactly like a user scrolling
+  // up. Following was released mid-answer with nobody touching anything —
+  // reproduced in WebKit, which is the engine family this app ships on.
+  // Re-pinning here means the position that deferred event finally reports is
+  // the one already recorded, so there is no drop for it to misread.
+  //
+  // Rail-agnostic on purpose: any content above the viewport that shrinks gets
+  // this for free, which is what a live-updating diff card will need next.
+  useLayoutEffect(() => {
+    if (followingRef.current) scrollToBottom(false);
+  });
 
   useEffect(() => {
     const el = containerRef.current;

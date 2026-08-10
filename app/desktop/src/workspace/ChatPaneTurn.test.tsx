@@ -351,14 +351,14 @@ describe("ChatPane — chat view", () => {
     expect(within(rail).getByText("verifying citations")).toBeInTheDocument();
   });
 
-  it("bounds the live window to the freshest steps while streaming, with a running tally", async () => {
+  it("keeps every step of a long run on the rail while streaming, with a running tally", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive());
     const { user } = setup();
     await screen.findByLabelText("Ask across your vault");
 
     const gate = deferred<string>();
-    // Emit far more calls than the live cap, then stay in-flight (no `done`) so
-    // the turn keeps streaming — this is the thorough-run bloat case.
+    // A thorough run's worth of calls, then stay in-flight (no `done`) so the
+    // turn keeps streaming — the case the rail used to window down to three.
     mockChat.mockImplementation((_turnId, _p, _h, onEvent) => {
       onEvent({
         type: "toolCall",
@@ -394,14 +394,15 @@ describe("ChatPane — chat view", () => {
     await user.click(sendButton());
 
     // The header verb tracks the current phase (last step is a read), and the
-    // running tally counts every step (1 search + 10 reads) — hidden ones too.
+    // running tally counts every step (1 search + 10 reads).
     expect(screen.getByText(/Reading notes/)).toBeInTheDocument();
     expect(screen.getByText(/11 steps/)).toBeInTheDocument();
 
-    // Only the freshest few grouped steps are on screen: the newest is shown…
+    // The whole ordered account is on the rail, not just the freshest few: the
+    // earliest read is as present as the newest, mid-run. A step that vanishes
+    // while it is happening takes the audit with it.
     expect(screen.getByText(/Note-10\.md/)).toBeInTheDocument();
-    // …while an early one has rolled off the top (bounded, not a 20-row wall).
-    expect(screen.queryByText(/Note-01\.md/)).not.toBeInTheDocument();
+    expect(screen.getByText(/Note-01\.md/)).toBeInTheDocument();
     // No aggregate summary while streaming — the collapse only happens once
     // settled, so the "10 notes" summary count is nowhere on screen yet.
     expect(screen.queryByText(/10 notes/)).not.toBeInTheDocument();
