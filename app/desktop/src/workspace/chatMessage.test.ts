@@ -26,15 +26,12 @@ import {
 } from "./chatMessage";
 
 describe("skill report context", () => {
-  it("extracts distinct caption and Whisper provenance in first-seen order", () => {
-    const turn = {
-      ...emptyAssistant(),
-      skillSteps: [
-        "Video 1 of 3 landed with captions:en-auto.",
-        "Video 2 of 3 landed with whisper:small.en; captions:en-auto was already used.",
-      ],
-      answer: "Transcript provenance: whisper:small.en",
-    };
+  it("reports the transcript sources the backend named, in first-seen order", () => {
+    const turn = run([
+      { type: "transcriptSource", label: "captions:en-auto", relPath: null },
+      { type: "transcriptSource", label: "whisper:small.en", relPath: null },
+      { type: "transcriptSource", label: "captions:en-auto", relPath: null },
+    ]);
 
     expect(modelReportedProvenance(turn)).toEqual([
       "captions:en-auto",
@@ -42,25 +39,52 @@ describe("skill report context", () => {
     ]);
   });
 
-  it("marks a settled skill run partial only when output survived a stop", () => {
+  it("never mistakes a transcript label mentioned in prose for a real source", () => {
+    // The old regex scraped `captions:`/`whisper:` out of concatenated model
+    // prose, so any answer that merely QUOTED a label claimed it as provenance.
+    const turn = {
+      ...emptyAssistant(),
+      skillSteps: ["Video 1 of 3 landed with captions:en-auto."],
+      answer: "Transcript provenance: whisper:small.en",
+    };
+
+    expect(modelReportedProvenance(turn)).toEqual([]);
+  });
+
+  it("marks a settled skill run partial only when the backend said it was", () => {
     const partial = {
       ...emptyAssistant(),
       done: true,
       skillActivations: [{ id: "youtube-distil", name: "YouTube distil" }],
       writtenNotes: [{ relPath: "Literature/One.md", kind: "literature" as const }],
-      skillSteps: ["Cancelled after video 1 of 4."],
+      partialRun: "the run was stopped before it finished every item",
     };
     expect(isPartialSkillRun(partial)).toBe(true);
     expect(isPartialSkillRun({ ...partial, writtenNotes: [] })).toBe(false);
     expect(isPartialSkillRun({ ...partial, done: false })).toBe(false);
+    expect(isPartialSkillRun({ ...partial, skillActivations: [] })).toBe(false);
     expect(
       isPartialSkillRun({
         ...partial,
+        partialRun: null,
         stopped: true,
-        skillSteps: [],
-        answer: "",
       }),
     ).toBe(true);
+  });
+
+  it("never calls a whole run partial just because the answer says 'cancelled'", () => {
+    // The old regex matched any answer that MENTIONED the word, so asking
+    // "why was my flight cancelled?" reported the run as incomplete.
+    const complete = {
+      ...emptyAssistant(),
+      done: true,
+      skillActivations: [{ id: "youtube-distil", name: "YouTube distil" }],
+      writtenNotes: [{ relPath: "Literature/One.md", kind: "literature" as const }],
+      skillSteps: ["Cancelled after video 1 of 4."],
+      answer: "The talk explains why the launch was cancelled.",
+    };
+
+    expect(isPartialSkillRun(complete)).toBe(false);
   });
 });
 
@@ -256,6 +280,167 @@ describe("reduceAssistant — skills bank", () => {
       { relPath: "Literature/Name.md", kind: "literature" },
       { relPath: "Atomic/Idea.md", kind: "atomic" },
     ]);
+  });
+
+  it("keeps a collided note out of the written ledger but never loses it", () => {
+    // #108: a create-only write that hit an existing note wrote nothing, so it
+    // must not be reported as written — and must not vanish either.
+    const turn = run([
+      { type: "noteWritten", relPath: "Atomic/Idea.md", kind: "atomic" },
+      { type: "noteExists", relPath: "Atomic/Idea.md", kind: "atomic" },
+    ]);
+
+    expect(turn.writtenNotes).toEqual([
+      { relPath: "Atomic/Idea.md", kind: "atomic" },
+    ]);
+    expect(turn.existingNotes).toEqual([
+      { relPath: "Atomic/Idea.md", kind: "atomic" },
+    ]);
+  });
+
+  it("records an activation failure with its structured install remedy", () => {
+    const turn = run([
+      {
+        type: "skillActivationFailed",
+        id: "youtube-distil",
+        name: "YouTube distil",
+        message: "Skill 'youtube-distil' could not be activated: …",
+        missingBinary: "yt-dlp",
+      },
+    ]);
+
+    expect(turn.skillActivationFailures).toEqual([
+      {
+        id: "youtube-distil",
+        name: "YouTube distil",
+        message: "Skill 'youtube-distil' could not be activated: …",
+        missingBinary: "yt-dlp",
+      },
+    ]);
+  });
+
+  it("keeps an absent install remedy absent rather than inventing one", () => {
+    const turn = run([
+      {
+        type: "skillActivationFailed",
+        id: "no-such-skill",
+        name: "no-such-skill",
+        message: "unknown skill",
+        missingBinary: null,
+      },
+    ]);
+
+    expect(turn.skillActivationFailures[0].missingBinary).toBeNull();
+  });
+
+  it("keeps the first partial-run reason rather than overwriting it", () => {
+    const turn = run([
+      { type: "partialRun", reason: "the run was stopped" },
+      { type: "partialRun", reason: "and also hit a limit" },
+    ]);
+
+    expect(turn.partialRun).toBe("the run was stopped");
+  });
+});
+
+describe("reduceAssistant — the tool timeline", () => {
+  it("opens a node when a call is announced and settles it in place", () => {
+    const turn = run([
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: '{"query":"spaced repetition"}',
+      },
+      {
+        type: "toolResult",
+        id: "c1",
+        status: "ok",
+        summary: "12 spans",
+        detail: null,
+      },
+    ]);
+
+    expect(turn.toolCalls).toEqual([
+      {
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: '{"query":"spaced repetition"}',
+        status: "ok",
+        summary: "12 spans",
+        detail: null,
+      },
+    ]);
+  });
+
+  it("leaves an unsettled call visibly in flight rather than guessing at it", () => {
+    const turn = run([
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "list_notes",
+        title: "List notes",
+        arguments: "{}",
+      },
+    ]);
+
+    expect(turn.toolCalls[0].status).toBeNull();
+    expect(turn.toolCalls[0].summary).toBeNull();
+  });
+
+  it("settles each call against its own id, not the most recent one", () => {
+    const turn = run([
+      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}" },
+      { type: "toolCall", id: "c2", name: "list_folders", title: "List folders", arguments: "{}" },
+      { type: "toolResult", id: "c2", status: "rejected", summary: null, detail: "nope" },
+    ]);
+
+    expect(turn.toolCalls.map((call) => call.status)).toEqual([null, "rejected"]);
+    expect(turn.toolCalls[1].detail).toBe("nope");
+  });
+
+  it("keeps a settlement whose call never arrived rather than dropping it", () => {
+    // Mirrors `withHitCount`: a backend that breaks its own pairing contract
+    // must produce a visible anomaly, never a silently discarded event.
+    const turn = run([
+      { type: "toolResult", id: "ghost", status: "error", summary: null, detail: "boom" },
+    ]);
+
+    expect(turn.toolCalls).toEqual([
+      {
+        id: "ghost",
+        name: "",
+        title: "",
+        arguments: "",
+        status: "error",
+        summary: null,
+        detail: "boom",
+      },
+    ]);
+  });
+
+  it("never re-settles a call that already settled", () => {
+    const turn = run([
+      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}" },
+      { type: "toolResult", id: "c1", status: "ok", summary: null, detail: null },
+      { type: "toolResult", id: "c1", status: "rejected", summary: null, detail: "late" },
+    ]);
+
+    expect(turn.toolCalls).toHaveLength(2);
+    expect(turn.toolCalls[0].status).toBe("ok");
+  });
+
+  it("leaves the progress phase to the events that actually name one", () => {
+    // A tool node is not a phase. Announcing a call must not overwrite the
+    // phase a `searching`/`reading` event established.
+    const turn = run([
+      { type: "reading", relPath: "n.md", startLine: 1, endLine: 2 },
+      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}" },
+    ]);
+
+    expect(turn.phase).toBe("reading");
   });
 });
 

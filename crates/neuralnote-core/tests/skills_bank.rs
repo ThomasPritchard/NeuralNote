@@ -1,4 +1,4 @@
-use neuralnote_core::ai::skills::YOUTUBE_DISTIL_SKILL_ID;
+use neuralnote_core::ai::skills::{missing_required_binary, YOUTUBE_DISTIL_SKILL_ID};
 use neuralnote_core::ai::{
     ActiveSkills, Eligibility, HardwareSpec, Requirement, RequirementStatus, SkillEnvironment,
     SkillLookupError, SkillManifest, SkillRegistry, FIXTURE_SKILL_ID,
@@ -736,4 +736,72 @@ fn platform_mismatch_names_both_axes() {
     };
     assert_eq!(reasons.len(), 1);
     assert!(reasons[0].contains("platform OS/architecture"));
+}
+
+#[test]
+fn missing_required_binary_names_the_binary_a_failed_activation_needs() {
+    // The install remedy the UI offers must come from the requirement SET, not
+    // from parsing the failure sentence — a wording change must not silently
+    // disable the remedy.
+    let requirements = vec![
+        Requirement::FreeDiskSpace { min_bytes: 1 },
+        Requirement::Binary {
+            name: "yt-dlp".into(),
+        },
+    ];
+
+    assert_eq!(
+        missing_required_binary(&requirements, &environment("macos", "aarch64", 99, &[])),
+        Some("yt-dlp".to_string())
+    );
+}
+
+#[test]
+fn missing_required_binary_is_absent_when_every_binary_is_installed() {
+    let requirements = vec![Requirement::Binary {
+        name: "yt-dlp".into(),
+    }];
+
+    assert_eq!(
+        missing_required_binary(
+            &requirements,
+            &environment("macos", "aarch64", 99, &["yt-dlp"])
+        ),
+        None
+    );
+}
+
+#[test]
+fn a_non_binary_blocker_offers_no_install_remedy() {
+    // Free disk space is not something an install button can fix. Offering one
+    // would be a lie about what the remedy does.
+    let requirements = vec![Requirement::FreeDiskSpace {
+        min_bytes: 1_000_000_000,
+    }];
+
+    assert_eq!(
+        missing_required_binary(&requirements, &environment("macos", "aarch64", 1, &[])),
+        None
+    );
+}
+
+#[test]
+fn an_undetectable_binary_offers_no_install_remedy() {
+    // Undetected is not the same as missing: with no app-data bin directory the
+    // probe never ran, so we do not know an install would help. Claiming one
+    // would be a guess dressed as a remedy.
+    let requirements = vec![Requirement::Binary {
+        name: "yt-dlp".into(),
+    }];
+    let unprobed = SkillEnvironment {
+        hardware: hardware("macos", "aarch64", 99),
+        available_binaries: BTreeSet::new(),
+        app_data_bin_dir: PathBuf::new(),
+    };
+    assert!(matches!(
+        Eligibility::evaluate(&requirements, &unprobed),
+        Eligibility::Undetected { .. }
+    ));
+
+    assert_eq!(missing_required_binary(&requirements, &unprobed), None);
 }

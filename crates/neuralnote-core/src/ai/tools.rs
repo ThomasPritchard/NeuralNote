@@ -24,19 +24,15 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-pub const TOOL_LIST_NOTES: &str = "list_notes";
-pub const TOOL_LIST_FOLDERS: &str = "list_folders";
-pub const TOOL_SEARCH_NOTES: &str = "search_notes";
-pub const TOOL_READ_NOTE_SPAN: &str = "read_note_span";
-pub const TOOL_USE_SKILL: &str = "use_skill";
-pub const TOOL_SKILL_STEP: &str = "skill_step";
-pub const TOOL_ASK_USER: &str = "ask_user";
-pub const TOOL_WRITE_NOTE: &str = "write_note";
-pub const TOOL_FETCH_VIDEO_INFO: &str = "fetch_video_info";
-pub const TOOL_FETCH_CAPTIONS: &str = "fetch_captions";
-pub const TOOL_TRANSCRIBE_AUDIO: &str = "transcribe_audio";
-pub const TOOL_SELECT_PLAYLIST_VIDEOS: &str = "select_playlist_videos";
-pub const TOOL_RESOLVE_DISTIL_ROUTE: &str = "resolve_distil_route";
+// The tool names live with the title table in `tool_registry`, so a name and its
+// human label can never drift apart. Re-exported here because this is the module
+// every caller already reaches for.
+pub use crate::ai::tool_registry::{
+    RegisteredTool, TOOL_ASK_USER, TOOL_FETCH_CAPTIONS, TOOL_FETCH_VIDEO_INFO, TOOL_LIST_FOLDERS,
+    TOOL_LIST_NOTES, TOOL_READ_NOTE_SPAN, TOOL_RESOLVE_DISTIL_ROUTE, TOOL_SEARCH_NOTES,
+    TOOL_SELECT_PLAYLIST_VIDEOS, TOOL_SKILL_STEP, TOOL_TRANSCRIBE_AUDIO, TOOL_USE_SKILL,
+    TOOL_WRITE_NOTE,
+};
 
 static UNAVAILABLE_VAULT_PROFILE_IO: UnavailableVaultProfileIo = UnavailableVaultProfileIo;
 
@@ -301,31 +297,38 @@ pub async fn dispatch(
     user_prompt: &dyn UserPrompt,
     context: &mut ToolContext<'_>,
 ) -> ToolResult {
-    if !known_tool(name) {
+    // Routing on the registry enum, not on the raw string, is what makes the title
+    // table exhaustive: a new tool cannot be dispatched until it is a variant, and
+    // a new variant does not compile until it has a title.
+    let Some(tool) = RegisteredTool::from_name(name) else {
         return reject(format!("unknown tool '{name}'"));
-    }
+    };
     if !context.authorized_tools.contains(name) {
         return reject(format!(
             "tool '{name}' is not active; activate a skill that grants it first"
         ));
     }
-    match name {
-        TOOL_LIST_NOTES => dispatch_list(args_json, provider),
-        TOOL_LIST_FOLDERS => dispatch_folders(provider),
-        TOOL_SEARCH_NOTES => dispatch_search(args_json, provider, registry),
-        TOOL_READ_NOTE_SPAN => dispatch_read(args_json, provider, registry),
-        TOOL_USE_SKILL => skill_tools::dispatch_use_skill(args_json, context),
-        TOOL_SKILL_STEP => skill_tools::dispatch_skill_step(args_json, context),
-        TOOL_ASK_USER => {
+    match tool {
+        RegisteredTool::ListNotes => dispatch_list(args_json, provider),
+        RegisteredTool::ListFolders => dispatch_folders(provider),
+        RegisteredTool::SearchNotes => dispatch_search(args_json, provider, registry),
+        RegisteredTool::ReadNoteSpan => dispatch_read(args_json, provider, registry),
+        RegisteredTool::UseSkill => skill_tools::dispatch_use_skill(args_json, context),
+        RegisteredTool::SkillStep => skill_tools::dispatch_skill_step(args_json, context),
+        RegisteredTool::AskUser => {
             skill_tools::dispatch_ask_user(call_id, args_json, user_prompt, context).await
         }
-        TOOL_WRITE_NOTE => skill_tools::dispatch_write_note(args_json, context),
-        TOOL_FETCH_VIDEO_INFO => youtube_tools::dispatch_fetch_video_info(args_json, context).await,
-        TOOL_FETCH_CAPTIONS => youtube_tools::dispatch_fetch_captions(args_json, context).await,
-        TOOL_TRANSCRIBE_AUDIO => {
+        RegisteredTool::WriteNote => skill_tools::dispatch_write_note(args_json, context),
+        RegisteredTool::FetchVideoInfo => {
+            youtube_tools::dispatch_fetch_video_info(args_json, context).await
+        }
+        RegisteredTool::FetchCaptions => {
+            youtube_tools::dispatch_fetch_captions(args_json, context).await
+        }
+        RegisteredTool::TranscribeAudio => {
             youtube_tools::dispatch_transcribe_audio(call_id, args_json, user_prompt, context).await
         }
-        TOOL_SELECT_PLAYLIST_VIDEOS => {
+        RegisteredTool::SelectPlaylistVideos => {
             crate::ai::youtube_selection::dispatch_select_playlist_videos(
                 call_id,
                 args_json,
@@ -334,7 +337,7 @@ pub async fn dispatch(
             )
             .await
         }
-        TOOL_RESOLVE_DISTIL_ROUTE => {
+        RegisteredTool::ResolveDistilRoute => {
             crate::ai::youtube_route::dispatch_resolve_distil_route(
                 call_id,
                 args_json,
@@ -344,27 +347,7 @@ pub async fn dispatch(
             )
             .await
         }
-        other => reject(format!("unknown tool '{other}'")),
     }
-}
-
-fn known_tool(name: &str) -> bool {
-    matches!(
-        name,
-        TOOL_LIST_NOTES
-            | TOOL_LIST_FOLDERS
-            | TOOL_SEARCH_NOTES
-            | TOOL_READ_NOTE_SPAN
-            | TOOL_USE_SKILL
-            | TOOL_SKILL_STEP
-            | TOOL_ASK_USER
-            | TOOL_WRITE_NOTE
-            | TOOL_FETCH_VIDEO_INFO
-            | TOOL_FETCH_CAPTIONS
-            | TOOL_TRANSCRIBE_AUDIO
-            | TOOL_SELECT_PLAYLIST_VIDEOS
-            | TOOL_RESOLVE_DISTIL_ROUTE
-    )
 }
 
 pub(super) fn reject(message: String) -> ToolResult {
@@ -737,6 +720,19 @@ mod tests {
             &NoUserPrompt,
             &mut context,
         ))
+    }
+
+    #[test]
+    fn the_advertised_schemas_and_the_tool_registry_agree_exactly() {
+        // Two independent sources: schemas are assembled from three modules, the
+        // registry is one table. A tool that gains a schema but no registry entry
+        // would render with no title; one registered but never advertised is dead.
+        let registered: BTreeSet<String> = RegisteredTool::ALL
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let advertised = advertised_tool_names(&tool_schemas(&registered));
+        assert_eq!(advertised, registered);
     }
 
     #[test]

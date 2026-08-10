@@ -38,6 +38,28 @@ pub struct Elicitation {
     pub multi_select: bool,
 }
 
+/// How a dispatched tool call settled. Mirrors [`crate::ai::tools::ToolOutcome`]'s
+/// discriminant but is the UI-facing vocabulary: `Rejected` (bad args/path — the
+/// orchestrator refused) and `Denied` (the user refused) are different stories and
+/// must render differently.
+///
+/// Two of the four have no producer yet, on purpose — this is the frozen wire
+/// contract the UI renders against, and both have a named owner:
+/// - `Denied` arrives with the tool-approval gate, which is what makes a user
+///   refusal distinguishable from an orchestrator rejection.
+/// - `Error` arrives when `ToolOutcome` gains a discriminant for "the tool ran and
+///   failed"; today every failure — malformed arguments and runtime failure alike —
+///   is one `ToolOutcome::Rejected`, so reporting `Error` would be a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub enum ToolStatus {
+    Ok,
+    Error,
+    Denied,
+    Rejected,
+}
+
 /// One event in a chat run's stream. Emitted in causal order; a run ends with
 /// either [`ChatEvent::Done`] (success) or [`ChatEvent::Error`] (surfaced failure)
 /// — never silently.
@@ -63,8 +85,57 @@ pub enum ChatEvent {
         options: Vec<ElicitOption>,
         multi_select: bool,
     },
+    /// A skill the user asked for could not be activated. `missing_binary` is the
+    /// only structured remedy the UI offers, so it is the only structured field;
+    /// it is derived from the skill's requirement set, never parsed back out of
+    /// `message` (a wording change must not silently disable the remedy).
+    SkillActivationFailed {
+        id: String,
+        name: String,
+        /// The human sentence, for display only — no longer load-bearing.
+        message: String,
+        missing_binary: Option<String>,
+    },
+    /// The model requested a tool call. Emitted BEFORE dispatch, so a call that is
+    /// rejected, denied, fails, or is cancelled still appears on the timeline
+    /// rather than vanishing. Exactly one [`ChatEvent::ToolResult`] follows it.
+    ToolCall {
+        /// The provider's call id — the correlation key for every later event.
+        id: String,
+        /// The registered tool name (one of the `TOOL_*` constants in `ai/tools.rs`).
+        name: String,
+        /// A human label from the Rust-side table in [`crate::ai::tool_registry`].
+        /// NEVER model prose — that is the coupling this event exists to kill.
+        title: String,
+        /// The raw arguments JSON exactly as the model emitted it. The UI parses it
+        /// defensively for the detail line; it is never trusted to be valid JSON.
+        arguments: String,
+    },
+    /// The call settled. Exactly one per [`ChatEvent::ToolCall`], always emitted —
+    /// including on rejection and cancellation, so no node is left spinning forever.
+    ToolResult {
+        id: String,
+        status: ToolStatus,
+        /// A Rust-composed one-liner ("12 spans"), never model prose.
+        summary: Option<String>,
+        /// Bounded result or error text for the disclosure. Truncated Rust-side.
+        detail: Option<String>,
+    },
+    /// How a transcript was actually obtained, reported by the tool that obtained
+    /// it — so provenance is read off the wire, never scraped out of model prose.
+    TranscriptSource {
+        label: String,
+        rel_path: Option<String>,
+    },
+    /// The run ended having completed only part of its work. The orchestrator knows
+    /// this authoritatively (cancellation, evidence/iteration guards), so the UI
+    /// never has to infer it from an answer that merely mentions "cancelled".
+    PartialRun { reason: String },
     /// A create-only skill write succeeded at the actual collision-safe path.
     NoteWritten { rel_path: String, kind: NoteKind },
+    /// A create-only write hit an existing note and wrote nothing (#108). Without
+    /// it the no-op is invisible, which the "failures are never silent" rule forbids.
+    NoteExists { rel_path: String, kind: NoteKind },
     /// A search is about to run for `query` (the live "searching…" cue).
     Searching { query: String },
     /// `query` finished, yielding `hit_count` evidence spans.
@@ -277,6 +348,126 @@ mod tests {
                 }],
                 "multiSelect": false,
             })
+        );
+    }
+
+    #[test]
+    fn tool_status_serialises_as_camel_case_over_all_four_states() {
+        for (status, expected) in [
+            (ToolStatus::Ok, "ok"),
+            (ToolStatus::Error, "error"),
+            (ToolStatus::Denied, "denied"),
+            (ToolStatus::Rejected, "rejected"),
+        ] {
+            assert_eq!(serde_json::to_value(status).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn tool_call_carries_the_correlation_key_title_and_raw_arguments() {
+        assert_eq!(
+            json(&ChatEvent::ToolCall {
+                id: "call-1".into(),
+                name: "search_notes".into(),
+                title: "Search notes".into(),
+                arguments: r#"{"query":"x"}"#.into(),
+            }),
+            serde_json::json!({
+                "type": "toolCall",
+                "id": "call-1",
+                "name": "search_notes",
+                "title": "Search notes",
+                "arguments": r#"{"query":"x"}"#,
+            })
+        );
+    }
+
+    #[test]
+    fn tool_result_keeps_absent_summary_and_detail_null_rather_than_empty() {
+        // An absent summary must render as absent, never as an empty string that
+        // reads like a real (blank) one-liner.
+        assert_eq!(
+            json(&ChatEvent::ToolResult {
+                id: "call-1".into(),
+                status: ToolStatus::Rejected,
+                summary: None,
+                detail: Some("unknown tool 'nope'".into()),
+            }),
+            serde_json::json!({
+                "type": "toolResult",
+                "id": "call-1",
+                "status": "rejected",
+                "summary": null,
+                "detail": "unknown tool 'nope'",
+            })
+        );
+    }
+
+    #[test]
+    fn skill_activation_failed_renames_the_missing_binary_field() {
+        let value = json(&ChatEvent::SkillActivationFailed {
+            id: "youtube-distil".into(),
+            name: "YouTube distil".into(),
+            message: "Skill could not be activated".into(),
+            missing_binary: Some("yt-dlp".into()),
+        });
+        assert_eq!(value["type"], "skillActivationFailed");
+        assert_eq!(value["missingBinary"], "yt-dlp");
+        assert_eq!(
+            json(&ChatEvent::SkillActivationFailed {
+                id: "x".into(),
+                name: "X".into(),
+                message: "no".into(),
+                missing_binary: None,
+            })["missingBinary"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn transcript_source_carries_the_label_and_an_optional_note_path() {
+        assert_eq!(
+            json(&ChatEvent::TranscriptSource {
+                label: "captions:en".into(),
+                rel_path: None,
+            }),
+            serde_json::json!({
+                "type": "transcriptSource",
+                "label": "captions:en",
+                "relPath": null,
+            })
+        );
+    }
+
+    #[test]
+    fn partial_run_carries_its_reason() {
+        assert_eq!(
+            json(&ChatEvent::PartialRun {
+                reason: "the run was stopped".into(),
+            }),
+            serde_json::json!({ "type": "partialRun", "reason": "the run was stopped" })
+        );
+    }
+
+    #[test]
+    fn note_exists_mirrors_note_written_and_round_trips() {
+        // #108: a create-only write that hits an existing note used to emit nothing.
+        // Its wire shape mirrors `noteWritten` so the UI can pair them.
+        let event = ChatEvent::NoteExists {
+            rel_path: "Notes/Name.md".into(),
+            kind: NoteKind::Atomic,
+        };
+        assert_eq!(
+            json(&event),
+            serde_json::json!({
+                "type": "noteExists",
+                "relPath": "Notes/Name.md",
+                "kind": "atomic",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
         );
     }
 

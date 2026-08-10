@@ -196,6 +196,33 @@ impl std::fmt::Display for Eligibility {
     }
 }
 
+/// The required binary that is genuinely missing, if a missing binary is what
+/// blocks this requirement set. This is the only remedy the UI can offer for a
+/// failed activation (an install action), and it is derived from the requirements
+/// themselves — never parsed back out of the failure sentence, so re-wording the
+/// message can never silently disable the remedy.
+///
+/// `Undetected` deliberately does not count: the probe failed, so we do not know
+/// that an install would help, and offering one would be a guess.
+pub fn missing_required_binary(
+    requirements: &[Requirement],
+    environment: &SkillEnvironment,
+) -> Option<String> {
+    requirements
+        .iter()
+        .find_map(|requirement| match requirement {
+            Requirement::Binary { name }
+                if matches!(
+                    Eligibility::evaluate(std::slice::from_ref(requirement), environment),
+                    Eligibility::Unmet { .. }
+                ) =>
+            {
+                Some(name.clone())
+            }
+            _ => None,
+        })
+}
+
 fn evaluate_free_disk_space(
     min_bytes: &u64,
     env: &SkillEnvironment,

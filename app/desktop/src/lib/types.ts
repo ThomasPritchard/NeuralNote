@@ -51,6 +51,7 @@ export type { CancelChatRunStatus } from "./bindings/CancelChatRunStatus";
 export type { Elicitation } from "./bindings/Elicitation";
 export type { ElicitOption } from "./bindings/ElicitOption";
 export type { NoteKind } from "./bindings/NoteKind";
+export type { ToolStatus } from "./bindings/ToolStatus";
 export type { UndoReport } from "./bindings/UndoReport";
 export type { UndoFileResult } from "./bindings/UndoFileResult";
 export type { UndoFileStatus } from "./bindings/UndoFileStatus";

@@ -28,6 +28,7 @@ pub mod requirement_binaries;
 pub mod retrieval;
 mod skill_tools;
 pub mod skills;
+pub mod tool_registry;
 pub mod tools;
 pub mod verify;
 pub mod write_policy;
@@ -45,7 +46,7 @@ pub use capabilities::{
     ReasoningSupport,
 };
 pub use elicitation::{elicit_user, ElicitationOutcome};
-pub use events::{ChatEvent, ElicitOption, Elicitation, EventSink};
+pub use events::{ChatEvent, ElicitOption, Elicitation, EventSink, ToolStatus};
 pub use evidence::{EvidenceRegistry, EvidenceSpan};
 pub use llm::{
     Completion, LlmClient, LlmMessage, LlmRequest, NoUserPrompt, Role, ToolCall, UserPrompt,

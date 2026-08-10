@@ -5,7 +5,7 @@ use futures::executor::block_on;
 use neuralnote_core::ai::{
     run_chat, ChatEvent, Completion, Elicitation, EventSink, Guards, HardwareSpec,
     KeywordRetriever, LlmClient, LlmRequest, SkillEnvironment, SkillRegistry, SkillServices,
-    ToolCall, UndoLedger, UserPrompt, FIXTURE_SKILL_ID, YOUTUBE_DISTIL_SKILL_ID,
+    ToolCall, ToolStatus, UndoLedger, UserPrompt, FIXTURE_SKILL_ID, YOUTUBE_DISTIL_SKILL_ID,
 };
 use neuralnote_core::CoreResult;
 use std::collections::{BTreeSet, VecDeque};
@@ -151,6 +151,321 @@ fn run(
     ))
     .unwrap();
     (sink.0, ledger)
+}
+
+/// Every call the model declared, in order: `(id, name, title)`.
+fn announced_calls(events: &[ChatEvent]) -> Vec<(String, String, String)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolCall {
+                id, name, title, ..
+            } => Some((id.clone(), name.clone(), title.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn settlements(events: &[ChatEvent]) -> Vec<(String, ToolStatus)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolResult { id, status, .. } => Some((id.clone(), *status)),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The invariant the timeline depends on: every declared call is announced once
+/// and settles exactly once, and the settlement never precedes the announcement.
+/// A node left unsettled spins forever, which is a silent failure.
+fn assert_one_settlement_per_call(events: &[ChatEvent]) {
+    let calls = announced_calls(events);
+    let settled = settlements(events);
+    assert_eq!(
+        calls.len(),
+        settled.len(),
+        "announced {} calls but settled {}",
+        calls.len(),
+        settled.len()
+    );
+    for (id, _, _) in &calls {
+        assert_eq!(
+            settled
+                .iter()
+                .filter(|(settled_id, _)| settled_id == id)
+                .count(),
+            1,
+            "call '{id}' did not settle exactly once"
+        );
+    }
+    for (id, _) in &settled {
+        assert!(
+            calls.iter().any(|(call_id, _, _)| call_id == id),
+            "settlement for '{id}' has no announced call"
+        );
+        let announced_at = events.iter().position(
+            |event| matches!(event, ChatEvent::ToolCall { id: call_id, .. } if call_id == id),
+        );
+        let settled_at = events.iter().position(
+            |event| matches!(event, ChatEvent::ToolResult { id: result_id, .. } if result_id == id),
+        );
+        assert!(
+            announced_at < settled_at,
+            "'{id}' settled before it was announced"
+        );
+    }
+}
+
+#[test]
+fn list_notes_is_announced_and_settled_instead_of_vanishing() {
+    // `list_notes` produced no user-facing event at all before Phase 2 — it hit a
+    // no-op arm and died there, so the model could work invisibly.
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![tool_call("l1", "list_notes", "{}"), final_turn()]);
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &Guards::default());
+
+    assert_eq!(
+        announced_calls(&events),
+        [(
+            "l1".to_string(),
+            "list_notes".to_string(),
+            "List notes".to_string()
+        )]
+    );
+    assert_eq!(settlements(&events), [("l1".to_string(), ToolStatus::Ok)]);
+    assert_one_settlement_per_call(&events);
+}
+
+#[test]
+fn list_folders_is_announced_and_settled_instead_of_vanishing() {
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![tool_call("f1", "list_folders", "{}"), final_turn()]);
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &Guards::default());
+
+    assert_eq!(
+        announced_calls(&events),
+        [(
+            "f1".to_string(),
+            "list_folders".to_string(),
+            "List folders".to_string()
+        )]
+    );
+    assert_eq!(settlements(&events), [("f1".to_string(), ToolStatus::Ok)]);
+}
+
+#[test]
+fn a_tool_name_the_model_invented_still_settles_under_a_rust_authored_title() {
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![
+        tool_call("x1", "delete_everything", "{}"),
+        final_turn(),
+    ]);
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &Guards::default());
+
+    assert_eq!(
+        announced_calls(&events),
+        [(
+            "x1".to_string(),
+            "delete_everything".to_string(),
+            "Unrecognised tool".to_string()
+        )],
+        "the label must come from our table, never from the name the model made up"
+    );
+    assert_eq!(
+        settlements(&events),
+        [("x1".to_string(), ToolStatus::Rejected)]
+    );
+    assert_one_settlement_per_call(&events);
+}
+
+#[test]
+fn a_tool_that_runs_and_fails_still_settles_with_its_reason() {
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![
+        tool_call(
+            "r1",
+            "read_note_span",
+            r#"{"rel_path":"absent.md","start_line":1,"end_line":2}"#,
+        ),
+        final_turn(),
+    ]);
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &Guards::default());
+
+    assert_one_settlement_per_call(&events);
+    let detail = events
+        .iter()
+        .find_map(|event| match event {
+            ChatEvent::ToolResult { id, detail, .. } if id == "r1" => detail.clone(),
+            _ => None,
+        })
+        .expect("a failed read must carry its reason into the disclosure");
+    assert!(
+        detail.contains("could not read note span"),
+        "unexpected detail: {detail}"
+    );
+}
+
+#[test]
+fn a_call_skipped_by_the_evidence_budget_still_settles() {
+    // The second call in the batch never reaches the dispatcher. It must still
+    // settle — otherwise its node spins forever with nothing coming.
+    let vault = tempfile::tempdir().unwrap();
+    std::fs::write(vault.path().join("n.md"), "# N\n\nalpha beta\n").unwrap();
+    let llm = RecordingLlm::new(vec![
+        parallel(vec![
+            ToolCall {
+                id: "s1".into(),
+                name: "search_notes".into(),
+                arguments: r#"{"query":"alpha"}"#.into(),
+            },
+            ToolCall {
+                id: "s2".into(),
+                name: "search_notes".into(),
+                arguments: r#"{"query":"beta"}"#.into(),
+            },
+        ]),
+        final_turn(),
+    ]);
+    let guards = Guards {
+        max_spans: 1,
+        ..Guards::default()
+    };
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &guards);
+
+    assert_eq!(
+        announced_calls(&events)
+            .iter()
+            .map(|(id, _, _)| id.clone())
+            .collect::<Vec<_>>(),
+        ["s1", "s2"]
+    );
+    assert_eq!(
+        settlements(&events),
+        [
+            ("s1".to_string(), ToolStatus::Ok),
+            ("s2".to_string(), ToolStatus::Rejected),
+        ]
+    );
+    assert_one_settlement_per_call(&events);
+}
+
+#[test]
+fn a_guard_tripped_run_reports_itself_partial_rather_than_leaving_it_to_be_inferred() {
+    let vault = tempfile::tempdir().unwrap();
+    std::fs::write(vault.path().join("n.md"), "# N\n\nalpha beta\n").unwrap();
+    let llm = RecordingLlm::new(vec![
+        tool_call("s1", "search_notes", r#"{"query":"alpha"}"#),
+        tool_call("s2", "search_notes", r#"{"query":"beta"}"#),
+        final_turn(),
+    ]);
+    let guards = Guards {
+        max_iterations: 2,
+        ..Guards::default()
+    };
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &guards);
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::PartialRun { .. }))
+            .count(),
+        1,
+        "a partial run is announced exactly once"
+    );
+}
+
+#[test]
+fn a_completed_run_never_claims_to_be_partial() {
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![tool_call("l1", "list_notes", "{}"), final_turn()]);
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &Guards::default());
+
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, ChatEvent::PartialRun { .. })));
+}
+
+#[test]
+fn a_failed_preload_reports_the_activation_structurally_not_only_as_prose() {
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![final_turn()]);
+
+    let (events, _) = run(
+        vault.path(),
+        &llm,
+        vec![YOUTUBE_DISTIL_SKILL_ID.into()],
+        &[],
+        &Guards::default(),
+    );
+
+    let failure = events
+        .iter()
+        .find_map(|event| match event {
+            ChatEvent::SkillActivationFailed {
+                id,
+                name,
+                missing_binary,
+                ..
+            } => Some((id.clone(), name.clone(), missing_binary.clone())),
+            _ => None,
+        })
+        .expect("a preload that could not activate must say so structurally");
+    assert_eq!(failure.0, YOUTUBE_DISTIL_SKILL_ID);
+    assert!(!failure.1.is_empty(), "the skill's own name, not its id");
+    assert_eq!(
+        failure.2,
+        Some("yt-dlp".to_string()),
+        "the install remedy comes from the requirement set, not from the sentence"
+    );
+}
+
+#[test]
+fn a_failed_use_skill_call_reports_the_activation_structurally() {
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![
+        tool_call(
+            "activate",
+            "use_skill",
+            &format!(r#"{{"id":"{YOUTUBE_DISTIL_SKILL_ID}"}}"#),
+        ),
+        final_turn(),
+    ]);
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &Guards::default());
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ChatEvent::SkillActivationFailed { id, missing_binary: Some(binary), .. }
+            if id == YOUTUBE_DISTIL_SKILL_ID && binary == "yt-dlp"
+    )));
+    assert_one_settlement_per_call(&events);
+}
+
+#[test]
+fn an_unknown_skill_id_reports_no_install_remedy() {
+    // Only a genuinely missing binary earns the install action. An unknown skill
+    // must not inherit one just because some other skill needs a binary.
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![
+        tool_call("activate", "use_skill", r#"{"id":"no-such-skill"}"#),
+        final_turn(),
+    ]);
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &Guards::default());
+
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ChatEvent::SkillActivationFailed { id, name, missing_binary: None, .. }
+            if id == "no-such-skill" && name == "no-such-skill"
+    )));
 }
 
 #[test]

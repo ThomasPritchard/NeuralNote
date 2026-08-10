@@ -4,7 +4,13 @@
 // and a coverage footer). Keeping the fold pure and framework-free makes the
 // harness feel unit-testable without React.
 
-import type { ChatEvent, ChatTurn, ElicitOption, NoteKind } from "../lib/types";
+import type {
+  ChatEvent,
+  ChatTurn,
+  ElicitOption,
+  NoteKind,
+  ToolStatus,
+} from "../lib/types";
 
 /** One row in the live activity log — the visible trace of the agent working. */
 export type ActivityStep =
@@ -39,6 +45,37 @@ export interface PendingElicitation {
   multiSelect: boolean;
 }
 
+/** One tool call the model made, and how it settled. `status === null` means the
+ *  call is still in flight: the backend emits exactly one settlement per call on
+ *  every path, so a node that stays null after the turn ends is a backend bug,
+ *  not a UI state to design around. Every string here is Rust-authored except
+ *  `arguments`, which is raw model output and must be treated as untrusted. */
+export interface ToolCallView {
+  id: string;
+  name: string;
+  title: string;
+  arguments: string;
+  status: ToolStatus | null;
+  summary: string | null;
+  detail: string | null;
+}
+
+/** A skill the user asked for that could not be activated. `missingBinary` is the
+ *  only structured remedy the backend offers; `message` is display-only prose. */
+export interface SkillActivationFailure {
+  id: string;
+  name: string;
+  message: string;
+  missingBinary: string | null;
+}
+
+/** How a transcript was actually obtained, as reported by the tool that obtained
+ *  it. `relPath` is absent until a note exists to attach it to. */
+export interface TranscriptSourceView {
+  label: string;
+  relPath: string | null;
+}
+
 export interface UserMessage {
   role: "user";
   content: string;
@@ -51,9 +88,23 @@ export interface AssistantMessage {
   /** The last progress phase backed by an actual transport/backend event. */
   phase: "sending" | "thinking" | "searching" | "reading" | "verifying";
   skillActivations: Array<{ id: string; name: string }>;
+  /** Skills that could not be activated, reported structurally by the backend —
+   *  never inferred from the wording of a progress message. */
+  skillActivationFailures: SkillActivationFailure[];
   skillSteps: string[];
   pendingElicitation: PendingElicitation | null;
   writtenNotes: Array<{ relPath: string; kind: NoteKind }>;
+  /** Create-only writes that hit a note the user already had, so nothing was
+   *  written (#108). Kept separate from `writtenNotes`: nothing landed on disk,
+   *  but the no-op is not allowed to disappear either. */
+  existingNotes: Array<{ relPath: string; kind: NoteKind }>;
+  /** Every tool call of the turn, in the order the model made them. */
+  toolCalls: ToolCallView[];
+  /** Transcript provenance as reported by the tools that fetched it. */
+  transcriptSources: TranscriptSourceView[];
+  /** Why the run ended having done only part of its work, straight from the
+   *  orchestrator that knows. `null` means it did not end short. */
+  partialRun: string | null;
   /** The live "searching / reading / verifying" trace, in order. */
   activity: ActivityStep[];
   /** Pinned at turn creation because reasoning can be toggled off mid-stream;
@@ -94,9 +145,14 @@ export function emptyAssistant(
     turnId,
     phase: "sending",
     skillActivations: [],
+    skillActivationFailures: [],
     skillSteps: [],
     pendingElicitation: null,
     writtenNotes: [],
+    existingNotes: [],
+    toolCalls: [],
+    transcriptSources: [],
+    partialRun: null,
     activity: [],
     reasoningRequested,
     thinking: "",
@@ -110,19 +166,24 @@ export function emptyAssistant(
   };
 }
 
-/** Model-reported transcript source labels surfaced during a skill run.
- *  These are presentation hints, not verified source metadata. Keep first-seen
- *  order so a playlist's model narrative remains readable. */
+/** The distinct transcript-source labels this run reported, in first-seen order.
+ *
+ *  These come from the `transcriptSource` events the fetching tools emit, so they
+ *  say where the text actually came from. They used to be regexed out of
+ *  concatenated model prose, which meant any answer that merely *quoted* a label
+ *  claimed it as provenance — a false claim about the source of the user's own
+ *  notes, which is the one thing this app must never make. */
 export function modelReportedProvenance(turn: AssistantMessage): string[] {
-  const narrative = [...turn.skillSteps, turn.answer, turn.error ?? ""].join("\n");
-  const labels = narrative.match(
-    /\b(?:captions:[A-Za-z0-9_-]+|whisper:[A-Za-z0-9_./:-]*[A-Za-z0-9_-])/g,
-  );
-  return [...new Set(labels ?? [])];
+  return [...new Set(turn.transcriptSources.map((source) => source.label))];
 }
 
-/** Infer a possible partial run from model-authored narrative. NoteWritten is
- *  authoritative for the file ledger; this status itself is not verified. */
+/** Whether a settled skill run wrote notes but did not finish its work.
+ *
+ *  Both signals are authoritative: `stopped` is the user's own stop, and
+ *  `partialRun` is the orchestrator reporting a guard it tripped or a
+ *  cancellation it honoured. This used to test the model's prose for
+ *  "cancelled|stopped|partial", so an answer that merely mentioned the word
+ *  reported a complete run as incomplete. */
 export function isPartialSkillRun(turn: AssistantMessage): boolean {
   if (
     !turn.done ||
@@ -131,9 +192,7 @@ export function isPartialSkillRun(turn: AssistantMessage): boolean {
   ) {
     return false;
   }
-  if (turn.stopped) return true;
-  const narrative = [...turn.skillSteps, turn.answer, turn.error ?? ""].join("\n");
-  return /\b(?:cancelled|canceled|stopped(?:\s+early)?|partial)\b/i.test(narrative);
+  return turn.stopped || turn.partialRun !== null;
 }
 
 /** The turn searched the vault and genuinely found nothing to cite.
@@ -221,6 +280,28 @@ function withHitCount(
   return [...steps, { kind: "search", query, hitCount }];
 }
 
+/** Settle the in-flight call that owns this id.
+ *
+ *  Matches the newest still-unsettled node so a re-used id cannot re-open a node
+ *  that already closed. A settlement whose call never arrived is appended as its
+ *  own row with an empty identity rather than dropped: the backend emits exactly
+ *  one settlement per announced call, so an unmatched one is a broken contract
+ *  that has to be visible, not a stray event to swallow. */
+function withSettlement(
+  calls: ToolCallView[],
+  settlement: Pick<ToolCallView, "id" | "status" | "summary" | "detail">,
+): ToolCallView[] {
+  for (let i = calls.length - 1; i >= 0; i--) {
+    const call = calls[i];
+    if (call.id === settlement.id && call.status === null) {
+      const next = calls.slice();
+      next[i] = { ...call, ...settlement };
+      return next;
+    }
+  }
+  return [...calls, { name: "", title: "", arguments: "", ...settlement }];
+}
+
 /** Immutably fold one streamed `ChatEvent` into the assistant turn's view
  *  state. Total over the `ChatEvent` union — a new variant is a compile error
  *  here, so the UI can never silently ignore a backend event. */
@@ -239,8 +320,64 @@ export function reduceAssistant(
           { id: event.id, name: event.name },
         ],
       };
+    case "skillActivationFailed":
+      return {
+        ...turn,
+        skillActivationFailures: [
+          ...turn.skillActivationFailures,
+          {
+            id: event.id,
+            name: event.name,
+            message: event.message,
+            missingBinary: event.missingBinary,
+          },
+        ],
+      };
     case "skillStep":
       return { ...turn, skillSteps: [...turn.skillSteps, event.message] };
+    case "toolCall":
+      // A tool node is not a progress phase — `phase` stays where the
+      // searching/reading/verifying events put it.
+      return {
+        ...turn,
+        toolCalls: [
+          ...turn.toolCalls,
+          {
+            id: event.id,
+            name: event.name,
+            title: event.title,
+            arguments: event.arguments,
+            status: null,
+            summary: null,
+            detail: null,
+          },
+        ],
+      };
+    case "toolResult":
+      return {
+        ...turn,
+        toolCalls: withSettlement(turn.toolCalls, {
+          id: event.id,
+          status: event.status,
+          summary: event.summary,
+          detail: event.detail,
+        }),
+      };
+    case "transcriptSource":
+      return {
+        ...turn,
+        transcriptSources: [
+          ...turn.transcriptSources,
+          { label: event.label, relPath: event.relPath },
+        ],
+      };
+    case "partialRun":
+      // First reason wins: the earliest is the one that actually ended the work,
+      // and a later one would overwrite the cause with a consequence.
+      return {
+        ...turn,
+        partialRun: turn.partialRun ?? event.reason,
+      };
     case "elicit":
       return {
         ...turn,
@@ -256,6 +393,16 @@ export function reduceAssistant(
         ...turn,
         writtenNotes: [
           ...turn.writtenNotes,
+          { relPath: event.relPath, kind: event.kind },
+        ],
+      };
+    case "noteExists":
+      // Nothing was written, so this must never reach `writtenNotes` — but it
+      // must reach the user (#108). `kind` is the kind that was requested.
+      return {
+        ...turn,
+        existingNotes: [
+          ...turn.existingNotes,
           { relPath: event.relPath, kind: event.kind },
         ],
       };

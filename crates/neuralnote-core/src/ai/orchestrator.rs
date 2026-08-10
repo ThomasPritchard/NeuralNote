@@ -7,11 +7,12 @@
 //! `Done`. Any error is surfaced as a [`ChatEvent::Error`] and stops the run — never
 //! a panic, never silent.
 
-use crate::ai::events::{ChatEvent, EventSink};
+use crate::ai::events::{ChatEvent, EventSink, ToolStatus};
 use crate::ai::evidence::EvidenceRegistry;
 use crate::ai::llm::{Completion, LlmClient, LlmMessage, LlmRequest, Role, ToolCall, UserPrompt};
 use crate::ai::retrieval::RetrievalProvider;
-use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
+use crate::ai::skills::{missing_required_binary, ActiveSkills, SkillEnvironment, SkillRegistry};
+use crate::ai::tool_registry;
 use crate::ai::tools::{self, dispatch, ToolOutcome};
 use crate::ai::verify::CitationVerifier;
 use crate::ai::write_policy::{NoteWriteBackend, UndoLedger, WriteSession};
@@ -38,6 +39,12 @@ pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.5";
 /// in `tests/skill_orchestrator.rs`, which asserts the emitted `SkillStep`
 /// message contains this constant.
 pub const SKILL_ACTIVATION_FAILURE_MARK: &str = "could not be activated";
+
+/// Why a run ended short. Both are the orchestrator's own knowledge — a guard it
+/// tripped, or a stop it honoured — so neither is ever inferred from model prose.
+const PARTIAL_RUN_GUARD_TRIPPED: &str =
+    "the run reached a work limit before finishing, so it covered only part of the task";
+const PARTIAL_RUN_CANCELLED: &str = "the run was stopped before it finished every item";
 
 /// Loop guards — cost- and runaway-protection (spec §4). Defaults suit a single
 /// own-vault user; the host may tune them.
@@ -366,10 +373,14 @@ impl ChatSession<'_> {
                 Ok(activation) => activation,
                 Err(error) => {
                     sink.send(ChatEvent::SkillStep {
-                        message: format!(
-                            "Skill '{id}' {SKILL_ACTIVATION_FAILURE_MARK}: {error} — continuing without it"
-                        ),
+                        message: activation_failure_message(id, &error),
                     });
+                    sink.send(skill_activation_failed(
+                        id,
+                        &error,
+                        self.skill_services.registry,
+                        self.skill_services.environment,
+                    ));
                     // A preload has no genuine tool-call id. Preserve protocol order
                     // with system context carrying the same recoverable JSON error a
                     // rejected `use_skill` call would return, then continue ungranted.
@@ -421,6 +432,13 @@ impl ChatSession<'_> {
                 return Ok(());
             }
         };
+        // The loop stopped the model mid-work. That is authoritative here — the UI
+        // must never have to infer it from an answer that merely says "partial".
+        if guard_tripped {
+            sink.send(ChatEvent::PartialRun {
+                reason: PARTIAL_RUN_GUARD_TRIPPED.to_string(),
+            });
+        }
 
         // Verify + answer phase. Verifying is the UI cue that the answer is being
         // grounded; the actual citation checks run once we have the streamed text.
@@ -583,8 +601,12 @@ impl ChatSession<'_> {
             .map(|(index, _, _)| index);
         let mut playlist_batch_closed = false;
         for call in calls {
+            // Announce the call BEFORE anything can go wrong with it, so one that
+            // is skipped, cancelled, rejected or fails still reaches the timeline
+            // instead of vanishing. Every branch below settles it exactly once.
+            emit_tool_call(sink, call);
             if playlist_batch_closed {
-                push_stale_playlist_tool_result(messages, call);
+                settle_skipped(messages, sink, call, SkippedCall::StalePlaylistBatch);
                 continue;
             }
             if !playlist_cancelled
@@ -593,16 +615,21 @@ impl ChatSession<'_> {
             {
                 youtube_session.cancel_playlist_remaining();
                 playlist_cancelled = true;
+                // The orchestrator knows the run is ending short. Say so once,
+                // rather than leaving the UI to infer it from the model's prose.
+                sink.send(ChatEvent::PartialRun {
+                    reason: PARTIAL_RUN_CANCELLED.to_string(),
+                });
             }
             if playlist_cancelled {
-                push_cancelled_tool_result(messages, call);
+                settle_skipped(messages, sink, call, SkippedCall::PlaylistCancelled);
                 continue;
             }
             if control.budget_hit {
-                push_skipped_tool_result(messages, call);
+                settle_skipped(messages, sink, call, SkippedCall::EvidenceBudgetSpent);
                 continue;
             }
-            control.complete_turn |= self
+            let (tool_control, settlement) = self
                 .push_tool_result(
                     messages,
                     call,
@@ -615,8 +642,9 @@ impl ChatSession<'_> {
                     sink,
                     context_chars,
                 )
-                .await
-                == tools::ToolControl::CompleteTurn;
+                .await;
+            control.complete_turn |= tool_control == tools::ToolControl::CompleteTurn;
+            emit_tool_result(sink, &call.id, settlement);
             let current_playlist_item = youtube_session
                 .playlist_current()
                 .map(|(index, _, _)| index);
@@ -647,7 +675,7 @@ impl ChatSession<'_> {
         coverage: &mut CoverageAcc,
         sink: &mut dyn EventSink,
         context_chars: &mut usize,
-    ) -> tools::ToolControl {
+    ) -> (tools::ToolControl, ToolSettlement) {
         let result = self
             .handle_tool_call(
                 call,
@@ -666,13 +694,14 @@ impl ChatSession<'_> {
         {
             youtube_session.fail_playlist_item(format!("tool '{}' was rejected", call.name));
         }
+        let settlement = settlement_for(&result);
         *context_chars += result.content.len();
         messages.push(LlmMessage::tool_result(
             &call.id,
             &call.name,
             result.content,
         ));
-        result.control
+        (result.control, settlement)
     }
 
     fn evidence_budget_spent(
@@ -1008,31 +1037,170 @@ fn compact_completed_playlist_context(messages: &mut [LlmMessage], context_chars
         .sum();
 }
 
-fn push_skipped_tool_result(messages: &mut Vec<LlmMessage>, call: &ToolCall) {
-    // Over budget already this turn: don't dispatch further, but the protocol
-    // still needs a result for every declared call, so the model is told the call
-    // was skipped rather than left dangling.
-    messages.push(LlmMessage::tool_result(
-        &call.id,
-        &call.name,
-        r#"{"error":"skipped: evidence budget reached"}"#,
-    ));
+/// Bound on the `detail` text crossing the event wire. A tool result can be a
+/// whole transcript; the disclosure is a peek at one, not a copy of it.
+const MAX_TOOL_DETAIL_CHARS: usize = 600;
+
+/// The [`ChatEvent::ToolResult`] payload for one settled call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolSettlement {
+    status: ToolStatus,
+    summary: Option<String>,
+    detail: Option<String>,
 }
 
-fn push_cancelled_tool_result(messages: &mut Vec<LlmMessage>, call: &ToolCall) {
-    messages.push(LlmMessage::tool_result(
-        &call.id,
-        &call.name,
-        r#"{"error":{"kind":"capture_cancelled","message":"skipped: playlist capture was cancelled before this call"}}"#,
-    ));
+/// Why a declared call never reached the dispatcher. Closed on purpose: each
+/// variant both answers the model and settles the timeline node, so a new
+/// short-circuit cannot be added that leaves a node spinning forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkippedCall {
+    StalePlaylistBatch,
+    PlaylistCancelled,
+    EvidenceBudgetSpent,
 }
 
-fn push_stale_playlist_tool_result(messages: &mut Vec<LlmMessage>, call: &ToolCall) {
+impl SkippedCall {
+    /// The `role:"tool"` content the model reads. The protocol still needs a
+    /// result for every declared call, so the model is told the call was skipped
+    /// rather than left waiting on one that never comes.
+    const fn tool_result_content(self) -> &'static str {
+        match self {
+            Self::StalePlaylistBatch => {
+                r#"{"error":{"kind":"stale_playlist_batch","message":"skipped: the playlist work item for this assistant batch has already resolved"}}"#
+            }
+            Self::PlaylistCancelled => {
+                r#"{"error":{"kind":"capture_cancelled","message":"skipped: playlist capture was cancelled before this call"}}"#
+            }
+            Self::EvidenceBudgetSpent => r#"{"error":"skipped: evidence budget reached"}"#,
+        }
+    }
+
+    /// The same story in the user's words, for the timeline node.
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::StalePlaylistBatch => "skipped: this playlist item had already finished",
+            Self::PlaylistCancelled => "skipped: the run was stopped before this call ran",
+            Self::EvidenceBudgetSpent => "skipped: the run reached its evidence budget",
+        }
+    }
+
+    fn settlement(self) -> ToolSettlement {
+        ToolSettlement {
+            // The call never ran, so this is the orchestrator declining it — not a
+            // tool failure and not a user denial.
+            status: ToolStatus::Rejected,
+            summary: None,
+            detail: Some(self.reason().to_string()),
+        }
+    }
+}
+
+/// Answer the model and settle the timeline node for a call that never ran — in
+/// one place, so the two accounts can never drift apart.
+fn settle_skipped(
+    messages: &mut Vec<LlmMessage>,
+    sink: &mut dyn EventSink,
+    call: &ToolCall,
+    skipped: SkippedCall,
+) {
     messages.push(LlmMessage::tool_result(
         &call.id,
         &call.name,
-        r#"{"error":{"kind":"stale_playlist_batch","message":"skipped: the playlist work item for this assistant batch has already resolved"}}"#,
+        skipped.tool_result_content(),
     ));
+    emit_tool_result(sink, &call.id, skipped.settlement());
+}
+
+/// Announce a declared call before anything can go wrong with it. The title comes
+/// from the Rust-side table in [`tool_registry`] — never from the model, and never
+/// composed by the UI.
+fn emit_tool_call(sink: &mut dyn EventSink, call: &ToolCall) {
+    sink.send(ChatEvent::ToolCall {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        title: tool_registry::title_for(&call.name).to_string(),
+        arguments: call.arguments.clone(),
+    });
+}
+
+fn emit_tool_result(sink: &mut dyn EventSink, id: &str, settlement: ToolSettlement) {
+    sink.send(ChatEvent::ToolResult {
+        id: id.to_string(),
+        status: settlement.status,
+        summary: settlement.summary,
+        detail: settlement.detail,
+    });
+}
+
+/// Read a dispatched result in the timeline's vocabulary. Every summary here is
+/// composed from the structured [`ToolOutcome`], never from model prose.
+fn settlement_for(result: &tools::ToolResult) -> ToolSettlement {
+    let (status, summary) = match &result.outcome {
+        ToolOutcome::Searched { hit_count, .. } => {
+            (ToolStatus::Ok, Some(format!("{hit_count} spans")))
+        }
+        ToolOutcome::Read {
+            rel_path,
+            start_line,
+            end_line,
+        } => (
+            ToolStatus::Ok,
+            Some(format!("{rel_path}:{start_line}–{end_line}")),
+        ),
+        ToolOutcome::Listed | ToolOutcome::Action => (ToolStatus::Ok, None),
+        ToolOutcome::Rejected => (ToolStatus::Rejected, None),
+    };
+    ToolSettlement {
+        status,
+        summary,
+        detail: disclosure(&result.content),
+    }
+}
+
+/// The bounded disclosure text for a settled call. A rejection's own sentence
+/// reads better than the JSON envelope the model receives, so unwrap it when it
+/// is there. Absent detail stays absent rather than becoming a blank line.
+fn disclosure(content: &str) -> Option<String> {
+    let text = serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| value.get("error")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| content.to_string());
+    let bounded = truncate_chars(text.trim(), MAX_TOOL_DETAIL_CHARS);
+    (!bounded.is_empty()).then_some(bounded)
+}
+
+/// Truncate on a char boundary, so a multi-byte character is never split.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max).collect();
+    format!("{kept}…")
+}
+
+/// The structured report for a skill that could not be activated. `missing_binary`
+/// is the only remedy the UI can offer, and it is derived from the requirement set
+/// — never from `message`, so re-wording the sentence cannot disable the remedy.
+pub(super) fn skill_activation_failed(
+    id: &str,
+    error: &str,
+    registry: &SkillRegistry,
+    environment: &SkillEnvironment,
+) -> ChatEvent {
+    let manifest = registry.lookup(id).ok();
+    ChatEvent::SkillActivationFailed {
+        id: id.to_string(),
+        // An id nobody recognises has no name of its own; the id the caller asked
+        // for is the only identity there is.
+        name: manifest.map_or_else(|| id.to_string(), |manifest| manifest.name.clone()),
+        message: activation_failure_message(id, error),
+        missing_binary: manifest
+            .and_then(|manifest| missing_required_binary(&manifest.requirements, environment)),
+    }
+}
+
+pub(super) fn activation_failure_message(id: &str, error: &str) -> String {
+    format!("Skill '{id}' {SKILL_ACTIVATION_FAILURE_MARK}: {error} — continuing without it")
 }
 
 fn emit_coverage(coverage: CoverageAcc, guard_tripped: bool, sink: &mut dyn EventSink) {
@@ -1501,6 +1669,122 @@ const MAX_COMPLETE_RETRIES: usize = 1;
 /// Retryability itself lives on [`crate::error::CoreError::is_retryable`] — the one place that decides
 /// which transport failures are transient.
 const RETRY_BACKOFF: Duration = Duration::from_millis(500);
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use crate::ai::events::VecSink;
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn every_skipped_call_both_answers_the_model_and_settles_the_node() {
+        // The two accounts must never drift: the model is told the call was
+        // skipped, and the node stops spinning. Both, for every reason.
+        for skipped in [
+            SkippedCall::StalePlaylistBatch,
+            SkippedCall::PlaylistCancelled,
+            SkippedCall::EvidenceBudgetSpent,
+        ] {
+            let mut messages = Vec::new();
+            let mut sink = VecSink::default();
+
+            settle_skipped(&mut messages, &mut sink, &call("search_notes"), skipped);
+
+            assert_eq!(messages.len(), 1, "the model needs one result per call");
+            assert!(messages[0]
+                .content
+                .as_deref()
+                .expect("a tool result always carries content")
+                .contains("skipped"));
+            assert_eq!(
+                sink.events,
+                vec![ChatEvent::ToolResult {
+                    id: "c1".into(),
+                    status: ToolStatus::Rejected,
+                    summary: None,
+                    detail: Some(skipped.reason().to_string()),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn a_skipped_reason_never_repeats_across_causes() {
+        // Three different stories — "already finished", "stopped", "out of
+        // budget" — must read differently, or the node explains nothing.
+        let reasons = [
+            SkippedCall::StalePlaylistBatch.reason(),
+            SkippedCall::PlaylistCancelled.reason(),
+            SkippedCall::EvidenceBudgetSpent.reason(),
+        ];
+        let distinct: std::collections::BTreeSet<&str> = reasons.into_iter().collect();
+        assert_eq!(distinct.len(), reasons.len());
+    }
+
+    #[test]
+    fn a_search_settles_with_its_span_count_and_a_read_with_its_range() {
+        let searched = settlement_for(&tools::ToolResult {
+            content: r#"{"query":"x"}"#.into(),
+            outcome: ToolOutcome::Searched {
+                query: "x".into(),
+                hit_count: 12,
+                truncated: false,
+                skipped_files: 0,
+                notes_read: Vec::new(),
+            },
+            control: tools::ToolControl::Continue,
+        });
+        assert_eq!(searched.status, ToolStatus::Ok);
+        assert_eq!(searched.summary, Some("12 spans".into()));
+
+        let read = settlement_for(&tools::ToolResult {
+            content: "{}".into(),
+            outcome: ToolOutcome::Read {
+                rel_path: "Notes/A.md".into(),
+                start_line: 12,
+                end_line: 28,
+            },
+            control: tools::ToolControl::Continue,
+        });
+        assert_eq!(read.summary, Some("Notes/A.md:12–28".into()));
+    }
+
+    #[test]
+    fn a_rejection_discloses_its_own_sentence_not_the_json_envelope() {
+        let settlement = settlement_for(&tools::ToolResult {
+            content: r#"{"error":"unknown tool 'nope'"}"#.into(),
+            outcome: ToolOutcome::Rejected,
+            control: tools::ToolControl::Continue,
+        });
+
+        assert_eq!(settlement.status, ToolStatus::Rejected);
+        assert_eq!(settlement.detail, Some("unknown tool 'nope'".into()));
+    }
+
+    #[test]
+    fn a_disclosure_is_bounded_and_never_splits_a_character() {
+        // A tool result can be a whole transcript. The disclosure is a peek.
+        let long = "é".repeat(MAX_TOOL_DETAIL_CHARS + 50);
+        let bounded = disclosure(&long).expect("long content still discloses");
+
+        assert_eq!(bounded.chars().count(), MAX_TOOL_DETAIL_CHARS + 1);
+        assert!(bounded.ends_with('…'));
+        assert!(bounded.starts_with('é'), "a multi-byte char must survive");
+    }
+
+    #[test]
+    fn empty_content_discloses_nothing_rather_than_a_blank_line() {
+        assert_eq!(disclosure(""), None);
+        assert_eq!(disclosure("   "), None);
+    }
+}
 
 #[cfg(test)]
 mod tests {
