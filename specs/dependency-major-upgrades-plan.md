@@ -276,6 +276,18 @@ Everything PR #107 knowingly left undone. Grouped by whether it is ours to fix.
   locally. The assertion has been destructured so the next occurrence prints the offending bytes;
   it was deliberately not relaxed, because weakening an assertion whose cause is unknown trades a
   diagnosable flake for a permanent blind spot. Re-open when the message arrives.
+
+  Two mechanisms are already **ruled out**, so don't spend time there:
+  - *"The shell emitted a diagnostic while dying."* No — `terminate_process_tree` sends SIGKILL,
+    which is uncatchable, so the child gets no opportunity to write anything at termination.
+  - *"The reader stopped draining, so `printf` hit EPIPE and dash reported it."* No — both
+    readers are independent `tokio::spawn` tasks (`process_runtime.rs:64-75`) that keep draining
+    to EOF after the main loop breaks, so the child never sees a stalled pipe.
+
+  With both gone, treat the "it must be the stderr clause" conclusion as *unconfirmed*: it was
+  reached by eliminating the stdout-length clause, and the elimination argument may have a hole
+  that static reading cannot see. The rewritten assertion also has an `other => panic!` arm that
+  prints the whole result, so a non-`OutputOverflow` variant would now be visible too.
 - `production-dependencies.test.ts` deliberately keeps `v1.2.0` and `desktop v0.2.1` in its
   fixture strings. They are synthetic inputs proving the rejection is version-independent, not
   pins — do not "fix" them to match the real versions.
@@ -304,6 +316,23 @@ Everything PR #107 knowingly left undone. Grouped by whether it is ours to fix.
   geometry assertions against a runner whose frames measured ~40x slower than healthy. Worth its
   own issue: the lane is informational, so it fails quietly and permanently, and a gate nobody
   trusts is not a gate.
+- **The Native Tauri macOS lane fails on `main` too, and cannot be diagnosed from CI output.**
+  Verified against `main` at `4d87df3` (2026-08-01): the same lane failed there, in a run that was
+  overall green because the lane is informational. The failure shape is identical on both — build
+  succeeds, ~2.5 minutes pass, then `Spec Files: 0 passed, 1 failed, 0 skipped, 1 total` with no
+  further output. The `@wdio/tauri-*` 1.3.0 bump is **not** implicated: the Rust build succeeded
+  with the new crates (a bad bump fails at compile, not at spec execution), and the failing spec is
+  `changes one local span and preserves every untouched Markdown byte`, a Markdown-editing
+  assertion, whereas 1.3.0's changes are window-focus and DirectEval plumbing.
+
+  The real obstacle is observability. The uploaded failure capture is deliberately redacted —
+  `{"errorType": "Error", "fixture": "synthetic-native-e2e-v1", "editorContentRedacted": true}` —
+  carrying the test title and error *type* but no message, stack or diff, and the run log holds two
+  lines. Artifacts also expire (main's was already gone at 9 days), so the natural A/B against a
+  known-good run is only available inside that window. **Anyone fixing this lane needs to solve the
+  evidence problem first**: either an unredacted capture behind a CI-only flag, or a synthetic
+  fixture whose content is safe to dump verbatim. That is the likeliest reason a lane has stayed red
+  since at least 2026-08-01 without being repaired.
 - **A fresh clone or worktree cannot build the `desktop` crate** until `scripts/fetch-ollama-sidecar.sh`
   has been run there. It writes three gitignored artifacts — `binaries/ollama-*`,
   `binaries/llama-server-*` and `ollama-libs/` — and the last is a resource *glob*, where matching
