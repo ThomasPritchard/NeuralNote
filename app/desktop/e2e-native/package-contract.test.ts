@@ -8,9 +8,12 @@ const manifest = JSON.parse(readFileSync(new URL("./package.json", import.meta.u
 };
 
 test("pins the Tauri integration and its compatible native utility runtime", () => {
-  assert.equal(manifest.devDependencies["@wdio/tauri-plugin"], "1.2.0");
-  assert.equal(manifest.devDependencies["@wdio/tauri-service"], "1.2.0");
-  assert.equal(manifest.overrides["@wdio/native-utils"], "2.5.0");
+  assert.equal(manifest.devDependencies["@wdio/tauri-plugin"], "1.3.0");
+  assert.equal(manifest.devDependencies["@wdio/tauri-service"], "1.3.0");
+  // Must track what @wdio/tauri-service pins: 1.3.0 depends on exactly 2.6.0, and
+  // leaving this override at 2.5.0 would silently downgrade it, running the new
+  // service against the old utils.
+  assert.equal(manifest.overrides["@wdio/native-utils"], "2.6.0");
   assert.equal(manifest.overrides.diff, "8.0.3");
 });
 

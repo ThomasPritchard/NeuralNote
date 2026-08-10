@@ -149,8 +149,27 @@ test("production config and Cargo defaults exclude native automation", () => {
   assert.deepEqual(productionConfig.app.security.capabilities, ["default"]);
   assert.notEqual(productionConfig.app.withGlobalTauri, true);
   assert.match(cargo, /native-e2e = \[[\s\S]*"dep:objc2-app-kit"[\s\S]*"dep:tauri-plugin-wdio"[\s\S]*"dep:tauri-plugin-wdio-webdriver"[\s\S]*\]/);
-  assert.match(cargo, /tauri-plugin-wdio = \{ version = "=1\.2\.0", optional = true \}/);
-  assert.match(cargo, /tauri-plugin-wdio-webdriver = \{ version = "=1\.2\.0", optional = true \}/);
+  // The npm guest JS and the Rust plugin talk a private wire protocol, so a version
+  // skew between them is a real breakage risk. Upstream releases all four together
+  // but does not guarantee it, so assert the parity here rather than a literal
+  // version — that keeps the invariant enforced across bumps instead of turning
+  // every upgrade into a find-and-replace that could silently be half-applied.
+  const e2eManifest = JSON.parse(
+    readFileSync(path.join(here, "package.json"), "utf8"),
+  ) as { devDependencies: Record<string, string> };
+  const wdioVersion = e2eManifest.devDependencies["@wdio/tauri-plugin"];
+  assert.match(wdioVersion, /^\d+\.\d+\.\d+$/, "the npm plugin must be pinned exactly");
+  assert.equal(e2eManifest.devDependencies["@wdio/tauri-service"], wdioVersion);
+  for (const crate of ["tauri-plugin-wdio", "tauri-plugin-wdio-webdriver"]) {
+    assert.match(
+      cargo,
+      new RegExp(
+        `${crate} = \\{ version = "=${wdioVersion.replace(/\./gu, "\\.")}", optional = true \\}`,
+        "u",
+      ),
+      `${crate} must be exact-pinned to the same version as the npm packages (${wdioVersion})`,
+    );
+  }
   assert.match(buildScript, /env::var\("PROFILE"\)[\s\S]*== "release"/);
   assert.match(buildScript, /rustc-cfg=native_e2e_release_profile/);
   assert.match(buildScript, /rustc-check-cfg=cfg\(native_e2e_release_profile\)/);

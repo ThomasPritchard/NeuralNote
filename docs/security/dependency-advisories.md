@@ -4,10 +4,19 @@ Status of every `cargo audit` **warning** in the workspace, with provenance,
 platform reachability, and the upgrade trigger that will clear it.
 
 `cargo audit` fails the quality gate only on **vulnerabilities**. As of
-2026-07-15 there are **0 vulnerabilities** and **17 allowed warnings** (1
+2026-08-10 there are **0 vulnerabilities** and **17 allowed warnings** (1
 `unsound`, 16 `unmaintained`). The gate is green. We deliberately keep **no
 `audit.toml` ignore-list**: silencing an advisory hides the day it turns into a
 vulnerability. Each warning below is instead accounted for here.
+
+**Cleared 2026-08-10 — `rkyv` 0.7.46 (RUSTSEC-2026-0235, out-of-bounds read).**
+It arrived as an *optional, never-activated* feature of `rust_decimal`, reached via
+`byte-unit → tauri-plugin-log`. `cargo audit` scans `Cargo.lock`, which records the union
+of a crate's optional dependencies, so it flagged a crate that was never compiled
+(`cargo tree -e features -p rust_decimal` showed only `arrayvec` and `num-traits`). A plain
+`cargo update` dropped `byte-unit`, and `rust_decimal` and `rkyv` left the lockfile with it.
+Worth remembering: a lockfile-only advisory can be a false positive, and the feature graph
+is what settles it.
 
 Re-check with:
 

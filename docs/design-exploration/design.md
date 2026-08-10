@@ -1,9 +1,15 @@
 # NeuralNote — design directions
 
+> **Historical record.** The prototype code this describes was removed in the commit that added
+> this note; it lives on in git history at `4d87df3`. Paths and commands below refer to that
+> deleted `prototype/` tree and are kept as a record of what was explored, not as instructions.
+>
+> **This doc no longer owns the tokens.** The chosen theme shipped into the app, and
+> `app/desktop/src/styles.css` is the source of truth. Where the two disagree, the app wins.
+
 Six aesthetic directions for the **app workspace** (not the marketing site — that's a queued
-fast-follow). Each is a runnable theme in the prototype, switchable live via the floating bar or
-`?variant=<id>`. This doc is the source of truth for tokens; `src/prototype/themes.css` is the
-codified version.
+fast-follow). Each was a runnable theme in the prototype, switchable live via the floating bar or
+`?variant=<id>`.
 
 > Inputs: Obsidian (structure), eden.so + Collective OS + Deepflow + AI-tools refs (look), and two
 > picks from styles.refero.design — **Linear** ("midnight command deck") and **Vercel**
