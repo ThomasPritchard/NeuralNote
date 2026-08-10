@@ -160,15 +160,36 @@ async fn stdout_overflow_is_bounded_and_stops_the_child() {
     .await
     .expect("overflow must stop a noisy process");
 
-    assert!(matches!(
-        result,
+    // Destructured rather than a single `matches!` so a failure names the clause. A
+    // combined guard reports only "assertion failed" and drops every actual value,
+    // which cost a full CI round-trip to get nowhere on 2026-08-10: the run went red
+    // here, passed on re-run against identical code, and the panic carried no
+    // evidence of which clause broke.
+    match result {
         Err(ProcessError::OutputOverflow {
-            stream: OutputStream::Stdout,
-            limit: 64,
+            stream,
+            limit,
             stdout,
             stderr,
-        }) if stdout.len() == 64 && stderr.is_empty()
-    ));
+        }) => {
+            assert_eq!(stream, OutputStream::Stdout);
+            assert_eq!(limit, 64);
+            // Guaranteed by construction, not a race: `read_bounded` caps each append
+            // at `limit - retained.len()`, so the buffer cannot exceed the limit.
+            assert_eq!(stdout.len(), 64, "stdout must be truncated at the limit");
+            // The stub writes nothing to stderr and the child is SIGKILLed as a
+            // process group, so this should hold — but it is the one clause here that
+            // depends on timing rather than construction. If it ever trips, the
+            // message is the evidence: it names what wrote, which static reading of
+            // the runner could not explain.
+            assert!(
+                stderr.is_empty(),
+                "expected no stderr from the overflow stub, got {:?}",
+                String::from_utf8_lossy(&stderr),
+            );
+        }
+        other => panic!("expected a bounded stdout overflow, got {other:?}"),
+    }
 }
 
 #[cfg(unix)]
