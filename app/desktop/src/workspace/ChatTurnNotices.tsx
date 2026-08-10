@@ -1,37 +1,34 @@
-// Small standalone notices that hang off an assistant turn: the collapsed
-// reasoning disclosure, the empty-retrieval "nothing found" on-ramp, and the
+// Small standalone notices that hang off an assistant turn: the missing-
+// reasoning backstop, the empty-retrieval "nothing found" on-ramp, and the
 // partial-coverage footer. Each is strictly honest about what the turn saw and
 // what this build can do. Presentational only.
+//
+// The reasoning DISCLOSURE itself is no longer here — reasoning is part of what
+// the assistant did, so it lives on the timeline rail (`ChatTimelineNodes.tsx`)
+// where it renders as markdown rather than one pre-wrapped string.
 
-import { ChevronRight, SearchX } from "lucide-react";
+import { SearchX } from "lucide-react";
 import type { CoverageView } from "./chatMessage";
 
-export function Reasoning({
+/** The backstop for an opt-in that produced nothing: reasoning was requested and
+ *  billed for, the turn finished cleanly, and no reasoning tokens arrived. Silence
+ *  there would read as "the feature is off", so it is said out loud. */
+export function MissingReasoningNotice({
   text,
-  requested = false,
-  showMissing = false,
-}: Readonly<{ text: string; requested?: boolean; showMissing?: boolean }>) {
-  if (text.trim() === "") {
-    if (!requested || !showMissing) return null;
-    return (
-      <p className="rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-[0.6875rem] leading-snug text-muted-foreground">
-        Reasoning was on, but the model didn&apos;t return any.
-      </p>
-    );
-  }
+  requested,
+  show,
+}: Readonly<{
+  text: string;
+  requested: boolean;
+  /** The turn settled normally and produced an answer — before that, absent
+   *  reasoning just means it hasn't streamed yet. */
+  show: boolean;
+}>) {
+  if (text.trim() !== "" || !requested || !show) return null;
   return (
-    <details className="group rounded-lg border border-border/60 bg-background/30 px-2.5 py-1.5 text-[0.6875rem] text-muted-foreground">
-      <summary className="flex cursor-pointer list-none select-none items-center gap-1.5 font-medium text-muted-foreground/90 [&::-webkit-details-marker]:hidden">
-        <ChevronRight
-          className="size-3 shrink-0 text-muted-foreground/60 transition-transform group-open:rotate-90 motion-reduce:transition-none"
-          aria-hidden
-        />
-        Reasoning
-      </summary>
-      <p className="mt-1.5 whitespace-pre-wrap pl-[18px] leading-relaxed text-muted-foreground/80">
-        {text}
-      </p>
-    </details>
+    <p className="rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-[0.6875rem] leading-snug text-muted-foreground">
+      Reasoning was on, but the model didn&apos;t return any.
+    </p>
   );
 }
 

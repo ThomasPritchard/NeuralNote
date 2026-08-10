@@ -46,8 +46,18 @@ describe("Journey 9: YouTube distil failures and fallbacks", () => {
   it("installs a first-use yt-dlp requirement from the failed skill turn", async () => {
     const missingRequirement =
       "Skill 'youtube-distil' could not be activated: skill 'youtube-distil' is not eligible: unmet requirements: required binary 'yt-dlp' is missing from the app-data bin directory — continuing without it";
+    // Both frames, exactly as the orchestrator emits them: the display-only
+    // narration step, then the structured failure whose `missingBinary` is what
+    // reaches the install affordance now. The sentence is no longer load-bearing.
     const script: ChatEvent[] = [
       { type: "skillStep", message: missingRequirement },
+      {
+        type: "skillActivationFailed",
+        id: "youtube-distil",
+        name: "YouTube distil",
+        message: missingRequirement,
+        missingBinary: "yt-dlp",
+      },
       { type: "done" },
     ];
     const { user, backend, advanceNextFrame, advanceAllFrames } = await openWorkspace({

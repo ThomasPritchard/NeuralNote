@@ -57,6 +57,20 @@ import {
   setup,
 } from "./chatPaneTestHarness";
 
+/** One zero-hit search, in the frame order the orchestrator emits it. */
+const emptySearch = (id: string, query: string): ChatEvent[] => [
+  {
+    type: "toolCall",
+    id,
+    name: "search_notes",
+    title: "Search notes",
+    arguments: JSON.stringify({ query }),
+  },
+  { type: "searching", query },
+  { type: "retrieved", query, hitCount: 0 },
+  { type: "toolResult", id, status: "ok", summary: "0 spans", detail: null },
+];
+
 beforeEach(() => {
   resetChatPaneMocks(reportError);
 });
@@ -301,15 +315,15 @@ describe("ChatPane — chat view", () => {
     ).toHaveClass("max-w-[11rem]");
   });
 
-  it("collapses a finished cited run to a summary line that expands to the full trace", async () => {
+  it("collapses a finished cited run to a summary line that expands to the full rail", async () => {
     const { user } = await askInChat("what is active recall?", CITED_RUN);
 
     // The prompt echoes into the transcript.
     expect(screen.getByText("what is active recall?")).toBeInTheDocument();
 
-    // The finished trace is one collapsed summary line, not a row wall — and it's
-    // collapsed by default so the answer sits right under the prompt.
-    const summaryLine = screen.getByText(/1 search · 1 note · verified/);
+    // The finished process is one collapsed summary line, not a row wall — and
+    // it's collapsed by default so the answer sits right under the prompt.
+    const summaryLine = screen.getByText(/2 tools · 1 search · 1 note · verified/);
     const disclosure = summaryLine.closest("details");
     expect(disclosure).not.toHaveAttribute("open");
 
@@ -323,17 +337,18 @@ describe("ChatPane — chat view", () => {
     // composer re-enabled once the run is done.
     expect(composer()).toBeEnabled();
 
-    // Expanding audits the full deduped trace: the search (with its hit count),
-    // the read (the basename:range stays legible), and the verify step.
+    // Expanding audits the whole rail: the search call with the query it ran and
+    // the spans it got back, the read with its span, and the verify step.
     await user.click(disclosure!.querySelector("summary")!);
     expect(disclosure).toHaveAttribute("open");
-    const trace = screen.getByRole("list", { name: "Search activity" });
-    expect(within(trace).getByText("“active recall”")).toBeInTheDocument();
-    expect(within(trace).getByText(/3 notes/)).toBeInTheDocument();
+    const rail = screen.getByRole("region", { name: "What the assistant did" });
+    expect(within(rail).getByText("Search notes")).toBeInTheDocument();
+    expect(within(rail).getByText(/active recall/)).toBeInTheDocument();
+    expect(within(rail).getByText(/3 spans/)).toBeInTheDocument();
     expect(
-      within(trace).getByText(/Spaced-Repetition\.md:12/),
+      within(rail).getByText(/Spaced-Repetition\.md:12–28/),
     ).toBeInTheDocument();
-    expect(within(trace).getByText("verifying citations")).toBeInTheDocument();
+    expect(within(rail).getByText("verifying citations")).toBeInTheDocument();
   });
 
   it("bounds the live window to the freshest steps while streaming, with a running tally", async () => {
@@ -342,16 +357,34 @@ describe("ChatPane — chat view", () => {
     await screen.findByLabelText("Ask across your vault");
 
     const gate = deferred<string>();
-    // Emit far more steps than the live cap, then stay in-flight (no `done`) so
+    // Emit far more calls than the live cap, then stay in-flight (no `done`) so
     // the turn keeps streaming — this is the thorough-run bloat case.
     mockChat.mockImplementation((_turnId, _p, _h, onEvent) => {
+      onEvent({
+        type: "toolCall",
+        id: "call-0",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: '{"query":"recall"}',
+      });
       onEvent({ type: "searching", query: "recall" });
+      onEvent({ type: "toolResult", id: "call-0", status: "ok", summary: "3 spans", detail: null });
       for (let n = 1; n <= 10; n++) {
+        const relPath = `Note-${String(n).padStart(2, "0")}.md`;
         onEvent({
-          type: "reading",
-          relPath: `Note-${String(n).padStart(2, "0")}.md`,
-          startLine: n,
-          endLine: n + 3,
+          type: "toolCall",
+          id: `call-${n}`,
+          name: "read_note_span",
+          title: "Read note",
+          arguments: JSON.stringify({ rel_path: relPath, start_line: n, end_line: n + 3 }),
+        });
+        onEvent({ type: "reading", relPath, startLine: n, endLine: n + 3 });
+        onEvent({
+          type: "toolResult",
+          id: `call-${n}`,
+          status: "ok",
+          summary: `${relPath}:${n}–${n + 3}`,
+          detail: null,
         });
       }
       return gate.promise; // never resolves → done stays false
@@ -380,28 +413,49 @@ describe("ChatPane — chat view", () => {
     });
   });
 
-  it("renders a short finished run (≤2 steps) inline, with no disclosure chevron", async () => {
+  it("renders a short finished run behind one fold head, with the answer beneath", async () => {
     await askInChat("what is spacing?", [
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: '{"query":"spacing"}',
+      },
       { type: "searching", query: "spacing" },
       { type: "retrieved", query: "spacing", hitCount: 1 },
-      { type: "reading", relPath: "Spacing.md", startLine: 1, endLine: 3 },
+      { type: "toolResult", id: "c1", status: "ok", summary: "1 span", detail: null },
       { type: "answer", delta: "Spacing is spreading review over time." },
       { type: "done" },
     ]);
 
-    // The two steps show as rows directly — a chevron guarding one or two rows is
-    // needless chrome — so there's no summary line and no <details> disclosure.
-    expect(screen.getByText("“spacing”")).toBeInTheDocument();
-    expect(screen.getByText(/Spacing\.md:1/)).toBeInTheDocument();
-    expect(screen.queryByText(/1 search · 1 note/)).not.toBeInTheDocument();
-    expect(document.querySelector("details")).toBeNull();
+    // One process fold carrying the whole rail, collapsed once the answer landed.
+    const summaryLine = screen.getByText(/1 tool · 1 search · nothing found/);
+    expect(screen.getByText("Spacing is spreading review over time.")).toBeInTheDocument();
+    // A search that read nothing is worth looking at, so the fold stays open.
+    expect(summaryLine.closest("details")).toHaveAttribute("open");
+    expect(screen.getByText("Search notes")).toBeInTheDocument();
   });
 
-  it("truncates long vault paths in activity and source rows while retaining full titles", async () => {
+  it("shows a long vault path in full on the rail, and truncates it with a title on the source chip", async () => {
     const relPath =
       "Areas/Programming/Artificial Intelligence/Vibe coding/2026-07-10 The New GPT 5.6 Sol is Insanely Capable and Keeps Going.md";
     await askInChat("q", [
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "read_note_span",
+        title: "Read note",
+        arguments: JSON.stringify({ rel_path: relPath, start_line: 123, end_line: 456 }),
+      },
       { type: "reading", relPath, startLine: 123, endLine: 456 },
+      {
+        type: "toolResult",
+        id: "c1",
+        status: "ok",
+        summary: `${relPath}:123–456`,
+        detail: null,
+      },
       { type: "answer", delta: "A cited answer [e1]." },
       {
         type: "citation",
@@ -414,41 +468,37 @@ describe("ChatPane — chat view", () => {
       { type: "done" },
     ]);
 
-    const activityTail = screen.getByText(/The New GPT 5\.6 Sol.*:123/);
-    expect(activityTail).toHaveClass("min-w-0", "truncate");
-    expect(activityTail.closest("[title]")).toHaveAttribute(
-      "title",
-      `${relPath}:123–456`,
-    );
+    // The rail wraps rather than elides: a truncated span would eat the line
+    // range, which is the citation-relevant half of the string.
+    expect(screen.getByText(`· ${relPath}:123–456`)).toBeInTheDocument();
 
+    // The source chip is a fixed-height row, so it still middle-elides behind a
+    // title that preserves the exact path:line.
     const sourcePath = screen.getByText(`${relPath}:321`);
     expect(sourcePath).toHaveClass("min-w-0", "truncate");
     expect(sourcePath.closest("[title]")).toHaveAttribute("title", `${relPath}:321`);
   });
 
-  it("summarises a run that found nothing as 'N searches · nothing found', trace open", async () => {
+  it("summarises a run that found nothing as 'N searches · nothing found', rail open", async () => {
     await askInChat("do we have notes on quokkas?", [
-      { type: "searching", query: "quokka" },
-      { type: "retrieved", query: "quokka", hitCount: 0 },
-      { type: "searching", query: "marsupial" },
-      { type: "retrieved", query: "marsupial", hitCount: 0 },
-      { type: "searching", query: "wallaby" },
-      { type: "retrieved", query: "wallaby", hitCount: 0 },
+      ...emptySearch("c1", "quokka"),
+      ...emptySearch("c2", "marsupial"),
+      ...emptySearch("c3", "wallaby"),
       { type: "answer", delta: "I couldn't find anything on quokkas." },
       { type: "done" },
     ]);
 
     // No absurd "· verified" when retrieval came up empty — a distinct, honest copy.
-    const summaryLine = screen.getByText(/3 searches · nothing found/);
+    const summaryLine = screen.getByText(/3 tools · 3 searches · nothing found/);
     expect(screen.queryByText(/verified/)).not.toBeInTheDocument();
 
     // Defaults OPEN so the zero-hit queries — what the user might rephrase — show.
     const disclosure = summaryLine.closest("details");
     expect(disclosure).toHaveAttribute("open");
-    const trace = screen.getByRole("list", { name: "Search activity" });
-    expect(within(trace).getByText("“quokka”")).toBeInTheDocument();
-    // Zero-hit searches stay honest in the trace — "→ 0 notes", never hidden.
-    expect(within(trace).getAllByText(/0 notes/)).toHaveLength(3);
+    const rail = screen.getByRole("region", { name: "What the assistant did" });
+    expect(within(rail).getByText("· quokka")).toBeInTheDocument();
+    // Zero-hit searches stay honest on the rail — "0 spans", never hidden.
+    expect(within(rail).getAllByText("· 0 spans")).toHaveLength(3);
   });
 
   it("passes the prior turn as history on the next question", async () => {

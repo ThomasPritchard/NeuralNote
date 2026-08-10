@@ -6,7 +6,7 @@
 // its authority over failed runs).
 
 import { useState } from "react";
-import { AlertTriangle, Check, FilePlus2, Info, Loader2, Undo2 } from "lucide-react";
+import { AlertTriangle, Check, FileCheck2, FilePlus2, Info, Loader2, Undo2 } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import { cn } from "../lib/cn";
@@ -71,8 +71,39 @@ function PathLabel({ relPath }: Readonly<{ relPath: string }>) {
   );
 }
 
+/** One row of the ledger: the requested kind, and the path as a button that
+ *  opens it. Shared by both groups so a note reads the same whether this run
+ *  wrote it or found it already there. */
+function LedgerRow({
+  file,
+  disabled,
+  onOpen,
+}: Readonly<{
+  file: { relPath: string; kind: NoteKind };
+  disabled: boolean;
+  onOpen: (relPath: string) => void;
+}>) {
+  return (
+    <div className="flex min-w-0 items-center gap-2">
+      <span className="nn-mono shrink-0 rounded-full bg-muted/40 px-1.5 py-px text-[0.5625rem] uppercase tracking-[0.08em] text-muted-foreground ring-1 ring-inset ring-border">
+        {file.kind}
+      </span>
+      <button
+        type="button"
+        aria-label={`Open ${file.relPath}`}
+        disabled={disabled}
+        onClick={() => onOpen(file.relPath)}
+        className="flex min-h-6 min-w-0 flex-1 rounded-sm text-left hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-45"
+      >
+        <PathLabel relPath={file.relPath} />
+      </button>
+    </div>
+  );
+}
+
 export function SkillReportCard({
   files,
+  existing = [],
   runId,
   done,
   partial = false,
@@ -81,6 +112,10 @@ export function SkillReportCard({
 }: Readonly<{
   /** The `NoteWritten` accumulation, in write order. */
   files: ReadonlyArray<{ relPath: string; kind: NoteKind }>;
+  /** The `NoteExists` accumulation: create-only writes that hit a note the user
+   *  already had. Nothing landed on disk for these, so they are listed apart and
+   *  never counted as written — and Undo has nothing of theirs to remove. */
+  existing?: ReadonlyArray<{ relPath: string; kind: NoteKind }>;
   /** The run id `chat` resolved with — null until the run settles. */
   runId: string | null;
   /** Whether the run has ended (Undo only makes sense on a settled run). */
@@ -113,11 +148,13 @@ export function SkillReportCard({
   const removedCount =
     report?.files.filter((f) => f.status === "deleted").length ?? 0;
 
-  // The button's three lives: fresh Undo, a retry after any failure, and gone
-  // once every file reached a terminal non-failed outcome (nothing left to do).
+  // The button's four lives: absent when nothing was written (an already-present
+  // note is not this run's to remove), fresh Undo, a retry after any failure, and
+  // gone once every file reached a terminal non-failed outcome.
   const showUndo =
     done &&
     runId !== null &&
+    files.length > 0 &&
     (undo.status === "idle" ||
       undo.status === "running" ||
       undo.status === "error" ||
@@ -125,13 +162,15 @@ export function SkillReportCard({
 
   return (
     <section
-      aria-label="Notes written by this run"
+      aria-label="Notes from this run"
       className="flex min-w-0 flex-col gap-2 rounded-lg border border-border/60 bg-background/30 px-3 py-2.5"
     >
-      <p className="flex items-center gap-1.5 text-[0.6875rem] font-medium text-foreground/80">
-        <FilePlus2 className="size-3.5 shrink-0 text-primary" aria-hidden />
-        {count(files.length, "note written", "notes written")}
-      </p>
+      {files.length > 0 && (
+        <p className="flex items-center gap-1.5 text-[0.6875rem] font-medium text-foreground/80">
+          <FilePlus2 className="size-3.5 shrink-0 text-primary" aria-hidden />
+          {count(files.length, "note written", "notes written")}
+        </p>
+      )}
 
       {partial && (
         <div className="flex items-start gap-2 rounded-lg border border-amber-500/25 bg-amber-500/[0.07] px-2.5 py-2 text-amber-200/90">
@@ -148,44 +187,61 @@ export function SkillReportCard({
         </div>
       )}
 
-      <ul aria-label="Written notes" className="flex min-w-0 flex-col gap-1.5">
-        {files.map((file) => {
-          const outcome = outcomeFor(file.relPath);
-          const removed =
-            outcome?.status === "deleted" || outcome?.status === "skippedMissing";
-          return (
-            <li key={file.relPath} className="flex min-w-0 flex-col gap-0.5">
-              <div className="flex min-w-0 items-center gap-2">
-                <span className="nn-mono shrink-0 rounded-full bg-muted/40 px-1.5 py-px text-[0.5625rem] uppercase tracking-[0.08em] text-muted-foreground ring-1 ring-inset ring-border">
-                  {file.kind}
+      {files.length > 0 && (
+        <ul aria-label="Written notes" className="flex min-w-0 flex-col gap-1.5">
+          {files.map((file) => {
+            const outcome = outcomeFor(file.relPath);
+            const removed =
+              outcome?.status === "deleted" || outcome?.status === "skippedMissing";
+            return (
+              <li key={file.relPath} className="flex min-w-0 flex-col gap-0.5">
+                <LedgerRow file={file} disabled={removed} onOpen={onOpen} />
+                {outcome && (
+                  <span
+                    className={cn(
+                      "flex items-start gap-1.5 pl-1 text-[0.625rem] leading-snug",
+                      outcome.status === "failed"
+                        ? "text-destructive"
+                        : "text-muted-foreground/80",
+                    )}
+                  >
+                    <OutcomeGlyph status={outcome.status} />
+                    <span className="min-w-0 break-words">{outcomeCopy(outcome)}</span>
+                  </span>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+
+      {existing.length > 0 && (
+        // A create-only write that hit a note the user already had wrote
+        // NOTHING. Listing these among the written ones would claim authorship
+        // of the user's own note and offer to "undo" a file this run never
+        // touched — so they get their own labelled group, their own quieter
+        // glyph, and no Undo. The no-op is still surfaced: silence here is what
+        // #108 was about.
+        <div className="flex min-w-0 flex-col gap-1.5">
+          <p className="flex items-center gap-1.5 text-[0.6875rem] font-medium text-muted-foreground">
+            <FileCheck2 className="size-3.5 shrink-0 text-muted-foreground/70" aria-hidden />
+            {count(existing.length, "note", "notes")} already in your vault
+          </p>
+          <ul
+            aria-label="Notes that already existed"
+            className="flex min-w-0 flex-col gap-1.5"
+          >
+            {existing.map((file) => (
+              <li key={file.relPath} className="flex min-w-0 flex-col gap-0.5">
+                <LedgerRow file={file} disabled={false} onOpen={onOpen} />
+                <span className="pl-1 text-[0.625rem] leading-snug text-muted-foreground/80">
+                  Left as it was — nothing was written
                 </span>
-                <button
-                  type="button"
-                  aria-label={`Open ${file.relPath}`}
-                  disabled={removed}
-                  onClick={() => onOpen(file.relPath)}
-                  className="flex min-h-6 min-w-0 flex-1 rounded-sm text-left hover:text-primary focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring disabled:cursor-not-allowed disabled:opacity-45"
-                >
-                  <PathLabel relPath={file.relPath} />
-                </button>
-              </div>
-              {outcome && (
-                <span
-                  className={cn(
-                    "flex items-start gap-1.5 pl-1 text-[0.625rem] leading-snug",
-                    outcome.status === "failed"
-                      ? "text-destructive"
-                      : "text-muted-foreground/80",
-                  )}
-                >
-                  <OutcomeGlyph status={outcome.status} />
-                  <span className="min-w-0 break-words">{outcomeCopy(outcome)}</span>
-                </span>
-              )}
-            </li>
-          );
-        })}
-      </ul>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       {provenance.length > 0 && (
         <div className="flex flex-col gap-1 border-t border-border/50 pt-2">

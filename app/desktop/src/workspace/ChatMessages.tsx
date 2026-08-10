@@ -1,10 +1,10 @@
-// Renders the chat transcript: user prompts, and assistant turns as the live
-// "harness" trace — a step-by-step activity log (searching / reading /
-// verifying / dropped), optional collapsed reasoning, the streamed markdown
-// answer, clickable source chips, a coverage footer, and a surfaced inline
-// error. Presentational only; all state folding lives in `chatMessage.ts`. The
-// per-part views (activity trace, skill chrome, sources, turn notices) live in
-// sibling modules; this file composes them into a turn and the transcript.
+// Renders the chat transcript: user prompts, and assistant turns as the
+// timeline rail of what the assistant did (reasoning, tool calls, verification,
+// dropped citations), the streamed markdown answer, clickable source chips, a
+// coverage footer, and a surfaced inline error. Presentational only; all state
+// folding lives in `chatMessage.ts`. The per-part views (the timeline, skill
+// chrome, sources, turn notices) live in sibling modules; this file composes
+// them into a turn and the transcript.
 
 import { useCallback, useState } from "react";
 import { AlertTriangle, Square } from "lucide-react";
@@ -22,10 +22,14 @@ import type {
   ChatMessage,
   CitationView,
 } from "./chatMessage";
-import { ActivityTrace } from "./ChatActivityTrace";
+import { ChatTimeline } from "./ChatTimeline";
 import { SkillActivations, SkillSteps } from "./ChatSkillChrome";
 import { Sources } from "./ChatSources";
-import { CoverageFooter, NothingFoundCard, Reasoning } from "./ChatTurnNotices";
+import {
+  CoverageFooter,
+  MissingReasoningNotice,
+  NothingFoundCard,
+} from "./ChatTurnNotices";
 
 // Re-exported so `playfulProgressCopy.test.ts` (and any other importer) can keep
 // pulling it from "./ChatMessages" even though it now lives in its own module.
@@ -68,6 +72,15 @@ function AssistantTurn({
     turn.skillActivations.length > 0 ||
     turn.skillSteps.length > 0 ||
     turn.pendingElicitation !== null;
+  // An activation failure arrives twice: once as narration and once as the
+  // structured event that carries the remedy. Both strings are backend-composed
+  // and identical, so comparing them is a set membership test over data that
+  // crossed the same wire — not the hand-copied sentence this phase deleted. The
+  // structured node wins; its duplicate narration row is dropped.
+  const failureMessages = new Set(
+    turn.skillActivationFailures.map((failure) => failure.message),
+  );
+  const narratedSteps = turn.skillSteps.filter((step) => !failureMessages.has(step));
   return (
     // No turn-wide aria-live: the per-row activity churn (15–20 mutations a run)
     // must stay silent. Liveness is scoped instead to the phase line (role=status),
@@ -75,16 +88,13 @@ function AssistantTurn({
     <div className="flex flex-col gap-3 rounded-xl border border-border bg-background/30 px-3 py-3">
       <SkillActivations activations={turn.skillActivations} />
       <SkillSteps
-        steps={turn.skillSteps}
+        steps={narratedSteps}
         working={!turn.done && !answering && !awaitingUser && turn.error === null}
       />
-      <ActivityTrace
-        activity={turn.activity}
-        phase={turn.phase}
+      <ChatTimeline
+        turn={turn}
         prompt={prompt}
         answering={answering}
-        done={turn.done}
-        errored={turn.error !== null}
         suppressLive={hasSkillNarrative}
       />
       {turn.stopped && (
@@ -93,10 +103,10 @@ function AssistantTurn({
           Stopped
         </p>
       )}
-      <Reasoning
+      <MissingReasoningNotice
         text={turn.thinking}
         requested={turn.reasoningRequested}
-        showMissing={turn.done && turn.error === null && !turn.stopped && answering}
+        show={turn.done && turn.error === null && !turn.stopped && answering}
       />
       {turn.pendingElicitation !== null && turn.turnId !== null && (
         // Keyed by elicitation id: a follow-up question in the same turn is a
@@ -134,9 +144,13 @@ function AssistantTurn({
       {showsNothingFoundCard(turn) && turn.coverage && (
         <NothingFoundCard terms={turn.coverage.searchedTerms} />
       )}
-      {turn.writtenNotes.length > 0 && (
+      {(turn.writtenNotes.length > 0 || turn.existingNotes.length > 0) && (
+        // A run that wrote nothing because every note already existed still gets
+        // the card: the no-op has to reach the user (#108), and the card is where
+        // the ledger lives.
         <SkillReportCard
           files={turn.writtenNotes}
+          existing={turn.existingNotes}
           runId={runId}
           done={turn.done}
           partial={isPartialSkillRun(turn)}

@@ -94,10 +94,43 @@ export function scriptChat(events: ChatEvent[]) {
   });
 }
 
+// A full cited run, in the frame order the orchestrator actually emits: each
+// dispatched call is announced before it runs and settled exactly once, with the
+// searching/reading cues it raises on the way. The `title` and `summary` strings
+// are the Rust-composed ones from `tool_registry` / `settlement_for` — the UI
+// composes neither.
 export const CITED_RUN: ChatEvent[] = [
+  {
+    type: "toolCall",
+    id: "call-search",
+    name: "search_notes",
+    title: "Search notes",
+    arguments: '{"query":"active recall"}',
+  },
   { type: "searching", query: "active recall" },
   { type: "retrieved", query: "active recall", hitCount: 3 },
+  {
+    type: "toolResult",
+    id: "call-search",
+    status: "ok",
+    summary: "3 spans",
+    detail: null,
+  },
+  {
+    type: "toolCall",
+    id: "call-read",
+    name: "read_note_span",
+    title: "Read note",
+    arguments: '{"rel_path":"Spaced-Repetition.md","start_line":12,"end_line":28}',
+  },
   { type: "reading", relPath: "Spaced-Repetition.md", startLine: 12, endLine: 28 },
+  {
+    type: "toolResult",
+    id: "call-read",
+    status: "ok",
+    summary: "Spaced-Repetition.md:12–28",
+    detail: null,
+  },
   { type: "verifying" },
   { type: "answer", delta: "Active recall " },
   { type: "answer", delta: "means testing yourself." },
