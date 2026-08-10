@@ -1,10 +1,14 @@
 # Prototype verdict — NeuralNote app workspace
 
-**Question this prototype answers:** What should the NeuralNote app workspace look and feel like?
+> **Historical record.** This is the verdict that produced the app's current look. The prototype
+> code itself was removed in the commit that added this note; it lives on in git history at
+> `4d87df3`. The screenshots referenced below travelled with this doc into `shots/`.
+
+**Question this prototype answered:** What should the NeuralNote app workspace look and feel like?
 Six directions, same vault data, switchable live (`?variant=` + `←/→`).
 
 ## Status: 6/6 built & verified
-- All six render correctly at 1440×900 (see `neuralnote-proto/shots/*.png` + `contact-sheet.png`).
+- All six render correctly at 1440×900 (see `shots/*.png` + `shots/contact-sheet.png`).
 - `npx tsc -b` clean (exit 0). Agents stayed in their own files; shared files + memory dir untouched.
 - Every direction preserves the moat: cited chat with inline `[n]` → citation cards carrying real
   locators (`04:12` / `07:48` / `p.3`), and the retained full-source transcript is visible.
