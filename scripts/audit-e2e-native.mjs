@@ -23,27 +23,10 @@ const e2eNativeDir = path.resolve(here, "../app/desktop/e2e-native");
 // an acceptance can never cover a different package. Each entry MUST carry: why no
 // compatible fix can be locked, why the risk is not reachable here, and the trigger
 // that should remove the acceptance.
-const ACCEPTED = new Map([
-  [
-    "GHSA-mh99-v99m-4gvg",
-    {
-      package: "brace-expansion",
-      rationale:
-        "brace-expansion <=5.0.7: DoS via unbounded expansion length. " +
-        "No compatible fix exists — only the 5.0.8+ line is patched, and it changed " +
-        "the CommonJS export shape (named `expand`), so forcing it onto the minimatch " +
-        "3.x/5.x/9.x consumers here (function-call import) breaks them at runtime " +
-        "(verified against the published tarballs). " +
-        "Reachability: the expansion path is only reachable through glob patterns, " +
-        "and e2e-native passes only fixed spec paths selected by the internal " +
-        "`nativeSpecsForPhase` allowlist in wdio.conf.ts. The phase is accepted only " +
-        "when it exactly matches a fixed value, so no untrusted input reaches glob " +
-        "expansion. The package is CI-only dev tooling that ships no artifact. " +
-        "Removal trigger: when minimatch/mocha/webdriverio releases pull a patched " +
-        "brace-expansion within compatible ranges, `npm audit fix` and delete this entry.",
-    },
-  ],
-]);
+// Empty on purpose: no advisory is currently accepted as residual risk. The
+// brace-expansion acceptance (GHSA-mh99-v99m-4gvg) was removed once upstream pulled a
+// patched version within compatible ranges, which was its documented removal trigger.
+const ACCEPTED = new Map([]);
 
 // npm's severity scale. Anything outside this table is schema drift → exit 2.
 const SEVERITY_RANK = { low: 1, moderate: 2, high: 3, critical: 4 };
