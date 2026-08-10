@@ -150,7 +150,25 @@ if (unaccepted.length > 0) {
   fail(`unaccepted advisories at or above the high gate:\n  ${unaccepted.join("\n  ")}`);
 }
 
+// An acceptance that matched nothing is not harmless: it is a standing
+// pre-authorisation for that advisory to return. If a later dependency change makes
+// the same GHSA reachable in a context its rationale never covered, the gate accepts
+// it silently and still prints PASS. Reporting only what blocked and what was
+// accepted makes "0 accepted" and "no stale entries" indistinguishable, which is how
+// the brace-expansion entry sat dormant here until it was found by hand.
+//
+// Warn rather than fail: a stale entry means upstream FIXED something, and turning
+// someone else's good news into a red build teaches people to distrust the gate.
+const stale = [...ACCEPTED.keys()].filter((id) => !acceptedSeen.includes(id));
+for (const id of stale) {
+  console.warn(
+    `audit-e2e-native: WARNING: accepted advisory ${id} ` +
+      `(${ACCEPTED.get(id).package}) matched nothing in this run — it is dormant and ` +
+      `still armed. Confirm it is genuinely resolved upstream, then delete the entry.`,
+  );
+}
+
 console.log(
   `audit-e2e-native: PASS (${advisories.size} advisories, ${acceptedSeen.length} accepted, ` +
-    `${unaccepted.length} blocking)`,
+    `${unaccepted.length} blocking, ${stale.length} stale acceptances)`,
 );
