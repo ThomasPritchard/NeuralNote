@@ -11,6 +11,8 @@ export default defineConfig({
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
+    // Explicit since @vitejs/plugin-react v5 stopped adding these automatically.
+    dedupe: ["react", "react-dom"],
   },
   test: {
     environment: "jsdom",

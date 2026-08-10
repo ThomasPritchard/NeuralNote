@@ -39,6 +39,11 @@ export default defineConfig({
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
+    // Explicit since @vitejs/plugin-react v5 stopped adding these automatically.
+    // This config is the one that most needs it: the graph specs pull in `three`,
+    // which is exactly the path the optimizeDeps note above guards against
+    // loading a second React on.
+    dedupe: ["react", "react-dom"],
   },
   test: {
     include: ["src/**/*.browser.test.{ts,tsx}"],
