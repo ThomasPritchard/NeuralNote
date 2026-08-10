@@ -172,9 +172,23 @@ async function scrollUpByKeyboard(port: HTMLElement): Promise<void> {
     port.focus();
   });
   expect(document.activeElement).toBe(port);
-  await userEvent.keyboard("{PageUp}");
-  await waitForScrollEnd(port);
-  expect(distanceFromBottom(port)).toBeGreaterThan(BOTTOM_THRESHOLD_PX);
+  // A single PageUp is not reliable when the whole browser suite runs: several
+  // test iframes exist at once, and a backgrounded one can drop the key or never
+  // run Chromium's ANIMATED keyboard scroll, so `waitForScrollEnd` returns with
+  // the port still at the bottom. Measured ~30-50% failure at this line.
+  //
+  // Retry DELIVERY, not the assertion. The condition below is the same one the
+  // old code asserted once, so a hook that genuinely stopped releasing on scroll
+  // still fails — it just no longer fails because a keypress went missing.
+  await expect
+    .poll(async () => {
+      if (distanceFromBottom(port) <= BOTTOM_THRESHOLD_PX) {
+        await userEvent.keyboard("{PageUp}");
+        await waitForScrollEnd(port);
+      }
+      return distanceFromBottom(port);
+    }, POLL)
+    .toBeGreaterThan(BOTTOM_THRESHOLD_PX);
 }
 
 describe("chat transcript — real-browser scroll follow", () => {
