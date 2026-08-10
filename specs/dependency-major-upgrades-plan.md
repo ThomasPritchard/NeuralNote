@@ -1,7 +1,11 @@
 # Dependency major upgrades — analysis and plan
 
-> Status: **analysis complete, nothing executed**. Written 2026-08-10 alongside PR #107, which
-> cleared every advisory and took every in-range update. What remains is out-of-range only.
+> Status: **steps 1-3 executed in PR #107; steps 4-6 remain**. Written 2026-08-10.
+>
+> Done: `@testing-library/jest-dom` 7.0.1, `@vitejs/plugin-react` 5.2.0 with `resolve.dedupe`
+> made explicit in all three configs, and `@wdio/tauri-*` 1.3.0 across all four coordinates
+> (including the `@wdio/native-utils` override that would otherwise have silently downgraded it).
+> Outstanding: **Vite 8**, then `@vitejs/plugin-react` 6, and **jsdom 30** once 30.0.2 ships.
 >
 > All version, engine, and peer-range claims below were verified against the npm registry and
 > crates.io at the time of writing, not asserted from memory. Re-check before executing — the
@@ -14,9 +18,9 @@ either npm project or the Cargo workspace. Every remaining item is a deliberate 
 
 | Package | Current | Latest | Verdict | Effort |
 | --- | --- | --- | --- | --- |
-| `@testing-library/jest-dom` | 6.9.1 | 7.0.1 | **Take now** | ~10 min |
-| `@vitejs/plugin-react` | 4.7.0 | 5.2.0 (interim) | **Take now** | ~15 min |
-| `@wdio/tauri-plugin` / `-service` (+ Rust crates) | 1.2.0 | 1.3.0 | **Take, own commit** | ~half day |
+| `@testing-library/jest-dom` | ~~6.9.1~~ 7.0.1 | 7.0.1 | ✅ **Done** | ~10 min |
+| `@vitejs/plugin-react` | ~~4.7.0~~ 5.2.0 | 5.2.0 (interim) | ✅ **Done** | ~15 min |
+| `@wdio/tauri-plugin` / `-service` (+ Rust crates) | ~~1.2.0~~ 1.3.0 | 1.3.0 | ✅ **Done** | ~half day |
 | `vite` | 7.3.6 | 8.2.1 | **Schedule** | 4–8 h |
 | `@vitejs/plugin-react` | 5.2.0 | 6.0.5 | **With Vite 8** | in the above |
 | `jsdom` | 29.1.1 | 30.0.1 | **Wait for 30.0.2** | blocked |
