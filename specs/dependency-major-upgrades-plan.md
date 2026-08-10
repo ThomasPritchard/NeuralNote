@@ -234,3 +234,75 @@ an unexplained exact pin reads as an accident to the next person. Ties to the sa
 `e2e-native`. The app was deliberately moved to TS 7, so the split may simply be that e2e-native was
 never migrated. Two majors of drift in one repo is a papercut that grows; either close it or write
 down why it stays open.
+
+---
+
+## Deferred
+
+Everything PR #107 knowingly left undone. Grouped by whether it is ours to fix.
+
+### Ours, scheduled
+
+- **`DEFER(vite-8)`** — steps 4 and 5 above (`vite` 8.2.x + `@vitejs/plugin-react` 6.0.5).
+  Needs a clear window, not a release run-up. The risk is concentrated in
+  `scripts/assert-production-bundle.mjs`, which holds only because the bundler's dead-code
+  elimination drops the `import.meta.env`-guarded native-e2e imports; Rolldown's DCE is a
+  different implementation and no documentation can answer whether it behaves identically.
+- **`DEFER(codemirror-pins)`** — `@codemirror/lang-markdown` (6.5.1, 6.5.2 available) and
+  `@codemirror/view` (6.43.6, 6.43.8 available) are pinned to exact versions, so routine patches
+  do not flow. Almost certainly deliberate given how much editor behaviour is tuned against
+  CodeMirror internals, but the intent is not written down anywhere, so it reads as an accident.
+  Confirm and record, or unpin.
+- **`DEFER(typescript-split)`** — TS `7.0.2` in `app/desktop` vs `~5.8.3` in `e2e-native`.
+
+### Ours, verification gaps rather than changes
+
+- **`DEFER(wdio-native-tier)`** — the `@wdio/tauri-*` 1.3.0 bump could not be exercised locally:
+  the native tier needs a built binary on macOS CI. 1.3.0 adds ~300 lines of macOS/WebKit
+  DirectEval handling plus a new `eval_channel.rs` under the execution path that suite drives,
+  and this repo has already shipped one WKWebView-specific bug (58a1664). Watch that lane across
+  several runs, not one.
+- One frontend test failed once while the Rust quality gate was running concurrently, then passed
+  on an idle re-run. It was not identified before it recovered, so it is recorded here rather
+  than diagnosed. If a jsdom test starts failing only under parallel load, this is the first
+  place to look.
+- `production-dependencies.test.ts` deliberately keeps `v1.2.0` and `desktop v0.2.1` in its
+  fixture strings. They are synthetic inputs proving the rejection is version-independent, not
+  pins — do not "fix" them to match the real versions.
+
+### Blocked upstream
+
+- **`DEFER(jsdom-30)`** — step 6 above. Two independent blockers: jsdom 30's `engines`
+  (`^22.22.2 || ^24.15.0 || >=26.0.0`) exclude versions our declared range admits in both arms,
+  and 30.0.1 ships a `querySelectorAll` regression (jsdom#4227) whose fix landed by bumping
+  `@asamuzakjp/dom-selector` **outside 30.0.1's own declared `^8.3.0` range**, so a fresh install
+  today still carries the bug. Re-evaluate when 30.0.2 ships. If it is attempted anyway and tests
+  begin hanging, pin `@testing-library/user-event` to 14.6.1 first to isolate — user-event#1323
+  reports exactly that on a stack matching ours in every respect except jsdom 30.
+- The 17 `cargo audit` warnings (Tauri's gtk-rs 0.18 GTK3 chain and the `unic-*` family). Fully
+  accounted for in `docs/security/dependency-advisories.md`; both groups are upstream-blocked and
+  neither compiles into the `aarch64-apple-darwin` bundle.
+
+### Pre-existing, not introduced here
+
+- **The webkit browser lane fails on `main`.** Re-running main's own CI job at `4d87df3` — which
+  passed on 2026-08-01 — reproduced the failures on unmodified code (`TitleBar` drag-layer hit
+  test plus three `SourceNoteEditor` tests). The specific set varies per run, which is the
+  signature of a contended runner rather than a deterministic break; the full suite passes
+  locally on the same engine build. One contributing cause *was* fixed here (the scroll-sync
+  frame assertion's tolerance did not scale with its baseline), but the remaining failures are
+  geometry assertions against a runner whose frames measured ~40x slower than healthy. Worth its
+  own issue: the lane is informational, so it fails quietly and permanently, and a gate nobody
+  trusts is not a gate.
+- **A fresh clone or worktree cannot build the `desktop` crate** until `scripts/fetch-ollama-sidecar.sh`
+  has been run there. It writes three gitignored artifacts — `binaries/ollama-*`,
+  `binaries/llama-server-*` and `ollama-libs/` — and the last is a resource *glob*, where matching
+  nothing is a hard build failure. The script already existed; the gap was that `CONTRIBUTING.md`
+  framed it as a prerequisite for `tauri dev` rather than for **any** Rust build, so someone running
+  only `cargo test --workspace` or the quality gate hits a Rust build error that reads as a code
+  problem. Fixed in `CONTRIBUTING.md`.
+
+### One-time, post-merge
+
+- Deleting `prototype/` removes the tracked files only. The untracked `prototype/node_modules`
+  (~352MB) survives in any existing checkout and must be removed by hand.

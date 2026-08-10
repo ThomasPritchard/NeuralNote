@@ -27,12 +27,20 @@ rustup toolchain install 1.96.0 --component clippy,rustfmt,llvm-tools-preview
 npm --prefix app/desktop ci
 ```
 
-For the native app on macOS, fetch the checksum-pinned Ollama sidecar:
+Fetch the checksum-pinned Ollama sidecar:
 
 ```bash
 ./scripts/fetch-ollama-sidecar.sh
 npm --prefix app/desktop run tauri dev
 ```
+
+Run this in **every** fresh clone or `git worktree`, before any Rust build — not just before
+`tauri dev`. It writes three gitignored artifacts that `tauri.conf.json` declares:
+`src-tauri/binaries/ollama-*`, `src-tauri/binaries/llama-server-*`, and `src-tauri/ollama-libs/`.
+Without them `cargo clippy --workspace`, `cargo test --workspace` and `scripts/rust-quality-gate.sh`
+all fail to build the `desktop` crate. `ollama-libs/` is declared as a resource *glob*, and a glob
+matching nothing is a hard build failure. The symptom is a Rust build error, so it reads as a code
+problem rather than a missing-artifact one.
 
 For frontend-only work:
 
