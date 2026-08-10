@@ -14,6 +14,15 @@
     "jsx-a11y"
   ],
   "rules": {
+    // The 500-line guardrail. It was a convention with no failing check until
+    // 2026-08 — which is how `ChatPane.test.tsx` reached 1595 lines (issues #64
+    // and #105). Counting skips blank lines and comments, so the budget is 500
+    // lines of actual code and a well-documented file is never punished for its
+    // documentation. Test files are exempt on purpose; see the override below.
+    "eslint/max-lines": [
+      "error",
+      { "max": 500, "skipBlankLines": true, "skipComments": true }
+    ],
     "eslint/no-underscore-dangle": [
       "error",
       {
@@ -63,6 +72,22 @@
     "unicorn/no-array-sort": "off",
     "unicorn/no-array-reverse": "off"
   },
+  "overrides": [
+    {
+      // Test files are exempt from `max-lines`, deliberately and not as an
+      // apology. On production code a line cap forces DECOMPOSITION, which is
+      // the thing worth having. On a test file the same cap forces splitting a
+      // suite by line COUNT, which scatters related cases into arbitrarily
+      // divided files and makes the coverage of one unit harder to find, not
+      // easier. Test files get split by CONCERN when they get unwieldy — which
+      // is what happened to `ChatPane.test.tsx` — and that is a review
+      // judgement, not an arithmetic one.
+      "files": ["**/*.test.ts", "**/*.test.tsx", "**/*.node-test.mjs"],
+      "rules": {
+        "eslint/max-lines": "off"
+      }
+    }
+  ],
   "ignorePatterns": [
     "coverage/**",
     "dist/**",

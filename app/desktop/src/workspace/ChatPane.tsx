@@ -13,7 +13,7 @@ import { cn } from "../lib/cn";
 import { useVault } from "../lib/store";
 import { buttonVariants } from "@/components/ui/button";
 import { StatusPill as NeuralStatusPill } from "@/components/neural/patterns";
-import { ChatMessages } from "./ChatMessages";
+import { ChatTranscript } from "./ChatTranscript";
 import type { CitationView } from "./chatMessage";
 import { ChatComposer } from "./ChatComposer";
 import { DisconnectedPane, KeySetupPanel } from "./KeySetupPanel";
@@ -168,32 +168,14 @@ export function ChatPane({
 
       {view === "chat" && (
         <>
-          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-            {chat.messages.length === 0 ? (
-              <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
-                <span className="grid size-11 place-items-center rounded-xl bg-primary/10 text-primary ring-1 ring-inset ring-primary/20">
-                  <Sparkles className="size-5" aria-hidden />
-                </span>
-                <div className="flex flex-col gap-1.5">
-                  <p className="text-[0.8125rem] font-medium text-foreground/90">
-                    Ask anything across your vault
-                  </p>
-                  <p className="mx-auto max-w-[15rem] text-[0.75rem] leading-relaxed text-muted-foreground">
-                    Watch the answer get searched, read and citation-checked live.
-                  </p>
-                </div>
-              </div>
-            ) : (
-              <ChatMessages
-                messages={chat.messages}
-                onOpenCitation={openCitation}
-                onOpenNote={openWrittenNote}
-                onSendFollowUp={chat.sendPrompt}
-                busy={chat.busy}
-                runIds={chat.runIds}
-              />
-            )}
-          </div>
+          <ChatTranscript
+            messages={chat.messages}
+            onOpenCitation={openCitation}
+            onOpenNote={openWrittenNote}
+            onSendFollowUp={chat.sendPrompt}
+            busy={chat.busy}
+            runIds={chat.runIds}
+          />
 
           <ChatComposer
             stopError={chat.stopError}

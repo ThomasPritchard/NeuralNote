@@ -89,6 +89,7 @@ Unavailable is never equivalent to passed. Do not start SonarQube or reset its v
 - Do not rely on secrecy of prompts or source code. Assume public source and attacker-controlled model input.
 - Use platform or maintained library protections before hand-written parser or validator approximations.
 - Keep scope narrow. Do not refactor adjacent code, change formatting broadly, or rewrite contracts without an explicit requirement.
+- Keep a frontend source file under 500 lines of code. This is enforced by `eslint/max-lines` in `app/desktop/.oxlintrc.json` (blank lines and comments are not counted), so a breach fails `npm --prefix app/desktop run lint`. Test files are exempt on purpose — split a suite by concern, never by line count. An unavoidable exception is a per-file `// oxlint-disable eslint/max-lines` carrying its reason, never an entry in `ignorePatterns`.
 
 ## Security-sensitive changes
 

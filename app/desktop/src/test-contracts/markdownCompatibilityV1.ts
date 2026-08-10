@@ -1,3 +1,9 @@
+// oxlint-disable eslint/max-lines -- This is a frozen CONTRACT corpus: the
+// Markdown compatibility matrix, one entry per construct. A 500-line cap
+// forces decomposition, which is the right pressure on production code and
+// the wrong pressure here — splitting a contract by line count scatters it
+// across files and makes "is this construct covered?" harder to answer. Remove
+// this directive if the corpus is ever restructured into real modules.
 export type MarkdownSupportLevelV1 = "livePreview" | "sourceOnly" | "inert";
 export type MarkdownActiveCaretBehaviorV1 =
   | "reveal source markers for the active construct"
