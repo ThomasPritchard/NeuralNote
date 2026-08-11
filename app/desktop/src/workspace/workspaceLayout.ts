@@ -4,6 +4,12 @@ export interface WorkspaceLayoutState {
   navigationExpanded: boolean;
   sidebarWidth: number;
   sidebarPanel: SidebarPanel;
+  /**
+   * Whether the chat pane is widened to its expanded size. The width itself
+   * belongs to the `--chat-width` CSS token, responsive overrides included;
+   * this flag only records which of the two sizes the user asked for.
+   */
+  chatExpanded: boolean;
 }
 
 export interface WorkspaceMeasurements {
@@ -33,6 +39,7 @@ export const DEFAULT_WORKSPACE_LAYOUT: WorkspaceLayoutState = {
   navigationExpanded: true,
   sidebarWidth: 296,
   sidebarPanel: "files",
+  chatExpanded: false,
 };
 
 interface LayoutStorage {
@@ -54,6 +61,16 @@ function defaultStorage(): LayoutStorage | undefined {
 
 function isSidebarPanel(value: unknown): value is SidebarPanel {
   return value === "files" || value === "search" || value === null;
+}
+
+/**
+ * Reads the chat expand flag tolerantly, so a stored payload written before the
+ * toggle existed keeps the sidebar geometry saved alongside it. Rejecting the
+ * whole payload over an absent or junk flag would reset every user's pane width,
+ * which is why this stays on version 2 rather than becoming a version 3.
+ */
+function readChatExpanded(value: unknown): boolean {
+  return value === true;
 }
 
 function parseLegacyWorkspaceLayout(raw: string | null): WorkspaceLayoutState | null {
@@ -79,6 +96,7 @@ function parseLegacyWorkspaceLayout(raw: string | null): WorkspaceLayoutState | 
         SIDEBAR_MAX_WIDTH,
       ),
       sidebarPanel: "files",
+      chatExpanded: false,
     };
   } catch {
     return null;
@@ -109,6 +127,7 @@ export function parseWorkspaceLayout(raw: string | null): WorkspaceLayoutState {
         SIDEBAR_MAX_WIDTH,
       ),
       sidebarPanel: candidate.sidebarPanel,
+      chatExpanded: readChatExpanded(candidate.chatExpanded),
     };
   } catch {
     return { ...DEFAULT_WORKSPACE_LAYOUT };
@@ -207,5 +226,10 @@ export function deriveEffectiveWorkspaceLayout(
       : 0,
     sidebarMaxWidth,
     splitterWidth,
+    // Passed through rather than responsively clamped: an expanded chat pane
+    // reaches this derivation as a wider measured `chatWidth`, which compacts
+    // the navigation ribbon above. Expanding chat means the user wants chat, so
+    // the ribbon yielding is the intended trade rather than a fallback.
+    chatExpanded: preferred.chatExpanded,
   };
 }

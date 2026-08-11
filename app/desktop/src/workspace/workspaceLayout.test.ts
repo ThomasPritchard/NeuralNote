@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   DEFAULT_WORKSPACE_LAYOUT,
+  NAVIGATION_EXPANDED_WIDTH,
   WORKSPACE_LAYOUT_STORAGE_KEY,
   deriveEffectiveWorkspaceLayout,
   loadWorkspaceLayout,
@@ -8,24 +9,71 @@ import {
   saveWorkspaceLayout,
 } from "./workspaceLayout";
 
+/** The sidebar geometry a stored v2 payload carries, chat expand flag aside. */
+const SAVED_GEOMETRY = {
+  navigationExpanded: false,
+  sidebarWidth: 344,
+  sidebarPanel: "search",
+} as const;
+
 describe("workspace layout persistence", () => {
   it("uses the expanded 296px defaults when storage is missing", () => {
     expect(parseWorkspaceLayout(null)).toEqual(DEFAULT_WORKSPACE_LAYOUT);
+  });
+
+  it("keeps the saved sidebar geometry when a payload predates the expand toggle", () => {
+    const restored = parseWorkspaceLayout(
+      JSON.stringify(SAVED_GEOMETRY),
+    );
+
+    expect(restored.chatExpanded).toBe(false);
+    expect(restored.sidebarWidth).toBe(344);
+    expect(restored.sidebarPanel).toBe("search");
+  });
+
+  it.each([
+    JSON.stringify({ ...SAVED_GEOMETRY, chatExpanded: "yes" }),
+    JSON.stringify({ ...SAVED_GEOMETRY, chatExpanded: "true" }),
+    JSON.stringify({ ...SAVED_GEOMETRY, chatExpanded: null }),
+    JSON.stringify({ ...SAVED_GEOMETRY, chatExpanded: 1 }),
+  ])("reads a malformed chatExpanded as collapsed, keeping the geometry", (raw) => {
+    expect(parseWorkspaceLayout(raw)).toEqual({
+      ...SAVED_GEOMETRY,
+      chatExpanded: false,
+    });
+  });
+
+  it("round-trips an expanded chat pane through storage", () => {
+    const items = new Map<string, string>();
+    const storage = {
+      getItem: (key: string) => items.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        items.set(key, value);
+      },
+    };
+    const expanded = {
+      navigationExpanded: true,
+      sidebarWidth: 296,
+      sidebarPanel: "files" as const,
+      chatExpanded: true,
+    };
+
+    saveWorkspaceLayout(expanded, storage);
+
+    expect(loadWorkspaceLayout(storage)).toEqual(expanded);
   });
 
   it("loads a valid saved preference", () => {
     expect(
       parseWorkspaceLayout(
         JSON.stringify({
-          navigationExpanded: false,
-          sidebarWidth: 344,
-          sidebarPanel: "search",
+          ...SAVED_GEOMETRY,
+          chatExpanded: true,
         }),
       ),
     ).toEqual({
-      navigationExpanded: false,
-      sidebarWidth: 344,
-      sidebarPanel: "search",
+      ...SAVED_GEOMETRY,
+      chatExpanded: true,
     });
   });
 
@@ -70,6 +118,7 @@ describe("workspace layout persistence", () => {
       navigationExpanded: true,
       sidebarWidth: 192,
       sidebarPanel: "files",
+      chatExpanded: false,
     });
     expect(
       parseWorkspaceLayout(
@@ -83,6 +132,7 @@ describe("workspace layout persistence", () => {
       navigationExpanded: false,
       sidebarWidth: 420,
       sidebarPanel: null,
+      chatExpanded: false,
     });
   });
 
@@ -100,6 +150,7 @@ describe("workspace layout persistence", () => {
       navigationExpanded: false,
       sidebarWidth: 344,
       sidebarPanel: "files",
+      chatExpanded: false,
     });
     expect(storage.getItem).toHaveBeenNthCalledWith(1, WORKSPACE_LAYOUT_STORAGE_KEY);
     expect(storage.getItem).toHaveBeenNthCalledWith(2, "nn:workspace-layout:v1");
@@ -109,6 +160,7 @@ describe("workspace layout persistence", () => {
         navigationExpanded: false,
         sidebarWidth: 344,
         sidebarPanel: "files",
+        chatExpanded: false,
       }),
     );
   });
@@ -145,6 +197,7 @@ describe("workspace layout persistence", () => {
           navigationExpanded: false,
           sidebarWidth: 240,
           sidebarPanel: null,
+          chatExpanded: false,
         },
         storage,
       ),
@@ -155,6 +208,7 @@ describe("workspace layout persistence", () => {
         navigationExpanded: false,
         sidebarWidth: 240,
         sidebarPanel: null,
+        chatExpanded: false,
       }),
     );
   });
@@ -168,6 +222,7 @@ describe("responsive workspace layout", () => {
           navigationExpanded: true,
           sidebarWidth: 344,
           sidebarPanel: "files",
+          chatExpanded: false,
         },
         { workspaceWidth: 1_440, chatWidth: 420 },
       ),
@@ -178,6 +233,7 @@ describe("responsive workspace layout", () => {
       sidebarMaxWidth: 420,
       sidebarPanel: "files",
       splitterWidth: 8,
+      chatExpanded: false,
     });
   });
 
@@ -188,6 +244,7 @@ describe("responsive workspace layout", () => {
           navigationExpanded: true,
           sidebarWidth: 344,
           sidebarPanel: "files",
+          chatExpanded: false,
         },
         { workspaceWidth: 800, chatWidth: 300 },
       ),
@@ -198,6 +255,7 @@ describe("responsive workspace layout", () => {
       sidebarMaxWidth: 196,
       sidebarPanel: "files",
       splitterWidth: 8,
+      chatExpanded: false,
     });
   });
 
@@ -208,6 +266,7 @@ describe("responsive workspace layout", () => {
           navigationExpanded: false,
           sidebarWidth: 300,
           sidebarPanel: "files",
+          chatExpanded: false,
         },
         { workspaceWidth: 1_440, chatWidth: 0 },
       ).navigationExpanded,
@@ -219,6 +278,7 @@ describe("responsive workspace layout", () => {
       navigationExpanded: true,
       sidebarWidth: 380,
       sidebarPanel: "files" as const,
+      chatExpanded: false,
     };
 
     expect(
@@ -237,6 +297,7 @@ describe("responsive workspace layout", () => {
       navigationExpanded: true,
       sidebarWidth: 380,
       sidebarPanel: "files",
+      chatExpanded: false,
     });
   });
 
@@ -245,6 +306,7 @@ describe("responsive workspace layout", () => {
       navigationExpanded: true,
       sidebarWidth: 296,
       sidebarPanel: "files" as const,
+      chatExpanded: false,
     };
     const openingFrames = [
       { chatWidth: 0, navigationWidth: 192 },
@@ -278,6 +340,7 @@ describe("responsive workspace layout", () => {
           navigationExpanded: true,
           sidebarWidth: 320,
           sidebarPanel: "files",
+          chatExpanded: true,
         },
         { workspaceWidth: 0, chatWidth: 0 },
       ),
@@ -288,6 +351,7 @@ describe("responsive workspace layout", () => {
       sidebarMaxWidth: 420,
       sidebarPanel: "files",
       splitterWidth: 8,
+      chatExpanded: true,
     });
   });
 
@@ -296,6 +360,7 @@ describe("responsive workspace layout", () => {
       navigationExpanded: true,
       sidebarWidth: 344,
       sidebarPanel: null,
+      chatExpanded: false,
     } as const;
 
     expect(
@@ -310,5 +375,84 @@ describe("responsive workspace layout", () => {
       sidebarMaxWidth: 420,
     });
     expect(preferred.sidebarWidth).toBe(344);
+  });
+});
+
+describe("expanded chat pane", () => {
+  // A workspace narrow enough that a wide chat pane and an expanded ribbon
+  // cannot both fit, but a normal-width chat pane and an expanded ribbon can.
+  const WORKSPACE_WIDTH = 1_200;
+  const COLLAPSED_CHAT_WIDTH = 420;
+  // Sized to land inside the band where compacting the ribbon frees enough room
+  // to justify re-expanding it. Outside that band no feedback rule could flap,
+  // so the settling test below would pass without proving anything.
+  const EXPANDED_CHAT_WIDTH = 640;
+  const preferred = {
+    navigationExpanded: true,
+    sidebarWidth: 296,
+    sidebarPanel: "files" as const,
+    chatExpanded: true,
+  };
+
+  // `chatExpanded` reaches this derivation as the *measured* width of a wider
+  // pane, never as the flag itself — the width lives in the `--chat-width` CSS
+  // token and its responsive overrides, which are the browser tier's to own.
+  it("yields the navigation ribbon to a chat pane the user has expanded", () => {
+    const collapsed = deriveEffectiveWorkspaceLayout(preferred, {
+      workspaceWidth: WORKSPACE_WIDTH,
+      chatWidth: COLLAPSED_CHAT_WIDTH,
+    });
+    const expanded = deriveEffectiveWorkspaceLayout(preferred, {
+      workspaceWidth: WORKSPACE_WIDTH,
+      chatWidth: EXPANDED_CHAT_WIDTH,
+    });
+
+    expect(collapsed.navigationExpanded).toBe(true);
+    expect(expanded.navigationExpanded).toBe(false);
+  });
+
+  it("settles compaction as the pane widens instead of oscillating", () => {
+    // The hook re-measures on every animation frame, so the ribbon width it
+    // renders this frame is the width it feeds back next frame. Compaction must
+    // not chase its own output: freeing 136px by compacting must never re-open
+    // the ribbon, which would consume that space again and flap forever. The
+    // frames dwell at the expanded width so a flapping rule gets caught mid-flap
+    // rather than sampled once.
+    const paneWidthFrames = [
+      COLLAPSED_CHAT_WIDTH,
+      520,
+      580,
+      EXPANDED_CHAT_WIDTH,
+      EXPANDED_CHAT_WIDTH,
+      EXPANDED_CHAT_WIDTH,
+      EXPANDED_CHAT_WIDTH,
+      EXPANDED_CHAT_WIDTH,
+    ];
+
+    let measuredNavigationWidth = NAVIGATION_EXPANDED_WIDTH;
+    const withFeedback = paneWidthFrames.map((chatWidth) => {
+      const layout = deriveEffectiveWorkspaceLayout(preferred, {
+        workspaceWidth: WORKSPACE_WIDTH,
+        chatWidth,
+        navigationWidth: measuredNavigationWidth,
+      });
+      measuredNavigationWidth = layout.navigationWidth;
+      return layout.navigationExpanded;
+    });
+    const withoutFeedback = paneWidthFrames.map(
+      (chatWidth) =>
+        deriveEffectiveWorkspaceLayout(preferred, {
+          workspaceWidth: WORKSPACE_WIDTH,
+          chatWidth,
+        }).navigationExpanded,
+    );
+    const flips = withFeedback.filter(
+      (expanded, frame) => frame > 0 && expanded !== withFeedback[frame - 1],
+    ).length;
+
+    expect(withFeedback.at(0)).toBe(true);
+    expect(withFeedback.at(-1)).toBe(false);
+    expect(flips).toBeLessThanOrEqual(1);
+    expect(withFeedback).toEqual(withoutFeedback);
   });
 });
