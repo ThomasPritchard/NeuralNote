@@ -125,15 +125,47 @@ the `root_of()` idiom). Errors are `CoreError` (existing kinds suffice: `io`, `n
   `starfield.glsl.ts`, `nodeRegistry.ts`. Sever: `nav.ts` (→ props/state), URL flags, orb
   variant + toggle, magnet-pick, `__nnFg` debug handle, "Workspace" back button (ribbon owns
   view switching). Keep: 3D/2D morph toggle, in-graph node search (Enter-to-fly, Esc-clear),
-  cluster legend, detail panel + neighbour traversal + camera-restore ✕.
+  cluster legend, selected-note preview + neighbour traversal + camera-restore ✕.
 - **`GraphView.tsx` wrapper**: fetches `readLinkGraph()` on mount, transforms to the galaxy
   shape (cluster → rotating 5-color bloom-tuned palette; `val` from link degree, hub
   threshold preserved; `bridge` → pink), **container-sized via ResizeObserver** (prototype
   used window size — center-pane mount requires explicit `width`/`height` props), empty state
   ("No notes yet") and error surface. Legend + stats copy: "N notes · M links · K
   cross-folder links".
-- **"Open in reader"** in the detail panel: opens the node's note (guarded) and switches to
+- **"Open in reader"** in the selected-note preview: opens the node's note (guarded) and switches to
   `centerView: "note"`.
+
+### Selected-note preview (production addendum, 2026-08-10)
+
+Selecting a graph node opens a note preview directly over the full-size galaxy. The WebGL canvas
+does not reflow or shrink, which keeps the selected node and its neighbourhood spatially stable.
+The bubble follows the selected star through `graph2ScreenCoords`, connects to it with a restrained
+tether, stays clamped inside the graph pane, and may be moved by pointer drag or keyboard arrows
+(Shift uses a larger step). In panes with the stacked toolbar, the selection flight reserves a
+left-hand star position so the bubble cannot cover its anchor. The large cluster legend is hidden
+while that compact focus mode is active. Closing restores the camera pose captured before
+selection; changing between 2D and 3D closes the preview before entering the new camera regime.
+
+The preview is deliberately local and bounded. It reads the selected note once through the existing
+`read_note` boundary and derives, in the webview, the first meaningful sentence, word count,
+estimated reading time at 220 words/minute, and ATX-heading section count. It also shows the resolved
+connected-note count and up to eight traversable neighbour dots in roomy panes, or six plus an
+explicit remainder count in compact panes. The UI states **"Derived on this
+device"** and **"No model called"**; selecting a node must never invoke chat or an AI provider. The
+full document remains behind **Open in reader**.
+
+The bubble targets 304×432 px in a roomy pane and 260×292 px below the toolbar’s 760 px stacking
+breakpoint or 500 px height, then clamps to a 14 px canvas margin (198 px wide in a 240 px graph
+pane, reserving space for the selected star). Its body never scrolls and does not line-clamp the
+digest. The default digest lead is bounded to 132 graphemes; the tight treatment uses 96 so the
+complete bounded payload, degradation notices, three statistics, connection count, 24 px neighbour
+targets, and reader action stay visible at the supported Large font setting. Long titles wrap safely
+and are visually bounded while retaining their complete accessible name.
+
+Reads are selection-safe: a late response from a previously selected node is discarded, and Retry
+rereads only the current node. Missing-vault, read error, binary, oversized, empty-body, lossy-text,
+and malformed-frontmatter states are explicit. Oversized files remain untouched, and lossy or
+frontmatter-degraded notes keep their local digest visible alongside the warning.
 
 ## Dependencies (judgment, prototype-verified — not latest-chasing)
 
@@ -149,7 +181,8 @@ no eval/WASM in the trio at these versions.
   resolution incl. `%20` and `../`, ambiguity tiebreak, code-block/span skipping, dedup,
   unresolved skipped, cluster/bridge assignment). ≥90% line coverage on changed code.
 - **TS unit**: `filterTree`, `SearchPanel` (debounce, states, highlight), graph transform,
-  `Ribbon` active states/callbacks, `GraphView` states (lib mocked).
+  `Ribbon` active states/callbacks, `GraphView` states (lib mocked), local-digest derivation,
+  selection-race/error states, and preview placement bounds.
 - **e2e (`src/e2e/`)**: `mockVault.ts` gains `search_vault` + `read_link_graph` handlers
   mirroring core semantics; journeys: search (type → grouped results → click → note opens,
   + error path), tree filter (filter → tree narrows → clear), graph (ribbon → graph view
@@ -158,6 +191,11 @@ no eval/WASM in the trio at these versions.
   tested.
   Tag-search parity covers exact/nested matching, YAML properties, masked code/syntax, and the
   inline-tag → Search sidebar → guarded-result-open journey.
+- **Browser geometry**: Chromium and WebKit verify the selected-note bubble and complete bounded
+  payload without horizontal or vertical scrolling at 960 px, the 700 px stacked-toolbar path,
+  429 px, and 240 px graph widths. The tight case includes a long unbroken title, dual degradation
+  notices, eight neighbours, Atkinson Hyperlegible, and the supported 112.5% Large font setting;
+  the graph canvas retains its observed size throughout.
 - **Security-adjacent gate**: both new Rust parsers consume untrusted note content →
   independent adversarial review (code-reviewer + silent-failure-hunter) required, not just
   green tests.

@@ -1,0 +1,623 @@
+/* Selected-note bubble projected from a WebGL graph node. The layer overlays
+ * the full canvas so opening a note never reflows or shrinks the galaxy. */
+
+.nn-graph-preview-layer {
+  position: absolute;
+  z-index: 28;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+}
+
+.nn-graph-preview {
+  --nn-preview-border: color-mix(in oklab, var(--nn-graph-preview-accent) 42%, var(--border));
+  position: absolute;
+  top: 0;
+  left: 0;
+  z-index: 2;
+  display: flex;
+  width: var(--nn-graph-preview-width);
+  height: var(--nn-graph-preview-height);
+  min-width: 0;
+  min-height: 0;
+  flex-direction: column;
+  overflow: hidden;
+  border: 1px solid var(--nn-preview-border);
+  border-radius: 3.25rem 1.55rem 3.25rem 1.55rem;
+  color: var(--foreground);
+  background:
+    radial-gradient(
+      circle at 50% 4%,
+      color-mix(in oklab, var(--nn-graph-preview-accent) 20%, transparent),
+      transparent 38%
+    ),
+    color-mix(in oklab, var(--card) 82%, transparent);
+  box-shadow:
+    0 22px 58px color-mix(in oklab, black 46%, transparent),
+    0 0 38px color-mix(in oklab, var(--nn-graph-preview-accent) 11%, transparent),
+    inset 0 1px color-mix(in oklab, white 7%, transparent);
+  backdrop-filter: blur(24px) saturate(1.12);
+  pointer-events: auto;
+  transform: translate3d(
+    var(--nn-graph-preview-bubble-x, 1rem),
+    var(--nn-graph-preview-bubble-y, 5.25rem),
+    0
+  );
+  transform-origin: center;
+  animation: nn-preview-bubble-in 240ms cubic-bezier(0.2, 0.9, 0.25, 1) both;
+  transition:
+    width 220ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    height 220ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    background-color 160ms ease;
+}
+
+.nn-graph-preview-tether {
+  position: absolute;
+  z-index: 1;
+  top: var(--nn-graph-preview-anchor-y, 50%);
+  left: var(--nn-graph-preview-anchor-x, 50%);
+  width: var(--nn-graph-preview-tether-length, 2rem);
+  height: 1px;
+  background: linear-gradient(
+    90deg,
+    color-mix(in oklab, var(--nn-graph-preview-accent) 92%, white),
+    color-mix(in oklab, var(--nn-graph-preview-accent) 38%, transparent)
+  );
+  box-shadow: 0 0 8px color-mix(in oklab, var(--nn-graph-preview-accent) 52%, transparent);
+  pointer-events: none;
+  transform: rotate(var(--nn-graph-preview-tether-angle, 0rad));
+  transform-origin: 0 50%;
+}
+
+.nn-graph-preview-tether::before,
+.nn-graph-preview-tether::after {
+  position: absolute;
+  top: 50%;
+  border-radius: 999px;
+  content: "";
+  transform: translateY(-50%);
+}
+
+.nn-graph-preview-tether::before {
+  left: -0.45rem;
+  width: 0.9rem;
+  height: 0.9rem;
+  border: 1px solid color-mix(in oklab, var(--nn-graph-preview-accent) 82%, white);
+  background: color-mix(in oklab, var(--background) 74%, transparent);
+  box-shadow:
+    0 0 0 5px color-mix(in oklab, var(--nn-graph-preview-accent) 10%, transparent),
+    0 0 18px var(--nn-graph-preview-accent);
+}
+
+.nn-graph-preview-tether::after {
+  right: -0.2rem;
+  width: 0.4rem;
+  height: 0.4rem;
+  background: var(--nn-graph-preview-accent);
+  box-shadow: 0 0 10px var(--nn-graph-preview-accent);
+}
+
+.nn-graph-preview-tether > span {
+  position: absolute;
+  top: -2px;
+  left: 24%;
+  width: 3px;
+  height: 3px;
+  border-radius: 999px;
+  background: white;
+  opacity: 0.62;
+}
+
+.nn-graph-preview-header {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex: none;
+  align-items: flex-start;
+  justify-content: center;
+  gap: 0.85rem;
+  padding: 1.05rem 2.75rem 0.55rem;
+}
+
+.nn-graph-preview-title {
+  display: -webkit-box;
+  max-width: 100%;
+  overflow: hidden;
+  overflow-wrap: anywhere;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.nn-graph-preview-controls {
+  position: absolute;
+  top: 1rem;
+  right: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
+}
+
+.nn-graph-preview-drag-handle,
+.nn-graph-preview-icon-button {
+  display: grid;
+  width: 1.9rem;
+  height: 1.9rem;
+  place-items: center;
+  border: 1px solid color-mix(in oklab, var(--border) 86%, transparent);
+  border-radius: 999px;
+  color: var(--muted-foreground);
+  background: color-mix(in oklab, var(--background) 58%, transparent);
+}
+
+.nn-graph-preview-drag-handle {
+  cursor: grab;
+  touch-action: none;
+}
+
+.nn-graph-preview-drag-handle:active {
+  cursor: grabbing;
+}
+
+.nn-graph-preview-icon-button {
+  transition:
+    color 140ms ease,
+    border-color 140ms ease,
+    transform 140ms ease;
+}
+
+.nn-graph-preview-icon-button:hover {
+  border-color: var(--nn-preview-border);
+  color: var(--foreground);
+  transform: rotate(5deg);
+}
+
+.nn-graph-preview-body {
+  position: relative;
+  z-index: 1;
+  min-height: 0;
+  flex: 1;
+  overflow: hidden;
+  margin-inline: 0.4rem;
+  padding: 0.25rem 0.9rem 0.85rem;
+  text-align: left;
+}
+
+.nn-graph-preview-content-treatment {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  padding-block: 0.2rem;
+}
+
+.nn-graph-preview-digest-labels {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.45rem;
+}
+
+.nn-graph-preview-content-label {
+  color: color-mix(in oklab, var(--nn-graph-preview-accent) 76%, var(--muted-foreground));
+  font-size: 0.52rem;
+  letter-spacing: 0.13em;
+  text-transform: uppercase;
+}
+
+.nn-graph-preview-no-model {
+  border: 1px solid color-mix(in oklab, var(--border) 78%, transparent);
+  border-radius: 999px;
+  padding: 0.18rem 0.4rem;
+  color: var(--muted-foreground);
+  background: color-mix(in oklab, var(--background) 40%, transparent);
+  font-family: var(--font-mono);
+  font-size: 0.46rem;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+  white-space: nowrap;
+}
+
+.nn-graph-preview-digest-lead {
+  color: color-mix(in oklab, var(--foreground) 88%, var(--muted-foreground));
+  font-size: 0.82rem;
+  line-height: 1.48;
+  overflow-wrap: anywhere;
+}
+
+.nn-graph-preview-stats {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 0.35rem;
+}
+
+.nn-graph-preview-stats > div {
+  min-width: 0;
+  border: 1px solid color-mix(in oklab, var(--border) 68%, transparent);
+  border-radius: 0.65rem;
+  padding: 0.42rem 0.48rem;
+  background: color-mix(in oklab, var(--background) 31%, transparent);
+}
+
+.nn-graph-preview-stats dt {
+  color: var(--muted-foreground);
+  font-family: var(--font-mono);
+  font-size: 0.45rem;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.nn-graph-preview-stats dd {
+  margin-top: 0.1rem;
+  color: var(--foreground);
+  font-size: 0.72rem;
+  font-weight: 650;
+  white-space: nowrap;
+}
+
+.nn-graph-preview-state,
+.nn-graph-preview-notice {
+  border: 1px solid var(--border);
+  border-radius: 0.9rem;
+  padding: 0.85rem;
+  color: var(--muted-foreground);
+  background: color-mix(in oklab, var(--muted) 44%, transparent);
+  font-size: 0.78rem;
+  line-height: 1.45;
+}
+
+.nn-graph-preview-state {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.65rem;
+}
+
+.nn-graph-preview-warning {
+  display: flex;
+  gap: 0.5rem;
+  margin-bottom: 0.35rem;
+  border: 1px solid color-mix(in oklab, var(--destructive) 30%, transparent);
+  border-radius: 0.55rem;
+  padding: 0.38rem 0.5rem;
+  color: color-mix(in oklab, var(--foreground) 85%, var(--muted-foreground));
+  background: color-mix(in oklab, var(--destructive) 10%, transparent);
+  font-size: 0.66rem;
+  line-height: 1.3;
+}
+
+.nn-graph-preview-warnings {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 0.3rem;
+  margin-bottom: 0.35rem;
+}
+
+.nn-graph-preview-warnings .nn-graph-preview-warning {
+  margin-bottom: 0;
+}
+
+.nn-graph-preview-warning-compact {
+  display: none;
+}
+
+.nn-graph-preview-retry {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.6rem;
+  border-radius: 0.4rem;
+  color: var(--foreground);
+  font-size: 0.72rem;
+  font-weight: 600;
+}
+
+.nn-graph-preview-neighbour-dots {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  min-height: 1.85rem;
+  flex: none;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  margin-inline: 1.35rem;
+  border-top: 1px solid color-mix(in oklab, var(--border) 68%, transparent);
+  padding-block: 0.3rem;
+  color: var(--muted-foreground);
+}
+
+.nn-graph-preview-neighbour-targets {
+  gap: 0;
+}
+
+.nn-graph-preview-neighbour-target {
+  display: grid;
+  width: 24px;
+  min-width: 24px;
+  height: 24px;
+  min-height: 24px;
+  flex: none;
+  place-items: center;
+  border-radius: 999px;
+}
+
+.nn-graph-preview-neighbour-dot {
+  display: block;
+  width: 0.72rem;
+  height: 0.72rem;
+  border: 2px solid color-mix(in oklab, var(--card) 90%, transparent);
+  border-radius: 999px;
+  box-shadow: 0 0 7px color-mix(in oklab, currentColor 35%, transparent);
+  transition: transform 140ms ease;
+}
+
+.nn-graph-preview-neighbour-target:hover .nn-graph-preview-neighbour-dot {
+  z-index: 1;
+  transform: scale(1.35);
+}
+
+.nn-graph-preview-actions {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  flex: none;
+  justify-content: center;
+  padding: 0.7rem 1rem 0.9rem;
+}
+
+.nn-graph-preview-open-reader {
+  display: inline-flex;
+  min-height: 2rem;
+  align-items: center;
+  justify-content: center;
+  gap: 0.4rem;
+  border: 1px solid color-mix(in oklab, var(--nn-graph-preview-accent) 58%, var(--border));
+  border-radius: 999px;
+  padding-inline: 0.8rem;
+  color: var(--primary-foreground);
+  background: color-mix(in oklab, var(--nn-graph-preview-accent) 82%, var(--primary));
+  font-size: 0.68rem;
+  font-weight: 650;
+  transition:
+    filter 140ms ease,
+    transform 140ms ease;
+}
+
+.nn-graph-preview-open-reader:hover {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+
+.nn-graph-preview-constellation-ring {
+  position: absolute;
+  z-index: 0;
+  inset: 0.55rem;
+  border: 1px solid color-mix(in oklab, var(--nn-graph-preview-accent) 18%, transparent);
+  border-radius: inherit;
+  pointer-events: none;
+}
+
+.nn-graph-preview-constellation-ring > span {
+  position: absolute;
+  width: 0.35rem;
+  height: 0.35rem;
+  border-radius: 999px;
+  background: var(--nn-graph-preview-accent);
+  box-shadow: 0 0 10px var(--nn-graph-preview-accent);
+}
+
+.nn-graph-preview-constellation-ring > span:nth-child(1) { top: 16%; left: -0.18rem; }
+.nn-graph-preview-constellation-ring > span:nth-child(2) { top: 6%; right: 18%; }
+.nn-graph-preview-constellation-ring > span:nth-child(3) { right: -0.18rem; bottom: 28%; }
+.nn-graph-preview-constellation-ring > span:nth-child(4) { bottom: -0.18rem; left: 31%; }
+
+.nn-graph-preview-icon-button:focus-visible,
+.nn-graph-preview-drag-handle:focus-visible,
+.nn-graph-preview-open-reader:focus-visible,
+.nn-graph-preview-neighbour-target:focus-visible,
+.nn-graph-preview-retry:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 2px;
+}
+
+.nn-graph-preview-layer[data-dragged="true"] .nn-graph-preview { animation: none; }
+
+@keyframes nn-preview-bubble-in {
+  from { opacity: 0; scale: 0.94; }
+  to { opacity: 1; scale: 1; }
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview {
+  border-radius: 1.5rem 0.9rem 1.5rem 0.9rem;
+  background-color: color-mix(in oklab, var(--card) 76%, transparent);
+  backdrop-filter: blur(16px) saturate(1.04);
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-header {
+  padding: 0.72rem 2.4rem 0.45rem;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-controls {
+  top: 0.6rem;
+  right: 0.6rem;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-cluster-badge {
+  display: none;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-header h2 {
+  margin-top: 0.2rem;
+  font-size: 0.95rem;
+  -webkit-line-clamp: 1;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-body {
+  margin-inline: 0;
+  padding: 0.15rem 0.75rem 0.45rem;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-content-treatment {
+  gap: 0.35rem;
+  padding-block: 0.05rem;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-warning {
+  align-items: center;
+  padding: 0.25rem 0.4rem;
+  font-size: 0.55rem;
+  line-height: 1.1;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-warning-full {
+  display: none;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-warning-compact {
+  display: inline;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-digest-lead {
+  font-size: 0.68rem;
+  line-height: 1.34;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-no-model {
+  padding-block: 0.12rem;
+  font-size: 0.41rem;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-stats > div {
+  padding: 0.25rem 0.35rem;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-stats dd { font-size: 0.63rem; }
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-neighbour-dots {
+  min-height: 2.15rem;
+  flex-direction: column;
+  margin-inline: 0.75rem;
+  gap: 0;
+  padding-block: 0.05rem;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-actions {
+  padding: 0.45rem 0.7rem 0.6rem;
+}
+
+.nn-graph-preview-layer[data-compact="true"] .nn-graph-preview-open-reader {
+  min-height: 1.8rem;
+  padding-inline: 0.65rem;
+  font-size: 0.62rem;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview {
+  border-radius: 1.2rem 0.75rem 1.2rem 0.75rem;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-header {
+  padding: 0.55rem 2rem 0.3rem;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-controls {
+  top: 0.42rem;
+  right: 0.42rem;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-drag-handle,
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-icon-button {
+  width: 1.55rem;
+  height: 1.55rem;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-header p {
+  margin-top: 0;
+  font-size: 0.47rem;
+  letter-spacing: 0.12em;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-header h2 {
+  margin-top: 0.12rem;
+  font-size: 0.82rem;
+  line-height: 1.12;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-body {
+  padding: 0.05rem 0.55rem 0.2rem;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-content-treatment {
+  gap: 0.22rem;
+  padding-block: 0;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-digest-labels { gap: 0.22rem; }
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-content-label {
+  font-size: 0.42rem;
+  letter-spacing: 0.07em;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-no-model {
+  padding: 0.08rem 0.25rem;
+  font-size: 0.37rem;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-digest-lead {
+  font-size: 0.64rem;
+  line-height: 1.3;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-stats { gap: 0.2rem; }
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-stats > div {
+  padding: 0.18rem 0.24rem;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-stats dt {
+  font-size: 0.37rem;
+  letter-spacing: 0.05em;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-stats dd {
+  margin-top: 0;
+  font-size: 0.56rem;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-warning {
+  gap: 0.25rem;
+  margin-bottom: 0.2rem;
+  padding: 0.24rem 0.32rem;
+  font-size: 0.52rem;
+  line-height: 1.18;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-warnings {
+  gap: 0.18rem;
+  margin-bottom: 0.18rem;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-neighbour-dots {
+  min-height: 2rem;
+  margin-inline: 0.6rem;
+  padding-block: 0;
+  font-size: 0.47rem;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-actions {
+  padding: 0.3rem 0.5rem 0.45rem;
+}
+
+.nn-graph-preview-layer[data-tight="true"] .nn-graph-preview-open-reader {
+  min-height: 1.55rem;
+  padding-inline: 0.55rem;
+  font-size: 0.55rem;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nn-graph-preview,
+  .nn-graph-preview * {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}

@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef, useState, type ReactNode } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import ForceGraph3D from "react-force-graph-3d";
 import type { GalaxyLink, GalaxyNode } from "./graph";
 import { makeStarNode } from "./starNode";
@@ -11,7 +11,13 @@ import { useGalaxyScene } from "./useGalaxyScene";
 import { useGalaxyCamera } from "./useGalaxyCamera";
 import { GalaxyToolbar } from "./GalaxyToolbar";
 import { GalaxyLegend } from "./GalaxyLegend";
-import { GalaxyDetailPanel } from "./GalaxyDetailPanel";
+import { GalaxyNotePreview } from "./GalaxyNotePreview";
+import {
+  GALAXY_COMPACT_TOOLBAR_WIDTH,
+  notePreviewFocusScreenX,
+  notePreviewMetrics,
+  notePreviewPlacement,
+} from "./notePreviewModel";
 
 // ── NeuralGalaxy ──────────────────────────────────────────────────────────
 // A 3D "neural map" of the vault: notes are nodes, wikilinks are edges,
@@ -27,7 +33,7 @@ import { GalaxyDetailPanel } from "./GalaxyDetailPanel";
 // This file is the composition shell. The cohesive pieces live in siblings:
 //  · galaxyForces / galaxyLinks / galaxyTooltip — pure styling + physics
 //  · useHoverFocus / useGalaxyScene / useGalaxyCamera — stateful lifecycles
-//  · GalaxyToolbar / GalaxyLegend / GalaxyDetailPanel — the DOM overlays
+//  · GalaxyToolbar / GalaxyLegend / GalaxyNotePreview — the DOM overlays
 
 // Re-exported for tests + importers that resolve these from this module: the
 // definitions moved to focused siblings, the public import path did not.
@@ -35,7 +41,7 @@ export { FORCE_PROFILES, type ForceProfile } from "./galaxyForces";
 export { BRIDGE_FADED_COLOR, LINK_FADE } from "./galaxyLinks";
 
 /** Shared with GraphView so notices clear the stacked compact toolbar. */
-export const GALAXY_COMPACT_TOOLBAR_WIDTH = 760;
+export { GALAXY_COMPACT_TOOLBAR_WIDTH } from "./notePreviewModel";
 
 export interface NeuralGalaxyProps {
   /** Pre-decorated render graph. IMMUTABLE per mount: the force simulation
@@ -69,7 +75,6 @@ export function NeuralGalaxy({
   onClusterSelect,
   breadcrumb,
 }: Readonly<NeuralGalaxyProps>) {
-  const compactToolbar = width < GALAXY_COMPACT_TOOLBAR_WIDTH;
   const fgRef = useRef<any>(null);
   const rootRef = useRef<HTMLDivElement | null>(null);
   const reducedRef = useRef(
@@ -78,6 +83,12 @@ export function NeuralGalaxy({
 
   const [selected, setSelected] = useState<GalaxyNode | null>(null);
   const [query, setQuery] = useState("");
+  const previewMetrics = useMemo(() => notePreviewMetrics(width, height), [width, height]);
+  const previewFocusScreenX = useMemo(
+    () => notePreviewFocusScreenX(width, previewMetrics),
+    [previewMetrics, width],
+  );
+  const compactToolbar = width < GALAXY_COMPACT_TOOLBAR_WIDTH;
 
   // Adjacency for hover-glow and the panel's neighbour list: a node's direct
   // neighbours (with the bridge flag) in both directions. Links may be raw
@@ -112,11 +123,104 @@ export function NeuralGalaxy({
   const { previewCluster, isLinkLit, onNodeHover } = useHoverFocus({ adjacency, data, selected });
 
   // Scene lifecycle: bloom pass, the per-frame twinkle loop, and auto-framing.
-  const { frameOnce } = useGalaxyScene({ fgRef, rootRef, width, height, reducedRef });
+  const { frameOnce } = useGalaxyScene({
+    fgRef,
+    rootRef,
+    width,
+    height,
+    reducedRef,
+  });
+
+  // The preview bubble is ordinary, accessible DOM, but it belongs to a moving
+  // WebGL node. Project that node into viewport coordinates on the graph's
+  // existing animation cadence and drive the overlay with CSS properties. This
+  // avoids React renders while the camera flies or orbits.
+  useEffect(() => {
+    const root = rootRef.current;
+    if (!selected || !root) return;
+
+    let raf = 0;
+    let lastProjection = -Infinity;
+    const project = (now: number) => {
+      if (now - lastProjection >= 32) {
+        const fg = fgRef.current;
+        const nodeX = Number.isFinite(selected.x) ? selected.x! : 0;
+        const nodeY = Number.isFinite(selected.y) ? selected.y! : 0;
+        const nodeZ = Number.isFinite(selected.z) ? selected.z! : 0;
+        const projected = fg?.graph2ScreenCoords?.(nodeX, nodeY, nodeZ) ?? {
+          x: width / 2,
+          y: height / 2,
+        };
+        const layer = root.querySelector<HTMLElement>(".nn-graph-preview-layer");
+        const surface = root.querySelector<HTMLElement>(".nn-graph-preview");
+        const liveMetrics = surface
+          ? {
+              ...previewMetrics,
+              width: surface.offsetWidth,
+              height: surface.offsetHeight,
+            }
+          : previewMetrics;
+        const dragX = Number.parseFloat(layer?.dataset.dragX ?? "");
+        const dragY = Number.parseFloat(layer?.dataset.dragY ?? "");
+        const draggedPosition =
+          Number.isFinite(dragX) && Number.isFinite(dragY) ? { x: dragX, y: dragY } : null;
+        const placement = notePreviewPlacement(
+          projected,
+          liveMetrics,
+          width,
+          height,
+          draggedPosition,
+        );
+        root.style.setProperty("--nn-graph-preview-anchor-x", `${placement.anchorX}px`);
+        root.style.setProperty("--nn-graph-preview-anchor-y", `${placement.anchorY}px`);
+        root.style.setProperty("--nn-graph-preview-bubble-x", `${placement.bubbleX}px`);
+        root.style.setProperty("--nn-graph-preview-bubble-y", `${placement.bubbleY}px`);
+        root.style.setProperty("--nn-graph-preview-tether-length", `${placement.tetherLength}px`);
+        root.style.setProperty("--nn-graph-preview-tether-angle", `${placement.tetherAngle}rad`);
+        lastProjection = now;
+      }
+      raf = requestAnimationFrame(project);
+    };
+    project(performance.now());
+
+    return () => {
+      cancelAnimationFrame(raf);
+      for (const property of [
+        "--nn-graph-preview-anchor-x",
+        "--nn-graph-preview-anchor-y",
+        "--nn-graph-preview-bubble-x",
+        "--nn-graph-preview-bubble-y",
+        "--nn-graph-preview-tether-length",
+        "--nn-graph-preview-tether-angle",
+      ]) {
+        root.style.removeProperty(property);
+      }
+    };
+  }, [height, previewMetrics, selected, width]);
 
   // Camera navigation + 2D↔3D morph; owns the view mode and selection flights.
   const { view, onNodeClick, dismissSelected, closeSelectedAndReturn, changeView, linkWidth } =
-    useGalaxyCamera({ fgRef, reducedRef, data, setSelected, onNodeHover });
+    useGalaxyCamera({
+      fgRef,
+      reducedRef,
+      viewportWidth: width,
+      viewportHeight: height,
+      focusScreenX: previewFocusScreenX,
+      data,
+      setSelected,
+      onNodeHover,
+    });
+
+  useEffect(() => {
+    if (!selected) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape" && !event.defaultPrevented) {
+        closeSelectedAndReturn();
+      }
+    };
+    window.addEventListener("keydown", closeOnEscape);
+    return () => window.removeEventListener("keydown", closeOnEscape);
+  }, [closeSelectedAndReturn, selected]);
 
   // Search results for the dropdown. No auto-fly while typing — flying to
   // the first match on each keystroke guesses the destination too eagerly;
@@ -188,21 +292,24 @@ export function NeuralGalaxy({
         clusters={clusters}
       />
 
-      <GalaxyLegend
-        breadcrumb={breadcrumb}
-        clusters={clusters}
-        onPreviewCluster={previewCluster}
-        onClusterSelect={onClusterSelect}
-      />
+      {(!selected || !compactToolbar) && (
+        <GalaxyLegend
+          breadcrumb={breadcrumb}
+          clusters={clusters}
+          onPreviewCluster={previewCluster}
+          onClusterSelect={onClusterSelect}
+        />
+      )}
 
       {selected && (
-        <GalaxyDetailPanel
+        <GalaxyNotePreview
           selected={selected}
           clusters={clusters}
           neighbours={neighbours}
           onNodeClick={onNodeClick}
           onClose={closeSelectedAndReturn}
           onOpenNote={onOpenNote}
+          metrics={previewMetrics}
         />
       )}
     </div>
