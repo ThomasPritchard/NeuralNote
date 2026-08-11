@@ -294,6 +294,24 @@ struct ThinkingCounter<'a> {
     count: usize,
 }
 
+/// A pass-through sink that remembers whether anything went out through it.
+///
+/// The one fact `complete_tool_turn` needs before it may retry: nothing the user
+/// can already see was published. Watching the sink means the answer holds for
+/// any client, including one whose streaming implementation this crate has never
+/// seen — rather than trusting each implementation to report it honestly.
+struct EmissionGuard<'a> {
+    inner: &'a mut dyn EventSink,
+    emitted: bool,
+}
+
+impl EventSink for EmissionGuard<'_> {
+    fn send(&mut self, event: ChatEvent) {
+        self.emitted = true;
+        self.inner.send(event);
+    }
+}
+
 #[derive(Default)]
 struct PlaylistLoopState {
     context_chars: usize,
@@ -541,7 +559,7 @@ impl ChatSession<'_> {
             // This tool-DECIDING turn is idempotent (no tool has run yet), so a single
             // transient transport failure is retried once rather than aborting the run.
             let completion = self
-                .complete_tool_turn(&self.request(&budgeted.messages, &tools))
+                .complete_tool_turn(&self.request(&budgeted.messages, &tools), sink)
                 .await?;
             consumed += 1;
             if completion.tool_calls.is_empty() {
@@ -724,19 +742,42 @@ impl ChatSession<'_> {
             .await
     }
 
-    /// Run one idempotent tool-DECIDING `complete` turn with a single bounded retry on a
-    /// transient transport failure. The call only decides tool calls — no tool has
-    /// executed yet at this point in the loop (dispatch happens after this returns) — so
-    /// a retry can never double-execute a tool. A non-transient failure or a user-stopped
-    /// run is never retried, and this is the non-streamed path, so the streamed answer
-    /// turn is untouched.
-    async fn complete_tool_turn(&self, request: &LlmRequest) -> CoreResult<Completion> {
+    /// Run one tool-DECIDING turn with a single bounded retry on a transient
+    /// transport failure.
+    ///
+    /// Retrying is safe on two counts, and BOTH have to hold. The turn only
+    /// decides tool calls — no tool has executed yet at this point in the loop,
+    /// dispatch happens after this returns — so a retry can never double-execute a
+    /// tool. And, historically, the turn emitted nothing, so a retry was invisible.
+    ///
+    /// That second half no longer holds by construction: this turn is now streamed
+    /// ([`LlmClient::complete_tool_streaming`]), and a client that streams it emits
+    /// live note previews as it goes. **So the turn is never retried once anything
+    /// has been emitted** — a replay would stream a second copy of a half-composed
+    /// note over the first, and the user would watch their note rewind. The guard
+    /// spans the whole loop, not one attempt: an attempt that emitted and then
+    /// failed bars every later attempt too. A client on the default (non-streaming)
+    /// implementation emits nothing, so its retry behaviour is unchanged.
+    ///
+    /// A non-transient failure or a user-stopped run is never retried either.
+    async fn complete_tool_turn(
+        &self,
+        request: &LlmRequest,
+        sink: &mut dyn EventSink,
+    ) -> CoreResult<Completion> {
         let mut retries = MAX_COMPLETE_RETRIES;
+        let mut sink = EmissionGuard {
+            inner: sink,
+            emitted: false,
+        };
         loop {
-            match self.llm.complete(request).await {
+            match self.llm.complete_tool_streaming(request, &mut sink).await {
                 Ok(completion) => return Ok(completion),
                 Err(error) => {
-                    let retryable = retries > 0 && error.is_retryable() && !self.run_cancelled();
+                    let retryable = retries > 0
+                        && error.is_retryable()
+                        && !self.run_cancelled()
+                        && !sink.emitted;
                     if !retryable {
                         return Err(error);
                     }
@@ -4259,7 +4300,8 @@ mod tests {
             guards: &env.guards,
         };
 
-        block_on(session.complete_tool_turn(&tool_decision_request())).unwrap();
+        block_on(session.complete_tool_turn(&tool_decision_request(), &mut VecSink::default()))
+            .unwrap();
 
         assert_eq!(llm.completion_requests().len(), 2, "retried exactly once");
         assert_eq!(
@@ -4293,7 +4335,8 @@ mod tests {
             guards: &env.guards,
         };
 
-        let result = block_on(session.complete_tool_turn(&tool_decision_request()));
+        let result =
+            block_on(session.complete_tool_turn(&tool_decision_request(), &mut VecSink::default()));
 
         assert!(result.is_err(), "a 400 is permanent — no retry");
         assert_eq!(llm.completion_requests().len(), 1);
@@ -4325,7 +4368,9 @@ mod tests {
             guards: &env.guards,
         };
 
-        let completion = block_on(session.complete_tool_turn(&tool_decision_request())).unwrap();
+        let completion =
+            block_on(session.complete_tool_turn(&tool_decision_request(), &mut VecSink::default()))
+                .unwrap();
 
         assert!(completion.content.is_some());
         assert_eq!(
@@ -4360,7 +4405,8 @@ mod tests {
             guards: &env.guards,
         };
 
-        block_on(session.complete_tool_turn(&tool_decision_request())).unwrap();
+        block_on(session.complete_tool_turn(&tool_decision_request(), &mut VecSink::default()))
+            .unwrap();
 
         assert_eq!(llm.completion_requests().len(), 2);
     }
@@ -4387,7 +4433,8 @@ mod tests {
             guards: &env.guards,
         };
 
-        let result = block_on(session.complete_tool_turn(&tool_decision_request()));
+        let result =
+            block_on(session.complete_tool_turn(&tool_decision_request(), &mut VecSink::default()));
 
         assert!(result.is_err(), "a 400 is permanent — no retry");
         assert_eq!(llm.completion_requests().len(), 1);
@@ -4418,7 +4465,8 @@ mod tests {
             guards: &env.guards,
         };
 
-        let result = block_on(session.complete_tool_turn(&tool_decision_request()));
+        let result =
+            block_on(session.complete_tool_turn(&tool_decision_request(), &mut VecSink::default()));
 
         assert!(result.is_err(), "a cancelled run must not retry");
         assert_eq!(
@@ -4426,6 +4474,122 @@ mod tests {
             1,
             "cancellation short-circuits the retry"
         );
+    }
+
+    /// A client whose streamed tool turn fails transiently, optionally after
+    /// putting a live preview on screen. The failure is retryable and the run is
+    /// not cancelled, so the emission guard is the only thing that can stop a
+    /// retry — which makes these two tests a direct measurement of it.
+    struct StreamingToolLlm {
+        previews_before_failing: bool,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StreamingToolLlm {
+        fn new(previews_before_failing: bool) -> Self {
+            Self {
+                previews_before_failing,
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for StreamingToolLlm {
+        async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+            panic!("a client that streams tool turns must not fall back to the buffered one")
+        }
+
+        async fn complete_tool_streaming(
+            &self,
+            _req: &LlmRequest,
+            sink: &mut dyn EventSink,
+        ) -> CoreResult<Completion> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.previews_before_failing {
+                sink.send(ChatEvent::NoteEditPreview {
+                    id: "call-1".into(),
+                    rel_path: None,
+                    kind: None,
+                    body: "half a note".into(),
+                    complete: false,
+                });
+            }
+            Err(CoreError::Llm(
+                "openrouter returned 429 Too Many Requests".into(),
+            ))
+        }
+
+        async fn complete_streaming(
+            &self,
+            _req: &LlmRequest,
+            _sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            unreachable!("the tool turn fails before any answer is streamed")
+        }
+    }
+
+    fn run_streamed_tool_turn(llm: &StreamingToolLlm) -> (CoreResult<Completion>, VecSink) {
+        let env = retry_env();
+        let services = SkillServices::new(
+            &env.skills,
+            &env.environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        );
+        let session = ChatSession {
+            root: env._vault.path(),
+            model: "test-model",
+            provider: &env.provider,
+            llm,
+            skill_services: &services,
+            guards: &env.guards,
+        };
+        let mut sink = VecSink::default();
+        let result = block_on(session.complete_tool_turn(&tool_decision_request(), &mut sink));
+        (result, sink)
+    }
+
+    #[test]
+    fn a_streamed_tool_turn_is_never_retried_once_it_has_emitted() {
+        // The retry was only ever safe because the turn published nothing. Now
+        // that it streams live previews, replaying it would stream a second copy
+        // of a half-composed note over the first — the user would watch their
+        // note rewind. So a transient, retryable failure is NOT retried here.
+        let llm = StreamingToolLlm::new(true);
+
+        let (result, sink) = run_streamed_tool_turn(&llm);
+
+        assert!(result.is_err(), "the failure is surfaced, not swallowed");
+        assert_eq!(llm.attempts(), 1, "emitted, so no replay");
+        assert_eq!(
+            sink.events
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::NoteEditPreview { .. }))
+                .count(),
+            1,
+            "exactly one preview reached the user"
+        );
+    }
+
+    #[test]
+    fn a_streamed_tool_turn_that_failed_before_emitting_is_still_retried_once() {
+        // The guard keys on what the user can already see, not on whether the turn
+        // was streamed. A pre-first-event failure is as invisible as the buffered
+        // turn's was, so the one bounded retry survives.
+        let llm = StreamingToolLlm::new(false);
+
+        let (result, sink) = run_streamed_tool_turn(&llm);
+
+        assert!(result.is_err(), "both attempts failed");
+        assert_eq!(llm.attempts(), 2, "retried exactly once");
+        assert!(sink.events.is_empty(), "nothing was ever published");
     }
 
     #[test]

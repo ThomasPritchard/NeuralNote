@@ -60,6 +60,25 @@ export interface ToolCallView {
   detail: string | null;
 }
 
+/** A note the model is composing, as the backend's partial parse of the streamed
+ *  tool call sees it. Keyed by the tool-call id, so the card upgrades in place
+ *  into the written note rather than becoming a second row.
+ *
+ *  `complete` means the arguments closed and parse — NOT that anything was
+ *  written. The tool still has to be dispatched and can still be rejected, so a
+ *  settled preview is not evidence a file exists; `writtenNotes` is. */
+export interface NoteEditView {
+  id: string;
+  /** Absent until the path finished arriving — half a path is not a path. */
+  relPath: string | null;
+  kind: NoteKind | null;
+  body: string;
+  complete: boolean;
+  /** Why the edit was abandoned, or `null` while it is still live. Set means the
+   *  note will never land, so the diff must stop reading as if it had. */
+  abandoned: string | null;
+}
+
 /** A skill the user asked for that could not be activated. `missingBinary` is the
  *  only structured remedy the backend offers; `message` is display-only prose. */
 export interface SkillActivationFailure {
@@ -98,6 +117,10 @@ export interface AssistantMessage {
    *  written (#108). Kept separate from `writtenNotes`: nothing landed on disk,
    *  but the no-op is not allowed to disappear either. */
   existingNotes: Array<{ relPath: string; kind: NoteKind }>;
+  /** Notes the model composed live, in first-seen order. An entry here has NOT
+   *  been written — it pairs with the `toolCalls` entry of the same id, which is
+   *  what says whether the write went on to succeed. */
+  noteEdits: NoteEditView[];
   /** Every tool call of the turn, in the order the model made them. */
   toolCalls: ToolCallView[];
   /** Transcript provenance as reported by the tools that fetched it. */
@@ -150,6 +173,7 @@ export function emptyAssistant(
     pendingElicitation: null,
     writtenNotes: [],
     existingNotes: [],
+    noteEdits: [],
     toolCalls: [],
     transcriptSources: [],
     partialRun: null,
@@ -302,6 +326,46 @@ function withSettlement(
   return [...calls, { name: "", title: "", arguments: "", ...settlement }];
 }
 
+/** Fold a live note preview into the edit that owns its id, or start one.
+ *
+ *  The body only ever grows and the backend re-sends the whole of it, so the
+ *  entry is replaced rather than appended to. `abandoned` is carried across
+ *  untouched: the backend never previews a call it has already abandoned, and
+ *  quietly clearing the flag would revive a card that was explicitly retired. */
+function withNoteEdit(
+  edits: NoteEditView[],
+  preview: Omit<NoteEditView, "abandoned">,
+): NoteEditView[] {
+  const index = edits.findIndex((edit) => edit.id === preview.id);
+  if (index < 0) return [...edits, { ...preview, abandoned: null }];
+  const next = edits.slice();
+  next[index] = { ...preview, abandoned: edits[index].abandoned };
+  return next;
+}
+
+/** Mark the edit that owns this id as abandoned.
+ *
+ *  An abandonment whose preview never arrived is appended as its own row rather
+ *  than dropped — the backend abandons only what it previewed, so an unmatched
+ *  one is a broken contract, and the same reasoning as `withSettlement` applies:
+ *  it has to be visible, not swallowed. */
+function withAbandonedNoteEdit(
+  edits: NoteEditView[],
+  id: string,
+  reason: string,
+): NoteEditView[] {
+  const index = edits.findIndex((edit) => edit.id === id);
+  if (index < 0) {
+    return [
+      ...edits,
+      { id, relPath: null, kind: null, body: "", complete: false, abandoned: reason },
+    ];
+  }
+  const next = edits.slice();
+  next[index] = { ...edits[index], abandoned: reason };
+  return next;
+}
+
 /** Immutably fold one streamed `ChatEvent` into the assistant turn's view
  *  state. Total over the `ChatEvent` union — a new variant is a compile error
  *  here, so the UI can never silently ignore a backend event. */
@@ -405,6 +469,22 @@ export function reduceAssistant(
           ...turn.existingNotes,
           { relPath: event.relPath, kind: event.kind },
         ],
+      };
+    case "noteEditPreview":
+      return {
+        ...turn,
+        noteEdits: withNoteEdit(turn.noteEdits, {
+          id: event.id,
+          relPath: event.relPath,
+          kind: event.kind,
+          body: event.body,
+          complete: event.complete,
+        }),
+      };
+    case "noteEditAbandoned":
+      return {
+        ...turn,
+        noteEdits: withAbandonedNoteEdit(turn.noteEdits, event.id, event.reason),
       };
     case "searching":
       return {

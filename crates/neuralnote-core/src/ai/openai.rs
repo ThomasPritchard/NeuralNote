@@ -7,6 +7,7 @@
 //! owned, and so a later Ollama client can reuse the same protocol plumbing.
 
 use crate::ai::events::{ChatEvent, EventSink};
+use crate::ai::tool_stream::{self, ToolCallDelta, ToolTurnAccumulator};
 use crate::ai::{Completion, LlmMessage, LlmRequest, Role, ToolCall};
 use crate::error::{CoreError, CoreResult};
 use serde::{Deserialize, Serialize};
@@ -172,73 +173,211 @@ pub enum SseEvent {
     Other,
 }
 
-/// Parse one line of the OpenRouter SSE stream. Pure (no I/O) so it is unit-tested
-/// directly. A malformed `data:` payload is skipped, not surfaced — mid-stream JSON
-/// noise (e.g. keep-alive artifacts) must not sink an otherwise-good answer.
+/// Parse one line of the OpenRouter SSE stream on the ANSWER turn. Pure (no I/O)
+/// so it is unit-tested directly. A malformed `data:` payload is skipped, not
+/// surfaced — mid-stream JSON noise (e.g. keep-alive artifacts) must not sink an
+/// otherwise-good answer.
 pub fn parse_sse_line(line: &str) -> SseEvent {
+    match classify_sse_line(line) {
+        SseLine::Ignorable => SseEvent::Other,
+        SseLine::Done => SseEvent::Done,
+        SseLine::Failed(message) => SseEvent::Error(message),
+        SseLine::Chunk(chunk) => answer_event(chunk),
+    }
+}
+
+/// What a `data:` line means before either turn interprets it.
+///
+/// The two turns read different things out of a frame, but they agree completely
+/// on comments, the terminator, and the in-band failure frame. Resolving those
+/// once is what stops the answer path and the tool path drifting apart on them —
+/// a stream error swallowed on one path and surfaced on the other would be the
+/// worst of both.
+enum SseLine {
+    Ignorable,
+    Done,
+    Failed(String),
+    Chunk(StreamChunk),
+}
+
+fn classify_sse_line(line: &str) -> SseLine {
     let line = line.trim_end_matches(['\r', '\n']).trim();
     // `:`-prefixed lines are SSE comments (OpenRouter sends `: OPENROUTER PROCESSING`).
     if line.is_empty() || line.starts_with(':') {
-        return SseEvent::Other;
+        return SseLine::Ignorable;
     }
     let Some(data) = line.strip_prefix("data:") else {
-        return SseEvent::Other;
+        return SseLine::Ignorable;
     };
     let data = data.trim();
     if data == "[DONE]" {
-        return SseEvent::Done;
+        return SseLine::Done;
     }
-    match serde_json::from_str::<StreamChunk>(data) {
-        Ok(chunk) => {
-            // Check the error frame BEFORE the empty-delta filter: the failure frame
-            // carries an empty `delta.content`, so filtering first would drop it.
-            if let Some(err) = chunk.error {
-                let msg = err.message.unwrap_or_else(|| "unknown error".into());
-                return match err.code {
-                    Some(code) => {
-                        // Render a string code without JSON quotes (`rate_limited`,
-                        // not `"rate_limited"`); numbers/other Values use Display.
-                        let code = code
-                            .as_str()
-                            .map(str::to_string)
-                            .unwrap_or_else(|| code.to_string());
-                        SseEvent::Error(format!("OpenRouter stream error {code}: {msg}"))
-                    }
-                    None => SseEvent::Error(format!("OpenRouter stream error: {msg}")),
-                };
-            }
-            let Some(choice) = chunk.choices.into_iter().next() else {
-                return SseEvent::Other;
-            };
-            let finish_reason = choice.finish_reason;
-            let delta = choice.delta;
-            // Read reasoning BEFORE the empty-content filter — the same reason the error
-            // frame is read first. A reasoning-only chunk carries an empty `delta.content`,
-            // so filtering first would silently drop every reasoning token, the exact
-            // mechanism that nearly ate the error frame.
-            //
-            // Both are read from the same frame and matched exhaustively rather than
-            // short-circuiting on reasoning: a frame may carry both, and returning early
-            // on reasoning would drop the answer token beside it.
-            let reasoning = extract_reasoning(&delta);
-            let content = delta.content.filter(|s| !s.is_empty());
-            // A `length` finish means the provider hit its output-token ceiling. Surface
-            // it, but keep any content token on the same frame (the wire may carry the
-            // final token beside the finish reason) — dropping it would lose an answer
-            // token, and any citation marker riding on it. `stop`, `tool_calls`, and a
-            // null finish are all ordinary and fall through to the content/reasoning
-            // classification below.
-            if finish_reason.as_deref() == Some("length") {
-                return SseEvent::Truncated { delta: content };
-            }
-            match (reasoning, content) {
-                (Some(reasoning), Some(delta)) => SseEvent::ReasoningAndDelta { reasoning, delta },
-                (Some(reasoning), None) => SseEvent::Reasoning(reasoning),
-                (None, Some(delta)) => SseEvent::Delta(delta),
-                (None, None) => SseEvent::Other,
-            }
+    let Ok(mut chunk) = serde_json::from_str::<StreamChunk>(data) else {
+        return SseLine::Ignorable;
+    };
+    // Check the error frame BEFORE anything else: the failure frame carries an
+    // empty `delta.content`, so an empty-delta filter would drop it.
+    let Some(err) = chunk.error.take() else {
+        return SseLine::Chunk(chunk);
+    };
+    let msg = err.message.unwrap_or_else(|| "unknown error".into());
+    SseLine::Failed(match err.code {
+        Some(code) => {
+            // Render a string code without JSON quotes (`rate_limited`, not
+            // `"rate_limited"`); numbers/other Values use Display.
+            let code = code
+                .as_str()
+                .map(str::to_string)
+                .unwrap_or_else(|| code.to_string());
+            format!("OpenRouter stream error {code}: {msg}")
         }
-        Err(_) => SseEvent::Other,
+        None => format!("OpenRouter stream error: {msg}"),
+    })
+}
+
+fn answer_event(chunk: StreamChunk) -> SseEvent {
+    let Some(choice) = chunk.choices.into_iter().next() else {
+        return SseEvent::Other;
+    };
+    let finish_reason = choice.finish_reason;
+    let delta = choice.delta;
+    // Read reasoning BEFORE the empty-content filter — the same reason the error
+    // frame is read first. A reasoning-only chunk carries an empty `delta.content`,
+    // so filtering first would silently drop every reasoning token, the exact
+    // mechanism that nearly ate the error frame.
+    //
+    // Both are read from the same frame and matched exhaustively rather than
+    // short-circuiting on reasoning: a frame may carry both, and returning early
+    // on reasoning would drop the answer token beside it.
+    let reasoning = extract_reasoning(&delta);
+    let content = delta.content.filter(|s| !s.is_empty());
+    // A `length` finish means the provider hit its output-token ceiling. Surface
+    // it, but keep any content token on the same frame (the wire may carry the
+    // final token beside the finish reason) — dropping it would lose an answer
+    // token, and any citation marker riding on it. `stop`, `tool_calls`, and a
+    // null finish are all ordinary and fall through to the content/reasoning
+    // classification below.
+    if finish_reason.as_deref() == Some("length") {
+        return SseEvent::Truncated { delta: content };
+    }
+    match (reasoning, content) {
+        (Some(reasoning), Some(delta)) => SseEvent::ReasoningAndDelta { reasoning, delta },
+        (Some(reasoning), None) => SseEvent::Reasoning(reasoning),
+        (None, Some(delta)) => SseEvent::Delta(delta),
+        (None, None) => SseEvent::Other,
+    }
+}
+
+/* ──────────────────────  The streamed TOOL-DECIDING turn  ───────────────────── */
+
+/// One parsed SSE line's meaning on a tool-deciding turn.
+pub enum ToolSseEvent {
+    /// What the frame carried for this turn. Both parts, because the wire does
+    /// not promise prose and tool-call fragments arrive in separate frames, and
+    /// returning early on either would drop the other.
+    Delta {
+        content: Option<String>,
+        fragments: Vec<ToolCallDelta>,
+    },
+    /// The `data: [DONE]` terminator.
+    Done,
+    /// The turn cannot be trusted or completed: an in-band error frame, a
+    /// provider-declared failure, or a fragment there is no way to place.
+    Failed(String),
+    /// A heartbeat, reasoning, an empty delta, or malformed noise.
+    Other,
+}
+
+/// The message for a fragment with no `index`, which is the one wire deviation
+/// that would silently corrupt a note body rather than merely lose one.
+const MISSING_TOOL_CALL_INDEX: &str =
+    "the provider streamed a tool-call fragment with no index, so NeuralNote cannot tell which call it belongs to";
+
+/// Parse one line of a streamed tool-deciding turn. Pure, like [`parse_sse_line`].
+pub fn parse_tool_sse_line(line: &str) -> ToolSseEvent {
+    match classify_sse_line(line) {
+        SseLine::Ignorable => ToolSseEvent::Other,
+        SseLine::Done => ToolSseEvent::Done,
+        SseLine::Failed(message) => ToolSseEvent::Failed(message),
+        SseLine::Chunk(chunk) => tool_event(chunk),
+    }
+}
+
+fn tool_event(chunk: StreamChunk) -> ToolSseEvent {
+    let Some(choice) = chunk.choices.into_iter().next() else {
+        return ToolSseEvent::Other;
+    };
+    if let Some(message) = tool_turn_failure(choice.finish_reason.as_deref()) {
+        return ToolSseEvent::Failed(message);
+    }
+    let mut fragments = Vec::with_capacity(choice.delta.tool_calls.len());
+    for entry in choice.delta.tool_calls {
+        let Some(index) = entry.index else {
+            return ToolSseEvent::Failed(MISSING_TOOL_CALL_INDEX.to_string());
+        };
+        let (name, arguments) = match entry.function {
+            Some(function) => (function.name, function.arguments),
+            None => (None, None),
+        };
+        fragments.push(ToolCallDelta {
+            index,
+            id: entry.id,
+            name,
+            arguments,
+        });
+    }
+    let content = choice.delta.content.filter(|s| !s.is_empty());
+    if content.is_none() && fragments.is_empty() {
+        return ToolSseEvent::Other;
+    }
+    ToolSseEvent::Delta { content, fragments }
+}
+
+/// A finish reason that means the model never finished deciding.
+///
+/// The completed calls of a cut-short turn are half a plan. The captured turn
+/// asked for fifteen duplicate note writes and *then* errored; running the ones
+/// that happened to close would execute a runaway the provider itself abandoned.
+/// `stop`, `tool_calls` and a null finish are ordinary and yield `None`.
+fn tool_turn_failure(finish_reason: Option<&str>) -> Option<String> {
+    match finish_reason {
+        Some("error") => Some(
+            "the provider ended the tool turn with finish_reason \"error\", so its tool calls are an unfinished plan".into(),
+        ),
+        Some("length") => Some(
+            "the provider hit its output ceiling mid tool-call, so the turn's tool calls are an unfinished plan".into(),
+        ),
+        _ => None,
+    }
+}
+
+/// Process one SSE line of a tool-deciding turn into the accumulator and sink.
+/// `Ok(true)` means a terminal `[DONE]` was seen (stop reading); `Ok(false)` means
+/// keep reading; `Err` surfaces a failure — with every live preview already
+/// cleared, so a failed turn can never leave a half-composed note on screen
+/// looking like one that landed.
+pub fn consume_tool_sse_line(
+    line_bytes: &[u8],
+    accumulator: &mut ToolTurnAccumulator,
+    sink: &mut dyn EventSink,
+) -> CoreResult<bool> {
+    match parse_tool_sse_line(&String::from_utf8_lossy(line_bytes)) {
+        ToolSseEvent::Delta { content, fragments } => {
+            if let Some(content) = content {
+                accumulator.push_content(&content);
+            }
+            for fragment in fragments {
+                accumulator.push_fragment(fragment, sink);
+            }
+            Ok(false)
+        }
+        ToolSseEvent::Done => Ok(true),
+        ToolSseEvent::Failed(message) => {
+            accumulator.abandon(tool_stream::ABANDONED_TURN_FAILED, sink);
+            Err(CoreError::Llm(message))
+        }
+        ToolSseEvent::Other => Ok(false),
     }
 }
 
@@ -457,6 +596,35 @@ struct StreamDelta {
     /// `reasoning_details` array — so both are supported, the array preferred.
     #[serde(default)]
     reasoning: Option<String>,
+    /// Streamed tool-call fragments. Read only by the tool-turn path
+    /// ([`parse_tool_sse_line`]); the answer turn advertises no tools, so a frame
+    /// carrying these there is nothing it can act on.
+    #[serde(default)]
+    tool_calls: Vec<StreamToolCall>,
+}
+
+/// One streamed tool-call entry. Shapes verified against the captured turn in
+/// `fixtures/openrouter_tool_stream.sse`: `index` on every entry, `id` and
+/// `function.name` exactly once each, then `function.arguments` in fragments.
+#[derive(Deserialize)]
+struct StreamToolCall {
+    /// The accumulation key. Deliberately NOT defaulted: defaulting it to 0 would
+    /// silently fold every call of a runaway turn into one, which is a wrong note
+    /// body rather than a visible failure.
+    #[serde(default)]
+    index: Option<u32>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(default)]
+    function: Option<StreamToolFn>,
+}
+
+#[derive(Deserialize)]
+struct StreamToolFn {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
 }
 
 /// One entry in `delta.reasoning_details`. Only `type` and `text` are read; the other
@@ -992,6 +1160,171 @@ mod tests {
                 .iter()
                 .any(|e| matches!(e, ChatEvent::AnswerTruncated)),
             "the length cut must be surfaced even when frames were chunk-split"
+        );
+    }
+
+    /* ─────────────  The streamed tool-deciding turn (contract C6)  ───────────── */
+
+    /// Every frame below is a line of the captured OpenRouter turn. Hand-writing
+    /// one would test this author's idea of the wire, not the wire.
+    const CAPTURE: &str = include_str!("fixtures/openrouter_tool_stream.sse");
+
+    /// The first captured frame matching `predicate`.
+    fn captured_frame(predicate: impl Fn(&str) -> bool) -> &'static str {
+        CAPTURE
+            .lines()
+            .find(|line| line.starts_with("data:") && predicate(line))
+            .expect("the capture still contains this frame")
+    }
+
+    fn fragments(line: &str) -> Vec<ToolCallDelta> {
+        match parse_tool_sse_line(line) {
+            ToolSseEvent::Delta { fragments, .. } => fragments,
+            _ => panic!("expected tool-call fragments from {line}"),
+        }
+    }
+
+    #[test]
+    fn a_first_sight_frame_carries_the_index_id_and_name_together() {
+        let frame = captured_frame(|line| line.contains(r#""name":"search_notes""#));
+        let fragment = fragments(frame).pop().unwrap();
+        assert_eq!(fragment.index, 0);
+        assert!(fragment
+            .id
+            .is_some_and(|id| id.starts_with("chatcmpl-tool-")));
+        assert_eq!(fragment.name.as_deref(), Some("search_notes"));
+        // First sight carries an EMPTY argument fragment, not a missing one.
+        assert_eq!(fragment.arguments.as_deref(), Some(""));
+    }
+
+    #[test]
+    fn a_continuation_frame_carries_only_the_index_and_an_argument_fragment() {
+        let frame = captured_frame(|line| line.contains(r#"{\"query\""#));
+        let fragment = fragments(frame).pop().unwrap();
+        assert_eq!(fragment.index, 0);
+        assert_eq!(fragment.id, None, "the id is sent once, on first sight");
+        assert_eq!(fragment.name, None, "so is the name");
+        assert!(fragment
+            .arguments
+            .is_some_and(|args| args.contains("query")));
+    }
+
+    #[test]
+    fn the_terminal_provider_error_frame_fails_the_tool_turn() {
+        // The capture ends `finish_reason: "error"` with its last call truncated.
+        // Its completed calls are half a plan — fifteen duplicate note writes the
+        // provider itself abandoned — so the turn fails rather than running them.
+        let frame = captured_frame(|line| line.contains(r#""finish_reason":"error""#));
+        match parse_tool_sse_line(frame) {
+            ToolSseEvent::Failed(message) => {
+                assert!(message.contains("unfinished plan"), "{message}");
+            }
+            _ => panic!("a provider-declared failure must not be swallowed"),
+        }
+    }
+
+    #[test]
+    fn an_output_ceiling_hit_mid_tool_call_fails_the_tool_turn_too() {
+        // Same class as the error frame: the model never finished deciding. Not
+        // observed in the capture, so it is derived from a captured frame rather
+        // than invented — only the finish reason differs.
+        let frame = captured_frame(|line| line.contains(r#""finish_reason":"error""#))
+            .replace(r#""finish_reason":"error""#, r#""finish_reason":"length""#);
+        match parse_tool_sse_line(&frame) {
+            ToolSseEvent::Failed(message) => {
+                assert!(message.contains("output ceiling"), "{message}")
+            }
+            _ => panic!("a turn cut off at the ceiling must not run its partial plan"),
+        }
+    }
+
+    #[test]
+    fn a_fragment_with_no_index_fails_rather_than_being_folded_onto_another_call() {
+        // Defaulting a missing index to 0 would silently merge every call of a
+        // runaway turn into one, which is a WRONG note body rather than a visible
+        // failure. Derived by deleting the field from a real frame — the capture
+        // cannot contain this case, since `index` was on all 3425 entries.
+        let frame = captured_frame(|line| line.contains(r#""name":"search_notes""#))
+            .replace(r#""index":0,"id""#, r#""id""#);
+        assert!(
+            !frame.contains(r#""index":0,"id""#),
+            "the frame really lost its tool-call index"
+        );
+        match parse_tool_sse_line(&frame) {
+            ToolSseEvent::Failed(message) => assert!(message.contains("no index"), "{message}"),
+            _ => panic!("an unplaceable fragment must surface, not be guessed at"),
+        }
+    }
+
+    #[test]
+    fn the_tool_turn_agrees_with_the_answer_turn_on_comments_done_and_errors() {
+        // Both turns read the same stream. A stream error swallowed on one path
+        // and surfaced on the other is the worst of both, so the shared parts are
+        // resolved once — this is the test that says so.
+        assert!(matches!(
+            parse_tool_sse_line(": OPENROUTER PROCESSING"),
+            ToolSseEvent::Other
+        ));
+        assert!(matches!(parse_tool_sse_line(""), ToolSseEvent::Other));
+        assert!(matches!(
+            parse_tool_sse_line("data: [DONE]"),
+            ToolSseEvent::Done
+        ));
+        assert!(matches!(
+            parse_tool_sse_line("data: {not json"),
+            ToolSseEvent::Other
+        ));
+        let error = r#"data: {"error":{"code":429,"message":"Rate limit exceeded"},"choices":[]}"#;
+        match parse_tool_sse_line(error) {
+            ToolSseEvent::Failed(message) => assert!(message.contains("Rate limit exceeded")),
+            _ => panic!("an in-band error frame is fatal on the tool turn too"),
+        }
+    }
+
+    #[test]
+    fn a_reasoning_frame_on_the_tool_turn_is_not_mistaken_for_a_tool_call() {
+        let frame = captured_frame(|line| line.contains("reasoning.text"));
+        assert!(matches!(parse_tool_sse_line(frame), ToolSseEvent::Other));
+    }
+
+    #[test]
+    fn consuming_a_failure_frame_clears_the_live_previews_before_it_errors() {
+        // Otherwise a half-composed note is left on screen looking like one that
+        // landed, which is the exact failure NoteEditAbandoned exists to prevent.
+        let mut sink = crate::ai::events::VecSink::default();
+        let mut accumulator = ToolTurnAccumulator::new();
+        accumulator.push_fragment(
+            ToolCallDelta {
+                index: 0,
+                id: Some("call-1".into()),
+                name: Some(crate::ai::tool_registry::TOOL_WRITE_NOTE.into()),
+                arguments: Some(r#"{"content": "half"#.into()),
+            },
+            &mut sink,
+        );
+        let frame = captured_frame(|line| line.contains(r#""finish_reason":"error""#));
+
+        let error = consume_tool_sse_line(frame.as_bytes(), &mut accumulator, &mut sink)
+            .expect_err("the failure is surfaced");
+
+        assert!(error.to_string().contains("unfinished plan"));
+        assert!(sink.events.iter().any(|event| matches!(
+            event,
+            ChatEvent::NoteEditAbandoned { reason, .. } if reason == tool_stream::ABANDONED_TURN_FAILED
+        )));
+    }
+
+    #[test]
+    fn consuming_the_capture_ends_on_its_terminator() {
+        let mut sink = crate::ai::events::VecSink::default();
+        let mut accumulator = ToolTurnAccumulator::new();
+        assert!(
+            !consume_tool_sse_line(b"data: [not json", &mut accumulator, &mut sink).unwrap(),
+            "noise is skipped, never fatal"
+        );
+        assert!(
+            consume_tool_sse_line(b"data: [DONE]", &mut accumulator, &mut sink).unwrap(),
+            "the terminator stops the read"
         );
     }
 }

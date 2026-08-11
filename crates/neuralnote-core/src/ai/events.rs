@@ -136,6 +136,32 @@ pub enum ChatEvent {
     /// A create-only write hit an existing note and wrote nothing (#108). Without
     /// it the no-op is invisible, which the "failures are never silent" rule forbids.
     NoteExists { rel_path: String, kind: NoteKind },
+    /// A best-effort, partially-parsed view of a note the model is still
+    /// composing. Rust owns the partial-JSON parse and emits a SEMANTIC preview,
+    /// so the UI never sees half a JSON blob and never has to know the body
+    /// arrived inside an escaped string.
+    ///
+    /// Emitted only for tools on [`crate::ai::tool_stream::PREVIEWABLE_TOOLS`] —
+    /// arbitrary tool arguments are model-authored and not safe to render as prose.
+    NoteEditPreview {
+        /// The [`ChatEvent::ToolCall`] id, so the card upgrades in place into
+        /// [`ChatEvent::NoteWritten`] rather than becoming a second node.
+        id: String,
+        /// Absent until the path member has finished arriving — half a path must
+        /// never be shown as if it were the whole path.
+        rel_path: Option<String>,
+        kind: Option<NoteKind>,
+        /// The note body composed SO FAR, already un-escaped.
+        body: String,
+        /// The arguments JSON has closed and parses. **The write has NOT happened
+        /// yet** — the tool still has to be dispatched, and can still be rejected.
+        complete: bool,
+    },
+    /// The preview is abandoned: the model never finished the call, the run was
+    /// cancelled, or the arguments never became valid JSON. Exactly one of these
+    /// follows any preview that does not go on to be written, so a half-composed
+    /// diff is never left sitting there looking committed.
+    NoteEditAbandoned { id: String, reason: String },
     /// A search is about to run for `query` (the live "searching…" cue).
     Searching { query: String },
     /// `query` finished, yielding `hit_count` evidence spans.
@@ -463,6 +489,66 @@ mod tests {
                 "type": "noteExists",
                 "relPath": "Notes/Name.md",
                 "kind": "atomic",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn note_edit_preview_carries_the_call_id_and_keeps_unknown_fields_null() {
+        // The id is the correlation key the card upgrades in place on, and an
+        // absent path must serialise as absent — never as an empty string, which
+        // would render as a real (blank) destination.
+        assert_eq!(
+            json(&ChatEvent::NoteEditPreview {
+                id: "call-1".into(),
+                rel_path: None,
+                kind: None,
+                body: "# Spaced".into(),
+                complete: false,
+            }),
+            serde_json::json!({
+                "type": "noteEditPreview",
+                "id": "call-1",
+                "relPath": null,
+                "kind": null,
+                "body": "# Spaced",
+                "complete": false,
+            })
+        );
+    }
+
+    #[test]
+    fn note_edit_preview_round_trips_a_settled_preview() {
+        let event = ChatEvent::NoteEditPreview {
+            id: "call-1".into(),
+            rel_path: Some("Zettelkasten/Spaced repetition.md".into()),
+            kind: Some(NoteKind::Atomic),
+            body: "# Spaced Repetition\n\nBody.".into(),
+            complete: true,
+        };
+        let value = json(&event);
+        assert_eq!(value["relPath"], "Zettelkasten/Spaced repetition.md");
+        assert_eq!(value["kind"], "atomic");
+        assert_eq!(value["complete"], true);
+        assert_eq!(serde_json::from_value::<ChatEvent>(value).unwrap(), event);
+    }
+
+    #[test]
+    fn note_edit_abandoned_carries_the_call_id_and_a_reason() {
+        let event = ChatEvent::NoteEditAbandoned {
+            id: "call-1".into(),
+            reason: "the model stopped before it finished composing this note".into(),
+        };
+        assert_eq!(
+            json(&event),
+            serde_json::json!({
+                "type": "noteEditAbandoned",
+                "id": "call-1",
+                "reason": "the model stopped before it finished composing this note",
             })
         );
         assert_eq!(

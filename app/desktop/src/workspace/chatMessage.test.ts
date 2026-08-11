@@ -444,6 +444,98 @@ describe("reduceAssistant — the tool timeline", () => {
   });
 });
 
+/** One live-preview event. A settled preview also carries the path and kind,
+ *  because those only finish arriving once the arguments have closed. */
+function preview(body: string, complete = false, id = "c1"): ChatEvent {
+  return {
+    type: "noteEditPreview",
+    id,
+    relPath: complete ? "Zettelkasten/Spaced.md" : null,
+    kind: complete ? "atomic" : null,
+    body,
+    complete,
+  };
+}
+
+describe("reduceAssistant — the live note preview", () => {
+  it("replaces the growing body in place rather than stacking rows", () => {
+    // The backend re-sends the whole body each time, so a second preview for one
+    // call is the SAME note further along — appending would render the note once
+    // per fragment, hundreds of times.
+    const turn = run([
+      preview("# Spa"),
+      preview("# Spaced rep"),
+      preview("# Spaced repetition", true),
+    ]);
+
+    expect(turn.noteEdits).toHaveLength(1);
+    expect(turn.noteEdits[0]).toEqual({
+      id: "c1",
+      relPath: "Zettelkasten/Spaced.md",
+      kind: "atomic",
+      body: "# Spaced repetition",
+      complete: true,
+      abandoned: null,
+    });
+  });
+
+  it("keeps two concurrent edits apart by their call id", () => {
+    const turn = run([preview("first", false, "c1"), preview("second", false, "c2")]);
+
+    expect(turn.noteEdits.map((edit) => [edit.id, edit.body])).toEqual([
+      ["c1", "first"],
+      ["c2", "second"],
+    ]);
+  });
+
+  it("a settled preview is not a written note", () => {
+    // `complete` means the arguments parsed, not that a file exists — the tool
+    // still has to be dispatched, and can still be rejected.
+    const turn = run([preview("# Spaced repetition", true)]);
+
+    expect(turn.noteEdits[0].complete).toBe(true);
+    expect(turn.writtenNotes).toEqual([]);
+  });
+
+  it("marks an abandoned edit so its diff stops reading as committed", () => {
+    const turn = run([
+      preview("# Half a n"),
+      { type: "noteEditAbandoned", id: "c1", reason: "the model stopped" },
+    ]);
+
+    expect(turn.noteEdits).toHaveLength(1);
+    expect(turn.noteEdits[0].abandoned).toBe("the model stopped");
+    expect(turn.noteEdits[0].body).toBe("# Half a n");
+  });
+
+  it("surfaces an abandonment whose preview never arrived rather than dropping it", () => {
+    // The backend abandons only what it previewed, so an unmatched one is a
+    // broken contract — and a broken contract has to be visible.
+    const turn = run([{ type: "noteEditAbandoned", id: "ghost", reason: "gone" }]);
+
+    expect(turn.noteEdits).toEqual([
+      {
+        id: "ghost",
+        relPath: null,
+        kind: null,
+        body: "",
+        complete: false,
+        abandoned: "gone",
+      },
+    ]);
+  });
+
+  it("never revives an edit the backend already abandoned", () => {
+    const turn = run([
+      preview("# Half"),
+      { type: "noteEditAbandoned", id: "c1", reason: "the model stopped" },
+      preview("# Half a note more"),
+    ]);
+
+    expect(turn.noteEdits[0].abandoned).toBe("the model stopped");
+  });
+});
+
 describe("showsNothingFoundCard", () => {
   // A genuine miss: the search surfaced nothing worth reading, so the turn read
   // no note and cited none. `notesRead` is empty — that is what makes "nothing

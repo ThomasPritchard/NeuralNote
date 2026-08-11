@@ -38,4 +38,23 @@ summary: string | null,
 /**
  * Bounded result or error text for the disclosure. Truncated Rust-side.
  */
-detail: string | null, } | { "type": "transcriptSource", label: string, relPath: string | null, } | { "type": "partialRun", reason: string, } | { "type": "noteWritten", relPath: string, kind: NoteKind, } | { "type": "noteExists", relPath: string, kind: NoteKind, } | { "type": "searching", query: string, } | { "type": "retrieved", query: string, hitCount: number, } | { "type": "reading", relPath: string, startLine: number, endLine: number, } | { "type": "thinking", delta: string, } | { "type": "verifying" } | { "type": "citationDropped", reason: string, } | { "type": "answer", delta: string, } | { "type": "answerTruncated" } | { "type": "citation", id: string, relPath: string, startLine: number, endLine: number, text: string, } | { "type": "coverage", searchedTerms: Array<string>, notesRead: Array<string>, truncated: boolean, skippedFiles: number, } | { "type": "error", message: string, } | { "type": "done" };
+detail: string | null, } | { "type": "transcriptSource", label: string, relPath: string | null, } | { "type": "partialRun", reason: string, } | { "type": "noteWritten", relPath: string, kind: NoteKind, } | { "type": "noteExists", relPath: string, kind: NoteKind, } | { "type": "noteEditPreview", 
+/**
+ * The [`ChatEvent::ToolCall`] id, so the card upgrades in place into
+ * [`ChatEvent::NoteWritten`] rather than becoming a second node.
+ */
+id: string, 
+/**
+ * Absent until the path member has finished arriving — half a path must
+ * never be shown as if it were the whole path.
+ */
+relPath: string | null, kind: NoteKind | null, 
+/**
+ * The note body composed SO FAR, already un-escaped.
+ */
+body: string, 
+/**
+ * The arguments JSON has closed and parses. **The write has NOT happened
+ * yet** — the tool still has to be dispatched, and can still be rejected.
+ */
+complete: boolean, } | { "type": "noteEditAbandoned", id: string, reason: string, } | { "type": "searching", query: string, } | { "type": "retrieved", query: string, hitCount: number, } | { "type": "reading", relPath: string, startLine: number, endLine: number, } | { "type": "thinking", delta: string, } | { "type": "verifying" } | { "type": "citationDropped", reason: string, } | { "type": "answer", delta: string, } | { "type": "answerTruncated" } | { "type": "citation", id: string, relPath: string, startLine: number, endLine: number, text: string, } | { "type": "coverage", searchedTerms: Array<string>, notesRead: Array<string>, truncated: boolean, skippedFiles: number, } | { "type": "error", message: string, } | { "type": "done" };
