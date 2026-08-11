@@ -109,6 +109,15 @@
   --sidebar-width: 18.5rem;
   --splitter-width: 8px;
   --chat-width: clamp(26.25rem, 28vw, 30rem);
+  /* The widened chat slot. A SECOND token rather than a modifier on the first,
+     because both have to survive the same responsive narrowing: every media
+     query below that overrides `--chat-width` overrides this one too. Miss one
+     and a narrow window gets a chat pane wider than the editor beside it.
+
+     Each tier is sized so the editor still clears EDITOR_MIN_WIDTH (240px,
+     `workspaceLayout.ts`) at the NARROWEST window that tier covers, with the
+     navigation compacted (56px) and the sidebar at its 192px floor. */
+  --chat-width-expanded: clamp(36rem, 44vw, 46rem);
   --panel-motion-duration: 200ms;
   --panel-motion-easing: cubic-bezier(0.25, 1, 0.5, 1);
   --note-toolbar-height: 2.75rem;
@@ -443,7 +452,10 @@ html[data-font-family="sourceSerif4"] {
   flex: 0 0 var(--chat-width);
   width: var(--chat-width);
   transform: translateX(0);
-  transition: transform var(--panel-motion-duration) var(--panel-motion-easing);
+  transition:
+    flex-basis var(--panel-motion-duration) var(--panel-motion-easing),
+    width var(--panel-motion-duration) var(--panel-motion-easing),
+    transform var(--panel-motion-duration) var(--panel-motion-easing);
 }
 
 .nn-chat-slot {
@@ -457,6 +469,26 @@ html[data-font-family="sourceSerif4"] {
     width var(--panel-motion-duration) var(--panel-motion-easing),
     opacity 150ms ease-out,
     visibility 0s linear;
+}
+
+/* Widened. `:not([data-visible="false"])` rather than source order: the
+   collapsed rule below is the same specificity, and an expanded pane that
+   out-ranked "the chat is closed" would hold a 36rem gap open next to a hidden
+   pane. Structural, so it cannot be broken by moving a rule.
+
+   The pane animates its own width alongside the slot's. The layout hook
+   (`useWorkspaceLayout`) measures BOTH and deliberately reads intermediate
+   animation frames, so navigation compaction tracks the widening frame by
+   frame instead of snapping when it lands. There is no feedback loop to fear:
+   the width comes from a token, never from a measurement, so compaction cannot
+   feed back into it. */
+.nn-chat-slot[data-expanded="true"]:not([data-visible="false"]) {
+  width: var(--chat-width-expanded);
+}
+
+.nn-chat-slot[data-expanded="true"] > .nn-chat-pane {
+  flex-basis: var(--chat-width-expanded);
+  width: var(--chat-width-expanded);
 }
 
 .nn-chat-slot[data-visible="false"] {
@@ -1140,15 +1172,24 @@ html[data-font-family="sourceSerif4"] {
   }
 }
 
+/* Every tier that narrows `--chat-width` narrows `--chat-width-expanded` with
+   it. The expanded values are derived, not guessed: at the narrowest window each
+   tier covers, `window − 56 (compact navigation) − 192 (sidebar floor) − 8
+   (splitter) − expanded` must still leave the editor its 240px minimum.
+     ≤1280 → at 1051: 1051 − 56 − 192 − 8 − 544 = 251
+     ≤1050 → at  941:  941 − 56 − 192 − 8 − 416 = 269
+     ≤ 940 → at  920:  920 − 56 − 192 − 8 − 384 = 240  (the app's minWidth) */
 @media (max-width: 1280px) {
   :root {
     --chat-width: 25.5rem;
+    --chat-width-expanded: 34rem;
   }
 }
 
 @media (max-width: 1050px) {
   :root {
     --chat-width: 20.5rem;
+    --chat-width-expanded: 26rem;
   }
 
   .nn-status-secondary,
@@ -1160,6 +1201,7 @@ html[data-font-family="sourceSerif4"] {
 @media (max-width: 940px) {
   :root {
     --chat-width: 18rem;
+    --chat-width-expanded: 24rem;
   }
 
 }

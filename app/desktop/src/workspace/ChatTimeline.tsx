@@ -21,16 +21,11 @@
 
 import { ChevronRight, Loader2 } from "lucide-react";
 import { summarizeActivity } from "./chatMessage";
-import type {
-  AssistantMessage,
-  SkillActivationFailure,
-  ToolApprovalView,
-  ToolCallView,
-} from "./chatMessage";
-import type { ApprovalDegradedReason } from "../lib/types";
+import type { AssistantMessage, ToolCallView } from "./chatMessage";
 import { playfulProgressCopy } from "./playfulProgressCopy";
 import { approvalNodeState } from "./approvalCopy";
 import { ApprovalDegradedNode, ToolApprovalNode } from "./ChatApprovalNode";
+import { PlanStepNode } from "./ChatPlanNode";
 import {
   ActivationFailureNode,
   DroppedNode,
@@ -38,6 +33,14 @@ import {
   ToolNode,
   VerifyingNode,
 } from "./ChatTimelineNodes";
+import {
+  keyed,
+  railCalls,
+  timelineEntries,
+  timelineRows,
+  type KeyedEntry,
+  type TimelineEntry,
+} from "./chatTimelineRows";
 
 /** Pluralise a count with its noun. Irregular plurals (search→searches) are
  *  passed explicitly rather than guessed from a suffix. */
@@ -62,100 +65,6 @@ function livePhase(phase: AssistantMessage["phase"], prompt: string): string {
   }
 }
 
-/** One rail node, before it is rendered. The wire carries no global sequence
- *  number, so nodes are grouped in the order a run's phases actually occur —
- *  activation, reasoning, dispatched calls, verification — rather than pretending
- *  to an interleaving the events cannot support. */
-type TimelineEntry =
-  | { kind: "failure"; failure: SkillActivationFailure }
-  | { kind: "thinking"; text: string }
-  | { kind: "degraded"; reason: ApprovalDegradedReason }
-  | { kind: "approval"; approval: ToolApprovalView }
-  | { kind: "tool"; call: ToolCallView }
-  | { kind: "verifying" }
-  | { kind: "dropped"; reason: string };
-
-/** Build the rail's nodes from the folded turn.
- *
- *  `searching` / `reading` activity steps deliberately do NOT become nodes: they
- *  are emitted by the very tool calls above them (`handle_tool_call` sends the
- *  cue, then the call settles), so rendering both would show one act twice. They
- *  still drive the settled summary's counts, where they are the cheapest honest
- *  source.
- *
- *  A previewed write is the same rule one step further. `ChatNoteEditCard` and
- *  the tool node share an id and describe one act, and the card is strictly the
- *  fuller account — it carries the composed body, the running count, and the
- *  call's own settlement and failure detail. So the node stands down. This is a
- *  SET test over the turn's edits, never a test of arrival order: the preview
- *  streams during the turn and its tool call is announced when the turn settles,
- *  so for most of a card's life there is no node to stand down yet. */
-function railCalls(turn: AssistantMessage): ToolCallView[] {
-  const previewed = new Set(turn.noteEdits.map((edit) => edit.id));
-  return turn.toolCalls.filter((call) => !previewed.has(call.id));
-}
-
-/** Pair each gated call's approval node with the call it governs.
- *
- *  Walks `toolCalls` rather than `toolApprovals` so an approval lands directly
- *  above the call it decided — the gate runs, then the call dispatches, and the
- *  rail should read in that order. The walk is over ALL calls, not just the ones
- *  the rail shows: a previewed write stands its tool node down in favour of
- *  `ChatNoteEditCard`, but that card carries no account of the approval, so the
- *  approval node stays regardless.
- *
- *  An approval whose `toolCall` has not arrived yet is appended afterwards
- *  instead of being dropped. The gate keys its events on the tool-call id, so in
- *  practice the call is announced first; a request that somehow outruns its call
- *  is a broken contract that has to be visible, not an event to swallow. */
-function approvalEntries(turn: AssistantMessage, onRail: ReadonlySet<string>): TimelineEntry[] {
-  const entries: TimelineEntry[] = [];
-  const placed = new Set<string>();
-  for (const call of turn.toolCalls) {
-    const approval = turn.toolApprovals.find((entry) => entry.id === call.id);
-    if (approval !== undefined && !placed.has(approval.id)) {
-      entries.push({ kind: "approval", approval });
-      placed.add(approval.id);
-    }
-    if (onRail.has(call.id)) entries.push({ kind: "tool", call });
-  }
-  for (const approval of turn.toolApprovals) {
-    if (!placed.has(approval.id)) entries.push({ kind: "approval", approval });
-  }
-  return entries;
-}
-
-function timelineEntries(turn: AssistantMessage, calls: ToolCallView[]): TimelineEntry[] {
-  const entries: TimelineEntry[] = turn.skillActivationFailures.map((failure) => ({
-    kind: "failure" as const,
-    failure,
-  }));
-  if (turn.thinking.trim() !== "") {
-    entries.push({ kind: "thinking", text: turn.thinking });
-  }
-  if (turn.approvalDegraded !== null) {
-    entries.push({ kind: "degraded", reason: turn.approvalDegraded });
-  }
-  entries.push(...approvalEntries(turn, new Set(calls.map((call) => call.id))));
-  for (const step of turn.activity) {
-    if (step.kind === "verifying") entries.push({ kind: "verifying" });
-    if (step.kind === "dropped") entries.push({ kind: "dropped", reason: step.reason });
-  }
-  return entries;
-}
-
-/** Keys by kind + occurrence. The rail is append-only and never reordered, so
- *  "the 2nd dropped citation" is a durable identity even when a tool id repeats
- *  or two citations are dropped for the same reason. */
-function keyed(entries: TimelineEntry[]): Array<{ entry: TimelineEntry; key: string }> {
-  const seen = new Map<string, number>();
-  return entries.map((entry) => {
-    const n = seen.get(entry.kind) ?? 0;
-    seen.set(entry.kind, n + 1);
-    return { entry, key: `${entry.kind}#${n}` };
-  });
-}
-
 function TimelineEntryNode({
   entry,
   last,
@@ -176,6 +85,15 @@ function TimelineEntryNode({
     case "dropped":
       return <DroppedNode reason={entry.reason} last={last} />;
   }
+}
+
+/** The nodes dispatched under one plan step. `last` is scoped to the group, so
+ *  the nested hairline stops at the group's own final node rather than running
+ *  on into the step below it. */
+function nestedNodes(children: KeyedEntry[]) {
+  return children.map(({ entry, key }, i) => (
+    <TimelineEntryNode key={key} entry={entry} last={i === children.length - 1} />
+  ));
 }
 
 /** The one-line account the head shows once the process has settled.
@@ -287,6 +205,11 @@ function needsAttention(turn: AssistantMessage, calls: ToolCallView[]): boolean 
     dropped > 0 ||
     calls.some((call) => call.status !== null && call.status !== "ok") ||
     (searches > 0 && notesRead === 0) ||
+    // A step the model declared and could not complete. It says the run did
+    // less than the answer above it implies, which is the same reason a failed
+    // call opens the fold — and unlike a failed call, nothing else on screen
+    // says so.
+    turn.planSteps.some((step) => step.status === "failed") ||
     // Anything the gate did that is not a settled automatic approval. A prompt
     // the user has to answer, a check they are waiting on, or a call that never
     // ran must never be one collapsed fold away — and automatic checking having
@@ -330,13 +253,22 @@ export function ChatTimeline({
   const entries = timelineEntries(turn, calls);
   const live = !turn.done && !answering && !suppressLive;
 
-  // Nothing happened and nothing is happening: say nothing at all.
-  if (entries.length === 0 && !live) return null;
-
   // Keyed by kind + occurrence, so a node keeps its identity as the list grows:
   // a re-key would remount the visible rows, restarting the in-flight spinner
-  // and discarding any disclosure the user had opened.
-  const rows = keyed(entries);
+  // and discarding any disclosure the user had opened. Keys are assigned before
+  // grouping, so gaining a plan re-parents a node rather than remounting it.
+  const rows = timelineRows(turn, keyed(entries));
+
+  // Nothing happened and nothing is happening: say nothing at all. Tested on
+  // ROWS, not on entries: a plan is content in its own right, and a model that
+  // declares three steps and then answers from what it already knew must not
+  // have its stated intentions disappear because no tool was dispatched.
+  if (rows.length === 0 && !live) return null;
+
+  // Every row the rail carries, nested ones included — the same number as before
+  // whenever no plan was declared, which is what keeps the unplanned head
+  // unchanged.
+  const nodeCount = entries.length + turn.planSteps.length;
   const lastRow = rows.length - 1;
   return (
     <section aria-label="What the assistant did" className="min-w-0">
@@ -352,12 +284,12 @@ export function ChatTimeline({
             aria-hidden
           />
           {live ? (
-            <LiveHead phase={turn.phase} prompt={prompt} nodeCount={entries.length} />
+            <LiveHead phase={turn.phase} prompt={prompt} nodeCount={nodeCount} />
           ) : (
             <SummaryLine
               turn={turn}
               calls={calls}
-              nodeCount={entries.length}
+              nodeCount={nodeCount}
               errored={errored}
             />
           )}
@@ -374,9 +306,13 @@ export function ChatTimeline({
                 : "mt-1.5 flex flex-col pl-[18px]"
             }
           >
-            {rows.map(({ entry, key }, i) => (
-              <TimelineEntryNode key={key} entry={entry} last={i === lastRow} />
-            ))}
+            {rows.map((row, i) =>
+              row.kind === "node" ? (
+                <TimelineEntryNode key={row.key} entry={row.entry} last={i === lastRow} />
+              ) : (
+                <PlanStepNode key={row.key} step={row.step} last={i === lastRow} nodes={nestedNodes(row.children)} />
+              ),
+            )}
           </ol>
         )}
       </details>

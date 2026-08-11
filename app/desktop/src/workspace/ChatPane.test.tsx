@@ -155,14 +155,14 @@ describe("ChatPane — first-run provider branching", () => {
     const openNoteAt = vi.fn();
     const onOpenSettings = vi.fn();
     const { rerender } = render(
-      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={0} />,
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={0} expanded={false} onToggleExpanded={vi.fn()} />,
     );
     await screen.findByRole("button", { name: /set up local ai/i });
 
     // The user configured a local model in Settings; closing it bumps the signal.
     mockAiStatus.mockResolvedValueOnce(localActive("qwen2.5:7b"));
     rerender(
-      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={1} />,
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={1} expanded={false} onToggleExpanded={vi.fn()} />,
     );
 
     expect(await screen.findByLabelText("Ask across your vault")).toBeInTheDocument();
@@ -175,14 +175,14 @@ describe("ChatPane — first-run provider branching", () => {
     const onOpenSettings = vi.fn();
     const user = userEvent.setup();
     const { rerender } = render(
-      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={0} />,
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={0} expanded={false} onToggleExpanded={vi.fn()} />,
     );
 
     // The user explicitly skipped; peeking at Settings without configuring
     // anything must not bounce them back to the picker.
     await user.click(await screen.findByRole("button", { name: /skip for now/i }));
     rerender(
-      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={1} />,
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={1} expanded={false} onToggleExpanded={vi.fn()} />,
     );
 
     await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));
@@ -207,6 +207,8 @@ describe("ChatPane — first-run provider branching", () => {
         openNoteAt={openNoteAt}
         onOpenSettings={onOpenSettings}
         refreshSignal={1}
+        expanded={false}
+        onToggleExpanded={vi.fn()}
       />,
     );
     await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));
@@ -252,6 +254,8 @@ describe("ChatPane — first-run provider branching", () => {
         openNoteAt={openNoteAt}
         onOpenSettings={onOpenSettings}
         refreshSignal={1}
+        expanded={false}
+        onToggleExpanded={vi.fn()}
       />,
     );
     await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));

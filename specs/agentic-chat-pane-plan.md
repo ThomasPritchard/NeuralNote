@@ -585,8 +585,18 @@ stops being cramped. It is last because it is the only phase whose blast radius 
 pane.
 
 **Scope.** A toggle in the pane header that widens the chat slot to an expanded width, persisted
-across sessions, with the tool disclosure and the note-edit diff switching to their two-column
-layouts at that width.
+across sessions, with the tool disclosure switching to a two-column layout at that width
+(arguments left, result right).
+
+> **Correction, 2026-08-11.** This bullet originally also required the **note-edit diff** to go
+> two-column. It cannot, and the reason is upstream: `write_note` is **create-only**
+> (`ai/write_policy.rs:72,307`; a collision returns `Existing` or writes to a suffixed name,
+> `ai/events.rs:184`). There is no baseline on the wire, so there is no diff — the card's own
+> comment already says the body is "a tail, not a diff". Its only genuine pair is
+> body-beside-refusal-reason, and in the refused state the body is folded shut by default, so that
+> column would appear only after a user expanded a settled failure. Building it would have meant
+> fabricating a baseline the backend does not produce. The two-column layout went where there are
+> genuinely two things.
 
 **The three things it collides with, all verified.**
 

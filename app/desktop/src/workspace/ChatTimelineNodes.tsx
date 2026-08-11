@@ -177,6 +177,29 @@ const HINT_FIELDS = [
  *  account. */
 const MAX_HINT_CHARS = 64;
 
+/** The widened disclosure's column heading. Quiet enough to be furniture. */
+const COLUMN_LABEL =
+  "text-[0.5625rem] font-semibold uppercase tracking-[0.08em] text-muted-foreground/60";
+
+/** A block of preformatted, untrusted-but-escaped text inside a disclosure —
+ *  bounded in height, because a model can put a whole document in one argument
+ *  and a fold that grows without limit is the rail's old wrapping bug again. */
+const DETAIL_BODY =
+  "nn-mono max-h-64 min-w-0 overflow-y-auto whitespace-pre-wrap break-words rounded-md bg-surface-sunken px-2 py-1.5 text-[0.625rem] leading-relaxed text-muted-foreground";
+
+/** The raw argument payload, indented if it happens to parse.
+ *
+ *  Best-effort by design: this is raw model output, so anything that is not
+ *  valid JSON is shown exactly as it arrived rather than being repaired into
+ *  something the model did not send. */
+export function formatArguments(argumentsJson: string): string {
+  try {
+    return JSON.stringify(JSON.parse(argumentsJson), null, 2);
+  } catch {
+    return argumentsJson;
+  }
+}
+
 export function argumentHint(argumentsJson: string): string | null {
   let parsed: unknown;
   try {
@@ -263,9 +286,22 @@ export function ToolNode({
             />
             Details
           </summary>
-          <p className="nn-mono mt-1 whitespace-pre-wrap break-words rounded-md bg-surface-sunken px-2 py-1.5 text-[0.625rem] leading-relaxed text-muted-foreground">
-            {call.detail}
-          </p>
+          {/* What was asked, beside what came back — but only where there is
+              room for two readable columns. The threshold is a container query
+              on the turn, so it answers to the pane's ACTUAL width: it opens at
+              the widened width on a normal window and stays shut at the narrow
+              breakpoints, where the expanded pane is still only ~24rem. Below
+              it, this is exactly the single detail block it has always been. */}
+          <div className="mt-1 grid gap-1.5 @[30rem]:grid-cols-2">
+            <div className="hidden min-w-0 flex-col gap-1 @[30rem]:flex">
+              <p className={COLUMN_LABEL}>Arguments</p>
+              <p className={DETAIL_BODY}>{formatArguments(call.arguments)}</p>
+            </div>
+            <div className="flex min-w-0 flex-col gap-1">
+              <p className={`hidden ${COLUMN_LABEL} @[30rem]:block`}>Result</p>
+              <p className={DETAIL_BODY}>{call.detail}</p>
+            </div>
+          </div>
         </details>
       )}
     </TimelineNode>

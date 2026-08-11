@@ -65,19 +65,25 @@ export function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-/** Render the pane with captured callbacks and a fresh user-event session. */
-export function setup(refreshSignal = 0) {
+/** Render the pane with captured callbacks and a fresh user-event session.
+ *
+ *  `expanded` is a plain prop, not state: the pane never owns its own width —
+ *  the workspace layout controller does, and the CSS token resolves it. */
+export function setup(refreshSignal = 0, expanded = false) {
   const openNoteAt = vi.fn();
   const onOpenSettings = vi.fn();
+  const onToggleExpanded = vi.fn();
   const user = userEvent.setup();
   const view = render(
     <ChatPane
       openNoteAt={openNoteAt}
       onOpenSettings={onOpenSettings}
       refreshSignal={refreshSignal}
+      expanded={expanded}
+      onToggleExpanded={onToggleExpanded}
     />,
   );
-  return { openNoteAt, onOpenSettings, user, view };
+  return { openNoteAt, onOpenSettings, onToggleExpanded, user, view };
 }
 
 export const composer = () => screen.getByLabelText("Ask across your vault");

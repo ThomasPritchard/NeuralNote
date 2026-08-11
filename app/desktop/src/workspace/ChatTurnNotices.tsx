@@ -8,7 +8,7 @@
 // where it renders as markdown rather than one pre-wrapped string.
 
 import { SearchX } from "lucide-react";
-import type { CoverageView } from "./chatMessage";
+import type { CoverageView, UsageView } from "./chatMessage";
 
 /** The backstop for an opt-in that produced nothing: reasoning was requested and
  *  billed for, the turn finished cleanly, and no reasoning tokens arrived. Silence
@@ -69,6 +69,52 @@ export function NothingFoundCard({ terms }: Readonly<{ terms: string[] }>) {
       </p>
       {/* TODO(slice-5): wire a capture CTA here once the skills bank lands. */}
     </div>
+  );
+}
+
+/** Pinned to one locale rather than the host's, so the grouping separator is a
+ *  property of the app and not of whatever machine it runs on. */
+const COUNT = new Intl.NumberFormat("en-US");
+
+/** Elapsed time, as a record rather than a live readout. One decimal is right
+ *  for a settled number — it is precise about something that has stopped moving.
+ *  Past a minute the decimal stops meaning anything, so it becomes `2m 05s`. */
+export function formatElapsed(ms: number): string {
+  const seconds = Math.max(0, ms) / 1000;
+  if (seconds < 60) return `${seconds.toFixed(1)}s`;
+  const whole = Math.floor(seconds);
+  return `${Math.floor(whole / 60)}m ${String(whole % 60).padStart(2, "0")}s`;
+}
+
+/** What the run cost, in the order it is worth reading: how long, what it spent,
+ *  and which model spent it.
+ *
+ *  A token count the provider declined to report is rendered as ABSENT — the
+ *  fact simply is not in the list. It must never appear as `0`, which claims a
+ *  measurement of nothing was taken when in truth nothing was measured; the
+ *  local lane routinely reports neither. Elapsed time is ours to measure and the
+ *  model is ours to know, so those two are always there.
+ *
+ *  No separator glyphs between the facts. Each is conditional, so dots would
+ *  need first/last bookkeeping to avoid a leading or doubled one — and a gap
+ *  reads the same. */
+export function UsageFooter({ usage }: Readonly<{ usage: UsageView | null }>) {
+  if (usage === null) return null;
+  const facts: string[] = [formatElapsed(usage.elapsedMs)];
+  if (usage.tokensIn !== null) facts.push(`${COUNT.format(usage.tokensIn)} tokens in`);
+  if (usage.tokensOut !== null) facts.push(`${COUNT.format(usage.tokensOut)} tokens out`);
+  return (
+    <ul
+      aria-label="What this turn cost"
+      className="flex flex-wrap items-center gap-x-3 gap-y-0.5 text-[0.625rem] leading-snug text-muted-foreground/70"
+    >
+      {facts.map((fact) => (
+        <li key={fact}>{fact}</li>
+      ))}
+      <li className="nn-mono min-w-0 truncate text-muted-foreground/60" title={usage.model}>
+        {usage.model}
+      </li>
+    </ul>
   );
 }
 

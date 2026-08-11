@@ -265,6 +265,8 @@ describe("ChatPane — composer reasoning toggle", () => {
         openNoteAt={openNoteAt}
         onOpenSettings={onOpenSettings}
         refreshSignal={1}
+        expanded={false}
+        onToggleExpanded={vi.fn()}
       />,
     );
     await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));
@@ -299,6 +301,8 @@ describe("ChatPane — composer reasoning toggle", () => {
         openNoteAt={openNoteAt}
         onOpenSettings={onOpenSettings}
         refreshSignal={1}
+        expanded={false}
+        onToggleExpanded={vi.fn()}
       />,
     );
     await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));
@@ -395,18 +399,18 @@ describe("ChatPane — composer reasoning toggle", () => {
     const openNoteAt = vi.fn();
     const onOpenSettings = vi.fn();
     const { rerender } = render(
-      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={0} />,
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={0} expanded={false} onToggleExpanded={vi.fn()} />,
     );
     await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(1));
 
     rerender(
-      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={1} />,
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={1} expanded={false} onToggleExpanded={vi.fn()} />,
     );
     await waitFor(() => expect(mockAiStatus).toHaveBeenCalledTimes(2));
     expect(mockRefreshSupport).toHaveBeenCalledTimes(1);
 
     rerender(
-      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={2} />,
+      <ChatPane openNoteAt={openNoteAt} onOpenSettings={onOpenSettings} refreshSignal={2} expanded={false} onToggleExpanded={vi.fn()} />,
     );
     await waitFor(() => expect(mockRefreshSupport).toHaveBeenCalledTimes(2));
   });

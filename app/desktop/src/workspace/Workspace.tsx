@@ -100,6 +100,7 @@ export function Workspace() {
     workspacePanesRef,
     setLayoutPreference,
     toggleNavigation,
+    toggleChatExpanded,
     selectFiles,
     selectSearch,
     handleSearchTag,
@@ -372,6 +373,8 @@ export function Workspace() {
         onSearchTag={handleSearchTag}
         reportError={reportError}
         showChat={showChat}
+        chatExpanded={effectiveLayout.chatExpanded}
+        onToggleChatExpanded={toggleChatExpanded}
         aiStatusVersion={aiStatusVersion}
         onOpenChatSettings={() => handleOpenSettings("ai")}
         openNoteAt={openNoteAt}

@@ -11,7 +11,7 @@ import type {
 } from "react";
 import type { LoadedDir } from "../lib/store";
 import type { TreeNode } from "../lib/types";
-import { ChatPane } from "./ChatPane";
+import { ChatSlot } from "./ChatSlot";
 import { FileTree } from "./FileTree";
 import { GraphView } from "./GraphView";
 import type { NoteIndexEntry } from "./linkResolve";
@@ -75,6 +75,9 @@ export interface WorkspacePanesProps {
   reportError: (message: string) => void;
   // Chat
   showChat: boolean;
+  /** The chat pane is widened to `--chat-width-expanded` (persisted). */
+  chatExpanded: boolean;
+  onToggleChatExpanded: () => void;
   aiStatusVersion: number;
   onOpenChatSettings: () => void;
   /** Shared open-by-absolute-path handler — SearchPanel results and chat citations. */
@@ -117,6 +120,8 @@ export function WorkspacePanes({
   onSearchTag,
   reportError,
   showChat,
+  chatExpanded,
+  onToggleChatExpanded,
   aiStatusVersion,
   onOpenChatSettings,
   openNoteAt,
@@ -219,21 +224,14 @@ export function WorkspacePanes({
           />
         </div>
       )}
-      {/* Keep ChatPane mounted and collapse only its clipping slot. Unmounting
-          would discard the transcript and abandon an in-flight streamed answer;
-          inert + aria-hidden remove the collapsed controls from interaction. */}
-      <div
-        className="nn-chat-slot"
-        data-visible={showChat}
-        aria-hidden={!showChat}
-        inert={!showChat}
-      >
-        <ChatPane
-          openNoteAt={openNoteAt}
-          onOpenSettings={onOpenChatSettings}
-          refreshSignal={aiStatusVersion}
-        />
-      </div>
+      <ChatSlot
+        showChat={showChat}
+        expanded={chatExpanded}
+        onToggleExpanded={onToggleChatExpanded}
+        openNoteAt={openNoteAt}
+        onOpenSettings={onOpenChatSettings}
+        refreshSignal={aiStatusVersion}
+      />
     </div>
   );
 }

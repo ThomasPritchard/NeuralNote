@@ -62,7 +62,7 @@ const skillListing = (over: Partial<SkillListing> = {}): SkillListing => ({
 function setup() {
   const user = userEvent.setup();
   render(
-    <ChatPane openNoteAt={vi.fn()} onOpenSettings={vi.fn()} refreshSignal={0} />,
+    <ChatPane openNoteAt={vi.fn()} onOpenSettings={vi.fn()} refreshSignal={0} expanded={false} onToggleExpanded={vi.fn()} />,
   );
   return { user };
 }
@@ -203,7 +203,7 @@ describe("ChatPane — async skill catalogue", () => {
   it("keeps the stale catalogue when a REFRESH fails, surfacing the failure on the shared channel", async () => {
     const user = userEvent.setup();
     const { rerender } = render(
-      <ChatPane openNoteAt={vi.fn()} onOpenSettings={vi.fn()} refreshSignal={0} />,
+      <ChatPane openNoteAt={vi.fn()} onOpenSettings={vi.fn()} refreshSignal={0} expanded={false} onToggleExpanded={vi.fn()} />,
     );
     const box = await screen.findByLabelText("Ask across your vault");
 
@@ -218,7 +218,7 @@ describe("ChatPane — async skill catalogue", () => {
     // Settings closes → the signal bumps → the catalogue re-read fails.
     mockListSkills.mockRejectedValueOnce({ kind: "io", message: "registry exploded" });
     rerender(
-      <ChatPane openNoteAt={vi.fn()} onOpenSettings={vi.fn()} refreshSignal={1} />,
+      <ChatPane openNoteAt={vi.fn()} onOpenSettings={vi.fn()} refreshSignal={1} expanded={false} onToggleExpanded={vi.fn()} />,
     );
     await vi.waitFor(() =>
       expect(reportError).toHaveBeenCalledWith("registry exploded"),

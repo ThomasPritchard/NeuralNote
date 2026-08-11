@@ -31,6 +31,7 @@ import {
   CoverageFooter,
   MissingReasoningNotice,
   NothingFoundCard,
+  UsageFooter,
 } from "./ChatTurnNotices";
 
 // Re-exported so `playfulProgressCopy.test.ts` (and any other importer) can keep
@@ -95,7 +96,18 @@ function AssistantTurn({
     // No turn-wide aria-live: the per-row activity churn (15–20 mutations a run)
     // must stay silent. Liveness is scoped instead to the phase line (role=status),
     // the streamed answer, and the error box (role=alert).
-    <div className="flex flex-col gap-3 rounded-xl border border-border bg-background/30 px-3 py-3">
+    //
+    // `@container` makes the turn the query container for everything inside it,
+    // so a card can lay itself out against the width it actually has rather than
+    // against a boolean threaded down from the workspace. That keeps the widened
+    // pane honest at every breakpoint: at the narrow tiers the expanded width is
+    // still too small for two columns, and nothing switches.
+    //
+    // Deliberately here and not on `.nn-chat-pane`: `container-type: inline-size`
+    // brings layout containment, which makes the element a containing block for
+    // fixed-position descendants. On the pane that would re-anchor any overlay
+    // rendered inside it; on one turn of a transcript there is nothing to catch.
+    <div className="@container flex flex-col gap-3 rounded-xl border border-border bg-background/30 px-3 py-3">
       <SkillActivations activations={turn.skillActivations} />
       <SkillSteps
         steps={narratedSteps}
@@ -187,6 +199,11 @@ function AssistantTurn({
       )}
       <Sources citations={turn.citations} onOpen={onOpenCitation} />
       {turn.coverage && <CoverageFooter coverage={turn.coverage} />}
+      {/* Last, and quietest. What the run cost is a fact about the turn worth
+          having on the record, not a thing to read on the way to the answer —
+          and a turn whose provider never reported usage renders exactly as it
+          did before this existed. */}
+      <UsageFooter usage={turn.usage} />
       {turn.error && (
         <div
           role="alert"

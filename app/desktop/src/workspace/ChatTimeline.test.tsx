@@ -15,7 +15,7 @@
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ToolStatus } from "../lib/types";
+import type { StepStatus, ToolStatus } from "../lib/types";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -28,7 +28,13 @@ vi.mock("../lib/api", async (importActual) => {
 
 import * as api from "../lib/api";
 import { ChatTimeline } from "./ChatTimeline";
-import { emptyAssistant, type AssistantMessage, type ToolCallView } from "./chatMessage";
+import { formatArguments } from "./ChatTimelineNodes";
+import {
+  emptyAssistant,
+  type AssistantMessage,
+  type PlanStepView,
+  type ToolCallView,
+} from "./chatMessage";
 
 const mockDownloadRequirement = vi.mocked(api.downloadRequirement);
 
@@ -379,5 +385,145 @@ describe("ChatTimeline — skill activation failures", () => {
       within(rail()).getByText(/Skill 'youtube-distil' could not be activated/),
     ).toHaveClass("text-destructive");
     expect(screen.queryByRole("button", { name: /Download/ })).not.toBeInTheDocument();
+  });
+});
+
+const planStep = (id: string, label: string, status: StepStatus): PlanStepView => ({
+  id,
+  label,
+  status,
+});
+
+describe("ChatTimeline — the declared plan", () => {
+  it("nests each call beneath the step it was dispatched under", () => {
+    // Fixture ids are known, and the assertion is which LABEL the node turned up
+    // beneath. Reading a node's `stepId` back off the object that placed it
+    // would compare a value against its own source and pass forever.
+    renderTimeline({
+      planSteps: [
+        planStep("s1", "Find notes on spaced repetition", "done"),
+        planStep("s2", "Read the two most relevant", "running"),
+      ],
+      toolCalls: [
+        call("c1", "ok", { stepId: "s1", title: "Search notes" }),
+        call("c2", "ok", { stepId: "s2", title: "Read note" }),
+      ],
+      done: true,
+      answer: "Here you go.",
+    });
+
+    const finding = screen.getByText("Find notes on spaced repetition").closest("li")!;
+    const reading = screen.getByText("Read the two most relevant").closest("li")!;
+    expect(within(finding).getByText("Search notes")).toBeInTheDocument();
+    expect(within(finding).queryByText("Read note")).not.toBeInTheDocument();
+    expect(within(reading).getByText("Read note")).toBeInTheDocument();
+  });
+
+  it("leaves the call that declared the plan outside it", () => {
+    // `stepId: null` is the ordinary case, not an edge one: the `update_plan`
+    // call went out before the plan existed, so it belongs to no step and must
+    // render exactly as every node did before plans existed.
+    renderTimeline({
+      planSteps: [planStep("s1", "Find notes on spaced repetition", "running")],
+      toolCalls: [
+        call("c0", "ok", { stepId: null, title: "Update plan" }),
+        call("c1", null, { stepId: "s1", title: "Search notes" }),
+      ],
+    });
+
+    const step = screen.getByText("Find notes on spaced repetition").closest("li")!;
+    expect(within(step).queryByText("Update plan")).not.toBeInTheDocument();
+    expect(within(rail()).getByText("Update plan")).toBeInTheDocument();
+  });
+
+  it("tells a step it chose to skip from one that went wrong", () => {
+    // Two accounts of the same missing work, and only one of them is a problem.
+    // Every step here carries the SAME label, so the label cannot be what makes
+    // the rows distinct — the status wording has to. Re-collapse `skipped` and
+    // `failed` onto one phrase and the set below drops to four.
+    const statuses: StepStatus[] = ["pending", "running", "done", "skipped", "failed"];
+    renderTimeline({
+      planSteps: statuses.map((status, i) => planStep(`s${i}`, "Do the thing", status)),
+      done: true,
+      answer: "Done.",
+    });
+
+    const texts = within(rail())
+      .getAllByRole("listitem")
+      .map((node) => node.textContent);
+    expect(new Set(texts).size).toBe(5);
+
+    // Pinned as literals, and in different registers: a step the model ruled
+    // out is not a step that broke.
+    const skipped = screen.getByText("· skipped as unnecessary");
+    const failed = screen.getByText("· did not work");
+    expect(skipped).toHaveClass("text-muted-foreground/60");
+    expect(failed).toHaveClass("text-warning");
+  });
+
+  it("says where a step has got to even when nothing visible carries it", () => {
+    // The glyph column is the whole signal for the three quiet statuses, and a
+    // screen reader cannot see it.
+    renderTimeline({
+      planSteps: [
+        planStep("s1", "Find the notes", "done"),
+        planStep("s2", "Read them", "running"),
+        planStep("s3", "Draft the summary", "pending"),
+      ],
+      done: true,
+      answer: "Done.",
+    });
+
+    expect(screen.getByText("Find the notes").closest("li")).toHaveTextContent(
+      "Done: Find the notes",
+    );
+    expect(screen.getByText("Read them").closest("li")).toHaveTextContent(
+      "In progress: Read them",
+    );
+    expect(screen.getByText("Draft the summary").closest("li")).toHaveTextContent(
+      "Not started: Draft the summary",
+    );
+  });
+
+  it("holds the fold open when a declared step could not be completed", () => {
+    // A failed step says the run did less than the answer above it implies, and
+    // nothing else on screen says so.
+    renderTimeline({
+      planSteps: [planStep("s1", "Read the source", "failed")],
+      done: true,
+      answer: "Here is what I could find.",
+    });
+
+    expect(fold()).toHaveAttribute("open");
+  });
+
+  it("renders a turn with no plan exactly as it did before plans existed", () => {
+    renderTimeline({
+      toolCalls: [call("c1", "ok", { summary: "12 spans" })],
+      done: true,
+      answer: "An answer.",
+    });
+
+    // One node, no step rows, nothing announced about a plan.
+    expect(within(rail()).getAllByRole("listitem")).toHaveLength(1);
+    expect(rail()).not.toHaveTextContent(/Not started|In progress|Done:/);
+  });
+});
+
+describe("formatArguments — the widened disclosure's left column", () => {
+  it("indents a payload that parses", () => {
+    expect(formatArguments('{"query":"recall","max_results":8}')).toBe(
+      '{\n  "query": "recall",\n  "max_results": 8\n}',
+    );
+  });
+
+  it.each([
+    ["truncated by a cut-off stream", '{"query":"rec'],
+    ["not JSON at all", "search notes for recall"],
+    ["empty", ""],
+  ])("shows a payload %s exactly as it arrived", (_case, raw) => {
+    // Raw model output. Anything unparseable is displayed verbatim rather than
+    // repaired into something the model never sent.
+    expect(formatArguments(raw)).toBe(raw);
   });
 });
