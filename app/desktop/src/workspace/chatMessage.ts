@@ -70,6 +70,16 @@ export interface ToolCallView {
   status: ToolStatus | null;
   summary: string | null;
   detail: string | null;
+  /** The `planSteps` id this call was dispatched under, so the timeline can nest
+   *  it beneath that step. The backend stamps it at dispatch and it never moves
+   *  again — a step that starts later must not adopt a node that already went
+   *  out.
+   *
+   *  `null` is ordinary, not a failure: the run declared no plan (the common
+   *  case), or no step was running when the call went out. Such a node renders
+   *  ungrouped, exactly as every node did before plans existed. It takes no part
+   *  in settlement, which correlates on `id` alone. */
+  stepId: string | null;
 }
 
 /** A note the model is composing, as the backend's partial parse of the streamed

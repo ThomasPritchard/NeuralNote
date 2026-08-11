@@ -37,6 +37,7 @@ const searchCall: ChatEvent[] = [
     name: "search_notes",
     title: "Search notes",
     arguments: '{"query":"photosynthesis"}',
+    stepId: null,
   },
   { type: "searching", query: "photosynthesis" },
   { type: "retrieved", query: "photosynthesis", hitCount: 3 },
@@ -49,6 +50,7 @@ const readCall: ChatEvent[] = [
     name: "read_note_span",
     title: "Read note",
     arguments: `{"rel_path":"${NOTE_REL}","start_line":12,"end_line":18}`,
+    stepId: null,
   },
   { type: "reading", relPath: NOTE_REL, startLine: 12, endLine: 18 },
   {
@@ -355,6 +357,7 @@ describe("Journey 7: cited chat — the timeline rail", () => {
         name: "search_notes",
         title: "Search notes",
         arguments: '{"query":"photosynthesis"}',
+        stepId: null,
       },
       { type: "searching", query: "photosynthesis" },
       { type: "retrieved", query: "photosynthesis", hitCount: 3 },
@@ -365,6 +368,7 @@ describe("Journey 7: cited chat — the timeline rail", () => {
         name: "read_note_span",
         title: "Read note",
         arguments: '{"rel_path":"Missing.md","start_line":1,"end_line":9}',
+        stepId: null,
       },
       {
         type: "toolResult",
@@ -379,6 +383,7 @@ describe("Journey 7: cited chat — the timeline rail", () => {
         name: "fetch_captions",
         title: "Fetch captions",
         arguments: '{"url":"https://youtu.be/jNQXAC9IVRw"}',
+        stepId: null,
       },
       {
         type: "toolResult",
@@ -475,6 +480,7 @@ describe("Journey 7: cited chat — a note write, previewed as it composes", () 
           kind: "atomic",
           content: WRITE_BODY,
         }),
+        stepId: null,
       },
       { type: "toolResult", id: "call-write", status: "ok", summary: null, detail: null },
       { type: "noteWritten", relPath: WRITE_REL, kind: "atomic" },

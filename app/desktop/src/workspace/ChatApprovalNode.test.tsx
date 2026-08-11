@@ -181,6 +181,7 @@ function call(patch: Partial<ToolCallView> = {}): ToolCallView {
     status: null,
     summary: null,
     detail: null,
+    stepId: null,
     ...patch,
   };
 }

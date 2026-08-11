@@ -352,6 +352,7 @@ describe("reduceAssistant — the tool timeline", () => {
         name: "search_notes",
         title: "Search notes",
         arguments: '{"query":"spaced repetition"}',
+        stepId: null,
       },
       {
         type: "toolResult",
@@ -371,6 +372,7 @@ describe("reduceAssistant — the tool timeline", () => {
         status: "ok",
         summary: "12 spans",
         detail: null,
+        stepId: null,
       },
     ]);
   });
@@ -383,6 +385,7 @@ describe("reduceAssistant — the tool timeline", () => {
         name: "list_notes",
         title: "List notes",
         arguments: "{}",
+        stepId: null,
       },
     ]);
 
@@ -392,8 +395,10 @@ describe("reduceAssistant — the tool timeline", () => {
 
   it("settles each call against its own id, not the most recent one", () => {
     const turn = run([
-      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}" },
-      { type: "toolCall", id: "c2", name: "list_folders", title: "List folders", arguments: "{}" },
+      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}",
+        stepId: null, },
+      { type: "toolCall", id: "c2", name: "list_folders", title: "List folders", arguments: "{}",
+        stepId: null, },
       { type: "toolResult", id: "c2", status: "rejected", summary: null, detail: "nope" },
     ]);
 
@@ -417,13 +422,119 @@ describe("reduceAssistant — the tool timeline", () => {
         status: "error",
         summary: null,
         detail: "boom",
+        // No announcement means no dispatch we ever saw, so there is no step to
+        // affiliate it with. Null, never a guess at whichever step is current.
+        stepId: null,
       },
     ]);
   });
 
+  it("carries the step the call was dispatched under onto the node", () => {
+    const turn = run([
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: "{}",
+        stepId: "s2",
+      },
+    ]);
+
+    expect(turn.toolCalls[0].stepId).toBe("s2");
+  });
+
+  it("leaves a call dispatched under no plan unaffiliated, and folds it as before", () => {
+    // The pre-plan case, which is the common one: no step, no grouping, and a
+    // node otherwise identical to the one the reducer built before plans existed.
+    const turn = run([
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: '{"query":"widgets"}',
+        stepId: null,
+      },
+      { type: "toolResult", id: "c1", status: "ok", summary: "3 spans", detail: null },
+    ]);
+
+    expect(turn.planSteps).toEqual([]);
+    expect(turn.toolCalls).toEqual([
+      {
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: '{"query":"widgets"}',
+        status: "ok",
+        summary: "3 spans",
+        detail: null,
+        stepId: null,
+      },
+    ]);
+  });
+
+  it("settles a call on its id alone, whatever step it was affiliated with", () => {
+    // `toolResult` carries no step of its own, and the affiliation must play no
+    // part in the match — nor be blanked by the settlement that lands on it.
+    const turn = run([
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: "{}",
+        stepId: "s1",
+      },
+      {
+        type: "toolCall",
+        id: "c2",
+        name: "list_notes",
+        title: "List notes",
+        arguments: "{}",
+        stepId: null,
+      },
+      { type: "toolResult", id: "c2", status: "ok", summary: null, detail: null },
+      { type: "toolResult", id: "c1", status: "rejected", summary: null, detail: "nope" },
+    ]);
+
+    expect(turn.toolCalls.map((call) => [call.id, call.status, call.stepId])).toEqual([
+      ["c1", "rejected", "s1"],
+      ["c2", "ok", null],
+    ]);
+  });
+
+  it("does not re-parent an already-dispatched node when a later step starts", () => {
+    // The affiliation is stamped by the backend at dispatch. A plan arriving
+    // afterwards restatuses the rail; it must never reach back into a node that
+    // already went out.
+    const turn = run([
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: "{}",
+        stepId: null,
+      },
+      {
+        type: "plan",
+        steps: [
+          { id: "s1", label: "Search the vault" },
+          { id: "s2", label: "Read the best matches" },
+        ],
+      },
+      { type: "planStepStatus", id: "s1", status: "running" },
+    ]);
+
+    expect(turn.planSteps.map((step) => step.status)).toEqual(["running", "pending"]);
+    expect(turn.toolCalls[0].stepId).toBeNull();
+  });
+
   it("never re-settles a call that already settled", () => {
     const turn = run([
-      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}" },
+      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}",
+        stepId: null, },
       { type: "toolResult", id: "c1", status: "ok", summary: null, detail: null },
       { type: "toolResult", id: "c1", status: "rejected", summary: null, detail: "late" },
     ]);
@@ -437,7 +548,8 @@ describe("reduceAssistant — the tool timeline", () => {
     // phase a `searching`/`reading` event established.
     const turn = run([
       { type: "reading", relPath: "n.md", startLine: 1, endLine: 2 },
-      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}" },
+      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}",
+        stepId: null, },
     ]);
 
     expect(turn.phase).toBe("reading");

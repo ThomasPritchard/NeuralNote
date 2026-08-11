@@ -65,6 +65,7 @@ const emptySearch = (id: string, query: string): ChatEvent[] => [
     name: "search_notes",
     title: "Search notes",
     arguments: JSON.stringify({ query }),
+    stepId: null,
   },
   { type: "searching", query },
   { type: "retrieved", query, hitCount: 0 },
@@ -366,6 +367,7 @@ describe("ChatPane — chat view", () => {
         name: "search_notes",
         title: "Search notes",
         arguments: '{"query":"recall"}',
+        stepId: null,
       });
       onEvent({ type: "searching", query: "recall" });
       onEvent({ type: "toolResult", id: "call-0", status: "ok", summary: "3 spans", detail: null });
@@ -377,6 +379,7 @@ describe("ChatPane — chat view", () => {
           name: "read_note_span",
           title: "Read note",
           arguments: JSON.stringify({ rel_path: relPath, start_line: n, end_line: n + 3 }),
+          stepId: null,
         });
         onEvent({ type: "reading", relPath, startLine: n, endLine: n + 3 });
         onEvent({
@@ -422,6 +425,7 @@ describe("ChatPane — chat view", () => {
         name: "search_notes",
         title: "Search notes",
         arguments: '{"query":"spacing"}',
+        stepId: null,
       },
       { type: "searching", query: "spacing" },
       { type: "retrieved", query: "spacing", hitCount: 1 },
@@ -448,6 +452,7 @@ describe("ChatPane — chat view", () => {
         name: "read_note_span",
         title: "Read note",
         arguments: JSON.stringify({ rel_path: relPath, start_line: 123, end_line: 456 }),
+        stepId: null,
       },
       { type: "reading", relPath, startLine: 123, endLine: 456 },
       {

@@ -139,6 +139,25 @@ pub enum ChatEvent {
         /// The raw arguments JSON exactly as the model emitted it. The UI parses it
         /// defensively for the detail line; it is never trusted to be valid JSON.
         arguments: String,
+        /// The [`ChatEvent::Plan`] step that was [`StepStatus::Running`] at the
+        /// moment this call was DISPATCHED — the key the timeline nests tool
+        /// nodes under their step by.
+        ///
+        /// Stamped at dispatch, never resolved at render: the affiliation is a
+        /// fact about when the call happened, so a later
+        /// [`ChatEvent::PlanStepStatus`] must not re-parent a node that already
+        /// went out. That is also why the `update_plan` call which declares the
+        /// plan is itself unaffiliated — it was dispatched before the plan
+        /// existed.
+        ///
+        /// `None` is ordinary, not a failure: no plan was declared (the common
+        /// case), or no step is running right now. It is never a synthetic step,
+        /// and never an empty string — an unaffiliated node renders on the rail
+        /// exactly as it did before plans existed.
+        ///
+        /// It plays **no part in settlement**: a [`ChatEvent::ToolResult`]
+        /// correlates on `id` alone, and carries no step of its own.
+        step_id: Option<String>,
     },
     /// The call settled. Exactly one per [`ChatEvent::ToolCall`], always emitted —
     /// including on rejection and cancellation, so no node is left spinning forever.
@@ -532,6 +551,7 @@ mod tests {
                 name: "search_notes".into(),
                 title: "Search notes".into(),
                 arguments: r#"{"query":"x"}"#.into(),
+                step_id: Some("s2".into()),
             }),
             serde_json::json!({
                 "type": "toolCall",
@@ -539,8 +559,27 @@ mod tests {
                 "name": "search_notes",
                 "title": "Search notes",
                 "arguments": r#"{"query":"x"}"#,
+                "stepId": "s2",
             })
         );
+    }
+
+    #[test]
+    fn an_unaffiliated_tool_call_keeps_its_step_id_null_rather_than_empty() {
+        // No plan, or no step running: the honest answer is "this call belongs to
+        // no step". An empty string would render as affiliation with a step whose
+        // id is blank, which is a step that does not exist.
+        let event = ChatEvent::ToolCall {
+            id: "call-1".into(),
+            name: "search_notes".into(),
+            title: "Search notes".into(),
+            arguments: "{}".into(),
+            step_id: None,
+        };
+        let value = json(&event);
+        assert_eq!(value["stepId"], serde_json::Value::Null);
+        assert_ne!(value["stepId"], "");
+        assert_eq!(serde_json::from_value::<ChatEvent>(value).unwrap(), event);
     }
 
     #[test]

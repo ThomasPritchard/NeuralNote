@@ -45,7 +45,11 @@ function withHitCount(
  *  that already closed. A settlement whose call never arrived is appended as its
  *  own row with an empty identity rather than dropped: the backend emits exactly
  *  one settlement per announced call, so an unmatched one is a broken contract
- *  that has to be visible, not a stray event to swallow. */
+ *  that has to be visible, not a stray event to swallow.
+ *
+ *  Correlation is on `id` **alone**. `stepId` is deliberately outside the `Pick`
+ *  below, so a settlement can neither be matched by step affiliation nor blank
+ *  the affiliation of the node it lands on. */
 function withSettlement(
   calls: ToolCallView[],
   settlement: Pick<ToolCallView, "id" | "status" | "summary" | "detail">,
@@ -58,7 +62,9 @@ function withSettlement(
       return next;
     }
   }
-  return [...calls, { name: "", title: "", arguments: "", ...settlement }];
+  // A node for a call we never saw announced has no dispatch we could have read
+  // a step off, so it is affiliated with nothing rather than with a guess.
+  return [...calls, { name: "", title: "", arguments: "", stepId: null, ...settlement }];
 }
 
 /** Fold a live note preview into the edit that owns its id, or start one.
@@ -192,6 +198,10 @@ export function reduceAssistant(
             status: null,
             summary: null,
             detail: null,
+            // Carried through exactly as the backend stamped it at dispatch —
+            // never re-derived here from `planSteps`, which is the live rail and
+            // will have moved on by the time this node is rendered.
+            stepId: event.stepId,
           },
         ],
       };

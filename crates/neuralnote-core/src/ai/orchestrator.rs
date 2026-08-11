@@ -797,7 +797,9 @@ impl ChatSession<'_> {
             // Announce the call BEFORE anything can go wrong with it, so one that
             // is skipped, cancelled, rejected or fails still reaches the timeline
             // instead of vanishing. Every branch below settles it exactly once.
-            emit_tool_call(sink, call);
+            // This is also where the step affiliation is stamped — the plan as it
+            // stands at THIS call's dispatch, not as it ends up.
+            emit_tool_call(sink, call, plan);
             if playlist_batch_closed {
                 settle_skipped(messages, sink, call, SkippedCall::StalePlaylistBatch);
                 continue;
@@ -1489,12 +1491,17 @@ fn settle_skipped(
 /// Announce a declared call before anything can go wrong with it. The title comes
 /// from the Rust-side table in [`tool_registry`] — never from the model, and never
 /// composed by the UI.
-fn emit_tool_call(sink: &mut dyn EventSink, call: &ToolCall) {
+///
+/// The step affiliation is read off `plan` **here**, at dispatch, because that is
+/// when it is true. Resolving it later — at render, or from the plan's final state
+/// — would re-parent nodes every time a step moved.
+fn emit_tool_call(sink: &mut dyn EventSink, call: &ToolCall, plan: &RunPlan) {
     sink.send(ChatEvent::ToolCall {
         id: call.id.clone(),
         name: call.name.clone(),
         title: tool_registry::title_for(&call.name).to_string(),
         arguments: call.arguments.clone(),
+        step_id: plan.running_step_id().map(str::to_string),
     });
 }
 
@@ -3742,6 +3749,179 @@ mod tests {
                     && detail.as_deref().is_some_and(|d| d.contains("declared once"))
         )));
         assert_eq!(count(&events, |e| matches!(e, ChatEvent::Plan { .. })), 1);
+    }
+
+    /// Every announced call as `(id, step_id)`, in emission order — the pairing
+    /// the timeline nests on.
+    fn call_affiliations(events: &[ChatEvent]) -> Vec<(&str, Option<&str>)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolCall { id, step_id, .. } => Some((id.as_str(), step_id.as_deref())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tool_dispatched_under_a_running_step_is_affiliated_with_it() {
+        // `s2` is pinned as a literal on purpose: reading the expectation back
+        // out of the same `RunPlan` the code read it from would compare a value
+        // against its own source and pass whatever the affiliation logic did.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![
+                plan_call(
+                    "p1",
+                    serde_json::json!([
+                        { "id": "s1", "label": "Plan the work", "status": "done" },
+                        { "id": "s2", "label": "Search the vault", "status": "running" },
+                        { "id": "s3", "label": "Answer", "status": "pending" },
+                    ]),
+                ),
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+            ],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        assert_eq!(
+            call_affiliations(&events),
+            vec![
+                // The plan call itself went out before any plan existed.
+                ("p1", None),
+                ("c1", Some("s2")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_plan_leaves_every_tool_call_unaffiliated() {
+        // Unaffiliated is ordinary, not a failure — and the turn still folds and
+        // answers exactly as it did before plans existed.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+                tool_call(
+                    "c2",
+                    "read_note_span",
+                    r#"{"rel_path":"w.md","start_line":1,"end_line":1}"#,
+                ),
+            ],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        assert_eq!(call_affiliations(&events), vec![("c1", None), ("c2", None)]);
+        assert_eq!(
+            count(&events, |e| matches!(e, ChatEvent::Plan { .. })),
+            0,
+            "no plan was declared, so none may be synthesised"
+        );
+        // The pre-plan run is unchanged: it still searches, reads, verifies,
+        // cites and completes.
+        assert!(count(&events, |e| matches!(e, ChatEvent::Answer { .. })) >= 1);
+        assert_eq!(
+            count(&events, |e| matches!(e, ChatEvent::Citation { .. })),
+            1
+        );
+        assert!(matches!(events.last(), Some(ChatEvent::Done)));
+    }
+
+    #[test]
+    fn a_plan_declared_after_a_call_does_not_retroactively_affiliate_it() {
+        // The affiliation is a fact about WHEN the call was dispatched, so it is
+        // stamped then. An implementation that resolved it at render time — or
+        // re-read the plan once the run finished — would hand `c1` the step that
+        // was running later, and this is the test that catches it.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+                plan_call(
+                    "p1",
+                    serde_json::json!([
+                        { "id": "s1", "label": "Read the best matches", "status": "running" },
+                    ]),
+                ),
+                tool_call(
+                    "c2",
+                    "read_note_span",
+                    r#"{"rel_path":"w.md","start_line":1,"end_line":1}"#,
+                ),
+            ],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        assert_eq!(
+            call_affiliations(&events),
+            vec![
+                // Dispatched before the plan existed, and it stays that way.
+                ("c1", None),
+                // The declaring call is itself pre-plan.
+                ("p1", None),
+                ("c2", Some("s1")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tool_result_still_settles_its_call_across_a_step_boundary() {
+        // Settlement correlates on `id` alone. A step that moves on between the
+        // call and its result must not leave the node spinning.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![
+                plan_call(
+                    "p1",
+                    serde_json::json!([
+                        { "id": "s1", "label": "Search the vault", "status": "running" },
+                        { "id": "s2", "label": "Read the best matches" },
+                    ]),
+                ),
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+                plan_call(
+                    "p2",
+                    serde_json::json!([
+                        { "id": "s1", "label": "Search the vault", "status": "done" },
+                        { "id": "s2", "label": "Read the best matches", "status": "running" },
+                    ]),
+                ),
+                tool_call(
+                    "c2",
+                    "read_note_span",
+                    r#"{"rel_path":"w.md","start_line":1,"end_line":1}"#,
+                ),
+            ],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        assert_eq!(
+            call_affiliations(&events),
+            vec![
+                ("p1", None),
+                ("c1", Some("s1")),
+                ("p2", Some("s1")),
+                ("c2", Some("s2"))
+            ]
+        );
+        for id in ["p1", "c1", "p2", "c2"] {
+            assert_eq!(
+                count(&events, |e| matches!(
+                    e,
+                    ChatEvent::ToolResult { id: settled, .. } if settled == id
+                )),
+                1,
+                "call '{id}' did not settle exactly once"
+            );
+        }
     }
 
     #[test]

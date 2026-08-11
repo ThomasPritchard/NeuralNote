@@ -137,6 +137,27 @@ impl RunPlan {
         })
     }
 
+    /// The id of the step currently [`StepStatus::Running`], for stamping onto a
+    /// tool call as it is dispatched.
+    ///
+    /// `None` is the ordinary answer, not a failure: no plan was declared, or
+    /// none of the declared steps is in flight right now. Callers affiliate the
+    /// node with nothing rather than inventing a step to hang it under.
+    ///
+    /// Nothing stops the model marking two steps running at once — the plan is
+    /// its own account of its work, and rejecting that would refuse a plausible
+    /// claim (it may genuinely interleave). So this takes the **first in
+    /// declared order**: declaration order is the only ordering the user can see
+    /// on the rail, so the earliest running step is the one they will read as
+    /// "where we are", and it is stable across calls in a way that "whichever
+    /// transitioned most recently" would not be.
+    pub fn running_step_id(&self) -> Option<&str> {
+        self.statuses
+            .iter()
+            .position(|status| *status == StepStatus::Running)
+            .map(|index| self.steps[index].id.as_str())
+    }
+
     fn declare(&mut self, input: Vec<PlanStepInput>) -> PlanUpdate {
         self.steps = input
             .iter()
@@ -475,6 +496,52 @@ mod tests {
             plan.update(vec![step("s1", " ", StepStatus::Pending)]),
             Err(PlanError::BlankField)
         );
+    }
+
+    #[test]
+    fn an_undeclared_plan_has_no_running_step() {
+        // The common case. `None` here is what makes an unaffiliated tool node
+        // ordinary rather than an error to paper over.
+        assert_eq!(RunPlan::default().running_step_id(), None);
+    }
+
+    #[test]
+    fn the_running_step_is_the_one_the_model_marked_running() {
+        let mut plan = RunPlan::default();
+        plan.update(vec![
+            step("s1", "Search", StepStatus::Done),
+            step("s2", "Read", StepStatus::Running),
+            step("s3", "Answer", StepStatus::Pending),
+        ])
+        .unwrap();
+
+        assert_eq!(plan.running_step_id(), Some("s2"));
+    }
+
+    #[test]
+    fn a_plan_with_nothing_running_has_no_running_step() {
+        // Between steps — every one declared, none in flight — is a real state,
+        // and it is `None`, not the last step that happened to finish.
+        let mut plan = RunPlan::default();
+        plan.update(vec![
+            step("s1", "Search", StepStatus::Done),
+            step("s2", "Read", StepStatus::Pending),
+        ])
+        .unwrap();
+
+        assert_eq!(plan.running_step_id(), None);
+    }
+
+    #[test]
+    fn two_running_steps_resolve_to_the_first_in_declared_order() {
+        let mut plan = RunPlan::default();
+        plan.update(vec![
+            step("s1", "Search", StepStatus::Running),
+            step("s2", "Read", StepStatus::Running),
+        ])
+        .unwrap();
+
+        assert_eq!(plan.running_step_id(), Some("s1"));
     }
 
     #[test]

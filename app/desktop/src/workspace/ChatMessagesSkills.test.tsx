@@ -146,6 +146,7 @@ describe("ChatMessages — skill turns", () => {
             status: "ok",
             summary: "0 spans",
             detail: null,
+            stepId: null,
           },
         ],
         activity: [{ kind: "search", query: "provider" }],

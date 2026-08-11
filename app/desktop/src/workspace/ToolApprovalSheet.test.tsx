@@ -213,6 +213,7 @@ function transcript(pending: ToolApprovalView | null, done = false): ChatMessage
           status: null,
           summary: null,
           detail: null,
+          stepId: null,
         },
       ],
       toolApprovals: pending === null ? [] : [pending],

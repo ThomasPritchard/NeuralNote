@@ -60,6 +60,7 @@ const writeCall = (id = CALL_ID): ChatEvent => ({
   name: "write_note",
   title: "Write note",
   arguments: JSON.stringify({ rel_path: REL_PATH, kind: "atomic", content: "…" }),
+  stepId: null,
 });
 
 const settle = (
@@ -271,6 +272,7 @@ describe("note-write card — the preview arrives before its tool call", () => {
           name: "search_notes",
           title: "Search notes",
           arguments: '{"query":"recall"}',
+          stepId: null,
         },
         settle("ok", null, "call-search"),
         writeCall(),

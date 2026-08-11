@@ -183,6 +183,7 @@ describe("the approval gate's view state", () => {
         name: "write_note",
         title: "Write note",
         arguments: '{"rel_path":"Notes/New.md"}',
+        stepId: null,
       },
       requested,
       { type: "toolApprovalResolved", id: "call-1", decision: "denied" },

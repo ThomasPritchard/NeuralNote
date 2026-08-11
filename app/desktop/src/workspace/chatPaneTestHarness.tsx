@@ -110,6 +110,7 @@ export const CITED_RUN: ChatEvent[] = [
     name: "search_notes",
     title: "Search notes",
     arguments: '{"query":"active recall"}',
+    stepId: null,
   },
   { type: "searching", query: "active recall" },
   { type: "retrieved", query: "active recall", hitCount: 3 },
@@ -126,6 +127,7 @@ export const CITED_RUN: ChatEvent[] = [
     name: "read_note_span",
     title: "Read note",
     arguments: '{"rel_path":"Spaced-Repetition.md","start_line":12,"end_line":28}',
+    stepId: null,
   },
   { type: "reading", relPath: "Spaced-Repetition.md", startLine: 12, endLine: 28 },
   {

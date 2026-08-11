@@ -31,6 +31,7 @@ const gatedWrite: ChatEvent[] = [
     name: "write_note",
     title: "Write note",
     arguments: `{"rel_path":"${NOTE_REL}"}`,
+    stepId: null,
   },
   {
     type: "toolApprovalRequested",

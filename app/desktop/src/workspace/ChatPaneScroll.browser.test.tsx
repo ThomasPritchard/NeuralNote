@@ -102,6 +102,7 @@ function inFlightCall(n: number): ToolCallView {
     status: null,
     summary: null,
     detail: null,
+    stepId: null,
   };
 }
 
@@ -163,6 +164,7 @@ function writeTurn(lines: number, settled: boolean, answerSentences: number): As
             status: "ok",
             summary: null,
             detail: null,
+            stepId: null,
           },
         ]
       : [],
@@ -586,6 +588,7 @@ function approvalTurn(pending: boolean, answerSentences: number): AssistantMessa
         status: pending ? null : "ok",
         summary: null,
         detail: null,
+        stepId: null,
       },
     ],
     toolApprovals: [approval],

@@ -37,7 +37,28 @@ title: string,
  * The raw arguments JSON exactly as the model emitted it. The UI parses it
  * defensively for the detail line; it is never trusted to be valid JSON.
  */
-arguments: string, } | { "type": "toolResult", id: string, status: ToolStatus, 
+arguments: string, 
+/**
+ * The [`ChatEvent::Plan`] step that was [`StepStatus::Running`] at the
+ * moment this call was DISPATCHED — the key the timeline nests tool
+ * nodes under their step by.
+ *
+ * Stamped at dispatch, never resolved at render: the affiliation is a
+ * fact about when the call happened, so a later
+ * [`ChatEvent::PlanStepStatus`] must not re-parent a node that already
+ * went out. That is also why the `update_plan` call which declares the
+ * plan is itself unaffiliated — it was dispatched before the plan
+ * existed.
+ *
+ * `None` is ordinary, not a failure: no plan was declared (the common
+ * case), or no step is running right now. It is never a synthetic step,
+ * and never an empty string — an unaffiliated node renders on the rail
+ * exactly as it did before plans existed.
+ *
+ * It plays **no part in settlement**: a [`ChatEvent::ToolResult`]
+ * correlates on `id` alone, and carries no step of its own.
+ */
+stepId: string | null, } | { "type": "toolResult", id: string, status: ToolStatus, 
 /**
  * A Rust-composed one-liner ("12 spans"), never model prose.
  */

@@ -45,6 +45,7 @@ const call = (
   status,
   summary: null,
   detail: null,
+  stepId: null,
   ...overrides,
 });
 
