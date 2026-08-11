@@ -14,6 +14,7 @@
 //! slots in as just another [`RetrievalProvider`] returning the same
 //! [`EvidenceSpan`] shape, with no change to the chat layer.
 
+pub mod approval;
 pub mod capabilities;
 pub mod elicitation;
 pub mod events;
@@ -82,6 +83,12 @@ pub use skills::{
     ActiveSkills, Eligibility, Requirement, RequirementStatus, SkillActivation, SkillEnvironment,
     SkillListing, SkillLookupError, SkillManifest, SkillRegistry, SkillRequirement,
     FIXTURE_SKILL_ID, YOUTUBE_DISTIL_SKILL_ID,
+};
+pub use tool_registry::{
+    title_for, RegisteredTool, TOOL_ASK_USER, TOOL_FETCH_CAPTIONS, TOOL_FETCH_VIDEO_INFO,
+    TOOL_LIST_FOLDERS, TOOL_LIST_NOTES, TOOL_READ_NOTE_SPAN, TOOL_RESOLVE_DISTIL_ROUTE,
+    TOOL_SEARCH_NOTES, TOOL_SELECT_PLAYLIST_VIDEOS, TOOL_SKILL_STEP, TOOL_TRANSCRIBE_AUDIO,
+    TOOL_USE_SKILL, TOOL_WRITE_NOTE,
 };
 pub use verify::CitationVerifier;
 pub use write_policy::{

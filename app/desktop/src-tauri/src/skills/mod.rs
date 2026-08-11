@@ -1,5 +1,6 @@
 //! Desktop implementations of the core skill I/O seams.
 
+mod approval;
 mod elicitation;
 #[cfg(unix)]
 mod note_writer;
@@ -13,6 +14,7 @@ use neuralnote_core::{ai::UndoLedger, CoreError};
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
+pub(crate) use approval::{PendingApprovals, RunApprovalGuard, ShellApprovalPrompt};
 pub(crate) use elicitation::{
     CancelChatRunOutcome, PendingElicitations, RunElicitationGuard, ShellUserPrompt,
 };
@@ -43,6 +45,31 @@ pub(crate) fn reconcile_quarantine_recovery(
     _canonical_root: &std::path::Path,
 ) -> QuarantineRecoveryReport {
     QuarantineRecoveryReport::default()
+}
+
+/// YOLO with the `transcribe_audio` pin cleared, for shell tests that exercise
+/// the write path rather than the approval gate. The gate still runs on every
+/// call — there is no bypass — it just says yes.
+#[cfg(test)]
+pub(crate) fn unattended_approval_for_tests() -> (
+    neuralnote_core::ai::approval::ApprovalPolicy,
+    &'static neuralnote_core::ai::approval::DenyingApprovalPrompt,
+    &'static neuralnote_core::ai::approval::UnavailableApprovalClassifier,
+) {
+    use neuralnote_core::ai::approval::{
+        ApprovalMode, ApprovalPolicy, DenyingApprovalPrompt, UnavailableApprovalClassifier,
+    };
+    static PROMPT: DenyingApprovalPrompt = DenyingApprovalPrompt;
+    static CLASSIFIER: UnavailableApprovalClassifier = UnavailableApprovalClassifier;
+    let policy = ApprovalPolicy::new(
+        ApprovalMode::Yolo,
+        std::collections::BTreeMap::from([(
+            neuralnote_core::ai::TOOL_TRANSCRIBE_AUDIO.to_string(),
+            ApprovalMode::Yolo,
+        )]),
+        false,
+    );
+    (policy, &PROMPT, &CLASSIFIER)
 }
 
 pub(crate) fn retain_chat_undo_ledger(
@@ -79,6 +106,37 @@ pub(crate) fn answer_elicitation(
     // stale or timed-out id already gets).
     let turn_id = uuid::Uuid::parse_str(&turn_id).map_err(|_| elicitation::not_live(&id))?;
     pending.answer(turn_id, &id, choices)
+}
+
+/// Resolve a live tool-approval prompt owned by `turn_id`.
+///
+/// A **separate command from `answer_elicitation`, deliberately.** `ask_user`
+/// lets the model author its own question text and option labels, so sharing one
+/// command would mean a webview answer intended for a model-authored question
+/// could satisfy a security prompt. Two commands over two registries carrying two
+/// types makes that unrepresentable rather than merely unlikely.
+///
+/// The decision is a bool, not a string: there is no option set for a caller to
+/// smuggle anything through. Anything that is not an explicit `true` denies.
+#[tauri::command]
+pub(crate) fn answer_tool_approval(
+    state: crate::SharedState<'_>,
+    turn_id: String,
+    id: String,
+    approved: bool,
+) -> Result<(), CoreError> {
+    let pending = {
+        let state = crate::lock_state(&state);
+        std::sync::Arc::clone(&state.pending_approvals)
+    };
+    let answer = if approved {
+        neuralnote_core::ai::approval::ApprovalAnswer::Approved
+    } else {
+        neuralnote_core::ai::approval::ApprovalAnswer::Denied
+    };
+    let turn_id = uuid::Uuid::parse_str(&turn_id)
+        .map_err(|_| CoreError::NotFound(format!("approval '{id}' is not live")))?;
+    pending.answer(turn_id, &id, answer)
 }
 
 /// Consume one run ledger once every file reaches a terminal result. A vault
@@ -473,13 +531,15 @@ mod tests {
             app_data_bin_dir: vault.path().join("bin"),
             available_binaries: BTreeSet::new(),
         };
+        let (policy, approval_prompt, approval_classifier) = unattended_approval_for_tests();
         let services = SkillServices::new(
             &registry,
             &environment,
             &NoUserPrompt,
             &FsNoteWriteBackend,
             1,
-        );
+        )
+        .with_approval(policy, approval_prompt, approval_classifier);
         let llm = ScriptedLlm(Mutex::new(
             vec![
                 Completion {

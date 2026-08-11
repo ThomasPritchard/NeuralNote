@@ -10,6 +10,7 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
+use neuralnote_core::ai::approval::{self, ToolApprovalSubject};
 use neuralnote_core::ai::tool_turn_reader::{StreamedToolTurn, ToolTurnReader};
 use neuralnote_core::ai::{openai, provider_config, tool_stream};
 use neuralnote_core::ai::{
@@ -646,6 +647,93 @@ impl OpenAiChatClient {
             }));
         }
         Ok(resp)
+    }
+
+    /// POST a hand-built body and decode the JSON response.
+    ///
+    /// Used by the approval judge, whose request is deliberately NOT an
+    /// [`LlmClient`] call: it carries `temperature: 0` and a 32-token ceiling that
+    /// no chat turn wants, and it must never go anywhere near the orchestrator's
+    /// message list.
+    async fn post_json(&self, body: &serde_json::Value) -> Result<serde_json::Value, CoreError> {
+        let provider = self.provider_label();
+        self.post(body)
+            .await?
+            .json()
+            .await
+            .map_err(|e| CoreError::Llm(format!("could not parse {provider} response: {e}")))
+    }
+}
+
+/// The tool-approval judge, over the same HTTP client the chat turn uses.
+///
+/// **The model is the user's already-selected chat model, not a separate cheap
+/// slug.** The design would prefer a small dedicated model and says so, but it
+/// also records that the choice "is not yet locked" — and hard-coding a model
+/// identifier that has not been verified against the provider's live catalogue
+/// would put a fabricated fact on the security path, which is worse than a
+/// slightly dearer call. Pricing a real candidate and pinning it here is a
+/// follow-up; until then this bills the model the user already chose, and the
+/// request is a few hundred tokens in and at most 32 out.
+pub(crate) struct ApprovalJudge<'a> {
+    client: &'a OpenAiChatClient,
+    model: String,
+}
+
+impl<'a> ApprovalJudge<'a> {
+    pub(crate) fn new(client: &'a OpenAiChatClient, model: impl Into<String>) -> Self {
+        Self {
+            client,
+            model: model.into(),
+        }
+    }
+
+    /// The exact request body. Split out so a test can assert the sampling knobs
+    /// without a network round trip — a judge that silently drifted to a warmer
+    /// temperature or a bigger ceiling is a change to the security decision's cost
+    /// and reproducibility, and that should not be able to land unseen.
+    fn request_body(&self, subject: &ToolApprovalSubject) -> serde_json::Value {
+        serde_json::json!({
+            "model": self.model,
+            "temperature": approval::CLASSIFIER_TEMPERATURE,
+            "max_tokens": approval::CLASSIFIER_MAX_TOKENS,
+            "stream": false,
+            "messages": [
+                { "role": "system", "content": approval::classifier_system_prompt() },
+                // The ONLY variable part, and it is the serialised subject: a
+                // closed struct of enums, integers and bools with no free-text
+                // field. There is nowhere in this body for an instruction to live.
+                { "role": "user", "content": approval::classifier_prompt(subject) },
+            ],
+        })
+    }
+}
+
+#[async_trait]
+impl approval::ApprovalClassifier for ApprovalJudge<'_> {
+    async fn classify(
+        &self,
+        subject: &ToolApprovalSubject,
+    ) -> Result<approval::ClassifierVerdict, CoreError> {
+        // The budget is enforced HERE, where the runtime timer lives, because the
+        // core owns no clock. No retries: a retry on a security decision doubles
+        // the exposure window for zero gain when the fallback is cheap and correct.
+        let value = tokio::time::timeout(
+            approval::CLASSIFIER_BUDGET,
+            self.client.post_json(&self.request_body(subject)),
+        )
+        .await
+        .map_err(|_| {
+            CoreError::Llm("the approval check did not answer within its budget".into())
+        })??;
+
+        // An answer that arrived but does not parse is NOT a transport failure: the
+        // provider is up and the model simply did not cooperate, so it resolves to
+        // "ask" without counting toward the two-failures-in-a-run degradation.
+        let text = value["choices"][0]["message"]["content"]
+            .as_str()
+            .unwrap_or_default();
+        Ok(approval::parse_verdict(text))
     }
 }
 

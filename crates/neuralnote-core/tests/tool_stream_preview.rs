@@ -239,7 +239,9 @@ fn run(root: &Path, llm: &FixtureStreamingLlm) -> Vec<ChatEvent> {
     let retriever = KeywordRetriever::new(root);
     let registry = SkillRegistry::built_in(&[]).unwrap();
     let environment = environment();
-    let services = SkillServices::new(&registry, &environment, &NoUserPrompt, &FsBackend, 1);
+    let (policy, approval_prompt, approval_classifier) = support::unattended_approval();
+    let services = SkillServices::new(&registry, &environment, &NoUserPrompt, &FsBackend, 1)
+        .with_approval(policy, approval_prompt, approval_classifier);
     let mut sink = VecEventSink::default();
     block_on(run_chat(
         "write up spaced repetition",

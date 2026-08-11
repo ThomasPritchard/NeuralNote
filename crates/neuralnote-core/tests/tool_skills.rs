@@ -115,6 +115,14 @@ impl Harness {
         arguments: &str,
         allowed: &BTreeSet<String>,
     ) -> tools::ToolResult {
+        let approved = support::approve_unattended(
+            self.vault.path(),
+            &neuralnote_core::ai::ToolCall {
+                id: call_id.to_string(),
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        );
         let mut evidence = EvidenceRegistry::new();
         let mut context = ToolContext::new(
             self.vault.path(),
@@ -127,9 +135,7 @@ impl Harness {
             allowed,
         );
         block_on(tools::dispatch(
-            call_id,
-            name,
-            arguments,
+            &approved,
             &self.retriever,
             &mut evidence,
             &self.prompt,

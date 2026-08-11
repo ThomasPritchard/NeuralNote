@@ -565,6 +565,96 @@
         }
       }
     ],
+    "tool-approval-answer": [
+      {
+        "command": "answer_tool_approval",
+        "arguments": {
+          "approved": false,
+          "id": "call-1",
+          "turnId": "00000000-0000-0000-0000-000000000001"
+        },
+        "result": null
+      }
+    ],
+    "tool-approval-set-mode": [
+      {
+        "command": "set_approval_mode",
+        "arguments": {
+          "mode": "yolo"
+        },
+        "result": {
+          "activeProvider": "openRouter",
+          "approval": {
+            "classifierAvailable": false,
+            "effectiveModes": {
+              "fetch_captions": "alwaysAsk",
+              "fetch_video_info": "alwaysAsk",
+              "resolve_distil_route": "alwaysAsk",
+              "select_playlist_videos": "alwaysAsk",
+              "transcribe_audio": "alwaysAsk",
+              "use_skill": "alwaysAsk",
+              "write_note": "alwaysAsk"
+            },
+            "irreversibleActions": [
+              "saving how it files your notes",
+              "fetching pages and captions from the internet",
+              "running audio transcription on your machine"
+            ],
+            "mode": "alwaysAsk",
+            "toolOverrides": {}
+          },
+          "local": {
+            "activeModelTag": null
+          },
+          "openrouter": {
+            "hasKey": true,
+            "model": "anthropic/claude-sonnet-4.5",
+            "reasoning": false
+          },
+          "reasoningSupported": "unknown"
+        }
+      }
+    ],
+    "tool-approval-set-override": [
+      {
+        "command": "set_tool_approval_override",
+        "arguments": {
+          "mode": "alwaysAsk",
+          "tool": "write_note"
+        },
+        "result": {
+          "activeProvider": "openRouter",
+          "approval": {
+            "classifierAvailable": false,
+            "effectiveModes": {
+              "fetch_captions": "alwaysAsk",
+              "fetch_video_info": "alwaysAsk",
+              "resolve_distil_route": "alwaysAsk",
+              "select_playlist_videos": "alwaysAsk",
+              "transcribe_audio": "alwaysAsk",
+              "use_skill": "alwaysAsk",
+              "write_note": "alwaysAsk"
+            },
+            "irreversibleActions": [
+              "saving how it files your notes",
+              "fetching pages and captions from the internet",
+              "running audio transcription on your machine"
+            ],
+            "mode": "alwaysAsk",
+            "toolOverrides": {}
+          },
+          "local": {
+            "activeModelTag": null
+          },
+          "openrouter": {
+            "hasKey": true,
+            "model": "anthropic/claude-sonnet-4.5",
+            "reasoning": false
+          },
+          "reasoningSupported": "unknown"
+        }
+      }
+    ],
     "workspace-corrupt": [
       {
         "command": "load_workspace_state",

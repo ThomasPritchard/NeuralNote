@@ -30,6 +30,7 @@ vi.mock("../lib/api", async (importActual) => {
 
 import * as api from "../lib/api";
 import { ChatPane } from "./ChatPane";
+import { ALWAYS_ASK_APPROVAL_STATUS } from "../lib/approvalStatusFixture";
 
 const mockAiStatus = vi.mocked(api.aiStatus);
 const mockChat = vi.mocked(api.chat);
@@ -43,6 +44,7 @@ const openRouterActive = (): AiStatus => ({
   reasoningSupported: "unknown",
   openrouter: { hasKey: true, model: DEFAULT_MODEL, reasoning: false },
   local: { activeModelTag: null },
+  approval: ALWAYS_ASK_APPROVAL_STATUS,
 });
 
 /** The backend catalogue a test seeds — the fixture skill as `list_skills`

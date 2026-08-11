@@ -7,6 +7,10 @@
 //! `Done`. Any error is surfaced as a [`ChatEvent::Error`] and stops the run — never
 //! a panic, never silent.
 
+use crate::ai::approval::{
+    self, ApprovalClassifier, ApprovalContext, ApprovalDecision, ApprovalGate, ApprovalPolicy,
+    ApprovalPrompt, ApprovedCall, DenyingApprovalPrompt, UnavailableApprovalClassifier,
+};
 use crate::ai::events::{ChatEvent, EventSink, ToolStatus};
 use crate::ai::evidence::EvidenceRegistry;
 use crate::ai::llm::{Completion, LlmClient, LlmMessage, LlmRequest, Role, ToolCall, UserPrompt};
@@ -135,7 +139,14 @@ pub struct SkillServices<'a> {
     pricing: Option<&'a PricingInput>,
     extractor_updates: ExtractorUpdateSession,
     retry_delay: &'a dyn RetryDelay,
+    approval_policy: ApprovalPolicy,
+    approval_prompt: &'a dyn ApprovalPrompt,
+    approval_classifier: &'a dyn ApprovalClassifier,
 }
+
+static DENYING_APPROVAL_PROMPT: DenyingApprovalPrompt = DenyingApprovalPrompt;
+static UNAVAILABLE_APPROVAL_CLASSIFIER: UnavailableApprovalClassifier =
+    UnavailableApprovalClassifier;
 
 static UNAVAILABLE_VAULT_PROFILE_IO: UnavailableVaultProfileIo = UnavailableVaultProfileIo;
 
@@ -163,7 +174,29 @@ impl<'a> SkillServices<'a> {
             extractor_updates: ExtractorUpdateSession::default(),
             // No-op backoff by default; the desktop shell wires its runtime timer.
             retry_delay: &NO_RETRY_DELAY,
+            // Fail-closed defaults: ask about everything, deny when nobody is
+            // listening, and have no judge. A client that forgets to wire the
+            // approval seams therefore cannot run gated tools unattended — the
+            // opposite default would turn a missed wiring step into silent
+            // unattended vault writes.
+            approval_policy: ApprovalPolicy::default(),
+            approval_prompt: &DENYING_APPROVAL_PROMPT,
+            approval_classifier: &UNAVAILABLE_APPROVAL_CLASSIFIER,
         }
+    }
+
+    /// Wire the tool-approval gate: the persisted policy, the host's approval
+    /// sheet, and the judge.
+    pub fn with_approval(
+        mut self,
+        policy: ApprovalPolicy,
+        prompt: &'a dyn ApprovalPrompt,
+        classifier: &'a dyn ApprovalClassifier,
+    ) -> Self {
+        self.approval_policy = policy;
+        self.approval_prompt = prompt;
+        self.approval_classifier = classifier;
+        self
     }
 
     pub fn with_youtube_io(mut self, youtube_io: &'a dyn YoutubeIo) -> Self {
@@ -257,9 +290,20 @@ pub async fn run_chat(
             return Ok(UndoLedger::default());
         }
     };
+    // Per-run, and deliberately never serialised: an approval cannot survive a
+    // restart, and a verdict cached across runs would have been derived from a
+    // vault state that no longer exists.
+    let mut gate = ApprovalGate::new(skill_services.approval_policy.clone());
     sink.send(ChatEvent::Processing);
     if let Err(e) = session
-        .drive(user_input, history, &active_skills, &mut writes, sink)
+        .drive(
+            user_input,
+            history,
+            &active_skills,
+            &mut writes,
+            &mut gate,
+            sink,
+        )
         .await
     {
         // Surface the failure explicitly and stop — never a panic, never silent.
@@ -364,12 +408,14 @@ impl EventSink for ThinkingCounter<'_> {
 }
 
 impl ChatSession<'_> {
+    #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
         user_input: &str,
         history: &[LlmMessage],
         preloaded_skills: &[String],
         writes: &mut WriteSession,
+        gate: &mut ApprovalGate,
         sink: &mut dyn EventSink,
     ) -> CoreResult<()> {
         // Sanitise history in the core (strip stale `[eN]` markers, window to a char
@@ -440,6 +486,7 @@ impl ChatSession<'_> {
                 &mut youtube_session,
                 &mut registry,
                 &mut coverage,
+                gate,
                 sink,
             )
             .await?;
@@ -525,6 +572,7 @@ impl ChatSession<'_> {
         youtube_session: &mut YoutubeToolSession,
         registry: &mut EvidenceRegistry,
         coverage: &mut CoverageAcc,
+        gate: &mut ApprovalGate,
         sink: &mut dyn EventSink,
     ) -> CoreResult<EvidenceCollection> {
         let mut consumed = 0usize;
@@ -587,6 +635,7 @@ impl ChatSession<'_> {
                     &authorized_tools,
                     registry,
                     coverage,
+                    gate,
                     sink,
                     &mut playlist.context_chars,
                 )
@@ -609,6 +658,7 @@ impl ChatSession<'_> {
         authorized_tools: &std::collections::BTreeSet<String>,
         registry: &mut EvidenceRegistry,
         coverage: &mut CoverageAcc,
+        gate: &mut ApprovalGate,
         sink: &mut dyn EventSink,
         context_chars: &mut usize,
     ) -> ToolBatchControl {
@@ -657,6 +707,7 @@ impl ChatSession<'_> {
                     authorized_tools,
                     registry,
                     coverage,
+                    gate,
                     sink,
                     context_chars,
                 )
@@ -691,12 +742,34 @@ impl ChatSession<'_> {
         authorized_tools: &std::collections::BTreeSet<String>,
         registry: &mut EvidenceRegistry,
         coverage: &mut CoverageAcc,
+        gate: &mut ApprovalGate,
         sink: &mut dyn EventSink,
         context_chars: &mut usize,
     ) -> (tools::ToolControl, ToolSettlement) {
+        // The gate is the single door in front of dispatch, and the ONLY producer
+        // of the `ApprovedCall` dispatch requires. A refusal still pushes exactly
+        // one result for this call and settles its node: denial is not
+        // run-cancellation, and the remaining calls in the batch stay gated.
+        let approved = match self.approve(gate, call, writes, sink).await {
+            Ok(approved) => approved,
+            Err(refusal) => {
+                messages.push(LlmMessage::tool_result(
+                    &call.id,
+                    &call.name,
+                    refusal.tool_result_content(),
+                ));
+                if youtube_session.playlist_is_active()
+                    && call.name != tools::TOOL_SELECT_PLAYLIST_VIDEOS
+                {
+                    youtube_session
+                        .fail_playlist_item(format!("tool '{}' was not approved", call.name));
+                }
+                return (tools::ToolControl::Continue, refusal.settlement());
+            }
+        };
         let result = self
             .handle_tool_call(
-                call,
+                &approved,
                 active_skills,
                 writes,
                 youtube_session,
@@ -720,6 +793,40 @@ impl ChatSession<'_> {
             result.content,
         ));
         (result.control, settlement)
+    }
+
+    /// Take one declared call through the approval gate.
+    ///
+    /// An **ungated** tool needs no decision at all — the four read-only vault
+    /// tools, `skill_step`, `ask_user`, and any name the model invented — so it is
+    /// admitted by [`ApprovedCall::ungated`], the one constructor that provably
+    /// cannot authorise a gated call. Everything the gate covers goes through
+    /// [`approval::decide`], which is its only other constructor.
+    async fn approve(
+        &self,
+        gate: &mut ApprovalGate,
+        call: &ToolCall,
+        writes: &WriteSession,
+        sink: &mut dyn EventSink,
+    ) -> Result<ApprovedCall, RefusedCall> {
+        if let Some(approved) = ApprovedCall::ungated(call) {
+            return Ok(approved);
+        }
+        // Budget headroom is one of the classified scalars and one clause of the
+        // eligibility rule. It comes from the run's already-enforced budget, so
+        // the gate reads the same number the write path will enforce.
+        let budget = writes.budget();
+        let writes_remaining = budget.total_cap().saturating_sub(budget.total_writes());
+        let context = ApprovalContext {
+            root: self.root,
+            classifier: self.skill_services.approval_classifier,
+            prompt: self.skill_services.approval_prompt,
+        };
+        match approval::decide(gate, &context, call, writes_remaining, sink).await {
+            ApprovalDecision::Approved(approved) => Ok(approved),
+            ApprovalDecision::Denied => Err(RefusedCall::Denied),
+            ApprovalDecision::HardDenied(denial) => Err(RefusedCall::HardDenied(denial.message())),
+        }
     }
 
     fn evidence_budget_spent(
@@ -805,7 +912,7 @@ impl ChatSession<'_> {
     #[allow(clippy::too_many_arguments)]
     async fn handle_tool_call(
         &self,
-        call: &ToolCall,
+        call: &ApprovedCall,
         active_skills: &mut ActiveSkills,
         writes: &mut WriteSession,
         youtube_session: &mut YoutubeToolSession,
@@ -815,8 +922,8 @@ impl ChatSession<'_> {
         sink: &mut dyn EventSink,
     ) -> tools::ToolResult {
         // The "searching…" cue precedes the search so the UI shows it live.
-        if call.name == tools::TOOL_SEARCH_NOTES {
-            if let Some(query) = peek_query(&call.arguments) {
+        if call.name() == tools::TOOL_SEARCH_NOTES {
+            if let Some(query) = peek_query(call.arguments()) {
                 sink.send(ChatEvent::Searching { query });
             }
         }
@@ -838,9 +945,7 @@ impl ChatSession<'_> {
                 context = context.with_pricing(pricing);
             }
             dispatch(
-                &call.id,
-                &call.name,
-                &call.arguments,
+                call,
                 self.provider,
                 registry,
                 self.skill_services.user_prompt,
@@ -1132,6 +1237,54 @@ impl SkippedCall {
             status: ToolStatus::Rejected,
             summary: None,
             detail: Some(self.reason().to_string()),
+        }
+    }
+}
+
+/// A declared call the approval gate refused.
+///
+/// Like [`SkippedCall`], each variant both answers the model and settles the
+/// timeline node, so a refusal can never leave a node spinning forever. And like
+/// a skip, a refusal is **not** run-cancellation: one result is still pushed for
+/// this call, and the rest of the batch stays gated. Ending the turn on a denial
+/// is the tempting shortcut and it breaks the protocol invariant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RefusedCall {
+    /// The user declined — or the prompt timed out, was cancelled, or the window
+    /// closed. All of those resolve to no.
+    Denied,
+    /// Refused without asking: a vault escape, an invalid path, arguments that
+    /// never parsed, or a subject the user has already declined twice. Validation
+    /// and confinement, not authorisation — so this happens in every mode,
+    /// `Yolo` included.
+    HardDenied(String),
+}
+
+impl RefusedCall {
+    /// The `role:"tool"` content the model reads and recovers from.
+    fn tool_result_content(&self) -> String {
+        let message = match self {
+            Self::Denied => "the user declined this action, so it did not run",
+            Self::HardDenied(detail) => detail,
+        };
+        serde_json::json!({ "error": message }).to_string()
+    }
+
+    /// The same story in the user's words, for the timeline node. `Denied` (the
+    /// user refused) and `Rejected` (the orchestrator refused) are different
+    /// stories and must render differently.
+    fn settlement(&self) -> ToolSettlement {
+        match self {
+            Self::Denied => ToolSettlement {
+                status: ToolStatus::Denied,
+                summary: None,
+                detail: Some("Denied. Nothing was written.".to_string()),
+            },
+            Self::HardDenied(detail) => ToolSettlement {
+                status: ToolStatus::Rejected,
+                summary: None,
+                detail: Some(detail.clone()),
+            },
         }
     }
 }
@@ -1830,6 +1983,7 @@ mod settlement_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::approval::ApprovalMode;
     use crate::ai::events::VecSink;
     use crate::ai::llm::{Completion, NoUserPrompt};
     use crate::ai::local::HardwareSpec;
@@ -1845,6 +1999,34 @@ mod tests {
     use crate::error::CoreError;
     use async_trait::async_trait;
     use futures::executor::block_on;
+
+    /// A gate that approves everything, for the tests in this module — none of
+    /// which is about approval. It still runs the real `decide()`, so the gate
+    /// stays on the dispatch path here rather than being bypassed. The approval
+    /// behaviour itself is tested in `ai::approval` and in
+    /// `tests/tool_approval*.rs`.
+    fn open_gate() -> ApprovalGate {
+        ApprovalGate::new(unattended_policy())
+    }
+
+    static TEST_APPROVAL_PROMPT: DenyingApprovalPrompt = DenyingApprovalPrompt;
+    static TEST_APPROVAL_CLASSIFIER: UnavailableApprovalClassifier = UnavailableApprovalClassifier;
+
+    /// YOLO, plus an explicit unpin of `transcribe_audio`, so a test that is not
+    /// about approval is not blocked by it. Written out rather than hidden behind
+    /// a "disable the gate" switch: there is no such switch, and the gate still
+    /// runs for every call these tests make.
+    fn unattended_policy() -> ApprovalPolicy {
+        ApprovalPolicy::new(
+            ApprovalMode::Yolo,
+            std::collections::BTreeMap::from([(
+                tools::TOOL_TRANSCRIBE_AUDIO.to_string(),
+                ApprovalMode::Yolo,
+            )]),
+            false,
+        )
+    }
+
     use std::collections::{BTreeSet, VecDeque};
     use std::fs;
     use std::fs::OpenOptions;
@@ -2500,6 +2682,11 @@ mod tests {
         };
         let pricing = PricingInput::Local;
         let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+            .with_approval(
+                unattended_policy(),
+                &TEST_APPROVAL_PROMPT,
+                &TEST_APPROVAL_CLASSIFIER,
+            )
             .with_youtube_io(&PlaylistIo(21))
             .with_pricing(&pricing);
         let mut sink = VecSink::default();
@@ -2626,6 +2813,11 @@ mod tests {
         let cancellation = CaptureCancellation::default();
         let writer = CancellingWriter(cancellation.clone());
         let services = SkillServices::new(&skills, &environment, &prompt, &writer, 1)
+            .with_approval(
+                unattended_policy(),
+                &TEST_APPROVAL_PROMPT,
+                &TEST_APPROVAL_CLASSIFIER,
+            )
             .with_youtube_io(&PlaylistIo(2))
             .with_capture_cancellation(cancellation);
         let mut sink = VecSink::default();
@@ -2748,6 +2940,11 @@ mod tests {
             available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
         };
         let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+            .with_approval(
+                unattended_policy(),
+                &TEST_APPROVAL_PROMPT,
+                &TEST_APPROVAL_CLASSIFIER,
+            )
             .with_youtube_io(&PlaylistIo(2));
         let mut sink = VecSink::default();
         let ledger = block_on(run_chat(
@@ -2854,8 +3051,13 @@ mod tests {
         let retriever = KeywordRetriever::new(vault.path());
         let skills = SkillRegistry::built_in(&[]).unwrap();
         let environment = youtube_test_environment();
-        let services =
-            SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1).with_youtube_io(&io);
+        let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+            .with_approval(
+                unattended_policy(),
+                &TEST_APPROVAL_PROMPT,
+                &TEST_APPROVAL_CLASSIFIER,
+            )
+            .with_youtube_io(&io);
         let mut sink = VecSink::default();
         let ledger = block_on(run_chat(
             "Distil this playlist",
@@ -2949,8 +3151,13 @@ mod tests {
         let retriever = KeywordRetriever::new(vault.path());
         let skills = SkillRegistry::built_in(&[]).unwrap();
         let environment = youtube_test_environment();
-        let services =
-            SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1).with_youtube_io(&io);
+        let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+            .with_approval(
+                unattended_policy(),
+                &TEST_APPROVAL_PROMPT,
+                &TEST_APPROVAL_CLASSIFIER,
+            )
+            .with_youtube_io(&io);
         let mut sink = VecSink::default();
         let ledger = block_on(run_chat(
             "Distil this playlist",
@@ -3094,6 +3301,7 @@ mod tests {
             &mut youtube_session,
             &mut registry,
             &mut coverage,
+            &mut open_gate(),
             &mut sink,
         ))
         .unwrap();
@@ -4084,6 +4292,7 @@ mod tests {
             &mut youtube_session,
             &mut registry,
             &mut coverage,
+            &mut open_gate(),
             &mut sink,
         ))
         .unwrap();
@@ -4160,6 +4369,7 @@ mod tests {
             &mut youtube_session,
             &mut registry,
             &mut coverage,
+            &mut open_gate(),
             &mut sink,
         ))
         .unwrap();

@@ -14,6 +14,7 @@ import { vi } from "vitest";
 import * as api from "../lib/api";
 import type { AiStatus, ChatEvent, ReasoningSupport } from "../lib/types";
 import { ChatPane } from "./ChatPane";
+import { ALWAYS_ASK_APPROVAL_STATUS } from "../lib/approvalStatusFixture";
 
 export const mockAiStatus = vi.mocked(api.aiStatus);
 export const mockSave = vi.mocked(api.saveApiKey);
@@ -34,6 +35,7 @@ export const unconfigured = (): AiStatus => ({
   reasoningSupported: "unknown",
   openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false },
   local: { activeModelTag: null },
+  approval: ALWAYS_ASK_APPROVAL_STATUS,
 });
 export const openRouterActive = (
   model = DEFAULT_MODEL,
@@ -43,12 +45,14 @@ export const openRouterActive = (
   reasoningSupported: opts.reasoningSupported ?? "unknown",
   openrouter: { hasKey: true, model, reasoning: opts.reasoning ?? false },
   local: { activeModelTag: null },
+  approval: ALWAYS_ASK_APPROVAL_STATUS,
 });
 export const localActive = (tag: string | null): AiStatus => ({
   activeProvider: "local",
   reasoningSupported: "unknown",
   openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false },
   local: { activeModelTag: tag },
+  approval: ALWAYS_ASK_APPROVAL_STATUS,
 });
 
 export function deferred<T>() {

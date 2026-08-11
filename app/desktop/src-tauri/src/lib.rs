@@ -65,6 +65,9 @@ pub(crate) struct AppState {
     /// Parked structured-question responders. The Arc is cloned out under the
     /// short AppState lock before any chat future awaits an answer.
     pub(crate) pending_elicitations: Arc<skills::PendingElicitations>,
+    /// Live tool-approval prompts. A SEPARATE registry from the elicitation one:
+    /// a model-authored question and a security prompt must not share a channel.
+    pub(crate) pending_approvals: Arc<skills::PendingApprovals>,
     /// Separate cancellation slot for app-data requirement downloads. It must
     /// never share Ollama's pull token: cancelling one download class must not
     /// abort the other.
@@ -118,6 +121,7 @@ impl Default for AppState {
             local_ai: local::LocalAiState::default(),
             youtube: youtube::YoutubeHostState::default(),
             pending_elicitations: Arc::new(skills::PendingElicitations::default()),
+            pending_approvals: Arc::new(skills::PendingApprovals::default()),
             requirement_download: requirement_download::RequirementDownloadState::default(),
             skill_undo_runs: skills::UndoRunStore::default(),
             openrouter_catalogue: openrouter_catalogue::OpenRouterCatalogueState::default(),
@@ -317,6 +321,8 @@ pub fn run() {
             commands::ai::open_openrouter_rankings,
             commands::ai::set_active_provider,
             commands::ai::set_reasoning,
+            commands::ai::set_approval_mode,
+            commands::ai::set_tool_approval_override,
             commands::ai::refresh_reasoning_support,
             commands::ai::detect_hardware,
             commands::ai::local_candidates,
@@ -329,6 +335,7 @@ pub fn run() {
             commands::ai::list_skills,
             commands::ai::set_skill_enabled,
             skills::answer_elicitation,
+            skills::answer_tool_approval,
             skills::undo_skill_run,
             requirement_download::download_requirement,
             requirement_download::cancel_requirement_download,

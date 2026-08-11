@@ -38,6 +38,7 @@ vi.mock("../lib/api", async (importActual) => {
 
 import * as api from "../lib/api";
 import { AiSettingsPage } from "./AiSettingsPage";
+import { ALWAYS_ASK_APPROVAL_STATUS } from "../lib/approvalStatusFixture";
 
 const mockAiStatus = vi.mocked(api.aiStatus);
 const mockSetActive = vi.mocked(api.setActiveProvider);
@@ -63,18 +64,21 @@ const UNCONFIGURED: AiStatus = {
   reasoningSupported: "unknown",
   openrouter: { hasKey: false, model: "anthropic/claude-sonnet-4.5", reasoning: false },
   local: { activeModelTag: null },
+  approval: ALWAYS_ASK_APPROVAL_STATUS,
 };
 const OR_ACTIVE: AiStatus = {
   activeProvider: "openRouter",
   reasoningSupported: "unknown",
   openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5", reasoning: false },
   local: { activeModelTag: null },
+  approval: ALWAYS_ASK_APPROVAL_STATUS,
 };
 const LOCAL_ACTIVE: AiStatus = {
   activeProvider: "local",
   reasoningSupported: "unknown",
   openrouter: { hasKey: false, model: "anthropic/claude-sonnet-4.5", reasoning: false },
   local: { activeModelTag: "qwen2.5:7b" },
+  approval: ALWAYS_ASK_APPROVAL_STATUS,
 };
 
 const HW: HardwareSpec = {
@@ -199,6 +203,7 @@ describe("AiSettingsPage — header + hardware", () => {
     mockAiStatus.mockResolvedValue({
       ...LOCAL_ACTIVE,
       local: { activeModelTag: null },
+      approval: ALWAYS_ASK_APPROVAL_STATUS,
     });
     setup();
     expect(
@@ -703,6 +708,7 @@ describe("AiSettingsPage — OpenRouter reasoning toggle", () => {
       reasoningSupported: "unsupported", // the LOCAL model's verdict
       openrouter: { hasKey: true, model: "openai/gpt-4.1", reasoning: false },
       local: { activeModelTag: "qwen3.5:9b" },
+      approval: ALWAYS_ASK_APPROVAL_STATUS,
     });
     setup();
 

@@ -218,6 +218,14 @@ pub fn call_configured(
     let mut active = ActiveSkills::new(8);
     let mut sink = NoopSink;
     let allowed = BTreeSet::from([name.to_string()]);
+    let approved = super::support::approve_unattended(
+        vault,
+        &neuralnote_core::ai::ToolCall {
+            id: "implementation-authored".into(),
+            name: name.to_string(),
+            arguments: arguments.to_string(),
+        },
+    );
     let mut evidence = EvidenceRegistry::new();
     let mut context = ToolContext::new(
         vault,
@@ -238,9 +246,7 @@ pub fn call_configured(
     }
 
     block_on(tools::dispatch(
-        "implementation-authored",
-        name,
-        arguments,
+        &approved,
         retriever,
         &mut evidence,
         prompt,

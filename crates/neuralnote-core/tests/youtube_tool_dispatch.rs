@@ -267,14 +267,20 @@ fn call_with_pricing(
     .with_pricing(pricing);
 
     block_on(tools::dispatch(
-        "youtube-call",
-        name,
-        arguments,
+        &support::approve_unattended(vault.path(), &tool_call("youtube-call", name, arguments)),
         &retriever,
         &mut evidence,
         &NoUserPrompt,
         &mut context,
     ))
+}
+
+fn tool_call(id: &str, name: &str, arguments: &str) -> neuralnote_core::ai::ToolCall {
+    neuralnote_core::ai::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: arguments.into(),
+    }
 }
 
 /// Like [`call`], but keeps the events instead of dropping them — for the
@@ -318,9 +324,7 @@ fn call_collecting_events(
         .with_pricing(&pricing);
 
         block_on(tools::dispatch(
-            "youtube-call",
-            name,
-            arguments,
+            &support::approve_unattended(vault.path(), &tool_call("youtube-call", name, arguments)),
             &retriever,
             &mut evidence,
             &NoUserPrompt,
@@ -457,9 +461,14 @@ fn call_with_installer(
     .with_youtube_requirements(installer)
     .with_pricing(&pricing);
     block_on(tools::dispatch(
-        "install-call",
-        TOOL_TRANSCRIBE_AUDIO,
-        &format!(r#"{{"url":"{URL}"}}"#),
+        &support::approve_unattended(
+            vault.path(),
+            &tool_call(
+                "install-call",
+                TOOL_TRANSCRIBE_AUDIO,
+                &format!(r#"{{"url":"{URL}"}}"#),
+            ),
+        ),
         &retriever,
         &mut evidence,
         prompt,

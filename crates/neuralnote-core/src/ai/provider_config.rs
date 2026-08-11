@@ -4,9 +4,11 @@
 //! only non-secret routing/model preferences so every client can share the same
 //! migration and tolerant-read behaviour.
 
+use crate::ai::approval::{retain_known_tool_overrides, ApprovalMode, ApprovalPolicy, GatedTool};
 use crate::ai::{capabilities::ReasoningSupport, DEFAULT_MODEL};
 use crate::error::{CoreError, CoreResult};
 use serde::{Deserialize, Deserializer, Serialize};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use ts_rs::TS;
@@ -73,6 +75,26 @@ pub struct ProviderConfig {
     /// Existing skills remain enabled, while incomplete new skills can ship off.
     #[serde(default = "default_disabled_skills")]
     pub disabled_skills: Vec<String>,
+    /// The global approval default. `#[serde(default)]` is load-bearing exactly
+    /// as it is for `reasoning`: an `ai-config.json` written before this field
+    /// existed reads back as `ApprovalMode::default()` = `AlwaysAsk`, so every
+    /// existing install migrates to the SAFE mode for free, with no migration
+    /// code. Getting this backwards would silently grant unattended vault writes
+    /// to every existing install, which is why it has its own named test.
+    #[serde(default)]
+    pub approval_mode: ApprovalMode,
+    /// Per-tool exceptions, keyed by the `TOOL_*` constants. Absent and empty both
+    /// mean "every tool takes its COMPILED default" — inherit-the-global for six
+    /// of the seven, and `AlwaysAsk` for `transcribe_audio`. So a legacy config
+    /// and a deliberately-cleared list are the same thing, and neither one
+    /// silently unpins the process-spawning tool. A stored entry REPLACES that
+    /// compiled default.
+    ///
+    /// `BTreeMap`, not `HashMap`: deterministic serialisation order, so the config
+    /// file does not churn in diffs and a golden-file test is stable. (This repo
+    /// has been bitten by JSON key reordering before.)
+    #[serde(default)]
+    pub tool_approval_overrides: BTreeMap<String, ApprovalMode>,
 }
 
 fn default_disabled_skills() -> Vec<String> {
@@ -110,6 +132,10 @@ struct RawProviderConfig {
     reasoning_probe_generation: u64,
     #[serde(default = "default_disabled_skills")]
     disabled_skills: Vec<String>,
+    #[serde(default)]
+    approval_mode: ApprovalMode,
+    #[serde(default)]
+    tool_approval_overrides: BTreeMap<String, ApprovalMode>,
 }
 
 /// Fold whichever reasoning-cache shape the file carried into the paired value. The
@@ -151,6 +177,11 @@ impl<'de> Deserialize<'de> for ProviderConfig {
             ),
             reasoning_probe_generation: raw.reasoning_probe_generation,
             disabled_skills: raw.disabled_skills,
+            approval_mode: raw.approval_mode,
+            // An UNKNOWN key is dropped on read rather than erroring, so a config
+            // written by a newer build (one that gates an eighth tool) still
+            // loads in an older one instead of bricking it.
+            tool_approval_overrides: retain_known_tool_overrides(raw.tool_approval_overrides),
         })
     }
 }
@@ -165,11 +196,38 @@ impl Default for ProviderConfig {
             reasoning_probe: None,
             reasoning_probe_generation: 0,
             disabled_skills: default_disabled_skills(),
+            approval_mode: ApprovalMode::default(),
+            tool_approval_overrides: BTreeMap::new(),
         }
     }
 }
 
 impl ProviderConfig {
+    /// The approval mode in force for one tool, after the per-tool clamp.
+    pub fn effective_approval_mode(&self, tool: GatedTool) -> ApprovalMode {
+        crate::ai::approval::effective_mode(self.approval_mode, &self.tool_approval_overrides, tool)
+    }
+
+    /// The run policy, resolved against whether the active provider can run the
+    /// judge. The local lane cannot (§9.5.2), and that is decided HERE rather
+    /// than in the UI: a settings-layer-only guard is one a stale config or a
+    /// direct IPC call walks straight through.
+    ///
+    /// The user's stored preference is **not** overwritten when it is momentarily
+    /// unusable — switching back to a cloud provider restores it. Silently
+    /// rewriting a stored choice is its own bug.
+    pub fn approval_policy(&self, key_present: bool) -> ApprovalPolicy {
+        let classifier_available = matches!(
+            self.effective_provider(key_present),
+            Some(ProviderKind::OpenRouter)
+        );
+        ApprovalPolicy::new(
+            self.approval_mode,
+            self.tool_approval_overrides.clone(),
+            classifier_available,
+        )
+    }
+
     fn reasoning_probe_identity(&self, key_present: bool) -> Option<(ProviderKind, String)> {
         Some((
             self.effective_provider(key_present)?,
@@ -393,6 +451,11 @@ mod tests {
             reasoning_probe: probed("qwen2.5:7b", ReasoningSupport::Supported),
             reasoning_probe_generation: 9,
             disabled_skills: vec![FIXTURE_SKILL_ID.into()],
+            approval_mode: ApprovalMode::Yolo,
+            tool_approval_overrides: BTreeMap::from([(
+                GatedTool::WriteNote.name().to_string(),
+                ApprovalMode::AlwaysAsk,
+            )]),
         };
 
         write_provider_config(dir.path(), &config).unwrap();
@@ -405,6 +468,150 @@ mod tests {
                 ..config
             }
         );
+    }
+
+    #[test]
+    fn a_pre_feature_ai_config_loads_as_always_ask_with_no_overrides() {
+        // THE migration test, and it is non-negotiable. Getting this backwards
+        // silently grants unattended vault writes to every existing install,
+        // which is the single worst outcome available in this phase. The config
+        // below is a real pre-feature shape: it has a model, a provider, and a
+        // reasoning opt-in, and it has never heard of approval.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_file(dir.path()),
+            r#"{
+                "activeProvider": "openRouter",
+                "model": "anthropic/claude-sonnet-4.5",
+                "reasoning": true,
+                "reasoningProbeGeneration": 3
+            }"#,
+        )
+        .unwrap();
+
+        let config = read_provider_config(dir.path()).unwrap();
+
+        assert_eq!(config.approval_mode, ApprovalMode::AlwaysAsk);
+        assert!(config.tool_approval_overrides.is_empty());
+        // …and every one of the seven tools resolves to asking, not just the
+        // stored default. A safe global with an inherited permissive per-tool
+        // value would be the same bug wearing a different hat.
+        for tool in crate::ai::approval::ALL_GATED_TOOLS {
+            assert_eq!(
+                config.effective_approval_mode(tool),
+                ApprovalMode::AlwaysAsk,
+                "{} must migrate to asking",
+                tool.name()
+            );
+        }
+        // The rest of the pre-feature config still loads.
+        assert!(config.reasoning);
+        assert_eq!(config.reasoning_probe_generation, 3);
+    }
+
+    #[test]
+    fn an_empty_config_file_also_loads_as_always_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(config_file(dir.path()), r#"{"model":""}"#).unwrap();
+        let config = read_provider_config(dir.path()).unwrap();
+        assert_eq!(config.approval_mode, ApprovalMode::AlwaysAsk);
+        assert!(config.tool_approval_overrides.is_empty());
+    }
+
+    #[test]
+    fn a_missing_config_file_defaults_to_always_ask() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = read_provider_config(dir.path()).unwrap();
+        assert_eq!(config.approval_mode, ApprovalMode::AlwaysAsk);
+    }
+
+    #[test]
+    fn an_override_key_from_a_newer_build_is_dropped_rather_than_erroring() {
+        // A downgrade after a future tool joins the gated set must not brick the
+        // config. The known entry survives; the unknown one is simply not read.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_file(dir.path()),
+            r#"{
+                "model": "anthropic/claude-sonnet-4.5",
+                "approvalMode": "approveForMe",
+                "toolApprovalOverrides": {
+                    "write_note": "alwaysAsk",
+                    "delete_note": "yolo"
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let config = read_provider_config(dir.path()).unwrap();
+
+        assert_eq!(config.approval_mode, ApprovalMode::ApproveForMe);
+        assert_eq!(
+            config.tool_approval_overrides,
+            BTreeMap::from([(
+                GatedTool::WriteNote.name().to_string(),
+                ApprovalMode::AlwaysAsk
+            )])
+        );
+    }
+
+    #[test]
+    fn overrides_serialise_in_a_stable_key_order() {
+        // `BTreeMap`, so the file does not churn in diffs on rewrite.
+        let config = ProviderConfig {
+            tool_approval_overrides: BTreeMap::from([
+                (
+                    GatedTool::WriteNote.name().to_string(),
+                    ApprovalMode::AlwaysAsk,
+                ),
+                (
+                    GatedTool::UseSkill.name().to_string(),
+                    ApprovalMode::AlwaysAsk,
+                ),
+                (
+                    GatedTool::FetchCaptions.name().to_string(),
+                    ApprovalMode::AlwaysAsk,
+                ),
+            ]),
+            ..ProviderConfig::default()
+        };
+        let encoded = serde_json::to_string(&config).unwrap();
+        let start = encoded.find("toolApprovalOverrides").unwrap();
+        assert!(
+            encoded[start..].starts_with(
+                r#"toolApprovalOverrides":{"fetch_captions":"alwaysAsk","use_skill":"alwaysAsk","write_note":"alwaysAsk"}"#
+            ),
+            "{encoded}"
+        );
+    }
+
+    #[test]
+    fn the_local_lane_reports_no_classifier_while_keeping_the_stored_preference() {
+        // §9.5.2, enforced in Rust. The stored mode is untouched — switching back
+        // to a cloud provider restores it — but the policy the run receives says
+        // the judge is unavailable, so `ApproveForMe` falls back to asking.
+        let mut config = ProviderConfig {
+            active_provider: Some(ProviderKind::Local),
+            local_model_tag: Some("qwen3.5:9b".into()),
+            approval_mode: ApprovalMode::ApproveForMe,
+            ..ProviderConfig::default()
+        };
+        let local = config.approval_policy(false);
+        assert!(!local.classifier_available);
+        assert_eq!(local.mode, ApprovalMode::ApproveForMe);
+        assert_eq!(config.approval_mode, ApprovalMode::ApproveForMe);
+
+        config.active_provider = Some(ProviderKind::OpenRouter);
+        assert!(config.approval_policy(true).classifier_available);
+    }
+
+    #[test]
+    fn no_configured_provider_reports_no_classifier() {
+        let config = ProviderConfig {
+            approval_mode: ApprovalMode::ApproveForMe,
+            ..ProviderConfig::default()
+        };
+        assert!(!config.approval_policy(false).classifier_available);
     }
 
     #[test]
@@ -987,6 +1194,8 @@ mod tests {
             reasoning_probe: probed("qwen2.5:7b", ReasoningSupport::Supported),
             reasoning_probe_generation: 7,
             disabled_skills: vec![FIXTURE_SKILL_ID.into()],
+            approval_mode: ApprovalMode::ApproveForMe,
+            tool_approval_overrides: BTreeMap::new(),
         })
         .unwrap();
 
@@ -1000,6 +1209,14 @@ mod tests {
         );
         assert!(value.get("reasoningSupport").is_none());
         assert!(value.get("reasoningProbedModel").is_none());
+        assert_eq!(
+            value.get("approvalMode"),
+            Some(&serde_json::json!("approveForMe"))
+        );
+        assert_eq!(
+            value.get("toolApprovalOverrides"),
+            Some(&serde_json::json!({}))
+        );
         assert_eq!(
             value.get("reasoningProbeGeneration"),
             Some(&serde_json::json!(7))

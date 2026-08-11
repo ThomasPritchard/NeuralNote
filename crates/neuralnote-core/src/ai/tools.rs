@@ -9,6 +9,7 @@
 //! *tool result* the model reads and recovers from, never a hard failure — an
 //! agentic loop must tolerate the model asking for something impossible.
 
+use crate::ai::approval::ApprovedCall;
 use crate::ai::events::EventSink;
 use crate::ai::evidence::EvidenceRegistry;
 use crate::ai::llm::UserPrompt;
@@ -286,17 +287,24 @@ fn read_note_span_schema() -> Value {
     )
 }
 
-/// Run the named tool. Spans it produces are registered (assigning citable ids) so
-/// the ids appear in the model-facing JSON and the verifier can find them later.
+/// Run the approved tool. Spans it produces are registered (assigning citable
+/// ids) so the ids appear in the model-facing JSON and the verifier can find them
+/// later.
+///
+/// Taking an [`ApprovedCall`] rather than a raw name and argument blob is what
+/// makes "no call reaches execution without a decision" a **compile error to
+/// violate**: the only two constructors are
+/// [`ApprovedCall::ungated`](crate::ai::approval::ApprovedCall::ungated), which
+/// cannot produce one for a gated tool, and the private one inside
+/// [`approval::decide`](crate::ai::approval::decide).
 pub async fn dispatch(
-    call_id: &str,
-    name: &str,
-    args_json: &str,
+    approved: &ApprovedCall,
     provider: &dyn RetrievalProvider,
     registry: &mut EvidenceRegistry,
     user_prompt: &dyn UserPrompt,
     context: &mut ToolContext<'_>,
 ) -> ToolResult {
+    let (call_id, name, args_json) = (approved.call_id(), approved.name(), approved.arguments());
     // Routing on the registry enum, not on the raw string, is what makes the title
     // table exhaustive: a new tool cannot be dispatched until it is a variant, and
     // a new variant does not compile until it has a title.
@@ -560,7 +568,7 @@ mod tests {
     use super::*;
     use crate::ai::events::VecSink;
     use crate::ai::evidence::EvidenceSpan;
-    use crate::ai::llm::NoUserPrompt;
+    use crate::ai::llm::{NoUserPrompt, ToolCall};
     use crate::ai::local::HardwareSpec;
     use crate::ai::retrieval::{FolderMeta, ListOutcome, NoteMeta, SearchOutcome};
     use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
@@ -711,10 +719,17 @@ mod tests {
             &mut sink,
             &allowed,
         );
+        // Every tool exercised here is ungated, so the one constructor that
+        // cannot authorise a gated call is the right one — and it fails loudly if
+        // a gated tool is ever added to these cases, which is the point.
+        let approved = ApprovedCall::ungated(&ToolCall {
+            id: "test-call".into(),
+            name: name.into(),
+            arguments: args_json.into(),
+        })
+        .expect("the tools dispatched here are ungated");
         block_on(dispatch(
-            "test-call",
-            name,
-            args_json,
+            &approved,
             provider,
             registry,
             &NoUserPrompt,

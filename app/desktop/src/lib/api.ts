@@ -21,6 +21,7 @@ import { MENU_ACTIONS } from "./bindings/menuActions";
 import type { QuarantineRecoveryReport } from "./bindings/QuarantineRecoveryReport";
 import type {
   AiStatus,
+  ApprovalMode,
   AppPreferences,
   AppPreferencesLoad,
   ApiKeyStatus,
@@ -311,6 +312,20 @@ export const cancelChatRun = (turnId: string) =>
 export const answerElicitation = (turnId: string, id: string, choices: string[]) =>
   invoke<void>("answer_elicitation", { turnId, id, choices });
 
+/** Answer one live tool-approval prompt.
+ *
+ *  A SEPARATE command from `answerElicitation`, deliberately: `ask_user` lets the
+ *  model author its own question text and option labels, so one shared command
+ *  would let a webview answer meant for a model-authored question satisfy a
+ *  security prompt. The decision is a bool — there is no option set to smuggle
+ *  anything through — and anything that is not an explicit `true` denies.
+ *
+ *  `turnId` scopes it to its own run, and Rust is the only expiry authority: a
+ *  sheet the user leaves open past the timeout is already resolved server-side
+ *  and this call reports "not live" rather than approving late. */
+export const answerToolApproval = (turnId: string, id: string, approved: boolean) =>
+  invoke<void>("answer_tool_approval", { turnId, id, approved });
+
 /** Open a core-validated YouTube timestamp through the native shell. External
  *  navigation never bypasses the shell's URL policy from the webview. */
 export const openYoutubeTimestamp = (url: string) =>
@@ -348,6 +363,28 @@ export const setActiveProvider = (
  *  would show "off" while the config says "on", billing the user silently. */
 export const setReasoning = (enabled: boolean) =>
   sequenceAiConfigMutation(() => invoke<AiStatus>("set_reasoning", { enabled }));
+
+/** Choose the global approval mode.
+ *
+ *  Returns the freshly persisted status for the same reason `setReasoning` does,
+ *  and it matters more here: a read that failed after the write landed would show
+ *  "ask me" while the config said "yolo", which is the difference between an app
+ *  that checks with you and one that does not. */
+export const setApprovalMode = (mode: ApprovalMode) =>
+  sequenceAiConfigMutation(() => invoke<AiStatus>("set_approval_mode", { mode }));
+
+/** Set (or, with `null`, clear) one per-tool approval override.
+ *
+ *  Clearing is NOT the same as storing the current global mode: it restores the
+ *  tool's compiled-in default, which is inherit-the-global for six of the seven
+ *  and always-ask for the one that spawns a host process. An override can only
+ *  ever be more restrictive than the global mode, so a stored value that is more
+ *  permissive is inert — the returned `approval.effectiveModes` is what actually
+ *  applies, and the UI should render from that rather than from `toolOverrides`. */
+export const setToolApprovalOverride = (tool: string, mode: ApprovalMode | null) =>
+  sequenceAiConfigMutation(() =>
+    invoke<AiStatus>("set_tool_approval_override", { tool, mode }),
+  );
 
 /** Probe the selected model over the network or loopback for reasoning support.
  *  This is async I/O, not a cheap config read like `aiStatus()`, so never call it

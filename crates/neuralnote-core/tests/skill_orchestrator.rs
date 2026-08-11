@@ -135,7 +135,9 @@ fn run(
     let retriever = KeywordRetriever::new(root);
     let registry = SkillRegistry::built_in(disabled).unwrap();
     let environment = environment();
-    let services = SkillServices::new(&registry, &environment, &YesPrompt, &FsBackend, 1);
+    let (policy, approval_prompt, approval_classifier) = support::unattended_approval();
+    let services = SkillServices::new(&registry, &environment, &YesPrompt, &FsBackend, 1)
+        .with_approval(policy, approval_prompt, approval_classifier);
     let mut sink = VecEventSink::default();
     let ledger = block_on(run_chat(
         "run the fixture",

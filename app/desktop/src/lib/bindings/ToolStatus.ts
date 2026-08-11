@@ -6,12 +6,15 @@
  * orchestrator refused) and `Denied` (the user refused) are different stories and
  * must render differently.
  *
- * Two of the four have no producer yet, on purpose — this is the frozen wire
- * contract the UI renders against, and both have a named owner:
- * - `Denied` arrives with the tool-approval gate, which is what makes a user
- *   refusal distinguishable from an orchestrator rejection.
- * - `Error` arrives when `ToolOutcome` gains a discriminant for "the tool ran and
- *   failed"; today every failure — malformed arguments and runtime failure alike —
- *   is one `ToolOutcome::Rejected`, so reporting `Error` would be a guess.
+ * `Denied` is produced by the tool-approval gate — a user refusal, a timeout, a
+ * cancel, or a closed window — which is what makes it distinguishable from an
+ * orchestrator rejection. A call the gate refuses WITHOUT asking (a vault
+ * escape, an invalid path) settles as `Rejected` instead: that is validation,
+ * not a decision the user made.
+ *
+ * `Error` still has no producer, on purpose. It arrives when `ToolOutcome` gains
+ * a discriminant for "the tool ran and failed"; today every failure — malformed
+ * arguments and runtime failure alike — is one `ToolOutcome::Rejected`, so
+ * reporting `Error` would be a guess.
  */
 export type ToolStatus = "ok" | "error" | "denied" | "rejected";

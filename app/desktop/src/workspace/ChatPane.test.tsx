@@ -53,6 +53,7 @@ import {
   setup,
   unconfigured,
 } from "./chatPaneTestHarness";
+import { ALWAYS_ASK_APPROVAL_STATUS } from "../lib/approvalStatusFixture";
 
 beforeEach(() => {
   resetChatPaneMocks(reportError);
@@ -142,6 +143,7 @@ describe("ChatPane — first-run provider branching", () => {
       reasoningSupported: "unknown",
       openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false },
       local: { activeModelTag: null },
+      approval: ALWAYS_ASK_APPROVAL_STATUS,
     });
     setup();
 
@@ -307,6 +309,7 @@ describe("ChatPane — key setup", () => {
       reasoningSupported: "unknown",
       openrouter: { hasKey: false, model: "acme/echoed-default", reasoning: false },
       local: { activeModelTag: null },
+      approval: ALWAYS_ASK_APPROVAL_STATUS,
     });
     const { user } = setup();
     await openKeySetup(user);

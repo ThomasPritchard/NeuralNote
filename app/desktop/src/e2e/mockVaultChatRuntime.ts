@@ -153,6 +153,19 @@ export const createChatRuntime = (
       });
       return { turnId, status: "cancelled" };
     },
+    answer_tool_approval: (a) => {
+      // A SEPARATE command from `answer_elicitation`, mirroring the shell, so a
+      // webview answer meant for a model-authored question can never satisfy a
+      // security prompt. Nothing parks approvals in the mock yet — the sheet is
+      // presentational and belongs to the UI lane — so every call reports "not
+      // live", which is exactly what a late answer gets from Rust once the 120s
+      // expiry has fired.
+      const id = a.id as string;
+      return fail(
+        "notFound",
+        `approval '${id}' is not live (it may have timed out or ended)`,
+      );
+    },
     answer_elicitation: (a) => {
       // Validation mirrors the shell (skills/elicitation.rs `answer`):
       // invalid choices reject and LEAVE the question parked for a retry;

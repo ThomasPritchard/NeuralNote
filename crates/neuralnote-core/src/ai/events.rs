@@ -12,6 +12,9 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::ai::approval::{
+    ApprovalDegradedReason, ApprovalReason, ApprovalResolution, ApprovalRule, GatedTool,
+};
 use crate::ai::write_policy::NoteKind;
 
 /// One selectable answer shown by an [`Elicitation`]. Images stay data URIs so a
@@ -43,13 +46,16 @@ pub struct Elicitation {
 /// orchestrator refused) and `Denied` (the user refused) are different stories and
 /// must render differently.
 ///
-/// Two of the four have no producer yet, on purpose — this is the frozen wire
-/// contract the UI renders against, and both have a named owner:
-/// - `Denied` arrives with the tool-approval gate, which is what makes a user
-///   refusal distinguishable from an orchestrator rejection.
-/// - `Error` arrives when `ToolOutcome` gains a discriminant for "the tool ran and
-///   failed"; today every failure — malformed arguments and runtime failure alike —
-///   is one `ToolOutcome::Rejected`, so reporting `Error` would be a guess.
+/// `Denied` is produced by the tool-approval gate — a user refusal, a timeout, a
+/// cancel, or a closed window — which is what makes it distinguishable from an
+/// orchestrator rejection. A call the gate refuses WITHOUT asking (a vault
+/// escape, an invalid path) settles as `Rejected` instead: that is validation,
+/// not a decision the user made.
+///
+/// `Error` still has no producer, on purpose. It arrives when `ToolOutcome` gains
+/// a discriminant for "the tool ran and failed"; today every failure — malformed
+/// arguments and runtime failure alike — is one `ToolOutcome::Rejected`, so
+/// reporting `Error` would be a guess.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -162,6 +168,45 @@ pub enum ChatEvent {
     /// follows any preview that does not go on to be written, so a half-composed
     /// diff is never left sitting there looking committed.
     NoteEditAbandoned { id: String, reason: String },
+    /// The approval gate has asked the judge about a gated call and is waiting.
+    /// Only `ApproveForMe` reaches this state; the other two modes go straight to
+    /// their outcome. It must never be terminal — it resolves within the judge's
+    /// budget, or *because* of it.
+    ToolApprovalChecking { id: String },
+    /// A gated call needs the user's decision before it can run.
+    ToolApprovalRequested {
+        /// The [`ChatEvent::ToolCall`] id, so the sheet attaches to that node.
+        id: String,
+        tool: GatedTool,
+        /// The vault-relative path, **for the human**. Deliberately absent from
+        /// the judge's input: a person can read a deceptive filename and is the
+        /// right party to judge it; a classifier cannot.
+        rel_path: Option<String>,
+        /// A compiled-in reason, never free text and never model prose.
+        reason: ApprovalReason,
+        expires_in_secs: u32,
+    },
+    /// A gated call ran without asking, under a compiled-in rule.
+    ///
+    /// Emitted in **every** mode that auto-approves, YOLO included: the user can
+    /// always see what ran unattended and on what authority. A skipped prompt
+    /// that leaves no trace is the failure this event exists to prevent.
+    ToolAutoApproved {
+        id: String,
+        tool: GatedTool,
+        rule: ApprovalRule,
+    },
+    /// How an approval settled. Unlike [`ChatEvent::Elicit`], which emits no
+    /// follow-up because presentation state is client-side, a security prompt
+    /// must report its own end — otherwise a timeout or a window close leaves a
+    /// security sheet on screen that silently no-ops.
+    ToolApprovalResolved {
+        id: String,
+        decision: ApprovalResolution,
+    },
+    /// Automatic checking is off for the rest of this turn. Emitted once per run,
+    /// not once per call.
+    ToolApprovalDegraded { reason: ApprovalDegradedReason },
     /// A search is about to run for `query` (the live "searching…" cue).
     Searching { query: String },
     /// `query` finished, yielding `hit_count` evidence spans.
@@ -554,6 +599,96 @@ mod tests {
         assert_eq!(
             serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
             event
+        );
+    }
+
+    #[test]
+    fn the_approval_events_use_the_frozen_camel_case_shape() {
+        use crate::ai::approval::{
+            ApprovalDegradedReason, ApprovalReason, ApprovalResolution, ApprovalRule, GatedTool,
+        };
+
+        assert_eq!(
+            json(&ChatEvent::ToolApprovalChecking {
+                id: "call-1".into()
+            }),
+            serde_json::json!({ "type": "toolApprovalChecking", "id": "call-1" })
+        );
+        assert_eq!(
+            json(&ChatEvent::ToolApprovalRequested {
+                id: "call-1".into(),
+                tool: GatedTool::WriteNote,
+                rel_path: Some("Notes/New.md".into()),
+                reason: ApprovalReason::ModeAlwaysAsk,
+                expires_in_secs: 120,
+            }),
+            serde_json::json!({
+                "type": "toolApprovalRequested",
+                "id": "call-1",
+                "tool": "writeNote",
+                "relPath": "Notes/New.md",
+                "reason": "modeAlwaysAsk",
+                "expiresInSecs": 120,
+            })
+        );
+        assert_eq!(
+            json(&ChatEvent::ToolAutoApproved {
+                id: "call-1".into(),
+                tool: GatedTool::WriteNote,
+                rule: ApprovalRule::Yolo,
+            }),
+            serde_json::json!({
+                "type": "toolAutoApproved",
+                "id": "call-1",
+                "tool": "writeNote",
+                "rule": "yolo",
+            })
+        );
+        assert_eq!(
+            json(&ChatEvent::ToolApprovalResolved {
+                id: "call-1".into(),
+                decision: ApprovalResolution::TimedOut,
+            }),
+            serde_json::json!({
+                "type": "toolApprovalResolved",
+                "id": "call-1",
+                "decision": "timedOut",
+            })
+        );
+        assert_eq!(
+            json(&ChatEvent::ToolApprovalDegraded {
+                reason: ApprovalDegradedReason::ProviderUnsupported,
+            }),
+            serde_json::json!({
+                "type": "toolApprovalDegraded",
+                "reason": "providerUnsupported",
+            })
+        );
+    }
+
+    #[test]
+    fn an_approval_request_with_no_path_keeps_it_null_rather_than_empty() {
+        use crate::ai::approval::{ApprovalReason, GatedTool};
+
+        // A network fetch has no vault path. An empty string would render as a
+        // real (blank) destination in the security sheet.
+        let value = json(&ChatEvent::ToolApprovalRequested {
+            id: "call-1".into(),
+            tool: GatedTool::FetchCaptions,
+            rel_path: None,
+            reason: ApprovalReason::Irreversible,
+            expires_in_secs: 120,
+        });
+        assert_eq!(value["relPath"], serde_json::Value::Null);
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(value).unwrap(),
+            ChatEvent::ToolApprovalRequested {
+                id: "call-1".into(),
+                tool: GatedTool::FetchCaptions,
+                rel_path: None,
+                reason: ApprovalReason::Irreversible,
+                expires_in_secs: 120,
+            }
         );
     }
 
