@@ -1125,6 +1125,38 @@ impl neuralnote_core::ai::LlmClient for RunLlmClient<'_> {
             .ok_or_else(|| self.closed_error())?
     }
 
+    /// The streamed tool turn has to be forwarded explicitly, not left to the
+    /// trait default — the default would delegate to `complete`, and the shell's
+    /// streaming implementation would never run at all.
+    ///
+    /// It also owns the one abandonment nothing else can send. A stop drops the
+    /// inner future together with its accumulator, so the notes it had on screen
+    /// outlive the only thing that knew about them; [`LivePreviews`] keeps their
+    /// ids out here, in the frame that survives, and clears them.
+    ///
+    /// [`LivePreviews`]: neuralnote_core::ai::tool_stream::LivePreviews
+    async fn complete_tool_streaming(
+        &self,
+        request: &neuralnote_core::ai::LlmRequest,
+        sink: &mut dyn neuralnote_core::ai::EventSink,
+    ) -> neuralnote_core::CoreResult<neuralnote_core::ai::Completion> {
+        use neuralnote_core::ai::tool_stream::{LivePreviews, ABANDONED_CANCELLED};
+
+        let mut tracked = LivePreviews::new(sink);
+        let outcome = await_run_or_close(
+            self.inner.complete_tool_streaming(request, &mut tracked),
+            self.close_signal,
+        )
+        .await;
+        match outcome {
+            Some(result) => result,
+            None => {
+                tracked.abandon_live(ABANDONED_CANCELLED);
+                Err(self.closed_error())
+            }
+        }
+    }
+
     async fn complete_streaming(
         &self,
         request: &neuralnote_core::ai::LlmRequest,
@@ -2576,6 +2608,180 @@ mod tests {
         );
 
         assert_eq!(client.context_window_tokens(), Some(123_456));
+    }
+
+    /// Streams a note preview, then never finishes — so a stop always lands
+    /// mid-compose, with a card on screen.
+    struct PreviewsThenHangs {
+        started: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for PreviewsThenHangs {
+        async fn complete(&self, _request: &LlmRequest) -> CoreResult<Completion> {
+            unreachable!(
+                "this probe streams its tool turn; reaching the buffered one means the \
+                 cancellation wrapper fell through to the trait default and the shell's \
+                 streaming implementation is never used"
+            )
+        }
+
+        async fn complete_tool_streaming(
+            &self,
+            _request: &LlmRequest,
+            sink: &mut dyn EventSink,
+        ) -> CoreResult<Completion> {
+            sink.send(ChatEvent::NoteEditPreview {
+                id: "call-1".into(),
+                rel_path: None,
+                kind: None,
+                body: "half a note".into(),
+                complete: false,
+            });
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn complete_streaming(
+            &self,
+            _request: &LlmRequest,
+            _sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            unreachable!("the run is stopped during the tool turn")
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordEvents(Vec<ChatEvent>);
+
+    impl EventSink for RecordEvents {
+        fn send(&mut self, event: ChatEvent) {
+            self.0.push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_stopped_mid_compose_clears_the_note_card_it_left_on_screen() {
+        // Stopping the run drops the streaming future — and with it the
+        // accumulator that would have cleared its own cards. Without this, a
+        // half-composed note sits on screen forever looking like one that landed.
+        let signal = ai::ChatRunCloseSignal::default();
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let inner = PreviewsThenHangs {
+            started: std::sync::Arc::clone(&started),
+        };
+        let client = RunLlmClient::new(
+            &inner,
+            &signal,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let request = LlmRequest {
+            model: "test".into(),
+            messages: vec![],
+            tools: vec![],
+        };
+        let mut sink = RecordEvents::default();
+
+        let result = {
+            let run = client.complete_tool_streaming(&request, &mut sink);
+            let cancel = async {
+                started.notified().await;
+                assert!(signal.stop_by_user());
+            };
+            let (result, ()) = tokio::join!(run, cancel);
+            result
+        };
+
+        assert!(result.is_err(), "a stopped run surfaces as an error");
+        let abandoned: Vec<(&str, &str)> = sink
+            .0
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::NoteEditAbandoned { id, reason } => Some((id.as_str(), reason.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            abandoned,
+            vec![(
+                "call-1",
+                neuralnote_core::ai::tool_stream::ABANDONED_CANCELLED
+            )],
+            "the card the stop orphaned must be cleared, exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_turn_that_completes_passes_straight_through() {
+        // The wrapper must not manufacture an abandonment on the happy path: the
+        // turn resolved its own cards, and a second one would report a note the
+        // user is about to see written as abandoned.
+        struct PreviewsThenCompletes;
+
+        #[async_trait::async_trait]
+        impl LlmClient for PreviewsThenCompletes {
+            async fn complete(&self, _request: &LlmRequest) -> CoreResult<Completion> {
+                unreachable!("this probe streams its tool turn")
+            }
+
+            async fn complete_tool_streaming(
+                &self,
+                _request: &LlmRequest,
+                sink: &mut dyn EventSink,
+            ) -> CoreResult<Completion> {
+                sink.send(ChatEvent::NoteEditPreview {
+                    id: "call-1".into(),
+                    rel_path: None,
+                    kind: None,
+                    body: "a whole note".into(),
+                    complete: true,
+                });
+                Ok(Completion {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".into(),
+                        name: "write_note".into(),
+                        arguments: "{}".into(),
+                    }],
+                })
+            }
+
+            async fn complete_streaming(
+                &self,
+                _request: &LlmRequest,
+                _sink: &mut dyn EventSink,
+            ) -> CoreResult<String> {
+                unreachable!("the tool turn is what this exercises")
+            }
+        }
+
+        let signal = ai::ChatRunCloseSignal::default();
+        let inner = PreviewsThenCompletes;
+        let client = RunLlmClient::new(
+            &inner,
+            &signal,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let request = LlmRequest {
+            model: "test".into(),
+            messages: vec![],
+            tools: vec![],
+        };
+        let mut sink = RecordEvents::default();
+
+        let completion = client
+            .complete_tool_streaming(&request, &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(completion.tool_calls.first().unwrap().id, "call-1");
+        assert!(
+            !sink
+                .0
+                .iter()
+                .any(|event| matches!(event, ChatEvent::NoteEditAbandoned { .. })),
+            "a turn that completed must not have its card abandoned"
+        );
     }
 
     struct CloseAfterWriteLlm {

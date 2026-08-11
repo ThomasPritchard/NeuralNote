@@ -208,6 +208,58 @@ impl ToolTurnAccumulator {
     }
 }
 
+/// A pass-through sink that remembers which previews are still unresolved.
+///
+/// [`ToolTurnAccumulator`] clears its own cards when the turn settles or fails,
+/// because it still exists to do it. A run STOPPED mid-compose is the one case
+/// where it does not: the host drops the whole streaming future — accumulator
+/// and all — the moment the user hits stop, so nothing is left to send the
+/// abandonment and a half-written note would sit on screen looking like one that
+/// landed. Keeping the ids out here, in the caller's frame, is what survives
+/// that drop.
+pub struct LivePreviews<'a> {
+    inner: &'a mut dyn EventSink,
+    /// Previewed ids not yet abandoned, in first-seen order so the cards clear
+    /// in the order the user watched them appear.
+    live: Vec<String>,
+}
+
+impl<'a> LivePreviews<'a> {
+    pub fn new(inner: &'a mut dyn EventSink) -> Self {
+        Self {
+            inner,
+            live: Vec::new(),
+        }
+    }
+
+    /// Clear every card still on screen. Idempotent: each is abandoned once, so
+    /// a caller that clears defensively cannot double-report one.
+    pub fn abandon_live(&mut self, reason: &str) {
+        for id in std::mem::take(&mut self.live) {
+            self.inner.send(ChatEvent::NoteEditAbandoned {
+                id,
+                reason: reason.to_string(),
+            });
+        }
+    }
+}
+
+impl EventSink for LivePreviews<'_> {
+    fn send(&mut self, event: ChatEvent) {
+        match &event {
+            ChatEvent::NoteEditPreview { id, .. } => {
+                if !self.live.iter().any(|live| live == id) {
+                    self.live.push(id.clone());
+                }
+            }
+            // The turn resolved this one itself, so it is no longer ours to clear.
+            ChatEvent::NoteEditAbandoned { id, .. } => self.live.retain(|live| live != id),
+            _ => {}
+        }
+        self.inner.send(event);
+    }
+}
+
 fn is_previewable(name: Option<&str>) -> bool {
     name.is_some_and(|name| PREVIEWABLE_TOOLS.contains(&name))
 }
@@ -745,6 +797,107 @@ mod tests {
             abandoned(&sink).is_empty(),
             "no card was ever shown, so there is none to clear"
         );
+    }
+
+    /// Every reason attached to an abandonment, in order.
+    fn abandon_reasons(sink: &VecSink) -> Vec<(&str, &str)> {
+        sink.events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::NoteEditAbandoned { id, reason } => Some((id.as_str(), reason.as_str())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Stream `fragments` through a tracker, then stop the run mid-compose.
+    /// Scoped so the sink is readable again once the tracker has let it go.
+    fn stopped_mid_compose(fragments: Vec<ToolCallDelta>, settle: bool) -> VecSink {
+        let mut sink = VecSink::default();
+        {
+            let mut tracked = LivePreviews::new(&mut sink);
+            let mut accumulator = ToolTurnAccumulator::new();
+            for fragment in fragments {
+                accumulator.push_fragment(fragment, &mut tracked);
+            }
+            if settle {
+                accumulator.finish(&mut tracked).unwrap();
+            }
+            tracked.abandon_live(ABANDONED_CANCELLED);
+        }
+        sink
+    }
+
+    #[test]
+    fn a_run_stopped_mid_compose_clears_the_card_it_left_on_screen() {
+        // The stop drops the streaming future and its accumulator, so the card
+        // outlives the only thing that knew about it. This is what clears it.
+        let sink = stopped_mid_compose(fragments_for(1).into_iter().take(40).collect(), false);
+
+        let abandoned = abandon_reasons(&sink);
+        assert_eq!(abandoned.len(), 1, "one card, cleared once");
+        assert_eq!(abandoned[0].1, ABANDONED_CANCELLED);
+        assert_eq!(
+            abandoned[0].0,
+            previews(&sink).last().unwrap().0,
+            "the abandonment is keyed to the card the user is looking at"
+        );
+    }
+
+    #[test]
+    fn a_card_the_turn_already_retired_keeps_the_turns_own_reason() {
+        // The accumulator clears its own unfinished cards when the turn settles.
+        // Clearing again on the way out would report one card twice — and would
+        // overwrite why it really went with a cancellation that came later.
+        let sink = stopped_mid_compose(fragments_for(15), true);
+
+        let abandoned = abandon_reasons(&sink);
+        assert_eq!(abandoned.len(), 1, "the turn retired it; the stop must not");
+        assert_eq!(
+            abandoned[0].1, ABANDONED_INCOMPLETE,
+            "the model stopped composing — that is why the card went, not the stop"
+        );
+    }
+
+    #[test]
+    fn a_turn_that_previewed_nothing_has_nothing_to_clear() {
+        // Index 0 is `search_notes`, which is never previewable.
+        let sink = stopped_mid_compose(fragments_for(0), false);
+
+        assert!(
+            sink.events.is_empty(),
+            "search_notes never previews, so a stop has no card to clear"
+        );
+    }
+
+    #[test]
+    fn clearing_twice_reports_each_card_once() {
+        let mut sink = VecSink::default();
+        {
+            let mut tracked = LivePreviews::new(&mut sink);
+            let mut accumulator = ToolTurnAccumulator::new();
+            for fragment in fragments_for(1).into_iter().take(40) {
+                accumulator.push_fragment(fragment, &mut tracked);
+            }
+            tracked.abandon_live(ABANDONED_CANCELLED);
+            tracked.abandon_live(ABANDONED_CANCELLED);
+        }
+
+        assert_eq!(abandon_reasons(&sink).len(), 1, "idempotent");
+    }
+
+    #[test]
+    fn tracking_previews_leaves_every_other_event_untouched() {
+        // It is a pass-through: the turn's events must reach the user unchanged,
+        // in order, whether or not they concern a note edit.
+        let mut sink = VecSink::default();
+        {
+            let mut tracked = LivePreviews::new(&mut sink);
+            tracked.send(ChatEvent::Verifying);
+            tracked.send(ChatEvent::Done);
+        }
+
+        assert_eq!(sink.events, vec![ChatEvent::Verifying, ChatEvent::Done]);
     }
 
     #[test]

@@ -10,7 +10,8 @@
 
 use async_trait::async_trait;
 use futures_util::StreamExt;
-use neuralnote_core::ai::{openai, provider_config};
+use neuralnote_core::ai::tool_turn_reader::{StreamedToolTurn, ToolTurnReader};
+use neuralnote_core::ai::{openai, provider_config, tool_stream};
 use neuralnote_core::ai::{
     openrouter_reasoning_support, parse_openrouter_context_windows, parse_openrouter_input_pricing,
     ChatEvent, Completion, EventSink, LlmClient, LlmMessage, LlmRequest, ReasoningSupport,
@@ -556,6 +557,50 @@ impl OpenAiChatClient {
         )
     }
 
+    /// The tool-deciding turn's wire body. Streamed, but otherwise identical to
+    /// what [`LlmClient::complete`] sends: **uncapped**, so long tool-call JSON is
+    /// never truncated mid-note, and with **no reasoning** — the tool turn drops
+    /// reasoning frames on the floor, so requesting them here is pure cost. Split
+    /// out so a test can inspect exactly what would be sent, without an endpoint.
+    fn tool_wire_body(&self, req: &LlmRequest, stream: bool) -> serde_json::Value {
+        openai::to_wire_request(
+            req,
+            stream,
+            self.num_ctx,
+            /* max_tokens */ None,
+            /* reasoning */ false,
+        )
+    }
+
+    /// Read one streamed tool turn to its end.
+    ///
+    /// Split out of [`LlmClient::complete_tool_streaming`] so that every way this
+    /// can fail — the socket, a frame, or settling the turn — leaves by the one
+    /// `Err` its caller clears the live previews on.
+    async fn read_tool_stream(
+        &self,
+        req: &LlmRequest,
+        sink: &mut dyn EventSink,
+    ) -> Result<StreamedToolTurn, CoreError> {
+        let resp = self
+            .post(&self.tool_wire_body(req, /* stream */ true))
+            .await?;
+
+        // Same byte-buffered line loop as the answer turn, and for the same
+        // reason: a chunk can split a multibyte character but never the `\n`
+        // delimiter, so every complete line decodes cleanly. The reassembly
+        // itself lives in core, where it is tested against the captured turn.
+        let mut stream = resp.bytes_stream();
+        let mut reader = ToolTurnReader::new();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
+            if reader.push_bytes(&chunk, sink)? {
+                break;
+            }
+        }
+        reader.finish(sink)
+    }
+
     fn provider_label(&self) -> &'static str {
         if self.bearer.is_none() && self.title.is_none() {
             "Local AI"
@@ -615,15 +660,7 @@ impl LlmClient for OpenAiChatClient {
     }
 
     async fn complete(&self, req: &LlmRequest) -> Result<Completion, CoreError> {
-        // No reasoning on tool-deciding turns: they aren't streamed and their content
-        // is parsed for tool_calls, so reasoning tokens here would be invisible cost.
-        let body = openai::to_wire_request(
-            req,
-            /* stream */ false,
-            self.num_ctx,
-            /* max_tokens */ None,
-            /* reasoning */ false,
-        );
+        let body = self.tool_wire_body(req, /* stream */ false);
         let resp = self.post(&body).await?;
         let provider = self.provider_label();
         let value: serde_json::Value = resp
@@ -631,6 +668,32 @@ impl LlmClient for OpenAiChatClient {
             .await
             .map_err(|e| CoreError::Llm(format!("could not parse {provider} response: {e}")))?;
         openai::parse_completion(value)
+    }
+
+    async fn complete_tool_streaming(
+        &self,
+        req: &LlmRequest,
+        sink: &mut dyn EventSink,
+    ) -> Result<Completion, CoreError> {
+        // Track the previews rather than clearing at each failure site: the turn
+        // can fail at the socket, at a frame, or as it settles, and a card left on
+        // screen by ANY of them reads as a note that landed. One exit, one clear.
+        // Cards the turn already retired are not re-reported.
+        let mut tracked = tool_stream::LivePreviews::new(sink);
+        match self.read_tool_stream(req, &mut tracked).await {
+            Ok(StreamedToolTurn::Completed(completion)) => Ok(completion),
+            // The provider sent no tool-call fragments and no prose, so it does
+            // not stream this turn. Returning the empty turn would read to the
+            // orchestrator as "the model chose to answer" and silently skip
+            // retrieval for the whole run, so re-run it buffered instead. Nothing
+            // was emitted (no calls means no previews), so this replays over
+            // nothing the user has seen and the retry contract still holds.
+            Ok(StreamedToolTurn::NotStreamed) => self.complete(req).await,
+            Err(error) => {
+                tracked.abandon_live(tool_stream::ABANDONED_TURN_FAILED);
+                Err(error)
+            }
+        }
     }
 
     async fn complete_streaming(
@@ -940,6 +1003,398 @@ mod tests {
 
         let on = OpenAiChatClient::new("sk-test".into(), true).answer_wire_body(&req);
         assert_eq!(on["reasoning"]["enabled"], true);
+    }
+
+    /* ─────────────  The streamed tool-deciding turn (contract C6)  ───────────── */
+
+    /// The captured OpenRouter turn that core's parser was derived from. Shared
+    /// rather than re-captured so the shell and core can never disagree about the
+    /// wire, and so no test here writes a tool-call frame of its own.
+    const CAPTURE: &str = include_str!(
+        "../../../../crates/neuralnote-core/src/ai/fixtures/openrouter_tool_stream.sse"
+    );
+
+    /// The capture's completed `write_note`, whose body arrived in 386 fragments.
+    const COMPLETED_CALL: u32 = 1;
+
+    /// The capture's raw lines carrying fragments for exactly one call.
+    fn frames_for(index: u32) -> Vec<&'static str> {
+        use neuralnote_core::ai::openai::{parse_tool_sse_line, ToolSseEvent};
+        CAPTURE
+            .lines()
+            .filter(|line| match parse_tool_sse_line(line) {
+                ToolSseEvent::Delta { fragments, .. } => {
+                    !fragments.is_empty() && fragments.iter().all(|f| f.index == index)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    /// Everything the capture sent as `arguments` for one call, in order.
+    fn captured_arguments(index: u32) -> String {
+        use neuralnote_core::ai::openai::{parse_tool_sse_line, ToolSseEvent};
+        frames_for(index)
+            .into_iter()
+            .filter_map(|line| match parse_tool_sse_line(line) {
+                ToolSseEvent::Delta { fragments, .. } => Some(fragments),
+                _ => None,
+            })
+            .flatten()
+            .filter_map(|fragment| fragment.arguments)
+            .collect()
+    }
+
+    fn sse_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nConnection: close\r\n\r\n{body}"
+        )
+    }
+
+    fn json_response(body: &str) -> String {
+        format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        )
+    }
+
+    /// A loopback endpoint that answers each request with the next canned
+    /// response, and hands back the request bodies it received.
+    ///
+    /// A real socket on purpose: the point of this change is that the client
+    /// actually streams, and a hand-rolled fake transport would prove the parser
+    /// works while the wiring stayed inert — which is exactly the state this
+    /// feature was already in.
+    fn fake_provider(responses: Vec<String>) -> (String, std::thread::JoinHandle<Vec<String>>) {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        let handle = std::thread::spawn(move || {
+            let mut bodies = Vec::new();
+            for response in responses {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut raw = Vec::new();
+                let mut byte = [0u8; 1];
+                // Read the head, then exactly the declared body — responding
+                // before draining the request would break the pipe under reqwest.
+                while !raw.ends_with(b"\r\n\r\n") {
+                    stream.read_exact(&mut byte).unwrap();
+                    raw.push(byte[0]);
+                }
+                let head = String::from_utf8_lossy(&raw).to_lowercase();
+                let length: usize = head
+                    .split("content-length:")
+                    .nth(1)
+                    .and_then(|rest| rest.split("\r\n").next())
+                    .and_then(|value| value.trim().parse().ok())
+                    .unwrap_or(0);
+                let mut body = vec![0u8; length];
+                stream.read_exact(&mut body).unwrap();
+                bodies.push(String::from_utf8_lossy(&body).to_string());
+                stream.write_all(response.as_bytes()).unwrap();
+                stream.flush().unwrap();
+            }
+            bodies
+        });
+        (url, handle)
+    }
+
+    fn client_for(url: String) -> OpenAiChatClient {
+        OpenAiChatClient::new_with(
+            url,
+            None,
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            None,
+            false,
+        )
+    }
+
+    /// The same client as the local (Ollama) provider builds — the one that must
+    /// size Ollama's context window on every turn.
+    fn local_client_for(url: String, num_ctx: u32) -> OpenAiChatClient {
+        OpenAiChatClient::new_with(
+            url,
+            None,
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            Some(num_ctx),
+            false,
+        )
+    }
+
+    fn tool_request() -> LlmRequest {
+        LlmRequest {
+            model: "z-ai/glm-5.2".into(),
+            messages: vec![LlmMessage::user("write up spaced repetition")],
+            tools: vec![serde_json::json!({"type": "function"})],
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordingSink(Vec<ChatEvent>);
+    impl EventSink for RecordingSink {
+        fn send(&mut self, event: ChatEvent) {
+            self.0.push(event);
+        }
+    }
+
+    impl RecordingSink {
+        fn previews(&self) -> Vec<(&str, &str, bool)> {
+            self.0
+                .iter()
+                .filter_map(|event| match event {
+                    ChatEvent::NoteEditPreview {
+                        id, body, complete, ..
+                    } => Some((id.as_str(), body.as_str(), *complete)),
+                    _ => None,
+                })
+                .collect()
+        }
+    }
+
+    #[test]
+    fn the_tool_turn_is_streamed_uncapped_and_without_reasoning() {
+        // Uncapped because a ceiling hit mid tool-call truncates the note JSON;
+        // no reasoning because the tool turn discards reasoning frames, so asking
+        // for them would be billed and thrown away. True even for a client whose
+        // user opted into reasoning — that opt-in belongs to the answer turn.
+        let client = OpenAiChatClient::new("sk-test".into(), true);
+
+        let streamed = client.tool_wire_body(&tool_request(), true);
+
+        assert_eq!(streamed["stream"], true);
+        assert!(
+            streamed.get("max_tokens").is_none(),
+            "a ceiling here would truncate the note the model is composing"
+        );
+        assert!(
+            streamed.get("reasoning").is_none(),
+            "the tool turn drops reasoning frames, so requesting them is pure cost"
+        );
+        assert!(streamed.get("tools").is_some(), "it is still a tool turn");
+    }
+
+    #[test]
+    fn the_local_tool_turn_still_sizes_ollamas_context_window() {
+        // Without `options.num_ctx` Ollama falls back to ~4096 and silently
+        // truncates FROM THE FRONT — dropping the grounding rules and earliest
+        // evidence, which breaks cited recall on the Local path (PA-001).
+        // Streaming the turn must not lose it, so both bodies carry the window.
+        let local = local_client_for("http://127.0.0.1:1/chat".into(), 32_768);
+
+        assert_eq!(
+            local.tool_wire_body(&tool_request(), true)["options"]["num_ctx"],
+            32_768,
+            "the streamed tool turn must size the window it will be judged against"
+        );
+        assert_eq!(
+            local.tool_wire_body(&tool_request(), false)["options"]["num_ctx"],
+            32_768,
+            "and the buffered fallback must size it identically"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_turn_previews_the_note_as_it_composes_and_returns_the_call() {
+        // The whole point of the change: the real client, over a real socket,
+        // showing the note arrive and handing back the same call the buffered
+        // turn would have.
+        let body: String = frames_for(COMPLETED_CALL)
+            .iter()
+            .map(|line| format!("{line}\n"))
+            .chain(std::iter::once("data: [DONE]\n".to_string()))
+            .collect();
+        let (url, server) = fake_provider(vec![sse_response(&body)]);
+        let client = client_for(url);
+        let mut sink = RecordingSink::default();
+
+        let completion = client
+            .complete_tool_streaming(&tool_request(), &mut sink)
+            .await
+            .unwrap();
+
+        let previews = sink.previews();
+        assert!(
+            previews.len() > 100,
+            "the body arrives in fragments, so it previews many times ({} here)",
+            previews.len()
+        );
+        assert!(previews.last().unwrap().2, "the last preview is complete");
+        let call = completion.tool_calls.first().expect("the call came back");
+        assert_eq!(call.name, "write_note");
+        assert_eq!(call.arguments, captured_arguments(COMPLETED_CALL));
+
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 1, "one turn, one request");
+        let sent: serde_json::Value = serde_json::from_str(&requests[0]).unwrap();
+        assert_eq!(sent["stream"], true, "the turn really was streamed");
+    }
+
+    #[tokio::test]
+    async fn a_whole_call_in_one_frame_streams_the_same_call_it_previews() {
+        // The local-Ollama shape, measured: the entire arguments blob lands in a
+        // SINGLE frame. The preview appears already complete rather than
+        // composing, and the call handed on must be identical to the fragmented
+        // provider's — same capture, one frame instead of 386.
+        let first_sight = frames_for(COMPLETED_CALL)
+            .into_iter()
+            .find(|line| line.contains(r#""name":"write_note""#))
+            .expect("the capture's first-sight frame");
+        let escaped = serde_json::to_string(&captured_arguments(COMPLETED_CALL)).unwrap();
+        let atomic = first_sight.replace(r#""arguments":"""#, &format!(r#""arguments":{escaped}"#));
+        assert_ne!(atomic, first_sight, "the substitution really happened");
+        let (url, server) = fake_provider(vec![sse_response(&format!("{atomic}\ndata: [DONE]\n"))]);
+        let client = client_for(url);
+        let mut sink = RecordingSink::default();
+
+        let completion = client
+            .complete_tool_streaming(&tool_request(), &mut sink)
+            .await
+            .unwrap();
+
+        let previews = sink.previews();
+        assert_eq!(previews.len(), 1, "one fragment previews exactly once");
+        assert!(
+            previews[0].2,
+            "a whole call is complete the moment it lands"
+        );
+        assert!(
+            previews[0].1.len() > 4000,
+            "the whole note previewed at once"
+        );
+        assert_eq!(
+            completion.tool_calls.first().unwrap().arguments,
+            captured_arguments(COMPLETED_CALL),
+            "atomic and fragmented providers must dispatch the same call"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_provider_that_streams_no_tool_calls_falls_back_to_the_buffered_turn() {
+        // Ollama does stream tool calls, but a provider that ignores `stream` on a
+        // tool turn would otherwise hand the orchestrator an empty turn — read as
+        // "the model chose to answer", silently skipping retrieval for the run.
+        let buffered = serde_json::json!({
+            "choices": [{"message": {"content": null, "tool_calls": [{
+                "id": "call-1",
+                "function": {"name": "search_notes", "arguments": "{\"query\":\"x\"}"}
+            }]}}]
+        })
+        .to_string();
+        let (url, server) = fake_provider(vec![
+            sse_response("data: [DONE]\n"),
+            json_response(&buffered),
+        ]);
+        let client = client_for(url);
+        let mut sink = RecordingSink::default();
+
+        let completion = client
+            .complete_tool_streaming(&tool_request(), &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            completion.tool_calls.first().unwrap().name,
+            "search_notes",
+            "the turn still completed, via the buffered fallback"
+        );
+        assert!(
+            sink.0.is_empty(),
+            "nothing reached the user before the fallback, so it replays over nothing"
+        );
+        let requests = server.join().unwrap();
+        assert_eq!(requests.len(), 2, "the streamed attempt, then the fallback");
+        let retried: serde_json::Value = serde_json::from_str(&requests[1]).unwrap();
+        assert_eq!(
+            retried["stream"], false,
+            "the fallback is the buffered turn"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_fails_as_it_settles_still_clears_its_completed_card() {
+        // The nastiest case: the note finished composing, so its card reads as
+        // DONE, and only then does the turn fail — here on a second call whose
+        // first-sight frame never arrived, leaving it with no id to answer. The
+        // completed card must still go, or it stands as a note that landed.
+        let first_sight = frames_for(COMPLETED_CALL)
+            .into_iter()
+            .find(|line| line.contains(r#""name":"write_note""#))
+            .expect("the capture's first-sight frame");
+        let escaped = serde_json::to_string(&captured_arguments(COMPLETED_CALL)).unwrap();
+        let atomic = first_sight.replace(r#""arguments":"""#, &format!(r#""arguments":{escaped}"#));
+        // A real continuation frame, re-keyed to a call that was never announced.
+        let orphan = CAPTURE
+            .lines()
+            .find(|line| line.contains(r#"{\"query\""#))
+            .expect("the capture's search_notes continuation frame")
+            .replace(r#""index":0"#, r#""index":3"#);
+        let (url, server) = fake_provider(vec![sse_response(&format!(
+            "{atomic}\n{orphan}\ndata: [DONE]\n"
+        ))]);
+        let client = client_for(url);
+        let mut sink = RecordingSink::default();
+
+        let error = client
+            .complete_tool_streaming(&tool_request(), &mut sink)
+            .await
+            .expect_err("a call with no id cannot be answered");
+
+        assert!(error.to_string().contains("index 3"), "{error}");
+        let completed = sink.previews();
+        assert_eq!(completed.len(), 1, "the first note composed in full");
+        assert!(completed[0].2, "and its card read as complete");
+        assert!(
+            sink.0.iter().any(|event| matches!(
+                event,
+                ChatEvent::NoteEditAbandoned { id, .. } if id == completed[0].0
+            )),
+            "a completed card must not survive a turn that failed to settle"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_mid_stream_provider_failure_clears_the_note_it_left_on_screen() {
+        // The capture's own ending. A half-composed note left on screen would read
+        // as one that landed — the exact failure NoteEditAbandoned exists for.
+        let body: String = frames_for(COMPLETED_CALL)
+            .iter()
+            .take(40)
+            .map(|line| format!("{line}\n"))
+            .chain(std::iter::once(
+                CAPTURE
+                    .lines()
+                    .find(|line| line.contains(r#""finish_reason":"error""#))
+                    .map(|line| format!("{line}\n"))
+                    .expect("the capture ends on a provider error frame"),
+            ))
+            .collect();
+        let (url, server) = fake_provider(vec![sse_response(&body)]);
+        let client = client_for(url);
+        let mut sink = RecordingSink::default();
+
+        let error = client
+            .complete_tool_streaming(&tool_request(), &mut sink)
+            .await
+            .expect_err("a provider-declared failure must surface");
+
+        assert!(error.to_string().contains("unfinished plan"), "{error}");
+        assert!(!sink.previews().is_empty(), "a card was on screen");
+        assert!(
+            sink.0
+                .iter()
+                .any(|event| matches!(event, ChatEvent::NoteEditAbandoned { .. })),
+            "the failure must clear the card it left behind"
+        );
+        server.join().unwrap();
     }
 
     #[test]

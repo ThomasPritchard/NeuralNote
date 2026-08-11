@@ -31,6 +31,7 @@ mod skill_tools;
 pub mod skills;
 pub mod tool_registry;
 pub mod tool_stream;
+pub mod tool_turn_reader;
 pub mod tools;
 pub mod verify;
 pub mod write_policy;
