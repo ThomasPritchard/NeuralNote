@@ -11,11 +11,11 @@
 #   Maintainability + Reliability (bugs/smells) -> clippy (deny ALL warnings)
 #   Consistency (style)                          -> rustfmt --check
 #   Reliability + Coverage (>=90% lines)         -> cargo-llvm-cov (runs tests too)
-#   Security / Vulnerabilities                   -> cargo-audit (RUSTSEC advisories)
+#   Security / Vulnerabilities                   -> cargo-deny (RUSTSEC advisories)
 #
 # Usage:  scripts/rust-quality-gate.sh
 # Deps:   rustup component add clippy rustfmt llvm-tools-preview
-#         cargo install cargo-llvm-cov cargo-audit
+#         cargo install cargo-llvm-cov cargo-deny
 #
 # Exit code (the contract automation reads):
 #   0  GREEN       every category ran and passed.
@@ -75,24 +75,28 @@ else
   redx "tests failed OR line coverage < ${COVERAGE_MIN}%"
 fi
 
-section "Security / Vulnerabilities — cargo-audit (RUSTSEC)"
-if command -v cargo-audit >/dev/null 2>&1; then
-  audit_out=$(cargo audit 2>&1); audit_rc=$?
-  if [ "$audit_rc" -eq 0 ]; then
-    # Exit 0 = no vulnerabilities. The allowed unmaintained/unsound warnings
-    # (Tauri's Linux GTK3 stack + urlpattern's unic-*) are accounted for in
-    # docs/security/dependency-advisories.md — no ignore-list needed.
-    pass "cargo-audit: no vulnerabilities (allowed warnings: docs/security/dependency-advisories.md)"
-  elif printf '%s' "$audit_out" | grep -qiE "couldn't fetch advisory database|talking to the server|error sending request|failed to fetch"; then
+section "Security / Vulnerabilities — cargo-deny (RUSTSEC, resolved feature graph)"
+if command -v cargo-deny >/dev/null 2>&1; then
+  # cargo-deny audits the RESOLVED feature graph, not Cargo.lock's union of every
+  # optional dependency, so a crate no feature ever activates cannot raise an
+  # advisory against code we never compile. Policy — including why unmaintained
+  # and unsound advisories don't fail, and why there is no ignore list — lives in
+  # deny.toml next to the evidence.
+  deny_out=$(cargo deny check advisories 2>&1); deny_rc=$?
+  if [ "$deny_rc" -eq 0 ]; then
+    pass "cargo-deny: no vulnerabilities in the resolved graph (allowed warnings: docs/security/dependency-advisories.md)"
+  elif printf '%s' "$deny_out" | grep -qiE "failed to fetch advisory database|unable to fetch advisory database"; then
     # Network couldn't reach the RUSTSEC git DB — an availability problem, not a
     # code verdict. Don't fail the gate; a networked CI run will exercise it.
-    skip "cargo-audit: advisory DB unreachable (offline) — not a verdict, category INCOMPLETE. Re-run with network (SonarQube also covers vulns server-side)."
+    # Keep this pattern narrow: widening it until it also swallows real failures
+    # would relabel breakage as INCOMPLETE, which is how a gate stops being read.
+    skip "cargo-deny: advisory DB unreachable (offline) — not a verdict, category INCOMPLETE. Re-run with network (SonarQube also covers vulns server-side)."
   else
-    redx "cargo-audit: vulnerable dependency reported"
-    printf '%s\n' "$audit_out" | grep -iE "ID:|Crate:|Title:|Solution:" | head -20
+    redx "cargo-deny: vulnerable dependency reported"
+    printf '%s\n' "$deny_out" | grep -iE "^error|ID:|Crate:|Title:|Solution:|RUSTSEC-" | head -20
   fi
 else
-  skip "cargo-audit not installed — category INCOMPLETE (install: cargo install cargo-audit). SonarQube also covers this category server-side."
+  skip "cargo-deny not installed — category INCOMPLETE (install: cargo install cargo-deny --locked). SonarQube also covers this category server-side."
 fi
 
 # Three-state verdict — the exit code is the contract automation reads:

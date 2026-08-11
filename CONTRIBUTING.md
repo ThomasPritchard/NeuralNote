@@ -85,7 +85,7 @@ Install the Rust gate tools once:
 
 ```bash
 cargo install cargo-llvm-cov --locked --version 0.8.7
-cargo install cargo-audit --locked --version 0.22.2
+cargo install cargo-deny --locked --version 0.20.2
 ```
 
 Then run the project gate:

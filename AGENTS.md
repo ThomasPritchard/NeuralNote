@@ -26,7 +26,7 @@ An agent that has not worked in this checkout must establish the local baseline 
    ```bash
    rustup toolchain install 1.96.0 --component clippy,rustfmt,llvm-tools-preview
    cargo install cargo-llvm-cov --locked --version 0.8.7
-   cargo install cargo-audit --locked --version 0.22.2
+   cargo install cargo-deny --locked --version 0.20.2
    ```
 
 4. Fetch the Ollama sidecar only when the task exercises the native local-AI path. Downloads and service startup require the user's approval.

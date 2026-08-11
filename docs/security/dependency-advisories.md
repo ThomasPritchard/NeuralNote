@@ -1,18 +1,26 @@
 # RustSec dependency advisories
 
-Status of every `cargo audit` **warning** in the workspace, with provenance,
+Status of every RUSTSEC **warning** in the workspace, with provenance,
 platform reachability, and the upgrade trigger that will clear it.
 
-`cargo audit` fails the quality gate only on **vulnerabilities**. As of
-2026-07-15 there are **0 vulnerabilities** and **17 allowed warnings** (1
-`unsound`, 16 `unmaintained`). The gate is green. We deliberately keep **no
-`audit.toml` ignore-list**: silencing an advisory hides the day it turns into a
-vulnerability. Each warning below is instead accounted for here.
+The quality gate fails only on **vulnerabilities**. As of 2026-07-15 there are
+**0 vulnerabilities** and **17 allowed warnings** (1 `unsound`, 16
+`unmaintained`). The gate is green. We deliberately keep **no ignore-list**:
+silencing an advisory ID hides the day it turns into a vulnerability. Each
+warning below is instead accounted for here.
+
+The gate runs **`cargo-deny`**, not `cargo audit`. `cargo audit` reads
+`Cargo.lock`, which records the union of every *optional* dependency whether or
+not a feature activates it, so it reported advisories against crates this
+workspace never compiles — it held the gate red on RUSTSEC-2026-0235 (`rkyv`, an
+unactivated optional dependency of `rust_decimal`). `cargo-deny` checks the
+resolved feature graph instead. The unmaintained/unsound classes are relaxed in
+`deny.toml`; vulnerability detection is never relaxed.
 
 Re-check with:
 
 ```bash
-cargo audit                 # exit 0 = no vulnerabilities (warnings are allowed)
+cargo deny check advisories # exit 0 = no vulnerabilities (warnings are allowed)
 cargo tree -i <crate> -e normal,build [--target x86_64-unknown-linux-gnu]
 cargo update --dry-run      # proves nothing bumps today
 ```
@@ -100,6 +108,9 @@ after any `tauri-utils` bump; when it resolves to nothing, delete this group.
 ## What was verified (2026-07-15)
 
 - `cargo audit` → 0 vulnerabilities, 17 allowed warnings; quality gate green.
+  (Superseded 2026-08-11: the gate now runs `cargo deny check advisories`, which
+  reports 0 vulnerabilities against the resolved feature graph. The 17 warnings
+  below are unchanged — they are still in the graph, just not failing.)
 - `cargo update --dry-run` → moves none of the 17 (all at their pinned ceilings).
 - `cargo tree -i` (host and `x86_64-unknown-linux-gnu`) → provenance above.
 - Latest published parents (`tauri` 2.11.5, `tauri-utils` 2.9.3, `muda` 0.19.3)

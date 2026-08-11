@@ -111,11 +111,11 @@ npm --prefix app/desktop run check:bindings
 
 Pull requests targeting `main` run the fast frontend checks on Node.js 22 and 24, plus a full-history Gitleaks scan. Pushes to `main` keep those compatibility checks and run the heavier frontend journeys, coverage, build, and npm audit gates once on Node.js 24. They also add the Rust gates and the Linux/Windows native WebDriver matrix.
 
-The complete Rust gate also needs `cargo-llvm-cov` and `cargo-audit`:
+The complete Rust gate also needs `cargo-llvm-cov` and `cargo-deny`:
 
 ```bash
 cargo install cargo-llvm-cov --locked --version 0.8.7
-cargo install cargo-audit --locked --version 0.22.2
+cargo install cargo-deny --locked --version 0.20.2
 ./scripts/rust-quality-gate.sh
 ```
 
