@@ -2,7 +2,7 @@
 //   12. Ribbon → graph mounts with REAL link-graph data (mockVault implements
 //       read_link_graph faithfully, so wikilink/md-link resolution, clusters,
 //       and cross-folder bridges are honestly end-to-end); node click → detail
-//       panel with neighbours → "Open in reader" lands back in the note view.
+//       local digest with neighbours → "Open in reader" lands back in the note view.
 //   13. Graph navigation preserves dirty note tabs, and a backend failure shows
 //       the in-pane error + Retry — never a silent empty galaxy.
 //
@@ -189,26 +189,37 @@ describe("Journey 12: graph view over real link data", () => {
     expect(screen.queryByRole("navigation", { name: "Folder breadcrumb" })).toBeNull();
   });
 
-  it("opens the detail panel on node click and routes 'Open in reader' back to the note view", async () => {
-    const { user } = await openVault(LINKED_SEED);
+  it("previews and traverses real notes before routing 'Open in reader' back to the note view", async () => {
+    const { user, backend } = await openVault(LINKED_SEED);
     await enterGraphView(user);
 
     clickNode("notes/Alpha.md");
 
-    // Detail panel: title, neighbour count, and both neighbours — the
-    // cross-folder one carries its marker. Scoped to the panel: the sidebar
-    // tree also lists "Beta.md" / "Gamma.md" buttons.
-    const heading = screen.getByRole("heading", { name: "Alpha", level: 3 });
-    const panel = within(heading.parentElement as HTMLElement);
-    expect(panel.getByText("2 connected notes")).toBeInTheDocument();
-    expect(panel.getByRole("button", { name: "Beta" })).toBeInTheDocument();
-    expect(panel.getByRole("button", { name: /Gamma.*Cross-folder/ })).toBeInTheDocument();
+    // The graph reads the real note through mock IPC and derives a local-only
+    // digest. Both connected nodes remain directly traversable.
+    const heading = await screen.findByRole("heading", { name: "Alpha", level: 2 });
+    const preview = within(heading.closest("aside") as HTMLElement);
+    expect(await preview.findByText("Linked to Beta.")).toBeInTheDocument();
+    expect(preview.getByText("Local digest")).toBeInTheDocument();
+    expect(preview.getByText("No model called")).toBeInTheDocument();
+    expect(preview.getByText("2 connected notes")).toBeInTheDocument();
+    expect(preview.getByRole("button", { name: "Preview connected note Beta" })).toBeInTheDocument();
+    expect(
+      preview.getByRole("button", { name: "Preview connected note Gamma, cross-folder" }),
+    ).toBeInTheDocument();
+    expect(backend.calls).toContain("read_note");
+    expect(backend.calls).not.toContain("chat");
 
-    await user.click(panel.getByRole("button", { name: "Open in reader" }));
+    await user.click(preview.getByRole("button", { name: "Preview connected note Beta" }));
+    const betaHeading = await screen.findByRole("heading", { name: "Beta", level: 2 });
+    const betaPreview = within(betaHeading.closest("aside") as HTMLElement);
+    expect(await betaPreview.findByText("Beta body.")).toBeInTheDocument();
+
+    await user.click(betaPreview.getByRole("button", { name: "Open in reader" }));
 
     // Back in the note view with the right note loaded (heading + breadcrumb).
-    expect(await screen.findByRole("heading", { name: "Alpha", level: 1 })).toBeInTheDocument();
-    expect(screen.getByText("notes/Alpha.md")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Beta", level: 1 })).toBeInTheDocument();
+    expect(screen.getByText("notes/Beta.md")).toBeInTheDocument();
     expect(screen.queryByTestId("force-graph-3d")).not.toBeInTheDocument();
   });
 });
@@ -267,5 +278,21 @@ describe("Journey 13: graph guard and failure surfacing", () => {
     expect(await screen.findByTestId("force-graph-3d")).toBeInTheDocument();
     expect(screen.getByText("3 notes · 2 links · 1 cross-folder link")).toBeInTheDocument();
     expect(screen.queryByText("graph scan failed")).not.toBeInTheDocument();
+  });
+
+  it("surfaces a note-preview read failure and retries without calling chat", async () => {
+    const { user, backend } = await openVault(LINKED_SEED);
+    await enterGraphView(user);
+    backend.setFailure("read_note", { kind: "io", message: "note preview failed" });
+
+    clickNode("notes/Alpha.md");
+    expect(await screen.findByRole("alert")).toHaveTextContent("note preview failed");
+
+    backend.clearFailure("read_note");
+    await user.click(screen.getByRole("button", { name: "Retry preview" }));
+
+    expect(await screen.findByText("Linked to Beta.")).toBeInTheDocument();
+    expect(backend.calls.filter((command) => command === "read_note")).toHaveLength(2);
+    expect(backend.calls).not.toContain("chat");
   });
 });

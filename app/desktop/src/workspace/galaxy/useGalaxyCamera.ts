@@ -21,6 +21,11 @@ import {
 interface GalaxyCameraArgs {
   fgRef: RefObject<any>;
   reducedRef: RefObject<boolean>;
+  viewportWidth: number;
+  viewportHeight: number;
+  /** Desired horizontal projection for a focused node in stacked panes. A
+   * null value keeps the conventional centred focus. */
+  focusScreenX: number | null;
   /** IMMUTABLE per mount — the morph mutates node objects in place. */
   data: { nodes: GalaxyNode[] };
   setSelected: Dispatch<SetStateAction<GalaxyNode | null>>;
@@ -44,6 +49,9 @@ export interface GalaxyCamera {
 export function useGalaxyCamera({
   fgRef,
   reducedRef,
+  viewportWidth,
+  viewportHeight,
+  focusScreenX,
   data,
   setSelected,
   onNodeHover,
@@ -65,13 +73,36 @@ export function useGalaxyCamera({
     (node: any) => {
       const dist = 90;
       const r = 1 + dist / Math.hypot(node.x || 1, node.y || 1, node.z || 1);
-      fgRef.current?.cameraPosition(
-        { x: (node.x || 0) * r, y: (node.y || 0) * r, z: (node.z || 0) * r },
-        node,
-        1400,
+      const fg = fgRef.current;
+      if (!fg) return;
+      const position = new THREE.Vector3(
+        (node.x || 0) * r,
+        (node.y || 0) * r,
+        (node.z || 0) * r,
       );
+
+      if (focusScreenX === null || viewportWidth <= 0 || viewportHeight <= 0) {
+        fg.cameraPosition(position, node, 1400);
+        return;
+      }
+
+      const nodePosition = new THREE.Vector3(node.x || 0, node.y || 0, node.z || 0);
+      const camera = fg.camera() as THREE.PerspectiveCamera;
+      const forward = nodePosition.clone().sub(position).normalize();
+      const right = new THREE.Vector3().crossVectors(forward, camera.up).normalize();
+      if (right.lengthSq() === 0) right.set(1, 0, 0);
+      const focusDistance = position.distanceTo(nodePosition);
+      const visibleWidth =
+        2 *
+        focusDistance *
+        Math.tan(THREE.MathUtils.degToRad(camera.fov / 2)) *
+        (viewportWidth / viewportHeight);
+      const worldOffset = ((viewportWidth / 2 - focusScreenX) / viewportWidth) * visibleWidth;
+      const shift = right.multiplyScalar(worldOffset);
+
+      fg.cameraPosition(position.add(shift), nodePosition.add(shift), 1400);
     },
-    [fgRef],
+    [fgRef, focusScreenX, viewportHeight, viewportWidth],
   );
 
   const onNodeClick = useCallback(
@@ -159,6 +190,7 @@ export function useGalaxyCamera({
       // keeps the sim ticking so the new forces take hold through the tween.
       applyForceProfile(fg, v);
       preFocusRef.current = null; // a pose saved in the other view's camera regime is wrong
+      setSelected(null); // dimension changes close any preview tied to that old camera regime
       const cam = fg.camera() as THREE.PerspectiveCamera;
       const controls: any = fg.controls();
       const ms = reducedRef.current ? 0 : MORPH_MS;
@@ -178,7 +210,7 @@ export function useGalaxyCamera({
         animateMorph(saved?.fov ?? cam.fov, false);
       }
     },
-    [fgRef, reducedRef, animateMorph, onNodeHover],
+    [fgRef, reducedRef, animateMorph, onNodeHover, setSelected],
   );
 
   const linkWidth = useCallback((l: any) => {

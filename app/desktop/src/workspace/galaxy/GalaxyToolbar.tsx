@@ -95,7 +95,11 @@ export function GalaxyToolbar({
               onChange={(e) => onQueryChange(e.target.value)}
               onKeyDown={(e) => {
                 if (e.key === "Enter" && results?.length) onPickResult(results[0]);
-                if (e.key === "Escape") onQueryChange("");
+                if (e.key === "Escape" && query) {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  onQueryChange("");
+                }
               }}
               placeholder="Search the galaxy…"
               className="w-full bg-transparent text-foreground placeholder:text-muted-foreground/70 focus:outline-none"
