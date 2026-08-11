@@ -75,8 +75,21 @@ type TimelineEntry =
  *  are emitted by the very tool calls above them (`handle_tool_call` sends the
  *  cue, then the call settles), so rendering both would show one act twice. They
  *  still drive the settled summary's counts, where they are the cheapest honest
- *  source. */
-function timelineEntries(turn: AssistantMessage): TimelineEntry[] {
+ *  source.
+ *
+ *  A previewed write is the same rule one step further. `ChatNoteEditCard` and
+ *  the tool node share an id and describe one act, and the card is strictly the
+ *  fuller account — it carries the composed body, the running count, and the
+ *  call's own settlement and failure detail. So the node stands down. This is a
+ *  SET test over the turn's edits, never a test of arrival order: the preview
+ *  streams during the turn and its tool call is announced when the turn settles,
+ *  so for most of a card's life there is no node to stand down yet. */
+function railCalls(turn: AssistantMessage): ToolCallView[] {
+  const previewed = new Set(turn.noteEdits.map((edit) => edit.id));
+  return turn.toolCalls.filter((call) => !previewed.has(call.id));
+}
+
+function timelineEntries(turn: AssistantMessage, calls: ToolCallView[]): TimelineEntry[] {
   const entries: TimelineEntry[] = turn.skillActivationFailures.map((failure) => ({
     kind: "failure" as const,
     failure,
@@ -84,7 +97,7 @@ function timelineEntries(turn: AssistantMessage): TimelineEntry[] {
   if (turn.thinking.trim() !== "") {
     entries.push({ kind: "thinking", text: turn.thinking });
   }
-  for (const call of turn.toolCalls) entries.push({ kind: "tool", call });
+  for (const call of calls) entries.push({ kind: "tool", call });
   for (const step of turn.activity) {
     if (step.kind === "verifying") entries.push({ kind: "verifying" });
     if (step.kind === "dropped") entries.push({ kind: "dropped", reason: step.reason });
@@ -133,16 +146,25 @@ function TimelineEntryNode({
  *  eventually disagree with each other. */
 function SummaryLine({
   turn,
+  calls,
   nodeCount,
   errored,
-}: Readonly<{ turn: AssistantMessage; nodeCount: number; errored: boolean }>) {
+}: Readonly<{
+  turn: AssistantMessage;
+  /** The calls the rail actually shows — a previewed write is accounted for by
+   *  its own card, so counting it here would report a failure with no node under
+   *  the head to explain it. */
+  calls: ToolCallView[];
+  nodeCount: number;
+  errored: boolean;
+}>) {
   const { searches, notesRead, dropped, verified } = summarizeActivity(turn.activity);
-  const failed = turn.toolCalls.filter(
+  const failed = calls.filter(
     (call) => call.status !== null && call.status !== "ok",
   ).length;
   const segs: string[] = [];
-  if (turn.toolCalls.length > 0) {
-    segs.push(count(turn.toolCalls.length, "tool", "tools"));
+  if (calls.length > 0) {
+    segs.push(count(calls.length, "tool", "tools"));
   }
   if (searches > 0) segs.push(count(searches, "search", "searches"));
   if (notesRead > 0) {
@@ -205,11 +227,11 @@ function LiveHead({
  *  citation is the moat's own alarm, a refused or failed call means the run did
  *  less than it looks like it did, and searches that read nothing are the queries
  *  worth rephrasing. */
-function needsAttention(turn: AssistantMessage): boolean {
+function needsAttention(turn: AssistantMessage, calls: ToolCallView[]): boolean {
   const { searches, notesRead, dropped } = summarizeActivity(turn.activity);
   return (
     dropped > 0 ||
-    turn.toolCalls.some((call) => call.status !== null && call.status !== "ok") ||
+    calls.some((call) => call.status !== null && call.status !== "ok") ||
     (searches > 0 && notesRead === 0)
   );
 }
@@ -241,7 +263,8 @@ export function ChatTimeline({
   suppressLive: boolean;
 }>) {
   const errored = turn.error !== null;
-  const entries = timelineEntries(turn);
+  const calls = railCalls(turn);
+  const entries = timelineEntries(turn, calls);
   const live = !turn.done && !answering && !suppressLive;
 
   // Nothing happened and nothing is happening: say nothing at all.
@@ -255,7 +278,7 @@ export function ChatTimeline({
   return (
     <section aria-label="What the assistant did" className="min-w-0">
       <details
-        open={errored || !answering || needsAttention(turn)}
+        open={errored || !answering || needsAttention(turn, calls)}
         className="group rounded-lg border border-border/60 bg-background/30 px-2.5 py-1.5 text-[0.6875rem] text-muted-foreground"
       >
         <summary className="flex cursor-pointer list-none select-none items-center gap-1.5 font-medium text-muted-foreground/90 [&::-webkit-details-marker]:hidden">
@@ -268,7 +291,12 @@ export function ChatTimeline({
           {live ? (
             <LiveHead phase={turn.phase} prompt={prompt} nodeCount={entries.length} />
           ) : (
-            <SummaryLine turn={turn} nodeCount={entries.length} errored={errored} />
+            <SummaryLine
+              turn={turn}
+              calls={calls}
+              nodeCount={entries.length}
+              errored={errored}
+            />
           )}
         </summary>
         {rows.length > 0 && (

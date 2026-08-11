@@ -22,6 +22,7 @@ import type {
   ChatMessage,
   CitationView,
 } from "./chatMessage";
+import { ChatNoteEdits } from "./ChatNoteEditCard";
 import { ChatTimeline } from "./ChatTimeline";
 import { SkillActivations, SkillSteps } from "./ChatSkillChrome";
 import { Sources } from "./ChatSources";
@@ -97,6 +98,10 @@ function AssistantTurn({
         answering={answering}
         suppressLive={hasSkillNarrative}
       />
+      {/* Directly under the rail, above the answer: a write composing is the
+          thing to watch while it happens, and each card folds itself away the
+          moment its write settles, so a finished turn does not pay for it. */}
+      <ChatNoteEdits turn={turn} />
       {turn.stopped && (
         <p className="flex items-center gap-1.5 text-[0.6875rem] font-medium text-muted-foreground">
           <Square className="size-3 fill-current" aria-hidden />

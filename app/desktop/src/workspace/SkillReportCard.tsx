@@ -53,8 +53,10 @@ function OutcomeGlyph({ status }: Readonly<{ status: UndoFileResult["status"] }>
 }
 
 /** A vault-relative path with the folder squeezed and the basename protected,
- *  so a long path elides in the middle rather than eating the filename. */
-function PathLabel({ relPath }: Readonly<{ relPath: string }>) {
+ *  so a long path elides in the middle rather than eating the filename. Shared
+ *  with `ChatNoteEditCard` so a note reads identically while it is being written
+ *  and once it has landed. */
+export function PathLabel({ relPath }: Readonly<{ relPath: string }>) {
   const slash = relPath.lastIndexOf("/");
   const dir = slash >= 0 ? relPath.slice(0, slash + 1) : "";
   const base = slash >= 0 ? relPath.slice(slash + 1) : relPath;

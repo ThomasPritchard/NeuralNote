@@ -41,6 +41,7 @@ import {
   emptyAssistant,
   type AssistantMessage,
   type ChatMessage,
+  type NoteEditView,
   type ToolCallView,
 } from "./chatMessage";
 import "../styles.css";
@@ -129,6 +130,61 @@ function liveTranscript(steps: number, answerSentences = 0): ChatMessage[] {
   ];
 }
 
+/** A note the model is composing: `lines` of body, complete once the arguments
+ *  have closed. `abandoned` stays null — this is the healthy path. */
+function writeEdit(lines: number, complete: boolean): NoteEditView {
+  return {
+    id: "call-write",
+    relPath: "Atomic/Spaced recall.md",
+    kind: "atomic",
+    body: `${Array.from({ length: lines }, (_, i) => `composed line ${i + 1}`).join("\n")}\n`,
+    complete,
+    abandoned: null,
+  };
+}
+
+/** A turn whose write is either still composing (card open, tall) or settled
+ *  (card folded to one line). The answer is already streaming in BOTH arms, so
+ *  the process rail is folded away in both and the only thing whose height
+ *  changes between them is the card itself. */
+function writeTurn(lines: number, settled: boolean, answerSentences: number): AssistantMessage {
+  return {
+    ...emptyAssistant(false, "turn-write"),
+    phase: "thinking",
+    noteEdits: [writeEdit(lines, settled)],
+    toolCalls: settled
+      ? [
+          {
+            id: "call-write",
+            name: "write_note",
+            title: "Write note",
+            arguments: "{}",
+            status: "ok",
+            summary: null,
+            detail: null,
+          },
+        ]
+      : [],
+    answer: Array.from(
+      { length: answerSentences },
+      (_, i) => `Answer ${i + 1}: retrieval practice beats rereading, reliably.`,
+    ).join(" "),
+    done: false,
+  };
+}
+
+function writeTranscript(
+  lines: number,
+  settled: boolean,
+  answerSentences = 1,
+): ChatMessage[] {
+  return [
+    ...transcript(3),
+    { role: "user", content: "capture that idea about recall" },
+    writeTurn(lines, settled, answerSentences),
+  ];
+}
+
 let root: Root | null = null;
 let host: HTMLElement | null = null;
 
@@ -150,6 +206,13 @@ function distanceFromBottom(el: HTMLElement): number {
 }
 
 const jumpControl = () => page.getByRole("button", { name: "Jump to latest" });
+
+/** The note-write card's rendered height, in real pixels. */
+function writeCardHeight(): number {
+  const el = host!.querySelector<HTMLElement>('[aria-label^="Note write"]');
+  if (el === null) throw new Error("the note-write card did not render");
+  return el.getBoundingClientRect().height;
+}
 
 /** The rail nodes of the newest turn — the live one in every test below. */
 function liveRailNodes(): HTMLElement[] {
@@ -431,6 +494,54 @@ describe("chat transcript — the live process rail", () => {
     });
     await settle();
 
+    await expect
+      .poll(() => distanceFromBottom(port), POLL)
+      .toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+    expect(jumpControl().query()).toBeNull();
+  });
+});
+
+describe("chat transcript — a note write composing in the port", () => {
+  it("keeps following while a write card grows and then collapses", async () => {
+    // The note-write card is the one element in the pane that grows AND shrinks
+    // on its own: it tails the composing body line by line, then folds the whole
+    // body away the instant the write settles. That collapse happens above the
+    // viewport while the answer is still streaming below it — the exact shape
+    // that broke scroll-follow once already (issue #109), and the reason this
+    // card owes the browser tier a test rather than only a jsdom one.
+    //
+    // Engine note, same as the rail's test below: the failure mode is a `scroll`
+    // event the engine defers past the next commit, and Chromium does not defer
+    // it. `test:browser:webkit` is where this assertion carries evidence.
+    const port = await mount(writeTranscript(2, false));
+    await expect
+      .poll(() => distanceFromBottom(port), POLL)
+      .toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+
+    // The note composes: fragment by fragment, the card grows.
+    for (const lines of [4, 8, 12]) {
+      await render(writeTranscript(lines, false));
+    }
+    await expect
+      .poll(() => distanceFromBottom(port), POLL)
+      .toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+    const composedHeight = writeCardHeight();
+    // Vacuous unless the card is genuinely tall enough for its collapse to move
+    // the content above the viewport.
+    expect(composedHeight).toBeGreaterThan(120);
+
+    // The write settles — the card folds its body away — and the answer keeps
+    // streaming. Two commits inside one task with a layout read between them:
+    // that is the frame the engine clamps `scrollTop` in and then queues the
+    // resulting scroll event for delivery long after the content has grown back.
+    await act(async () => {
+      flushSync(() => root!.render(transcriptTree(writeTranscript(12, true, 1))));
+      void port.scrollHeight;
+      flushSync(() => root!.render(transcriptTree(writeTranscript(12, true, 24))));
+    });
+    await settle();
+
+    await expect.poll(() => writeCardHeight(), POLL).toBeLessThan(composedHeight);
     await expect
       .poll(() => distanceFromBottom(port), POLL)
       .toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);

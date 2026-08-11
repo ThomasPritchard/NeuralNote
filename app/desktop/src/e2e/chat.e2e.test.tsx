@@ -442,6 +442,113 @@ describe("Journey 7: cited chat — the timeline rail", () => {
   });
 });
 
+describe("Journey 7: cited chat — a note write, previewed as it composes", () => {
+  const WRITE_REL = "Atomic/Spaced recall.md";
+  const WRITE_BODY = "# Spaced recall\n\nRetrieval beats rereading, reliably.\n";
+  const previewFrame = (body: string, complete: boolean, named = true): ChatEvent => ({
+    type: "noteEditPreview",
+    id: "call-write",
+    relPath: named ? WRITE_REL : null,
+    kind: named ? "atomic" : null,
+    body,
+    complete,
+  });
+
+  it("streams the composing note across the IPC seam, then settles it in place", async () => {
+    // The card and its tool call share an id, and the frames arrive in the order
+    // the orchestrator actually emits them: the preview streams DURING the turn
+    // and the call is announced when the turn settles. Only this tier proves
+    // those frames cross the Channel — the component tests stub the whole api
+    // module, so a `noteEditPreview` that never serialised would still pass there.
+    const script: ChatEvent[] = [
+      previewFrame("", false, false),
+      previewFrame("# Spaced recall\n", false),
+      previewFrame("# Spaced recall\n\nRetrieval beats", false),
+      previewFrame(WRITE_BODY, true),
+      {
+        type: "toolCall",
+        id: "call-write",
+        name: "write_note",
+        title: "Write note",
+        arguments: JSON.stringify({
+          rel_path: WRITE_REL,
+          kind: "atomic",
+          content: WRITE_BODY,
+        }),
+      },
+      { type: "toolResult", id: "call-write", status: "ok", summary: null, detail: null },
+      { type: "noteWritten", relPath: WRITE_REL, kind: "atomic" },
+      { type: "answer", delta: "Captured it." },
+      { type: "done" },
+    ];
+    const { user, advanceAllFrames, advanceNextFrame } = await openWorkspace({
+      chatScript: script,
+    });
+
+    await ask(user, "capture that idea about recall");
+
+    // Frame at a time, so the card is caught MID-RUN: it exists before any
+    // settlement frame has been delivered, which is the ordering that makes the
+    // preview a preview rather than a receipt.
+    for (
+      let guard = 0;
+      guard < 4 && screen.queryByRole("region", { name: /^Note write/ }) === null;
+      guard += 1
+    ) {
+      expect(await advanceNextFrame()).toBe(true);
+    }
+    const card = screen.getByRole("region", { name: /^Note write/ });
+    expect(card).toHaveTextContent("writing");
+    expect(card).not.toHaveTextContent("written");
+
+    await advanceAllFrames();
+
+    // Upgraded in place: still exactly one card, now reporting the write.
+    const settledCards = screen.getAllByRole("region", { name: /^Note write/ });
+    expect(settledCards).toHaveLength(1);
+    expect(settledCards[0]).toHaveTextContent("written");
+    expect(within(settledCards[0]).getByText("+3")).toBeInTheDocument();
+    // Its rail node stood down — one act, one surface. The write was this run's
+    // only tool call, so the rail is left with nothing to show at all.
+    expect(screen.queryByText("Write note")).toBeNull();
+    expect(screen.queryByRole("region", { name: "What the assistant did" })).toBeNull();
+    // Undo is offered on settle, exactly once: the run's report card owns it,
+    // because only it carries the path the write actually RESOLVED to.
+    expect(screen.getAllByRole("button", { name: "Undo" })).toHaveLength(1);
+    expect(await screen.findByText("1 note written")).toBeInTheDocument();
+  });
+
+  it("clears an abandoned preview instead of leaving a fragment looking committed", async () => {
+    // The captured turn's real failure: the provider died with the last call
+    // truncated mid-sentence. No write happened, and no `noteWritten` follows.
+    const { user, advanceAllFrames } = await openWorkspace({
+      chatScript: [
+        previewFrame("# Spaced recall\n\nRetrieval beats rer", false),
+        {
+          type: "noteEditAbandoned",
+          id: "call-write",
+          reason: "the provider stream ended mid-call",
+        },
+        { type: "error", message: "The model provider is unreachable." },
+      ],
+    });
+
+    await ask(user, "capture that idea about recall");
+    await advanceAllFrames();
+
+    const card = await screen.findByRole("region", { name: /^Note write/ });
+    expect(card).toHaveTextContent("not written");
+    expect(
+      within(card).getByText(
+        "This note was never written — the provider stream ended mid-call",
+      ),
+    ).toBeInTheDocument();
+    // The fragment is gone, and nothing offers to undo a write that never was.
+    expect(screen.queryByText(/Retrieval beats rer/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
+  });
+});
+
 describe("Journey 7: cited chat — surfaced error", () => {
   it("shows a run error inline instead of a silent blank, and frees the composer", async () => {
     const errorScript: ChatEvent[] = [

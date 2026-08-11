@@ -100,8 +100,16 @@ export function ThinkingNode({
  *  it could not safely run is not the user refusing to let it run, and a UI that
  *  blurred the two would misattribute a decision the user did or did not make.
  *  (`denied` has no producer until the approval gate lands, and `error` none yet
- *  — they are rendered correctly now so the wire contract has a consumer.) */
-const SETTLED: Record<ToolStatus, { icon: LucideIcon; tone: string; label: string }> = {
+ *  — they are rendered correctly now so the wire contract has a consumer.)
+ *
+ *  Exported because a previewed write's node stands down in favour of
+ *  `ChatNoteEditCard`, which then owes the user the same account in the same
+ *  words. Two hand-written copies of this vocabulary would eventually disagree
+ *  about what "rejected" means. */
+export const TOOL_SETTLEMENT: Record<
+  ToolStatus,
+  { icon: LucideIcon; tone: string; label: string }
+> = {
   // The common case is calm: a call that did what it said is not news.
   ok: { icon: Check, tone: "text-muted-foreground/70", label: "" },
   error: { icon: AlertTriangle, tone: "text-destructive", label: "failed" },
@@ -173,7 +181,7 @@ export function ToolNode({
   call,
   last,
 }: Readonly<{ call: ToolCallView; last: boolean }>) {
-  const settled = call.status === null ? null : SETTLED[call.status];
+  const settled = call.status === null ? null : TOOL_SETTLEMENT[call.status];
   const summary = call.summary !== null && call.summary !== "" ? call.summary : null;
   const hint = argumentHint(call.arguments);
   // While a call is in flight its arguments are all there is to say what it is
