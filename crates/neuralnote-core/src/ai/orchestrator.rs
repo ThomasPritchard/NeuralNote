@@ -9,7 +9,8 @@
 
 use crate::ai::approval::{
     self, ApprovalClassifier, ApprovalContext, ApprovalDecision, ApprovalGate, ApprovalPolicy,
-    ApprovalPrompt, ApprovedCall, DenyingApprovalPrompt, UnavailableApprovalClassifier,
+    ApprovalPrompt, ApprovalResolution, ApprovedCall, DenyingApprovalPrompt,
+    UnavailableApprovalClassifier,
 };
 use crate::ai::events::{ChatEvent, EventSink, ToolStatus};
 use crate::ai::evidence::EvidenceRegistry;
@@ -824,7 +825,7 @@ impl ChatSession<'_> {
         };
         match approval::decide(gate, &context, call, writes_remaining, sink).await {
             ApprovalDecision::Approved(approved) => Ok(approved),
-            ApprovalDecision::Denied => Err(RefusedCall::Denied),
+            ApprovalDecision::Denied(resolution) => Err(RefusedCall::Denied(resolution)),
             ApprovalDecision::HardDenied(denial) => Err(RefusedCall::HardDenied(denial.message())),
         }
     }
@@ -1250,9 +1251,12 @@ impl SkippedCall {
 /// is the tempting shortcut and it breaks the protocol invariant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum RefusedCall {
-    /// The user declined — or the prompt timed out, was cancelled, or the window
-    /// closed. All of those resolve to no.
-    Denied,
+    /// The gate asked and did not get a yes, carrying **which** kind of no it
+    /// was. Deliberately not collapsed: "the user declined" is a claim about a
+    /// person, and it is false for a prompt that expired unanswered or a window
+    /// that closed. The gate distinguishes these on the wire already; this is the
+    /// step that used to throw the distinction away.
+    Denied(ApprovalResolution),
     /// Refused without asking: a vault escape, an invalid path, arguments that
     /// never parsed, or a subject the user has already declined twice. Validation
     /// and confinement, not authorisation — so this happens in every mode,
@@ -1262,9 +1266,13 @@ enum RefusedCall {
 
 impl RefusedCall {
     /// The `role:"tool"` content the model reads and recovers from.
+    ///
+    /// The three refusals read differently to the model too, and that is not
+    /// cosmetic: "the user declined" invites a reworded retry aimed at changing
+    /// their mind, while "nobody answered" and "the session ended" do not.
     fn tool_result_content(&self) -> String {
         let message = match self {
-            Self::Denied => "the user declined this action, so it did not run",
+            Self::Denied(resolution) => Self::refusal_message(*resolution),
             Self::HardDenied(detail) => detail,
         };
         serde_json::json!({ "error": message }).to_string()
@@ -1272,19 +1280,63 @@ impl RefusedCall {
 
     /// The same story in the user's words, for the timeline node. `Denied` (the
     /// user refused) and `Rejected` (the orchestrator refused) are different
-    /// stories and must render differently.
+    /// stories and must render differently — and so are the three refusals.
     fn settlement(&self) -> ToolSettlement {
         match self {
-            Self::Denied => ToolSettlement {
-                status: ToolStatus::Denied,
+            Self::Denied(resolution) => ToolSettlement {
+                status: Self::refusal_status(*resolution),
                 summary: None,
-                detail: Some("Denied. Nothing was written.".to_string()),
+                detail: Some(Self::refusal_detail(*resolution).to_string()),
             },
             Self::HardDenied(detail) => ToolSettlement {
                 status: ToolStatus::Rejected,
                 summary: None,
                 detail: Some(detail.clone()),
             },
+        }
+    }
+
+    /// Exhaustive, no wildcard arm, so a new [`ApprovalResolution`] has to be
+    /// classified here before it compiles. `Approved` and `Unavailable` cannot
+    /// reach a refusal — the first is the other decision, the second precedes a
+    /// prompt rather than settling one — so they fall to the most conservative
+    /// status rather than being waved through.
+    const fn refusal_status(resolution: ApprovalResolution) -> ToolStatus {
+        match resolution {
+            ApprovalResolution::Denied => ToolStatus::Denied,
+            ApprovalResolution::TimedOut => ToolStatus::TimedOut,
+            ApprovalResolution::Cancelled => ToolStatus::Cancelled,
+            ApprovalResolution::Approved | ApprovalResolution::Unavailable => ToolStatus::Denied,
+        }
+    }
+
+    /// The user-facing sentence. All three end by saying nothing was written,
+    /// because that is the fact the user most needs and it holds in every case.
+    const fn refusal_detail(resolution: ApprovalResolution) -> &'static str {
+        match resolution {
+            ApprovalResolution::TimedOut => "The request expired unanswered. Nothing was written.",
+            ApprovalResolution::Cancelled => {
+                "The run ended before this was answered. Nothing was written."
+            }
+            ApprovalResolution::Denied
+            | ApprovalResolution::Approved
+            | ApprovalResolution::Unavailable => "Denied. Nothing was written.",
+        }
+    }
+
+    /// The model-facing sentence, composed in Rust from the resolution — never
+    /// model prose echoed back.
+    const fn refusal_message(resolution: ApprovalResolution) -> &'static str {
+        match resolution {
+            ApprovalResolution::TimedOut => {
+                "the approval request expired without an answer, so it did not run"
+            }
+            ApprovalResolution::Cancelled => {
+                "the session ended before this was approved, so it did not run"
+            }
+            ApprovalResolution::Denied
+            | ApprovalResolution::Approved
+            | ApprovalResolution::Unavailable => "the user declined this action, so it did not run",
         }
     }
 }
@@ -1868,12 +1920,87 @@ const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 mod settlement_tests {
     use super::*;
     use crate::ai::events::VecSink;
+    use std::collections::BTreeSet;
 
     fn call(name: &str) -> ToolCall {
         ToolCall {
             id: "c1".into(),
             name: name.into(),
             arguments: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn a_timeout_is_not_reported_as_a_user_denial() {
+        // THE regression this split exists for. All three refusals mean the call
+        // did not run, and exactly one of them means a person decided that. The
+        // UI reads the status, so a timeout that arrives as `Denied` renders as
+        // "denied by you" to a user who never saw the sheet.
+        //
+        // What goes red: make `refusal_status` return `ToolStatus::Denied` for
+        // every resolution — the shape this shipped in — and all three
+        // assertions below fail at once.
+        let expected = [
+            (ApprovalResolution::Denied, ToolStatus::Denied),
+            (ApprovalResolution::TimedOut, ToolStatus::TimedOut),
+            (ApprovalResolution::Cancelled, ToolStatus::Cancelled),
+        ];
+        for (resolution, status) in expected {
+            assert_eq!(
+                RefusedCall::Denied(resolution).settlement().status,
+                status,
+                "{resolution:?} settled as the wrong status"
+            );
+        }
+        // Distinct in the user's words and in the model's, not only in the enum:
+        // an identical sentence under three statuses would leave the timeline
+        // saying "Denied" beneath a `timedOut` glyph.
+        let details: BTreeSet<String> = expected
+            .iter()
+            .map(|(resolution, _)| {
+                RefusedCall::Denied(*resolution)
+                    .settlement()
+                    .detail
+                    .expect("a refusal always explains itself")
+            })
+            .collect();
+        assert_eq!(
+            details.len(),
+            3,
+            "two refusals tell the user the same story"
+        );
+        let messages: BTreeSet<String> = expected
+            .iter()
+            .map(|(resolution, _)| RefusedCall::Denied(*resolution).tool_result_content())
+            .collect();
+        assert_eq!(
+            messages.len(),
+            3,
+            "two refusals tell the model the same story"
+        );
+        // Only the genuine refusal may blame the user. The other two must not,
+        // because the model reads this and a false "the user declined" invites a
+        // retry aimed at changing a mind that was never made up.
+        for resolution in [ApprovalResolution::TimedOut, ApprovalResolution::Cancelled] {
+            let message = RefusedCall::Denied(resolution).tool_result_content();
+            assert!(!message.contains("declined"), "{resolution:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_never_claims_something_was_written() {
+        // The one fact that holds across every refusal, stated once so a future
+        // reworded sentence cannot quietly drop it.
+        for resolution in [
+            ApprovalResolution::Denied,
+            ApprovalResolution::TimedOut,
+            ApprovalResolution::Cancelled,
+        ] {
+            let detail = RefusedCall::Denied(resolution)
+                .settlement()
+                .detail
+                .expect("a refusal always explains itself");
+            assert!(detail.contains("Nothing was written"), "{detail}");
         }
     }
 

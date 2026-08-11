@@ -855,6 +855,115 @@ mod tests {
     use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
     use std::sync::{Arc, Barrier, Mutex as StdMutex, OnceLock};
 
+    /* ─────────────────────────  the approval judge  ────────────────────── */
+
+    /// A subject to judge. `fetch_captions` is used because it needs no vault on
+    /// disk — the judge under test does not care which subject it is handed, only
+    /// that it is one.
+    fn judge_subject() -> ToolApprovalSubject {
+        neuralnote_core::ai::approval::build_subject(
+            neuralnote_core::ai::approval::GatedTool::FetchCaptions,
+            &neuralnote_core::ai::ToolCall {
+                id: "c1".into(),
+                name: neuralnote_core::ai::approval::GatedTool::FetchCaptions
+                    .name()
+                    .into(),
+                arguments: r#"{"video_id":"abc123"}"#.into(),
+            },
+            Path::new("/nonexistent-vault"),
+            &neuralnote_core::ai::approval::PathDigestSalt::fixed(3),
+            8,
+        )
+        .expect("a call with no filesystem target always describes")
+        .subject
+    }
+
+    #[test]
+    fn the_judges_request_pins_the_sampling_knobs_and_carries_only_the_subject() {
+        // `request_body` was split out with a doc comment saying a test would
+        // assert the sampling knobs. No such test existed, so a drift to a warmer
+        // temperature or a wider ceiling — a change to the cost and the
+        // reproducibility of a SECURITY decision — could land unseen.
+        //
+        // What goes red: change `temperature`, `max_tokens`, or `stream` in
+        // `request_body`, or let anything other than the serialised subject into
+        // the user message.
+        let client = client_for("http://127.0.0.1:1/v1/chat/completions".into());
+        let judge = ApprovalJudge::new(&client, "some/model");
+        let body = judge.request_body(&judge_subject());
+
+        assert_eq!(body["temperature"], 0.0);
+        assert_eq!(body["max_tokens"], 32);
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["model"], "some/model");
+        // Two messages, and the variable one is the serialised subject verbatim.
+        // Anything else here would be a channel the subject's closed shape was
+        // designed to remove.
+        assert_eq!(body["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            body["messages"][1]["content"],
+            approval::classifier_prompt(&judge_subject())
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_judge_that_never_answers_fails_closed_at_its_own_budget() {
+        // The budget is enforced HERE, in the shell, because the core owns no
+        // clock — and deleting the `tokio::time::timeout` wrapper left the whole
+        // suite green, so the one thing standing between a hung provider and a
+        // stalled chat turn was untested.
+        //
+        // Clock-driven rather than wall-clock: time is paused, so the runtime
+        // auto-advances to the next deadline once nothing can make progress. The
+        // client's own connect and read timeouts are set an hour out, which makes
+        // `CLASSIFIER_BUDGET` the ONLY short timer in play — so the elapsed
+        // assertion below is measuring the budget and nothing else.
+        //
+        // What goes red: delete the `tokio::time::timeout` wrapper in `classify`
+        // and the only remaining deadline is an hour away, so both the message
+        // and the elapsed assertion fail.
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let url = format!(
+            "http://{}/v1/chat/completions",
+            listener.local_addr().unwrap()
+        );
+        // Accept and then say nothing at all: a provider that took the request
+        // and never answered, which is the failure a read timeout alone handles
+        // far too late for a prompt the user is waiting behind.
+        let _silent = std::thread::spawn(move || {
+            let accepted = listener.accept();
+            std::thread::sleep(Duration::from_secs(30));
+            drop(accepted);
+        });
+
+        let client = OpenAiChatClient::new_with(
+            url,
+            None,
+            None,
+            Duration::from_secs(3600),
+            Duration::from_secs(3600),
+            None,
+            false,
+        );
+        let judge = ApprovalJudge::new(&client, "some/model");
+
+        let started = tokio::time::Instant::now();
+        let error = approval::ApprovalClassifier::classify(&judge, &judge_subject())
+            .await
+            .expect_err("a judge that never answers must not produce a verdict");
+        let elapsed = started.elapsed();
+
+        assert!(
+            error.to_string().contains("within its budget"),
+            "expected the budget error, got: {error}"
+        );
+        assert_eq!(
+            elapsed,
+            approval::CLASSIFIER_BUDGET,
+            "the judge must give up at its own budget, not at the transport's timeout"
+        );
+    }
+
     #[test]
     fn native_e2e_uses_a_distinct_keychain_namespace() {
         assert_eq!(KEYCHAIN_SERVICE, "com.neuralnote.desktop");

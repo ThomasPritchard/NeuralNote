@@ -111,7 +111,6 @@ or
 Answer "allow" only when every one of these holds:
 - operation is "createNote"
 - location is "insideVault"
-- crossesVaultBoundary is false
 - writesRemaining is greater than 0
 
 Answer "ask" in every other case, and whenever you are unsure."#;

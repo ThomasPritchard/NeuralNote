@@ -77,7 +77,11 @@ tauri-plugin-wdio-webdriver = { version = "=1.2.0", optional = true }
 # Behavioural-eval integration test (tests/behavioural_eval.rs): a temp fixture
 # vault, an async runtime for the real HTTP clients, and its own Ollama reachability probe.
 tempfile = "3"
-tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+# `test-util` is dev-only and adds no production surface. It supplies the paused
+# clock the approval-judge budget test needs; the alternative is a real
+# three-second sleep in the unit suite, and a timing assertion that would then be
+# measuring the machine rather than the timeout.
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "test-util"] }
 image = { version = "0.25.10", default-features = false, features = ["jpeg"] }
 
 [target.'cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))'.dependencies]

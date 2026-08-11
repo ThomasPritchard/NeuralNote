@@ -170,10 +170,18 @@ impl ApprovedCall {
 pub enum ApprovalDecision {
     /// Run it.
     Approved(ApprovedCall),
-    /// The user said no (or said nothing, or closed the window). **Not a
-    /// run-cancellation**: one result per declared call must still be pushed, and
-    /// the remaining calls stay gated.
-    Denied,
+    /// The gate asked and did not get a yes. **Not a run-cancellation**: one
+    /// result per declared call must still be pushed, and the remaining calls
+    /// stay gated.
+    ///
+    /// It carries **which** non-yes it was, rather than collapsing them, because
+    /// the caller renders it: a timeout and a closed window are not the user
+    /// saying no, and telling them they refused something they never saw is the
+    /// one account that is definitely wrong. The payload is never
+    /// [`ApprovalResolution::Approved`] (that is the `Approved` arm) and never
+    /// [`ApprovalResolution::Unavailable`] (which precedes a prompt rather than
+    /// settling one).
+    Denied(ApprovalResolution),
     /// Refused without asking — a vault escape, an invalid path, or arguments
     /// that never parsed. Becomes a `reject()` tool result the model reads and
     /// recovers from.

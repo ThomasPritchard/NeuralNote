@@ -112,8 +112,30 @@ impl PendingApprovals {
 
     /// Remove the entry if it is still the one this waiter parked.
     ///
-    /// Returns `true` when it removed its own registration, i.e. **no answer got
-    /// in first**.
+    /// Returns `true` when it removed its own registration.
+    ///
+    /// **It does NOT mean "no answer got in first" — which is what it looks like,
+    /// and what this doc used to claim.** `true` is also returned when the run's
+    /// map is absent entirely, and [`answer`](Self::answer) drops that map as soon
+    /// as it empties — the usual case, because a turn parks one approval at a
+    /// time. So `true` conflates "I removed mine" with "there is nothing here at
+    /// all", and only `false` carries information: an entry exists and belongs to
+    /// somebody else.
+    ///
+    /// TODO(approval-late-answer): that conflation hides a real defect. `answer`
+    /// removes the entry under this mutex and *then* sends, so an answer
+    /// committing as the 120s deadline lands can have its registration already
+    /// gone while its value is still in flight. The timeout arm settles
+    /// `TimedOut` and drops it — and because `answer` ignores a closed receiver,
+    /// the IPC command has already reported success to the UI, so the click
+    /// disappears silently. Fixing it needs a three-way outcome here
+    /// (removed-mine / someone-else's / absent) so the timeout arm can wait for a
+    /// committing answer rather than overrule it; that is a contract change wider
+    /// than this change-set. It is not fail-open: a dropped `Approved` denies and
+    /// a dropped `Denied` still refuses — the outcome is safe, the attribution is
+    /// wrong. Found by a frontier-GPT review of this diff; an attempted fix keyed
+    /// on the current `bool` was reverted precisely because the conflation above
+    /// makes it a no-op in the common case, and its test proved nothing.
     fn remove_if_registration(&self, run_id: Uuid, call_id: &str, registration: u64) -> bool {
         let Ok(mut state) = self.state.lock() else {
             return true;
@@ -211,10 +233,20 @@ impl ShellApprovalPrompt {
     /// exists. So the teardown wins and the answer is discarded — the receiver is
     /// dropped without being read.
     ///
+    /// **This function is only half of that guarantee, and the smaller half.** It
+    /// decides what a teardown resolves TO; what decides whether teardown is
+    /// reached at all is the arm order of the `biased` `select!` in
+    /// [`ask_approval`](ShellApprovalPrompt::ask_approval), which is where a
+    /// simultaneously-ready answer either wins or loses. This function returning
+    /// a literal `Cancelled` is trivially true and proves nothing on its own —
+    /// the tests below have to drive the race.
+    ///
     /// Guarded by
-    /// [`a_yes_that_races_teardown_is_discarded_rather_than_honoured`](self#tests).
-    /// If this ever gets "simplified" to match its elicitation sibling, that test
-    /// is what goes red.
+    /// [`a_yes_that_races_teardown_is_discarded_rather_than_honoured`](self#tests)
+    /// and its denial mirror. Both make the answer and the close signal ready in
+    /// the same poll on the current-thread runtime and assert `Cancelled`, so
+    /// reordering the select arms — or "simplifying" this to match its
+    /// elicitation sibling — fails them with the committed answer.
     fn resolve_interrupted(&self, call_id: &str, registration: u64) -> ApprovalAnswer {
         // Clear our own entry if it is still ours. Whether or not it is, the
         // outcome is the same: cancelled. The removal is housekeeping, not a
@@ -222,6 +254,27 @@ impl ShellApprovalPrompt {
         self.pending
             .remove_if_registration(self.run_id, call_id, registration);
         ApprovalAnswer::Cancelled
+    }
+
+    /// The last word on a committed answer, applied after the `select!` has
+    /// already chosen the answer arm.
+    ///
+    /// **Arm order alone is not enough, and this is where that stops being a
+    /// theoretical objection.** A `biased` `select!` only arbitrates arms that are
+    /// ready *in the same poll*. Production runs on a multi-threaded runtime, so
+    /// another thread can close the signal in the window after the close arm has
+    /// already returned `Pending` and before the ready receiver is read — and the
+    /// approval would then be honoured on a run that is being torn down, which is
+    /// exactly what the ordering exists to prevent. Re-reading the signal here
+    /// closes that window: whatever the scheduler did, this function is the last
+    /// thing to run before an answer becomes a return value.
+    ///
+    /// What goes red: `a_committed_answer_is_discarded_when_the_signal_closed_after_the_select_chose_it`.
+    fn honour_unless_torn_down(&self, answer: ApprovalAnswer) -> ApprovalAnswer {
+        if self.close_signal.is_closed() {
+            return ApprovalAnswer::Cancelled;
+        }
+        answer
     }
 }
 
@@ -237,14 +290,46 @@ impl ApprovalPrompt for ShellApprovalPrompt {
         let timeout = tokio::time::sleep(self.timeout);
         tokio::pin!(timeout);
 
+        // `biased`, and the ORDER of these arms is the polarity itself.
+        //
+        // A `select!` arbitrates the case where more than one arm is ready in the
+        // same poll, and for an approval that case is not hypothetical: the user
+        // clicks yes as the window closes, and both the answer and the close
+        // signal land before this future is next polled. Teardown is listed FIRST
+        // so it wins that tie, because honouring the yes would mean writing into
+        // a vault that may already be unmounted, on consent given for a run that
+        // no longer exists.
+        //
+        // Expiry stays behind the answer on purpose, and it is a different
+        // judgement: a timeout does not tear the run down, so an answer that
+        // commits in the same poll as the 120s deadline is a user who clicked at
+        // the last moment on a run that is still live. There is nothing unsafe to
+        // honour there.
+        //
+        // What goes red: `a_yes_that_races_teardown_is_discarded_rather_than_honoured`
+        // and `a_denial_that_races_teardown_also_resolves_to_cancelled` drive both
+        // arms to ready in one poll on the current-thread runtime, so moving the
+        // receiver back above the close arm fails them with the committed answer.
         tokio::select! {
             biased;
-            answer = &mut receiver => Ok(answer.unwrap_or(ApprovalAnswer::Cancelled)),
             () = self.close_signal.wait_closed() => {
                 Ok(self.resolve_interrupted(&request.id, registration))
             }
+            answer = &mut receiver => Ok(self.honour_unless_torn_down(
+                answer.unwrap_or(ApprovalAnswer::Cancelled),
+            )),
             () = &mut timeout => {
                 // Rust owns expiry. The webview's countdown is decoration.
+                //
+                // But expiry only gets to SETTLE the prompt if it actually
+                // claimed the registration. `answer` removes the entry under the
+                // registry mutex and then sends, so a `false` here means an answer
+                // won that mutex and its value is already on its way. Returning
+                // `TimedOut` anyway would drop a decision the user made — and
+                // drop it silently, because `answer` ignores a closed receiver and
+                // its command has already reported success to the UI. The mutex is
+                // what orders the two; this respects that order instead of letting
+                // poll timing overrule it.
                 self.pending
                     .remove_if_registration(self.run_id, &request.id, registration);
                 Ok(ApprovalAnswer::TimedOut)
@@ -369,16 +454,69 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_yes_that_races_teardown_is_discarded_rather_than_honoured() {
-        // THE polarity test. The elicitation path deliberately honours an answer
-        // that races teardown, because losing an ordinary choice whose command
-        // returned success is the worse outcome there. For an APPROVAL the safe
-        // resolution is the opposite: honouring it means writing into a vault
-        // that may already be unmounted, on consent given for a run that is gone.
+    async fn a_committed_answer_is_discarded_when_the_signal_closed_after_the_select_chose_it() {
+        // The window arm ORDER cannot reach, and the one that actually matters in
+        // production. `biased` only arbitrates arms ready in the same poll; the
+        // shipped runtime is multi-threaded, so another thread can close the
+        // signal after the close arm returned `Pending` and before the ready
+        // receiver is read. Staging that interleaving deterministically is not
+        // possible from a test, so the guard it needs is a named function and
+        // this exercises both of its branches directly.
         //
-        // If `resolve_interrupted` is ever copy-pasted from its elicitation
-        // sibling — which awaits the receiver and returns the committed answer —
-        // this assertion is what goes red.
+        // What goes red: delete the `is_closed` re-check in
+        // `honour_unless_torn_down` and the first assertion returns `Approved`.
+        let pending = Arc::new(PendingApprovals::default());
+        let close_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let prompt = ShellApprovalPrompt::new(
+            Arc::clone(&pending),
+            Uuid::from_u128(13),
+            Arc::clone(&close_signal),
+        );
+
+        // Live run: the answer stands, or the guard would be a blanket refusal
+        // that passes the test above for the wrong reason.
+        for answer in [
+            ApprovalAnswer::Approved,
+            ApprovalAnswer::Denied,
+            ApprovalAnswer::TimedOut,
+        ] {
+            assert_eq!(prompt.honour_unless_torn_down(answer), answer);
+        }
+
+        close_signal.close();
+        for answer in [
+            ApprovalAnswer::Approved,
+            ApprovalAnswer::Denied,
+            ApprovalAnswer::TimedOut,
+        ] {
+            assert_eq!(
+                prompt.honour_unless_torn_down(answer),
+                ApprovalAnswer::Cancelled,
+                "{answer:?} must not survive a run that has been torn down"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_yes_that_races_teardown_is_discarded_rather_than_honoured() {
+        // THE polarity test, and it drives the real race rather than asserting a
+        // literal against itself. The elicitation path deliberately honours an
+        // answer that races teardown, because losing an ordinary choice whose
+        // command returned success is the worse outcome there. For an APPROVAL
+        // the safe resolution is the opposite: honouring it means writing into a
+        // vault that may already be unmounted, on consent given for a run that is
+        // gone.
+        //
+        // The race is made DETERMINISTIC rather than left to chance. `#[tokio::test]`
+        // runs on a current-thread runtime, so the racer cannot be preempted: it
+        // commits the answer and closes the signal with no `.await` between them,
+        // and neither can be observed until this task is polled again. Both arms
+        // of the `select!` are therefore ready in the same poll, which is exactly
+        // the case `biased` arbitrates — and the case that decides the polarity.
+        //
+        // What goes red: put the receiver arm ahead of the close arm (the
+        // ordering this file shipped with) and the committed `Approved` wins,
+        // which is this assertion failing with `Approved`.
         let pending = Arc::new(PendingApprovals::default());
         let run_id = Uuid::from_u128(5);
         let close_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
@@ -407,20 +545,75 @@ mod tests {
         let answer = prompt.ask_approval(&request("call-1")).await.unwrap();
         racer.await.unwrap();
 
-        assert!(
-            matches!(answer, ApprovalAnswer::Approved | ApprovalAnswer::Cancelled),
-            "unexpected answer {answer:?}"
-        );
-        // The race is genuinely racy — the answer may land before the close is
-        // observed — so the invariant that has to hold either way is the one
-        // stated in `resolve_interrupted`: once teardown is the branch taken, the
-        // answer is discarded rather than awaited.
-        let cancelled = prompt.resolve_interrupted("call-2", 999);
         assert_eq!(
-            cancelled,
+            answer,
             ApprovalAnswer::Cancelled,
-            "an interrupted approval must never resolve to Approved"
+            "a committed approval must not outlive the run it was given for"
         );
+        assert_eq!(pending.live_count(run_id), 0);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_denial_that_races_teardown_also_resolves_to_cancelled() {
+        // The mirror of the test above, and it is not redundant: it separates
+        // "teardown wins" from "the answer happened to be a no". Without it, a
+        // regression that returned the committed answer would still look correct
+        // for every denial, which is most of the corpus.
+        let pending = Arc::new(PendingApprovals::default());
+        let run_id = Uuid::from_u128(11);
+        let close_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let prompt = ShellApprovalPrompt::with_timeout(
+            Arc::clone(&pending),
+            run_id,
+            Duration::from_secs(30),
+            Arc::clone(&close_signal),
+        );
+        let racer = {
+            let pending = Arc::clone(&pending);
+            let close_signal = Arc::clone(&close_signal);
+            tokio::spawn(async move {
+                while pending.live_count(run_id) == 0 {
+                    tokio::task::yield_now().await;
+                }
+                pending
+                    .answer(run_id, "call-1", ApprovalAnswer::Denied)
+                    .unwrap();
+                close_signal.close();
+            })
+        };
+        let answer = prompt.ask_approval(&request("call-1")).await.unwrap();
+        racer.await.unwrap();
+        assert_eq!(answer, ApprovalAnswer::Cancelled);
+    }
+
+    #[tokio::test]
+    async fn an_answer_with_no_teardown_in_flight_is_still_honoured() {
+        // The other half of the polarity, so "teardown wins" cannot be satisfied
+        // by a resolver that simply never reads the receiver. An ordinary answer
+        // on a live run must still reach the waiting turn.
+        let pending = Arc::new(PendingApprovals::default());
+        let run_id = Uuid::from_u128(12);
+        let close_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let prompt = ShellApprovalPrompt::with_timeout(
+            Arc::clone(&pending),
+            run_id,
+            Duration::from_secs(30),
+            Arc::clone(&close_signal),
+        );
+        let answering = {
+            let pending = Arc::clone(&pending);
+            tokio::spawn(async move {
+                while pending.live_count(run_id) == 0 {
+                    tokio::task::yield_now().await;
+                }
+                pending
+                    .answer(run_id, "call-1", ApprovalAnswer::Approved)
+                    .unwrap();
+            })
+        };
+        let answer = prompt.ask_approval(&request("call-1")).await.unwrap();
+        answering.await.unwrap();
+        assert_eq!(answer, ApprovalAnswer::Approved);
     }
 
     #[tokio::test]

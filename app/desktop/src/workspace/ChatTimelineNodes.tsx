@@ -95,12 +95,23 @@ export function ThinkingNode({
   );
 }
 
-/** How one settled status reads. `rejected` and `denied` are deliberately
- *  different stories told in different words: the orchestrator refusing a call
- *  it could not safely run is not the user refusing to let it run, and a UI that
- *  blurred the two would misattribute a decision the user did or did not make.
- *  (`denied` has no producer until the approval gate lands, and `error` none yet
- *  — they are rendered correctly now so the wire contract has a consumer.)
+/** How one settled status reads. Each label names *who* stopped the call, because
+ *  that is the whole story and the one thing a user cannot recover from being
+ *  told wrongly: the orchestrator refusing a call it could not safely run is not
+ *  the user refusing to let it run, and neither is a prompt nobody answered.
+ *
+ *  `denied`, `timedOut` and `cancelled` are three statuses rather than one for
+ *  exactly that reason. The gate distinguishes them on the wire and the
+ *  orchestrator now carries the distinction through, so a request that expired
+ *  while the user was away no longer reports itself as something they refused.
+ *  (`error` still has no producer — it is rendered correctly now so the wire
+ *  contract has a consumer.)
+ *
+ *  The glyph column is meant to read before any text, and the two new statuses
+ *  currently borrow `Ban` and the warning tone from `rejected` — correct in
+ *  register (nobody chose this; it just did not happen) but not yet a considered
+ *  glyph. Refining that is a design-lane change; the wording below is the part
+ *  that had to be right immediately.
  *
  *  Exported because a previewed write's node stands down in favour of
  *  `ChatNoteEditCard`, which then owes the user the same account in the same
@@ -115,6 +126,8 @@ export const TOOL_SETTLEMENT: Record<
   error: { icon: AlertTriangle, tone: "text-destructive", label: "failed" },
   rejected: { icon: Ban, tone: "text-warning", label: "refused by NeuralNote" },
   denied: { icon: UserX, tone: "text-warning", label: "denied by you" },
+  timedOut: { icon: Ban, tone: "text-warning", label: "expired unanswered" },
+  cancelled: { icon: Ban, tone: "text-warning", label: "run ended first" },
 };
 
 /** The argument fields the tool schemas actually declare, in the order that

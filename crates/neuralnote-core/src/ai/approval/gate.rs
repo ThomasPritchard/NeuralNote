@@ -235,8 +235,11 @@ pub async fn decide(
         // a security event for a read-only tool.
         return match ApprovedCall::ungated(call) {
             Some(approved) => ApprovalDecision::Approved(approved),
-            // Unreachable: `from_name` already said the tool is not gated.
-            None => ApprovalDecision::Denied,
+            // Unreachable: `from_name` already said the tool is not gated, and
+            // that is the only condition under which `ungated` returns `None`.
+            // Denying rather than unwrapping keeps the impossible case
+            // fail-closed instead of a panic on the security path.
+            None => ApprovalDecision::Denied(ApprovalResolution::Denied),
         };
     };
 
@@ -484,13 +487,18 @@ async fn ask(
         .ask_approval(&request)
         .await
         .unwrap_or(ApprovalAnswer::Cancelled);
+    let resolution = answer.resolution();
     sink.send(ChatEvent::ToolApprovalResolved {
         id: call.id.clone(),
-        decision: answer.resolution(),
+        decision: resolution,
     });
     if answer.approves() {
         return ApprovalDecision::Approved(ApprovedCall::granted(call, tool));
     }
+    // A timeout, a cancel and a refusal are all "no" for authorisation purposes
+    // and are all recorded as a denial — consent fatigue does not care which one
+    // it was. They stop being interchangeable at the point they are REPORTED, so
+    // the resolution rides along to the caller rather than being folded here.
     gate.record_denial(subject);
-    ApprovalDecision::Denied
+    ApprovalDecision::Denied(resolution)
 }

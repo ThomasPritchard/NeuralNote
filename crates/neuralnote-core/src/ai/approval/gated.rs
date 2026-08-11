@@ -23,36 +23,120 @@ use crate::ai::tool_registry::{
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
-/// One tool the approval gate covers.
+/// Declares the gated set **once**, and derives from that one list everything
+/// that has to cover every variant: the enum itself, [`ALL_GATED_TOOLS`],
+/// [`GatedTool::name`], and [`GatedTool::from_name`].
 ///
-/// **Closed on purpose, and there is deliberately no `Other(String)` variant.**
-/// A string variant would reopen the injection channel this whole design closes:
-/// the classifier's input is a fixed set of app-computed scalars precisely so
-/// that no field exists for an instruction to live in. One `String` is enough to
-/// undo that, so the escape hatch is not offered.
+/// **Why a macro rather than a hand-written enum plus a hand-written array.**
+/// The array and the enum used to be two lists a human kept in step, tied
+/// together by a const assertion. That assertion could prove the array was
+/// *ordered* correctly but not that it was *complete*, because stable Rust
+/// cannot enumerate an enum's variants in a const context. A variant declared in
+/// all six exhaustive matches but left out of the array therefore compiled — and
+/// `from_name` searched the array, so it answered `None` for that tool,
+/// `ApprovedCall::ungated` accepted the call, and [`decide`] was never reached.
+/// The tool ran with **no approval decision in any mode**, `AlwaysAsk` included,
+/// with the whole suite green. Verified by adding a throwaway eighth variant: 45
+/// gate tests passed while the tool was completely un-gated.
 ///
-/// The wire name of each variant is a `TOOL_*` constant from
-/// [`crate::ai::tool_registry`], and
-/// [`every_gated_tool_name_is_a_registered_tool`](self#tests) keeps the two
-/// tables tied together — a tool rename cannot silently un-gate a tool.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase")]
-#[ts(export)]
-pub enum GatedTool {
-    /// Creates a note in the vault.
-    WriteNote,
-    /// Widens the tool grant set for the rest of the run (`skill_tools.rs`).
-    UseSkill,
-    /// Widens the run's write budget (`write_policy.rs`).
-    SelectPlaylistVideos,
-    /// Persists a vault profile that steers *future* routing (`youtube_route.rs`).
-    ResolveDistilRoute,
-    /// Reaches the internet for video metadata.
-    FetchVideoInfo,
-    /// Reaches the internet for captions.
-    FetchCaptions,
-    /// Spawns a host process and may trigger a binary install.
-    TranscribeAudio,
+/// Here there is no second list to fall out of step with. A variant that is not
+/// in this invocation does not exist; one that is, is in the array and resolves
+/// by name. **What would go red if this were violated:** nothing needs to — the
+/// state is unrepresentable. What a reviewer must protect is the macro itself:
+/// declaring a `GatedTool` variant *outside* this invocation would reopen the
+/// hole, and the compiler cannot stop that (a second `enum GatedTool` would
+/// collide, but adding an arm to a hand-rolled enum would not).
+///
+/// `$wire_name` is a `TOOL_*` path constant from [`crate::ai::tool_registry`], so
+/// it serves as both the returned value and the match pattern — the name a tool
+/// is gated under and the name the dispatcher routes on are the same token.
+macro_rules! declare_gated_tools {
+    (
+        $( #[$enum_meta:meta] )*
+        pub enum $enum_name:ident {
+            $( $( #[$variant_meta:meta] )* $variant:ident => $wire_name:path ),+ $(,)?
+        }
+    ) => {
+        $( #[$enum_meta] )*
+        pub enum $enum_name {
+            $( $( #[$variant_meta] )* $variant, )+
+        }
+
+        /// Every gated tool, in the order the user-facing warning lists them.
+        ///
+        /// Generated from the same list as the enum by [`declare_gated_tools!`],
+        /// so it cannot omit a variant. The length is counted from that list
+        /// rather than written down, so it cannot disagree with it either.
+        pub const ALL_GATED_TOOLS: [$enum_name; [$( stringify!($variant) ),+].len()] =
+            [ $( $enum_name::$variant ),+ ];
+
+        impl $enum_name {
+            /// The model-facing wire name, shared with [`crate::ai::tool_registry`].
+            pub const fn name(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $wire_name, )+
+                }
+            }
+
+            /// Resolve a wire name. `None` means the tool is **not gated** — a
+            /// read-only vault tool, `skill_step`, or `ask_user` — and needs no
+            /// approval decision.
+            ///
+            /// One arm per variant, generated from the same list as the enum, so
+            /// a `GatedTool` this cannot resolve is unrepresentable. That matters
+            /// more than it looks: `None` here is not a soft failure, it is the
+            /// un-gating. `ApprovedCall::ungated` returns `Some` for a name the
+            /// gate does not claim, and [`decide`] is then never called at all.
+            ///
+            /// `deny(unreachable_patterns)` is the one piece of this that is not
+            /// free. `&'static str` constants match by VALUE, so two variants
+            /// pointing at the same `TOOL_*` constant would silently make the
+            /// second unreachable — `from_name` would answer with the first, and
+            /// a call could be classified as one tool and dispatched as another.
+            /// Rust only warns about that by default; here it must not compile.
+            pub fn from_name(name: &str) -> Option<Self> {
+                #[deny(unreachable_patterns)]
+                match name {
+                    $( $wire_name => Some(Self::$variant), )+
+                    _ => None,
+                }
+            }
+        }
+    };
+}
+
+declare_gated_tools! {
+    /// One tool the approval gate covers.
+    ///
+    /// **Closed on purpose, and there is deliberately no `Other(String)` variant.**
+    /// A string variant would reopen the injection channel this whole design closes:
+    /// the classifier's input is a fixed set of app-computed scalars precisely so
+    /// that no field exists for an instruction to live in. One `String` is enough to
+    /// undo that, so the escape hatch is not offered.
+    ///
+    /// The wire name of each variant is a `TOOL_*` constant from
+    /// [`crate::ai::tool_registry`], and
+    /// [`every_gated_tool_name_is_a_registered_tool`](self#tests) keeps the two
+    /// tables tied together — a tool rename cannot silently un-gate a tool.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, TS)]
+    #[serde(rename_all = "camelCase")]
+    #[ts(export)]
+    pub enum GatedTool {
+        /// Creates a note in the vault.
+        WriteNote => TOOL_WRITE_NOTE,
+        /// Widens the tool grant set for the rest of the run (`skill_tools.rs`).
+        UseSkill => TOOL_USE_SKILL,
+        /// Widens the run's write budget (`write_policy.rs`).
+        SelectPlaylistVideos => TOOL_SELECT_PLAYLIST_VIDEOS,
+        /// Persists a vault profile that steers *future* routing (`youtube_route.rs`).
+        ResolveDistilRoute => TOOL_RESOLVE_DISTIL_ROUTE,
+        /// Reaches the internet for video metadata.
+        FetchVideoInfo => TOOL_FETCH_VIDEO_INFO,
+        /// Reaches the internet for captions.
+        FetchCaptions => TOOL_FETCH_CAPTIONS,
+        /// Spawns a host process and may trigger a binary install.
+        TranscribeAudio => TOOL_TRANSCRIBE_AUDIO,
+    }
 }
 
 /// Whether a tool's effect can be taken back once it has run.
@@ -69,17 +153,6 @@ pub enum Reversibility {
     /// Cannot be taken back once it has run.
     Irreversible,
 }
-
-/// Every gated tool, in the order the user-facing warning lists them.
-pub const ALL_GATED_TOOLS: [GatedTool; 7] = [
-    GatedTool::WriteNote,
-    GatedTool::UseSkill,
-    GatedTool::SelectPlaylistVideos,
-    GatedTool::ResolveDistilRoute,
-    GatedTool::FetchVideoInfo,
-    GatedTool::FetchCaptions,
-    GatedTool::TranscribeAudio,
-];
 
 /// Exhaustive by construction — **no wildcard arm**. Adding a [`GatedTool`]
 /// variant makes this fail to compile (E0004, non-exhaustive patterns) until its
@@ -110,77 +183,7 @@ pub const fn reversibility(tool: GatedTool) -> Reversibility {
     }
 }
 
-/// The slot each variant occupies in [`ALL_GATED_TOOLS`]. One arm per variant, no
-/// wildcard, so adding a variant fails here (E0004) until someone declares where
-/// it belongs.
-const fn slot(tool: GatedTool) -> usize {
-    let index = match tool {
-        GatedTool::WriteNote => 0,
-        GatedTool::UseSkill => 1,
-        GatedTool::SelectPlaylistVideos => 2,
-        GatedTool::ResolveDistilRoute => 3,
-        GatedTool::FetchVideoInfo => 4,
-        GatedTool::FetchCaptions => 5,
-        GatedTool::TranscribeAudio => 6,
-    };
-    // A slot past the end of the array names a tool that was declared but never
-    // placed in it — see the honest limits below. This makes that loud wherever
-    // `slot` is actually reached, rather than silent.
-    assert!(index < ALL_GATED_TOOLS.len());
-    index
-}
-
-/// Ties [`ALL_GATED_TOOLS`] to the slot table at COMPILE time.
-///
-/// **What it proves:** every entry of the array sits at the index [`slot`]
-/// declares for it. So the array cannot be reordered, and it cannot contain the
-/// same tool twice, without failing const-eval (E0080).
-///
-/// **What it does NOT prove, stated plainly because the difference matters:**
-/// that the array is *complete*. Stable Rust has no way to enumerate an enum's
-/// variants in a const context (`variant_count` is unstable and there is no
-/// derive here), so a variant that is declared in all six exhaustive matches but
-/// left out of this array would still compile, and would drop silently out of
-/// the generated YOLO warning.
-///
-/// The plan's §9.6.6 asserts that case fails with E0080 because "the new arm's
-/// slot indexes past a `[_; 7]` array". It does not: nothing indexes the array
-/// *by* slot, so `slot(NewVariant) == 7` is never evaluated. This was checked by
-/// adding a throwaway variant — the six E0004s fired, the const block stayed
-/// silent — rather than taken on trust.
-///
-/// What closes the gap instead is the runtime pairing in
-/// [`the_reversibility_classification_matches_the_blessed_table`](self#tests):
-/// its expected table is hand-written variant by variant, so the length check
-/// inside `assert_eq!` reddens the moment the array and that table disagree.
-const _: () = {
-    let mut i = 0;
-    while i < ALL_GATED_TOOLS.len() {
-        assert!(slot(ALL_GATED_TOOLS[i]) == i);
-        i += 1;
-    }
-};
-
 impl GatedTool {
-    /// The model-facing wire name, shared with [`crate::ai::tool_registry`].
-    pub const fn name(self) -> &'static str {
-        match self {
-            Self::WriteNote => TOOL_WRITE_NOTE,
-            Self::UseSkill => TOOL_USE_SKILL,
-            Self::SelectPlaylistVideos => TOOL_SELECT_PLAYLIST_VIDEOS,
-            Self::ResolveDistilRoute => TOOL_RESOLVE_DISTIL_ROUTE,
-            Self::FetchVideoInfo => TOOL_FETCH_VIDEO_INFO,
-            Self::FetchCaptions => TOOL_FETCH_CAPTIONS,
-            Self::TranscribeAudio => TOOL_TRANSCRIBE_AUDIO,
-        }
-    }
-
-    /// Resolve a wire name. `None` means the tool is **not gated** — a read-only
-    /// vault tool, `skill_step`, or `ask_user` — and needs no approval decision.
-    pub fn from_name(name: &str) -> Option<Self> {
-        ALL_GATED_TOOLS.into_iter().find(|tool| tool.name() == name)
-    }
-
     /// Whether this tool's effect can be taken back. See [`reversibility`].
     pub const fn reversibility(self) -> Reversibility {
         reversibility(self)
@@ -276,6 +279,11 @@ mod tests {
         // silent safety regression at the one place the design says a regression
         // must be loud. This table is hand-written here and compared against the
         // code's own match, so ANY single reclassification reddens it.
+        //
+        // It no longer doubles as the completeness check it was once documented
+        // as being. A variant missing from the gated set is now unrepresentable
+        // (see `declare_gated_tools!`); an ADDED variant fails this assertion on
+        // length, but it fails `reversibility()` with E0004 first.
         let expected = [
             (GatedTool::WriteNote, Reversibility::Reversible),
             (GatedTool::UseSkill, Reversibility::Reversible),
@@ -309,7 +317,78 @@ mod tests {
     }
 
     #[test]
+    fn every_registered_tool_is_either_gated_or_on_the_blessed_ungated_list() {
+        // The direction `every_gated_tool_name_is_a_registered_tool` does NOT
+        // cover, and the one hole `declare_gated_tools!` cannot close by
+        // construction. The macro guarantees that a tool in the gated set is
+        // reachable; nothing guarantees that a tool which OUGHT to be gated was
+        // ever added to it. Someone registering a new `delete_note` tomorrow
+        // gets no compile error from the approval module at all — the gate would
+        // simply never see it, which is the same outcome as the un-gating bug
+        // this change-set exists to close, arrived at from the other side.
+        //
+        // So the ungated set is written down and blessed here rather than left
+        // implicit. Every name below is a read-only vault query, the skill
+        // stepper, or the model's own question tool: nothing that writes, fetches
+        // or spawns.
+        //
+        // The classification is an exhaustive `match`, not a list of strings, so
+        // registering a new tool does not merely fail this assertion — it stops
+        // this file COMPILING (E0004) until someone writes its arm. A `cargo test`
+        // that cannot build is the loudest signal available, and unlike a runtime
+        // assertion it cannot be filtered out of a run.
+        //
+        // What goes red: add a variant to `RegisteredTool` and this match is
+        // non-exhaustive; classify a gated tool as `Ungated` (or the reverse) and
+        // the assertion below fires with its name.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Expected {
+            Gated,
+            Ungated,
+        }
+        const fn expected(tool: RegisteredTool) -> Expected {
+            match tool {
+                // Read-only vault queries, the skill stepper, and the model's own
+                // question tool. Nothing that writes, fetches, or spawns.
+                RegisteredTool::ListNotes
+                | RegisteredTool::ListFolders
+                | RegisteredTool::SearchNotes
+                | RegisteredTool::ReadNoteSpan
+                | RegisteredTool::SkillStep
+                | RegisteredTool::AskUser => Expected::Ungated,
+                RegisteredTool::WriteNote
+                | RegisteredTool::UseSkill
+                | RegisteredTool::SelectPlaylistVideos
+                | RegisteredTool::ResolveDistilRoute
+                | RegisteredTool::FetchVideoInfo
+                | RegisteredTool::FetchCaptions
+                | RegisteredTool::TranscribeAudio => Expected::Gated,
+            }
+        }
+        for registered in RegisteredTool::ALL {
+            let name = registered.name();
+            let actual = if GatedTool::from_name(name).is_some() {
+                Expected::Gated
+            } else {
+                Expected::Ungated
+            };
+            assert_eq!(
+                actual,
+                expected(registered),
+                "'{name}' is on the wrong side"
+            );
+        }
+    }
+
+    #[test]
     fn the_gated_set_is_exactly_seven_distinct_tools() {
+        // Both counts now come from the ONE variant list, so this reddens when
+        // the gated set grows or shrinks — it is a "say it out loud" gate on a
+        // change to the security surface, not the completeness proof it used to
+        // be mistaken for. Distinctness is the second assertion's job: two
+        // variants sharing a wire name would make `from_name` unreachable for
+        // the later one, which the compiler reports as an unreachable pattern
+        // but which this states as a property.
         let names: BTreeSet<&str> = ALL_GATED_TOOLS.iter().map(|tool| tool.name()).collect();
         assert_eq!(names.len(), 7);
         assert_eq!(ALL_GATED_TOOLS.len(), 7);

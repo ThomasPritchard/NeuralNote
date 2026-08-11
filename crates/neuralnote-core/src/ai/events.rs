@@ -46,11 +46,27 @@ pub struct Elicitation {
 /// orchestrator refused) and `Denied` (the user refused) are different stories and
 /// must render differently.
 ///
-/// `Denied` is produced by the tool-approval gate — a user refusal, a timeout, a
-/// cancel, or a closed window — which is what makes it distinguishable from an
-/// orchestrator rejection. A call the gate refuses WITHOUT asking (a vault
-/// escape, an invalid path) settles as `Rejected` instead: that is validation,
-/// not a decision the user made.
+/// The three ways the approval gate can settle a call it ASKED about are three
+/// separate statuses — `Denied`, `TimedOut`, `Cancelled` — and the split is the
+/// point. All three mean "the call did not run", but they attribute it to three
+/// different parties: the user said no, nobody answered inside 120s, or the run
+/// went away underneath the question. Folding them into `Denied` tells a user who
+/// never saw the sheet that they refused something, which is the one account that
+/// is definitely false. `ApprovalResolution` already distinguishes them on the
+/// wire — §9.2 says it exists precisely so a timeout or a window close is visible
+/// — so collapsing here threw the distinction away at the last step.
+///
+/// A call the gate refuses WITHOUT asking (a vault escape, an invalid path)
+/// settles as `Rejected` instead: that is validation, not a decision anyone made.
+///
+/// `ApprovalResolution::Unavailable` has no counterpart here and needs none: it is
+/// emitted *before* a prompt, to explain the pause, and is always followed by one
+/// of the three above.
+///
+/// What goes red if these are re-collapsed:
+/// `a_timeout_is_not_reported_as_a_user_denial`, in `orchestrator.rs`'s
+/// `settlement_tests`, which is where the mapping from `ApprovalResolution` to
+/// this enum actually lives.
 ///
 /// `Error` still has no producer, on purpose. It arrives when `ToolOutcome` gains
 /// a discriminant for "the tool ran and failed"; today every failure — malformed
@@ -62,7 +78,13 @@ pub struct Elicitation {
 pub enum ToolStatus {
     Ok,
     Error,
+    /// The user was asked and said no.
     Denied,
+    /// The user was asked and the prompt expired unanswered.
+    TimedOut,
+    /// The user was asked and the run ended — window closed, or stopped — before
+    /// an answer could be honoured.
+    Cancelled,
     Rejected,
 }
 
@@ -423,11 +445,16 @@ mod tests {
     }
 
     #[test]
-    fn tool_status_serialises_as_camel_case_over_all_four_states() {
+    fn tool_status_serialises_as_camel_case_over_every_state() {
+        // The three approval refusals are separate wire values, not one `denied`
+        // with different prose: the UI keys its wording off the status, so
+        // collapsing them here is what put "denied by you" under a timeout.
         for (status, expected) in [
             (ToolStatus::Ok, "ok"),
             (ToolStatus::Error, "error"),
             (ToolStatus::Denied, "denied"),
+            (ToolStatus::TimedOut, "timedOut"),
+            (ToolStatus::Cancelled, "cancelled"),
             (ToolStatus::Rejected, "rejected"),
         ] {
             assert_eq!(serde_json::to_value(status).unwrap(), expected);

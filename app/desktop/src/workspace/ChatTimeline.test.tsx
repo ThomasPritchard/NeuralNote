@@ -4,8 +4,9 @@
 // reads from the glyph column before any text.
 //
 // The properties under test are honesty properties, not layout ones:
-//   • the four ToolStatus values tell four different stories, and `rejected`
-//     (the orchestrator refused) never reads as `denied` (the user refused);
+//   • every ToolStatus tells its own story — `rejected` (the orchestrator
+//     refused) never reads as `denied` (the user refused), and neither
+//     `timedOut` nor `cancelled` reads as either;
 //   • a failure opens itself rather than hiding one click away;
 //   • reasoning renders as markdown, so a structured thought stays legible;
 //   • the install affordance is reached through the structured `missingBinary`,
@@ -108,6 +109,32 @@ describe("ChatTimeline — tool node statuses", () => {
     expect(rejected).not.toHaveTextContent("denied by you");
     expect(denied).toHaveTextContent("denied by you");
     expect(denied).not.toHaveTextContent("refused by NeuralNote");
+  });
+
+  it("never tells a user they denied something they were never shown", () => {
+    // A prompt that expired, and a run that ended under an open sheet, are not
+    // the user saying no. The gate has always distinguished them on the wire;
+    // the orchestrator used to fold all three into `denied`, so the timeline
+    // said "denied by you" to someone who was making a cup of tea.
+    //
+    // What goes red: map `timedOut` or `cancelled` back onto the `denied`
+    // wording in TOOL_SETTLEMENT and the two `not.toHaveTextContent` assertions
+    // below fail.
+    renderTimeline({
+      toolCalls: [call("c1", "timedOut"), call("c2", "cancelled"), call("c3", "denied")],
+      done: true,
+      answer: "I couldn't do that.",
+    });
+
+    const [timedOut, cancelled, denied] = within(rail()).getAllByRole("listitem");
+    expect(timedOut).not.toHaveTextContent("denied by you");
+    expect(cancelled).not.toHaveTextContent("denied by you");
+    expect(denied).toHaveTextContent("denied by you");
+    // And the two non-denials still say something, rather than settling
+    // silently — a node that stops spinning with no account is the failure the
+    // whole settlement vocabulary exists to prevent.
+    expect(timedOut).toHaveTextContent(/expired/i);
+    expect(cancelled).toHaveTextContent(/ended/i);
   });
 
   it("surfaces a failed call in the destructive register", () => {

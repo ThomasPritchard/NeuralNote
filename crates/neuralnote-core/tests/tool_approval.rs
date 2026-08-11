@@ -10,7 +10,7 @@ use neuralnote_core::ai::approval::{
     decide, ApprovalAnswer, ApprovalClassifier, ApprovalContext, ApprovalDecision,
     ApprovalDegradedReason, ApprovalGate, ApprovalMode, ApprovalPolicy, ApprovalPrompt,
     ApprovalPromptRequest, ApprovalReason, ApprovalResolution, ApprovalRule, ClassifierVerdict,
-    GatedTool, Reversibility, ToolApprovalSubject, ALL_GATED_TOOLS,
+    DenyingApprovalPrompt, GatedTool, Reversibility, ToolApprovalSubject, ALL_GATED_TOOLS,
 };
 use neuralnote_core::ai::{ChatEvent, EventSink, ToolCall};
 use neuralnote_core::{CoreError, CoreResult};
@@ -238,7 +238,10 @@ fn a_denial_settles_as_denied_and_does_not_approve() {
         &write_call("call-1", "Notes/New.md", "body"),
         8,
     );
-    assert_eq!(decision, ApprovalDecision::Denied);
+    assert_eq!(
+        decision,
+        ApprovalDecision::Denied(ApprovalResolution::Denied)
+    );
     assert_eq!(resolutions(&events), vec![ApprovalResolution::Denied]);
 }
 
@@ -266,7 +269,10 @@ fn a_timeout_a_cancel_and_a_closed_channel_all_resolve_to_deny() {
             &write_call("call-1", "Notes/New.md", "body"),
             8,
         );
-        assert_eq!(decision, ApprovalDecision::Denied);
+        // The decision CARRIES which no it was, so a timeout is not reported
+        // as the user having declined. Fold the three back into one bare
+        // `Denied` and this is the assertion that fails.
+        assert_eq!(decision, ApprovalDecision::Denied(expected));
         assert_eq!(resolutions(&events), vec![expected]);
     }
 }
@@ -318,6 +324,45 @@ fn within_approve_for_me_every_irreversible_tool_is_asked_and_the_judge_is_unrea
             // as far as the irreversibility check — both are unconditional.
             ApprovalReason::Irreversible | ApprovalReason::ModeAlwaysAsk
         ));
+    }
+}
+
+#[test]
+fn within_approve_for_me_an_ineligible_reversible_tool_is_asked_and_the_judge_is_unreachable() {
+    // `ApprovalReason::NotEligible` had no test at all, and it guards the two
+    // tools that WIDEN the gate itself: `use_skill` grows the tool grant set and
+    // `select_playlist_videos` grows the write budget. Both are classified
+    // Reversible, so they walk straight past the irreversibility floor, and the
+    // eligibility rule is the only thing between them and an unattended run.
+    //
+    // The claim is unreachability, not override, so the judge is scripted to
+    // allow everything and the assertion is that it was never asked. A judge
+    // scripted to say "ask" would make this pass for the wrong reason.
+    //
+    // What goes red: delete the `!eligible(&subject)` branch in `decide` and the
+    // judge gets consulted, so `calls()` becomes 1. Reclassify either tool's
+    // operation as eligible in `subject::eligible` and the same thing happens.
+    let dir = vault();
+    for tool in [GatedTool::UseSkill, GatedTool::SelectPlaylistVideos] {
+        assert_eq!(
+            tool.reversibility(),
+            Reversibility::Reversible,
+            "{tool:?} is only interesting here while it clears the irreversible floor"
+        );
+        let judge = SpyClassifier::always(ClassifierVerdict::Allow(ApprovalRule::NewNoteInVault));
+        let prompt = ScriptedPrompt::always(ApprovalAnswer::Denied);
+        let mut gate = ApprovalGate::new(policy(ApprovalMode::ApproveForMe, true));
+        let (decision, _) = run(&mut gate, dir.path(), &judge, &prompt, &call_for(tool), 8);
+
+        assert_eq!(judge.calls(), 0, "{tool:?} must never reach the judge");
+        assert_eq!(prompt.asked(), 1, "{tool:?} must be asked about");
+        assert_eq!(
+            prompt.seen()[0].reason,
+            ApprovalReason::NotEligible,
+            "{tool:?} is asked about because it is not the KIND of call that may \
+             ever run unattended — not because a judge said so"
+        );
+        assert!(!approved(&decision), "{tool:?}");
     }
 }
 
@@ -380,7 +425,10 @@ fn a_judge_timeout_results_in_a_user_prompt_and_never_an_allow() {
         &write_call("call-1", "Notes/New.md", "body"),
         8,
     );
-    assert_eq!(decision, ApprovalDecision::Denied);
+    assert_eq!(
+        decision,
+        ApprovalDecision::Denied(ApprovalResolution::Denied)
+    );
     assert_eq!(prompt.seen()[0].reason, ApprovalReason::JudgeUnavailable);
     // The timeline explains the pause before the sheet appears, so the user is
     // not left wondering why a mode called "approve for me" is asking.
@@ -598,7 +646,10 @@ fn transcribe_audio_stays_pinned_even_under_a_yolo_global() {
         &call_for(GatedTool::TranscribeAudio),
         8,
     );
-    assert_eq!(decision, ApprovalDecision::Denied);
+    assert_eq!(
+        decision,
+        ApprovalDecision::Denied(ApprovalResolution::Denied)
+    );
     assert_eq!(prompt.asked(), 1);
     assert_eq!(prompt.seen()[0].reason, ApprovalReason::ModeAlwaysAsk);
 }
@@ -724,7 +775,7 @@ fn a_denial_invalidates_a_cached_allow_for_the_same_subject_within_a_run() {
         &subject_call("c2"),
         7,
     );
-    assert_eq!(second, ApprovalDecision::Denied);
+    assert_eq!(second, ApprovalDecision::Denied(ApprovalResolution::Denied));
 
     // 3. back at budget 8 — the byte-identical cached entry — the call must NOT
     //    be auto-approved. The denial outranks the cache.
@@ -768,7 +819,7 @@ fn a_repeat_after_one_denial_is_unconditional_and_a_second_denial_hard_rejects()
         &write_call("c1", "Notes/New.md", "one body"),
         8,
     );
-    assert_eq!(first, ApprovalDecision::Denied);
+    assert_eq!(first, ApprovalDecision::Denied(ApprovalResolution::Denied));
 
     let (second, _) = run(
         &mut gate,
@@ -778,7 +829,7 @@ fn a_repeat_after_one_denial_is_unconditional_and_a_second_denial_hard_rejects()
         &write_call("c2", "Notes/New.md", "a completely reworded body"),
         8,
     );
-    assert_eq!(second, ApprovalDecision::Denied);
+    assert_eq!(second, ApprovalDecision::Denied(ApprovalResolution::Denied));
     assert_eq!(
         prompt.seen()[1].reason,
         ApprovalReason::PreviouslyDenied,
@@ -815,7 +866,10 @@ fn a_different_path_each_retry_defeats_the_counter_and_the_write_budget_is_the_b
     for index in 0..5 {
         let call = write_call(&format!("c{index}"), &format!("Notes/N{index}.md"), "body");
         let (decision, _) = run(&mut gate, dir.path(), &judge, &prompt, &call, 8);
-        assert_eq!(decision, ApprovalDecision::Denied);
+        assert_eq!(
+            decision,
+            ApprovalDecision::Denied(ApprovalResolution::Denied)
+        );
     }
     assert_eq!(prompt.asked(), 5, "each distinct path is its own question");
 
@@ -830,7 +884,7 @@ fn a_different_path_each_retry_defeats_the_counter_and_the_write_budget_is_the_b
         &write_call("c9", "Notes/N9.md", "body"),
         0,
     );
-    assert_eq!(spent, ApprovalDecision::Denied);
+    assert_eq!(spent, ApprovalDecision::Denied(ApprovalResolution::Denied));
     assert_eq!(judge.calls(), before, "an over-budget call is not judged");
 }
 
@@ -853,4 +907,56 @@ fn an_ungated_tool_is_never_prompted_and_emits_no_approval_events() {
         assert!(events.is_empty(), "{name} must emit no approval events");
     }
     assert_eq!(prompt.asked(), 0);
+}
+
+/* ────────────────────  the unwired-client default  ───────────────────── */
+
+#[test]
+fn a_client_with_no_approval_sheet_wired_denies_every_gated_call() {
+    // `DenyingApprovalPrompt` is the fail-closed default for a client that has
+    // not plumbed an approval sheet, and its return had never once executed in a
+    // test: every harness that wires it runs under `Yolo`, where the prompt is
+    // unreachable by construction. So the one line that decides what an
+    // unwired client does was covered by nothing.
+    //
+    // The other default — approving when nobody is listening — is the one that
+    // turns a forgotten wiring step into silent unattended vault writes, which
+    // is why this direction is worth a test of its own rather than an
+    // assumption.
+    //
+    // What goes red: make `DenyingApprovalPrompt::ask_approval` return
+    // `Approved` and both assertions fail — the decision becomes an approval and
+    // the timeline reports it as one.
+    let dir = vault();
+    // The judge says ASK, so the eligible create actually reaches the prompt
+    // under `ApproveForMe` instead of being auto-approved before it. Scripting
+    // it to allow made this test green on `write_note` for the wrong reason —
+    // the prompt was never consulted at all.
+    let judge = SpyClassifier::always(ClassifierVerdict::Ask);
+    for tool in ALL_GATED_TOOLS {
+        // Every mode that asks at all, so this is not accidentally a statement
+        // about `AlwaysAsk` alone. `Yolo` is excluded on purpose: it skips the
+        // prompt entirely, which is the documented behaviour and the reason this
+        // return was unreachable in the existing harnesses.
+        for mode in [ApprovalMode::AlwaysAsk, ApprovalMode::ApproveForMe] {
+            let mut gate = ApprovalGate::new(policy(mode, true));
+            let (decision, events) = run(
+                &mut gate,
+                dir.path(),
+                &judge,
+                &DenyingApprovalPrompt,
+                &call_for(tool),
+                8,
+            );
+            assert_eq!(
+                decision,
+                ApprovalDecision::Denied(ApprovalResolution::Denied),
+                "{tool:?} under {mode:?} must not run without a wired sheet"
+            );
+            assert!(
+                resolutions(&events).contains(&ApprovalResolution::Denied),
+                "{tool:?} under {mode:?} must say so in the timeline"
+            );
+        }
+    }
 }

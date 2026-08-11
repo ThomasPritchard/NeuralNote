@@ -220,7 +220,6 @@ fn group_a_the_subject_is_a_fixed_set_of_scalar_fields() {
         fields.keys().map(String::as_str).collect::<Vec<_>>(),
         // Alphabetical, because `serde_json`'s object map is a `BTreeMap` here.
         vec![
-            "crossesVaultBoundary",
             "leafLen",
             "location",
             "operation",
@@ -475,7 +474,10 @@ fn group_d_a_prompt_channel_failure_is_a_denial_not_an_approval() {
         8,
         &mut sink,
     ));
-    assert_eq!(decision, ApprovalDecision::Denied);
+    assert_eq!(
+        decision,
+        ApprovalDecision::Denied(neuralnote_core::ai::approval::ApprovalResolution::Cancelled)
+    );
     assert!(sink.0.iter().any(|event| matches!(
         event,
         ChatEvent::ToolApprovalResolved {
@@ -557,7 +559,8 @@ fn group_e_a_retry_after_two_denials_hard_rejects_rather_than_asking_again() {
     let judge = SpyClassifier::allowing();
     let mut gate = ApprovalGate::new(ApprovalPolicy::default());
 
-    let mut last = ApprovalDecision::Denied;
+    let mut last =
+        ApprovalDecision::Denied(neuralnote_core::ai::approval::ApprovalResolution::Denied);
     for attempt in 0..3 {
         let mut sink = VecSink::default();
         last = block_on(decide(
@@ -590,8 +593,11 @@ fn group_e_reversibility_is_enforced_not_documented() {
     // `Reversibility` has no `Default` and `reversibility()` has no wildcard arm,
     // so adding a `GatedTool` variant fails with E0004 until someone classifies
     // it. That is a COMPILE-time property and cannot be asserted from a test —
-    // it was verified by adding a throwaway variant and watching six matches go
-    // red (see the note on the const block in `approval/gated.rs`).
+    // it was verified by adding a throwaway variant and watching the remaining
+    // exhaustive matches go red (see `declare_gated_tools!` in
+    // `approval/gated.rs`, which also closes the way that variant could
+    // previously have been left OUT of the gated set and so un-gated outright
+    // while every test here stayed green).
     //
     // What a test CAN pin is the classification itself, so a silent
     // reclassification in a match arm reddens here as well as in the copy.
