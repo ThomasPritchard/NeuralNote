@@ -6,7 +6,7 @@
 //! core (not the Tauri shell) so coverage is measured where the behaviour is
 //! owned, and so a later Ollama client can reuse the same protocol plumbing.
 
-use crate::ai::events::{ChatEvent, EventSink};
+use crate::ai::events::{ChatEvent, EventSink, TokenUsage};
 use crate::ai::tool_stream::{self, ToolCallDelta, ToolTurnAccumulator};
 use crate::ai::{Completion, LlmMessage, LlmRequest, Role, ToolCall};
 use crate::error::{CoreError, CoreResult};
@@ -23,6 +23,62 @@ pub fn redact(text: &str, key: &str) -> String {
     }
 }
 
+/// What one streamed answer turn has accumulated so far: the answer text, and
+/// whether the provider's usage frame has been seen.
+///
+/// The two travel together because the caller needs both at end of stream and
+/// neither is derivable from the other. `usage_reported` is what lets the client
+/// report `None` exactly once for a turn the provider never metered — without it
+/// an unmetered turn would be indistinguishable from one whose report is still
+/// coming, and the run's total would silently omit it.
+#[derive(Debug, Default)]
+pub struct AnswerStream {
+    text: String,
+    usage_reported: bool,
+}
+
+impl AnswerStream {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Whether the provider reported this turn's token usage.
+    pub fn usage_reported(&self) -> bool {
+        self.usage_reported
+    }
+
+    /// The answer accumulated so far — byte-equal to the streamed `Answer` deltas.
+    pub fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub fn into_text(self) -> String {
+        self.text
+    }
+
+    /// Pass a frame's usage on to the sink, at most once per turn. A provider
+    /// that repeats the frame must not double-count the run.
+    fn report(&mut self, usage: Option<&WireUsage>, sink: &mut dyn EventSink) {
+        report_usage_once(&mut self.usage_reported, usage, sink);
+    }
+}
+
+/// Report a frame's usage to the sink unless this turn already reported.
+///
+/// Shared by both turns so they cannot drift on the one property the total
+/// depends on: **exactly one report per model call.** Two reports would double
+/// a turn's tokens; none would silently drop them from the run's total.
+fn report_usage_once(reported: &mut bool, usage: Option<&WireUsage>, sink: &mut dyn EventSink) {
+    if *reported {
+        return;
+    }
+    let Some(usage) = usage.and_then(WireUsage::to_token_usage) else {
+        return;
+    };
+    *reported = true;
+    sink.record_usage(Some(usage));
+}
+
 /// Process one SSE line into the sink + accumulator. `Ok(Some(answer))` means a
 /// terminal `[DONE]` was seen (stop reading); `Ok(None)` means keep reading; `Err`
 /// surfaces a mid-stream error frame. Shared by the newline loop and the EOF flush
@@ -30,9 +86,18 @@ pub fn redact(text: &str, key: &str) -> String {
 pub fn consume_sse_line(
     line_bytes: &[u8],
     sink: &mut dyn EventSink,
-    full: &mut String,
+    stream: &mut AnswerStream,
 ) -> CoreResult<Option<String>> {
-    match parse_sse_line(&String::from_utf8_lossy(line_bytes)) {
+    let line = String::from_utf8_lossy(line_bytes);
+    let classified = classify_sse_line(&line);
+    // Read usage off the raw chunk, before the answer classification: the usage
+    // frame carries an empty content delta (and, on the local lane, no choices at
+    // all), so every classification below resolves it to `Other` and would drop it.
+    if let SseLine::Chunk(chunk) = &classified {
+        stream.report(chunk.usage.as_ref(), sink);
+    }
+    let full = &mut stream.text;
+    match sse_event(classified) {
         SseEvent::Delta(delta) => {
             sink.send(ChatEvent::Answer {
                 delta: delta.clone(),
@@ -178,7 +243,14 @@ pub enum SseEvent {
 /// surfaced — mid-stream JSON noise (e.g. keep-alive artifacts) must not sink an
 /// otherwise-good answer.
 pub fn parse_sse_line(line: &str) -> SseEvent {
-    match classify_sse_line(line) {
+    sse_event(classify_sse_line(line))
+}
+
+/// What a classified line means on the answer turn. Split from
+/// [`parse_sse_line`] so [`consume_sse_line`] can read the frame's usage on the
+/// way past without classifying the line twice.
+fn sse_event(classified: SseLine) -> SseEvent {
+    match classified {
         SseLine::Ignorable => SseEvent::Other,
         SseLine::Done => SseEvent::Done,
         SseLine::Failed(message) => SseEvent::Error(message),
@@ -296,7 +368,14 @@ const MISSING_TOOL_CALL_INDEX: &str =
 
 /// Parse one line of a streamed tool-deciding turn. Pure, like [`parse_sse_line`].
 pub fn parse_tool_sse_line(line: &str) -> ToolSseEvent {
-    match classify_sse_line(line) {
+    tool_sse_event(classify_sse_line(line))
+}
+
+/// What a classified line means on the tool turn. Split for the same reason as
+/// [`sse_event`]: the usage frame has to be read before the classification
+/// resolves it to `Other`.
+fn tool_sse_event(classified: SseLine) -> ToolSseEvent {
+    match classified {
         SseLine::Ignorable => ToolSseEvent::Other,
         SseLine::Done => ToolSseEvent::Done,
         SseLine::Failed(message) => ToolSseEvent::Failed(message),
@@ -362,7 +441,18 @@ pub fn consume_tool_sse_line(
     accumulator: &mut ToolTurnAccumulator,
     sink: &mut dyn EventSink,
 ) -> CoreResult<bool> {
-    match parse_tool_sse_line(&String::from_utf8_lossy(line_bytes)) {
+    let line = String::from_utf8_lossy(line_bytes);
+    let classified = classify_sse_line(&line);
+    // Before classification, for the same reason as the answer turn: the captured
+    // OpenRouter usage frame rides on the terminal `finish_reason: "error"` chunk,
+    // which classifies as a turn failure and would take the measurement with it.
+    if let SseLine::Chunk(chunk) = &classified {
+        accumulator.report_usage(
+            chunk.usage.as_ref().and_then(WireUsage::to_token_usage),
+            sink,
+        );
+    }
+    match tool_sse_event(classified) {
         ToolSseEvent::Delta { content, fragments } => {
             if let Some(content) = content {
                 accumulator.push_content(&content);
@@ -425,6 +515,58 @@ struct WireOptions {
     num_ctx: u32,
 }
 
+/// The OpenAI-compatible ask for a usage frame on a streamed response.
+///
+/// **Not optional cosmetics on the local lane — it is the only way to get token
+/// counts there at all.** Probed against Ollama 0.31.1 with the exact body this
+/// client sends: without it, 249 frames and no `usage` object anywhere; with it,
+/// a final `{"choices":[],"usage":{...}}` frame. OpenRouter reports usage on the
+/// streaming path either way (its own docs now call both this and
+/// `usage: {include: true}` deprecated and inert), so sending it always keeps one
+/// code path instead of sniffing the provider.
+///
+/// Only ever sent on a streamed request: the OpenAI schema rejects
+/// `stream_options` without `stream`, and on a buffered response the usage object
+/// is already in the body.
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
+}
+
+/// The provider's token report. Both counts are `Option` and neither is
+/// defaulted: a frame missing one yields no measurement rather than a zero, so a
+/// wire shape we did not anticipate degrades to *absent* and never to a number
+/// the footer would show as real. (The pre-existing `"usage":{}` frame in the
+/// answer-stream tests lands here and correctly produces nothing.)
+#[derive(Debug, Deserialize)]
+struct WireUsage {
+    #[serde(default)]
+    prompt_tokens: Option<u32>,
+    #[serde(default)]
+    completion_tokens: Option<u32>,
+}
+
+impl WireUsage {
+    fn to_token_usage(&self) -> Option<TokenUsage> {
+        Some(TokenUsage {
+            tokens_in: self.prompt_tokens?,
+            tokens_out: self.completion_tokens?,
+        })
+    }
+}
+
+/// The token usage a buffered (non-streamed) response reported, if any.
+///
+/// Read separately from [`parse_completion`] rather than folded into
+/// [`Completion`]: what the model *said* and what the call *cost* are two
+/// different facts, and the ~40 places that build a `Completion` have nothing to
+/// say about the second.
+pub fn parse_usage(value: &serde_json::Value) -> Option<TokenUsage> {
+    serde_json::from_value::<WireUsage>(value.get("usage")?.clone())
+        .ok()?
+        .to_token_usage()
+}
+
 #[derive(Serialize)]
 struct WireRequest<'a> {
     model: &'a str,
@@ -434,6 +576,10 @@ struct WireRequest<'a> {
     #[serde(skip_serializing_if = "<[_]>::is_empty")]
     tools: &'a [serde_json::Value],
     stream: bool,
+    /// Asks for the streamed turn's token usage. Present on every streamed
+    /// request and omitted from every buffered one — see [`StreamOptions`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     /// Set only for the local (Ollama) provider to size its context window; omitted
     /// for OpenRouter.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -460,6 +606,9 @@ impl<'a> WireRequest<'a> {
             messages: req.messages.iter().map(WireMessage::from_core).collect(),
             tools: &req.tools,
             stream,
+            stream_options: stream.then_some(StreamOptions {
+                include_usage: true,
+            }),
             options: num_ctx.map(|num_ctx| WireOptions { num_ctx }),
             max_tokens,
             reasoning: reasoning.then_some(ReasoningRequest { enabled: true }),
@@ -558,6 +707,11 @@ struct WireRespFn {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    /// The turn's token report, on the final chunk. On the local lane that chunk
+    /// carries no choices at all; on OpenRouter it rides on the last content
+    /// frame — so it is read off the chunk, never inferred from the choice.
+    #[serde(default)]
+    usage: Option<WireUsage>,
     /// Present on a mid-stream failure frame. OpenRouter commits HTTP 200 on the
     /// first token, so a later failure (rate-limit, out-of-credits, provider 5xx,
     /// content filter) arrives in-band here — it MUST be surfaced, not ignored.
@@ -709,6 +863,27 @@ mod tests {
     }
 
     #[test]
+    fn a_streamed_request_asks_for_usage_and_a_buffered_one_does_not() {
+        // The local lane reports no tokens at all without this — probed against
+        // Ollama 0.31.1 with this exact body. It is confined to streamed requests
+        // because the OpenAI schema rejects `stream_options` without `stream`,
+        // and a buffered response already carries `usage` in its body.
+        let req = LlmRequest {
+            model: "qwen3.5:9b".into(),
+            messages: vec![LlmMessage::user("q")],
+            tools: Vec::new(),
+        };
+        let streamed = to_wire_request(&req, true, None, None, false);
+        assert_eq!(streamed["stream_options"]["include_usage"], true);
+
+        let buffered = to_wire_request(&req, false, None, None, false);
+        assert!(
+            buffered.get("stream_options").is_none(),
+            "stream_options must never ride on a non-streamed request"
+        );
+    }
+
+    #[test]
     fn wire_request_sets_num_ctx_only_when_provided() {
         let req = LlmRequest {
             model: "qwen2.5:7b".into(),
@@ -777,6 +952,19 @@ mod tests {
         }
     }
 
+    /// A sink that keeps every usage report in order, so a test can tell one
+    /// report from two and `Some` from `None`.
+    #[derive(Default)]
+    struct MeteringSink {
+        reports: Vec<Option<TokenUsage>>,
+    }
+    impl EventSink for MeteringSink {
+        fn send(&mut self, _event: ChatEvent) {}
+        fn record_usage(&mut self, usage: Option<TokenUsage>) {
+            self.reports.push(usage);
+        }
+    }
+
     #[test]
     fn redact_removes_the_key_everywhere_it_appears() {
         let key = "sk-or-secret-123";
@@ -815,7 +1003,7 @@ mod tests {
     #[test]
     fn consume_sse_line_streams_delta_and_accumulates() {
         let mut sink = VecSink::default();
-        let mut full = String::new();
+        let mut full = AnswerStream::new();
         let stop = consume_sse_line(
             br#"data: {"choices":[{"delta":{"content":"Hi"}}]}"#,
             &mut sink,
@@ -823,7 +1011,7 @@ mod tests {
         )
         .unwrap();
         assert!(stop.is_none());
-        assert_eq!(full, "Hi");
+        assert_eq!(full.text(), "Hi");
         assert_eq!(sink.0.len(), 1);
         match &sink.0[0] {
             ChatEvent::Answer { delta } => assert_eq!(delta.as_str(), "Hi"),
@@ -834,7 +1022,7 @@ mod tests {
     #[test]
     fn consume_sse_line_error_frame_returns_err() {
         let mut sink = VecSink::default();
-        let mut full = String::from("partial");
+        let mut full = AnswerStream::new();
         assert!(
             consume_sse_line(
                 br#"data: {"error":{"message":"boom"}}"#,
@@ -849,7 +1037,13 @@ mod tests {
     #[test]
     fn consume_sse_line_done_returns_the_accumulated_answer() {
         let mut sink = VecSink::default();
-        let mut full = String::from("done text");
+        let mut full = AnswerStream::new();
+        consume_sse_line(
+            br#"data: {"choices":[{"delta":{"content":"done text"}}]}"#,
+            &mut sink,
+            &mut full,
+        )
+        .unwrap();
         let stop = consume_sse_line(b"data: [DONE]", &mut sink, &mut full).unwrap();
         assert_eq!(stop.as_deref(), Some("done text"));
     }
@@ -936,7 +1130,7 @@ mod tests {
         // Reasoning streams to the sink as Thinking, but never enters `full` — so the
         // returned answer stays byte-equal to the Answer deltas.
         let mut sink = VecSink::default();
-        let mut full = String::new();
+        let mut full = AnswerStream::new();
         let stop = consume_sse_line(
             br#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"hmm"}]}}]}"#,
             &mut sink,
@@ -945,7 +1139,7 @@ mod tests {
         .unwrap();
         assert!(stop.is_none());
         assert!(
-            full.is_empty(),
+            full.text().is_empty(),
             "reasoning must not accumulate into the answer"
         );
         match sink.0.as_slice() {
@@ -960,7 +1154,7 @@ mod tests {
         // A frame carrying both must surface both — dropping the content would lose an
         // answer token, and with it any citation marker riding on it.
         let mut sink = VecSink::default();
-        let mut full = String::new();
+        let mut full = AnswerStream::new();
         let stop = consume_sse_line(
             br#"data: {"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"so"}],"content":"[e1] Plants"}}]}"#,
             &mut sink,
@@ -968,7 +1162,11 @@ mod tests {
         )
         .unwrap();
         assert!(stop.is_none());
-        assert_eq!(full, "[e1] Plants", "the answer token must not be dropped");
+        assert_eq!(
+            full.text(),
+            "[e1] Plants",
+            "the answer token must not be dropped"
+        );
         match sink.0.as_slice() {
             [ChatEvent::Thinking { delta: thinking }, ChatEvent::Answer { delta: answer }] => {
                 assert_eq!(thinking, "so");
@@ -982,14 +1180,14 @@ mod tests {
     fn a_plain_string_reasoning_frame_with_content_keeps_both() {
         // Same guarantee for the legacy plain-string `reasoning` shape.
         let mut sink = VecSink::default();
-        let mut full = String::new();
+        let mut full = AnswerStream::new();
         consume_sse_line(
             br#"data: {"choices":[{"delta":{"reasoning":"weighing","content":"Sugar."}}]}"#,
             &mut sink,
             &mut full,
         )
         .unwrap();
-        assert_eq!(full, "Sugar.");
+        assert_eq!(full.text(), "Sugar.");
         assert_eq!(sink.0.len(), 2, "both a Thinking and an Answer event");
     }
 
@@ -998,7 +1196,7 @@ mod tests {
         // A stream that reasons at length and then produces no answer is still a
         // failure: reasoning never satisfies finish_answer's empty-answer guard.
         let mut sink = VecSink::default();
-        let mut full = String::new();
+        let mut full = AnswerStream::new();
         for text in ["Let me ", "think about ", "this"] {
             let line = format!(
                 r#"data: {{"choices":[{{"delta":{{"reasoning_details":[{{"type":"reasoning.text","text":"{text}"}}]}}}}]}}"#
@@ -1087,7 +1285,14 @@ mod tests {
     #[test]
     fn consume_sse_line_length_finish_flags_truncation_without_content() {
         let mut sink = VecSink::default();
-        let mut full = String::from("partial answer");
+        let mut full = AnswerStream::new();
+        consume_sse_line(
+            br#"data: {"choices":[{"delta":{"content":"partial answer"}}]}"#,
+            &mut sink,
+            &mut full,
+        )
+        .unwrap();
+        sink.0.clear();
         let stop = consume_sse_line(
             br#"data: {"choices":[{"delta":{"content":""},"finish_reason":"length"}]}"#,
             &mut sink,
@@ -1097,7 +1302,7 @@ mod tests {
         // Not terminal: `[DONE]`/EOF still ends the stream. The accumulated answer is
         // untouched, and a single AnswerTruncated event is surfaced.
         assert!(stop.is_none());
-        assert_eq!(full, "partial answer");
+        assert_eq!(full.text(), "partial answer");
         match sink.0.as_slice() {
             [ChatEvent::AnswerTruncated] => {}
             other => panic!("expected a single AnswerTruncated event, got {other:?}"),
@@ -1111,14 +1316,21 @@ mod tests {
         // Answer deltas, and a severed marker is preserved verbatim (to be dropped later
         // by the citation parser, never emitted as a citation).
         let mut sink = VecSink::default();
-        let mut full = String::from("Sugar is sweet");
+        let mut full = AnswerStream::new();
+        consume_sse_line(
+            br#"data: {"choices":[{"delta":{"content":"Sugar is sweet"}}]}"#,
+            &mut sink,
+            &mut full,
+        )
+        .unwrap();
+        sink.0.clear();
         consume_sse_line(
             br#"data: {"choices":[{"delta":{"content":" and salt [e2"},"finish_reason":"length"}]}"#,
             &mut sink,
             &mut full,
         )
         .unwrap();
-        assert_eq!(full, "Sugar is sweet and salt [e2");
+        assert_eq!(full.text(), "Sugar is sweet and salt [e2");
         match sink.0.as_slice() {
             [ChatEvent::Answer { delta }, ChatEvent::AnswerTruncated] => {
                 assert_eq!(delta, " and salt [e2");
@@ -1141,7 +1353,7 @@ mod tests {
         // ASCII) to prove reassembly, exactly as the shell's byte-buffer loop does.
         let bytes = wire.as_bytes();
         let mut sink = VecSink::default();
-        let mut full = String::new();
+        let mut full = AnswerStream::new();
         let mut buf: Vec<u8> = Vec::new();
         let mut answer: Option<String> = None;
         for chunk in [&bytes[..40], &bytes[40..95], &bytes[95..]] {
@@ -1154,7 +1366,7 @@ mod tests {
             }
         }
         assert_eq!(answer.as_deref(), Some("Photosynthesis needs light [e1"));
-        assert_eq!(full, "Photosynthesis needs light [e1");
+        assert_eq!(full.text(), "Photosynthesis needs light [e1");
         assert!(
             sink.0
                 .iter()
@@ -1182,6 +1394,142 @@ mod tests {
             ToolSseEvent::Delta { fragments, .. } => fragments,
             _ => panic!("expected tool-call fragments from {line}"),
         }
+    }
+
+    /* ─────────────────────────  What a turn actually cost  ───────────────────── */
+
+    /// A real streamed answer turn from the LOCAL lane (Ollama 0.31.1), captured
+    /// with the body this client sends plus `stream_options`. It is here for one
+    /// wire fact the OpenRouter capture cannot settle: the local usage frame
+    /// carries an EMPTY `choices` array, so any parse that reads the choice first
+    /// throws the measurement away.
+    const LOCAL_CAPTURE: &str = include_str!("fixtures/ollama_answer_stream.sse");
+
+    fn captured_local_frame(predicate: impl Fn(&str) -> bool) -> &'static str {
+        LOCAL_CAPTURE
+            .lines()
+            .find(|line| line.starts_with("data:") && predicate(line))
+            .expect("the local capture still contains this frame")
+    }
+
+    #[test]
+    fn the_captured_openrouter_usage_frame_reports_the_turn_it_priced() {
+        // The capture's usage frame rides on the terminal `finish_reason: "error"`
+        // chunk. The turn still fails — but its price is read off first, rather
+        // than being thrown away with the failure.
+        let frame = captured_frame(|line| line.contains(r#""usage""#));
+        let mut sink = MeteringSink::default();
+        let mut accumulator = ToolTurnAccumulator::new();
+        let outcome = consume_tool_sse_line(frame.as_bytes(), &mut accumulator, &mut sink);
+
+        assert!(outcome.is_err(), "the frame still fails the turn");
+        assert_eq!(
+            sink.reports,
+            vec![Some(TokenUsage {
+                tokens_in: 217,
+                tokens_out: 17_572,
+            })]
+        );
+        assert!(accumulator.usage_reported());
+    }
+
+    #[test]
+    fn the_captured_local_usage_frame_is_read_despite_carrying_no_choices() {
+        let frame = captured_local_frame(|line| line.contains(r#""usage""#));
+        assert!(
+            frame.contains(r#""choices":[]"#),
+            "the local usage frame is the empty-choices shape this test exists for"
+        );
+        let mut sink = MeteringSink::default();
+        let mut stream = AnswerStream::new();
+        consume_sse_line(frame.as_bytes(), &mut sink, &mut stream).unwrap();
+
+        assert_eq!(
+            sink.reports,
+            vec![Some(TokenUsage {
+                tokens_in: 17,
+                tokens_out: 153,
+            })]
+        );
+        assert!(stream.usage_reported());
+    }
+
+    #[test]
+    fn a_whole_local_answer_stream_reports_its_price_exactly_once() {
+        let mut sink = MeteringSink::default();
+        let mut stream = AnswerStream::new();
+        for line in LOCAL_CAPTURE.lines() {
+            if consume_sse_line(line.as_bytes(), &mut sink, &mut stream)
+                .unwrap()
+                .is_some()
+            {
+                break;
+            }
+        }
+        // Exactly one report per model call is what makes a run's total addable.
+        assert_eq!(sink.reports.len(), 1);
+        assert!(!stream.text().is_empty(), "the answer still streamed");
+    }
+
+    #[test]
+    fn an_unpriced_stream_reports_nothing_rather_than_a_zero() {
+        // The pre-existing `"usage":{}` frame: an object with no counts in it is
+        // not a measurement of nothing, it is the absence of a measurement.
+        let mut sink = MeteringSink::default();
+        let mut stream = AnswerStream::new();
+        consume_sse_line(
+            br#"data: {"choices":[{"delta":{"content":"hi"}}],"usage":{}}"#,
+            &mut sink,
+            &mut stream,
+        )
+        .unwrap();
+        assert!(sink.reports.is_empty());
+        assert!(!stream.usage_reported());
+    }
+
+    #[test]
+    fn a_half_reported_usage_frame_is_no_measurement_at_all() {
+        // Rather than defaulting the missing side to 0 — which would put a
+        // fabricated number in a cost footer.
+        let mut sink = MeteringSink::default();
+        let mut stream = AnswerStream::new();
+        consume_sse_line(
+            br#"data: {"choices":[],"usage":{"prompt_tokens":17}}"#,
+            &mut sink,
+            &mut stream,
+        )
+        .unwrap();
+        assert!(sink.reports.is_empty());
+    }
+
+    #[test]
+    fn a_repeated_usage_frame_prices_the_turn_once() {
+        let frame = captured_local_frame(|line| line.contains(r#""usage""#));
+        let mut sink = MeteringSink::default();
+        let mut stream = AnswerStream::new();
+        consume_sse_line(frame.as_bytes(), &mut sink, &mut stream).unwrap();
+        consume_sse_line(frame.as_bytes(), &mut sink, &mut stream).unwrap();
+        assert_eq!(sink.reports.len(), 1, "a repeat must not double the turn");
+    }
+
+    #[test]
+    fn a_buffered_response_is_priced_from_its_body_or_not_at_all() {
+        let priced = serde_json::json!({
+            "choices": [{ "message": { "content": "hi" } }],
+            "usage": { "prompt_tokens": 11, "completion_tokens": 3, "total_tokens": 14 },
+        });
+        assert_eq!(
+            parse_usage(&priced),
+            Some(TokenUsage {
+                tokens_in: 11,
+                tokens_out: 3
+            })
+        );
+        assert_eq!(
+            parse_usage(&serde_json::json!({ "choices": [] })),
+            None,
+            "a response with no usage object prices nothing"
+        );
     }
 
     #[test]

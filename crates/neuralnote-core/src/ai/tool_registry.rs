@@ -20,6 +20,7 @@ pub const TOOL_FETCH_CAPTIONS: &str = "fetch_captions";
 pub const TOOL_TRANSCRIBE_AUDIO: &str = "transcribe_audio";
 pub const TOOL_SELECT_PLAYLIST_VIDEOS: &str = "select_playlist_videos";
 pub const TOOL_RESOLVE_DISTIL_ROUTE: &str = "resolve_distil_route";
+pub const TOOL_UPDATE_PLAN: &str = "update_plan";
 
 /// The label shown for a name that is not a registered tool. The model can invent
 /// one; the call is rejected, but it still gets a timeline node — with a title we
@@ -45,12 +46,13 @@ pub enum RegisteredTool {
     TranscribeAudio,
     SelectPlaylistVideos,
     ResolveDistilRoute,
+    UpdatePlan,
 }
 
 impl RegisteredTool {
     /// Every registered tool, for callers that need the whole set (schema/registry
     /// agreement checks, and the tests that keep this table honest).
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 14] = [
         Self::ListNotes,
         Self::ListFolders,
         Self::SearchNotes,
@@ -64,6 +66,7 @@ impl RegisteredTool {
         Self::TranscribeAudio,
         Self::SelectPlaylistVideos,
         Self::ResolveDistilRoute,
+        Self::UpdatePlan,
     ];
 
     /// The model-facing wire name.
@@ -82,6 +85,7 @@ impl RegisteredTool {
             Self::TranscribeAudio => TOOL_TRANSCRIBE_AUDIO,
             Self::SelectPlaylistVideos => TOOL_SELECT_PLAYLIST_VIDEOS,
             Self::ResolveDistilRoute => TOOL_RESOLVE_DISTIL_ROUTE,
+            Self::UpdatePlan => TOOL_UPDATE_PLAN,
         }
     }
 
@@ -102,6 +106,7 @@ impl RegisteredTool {
             Self::TranscribeAudio => "Transcribe audio",
             Self::SelectPlaylistVideos => "Choose playlist videos",
             Self::ResolveDistilRoute => "Choose transcript source",
+            Self::UpdatePlan => "Plan",
         }
     }
 

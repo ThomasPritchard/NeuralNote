@@ -83,13 +83,23 @@ impl ToolTurnReader {
             let tail = std::mem::take(&mut self.buf);
             consume_tool_sse_line(&tail, &mut self.accumulator, sink)?;
         }
+        let metered = self.accumulator.usage_reported();
         let completion = self.accumulator.finish(sink)?;
         // Prose alone is a real answer — the model declining to call a tool — and
         // must NOT trigger a fallback that would bill a second turn and could
         // answer differently. Only a turn that carried nothing at all is one the
         // provider failed to stream.
         if completion.content.is_none() && completion.tool_calls.is_empty() {
+            // Deliberately silent on usage: this turn did not happen as far as the
+            // run is concerned, and the buffered call that replaces it reports its
+            // own. Saying "unmetered" here would write off a total the fallback is
+            // about to supply.
             return Ok(StreamedToolTurn::NotStreamed);
+        }
+        if !metered {
+            // The turn completed and the provider never priced it. Say so, so the
+            // run's total comes out absent rather than quietly missing this turn.
+            sink.record_usage(None);
         }
         Ok(StreamedToolTurn::Completed(completion))
     }

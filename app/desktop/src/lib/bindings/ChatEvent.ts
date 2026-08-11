@@ -6,6 +6,8 @@ import type { ApprovalRule } from "./ApprovalRule";
 import type { ElicitOption } from "./ElicitOption";
 import type { GatedTool } from "./GatedTool";
 import type { NoteKind } from "./NoteKind";
+import type { PlanStep } from "./PlanStep";
+import type { StepStatus } from "./StepStatus";
 import type { ToolStatus } from "./ToolStatus";
 
 /**
@@ -76,4 +78,4 @@ relPath: string | null,
 /**
  * A compiled-in reason, never free text and never model prose.
  */
-reason: ApprovalReason, expiresInSecs: number, } | { "type": "toolAutoApproved", id: string, tool: GatedTool, rule: ApprovalRule, } | { "type": "toolApprovalResolved", id: string, decision: ApprovalResolution, } | { "type": "toolApprovalDegraded", reason: ApprovalDegradedReason, } | { "type": "searching", query: string, } | { "type": "retrieved", query: string, hitCount: number, } | { "type": "reading", relPath: string, startLine: number, endLine: number, } | { "type": "thinking", delta: string, } | { "type": "verifying" } | { "type": "citationDropped", reason: string, } | { "type": "answer", delta: string, } | { "type": "answerTruncated" } | { "type": "citation", id: string, relPath: string, startLine: number, endLine: number, text: string, } | { "type": "coverage", searchedTerms: Array<string>, notesRead: Array<string>, truncated: boolean, skippedFiles: number, } | { "type": "error", message: string, } | { "type": "done" };
+reason: ApprovalReason, expiresInSecs: number, } | { "type": "toolAutoApproved", id: string, tool: GatedTool, rule: ApprovalRule, } | { "type": "toolApprovalResolved", id: string, decision: ApprovalResolution, } | { "type": "toolApprovalDegraded", reason: ApprovalDegradedReason, } | { "type": "searching", query: string, } | { "type": "retrieved", query: string, hitCount: number, } | { "type": "reading", relPath: string, startLine: number, endLine: number, } | { "type": "thinking", delta: string, } | { "type": "verifying" } | { "type": "citationDropped", reason: string, } | { "type": "answer", delta: string, } | { "type": "answerTruncated" } | { "type": "citation", id: string, relPath: string, startLine: number, endLine: number, text: string, } | { "type": "coverage", searchedTerms: Array<string>, notesRead: Array<string>, truncated: boolean, skippedFiles: number, } | { "type": "plan", steps: Array<PlanStep>, } | { "type": "planStepStatus", id: string, status: StepStatus, } | { "type": "usage", elapsedMs: number, tokensIn: number | null, tokensOut: number | null, model: string, } | { "type": "error", message: string, } | { "type": "done" };

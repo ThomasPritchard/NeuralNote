@@ -379,6 +379,42 @@ export function reduceAssistant(
           skippedFiles: event.skippedFiles,
         },
       };
+    case "plan":
+      // Replaces rather than merges, because the backend only ever declares
+      // once: `RunPlan::update` returns `declared: Some(..)` on the first
+      // accepted call and `None` on every later one, so a second `plan` event
+      // cannot reach us with a different set.
+      return {
+        ...turn,
+        planSteps: event.steps.map((step) => ({ ...step, status: "pending" })),
+      };
+    case "planStepStatus":
+      // An id with no declared step is a no-op, and deliberately not appended
+      // the way `withApproval`/`withSettlement` append theirs. Those two have to
+      // cope with an update arriving before its opener; this one cannot, because
+      // `plan.rs::same_steps` refuses any call whose step set differs and emits
+      // nothing (`a_refused_update_leaves_the_declared_plan_untouched`). A
+      // placeholder branch here would be a row with no label — the one thing a
+      // plan step consists of — defending against a state the wire cannot carry.
+      return {
+        ...turn,
+        planSteps: turn.planSteps.map((step) =>
+          step.id === event.id ? { ...step, status: event.status } : step,
+        ),
+      };
+    case "usage":
+      // Nulls are carried through untouched: `tokensIn`/`tokensOut` are absent
+      // when the provider did not report them, and coercing that to 0 here
+      // would manufacture a measurement the run never made.
+      return {
+        ...turn,
+        usage: {
+          elapsedMs: event.elapsedMs,
+          tokensIn: event.tokensIn,
+          tokensOut: event.tokensOut,
+          model: event.model,
+        },
+      };
     case "error":
       // A run ends on `error` too — mark it done so the working indicator
       // clears, but keep the message visible.

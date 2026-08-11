@@ -26,7 +26,7 @@
 //!
 //! [`LlmClient::complete`]: crate::ai::llm::LlmClient::complete
 
-use crate::ai::events::{ChatEvent, EventSink};
+use crate::ai::events::{ChatEvent, EventSink, TokenUsage};
 use crate::ai::llm::{Completion, ToolCall};
 use crate::ai::partial_json::PartialObject;
 use crate::ai::tool_registry::TOOL_WRITE_NOTE;
@@ -71,6 +71,12 @@ pub struct ToolCallDelta {
 pub struct ToolTurnAccumulator {
     content: String,
     calls: BTreeMap<u32, PendingCall>,
+    /// Whether this turn's token usage has already gone to the sink. The run's
+    /// total needs exactly one report per model call, so a repeated frame must
+    /// not double-count — and a turn the provider never metered must still be
+    /// reported as unmetered, which is what [`Self::usage_reported`] tells the
+    /// reader to do.
+    usage_reported: bool,
 }
 
 #[derive(Debug, Default)]
@@ -122,6 +128,27 @@ impl ToolTurnAccumulator {
     /// so a streamed turn returns the same [`Completion`] shape as a buffered one.
     pub fn push_content(&mut self, delta: &str) {
         self.content.push_str(delta);
+    }
+
+    /// Pass this turn's token report to the sink, at most once.
+    ///
+    /// `None` is a frame that carried no usage, not a turn that carried none —
+    /// it is ignored here, and the *reader* is what reports an unmetered turn
+    /// once the stream has actually ended.
+    pub fn report_usage(&mut self, usage: Option<TokenUsage>, sink: &mut dyn EventSink) {
+        if self.usage_reported {
+            return;
+        }
+        let Some(usage) = usage else {
+            return;
+        };
+        self.usage_reported = true;
+        sink.record_usage(Some(usage));
+    }
+
+    /// Whether the provider metered this turn.
+    pub fn usage_reported(&self) -> bool {
+        self.usage_reported
     }
 
     /// Fold in one tool-call fragment, emitting a live preview when the call is
@@ -257,6 +284,13 @@ impl EventSink for LivePreviews<'_> {
             _ => {}
         }
         self.inner.send(event);
+    }
+
+    /// Forwarded, not defaulted. This sink sits between the streaming client and
+    /// the orchestrator's meter on BOTH tool-turn paths, so swallowing here would
+    /// silently cost every real run its token counts.
+    fn record_usage(&mut self, usage: Option<TokenUsage>) {
+        self.inner.record_usage(usage);
     }
 }
 

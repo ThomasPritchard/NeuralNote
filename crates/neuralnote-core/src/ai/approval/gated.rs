@@ -355,7 +355,10 @@ mod tests {
                 | RegisteredTool::SearchNotes
                 | RegisteredTool::ReadNoteSpan
                 | RegisteredTool::SkillStep
-                | RegisteredTool::AskUser => Expected::Ungated,
+                | RegisteredTool::AskUser
+                // Declaring a plan changes nothing outside the timeline: no
+                // write, no fetch, no process, and no widening of any grant.
+                | RegisteredTool::UpdatePlan => Expected::Ungated,
                 RegisteredTool::WriteNote
                 | RegisteredTool::UseSkill
                 | RegisteredTool::SelectPlaylistVideos

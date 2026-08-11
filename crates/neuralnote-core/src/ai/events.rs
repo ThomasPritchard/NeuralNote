@@ -15,6 +15,7 @@ use ts_rs::TS;
 use crate::ai::approval::{
     ApprovalDegradedReason, ApprovalReason, ApprovalResolution, ApprovalRule, GatedTool,
 };
+use crate::ai::plan::{PlanStep, StepStatus};
 use crate::ai::write_policy::NoteKind;
 
 /// One selectable answer shown by an [`Elicitation`]. Images stay data URIs so a
@@ -271,10 +272,54 @@ pub enum ChatEvent {
         truncated: bool,
         skipped_files: u32,
     },
+    /// The model declared the steps it intends to take, before acting on them.
+    /// Emitted at most once per run: [`crate::ai::plan::RunPlan`] refuses a second
+    /// declaration, so the UI never has to re-parent nodes already affiliated
+    /// with a step id.
+    ///
+    /// Every declared step starts [`StepStatus::Pending`]; only departures from
+    /// that arrive as [`ChatEvent::PlanStepStatus`].
+    Plan { steps: Vec<PlanStep> },
+    /// A declared step moved. `id` is the step's own id from [`ChatEvent::Plan`].
+    PlanStepStatus { id: String, status: StepStatus },
+    /// What the run cost. Emitted exactly once, immediately before
+    /// [`ChatEvent::Done`].
+    ///
+    /// The token counts are `Option` because a provider may report none — the
+    /// local (Ollama) lane reports nothing unless asked, and a client that has
+    /// not been taught to meter reports nothing at all. **An absent count must
+    /// render as absent, never as `0`:** a zero here would read as a real
+    /// measurement of a run that cost nothing. They are absent together or
+    /// present together, because [`UsageMeter`](crate::ai::orchestrator) only
+    /// totals a run in which *every* model call reported — a partial total is a
+    /// wrong number, which is worse than no number.
+    ///
+    /// `elapsed_ms` is never optional: the run's own duration is always known.
+    Usage {
+        elapsed_ms: u64,
+        tokens_in: Option<u32>,
+        tokens_out: Option<u32>,
+        model: String,
+    },
     /// A fatal, user-facing error ended the run.
     Error { message: String },
     /// The run completed successfully.
     Done,
+}
+
+/// What one model call cost, as the provider reported it.
+///
+/// Deliberately **not** a [`ChatEvent`]: this is metering travelling from the
+/// transport back to the orchestrator, not a UI event. The orchestrator totals
+/// these and emits the single user-facing [`ChatEvent::Usage`].
+///
+/// Both counts are required. A provider either reported a usage frame or it did
+/// not — [`EventSink::record_usage`] carries that distinction in its `Option`, so
+/// there is no third state where half a measurement gets rendered as a whole one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct TokenUsage {
+    pub tokens_in: u32,
+    pub tokens_out: u32,
 }
 
 /// Where [`ChatEvent`]s go. The host app implements this over a Tauri channel;
@@ -283,6 +328,24 @@ pub enum ChatEvent {
 /// design — an event stream must not fail mid-run.
 pub trait EventSink: Send {
     fn send(&mut self, event: ChatEvent);
+
+    /// Report what one model call cost — `None` when the provider said nothing.
+    ///
+    /// This is the transport's only channel back to the orchestrator besides its
+    /// return value, and it carries metering rather than a UI event, which is why
+    /// it is a separate method taking a [`TokenUsage`] instead of a
+    /// [`ChatEvent::Usage`]. An implementation must call it **once per completed
+    /// model call**, passing `None` when the provider reported no usage: that is
+    /// what lets the orchestrator tell "nothing reported" apart from "everything
+    /// reported and the total is this".
+    ///
+    /// **The default discards, and that is the honest degradation.** A sink that
+    /// does not meter — and a wrapper sink that forgets to forward — costs the
+    /// footer its token counts, which then render as *absent*. It can never
+    /// produce a wrong number, only no number. Every wrapper sink in this crate
+    /// forwards; `usage_survives_the_whole_sink_stack` in `orchestrator.rs` is
+    /// the test that proves the real stack still does.
+    fn record_usage(&mut self, _usage: Option<TokenUsage>) {}
 }
 
 /// A test [`EventSink`] that collects every event for assertions.
@@ -717,6 +780,118 @@ mod tests {
                 expires_in_secs: 120,
             }
         );
+    }
+
+    #[test]
+    fn plan_carries_its_declared_steps_in_the_frozen_camel_case_shape() {
+        use crate::ai::plan::PlanStep;
+
+        let event = ChatEvent::Plan {
+            steps: vec![
+                PlanStep {
+                    id: "s1".into(),
+                    label: "Search the vault".into(),
+                },
+                PlanStep {
+                    id: "s2".into(),
+                    label: "Read the best matches".into(),
+                },
+            ],
+        };
+        assert_eq!(
+            json(&event),
+            serde_json::json!({
+                "type": "plan",
+                "steps": [
+                    { "id": "s1", "label": "Search the vault" },
+                    { "id": "s2", "label": "Read the best matches" },
+                ],
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn plan_step_status_serialises_every_state_as_camel_case() {
+        use crate::ai::plan::StepStatus;
+
+        for (status, expected) in [
+            (StepStatus::Pending, "pending"),
+            (StepStatus::Running, "running"),
+            (StepStatus::Done, "done"),
+            (StepStatus::Skipped, "skipped"),
+            (StepStatus::Failed, "failed"),
+        ] {
+            assert_eq!(
+                json(&ChatEvent::PlanStepStatus {
+                    id: "s1".into(),
+                    status,
+                }),
+                serde_json::json!({
+                    "type": "planStepStatus",
+                    "id": "s1",
+                    "status": expected,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn usage_renames_every_field_to_camel_case() {
+        let event = ChatEvent::Usage {
+            elapsed_ms: 24_100,
+            tokens_in: Some(8_412),
+            tokens_out: Some(611),
+            model: "anthropic/claude-sonnet-4.5".into(),
+        };
+        assert_eq!(
+            json(&event),
+            serde_json::json!({
+                "type": "usage",
+                "elapsedMs": 24_100,
+                "tokensIn": 8_412,
+                "tokensOut": 611,
+                "model": "anthropic/claude-sonnet-4.5",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn unreported_token_counts_stay_null_and_never_become_zero() {
+        // The whole point of the phase: the local lane may report nothing, and a
+        // `0` on the wire would render as a real measurement of a run that cost
+        // nothing. The elapsed time is still known and still reported.
+        let value = json(&ChatEvent::Usage {
+            elapsed_ms: 812,
+            tokens_in: None,
+            tokens_out: None,
+            model: "qwen3.5:9b".into(),
+        });
+        assert_eq!(value["tokensIn"], serde_json::Value::Null);
+        assert_eq!(value["tokensOut"], serde_json::Value::Null);
+        assert_ne!(value["tokensIn"], 0);
+        assert_ne!(value["tokensOut"], 0);
+        assert_eq!(value["elapsedMs"], 812);
+    }
+
+    #[test]
+    fn a_sink_that_does_not_meter_discards_usage_rather_than_failing() {
+        // The default `record_usage` is what keeps every existing sink compiling
+        // and every unmetered client honest: no number, never a wrong one.
+        let mut sink = VecSink::default();
+        sink.record_usage(Some(TokenUsage {
+            tokens_in: 10,
+            tokens_out: 2,
+        }));
+        sink.record_usage(None);
+        assert!(sink.events.is_empty());
     }
 
     #[test]

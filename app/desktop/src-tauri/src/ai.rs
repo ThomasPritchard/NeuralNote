@@ -16,7 +16,7 @@ use neuralnote_core::ai::{openai, provider_config, tool_stream};
 use neuralnote_core::ai::{
     openrouter_reasoning_support, parse_openrouter_context_windows, parse_openrouter_input_pricing,
     ChatEvent, Completion, EventSink, LlmClient, LlmMessage, LlmRequest, ReasoningSupport,
-    RetryDelay, Role,
+    RetryDelay, Role, TokenUsage,
 };
 use neuralnote_core::capture::ModelPricing;
 use neuralnote_core::CoreError;
@@ -602,6 +602,67 @@ impl OpenAiChatClient {
         reader.finish(sink)
     }
 
+    /// One buffered turn: the completion the model returned, and what the
+    /// provider said it cost (`None` when it said nothing).
+    async fn buffered_turn(
+        &self,
+        req: &LlmRequest,
+    ) -> Result<(Completion, Option<TokenUsage>), CoreError> {
+        let body = self.tool_wire_body(req, /* stream */ false);
+        let resp = self.post(&body).await?;
+        let provider = self.provider_label();
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| CoreError::Llm(format!("could not parse {provider} response: {e}")))?;
+        let usage = openai::parse_usage(&value);
+        Ok((openai::parse_completion(value)?, usage))
+    }
+
+    /// Read the streamed answer to its end, returning the text exactly as it was
+    /// streamed.
+    ///
+    /// Split out of [`LlmClient::complete_streaming`] so the turn has ONE exit:
+    /// the `[DONE]` early return and the end-of-body flush used to be two, and a
+    /// turn that reports its price on only one of them reports it on neither
+    /// reliably.
+    ///
+    /// Buffers BYTES, not str: a chunk can split a multibyte char, but never the
+    /// `\n` line delimiter (a single byte, never part of a UTF-8 sequence), so
+    /// decoding each complete line is always valid. The string returned is the
+    /// exact concatenation of the deltas streamed — the orchestrator scans it for
+    /// cited ids, so returned MUST equal streamed (it does here by construction).
+    async fn read_answer_stream(
+        &self,
+        req: &LlmRequest,
+        sink: &mut dyn EventSink,
+        answer: &mut openai::AnswerStream,
+    ) -> Result<String, CoreError> {
+        let body = self.answer_wire_body(req);
+        let resp = self.post(&body).await?;
+        let mut stream = resp.bytes_stream();
+        let mut buf: Vec<u8> = Vec::new();
+
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
+            buf.extend_from_slice(&chunk);
+
+            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
+                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
+                if let Some(done) = openai::consume_sse_line(&line_bytes, sink, answer)? {
+                    return Ok(done);
+                }
+            }
+        }
+        // Flush a final line the stream left without a trailing newline — otherwise a
+        // last delta, or a terminal error frame, in the tail would be silently lost
+        // (and a cited id in that tail would go missing, corrupting verification).
+        if !buf.is_empty() {
+            openai::consume_sse_line(&buf, sink, answer)?;
+        }
+        Ok(answer.text().to_string())
+    }
+
     fn provider_label(&self) -> &'static str {
         if self.bearer.is_none() && self.title.is_none() {
             "Local AI"
@@ -748,14 +809,7 @@ impl LlmClient for OpenAiChatClient {
     }
 
     async fn complete(&self, req: &LlmRequest) -> Result<Completion, CoreError> {
-        let body = self.tool_wire_body(req, /* stream */ false);
-        let resp = self.post(&body).await?;
-        let provider = self.provider_label();
-        let value: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| CoreError::Llm(format!("could not parse {provider} response: {e}")))?;
-        openai::parse_completion(value)
+        Ok(self.buffered_turn(req).await?.0)
     }
 
     async fn complete_tool_streaming(
@@ -776,7 +830,15 @@ impl LlmClient for OpenAiChatClient {
             // retrieval for the whole run, so re-run it buffered instead. Nothing
             // was emitted (no calls means no previews), so this replays over
             // nothing the user has seen and the retry contract still holds.
-            Ok(StreamedToolTurn::NotStreamed) => self.complete(req).await,
+            Ok(StreamedToolTurn::NotStreamed) => {
+                // The buffered response carries its own `usage` object, so the
+                // fallback prices itself. Reporting through `tracked` rather than
+                // dropping it is what keeps the run's total complete on a provider
+                // that cannot stream a tool turn at all.
+                let (completion, usage) = self.buffered_turn(req).await?;
+                tracked.record_usage(usage);
+                Ok(completion)
+            }
             Err(error) => {
                 tracked.abandon_live(tool_stream::ABANDONED_TURN_FAILED);
                 Err(error)
@@ -792,37 +854,15 @@ impl LlmClient for OpenAiChatClient {
         // The answer turn carries the output ceiling; tool-deciding turns do not. It
         // also carries the reasoning request (OpenRouter only, when opted in) — this is
         // the one turn whose reasoning tokens surface as live `Thinking` events.
-        let body = self.answer_wire_body(req);
-        let resp = self.post(&body).await?;
-
-        // Buffer BYTES, not str: a chunk can split a multibyte char, but never the
-        // `\n` line delimiter (a single byte, never part of a UTF-8 sequence), so
-        // decoding each complete line is always valid. The `full` string we return
-        // is the exact concatenation of the deltas we streamed — the orchestrator
-        // scans it for cited ids, so returned MUST equal streamed (it does here by
-        // construction).
-        let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
-        let mut full = String::new();
-
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
-            buf.extend_from_slice(&chunk);
-
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-                if let Some(answer) = openai::consume_sse_line(&line_bytes, sink, &mut full)? {
-                    return openai::finish_answer(answer);
-                }
-            }
+        let mut answer = openai::AnswerStream::new();
+        let text = self.read_answer_stream(req, sink, &mut answer).await?;
+        if !answer.usage_reported() {
+            // The provider never priced this turn. Saying so is what makes the
+            // run's footer come out ABSENT rather than quietly reporting the
+            // tool turns' tokens as the whole bill.
+            sink.record_usage(None);
         }
-        // Flush a final line the stream left without a trailing newline — otherwise a
-        // last delta, or a terminal error frame, in the tail would be silently lost
-        // (and a cited id in that tail would go missing, corrupting verification).
-        if !buf.is_empty() {
-            openai::consume_sse_line(&buf, sink, &mut full)?;
-        }
-        openai::finish_answer(full)
+        openai::finish_answer(text)
     }
 }
 
@@ -1334,10 +1374,13 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct RecordingSink(Vec<ChatEvent>);
+    struct RecordingSink(Vec<ChatEvent>, Vec<Option<TokenUsage>>);
     impl EventSink for RecordingSink {
         fn send(&mut self, event: ChatEvent) {
             self.0.push(event);
+        }
+        fn record_usage(&mut self, usage: Option<TokenUsage>) {
+            self.1.push(usage);
         }
     }
 
@@ -1353,6 +1396,60 @@ mod tests {
                 })
                 .collect()
         }
+    }
+
+    /// A real streamed answer turn captured from the LOCAL lane (Ollama 0.31.1),
+    /// with the `stream_options` this client now sends. Its usage frame carries
+    /// an EMPTY `choices` array — the shape the answer parser has to survive.
+    const LOCAL_CAPTURE: &str =
+        include_str!("../../../../crates/neuralnote-core/src/ai/fixtures/ollama_answer_stream.sse");
+
+    #[tokio::test]
+    async fn a_streamed_answer_turn_reports_what_the_provider_charged_for_it() {
+        // Over a real socket, through the real client: the parser working in core
+        // proves nothing about whether this wiring carries the report out.
+        let (url, server) = fake_provider(vec![sse_response(LOCAL_CAPTURE)]);
+        let client = client_for(url);
+        let mut sink = RecordingSink::default();
+
+        let answer = client
+            .complete_streaming(&tool_request(), &mut sink)
+            .await
+            .unwrap();
+
+        assert!(!answer.is_empty(), "the answer still streamed");
+        assert_eq!(
+            sink.1,
+            vec![Some(TokenUsage {
+                tokens_in: 17,
+                tokens_out: 153,
+            })],
+            "exactly one report, carrying the captured counts"
+        );
+        let body: serde_json::Value = serde_json::from_str(&server.join().unwrap()[0]).unwrap();
+        assert_eq!(
+            body["stream_options"]["include_usage"], true,
+            "the local lane reports nothing at all without this"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_answer_turn_the_provider_never_priced_is_reported_as_unpriced() {
+        // Not silence: silence would let the run total its tool turns alone and
+        // show that as the whole bill.
+        let (url, server) = fake_provider(vec![sse_response(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"hi\"}}]}\ndata: [DONE]\n",
+        )]);
+        let client = client_for(url);
+        let mut sink = RecordingSink::default();
+
+        client
+            .complete_streaming(&tool_request(), &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(sink.1, vec![None]);
+        server.join().unwrap();
     }
 
     #[test]

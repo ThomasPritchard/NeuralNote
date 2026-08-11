@@ -25,6 +25,7 @@ pub mod openai;
 pub mod openrouter_catalogue;
 pub mod orchestrator;
 mod partial_json;
+pub mod plan;
 pub mod provider_config;
 pub mod requirement_binaries;
 pub mod retrieval;
@@ -50,7 +51,7 @@ pub use capabilities::{
     ReasoningSupport,
 };
 pub use elicitation::{elicit_user, ElicitationOutcome};
-pub use events::{ChatEvent, ElicitOption, Elicitation, EventSink, ToolStatus};
+pub use events::{ChatEvent, ElicitOption, Elicitation, EventSink, TokenUsage, ToolStatus};
 pub use evidence::{EvidenceRegistry, EvidenceSpan};
 pub use llm::{
     Completion, LlmClient, LlmMessage, LlmRequest, NoUserPrompt, Role, ToolCall, UserPrompt,
@@ -69,6 +70,7 @@ pub use orchestrator::{
     run_chat, Guards, NoRetryDelay, RetryDelay, SkillServices, DEFAULT_MODEL,
     SKILL_ACTIVATION_FAILURE_MARK,
 };
+pub use plan::{PlanStep, RunPlan, StepStatus};
 pub use provider_config::{
     read_provider_config, write_provider_config, ProbedReasoning, ProviderConfig, ProviderKind,
     ReasoningProbeTarget,

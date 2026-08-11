@@ -13,6 +13,7 @@ use crate::ai::approval::ApprovedCall;
 use crate::ai::events::EventSink;
 use crate::ai::evidence::EvidenceRegistry;
 use crate::ai::llm::UserPrompt;
+use crate::ai::plan::{self, RunPlan};
 use crate::ai::retrieval::RetrievalProvider;
 use crate::ai::skill_tools;
 use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
@@ -31,8 +32,8 @@ use std::path::Path;
 pub use crate::ai::tool_registry::{
     RegisteredTool, TOOL_ASK_USER, TOOL_FETCH_CAPTIONS, TOOL_FETCH_VIDEO_INFO, TOOL_LIST_FOLDERS,
     TOOL_LIST_NOTES, TOOL_READ_NOTE_SPAN, TOOL_RESOLVE_DISTIL_ROUTE, TOOL_SEARCH_NOTES,
-    TOOL_SELECT_PLAYLIST_VIDEOS, TOOL_SKILL_STEP, TOOL_TRANSCRIBE_AUDIO, TOOL_USE_SKILL,
-    TOOL_WRITE_NOTE,
+    TOOL_SELECT_PLAYLIST_VIDEOS, TOOL_SKILL_STEP, TOOL_TRANSCRIBE_AUDIO, TOOL_UPDATE_PLAN,
+    TOOL_USE_SKILL, TOOL_WRITE_NOTE,
 };
 
 static UNAVAILABLE_VAULT_PROFILE_IO: UnavailableVaultProfileIo = UnavailableVaultProfileIo;
@@ -109,6 +110,9 @@ pub struct ToolContext<'a> {
     pub(super) youtube_session: Option<&'a mut YoutubeToolSession>,
     pub(super) vault_profile_io: &'a dyn VaultProfileIo,
     pub(super) pricing: Option<&'a PricingInput>,
+    /// The run's declared plan. `None` only for a caller that never wired one —
+    /// `update_plan` then rejects rather than pretending to record a plan.
+    pub(super) plan: Option<&'a mut RunPlan>,
     authorized_tools: &'a BTreeSet<String>,
 }
 
@@ -137,8 +141,15 @@ impl<'a> ToolContext<'a> {
             youtube_session: None,
             vault_profile_io: &UNAVAILABLE_VAULT_PROFILE_IO,
             pricing: None,
+            plan: None,
             authorized_tools,
         }
+    }
+
+    /// Wire the run's plan, so `update_plan` has somewhere to record one.
+    pub fn with_plan(mut self, plan: &'a mut RunPlan) -> Self {
+        self.plan = Some(plan);
+        self
     }
 
     /// Opt into the host YouTube seam for this run. Existing clients keep the
@@ -180,6 +191,10 @@ pub fn tool_schemas(active_skill_tools: &BTreeSet<String>) -> Vec<Value> {
         search_notes_schema(),
         read_note_span_schema(),
         skill_tools::use_skill_schema(),
+        // Always advertised. A plan is a general agent affordance, not something
+        // a skill grants — and a model that never calls it simply produces a
+        // timeline with no step grouping, which is the pre-plan behaviour.
+        plan::update_plan_schema(),
     ];
     for (name, schema) in skill_tools::active_schemas() {
         if active_skill_tools.contains(name) {
@@ -323,6 +338,7 @@ pub async fn dispatch(
         RegisteredTool::ReadNoteSpan => dispatch_read(args_json, provider, registry),
         RegisteredTool::UseSkill => skill_tools::dispatch_use_skill(args_json, context),
         RegisteredTool::SkillStep => skill_tools::dispatch_skill_step(args_json, context),
+        RegisteredTool::UpdatePlan => plan::dispatch_update_plan(args_json, context),
         RegisteredTool::AskUser => {
             skill_tools::dispatch_ask_user(call_id, args_json, user_prompt, context).await
         }
@@ -764,6 +780,9 @@ mod tests {
                 TOOL_SEARCH_NOTES,
                 TOOL_READ_NOTE_SPAN,
                 TOOL_USE_SKILL,
+                // Always advertised: a plan is a general agent affordance, not
+                // something a skill grants.
+                TOOL_UPDATE_PLAN,
             ]
         );
     }

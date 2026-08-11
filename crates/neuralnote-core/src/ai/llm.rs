@@ -164,9 +164,15 @@ pub trait LlmClient: Send + Sync {
     async fn complete_tool_streaming(
         &self,
         req: &LlmRequest,
-        _sink: &mut dyn EventSink,
+        sink: &mut dyn EventSink,
     ) -> CoreResult<Completion> {
-        self.complete(req).await
+        let completion = self.complete(req).await?;
+        // `complete` has no sink and so cannot price itself. Declaring this turn
+        // unmetered is what stops the run's total quietly omitting it: without
+        // this, a client that streams the answer but buffers its tool turns would
+        // report the answer's tokens as if they were the whole run.
+        sink.record_usage(None);
+        Ok(completion)
     }
 
     /// Stream the final answer: push each chunk as a [`ChatEvent::Answer`] via

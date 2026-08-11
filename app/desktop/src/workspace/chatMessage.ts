@@ -14,6 +14,7 @@ import type {
   ElicitOption,
   GatedTool,
   NoteKind,
+  StepStatus,
   ToolStatus,
 } from "../lib/types";
 import { reduceAssistant } from "./chatMessageReducer";
@@ -134,6 +135,27 @@ export interface TranscriptSourceView {
   relPath: string | null;
 }
 
+/** One step of the plan the model declared, and where it has got to.
+ *
+ *  `label` is model prose — unavoidably, since only the model knows what it
+ *  intends — so it is rendered as a label and never matched on. */
+export interface PlanStepView {
+  id: string;
+  label: string;
+  status: StepStatus;
+}
+
+/** What the run cost. Token counts are nullable because not every provider
+ *  reports them, and an unreported count must render as *absent*: a `0` would
+ *  read as a real measurement of nothing. `elapsedMs` is always ours to
+ *  measure, so it is never null. */
+export interface UsageView {
+  elapsedMs: number;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  model: string;
+}
+
 export interface UserMessage {
   role: "user";
   content: string;
@@ -170,6 +192,17 @@ export interface AssistantMessage {
    *  been written — it pairs with the `toolCalls` entry of the same id, which is
    *  what says whether the write went on to succeed. */
   noteEdits: NoteEditView[];
+  /** The steps the model declared it intended to take, in declared order.
+   *
+   *  Empty when it never declared a plan, which is the ordinary case and not a
+   *  failure — the rail simply renders without step grouping. The backend
+   *  declares the set once and refuses any later call that changes it
+   *  (`plan.rs::same_steps`), so entries are only ever *restatused* here, never
+   *  added, removed or relabelled after the fact. */
+  planSteps: PlanStepView[];
+  /** What the run cost, or `null` until the backend reports it (immediately
+   *  before `done`) — and `null` forever if it never does. */
+  usage: UsageView | null;
   /** Every tool call of the turn, in the order the model made them. */
   toolCalls: ToolCallView[];
   /** Transcript provenance as reported by the tools that fetched it. */
@@ -226,6 +259,8 @@ export function emptyAssistant(
     writtenNotes: [],
     existingNotes: [],
     noteEdits: [],
+    planSteps: [],
+    usage: null,
     toolCalls: [],
     transcriptSources: [],
     partialRun: null,

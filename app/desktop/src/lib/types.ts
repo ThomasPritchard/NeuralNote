@@ -59,6 +59,8 @@ export type { ApprovalResolution } from "./bindings/ApprovalResolution";
 export type { ApprovalRule } from "./bindings/ApprovalRule";
 export type { ApprovalDegradedReason } from "./bindings/ApprovalDegradedReason";
 export type { ApprovalStatus } from "./bindings/ApprovalStatus";
+export type { PlanStep } from "./bindings/PlanStep";
+export type { StepStatus } from "./bindings/StepStatus";
 export type { UndoReport } from "./bindings/UndoReport";
 export type { UndoFileResult } from "./bindings/UndoFileResult";
 export type { UndoFileStatus } from "./bindings/UndoFileStatus";
