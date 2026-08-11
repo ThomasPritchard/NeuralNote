@@ -18,6 +18,8 @@ import {
   Download,
   Loader2,
   ShieldCheck,
+  Square,
+  TimerOff,
   UserX,
 } from "lucide-react";
 import type { LucideIcon } from "lucide-react";
@@ -107,11 +109,18 @@ export function ThinkingNode({
  *  (`error` still has no producer — it is rendered correctly now so the wire
  *  contract has a consumer.)
  *
- *  The glyph column is meant to read before any text, and the two new statuses
- *  currently borrow `Ban` and the warning tone from `rejected` — correct in
- *  register (nobody chose this; it just did not happen) but not yet a considered
- *  glyph. Refining that is a design-lane change; the wording below is the part
- *  that had to be right immediately.
+ *  The glyph column reads before any text, so each of the three now carries its
+ *  own, matching the approval node's vocabulary in `approvalCopy` (one act, two
+ *  rows — they must not disagree about what happened):
+ *
+ *  • `denied` — a person icon refusing. The user is the party who acted.
+ *  • `timedOut` — an expired timer. The window closed, nobody acted.
+ *  • `cancelled` — the pane's own solid Stop square, the glyph this UI already
+ *    uses for "this run ended", in the calm register: nobody refused anything.
+ *    A warning tone here would blame someone for a non-event.
+ *
+ *  `rejected` keeps `Ban` and the warning tone: NeuralNote itself refused, which
+ *  is the one of the four that IS a refusal by a party with a reason.
  *
  *  Exported because a previewed write's node stands down in favour of
  *  `ChatNoteEditCard`, which then owes the user the same account in the same
@@ -119,15 +128,20 @@ export function ThinkingNode({
  *  about what "rejected" means. */
 export const TOOL_SETTLEMENT: Record<
   ToolStatus,
-  { icon: LucideIcon; tone: string; label: string }
+  { icon: LucideIcon; tone: string; label: string; filled?: true }
 > = {
   // The common case is calm: a call that did what it said is not news.
   ok: { icon: Check, tone: "text-muted-foreground/70", label: "" },
   error: { icon: AlertTriangle, tone: "text-destructive", label: "failed" },
   rejected: { icon: Ban, tone: "text-warning", label: "refused by NeuralNote" },
   denied: { icon: UserX, tone: "text-warning", label: "denied by you" },
-  timedOut: { icon: Ban, tone: "text-warning", label: "expired unanswered" },
-  cancelled: { icon: Ban, tone: "text-warning", label: "run ended first" },
+  timedOut: { icon: TimerOff, tone: "text-warning", label: "expired unanswered" },
+  cancelled: {
+    icon: Square,
+    tone: "text-muted-foreground/70",
+    label: "run ended first",
+    filled: true,
+  },
 };
 
 /** The argument fields the tool schemas actually declare, in the order that
@@ -210,7 +224,10 @@ export function ToolNode({
         aria-hidden
       />
     ) : (
-      <settled.icon className={`size-3.5 ${settled.tone}`} aria-hidden />
+      <settled.icon
+        className={cn("size-3.5", settled.tone, settled.filled && "fill-current")}
+        aria-hidden
+      />
     );
   return (
     <TimelineNode glyph={glyph} last={last}>

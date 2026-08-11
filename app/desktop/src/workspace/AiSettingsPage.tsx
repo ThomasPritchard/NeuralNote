@@ -11,6 +11,7 @@ import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import { cn } from "../lib/cn";
 import type { AiStatus, ProviderKind } from "../lib/types";
+import { ApprovalSettings } from "./ApprovalSettings";
 import { LocalAiCard } from "./LocalAiCard";
 import { OpenRouterCard } from "./OpenRouterCard";
 import { InlineError } from "./ProviderCard";
@@ -172,6 +173,11 @@ export function AiSettingsPage() {
         onActivate={(tag) => switchProvider("local", tag)}
         refreshStatus={refreshStatus}
       />
+
+      {/* Below the provider cards on purpose: "approve for me" is unavailable on
+          the local lane, so the choice above is the context this section reads
+          against. */}
+      <ApprovalSettings status={status} onStatusChange={applyStatus} />
     </div>
   );
 }

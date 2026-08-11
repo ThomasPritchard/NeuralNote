@@ -24,9 +24,13 @@ import { summarizeActivity } from "./chatMessage";
 import type {
   AssistantMessage,
   SkillActivationFailure,
+  ToolApprovalView,
   ToolCallView,
 } from "./chatMessage";
+import type { ApprovalDegradedReason } from "../lib/types";
 import { playfulProgressCopy } from "./playfulProgressCopy";
+import { approvalNodeState } from "./approvalCopy";
+import { ApprovalDegradedNode, ToolApprovalNode } from "./ChatApprovalNode";
 import {
   ActivationFailureNode,
   DroppedNode,
@@ -65,6 +69,8 @@ function livePhase(phase: AssistantMessage["phase"], prompt: string): string {
 type TimelineEntry =
   | { kind: "failure"; failure: SkillActivationFailure }
   | { kind: "thinking"; text: string }
+  | { kind: "degraded"; reason: ApprovalDegradedReason }
+  | { kind: "approval"; approval: ToolApprovalView }
   | { kind: "tool"; call: ToolCallView }
   | { kind: "verifying" }
   | { kind: "dropped"; reason: string };
@@ -89,6 +95,36 @@ function railCalls(turn: AssistantMessage): ToolCallView[] {
   return turn.toolCalls.filter((call) => !previewed.has(call.id));
 }
 
+/** Pair each gated call's approval node with the call it governs.
+ *
+ *  Walks `toolCalls` rather than `toolApprovals` so an approval lands directly
+ *  above the call it decided — the gate runs, then the call dispatches, and the
+ *  rail should read in that order. The walk is over ALL calls, not just the ones
+ *  the rail shows: a previewed write stands its tool node down in favour of
+ *  `ChatNoteEditCard`, but that card carries no account of the approval, so the
+ *  approval node stays regardless.
+ *
+ *  An approval whose `toolCall` has not arrived yet is appended afterwards
+ *  instead of being dropped. The gate keys its events on the tool-call id, so in
+ *  practice the call is announced first; a request that somehow outruns its call
+ *  is a broken contract that has to be visible, not an event to swallow. */
+function approvalEntries(turn: AssistantMessage, onRail: ReadonlySet<string>): TimelineEntry[] {
+  const entries: TimelineEntry[] = [];
+  const placed = new Set<string>();
+  for (const call of turn.toolCalls) {
+    const approval = turn.toolApprovals.find((entry) => entry.id === call.id);
+    if (approval !== undefined && !placed.has(approval.id)) {
+      entries.push({ kind: "approval", approval });
+      placed.add(approval.id);
+    }
+    if (onRail.has(call.id)) entries.push({ kind: "tool", call });
+  }
+  for (const approval of turn.toolApprovals) {
+    if (!placed.has(approval.id)) entries.push({ kind: "approval", approval });
+  }
+  return entries;
+}
+
 function timelineEntries(turn: AssistantMessage, calls: ToolCallView[]): TimelineEntry[] {
   const entries: TimelineEntry[] = turn.skillActivationFailures.map((failure) => ({
     kind: "failure" as const,
@@ -97,7 +133,10 @@ function timelineEntries(turn: AssistantMessage, calls: ToolCallView[]): Timelin
   if (turn.thinking.trim() !== "") {
     entries.push({ kind: "thinking", text: turn.thinking });
   }
-  for (const call of calls) entries.push({ kind: "tool", call });
+  if (turn.approvalDegraded !== null) {
+    entries.push({ kind: "degraded", reason: turn.approvalDegraded });
+  }
+  entries.push(...approvalEntries(turn, new Set(calls.map((call) => call.id))));
   for (const step of turn.activity) {
     if (step.kind === "verifying") entries.push({ kind: "verifying" });
     if (step.kind === "dropped") entries.push({ kind: "dropped", reason: step.reason });
@@ -126,6 +165,10 @@ function TimelineEntryNode({
       return <ActivationFailureNode failure={entry.failure} last={last} />;
     case "thinking":
       return <ThinkingNode text={entry.text} last={last} />;
+    case "degraded":
+      return <ApprovalDegradedNode reason={entry.reason} last={last} />;
+    case "approval":
+      return <ToolApprovalNode approval={entry.approval} last={last} />;
     case "tool":
       return <ToolNode call={entry.call} last={last} />;
     case "verifying":
@@ -159,8 +202,16 @@ function SummaryLine({
   errored: boolean;
 }>) {
   const { searches, notesRead, dropped, verified } = summarizeActivity(turn.activity);
+  // "Failed" and "never ran" are different accounts and the head must not merge
+  // them: a call the user declined did not fail, and reporting it as a failure
+  // is the same false attribution that made `denied`, `timedOut` and `cancelled`
+  // three wire statuses instead of one.
   const failed = calls.filter(
-    (call) => call.status !== null && call.status !== "ok",
+    (call) => call.status === "error" || call.status === "rejected",
+  ).length;
+  const notRun = calls.filter(
+    (call) =>
+      call.status === "denied" || call.status === "timedOut" || call.status === "cancelled",
   ).length;
   const segs: string[] = [];
   if (calls.length > 0) {
@@ -185,6 +236,9 @@ function SummaryLine({
       {base}
       {failed > 0 && (
         <span className="text-warning"> · {count(failed, "call", "calls")} failed</span>
+      )}
+      {notRun > 0 && (
+        <span className="text-warning"> · {count(notRun, "call", "calls")} never ran</span>
       )}
       {dropped > 0 && (
         <span className="text-destructive">
@@ -232,7 +286,16 @@ function needsAttention(turn: AssistantMessage, calls: ToolCallView[]): boolean 
   return (
     dropped > 0 ||
     calls.some((call) => call.status !== null && call.status !== "ok") ||
-    (searches > 0 && notesRead === 0)
+    (searches > 0 && notesRead === 0) ||
+    // Anything the gate did that is not a settled automatic approval. A prompt
+    // the user has to answer, a check they are waiting on, or a call that never
+    // ran must never be one collapsed fold away — and automatic checking having
+    // switched itself off is the frame for every prompt that follows it.
+    turn.approvalDegraded !== null ||
+    turn.toolApprovals.some((approval) => {
+      const kind = approvalNodeState(approval).kind;
+      return kind !== "autoApproved" && kind !== "approvedByYou";
+    })
   );
 }
 

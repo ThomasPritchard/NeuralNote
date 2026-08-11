@@ -978,9 +978,14 @@ Three enforcement mechanisms, strongest first:
 > - `OperationKind` — only operations that **actually exist today**. §9.1.1 rejects
 >   `create/append/overwrite/delete` precisely because that vocabulary models a surface the code
 >   does not have. Adding one later must be a compile error, not a new enum value with a default.
-> - `TargetLocation` — must distinguish inside-vault from outside-vault, since "crosses no vault
->   boundary" is an eligibility clause. Derive it from the **canonicalised** path, never the
->   requested one.
+> - `TargetLocation` — must be derived from the **canonicalised** path, never the requested one.
+>   *(This bullet originally also required an `OutsideVault` variant. The implementation dropped
+>   it, and the reason is in `subject.rs`: hard-deny runs first and in every mode, so a target
+>   resolving outside the vault becomes a `HardDeny::VaultEscape` before a subject exists. The
+>   variant shipped, was constructed by no code path, and fed a permanently-`false`
+>   `crosses_vault_boundary` field — an eligibility clause that could not fire. Deleting the
+>   clause reddened nothing across 105 approval tests; the positive `matches!(location,
+>   InsideVault)` test is what actually holds the line, and it fails closed for anything else.)*
 > - `ToolApprovalSubject` — every field either a closed enum, a clamped integer, a bool, or the
 >   salted digest. **If a field's type is `String`, the design is broken.** The serialisation test
 >   above is what proves it, so write the struct so that test can pass.
@@ -1558,26 +1563,31 @@ pub const fn reversibility(tool: GatedTool) -> Reversibility {
     }
 }
 
-/// Ties `ALL_GATED_TOOLS` to the enum at COMPILE time, so the array cannot silently
-/// fall out of sync and quietly drop a tool from the generated warning. Every variant
-/// maps to a distinct slot; the const block asserts the array agrees. Add a variant and
-/// (a) this match is non-exhaustive → E0004, then (b) the new arm's slot indexes past a
-/// `[_; 7]` array → E0080 at const-eval, until the array is extended too.
-const fn slot(tool: GatedTool) -> usize { /* one arm per variant, no wildcard */ }
-
-const _: () = {
-    let mut i = 0;
-    while i < ALL_GATED_TOOLS.len() {
-        assert!(slot(ALL_GATED_TOOLS[i]) == i);
-        i += 1;
-    }
-};
 ```
 
-The crate has no enum-iteration dependency (no `strum` in
-`crates/neuralnote-core/Cargo.toml`), and this does not warrant adding one — the const assertion
-is a dozen lines and buys the same guarantee without a new supply-chain surface. If `strum`
-arrives later for other reasons, `EnumIter` replaces the array and the const block.
+> **CORRECTED IN IMPLEMENTATION — the paragraph this replaces was wrong, and the way it was
+> wrong is worth keeping on the record.**
+>
+> This section originally specified a hand-written `ALL_GATED_TOOLS` array tied to a `slot()`
+> match by a const assertion, and claimed that adding a variant would fail with E0080 "because
+> the new arm's slot indexes past a `[_; 7]` array". **It does not.** Nothing indexes the array
+> *by* slot, so `slot(NewVariant)` is never const-evaluated. A variant declared in all six
+> exhaustive matches but left out of the array compiled cleanly — and because `from_name`
+> searched that array, it answered `None` for the tool, `ApprovedCall::ungated` accepted the
+> call, and `decide` was never reached. **The tool ran with no approval decision in any mode,
+> `AlwaysAsk` included.** Confirmed by adding a throwaway eighth variant: 45 gate tests passed
+> while the tool was completely un-gated.
+>
+> The paragraph then declined `strum` on the grounds that "the const assertion is a dozen lines
+> and buys the same guarantee". It bought a weaker one — ordering and uniqueness, not
+> completeness — so the trade it described was not the trade on offer.
+>
+> **What ships instead:** a local `declare_gated_tools!` macro in `approval/gated.rs` that
+> declares the enum, `ALL_GATED_TOOLS`, `name()` and `from_name()` from one variant list. Stable
+> Rust cannot enumerate an enum's variants without a macro or a derive, so this is the
+> dependency-free way to make the omission unrepresentable rather than merely tested for. The
+> `strum` decision stands, and for a better reason than the original: `EnumIter` would solve the
+> same problem, and the macro solves it without the supply-chain surface.
 
 `transcribe_audio` ships pinned to always-ask and the override UI shows it as such with its
 reason. Spawning a process and installing a binary is categorically not "a tool call", and it is

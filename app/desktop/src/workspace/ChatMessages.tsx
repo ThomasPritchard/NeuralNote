@@ -24,6 +24,7 @@ import type {
 } from "./chatMessage";
 import { ChatNoteEdits } from "./ChatNoteEditCard";
 import { ChatTimeline } from "./ChatTimeline";
+import { ToolApprovalSheet } from "./ToolApprovalSheet";
 import { SkillActivations, SkillSteps } from "./ChatSkillChrome";
 import { Sources } from "./ChatSources";
 import {
@@ -65,14 +66,22 @@ function AssistantTurn({
   // citation must never linger as a live reference in the answer (the moat).
   const answer = resolveAnswerMarkers(turn.answer, turn.citations, turn.done);
   const answering = turn.answer.trim() !== "";
-  // The run is parked on the user, not working: the question is live (not yet
-  // answered) and the run hasn't ended. No spinner may claim progress here.
+  // The run is parked on the user, not working: a question or a security prompt
+  // is live (not yet answered) and the run hasn't ended. No spinner may claim
+  // progress here.
+  //
+  // `checking` is deliberately NOT in this test. The gate genuinely is working
+  // while the judge runs, and its own node pulses to say so; only a prompt
+  // waiting on an answer parks the run on the user.
+  const awaitingApproval = turn.pendingApproval !== null && !turn.done;
   const awaitingUser =
-    turn.pendingElicitation !== null && elicitAnswer === undefined && !turn.done;
+    (turn.pendingElicitation !== null && elicitAnswer === undefined && !turn.done) ||
+    awaitingApproval;
   const hasSkillNarrative =
     turn.skillActivations.length > 0 ||
     turn.skillSteps.length > 0 ||
-    turn.pendingElicitation !== null;
+    turn.pendingElicitation !== null ||
+    awaitingApproval;
   // An activation failure arrives twice: once as narration and once as the
   // structured event that carries the remedy. Both strings are backend-composed
   // and identical, so comparing them is a set membership test over data that
@@ -102,6 +111,19 @@ function AssistantTurn({
           thing to watch while it happens, and each card folds itself away the
           moment its write settles, so a finished turn does not pay for it. */}
       <ChatNoteEdits turn={turn} />
+      {turn.pendingApproval !== null && turn.turnId !== null && (
+        // Under the composing-write card on purpose: for a `write_note` the
+        // card IS what the user is being asked to allow, so the ask reads best
+        // directly beneath the thing it is about. Keyed by the call id, so a
+        // second gated call in one turn is a fresh mount (fresh focus, no
+        // half-answered reuse of the previous request's state).
+        <ToolApprovalSheet
+          key={turn.pendingApproval.id}
+          approval={turn.pendingApproval}
+          turnId={turn.turnId}
+          dormant={turn.done}
+        />
+      )}
       {turn.stopped && (
         <p className="flex items-center gap-1.5 text-[0.6875rem] font-medium text-muted-foreground">
           <Square className="size-3 fill-current" aria-hidden />

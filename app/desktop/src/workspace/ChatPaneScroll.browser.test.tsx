@@ -42,6 +42,7 @@ import {
   type AssistantMessage,
   type ChatMessage,
   type NoteEditView,
+  type ToolApprovalView,
   type ToolCallView,
 } from "./chatMessage";
 import "../styles.css";
@@ -546,5 +547,151 @@ describe("chat transcript — a note write composing in the port", () => {
       .poll(() => distanceFromBottom(port), POLL)
       .toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
     expect(jumpControl().query()).toBeNull();
+  });
+});
+
+// ── The approval sheet in the scroll port ────────────────────────────────────
+
+const APPROVAL_CALL_ID = "call-write";
+
+function approvalView(pending: boolean): ToolApprovalView {
+  return {
+    id: APPROVAL_CALL_ID,
+    tool: "writeNote",
+    relPath: "Atomic/Spaced recall.md",
+    reason: "modeAlwaysAsk",
+    expiresInSecs: 120,
+    checking: false,
+    resolution: pending ? null : "approved",
+    autoApprovedRule: null,
+  };
+}
+
+/** A live turn whose gated write is either waiting on the user (the sheet is up)
+ *  or already answered (the sheet is gone). The answer streams in BOTH arms, so
+ *  the sheet is never the last thing in the port — which is what stops the
+ *  sheet's own mount focus from parking the view at the bottom and making a
+ *  follow assertion pass for the wrong reason. */
+function approvalTurn(pending: boolean, answerSentences: number): AssistantMessage {
+  const approval = approvalView(pending);
+  return {
+    ...emptyAssistant(false, "turn-approval"),
+    phase: "thinking",
+    toolCalls: [
+      {
+        id: APPROVAL_CALL_ID,
+        name: "write_note",
+        title: "Write note",
+        arguments: '{"rel_path":"Atomic/Spaced recall.md"}',
+        status: pending ? null : "ok",
+        summary: null,
+        detail: null,
+      },
+    ],
+    toolApprovals: [approval],
+    pendingApproval: pending ? approval : null,
+    answer: Array.from(
+      { length: answerSentences },
+      (_, i) => `Answer ${i + 1}: retrieval practice beats rereading, reliably.`,
+    ).join(" "),
+    done: false,
+  };
+}
+
+function approvalTranscript(pending: boolean, answerSentences = 1): ChatMessage[] {
+  return [
+    ...transcript(3),
+    { role: "user", content: "capture that idea about recall" },
+    approvalTurn(pending, answerSentences),
+  ];
+}
+
+/** The pinned security sheet, by its accessible name — the question itself. */
+const approvalSheet = () => page.getByRole("region", { name: /^Allow NeuralNote/ });
+
+describe("chat transcript — the approval sheet appearing and going", () => {
+  it("keeps following when a request arrives, and keeps the sheet in the port", async () => {
+    const port = await mount(approvalTranscript(false, 1));
+    await expect
+      .poll(() => distanceFromBottom(port), POLL)
+      .toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+    expect(approvalSheet().query()).toBeNull();
+    const heightBefore = port.scrollHeight;
+
+    await render(approvalTranscript(true, 1));
+
+    const sheet = approvalSheet().query();
+    expect(sheet).not.toBeNull();
+    // Pinned IN the transcript, not floated over it: a security prompt that
+    // escaped the scroll port would be a modal by another name.
+    expect(port.contains(sheet)).toBe(true);
+    // Vacuous unless the sheet genuinely added height.
+    await expect.poll(() => port.scrollHeight, POLL).toBeGreaterThan(heightBefore);
+    await expect
+      .poll(() => distanceFromBottom(port), POLL)
+      .toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+    expect(jumpControl().query()).toBeNull();
+  });
+
+  it("keeps following when the sheet is answered away while the answer streams", async () => {
+    // The §109 shape, and the reason this test is at the browser tier at all:
+    // the sheet is REMOVED above the viewport while content keeps arriving
+    // below it. The engine clamps `scrollTop` down to the new maximum by itself
+    // and queues the resulting `scroll` event; by the time it is delivered the
+    // answer has grown the transcript back, so the position it reports looks
+    // exactly like a user scrolling up. Pin lost, nobody touched anything.
+    //
+    // Engine note: this reproduces in WebKit, the family this app ships on, and
+    // NOT in Chromium, which dispatches the clamp's scroll event before the
+    // second commit lands. A green Chromium run is not evidence about this bug;
+    // `test:browser:webkit` is.
+    const port = await mount(approvalTranscript(true, 1));
+    await expect
+      .poll(() => distanceFromBottom(port), POLL)
+      .toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+    const sheetHeight = approvalSheet().element().getBoundingClientRect().height;
+    // Vacuous unless the sheet is tall enough for its removal to move content
+    // above the viewport.
+    expect(sheetHeight).toBeGreaterThan(80);
+
+    await act(async () => {
+      flushSync(() => root!.render(transcriptTree(approvalTranscript(false, 1))));
+      void port.scrollHeight;
+      flushSync(() => root!.render(transcriptTree(approvalTranscript(false, 24))));
+    });
+    await settle();
+
+    expect(approvalSheet().query()).toBeNull();
+    await expect
+      .poll(() => distanceFromBottom(port), POLL)
+      .toBeLessThanOrEqual(BOTTOM_THRESHOLD_PX);
+    expect(jumpControl().query()).toBeNull();
+  });
+
+  it("brings a user who scrolled away to the request, rather than pinging at them", async () => {
+    // The one place a request is allowed to move a view the user parked, and it
+    // is deliberate. The pane's standing rule is that streaming content never
+    // yanks — but this is not content. It blocks the run, it expires in 120
+    // seconds, and an unanswered one settles as "nobody answered in time".
+    //
+    // It also falls out of taking focus at all: `focus()` scrolls its target
+    // into view, and focus that lands somewhere off screen is a WCAG 2.4.7
+    // failure. Either the sheet takes focus AND the view follows, or it does
+    // neither. `ElicitCard`, the same pattern for a model-authored question,
+    // already resolves this the same way.
+    const port = await mount(approvalTranscript(false, 12));
+    await scrollUpByKeyboard(port);
+    await expect.poll(() => jumpControl().query(), POLL).not.toBeNull();
+
+    await render(approvalTranscript(true, 12));
+
+    const sheet = approvalSheet().element();
+    expect(document.activeElement).toBe(sheet);
+    // The property that matters is pixels, not `scrollTop`: the thing the user
+    // must answer is on screen.
+    const sheetBox = sheet.getBoundingClientRect();
+    const portBox = port.getBoundingClientRect();
+    expect(sheetBox.bottom).toBeLessThanOrEqual(portBox.bottom + 1);
+    expect(sheetBox.top).toBeGreaterThanOrEqual(portBox.top - 1);
   });
 });
