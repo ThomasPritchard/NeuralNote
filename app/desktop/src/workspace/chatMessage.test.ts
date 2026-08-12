@@ -13,6 +13,7 @@ import {
   reduceAssistant,
   reduceAssistantForTurn,
   resolveAnswerMarkers,
+  searchOutcome,
   showsNothingFoundCard,
   stripCitationMarkers,
   summarizeActivity,
@@ -648,6 +649,20 @@ describe("reduceAssistant — the live note preview", () => {
   });
 });
 
+/** One search, with its `retrieved` report or without it. `null` leaves the hit
+ *  count undefined — the in-flight shape, which is not zero. */
+const settledSearch = (query: string, hitCount: number | null): ChatEvent[] =>
+  hitCount === null
+    ? [{ type: "searching", query }]
+    : [{ type: "searching", query }, { type: "retrieved", query, hitCount }];
+
+/** Close a run with a coverage footer that read no note — the state the empty-
+ *  retrieval card is eligible in. */
+const finishHavingReadNothing = (searchedTerms: string[]): ChatEvent[] => [
+  { type: "coverage", searchedTerms, notesRead: [], truncated: false, skippedFiles: 0 },
+  { type: "done" },
+];
+
 describe("showsNothingFoundCard", () => {
   // A genuine miss: the search surfaced nothing worth reading, so the turn read
   // no note and cited none. `notesRead` is empty — that is what makes "nothing
@@ -718,6 +733,37 @@ describe("showsNothingFoundCard", () => {
       text: "Active recall improves retention.",
     };
     expect(showsNothingFoundCard({ ...finishedMiss, citations: [citation] })).toBe(false);
+  });
+
+  // ── The retrieval veto (#122) ─────────────────────────────────────────────
+  // Built from events through the real reducer, because the property under test
+  // is that a hit count which crossed the wire reaches this decision at all.
+
+  it("stays hidden when the searches returned spans the model never opened", () => {
+    // The reported run: no note read and no citation survived, which used to be
+    // the whole test — but eleven spans came back, so the vault plainly does
+    // cover this. "Nothing in your vault covers this" is then a false statement
+    // about the user's own notes, and a louder one than the rail summary's.
+    const turn = run([
+      ...settledSearch("markdown", 6),
+      ...settledSearch("spaced repetition", 5),
+      ...finishHavingReadNothing(["markdown", "spaced repetition"]),
+    ]);
+    expect(showsNothingFoundCard(turn)).toBe(false);
+  });
+
+  it("still shows when every search reported and every one of them was empty", () => {
+    // The veto must not swallow the card's real purpose: this is a genuine miss,
+    // and the on-ramp is exactly what the user needs here.
+    const turn = run([...settledSearch("quokka", 0), ...finishHavingReadNothing(["quokka"])]);
+    expect(showsNothingFoundCard(turn)).toBe(true);
+  });
+
+  it("stays hidden when a search never reported what it found", () => {
+    // The run ended with the count still undefined. Nothing established that the
+    // vault is empty, so "not yet known" must not be rendered as "no".
+    const turn = run([...settledSearch("focus", null), ...finishHavingReadNothing(["focus"])]);
+    expect(showsNothingFoundCard(turn)).toBe(false);
   });
 });
 
@@ -1008,5 +1054,59 @@ describe("summarizeActivity", () => {
       verified: false,
       totalSteps: 0,
     });
+  });
+});
+
+describe("searchOutcome", () => {
+  // The type exists because #122 collapsed three states into two: the summary
+  // asked whether anything had been READ and then reported whether anything had
+  // been FOUND. Each state is pinned separately here because each one licenses a
+  // different sentence in front of the user.
+
+  it("reports no retrieval at all when no search ran", () => {
+    expect(searchOutcome([])).toEqual({ kind: "none" });
+    expect(searchOutcome([{ kind: "verifying" }])).toEqual({ kind: "none" });
+  });
+
+  it("totals the spans across every search that reported", () => {
+    const steps: ActivityStep[] = [
+      { kind: "search", query: "markdown", hitCount: 6 },
+      { kind: "search", query: "spaced repetition", hitCount: 5 },
+    ];
+    // The total the head prints has to be the sum of what the nodes beneath it
+    // print, or the summary contradicts its own children — which is the bug.
+    expect(searchOutcome(steps)).toEqual({ kind: "hits", spans: 11 });
+  });
+
+  it("reports empty only when every search reported and every one was zero", () => {
+    const steps: ActivityStep[] = [
+      { kind: "search", query: "quokka", hitCount: 0 },
+      { kind: "search", query: "wallaby", hitCount: 0 },
+    ];
+    expect(searchOutcome(steps)).toEqual({ kind: "empty" });
+  });
+
+  it("reports pending, never empty, while a search has yet to report", () => {
+    // `hitCount` is undefined between `searching` and `retrieved`. Reading that
+    // as zero is what let "nothing found" appear before the vault had answered.
+    expect(searchOutcome([{ kind: "search", query: "focus" }])).toEqual({ kind: "pending" });
+  });
+
+  it("still reports pending when the searches that HAVE reported found nothing", () => {
+    const steps: ActivityStep[] = [
+      { kind: "search", query: "quokka", hitCount: 0 },
+      { kind: "search", query: "focus" },
+    ];
+    expect(searchOutcome(steps)).toEqual({ kind: "pending" });
+  });
+
+  it("lets a reported hit outrank a straggler that has not answered", () => {
+    // Once one search has come back with spans, retrieval demonstrably found
+    // something and a later straggler cannot unsay it.
+    const steps: ActivityStep[] = [
+      { kind: "search", query: "markdown", hitCount: 6 },
+      { kind: "search", query: "focus" },
+    ];
+    expect(searchOutcome(steps)).toEqual({ kind: "hits", spans: 6 });
   });
 });

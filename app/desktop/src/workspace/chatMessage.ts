@@ -319,12 +319,22 @@ export function isPartialSkillRun(turn: AssistantMessage): boolean {
 /** The turn searched the vault and genuinely found nothing to cite.
  *
  *  Zero surviving citations does not mean the vault held nothing — it can also
- *  mean a note was read and the model answered without an [eN] marker, or the
- *  verifier dropped the quote. In either of those the vault *did* cover it, so
- *  "nothing covers this" would be a false claim about the user's own notes. The
- *  card fires only when the turn read nothing (`notesRead` empty) and dropped
- *  nothing; otherwise the footer and the model's own answer carry the account. */
+ *  mean a note was read and the model answered without an [eN] marker, the
+ *  verifier dropped the quote, or the search returned spans the model never
+ *  opened. In every one of those the vault *did* cover it, so "nothing covers
+ *  this" would be a false claim about the user's own notes.
+ *
+ *  Coverage decides whether the card is eligible; the activity log only ever
+ *  vetoes it. A dropped citation is one veto and a search that reported spans is
+ *  another — the second was missing, so the card made the same false claim as
+ *  the rail summary in #122, one line lower and in bigger type. A search still
+ *  awaiting its `retrieved` event vetoes it too: nothing has confirmed the vault
+ *  is empty, and "not yet known" must not render as "no". */
 export function showsNothingFoundCard(turn: AssistantMessage): boolean {
+  const retrieval = searchOutcome(turn.activity).kind;
+  // `none` is not a veto: the activity log simply has nothing to say about
+  // retrieval, and coverage governs exactly as it did before hit counts existed.
+  const retrievalAgrees = retrieval === "empty" || retrieval === "none";
   return (
     turn.done &&
     !turn.stopped &&
@@ -333,6 +343,7 @@ export function showsNothingFoundCard(turn: AssistantMessage): boolean {
     turn.coverage.searchedTerms.length > 0 &&
     turn.coverage.notesRead.length === 0 &&
     turn.citations.length === 0 &&
+    retrievalAgrees &&
     !turn.activity.some((step) => step.kind === "dropped")
   );
 }
@@ -471,6 +482,48 @@ export function summarizeActivity(activity: ActivityStep[]): ActivitySummary {
     }
   }
   return { searches, notesRead: notes.size, dropped, verified, totalSteps: activity.length };
+}
+
+/** What a turn's searches have said about the vault. Three states, not two.
+ *
+ *  A search reports its hit count in a *separate* `retrieved` event, so between
+ *  `searching` and `retrieved` the count is `undefined` — and `undefined` is
+ *  "hasn't said yet", never zero. Collapsing those two into one boolean is what
+ *  produced #122: the summary tested whether anything had been READ and then
+ *  told the user nothing had been FOUND. They are different events, and the gap
+ *  between them is routine — searches return spans and the model decides none
+ *  are worth opening. Telling a user their vault holds nothing on a subject it
+ *  demonstrably covers is a false claim about their own notes, which is the same
+ *  class of failure as a wrong citation. */
+export type RetrievalOutcome =
+  /** No search ran, so there is no retrieval to report on. */
+  | { kind: "none" }
+  /** Every search that reported came back empty. The only state in which
+   *  "nothing found" is a true statement about the vault. */
+  | { kind: "empty" }
+  /** A search is still to report and nothing has come back yet, so neither
+   *  outcome may be claimed. Silence is the only honest answer here. */
+  | { kind: "pending" }
+  /** The vault returned `spans`. Whether any were opened is a separate question
+   *  the model answers, and `notesRead` is where that is counted. */
+  | { kind: "hits"; spans: number };
+
+/** `hits` wins over `pending`: once one search has reported spans, retrieval
+ *  demonstrably found something and a later straggler cannot unsay it. Only the
+ *  empty-versus-not-yet distinction actually needs the pending guard. */
+export function searchOutcome(activity: ActivityStep[]): RetrievalOutcome {
+  let searches = 0;
+  let spans = 0;
+  let awaitingReport = false;
+  for (const step of activity) {
+    if (step.kind !== "search") continue;
+    searches += 1;
+    if (step.hitCount === undefined) awaitingReport = true;
+    else spans += step.hitCount;
+  }
+  if (searches === 0) return { kind: "none" };
+  if (spans > 0) return { kind: "hits", spans };
+  return awaitingReport ? { kind: "pending" } : { kind: "empty" };
 }
 
 /** Strip every `[eN]` citation marker from a prior answer before it re-enters a

@@ -20,7 +20,7 @@
 // every label from the backend, so nothing here composes or matches prose.
 
 import { ChevronRight, Loader2 } from "lucide-react";
-import { summarizeActivity } from "./chatMessage";
+import { searchOutcome, summarizeActivity } from "./chatMessage";
 import type { AssistantMessage, ToolCallView } from "./chatMessage";
 import { playfulProgressCopy } from "./playfulProgressCopy";
 import { approvalNodeState } from "./approvalCopy";
@@ -98,9 +98,16 @@ function nestedNodes(children: KeyedEntry[]) {
 
 /** The one-line account the head shows once the process has settled.
  *
- *  Copy: "N tools · N searches · N notes · verified" — or "· nothing found" when
- *  retrieval came up empty (the zero-hit calls stay auditable on the rail). What
- *  went wrong is appended in the destructive/warning register and never hidden:
+ *  Copy: "N tools · N searches · N notes · verified" when notes were opened.
+ *  When none were, the line reports what retrieval actually said, which is three
+ *  different statements and not one (see `RetrievalOutcome`):
+ *
+ *    · N spans · nothing read  — the vault had material; the model opened none
+ *    · nothing found           — every search reported, every one of them empty
+ *    (nothing appended)        — a search has yet to report, so neither holds
+ *
+ *  The zero-hit calls stay auditable on the rail either way. What went wrong is
+ *  appended in the destructive/warning register and never hidden:
  *  a failed call and a dropped citation are the two things worth interrupting a
  *  calm summary for. Written notes are pointedly absent — the report card below
  *  owns that ledger, and two independently-computed provenance lines in one turn
@@ -120,6 +127,7 @@ function SummaryLine({
   errored: boolean;
 }>) {
   const { searches, notesRead, dropped, verified } = summarizeActivity(turn.activity);
+  const retrieval = searchOutcome(turn.activity);
   // "Failed" and "never ran" are different accounts and the head must not merge
   // them: a call the user declined did not fail, and reporting it as a failure
   // is the same false attribution that made `denied`, `timedOut` and `cancelled`
@@ -139,9 +147,18 @@ function SummaryLine({
   if (notesRead > 0) {
     segs.push(count(notesRead, "note", "notes"));
     if (verified) segs.push("verified");
-  } else if (searches > 0) {
+  } else if (retrieval.kind === "hits") {
+    // The vault had material and none of it was opened. The span total is what
+    // makes the absent "N notes" legible — without it the line reads as though
+    // retrieval simply did not happen, and it is also the number that has to
+    // agree with the nodes directly beneath the head.
+    segs.push(count(retrieval.spans, "span", "spans"), "nothing read");
+  } else if (retrieval.kind === "empty") {
     segs.push("nothing found");
   }
+  // `pending` deliberately adds nothing: a search that has not reported yet
+  // cannot be summarised as either outcome, and the search count above already
+  // says what went out.
   // Never an empty head: a rail with nodes but no countable retrieval (a
   // reasoning-only turn, say) still says how much happened.
   const counted = segs.length > 0 ? segs.join(" · ") : count(nodeCount, "step", "steps");
@@ -197,8 +214,11 @@ function LiveHead({
 /** Whether the fold has something the user should be pushed into rather than
  *  left to discover. All three are honesty signals, not decoration: a dropped
  *  citation is the moat's own alarm, a refused or failed call means the run did
- *  less than it looks like it did, and searches that read nothing are the queries
- *  worth rephrasing. */
+ *  less than it looks like it did, and a search whose results were never opened
+ *  is worth the user's eye whichever way it went — either the queries missed and
+ *  are worth rephrasing, or the vault answered and the run walked past it. Both
+ *  readings live behind this one condition, which is why it stays a plain
+ *  "searched but read nothing" rather than branching on the outcome. */
 function needsAttention(turn: AssistantMessage, calls: ToolCallView[]): boolean {
   const { searches, notesRead, dropped } = summarizeActivity(turn.activity);
   return (

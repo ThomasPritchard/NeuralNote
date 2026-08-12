@@ -72,6 +72,23 @@ const emptySearch = (id: string, query: string): ChatEvent[] => [
   { type: "toolResult", id, status: "ok", summary: "0 spans", detail: null },
 ];
 
+/** One search that DID return spans, in the same frame order. No `reading`
+ *  follows it: the vault had material and the model opened none of it, which is
+ *  an ordinary outcome and a completely different event from finding nothing. */
+const hitSearch = (id: string, query: string, hits: number): ChatEvent[] => [
+  {
+    type: "toolCall",
+    id,
+    name: "search_notes",
+    title: "Search notes",
+    arguments: JSON.stringify({ query }),
+    stepId: null,
+  },
+  { type: "searching", query },
+  { type: "retrieved", query, hitCount: hits },
+  { type: "toolResult", id, status: "ok", summary: `${hits} spans`, detail: null },
+];
+
 beforeEach(() => {
   resetChatPaneMocks(reportError);
 });
@@ -435,7 +452,10 @@ describe("ChatPane — chat view", () => {
     ]);
 
     // One process fold carrying the whole rail, collapsed once the answer landed.
-    const summaryLine = screen.getByText(/1 tool · 1 search · nothing found/);
+    // The search returned a span and the model answered without opening it, so
+    // the head reports the hit and says the note went unread — it used to claim
+    // "nothing found" here, contradicting the "1 span" node directly beneath it.
+    const summaryLine = screen.getByText("1 tool · 1 search · 1 span · nothing read");
     expect(screen.getByText("Spacing is spreading review over time.")).toBeInTheDocument();
     // A search that read nothing is worth looking at, so the fold stays open.
     expect(summaryLine.closest("details")).toHaveAttribute("open");
@@ -485,6 +505,76 @@ describe("ChatPane — chat view", () => {
     expect(sourcePath.closest("[title]")).toHaveAttribute("title", `${relPath}:321`);
   });
 
+  // ── The three retrieval outcomes the summary line must tell apart (#122) ──
+  //
+  // "Nothing was read" and "nothing was found" are different events, and the gap
+  // between them is routine: searches return spans and the model decides none are
+  // worth opening. Each of these pins the RENDERED STRING as a literal. Asserting
+  // against a value recomputed from `summarizeActivity` would compare the summary
+  // with its own source and pass forever — including on the bug below, which
+  // shipped precisely because nothing pinned the words the user actually sees.
+
+  it("never says 'nothing found' when the searches returned spans the model chose not to open (#122)", async () => {
+    // The exact shape of the reported run: two searches, eleven spans between
+    // them, no note opened. The old copy said "nothing found" one line above two
+    // nodes reading "6 spans" and "5 spans" — a summary contradicting its own
+    // children, and a false claim about the user's vault.
+    await askInChat("how should I revise?", [
+      ...hitSearch("c1", "markdown", 6),
+      ...hitSearch("c2", "spaced repetition", 5),
+      { type: "answer", delta: "Revision works best when spread out." },
+      {
+        type: "coverage",
+        searchedTerms: ["markdown", "spaced repetition"],
+        notesRead: [],
+        truncated: false,
+        skippedFiles: 0,
+      },
+      { type: "done" },
+    ]);
+
+    const rail = screen.getByRole("region", { name: "What the assistant did" });
+    expect(
+      within(rail).getByText("2 tools · 2 searches · 11 spans · nothing read"),
+    ).toBeInTheDocument();
+    expect(within(rail).queryByText(/nothing found/)).not.toBeInTheDocument();
+
+    // The span total agrees with the nodes beneath it — 6 + 5 — which is the
+    // property the bug broke: the head must never contradict its own children.
+    expect(within(rail).getByText("· 6 spans")).toBeInTheDocument();
+    expect(within(rail).getByText("· 5 spans")).toBeInTheDocument();
+
+    // Same false claim, louder: the empty-retrieval card tells the user their
+    // vault holds nothing on the subject. Eleven spans came back, so it must
+    // stand down here just as the summary does.
+    expect(screen.queryByText("Nothing in your vault covers this")).not.toBeInTheDocument();
+  });
+
+  it("says nothing about the outcome while a search has yet to report", async () => {
+    // `hitCount` is undefined between `searching` and `retrieved`. That is
+    // "hasn't said yet", not zero — and the answer streaming has already folded
+    // the rail down to this one line, so the summary renders mid-flight.
+    await askInChat("what did I write about focus?", [
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: '{"query":"focus"}',
+        stepId: null,
+      },
+      { type: "searching", query: "focus" },
+      { type: "answer", delta: "Let me pull that together." },
+    ]);
+
+    const rail = screen.getByRole("region", { name: "What the assistant did" });
+    expect(within(rail).getByText("1 tool · 1 search")).toBeInTheDocument();
+    // Claiming either outcome before the search reports is the same false
+    // statement as the bug above, just earlier in the turn.
+    expect(within(rail).queryByText(/nothing found/)).not.toBeInTheDocument();
+    expect(within(rail).queryByText(/nothing read/)).not.toBeInTheDocument();
+  });
+
   it("summarises a run that found nothing as 'N searches · nothing found', rail open", async () => {
     await askInChat("do we have notes on quokkas?", [
       ...emptySearch("c1", "quokka"),
@@ -494,8 +584,11 @@ describe("ChatPane — chat view", () => {
       { type: "done" },
     ]);
 
+    // Every search reported, and every one of them reported zero. This is the
+    // one state in which "nothing found" is a true statement about the vault.
+    // Pinned as a literal, not a regex: the words are the thing under test.
+    const summaryLine = screen.getByText("3 tools · 3 searches · nothing found");
     // No absurd "· verified" when retrieval came up empty — a distinct, honest copy.
-    const summaryLine = screen.getByText(/3 tools · 3 searches · nothing found/);
     expect(screen.queryByText(/verified/)).not.toBeInTheDocument();
 
     // Defaults OPEN so the zero-hit queries — what the user might rephrase — show.
