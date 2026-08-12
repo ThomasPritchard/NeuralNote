@@ -116,11 +116,21 @@ export function useChatPaneChat({
         return;
       }
       if (outcome.status === "cancelled") {
-        // TODO(done-cancel-announcement): announce stopped only when
-        // markAssistantStopped actually transitions this turn; Done must keep
-        // its completed announcement if native guard cleanup is still pending.
-        setMessages((prev) => markAssistantStopped(prev, turnId));
-        setLiveAnnouncement("Response stopped.");
+        setMessages((prev) => {
+          const next = markAssistantStopped(prev, turnId);
+          // The live region is the only account of the outcome a screen-reader
+          // user gets, so it may only claim a stop that actually happened. If
+          // `done` already landed while native guard cleanup was unwinding, the
+          // turn is settled and `markAssistantStopped` hands back the very same
+          // array — leave the announcement to the completed turn.
+          //
+          // The check has to run against `prev`: this callback holds the only
+          // view of the transcript guaranteed to be current, and it is precisely
+          // a `done` racing the stop that decides the answer. Announcing here is
+          // idempotent, so a repeated updater invocation announces once.
+          if (next !== prev) setLiveAnnouncement("Response stopped.");
+          return next;
+        });
       } else {
         setStoppingTurnId(null);
       }
