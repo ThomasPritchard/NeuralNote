@@ -455,3 +455,141 @@ describe("GraphView cluster drill-down", () => {
     expect(screen.queryByRole("navigation", { name: "Folder breadcrumb" })).toBeNull();
   });
 });
+
+// ── Live refresh while mounted (#34) ────────────────────────────────────────
+// The graph must follow the vault while it stays open. These lock the four
+// halves of that mechanism the mount-path tests above can't reach: a burst
+// coalesces into ONE reload, the drill-down level survives a reload (and only
+// falls back to root when its folder actually went away), and a failed
+// background reload neither blanks the last-good galaxy nor hides a failure
+// the user can already see.
+describe("GraphView live refresh", () => {
+  const nodeIds = () => harness.props.graphData.nodes.map((n: any) => n.id).sort();
+
+  /** Render, settle the first load, and size the pane so the galaxy mounts. */
+  async function renderMounted(first: LinkGraph) {
+    mocks.readLinkGraph.mockResolvedValueOnce(first);
+    render(<GraphView onOpenNote={vi.fn()} />);
+    fireResize(800, 600);
+    await screen.findByTestId("force-graph-3d");
+  }
+
+  /** Play one watcher ping and let the debounce expire, on fake time. */
+  async function fireTreeChangedAfterDebounce() {
+    vi.useFakeTimers();
+    try {
+      await act(async () => {
+        treeChanged.cb!();
+        await vi.advanceTimersByTimeAsync(300);
+      });
+    } finally {
+      vi.useRealTimers();
+    }
+  }
+
+  it("coalesces a burst of tree-change events into a single reload (#34)", async () => {
+    vi.useFakeTimers();
+    try {
+      mocks.readLinkGraph.mockResolvedValue(linkGraph());
+      render(<GraphView onOpenNote={vi.fn()} />);
+      await act(async () => {});
+      fireResize(800, 600);
+      expect(mocks.readLinkGraph).toHaveBeenCalledTimes(1); // the mount load
+
+      // A git-pull-style burst: every ping restarts the window, so 499 ms after
+      // the FIRST one — but only 299 ms after the last — nothing has refetched.
+      await act(async () => {
+        treeChanged.cb!();
+        await vi.advanceTimersByTimeAsync(100);
+        treeChanged.cb!();
+        await vi.advanceTimersByTimeAsync(100);
+        treeChanged.cb!();
+        await vi.advanceTimersByTimeAsync(299);
+      });
+      expect(mocks.readLinkGraph).toHaveBeenCalledTimes(1);
+
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(1);
+      });
+      expect(mocks.readLinkGraph).toHaveBeenCalledTimes(2); // one reload, not three
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the drilled-into level and its breadcrumb across a live reload (#34)", async () => {
+    await renderMounted(deepGraph());
+    await userEvent.click(screen.getByRole("button", { name: "notes" }));
+    expect(nodeIds()).toHaveLength(3);
+
+    // A note lands under the folder the user is currently inside.
+    const grown = deepGraph();
+    grown.nodes.push({ id: "notes/zeta.md", title: "Zeta", cluster: "notes" });
+    mocks.readLinkGraph.mockResolvedValueOnce(grown);
+    await fireTreeChangedAfterDebounce();
+
+    // Still inside notes/, now showing the new note — never bounced to root.
+    expect(nodeIds()).toEqual([
+      "notes/beta.md",
+      "notes/daily/delta.md",
+      "notes/daily/gamma.md",
+      "notes/zeta.md",
+    ]);
+    const crumb = screen.getByRole("navigation", { name: "Folder breadcrumb" });
+    expect(within(crumb).getByText("notes")).toBeInTheDocument();
+  });
+
+  it("falls back to root when a live reload drops the drilled-into folder (#34)", async () => {
+    await renderMounted(deepGraph());
+    await userEvent.click(screen.getByRole("button", { name: "notes" }));
+    expect(nodeIds()).toHaveLength(3);
+
+    // notes/ is gone from the vault (an external move, a git pull).
+    mocks.readLinkGraph.mockResolvedValueOnce(
+      linkGraph({
+        nodes: [
+          { id: "alpha.md", title: "Alpha", cluster: "" },
+          { id: "essays/epsilon.md", title: "Epsilon", cluster: "essays" },
+        ],
+        links: [],
+      }),
+    );
+    await fireTreeChangedAfterDebounce();
+
+    expect(nodeIds()).toEqual(["alpha.md", "essays/epsilon.md"]);
+    expect(screen.queryByRole("navigation", { name: "Folder breadcrumb" })).toBeNull();
+    expect(screen.queryByText("No notes yet")).not.toBeInTheDocument();
+  });
+
+  it("keeps the last-good galaxy when a background reload fails (#34)", async () => {
+    await renderMounted(linkGraph());
+    expect(nodeIds()).toHaveLength(2);
+
+    mocks.readLinkGraph.mockRejectedValueOnce({ kind: "io", message: "vault unreadable" });
+    await fireTreeChangedAfterDebounce();
+
+    // The reload really ran — and left the last-good view untouched: no error
+    // swap, no spinner, no empty galaxy.
+    expect(mocks.readLinkGraph).toHaveBeenCalledTimes(2);
+    expect(nodeIds()).toHaveLength(2);
+    expect(screen.queryByText("vault unreadable")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Loading graph")).not.toBeInTheDocument();
+  });
+
+  it("never hides an already-visible read failure behind a background reload (#34)", async () => {
+    mocks.readLinkGraph.mockRejectedValueOnce({ kind: "io", message: "vault unreadable" });
+    render(<GraphView onOpenNote={vi.fn()} />);
+    fireResize(800, 600);
+    expect(await screen.findByText("vault unreadable")).toBeInTheDocument();
+
+    mocks.readLinkGraph.mockRejectedValueOnce({ kind: "io", message: "still unreadable" });
+    await fireTreeChangedAfterDebounce();
+
+    // The failure stays on screen with its Retry — never a silent blank pane.
+    expect(mocks.readLinkGraph).toHaveBeenCalledTimes(2);
+    expect(screen.getByText("vault unreadable")).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: /Retry/ })).toBeInTheDocument();
+    expect(screen.queryByTestId("force-graph-3d")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Loading graph")).not.toBeInTheDocument();
+  });
+});
