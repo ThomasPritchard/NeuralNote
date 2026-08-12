@@ -111,7 +111,12 @@ pub enum ToolStatus {
 )]
 #[ts(export)]
 pub enum ChatEvent {
-    /// The backend accepted the run and is preparing the first model request.
+    /// The run is working and nothing more specific is true yet: the backend has
+    /// accepted it and is preparing a model request. Emitted once when the run is
+    /// accepted, and again before each tool-deciding round-trip — that turn can
+    /// take fifteen seconds and emits nothing else, so without it the last phase
+    /// word simply goes stale on screen (#126). Deliberately repeatable and
+    /// idempotent: it re-states the phase, it does not announce a new thing.
     Processing,
     /// A skill became active and granted its declared tools.
     SkillActivated { id: String, name: String },

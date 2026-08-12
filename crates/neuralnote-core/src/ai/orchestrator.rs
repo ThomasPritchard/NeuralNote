@@ -1003,11 +1003,27 @@ impl ChatSession<'_> {
     /// implementation emits nothing, so its retry behaviour is unchanged.
     ///
     /// A non-transient failure or a user-stopped run is never retried either.
+    ///
+    /// **It opens by saying the run is working** (#126). Nothing else can reach the
+    /// user during this turn — only a `write_note` preview can, and only on a
+    /// provider that streams tool calls — so an answered question was followed by a
+    /// whole round-trip of silence, and by TWO on a provider that does not stream
+    /// tool turns and re-runs the turn buffered. The pane went on showing whichever
+    /// phase word it last had ("searching", while the model was composing). One
+    /// [`ChatEvent::Processing`] before the turn is the honest correction: it is the
+    /// variant that already means "working", which the run genuinely is.
     async fn complete_tool_turn(
         &self,
         request: &LlmRequest,
         sink: &mut dyn EventSink,
     ) -> CoreResult<Completion> {
+        // Sent through the raw sink, BEFORE the guard below wraps it, and once for
+        // the whole call rather than once per attempt. Both matter. The guard bars a
+        // retry on anything the user can already SEE — a half-composed note — and
+        // this beacon is neither the provider's output nor something a replay could
+        // rewind, so counting it would silently disable the one bounded retry. Once
+        // per call also keeps the turn to a single event no matter how it goes.
+        sink.send(ChatEvent::Processing);
         let mut retries = MAX_COMPLETE_RETRIES;
         let mut sink = EmissionGuard {
             inner: sink,
@@ -2333,11 +2349,13 @@ mod tests {
     use crate::ai::plan::{PlanStep, StepStatus};
     use crate::ai::retrieval::{FolderMeta, KeywordRetriever, ListOutcome, SearchOutcome};
     use crate::ai::skills::{SkillEnvironment, SkillRegistry};
+    use crate::ai::tool_turn_reader::{StreamedToolTurn, ToolTurnReader};
     use crate::ai::write_policy::UnavailableNoteWriter;
     use crate::ai::{
         CaptionPayload, CaptionRequest, CaptureCancellation, Elicitation, MetadataPayload,
         NotePathState, NoteWriteBackend, NoteWriteParent, OpenedNoteParent, PlaylistPayload,
-        ThumbnailPayload, VideoId, YoutubeIo, YoutubeUrl, YOUTUBE_DISTIL_SKILL_ID,
+        ThumbnailPayload, VideoId, YoutubeIo, YoutubeUrl, FIXTURE_SKILL_ID,
+        YOUTUBE_DISTIL_SKILL_ID,
     };
     use crate::capture::{CaptureError, PricingInput};
     use crate::error::CoreError;
@@ -4605,9 +4623,15 @@ mod tests {
         let events = run(v.path(), &mock, &Guards::default());
 
         assert!(matches!(events.first(), Some(ChatEvent::Processing)));
+        // One beacon for the accepted run, then exactly one more before each
+        // tool-deciding turn (#126) — never a second for the same turn, and never
+        // one per row of anything. Counted from the turns the mock was actually
+        // asked for rather than written as a number, so the bound is on the RATE:
+        // a turn that beaconed twice still fails here. Nothing in this run fails,
+        // so one `complete` call is one turn is one round-trip.
         assert_eq!(
             count(&events, |event| matches!(event, ChatEvent::Processing)),
-            1
+            1 + mock.completion_requests().len()
         );
         assert!(events
             .iter()
@@ -5943,7 +5967,17 @@ mod tests {
 
         assert!(result.is_err(), "both attempts failed");
         assert_eq!(llm.attempts(), 2, "retried exactly once");
-        assert!(sink.events.is_empty(), "nothing was ever published");
+        // This used to read `sink.events.is_empty()`. The turn now opens by saying
+        // the run is working (#126), and that beacon must NOT be mistaken for
+        // something a replay could rewind — if it were counted as an emission, the
+        // retry above would silently stop happening. So the claim is stated
+        // precisely instead of loosened: the provider published nothing across BOTH
+        // attempts, and the beacon went out once for the call rather than per try.
+        assert_eq!(
+            sink.events,
+            vec![ChatEvent::Processing],
+            "only the beacon, and only one of it"
+        );
     }
 
     #[test]
@@ -5967,5 +6001,193 @@ mod tests {
             .iter()
             .any(|event| matches!(event, ChatEvent::Error { .. })));
         assert_eq!(count(&events, |event| matches!(event, ChatEvent::Done)), 0);
+    }
+
+    // ── §5 the run says it is working across a model round-trip (#126) ──────
+    // An answered `ask_user` was followed by NOTHING for a whole provider
+    // round-trip — and by two of them on a provider that does not stream tool
+    // turns, which re-runs the turn buffered. The pane went on showing the last
+    // phase word it was handed, so the user watched "searching" for the fifteen
+    // seconds the model spent composing. Not a correctness bug; a stale phase
+    // word is still a dishonest one.
+
+    /// The fixture skill's question, answered by whoever the run was given.
+    const ASK_USER_ARGS: &str = r#"{"question":"Continue?","options":[{"id":"continue","label":"Continue","description":null,"imageDataUri":null}],"multi_select":false}"#;
+
+    /// Picks the first option, like a user who clicked one.
+    struct AnsweringPrompt;
+
+    #[async_trait]
+    impl UserPrompt for AnsweringPrompt {
+        async fn ask(&self, elicitation: Elicitation) -> CoreResult<Option<Vec<String>>> {
+            Ok(Some(vec![elicitation.options[0].id.clone()]))
+        }
+    }
+
+    /// A whole run with the fixture skill preloaded (so `ask_user` is granted)
+    /// and every question answered — the shape the fifteen seconds was measured
+    /// on.
+    fn run_answered_question(llm: &dyn LlmClient) -> Vec<ChatEvent> {
+        let env = retry_env();
+        let services = SkillServices::new(
+            &env.skills,
+            &env.environment,
+            &AnsweringPrompt,
+            &UnavailableNoteWriter,
+            1,
+        )
+        .with_approval(
+            unattended_policy(),
+            &TEST_APPROVAL_PROMPT,
+            &TEST_APPROVAL_CLASSIFIER,
+        );
+        let mut sink = VecSink::default();
+        block_on(run_chat(
+            "ask me what to do",
+            &[],
+            vec![FIXTURE_SKILL_ID.into()],
+            env._vault.path(),
+            "test-model",
+            &env.provider,
+            llm,
+            &services,
+            &mut sink,
+            &env.guards,
+        ))
+        .unwrap();
+        sink.events
+    }
+
+    #[test]
+    fn an_answered_question_is_followed_by_a_beacon_rather_than_silence() {
+        let llm = MockLlmClient::new(
+            vec![tool_call("prompt", "ask_user", ASK_USER_ARGS), final_turn()],
+            "done",
+        );
+
+        let events = run_answered_question(&llm);
+
+        let settled = events
+            .iter()
+            .position(|event| {
+                matches!(event, ChatEvent::ToolResult { id, status, .. }
+                    if id == "prompt" && *status == ToolStatus::Ok)
+            })
+            .expect("the answered question settles");
+        assert_eq!(
+            events.get(settled + 1),
+            Some(&ChatEvent::Processing),
+            "a full provider round-trip starts here, and nothing else can be \
+             emitted during it — so without a beacon the pane keeps showing \
+             whichever phase word it last had. Got: {:?}",
+            &events[settled..],
+        );
+        assert!(
+            matches!(events.last(), Some(ChatEvent::Done)),
+            "the run still finishes, so the assertion above is about a real run"
+        );
+    }
+
+    /// A provider that does not stream tool turns: the streamed attempt carries
+    /// nothing, the real [`ToolTurnReader`] settles that as `NotStreamed`, and
+    /// the turn is re-run buffered — the shell's fallback, in
+    /// `app/desktop/src-tauri/src/ai.rs`. Two round-trips, and neither publishes
+    /// anything of its own.
+    struct UnstreamableToolLlm {
+        completions: Mutex<VecDeque<Completion>>,
+        round_trips: std::sync::atomic::AtomicUsize,
+    }
+
+    impl UnstreamableToolLlm {
+        fn new(completions: Vec<Completion>) -> Self {
+            Self {
+                completions: Mutex::new(completions.into()),
+                round_trips: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn round_trips(&self) -> usize {
+            self.round_trips.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for UnstreamableToolLlm {
+        async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+            self.round_trips
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .completions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(final_turn))
+        }
+
+        async fn complete_tool_streaming(
+            &self,
+            req: &LlmRequest,
+            sink: &mut dyn EventSink,
+        ) -> CoreResult<Completion> {
+            self.round_trips
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Read the empty turn through the real reader, so the `NotStreamed`
+            // verdict is that module's own rather than one this double invented.
+            let mut reader = ToolTurnReader::new();
+            assert!(
+                reader.push_bytes(b"data: [DONE]\n", sink)?,
+                "the terminator stops the read"
+            );
+            match reader.finish(sink)? {
+                StreamedToolTurn::Completed(_) => {
+                    panic!("a turn that carried nothing must ask for the buffered fallback")
+                }
+                StreamedToolTurn::NotStreamed => self.complete(req).await,
+            }
+        }
+
+        async fn complete_streaming(
+            &self,
+            _req: &LlmRequest,
+            _sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            unreachable!("this test settles the tool turn and never reaches the answer")
+        }
+    }
+
+    #[test]
+    fn a_turn_the_provider_reruns_buffered_still_gets_one_beacon_before_both_round_trips() {
+        let env = retry_env();
+        let services = SkillServices::new(
+            &env.skills,
+            &env.environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        );
+        let llm = UnstreamableToolLlm::new(vec![final_turn()]);
+        let session = ChatSession {
+            root: env._vault.path(),
+            model: "test-model",
+            provider: &env.provider,
+            llm: &llm,
+            skill_services: &services,
+            guards: &env.guards,
+        };
+        let mut sink = VecSink::default();
+
+        block_on(session.complete_tool_turn(&tool_decision_request(), &mut sink)).unwrap();
+
+        assert_eq!(
+            llm.round_trips(),
+            2,
+            "the worse case the issue names: this turn really did run twice"
+        );
+        assert_eq!(
+            sink.events,
+            vec![ChatEvent::Processing],
+            "the beacon precedes the pair, so ONE covers both — and the two \
+             round-trips publish nothing else between them"
+        );
     }
 }
