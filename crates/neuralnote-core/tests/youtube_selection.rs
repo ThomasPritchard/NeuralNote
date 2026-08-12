@@ -3,7 +3,9 @@ mod selection_support;
 mod support;
 mod youtube_support;
 
-use neuralnote_core::ai::tools::{ToolOutcome, TOOL_SELECT_PLAYLIST_VIDEOS};
+use neuralnote_core::ai::tools::{
+    ToolOutcome, TOOL_FETCH_VIDEO_INFO, TOOL_SELECT_PLAYLIST_VIDEOS, TOOL_WRITE_NOTE,
+};
 use neuralnote_core::ai::{
     KeywordRetriever, PlaylistPayload, ThumbnailPayload, WriteSession, YoutubeToolSession,
     YoutubeUrl,
@@ -827,4 +829,92 @@ fn high_usage_confirmation_surfaces_cancel_and_no_response() {
         assert_eq!(result.outcome, ToolOutcome::Rejected);
         assert!(result.content.contains(expected), "{}", result.content);
     }
+}
+
+#[test]
+fn one_playlist_confinement_refusal_reads_the_same_through_write_note_and_capture() {
+    // Two dispatchers police the SAME playlist run seconds apart: `write_note`
+    // checks the work item, `fetch_video_info` checks the capture URL. Both raise
+    // one `CaptureError::PlaylistInvalid` — one confinement decision — but only
+    // the capture side settled it at the shared seam. `write_note` kept a private
+    // copy of the answer inline, which is the drift #116 says cannot exist: a copy
+    // agrees right up until the seam changes, and then one refusal starts telling
+    // two stories.
+    //
+    // So this does not name the right answer per dispatcher, it asserts they
+    // AGREE — and that both speak the seam's envelope, whose stable `kind` a
+    // hand-rolled refusal cannot produce. Per-variant correctness is pinned
+    // separately by the seam's own exhaustive test.
+    let vault = tempfile::tempdir().unwrap();
+    let retriever = KeywordRetriever::new(vault.path());
+    let profile = MemoryProfileIo::default();
+    let prompt = ScriptedPrompt::with_answers([vec!["iG9CE55wbtY".into(), "UF8uR6Z6KLc".into()]]);
+    let mut session = YoutubeToolSession::default();
+    let mut writes = WriteSession::new(1).unwrap();
+
+    let selected = call_with_writes(
+        vault.path(),
+        &retriever,
+        &PlaylistIo::default(),
+        &mut session,
+        &profile,
+        &prompt,
+        TOOL_SELECT_PLAYLIST_VIDEOS,
+        r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-safe_123"}"#,
+        &mut writes,
+    );
+    assert_eq!(
+        selected.outcome,
+        ToolOutcome::Action,
+        "{}",
+        selected.content
+    );
+
+    // The run is on work item 0, whose one authorised video is the first of the
+    // two. A capture of anything else, and a write filed against any other work
+    // item, are the same refusal.
+    let outside_the_selection = call_with_writes(
+        vault.path(),
+        &retriever,
+        &PlaylistIo::default(),
+        &mut session,
+        &profile,
+        &prompt,
+        TOOL_FETCH_VIDEO_INFO,
+        r#"{"url":"https://www.youtube.com/watch?v=aaaaaaaaaaa"}"#,
+        &mut writes,
+    );
+    let wrong_work_item = call_with_writes(
+        vault.path(),
+        &retriever,
+        &PlaylistIo::default(),
+        &mut session,
+        &profile,
+        &prompt,
+        TOOL_WRITE_NOTE,
+        r#"{"rel_path":"Outside.md","content":"body","kind":"literature","work_item":1}"#,
+        &mut writes,
+    );
+
+    assert_eq!(
+        std::mem::discriminant(&outside_the_selection.outcome),
+        std::mem::discriminant(&wrong_work_item.outcome),
+        "one confinement refusal settles as {:?} through fetch_video_info and \
+         {:?} through write_note — one decision cannot have two accounts",
+        outside_the_selection.outcome,
+        wrong_work_item.outcome
+    );
+    for result in [&outside_the_selection, &wrong_work_item] {
+        let envelope: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(
+            envelope["error"]["kind"], "playlist_invalid",
+            "a confinement refusal must carry the seam's stable code rather than a \
+             sentence assembled at the call site: {}",
+            result.content
+        );
+    }
+    assert!(
+        !vault.path().join("Outside.md").exists(),
+        "the refusal must precede the write, not follow it"
+    );
 }

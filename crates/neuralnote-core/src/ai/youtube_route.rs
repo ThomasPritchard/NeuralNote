@@ -79,13 +79,16 @@ pub(super) async fn dispatch_resolve_distil_route(
 ///
 /// Failing with a `ToolResult` rather than an error keeps the classification at
 /// one seam. It is the shape `elicit_and_persist_route` already uses in this
-/// file, for the same reason.
+/// file, for the same reason. Guarded by
+/// `one_vault_error_reads_the_same_through_the_route_and_the_listing_dispatchers`,
+/// which pushes one `CoreError` through both dispatchers and compares the two
+/// accounts.
 fn build_inventory(
     provider: &dyn crate::ai::retrieval::RetrievalProvider,
 ) -> Result<(VaultInventory, bool, u32), ToolResult> {
     let folders = provider
         .list_folders()
-        .map_err(|error| settle_capture_error(CaptureError::ProfileInvalid(format!("could not inspect vault folders: {error}"))))?;
+        .map_err(|error| settle_vault_error("could not inspect vault folders", &error))?;
     let notes = provider
         .list_notes(None)
         .map_err(|error| settle_vault_error("could not inspect vault notes", &error))?;

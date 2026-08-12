@@ -499,7 +499,24 @@ pub(super) fn fail(message: String) -> ToolResult {
 ///
 /// Both stories reach the dispatcher through the same `Err` arm, so the variant
 /// is the only thing that can tell them apart. Exhaustive on purpose: a new
-/// `CoreError` cannot reach a tool result until it has been classified here.
+/// `CoreError` variant does not compile until it has been bucketed here, and this
+/// module's `a_confinement_refusal_is_never_reported_as_a_failure` pins which
+/// bucket each one lands in. All seven provider and vault calls a tool makes
+/// route through it — the four dispatchers below, `write_note`'s policy result in
+/// `skill_tools`, and the two inventory reads `youtube_route` makes with the same
+/// provider. That last pair was the exception until #116: it wrapped them as
+/// `ProfileInvalid`, so one `NotFound` read as a refusal through `list_folders`
+/// and as a broken stored profile through `resolve_distil_route`, seconds apart.
+/// The two accounts are now held together by
+/// `one_vault_error_reads_the_same_through_the_route_and_the_listing_dispatchers`.
+///
+/// It is not, however, the only place a `CoreError` can be quoted to the model,
+/// and the two exceptions are deliberate rather than gaps. A prompt-channel
+/// failure (`elicitation::elicit_user`, when `UserPrompt::ask` errors) and an
+/// unresolvable path at the approval gate (`approval::subject::probe_note_target`)
+/// both stringify theirs. Neither is a vault operation and neither can produce a
+/// `Failed`: nothing was attempted, so the STAGE settles the bucket and the
+/// variant has nothing left to say.
 pub(super) fn settle_vault_error(context: &str, error: &CoreError) -> ToolResult {
     let message = format!("{context}: {error}");
     match error {

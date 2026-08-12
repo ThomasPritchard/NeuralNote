@@ -11,6 +11,7 @@ use crate::ai::tools::{
     TOOL_WRITE_NOTE,
 };
 use crate::ai::write_policy::{write_note_policy, NoteKind, WriteOutcome};
+use crate::ai::youtube_tool_errors::settle_capture_error;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -229,8 +230,13 @@ pub(super) fn dispatch_write_note(args_json: &str, context: &mut ToolContext<'_>
         Err(error) => return reject(format!("invalid write_note arguments: {error}")),
     };
     if let Some(session) = context.youtube_session.as_deref() {
+        // Settled at the capture seam, not decided here. This is the same
+        // confinement `fetch_video_info` and `fetch_captions` enforce against the
+        // same playlist run, so a second copy of the answer at this call site
+        // would agree only until the day the seam changes (#116). Guarded by
+        // `one_playlist_confinement_refusal_reads_the_same_through_write_note_and_capture`.
         if let Err(error) = session.validate_playlist_work_item(args.work_item) {
-            return reject(format!("write_note failed: {error}"));
+            return settle_capture_error(error);
         }
     }
     match write_note_policy(

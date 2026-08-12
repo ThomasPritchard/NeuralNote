@@ -3744,17 +3744,9 @@ mod tests {
         // nobody stopped anything, and calling that "run ended first" would be
         // the same false attribution pointed the other way.
         let vault = vault();
-        let llm = MockLlmClient::new(
-            vec![tool_call("c1", "list_notes", "{}")],
-            "Nothing found.",
-        );
+        let llm = MockLlmClient::new(vec![tool_call("c1", "list_notes", "{}")], "Nothing found.");
 
-        let events = run_with_provider(
-            vault.path(),
-            &StoppedRunProvider,
-            &llm,
-            &Guards::default(),
-        );
+        let events = run_with_provider(vault.path(), &StoppedRunProvider, &llm, &Guards::default());
 
         assert_eq!(
             settled_status(&events, "c1"),
@@ -4807,12 +4799,18 @@ mod tests {
         let events = run(v.path(), &mock, &Guards::default());
 
         assert!(matches!(events.first(), Some(ChatEvent::Processing)));
-        // One beacon for the accepted run, then exactly one more before each
-        // tool-deciding turn (#126) — never a second for the same turn, and never
-        // one per row of anything. Counted from the turns the mock was actually
-        // asked for rather than written as a number, so the bound is on the RATE:
-        // a turn that beaconed twice still fails here. Nothing in this run fails,
-        // so one `complete` call is one turn is one round-trip.
+        // One beacon for the accepted run, then one more before each tool-deciding
+        // turn (#126) — never one per row of anything. Counted from the turns the
+        // mock was actually asked for rather than written as a number, so the
+        // bound is on the RATE rather than on this script's length.
+        //
+        // What it does NOT bound is beacons per ATTEMPT. Nothing in this run
+        // fails, so one `complete` call is one turn is one round-trip, and a
+        // beacon moved inside the retry loop would lift both sides of this
+        // equality together and leave the fixture green. That property — one
+        // beacon per CALL, not per try — is pinned by
+        // `a_streamed_tool_turn_that_failed_before_emitting_is_still_retried_once`,
+        // which retries once and still admits exactly one.
         assert_eq!(
             count(&events, |event| matches!(event, ChatEvent::Processing)),
             1 + mock.completion_requests().len()
