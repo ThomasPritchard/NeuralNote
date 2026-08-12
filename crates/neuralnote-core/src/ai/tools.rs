@@ -18,9 +18,12 @@ use crate::ai::retrieval::RetrievalProvider;
 use crate::ai::skill_tools;
 use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
 use crate::ai::write_policy::{NoteWriteBackend, WriteSession};
-use crate::ai::youtube::{YoutubeIo, YoutubeToolSession, UNAVAILABLE_YOUTUBE_IO};
+use crate::ai::youtube::{
+    CaptureCancellation, YoutubeIo, YoutubeToolSession, UNAVAILABLE_YOUTUBE_IO,
+};
 use crate::ai::youtube_tools;
 use crate::capture::{PricingInput, UnavailableVaultProfileIo, VaultProfileIo};
+use crate::error::CoreError;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::collections::BTreeSet;
@@ -71,9 +74,36 @@ pub enum ToolOutcome {
     },
     /// A skill action completed and emitted its own structured event if needed.
     Action,
-    /// The call was rejected (bad name/args/path). The detail is in the content the
+    /// The call was refused before it did anything (bad name/args/path, an
+    /// unauthorised tool, a confinement rule). The detail is in the content the
     /// model reads; the orchestrator emits no event for it.
+    ///
+    /// This and [`Self::Failed`] are separate for the reason
+    /// [`StepStatus`](crate::ai::plan::StepStatus) splits `Skipped` from
+    /// `Failed`: "I declined to do this" and "I tried this and it did not work"
+    /// are two different accounts, and only one of them means something broke.
+    /// Collapsing them tells the user NeuralNote refused a call it in fact
+    /// attempted (#116).
     Rejected,
+    /// The call ran and failed. `message` is the same sentence the model reads,
+    /// carried structurally so the orchestrator can report the failure without
+    /// parsing it back out of the model-facing envelope.
+    Failed { message: String },
+    /// The call did not deliver because the RUN ended underneath it — the user
+    /// pressed Stop, or the window closed. Nobody refused anything and nothing
+    /// broke.
+    ///
+    /// A third account for the same reason [`Self::Rejected`] and [`Self::Failed`]
+    /// are two: it is the only one where nothing is wrong. It settles as
+    /// [`ToolStatus::Cancelled`](crate::ai::events::ToolStatus::Cancelled), which
+    /// the timeline already renders as "run ended first" in the calm register.
+    ///
+    /// Produced only by [`settle_against_run_state`], never by a dispatcher —
+    /// which is deliberate. No error variant can identify this case, because the
+    /// producers are indistinguishable at the point they are raised (see that
+    /// function). Only the state of the run can, and only the dispatch boundary
+    /// can see both.
+    Cancelled,
 }
 
 /// Internal orchestration control carried alongside a normal tool result.
@@ -114,6 +144,13 @@ pub struct ToolContext<'a> {
     /// `update_plan` then rejects rather than pretending to record a plan.
     pub(super) plan: Option<&'a mut RunPlan>,
     authorized_tools: &'a BTreeSet<String>,
+    /// The run's cancellation token, shared with the host. Read once, after the
+    /// tool has run, by [`settle_against_run_state`].
+    ///
+    /// Defaults to a token nobody can cancel, so a caller that wires none simply
+    /// never re-attributes — today's behaviour exactly, rather than a silently
+    /// different one.
+    cancellation: CaptureCancellation,
 }
 
 impl<'a> ToolContext<'a> {
@@ -143,7 +180,15 @@ impl<'a> ToolContext<'a> {
             pricing: None,
             plan: None,
             authorized_tools,
+            cancellation: CaptureCancellation::default(),
         }
+    }
+
+    /// Wire the run's cancellation token, so a call that comes apart *because*
+    /// the run ended is reported as the run ending rather than as a failure.
+    pub fn with_cancellation(mut self, cancellation: CaptureCancellation) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     /// Wire the run's plan, so `update_plan` has somewhere to record one.
@@ -319,6 +364,55 @@ pub async fn dispatch(
     user_prompt: &dyn UserPrompt,
     context: &mut ToolContext<'_>,
 ) -> ToolResult {
+    let result = run_tool(approved, provider, registry, user_prompt, context).await;
+    settle_against_run_state(result, context)
+}
+
+/// Re-read a settled call against the state of the RUN, which no error variant
+/// can see.
+///
+/// [`settle_vault_error`] and its capture-side twin classify on the variant,
+/// because that is the only thing that separates the stories *within* one call.
+/// It is not enough on its own: `CoreError::Conflict` has three unrelated
+/// producers and only one of them is breakage —
+///
+/// * a user Stop — the shell's run-scoped wrapper (`ensure_run_active` in
+///   `app/desktop/src-tauri/src/skills/note_writer.rs`) answers `Conflict` for
+///   every write once the close signal is set;
+/// * a policy refusal — the `write_note` cap in `write_policy`;
+/// * a genuine conflict — an atomic-note collision, also in `write_policy`.
+///
+/// They arrive identical, so no amount of care at the variant seam can tell them
+/// apart. What separates them is whether the run was still live, and the
+/// dispatch boundary is the one place that sees both that and the result.
+///
+/// Only [`ToolOutcome::Failed`] is re-attributed. A refusal stays a refusal: the
+/// model's arguments were nonsense whether or not the user later pressed Stop,
+/// and nothing was attempted either way.
+///
+/// **The content is deliberately untouched.** Nothing is swallowed to buy the
+/// gentler status: the model still reads the real error, and the timeline's
+/// disclosure still shows it. A genuine fault that happened to coincide with a
+/// Stop is therefore still legible — only the blame moves, and it moves off the
+/// user, who is the one party certainly not at fault.
+fn settle_against_run_state(result: ToolResult, context: &ToolContext<'_>) -> ToolResult {
+    if !matches!(result.outcome, ToolOutcome::Failed { .. }) || !context.cancellation.is_cancelled()
+    {
+        return result;
+    }
+    ToolResult {
+        outcome: ToolOutcome::Cancelled,
+        ..result
+    }
+}
+
+async fn run_tool(
+    approved: &ApprovedCall,
+    provider: &dyn RetrievalProvider,
+    registry: &mut EvidenceRegistry,
+    user_prompt: &dyn UserPrompt,
+    context: &mut ToolContext<'_>,
+) -> ToolResult {
     let (call_id, name, args_json) = (approved.call_id(), approved.name(), approved.arguments());
     // Routing on the registry enum, not on the raw string, is what makes the title
     // table exhaustive: a new tool cannot be dispatched until it is a variant, and
@@ -374,6 +468,7 @@ pub async fn dispatch(
     }
 }
 
+/// "I refused this." The call was declined before it did anything.
 pub(super) fn reject(message: String) -> ToolResult {
     rejected_with_control(message, ToolControl::Continue)
 }
@@ -387,6 +482,57 @@ fn rejected_with_control(message: String, control: ToolControl) -> ToolResult {
         content: json!({ "error": message }).to_string(),
         outcome: ToolOutcome::Rejected,
         control,
+    }
+}
+
+/// "I tried this and it failed." The call was attempted and blew up.
+pub(super) fn fail(message: String) -> ToolResult {
+    ToolResult {
+        content: json!({ "error": message }).to_string(),
+        outcome: ToolOutcome::Failed { message },
+        control: ToolControl::Continue,
+    }
+}
+
+/// Settle a vault operation that did not succeed into the bucket its
+/// [`CoreError`] belongs to.
+///
+/// Both stories reach the dispatcher through the same `Err` arm, so the variant
+/// is the only thing that can tell them apart. Exhaustive on purpose: a new
+/// `CoreError` variant does not compile until it has been bucketed here, and this
+/// module's `a_confinement_refusal_is_never_reported_as_a_failure` pins which
+/// bucket each one lands in. All seven provider and vault calls a tool makes
+/// route through it — the four dispatchers below, `write_note`'s policy result in
+/// `skill_tools`, and the two inventory reads `youtube_route` makes with the same
+/// provider. That last pair was the exception until #116: it wrapped them as
+/// `ProfileInvalid`, so one `NotFound` read as a refusal through `list_folders`
+/// and as a broken stored profile through `resolve_distil_route`, seconds apart.
+/// The two accounts are now held together by
+/// `one_vault_error_reads_the_same_through_the_route_and_the_listing_dispatchers`.
+///
+/// It is not, however, the only place a `CoreError` can be quoted to the model,
+/// and the two exceptions are deliberate rather than gaps. A prompt-channel
+/// failure (`elicitation::elicit_user`, when `UserPrompt::ask` errors) and an
+/// unresolvable path at the approval gate (`approval::subject::probe_note_target`)
+/// both stringify theirs. Neither is a vault operation and neither can produce a
+/// `Failed`: nothing was attempted, so the STAGE settles the bucket and the
+/// variant has nothing left to say.
+pub(super) fn settle_vault_error(context: &str, error: &CoreError) -> ToolResult {
+    let message = format!("{context}: {error}");
+    match error {
+        // The model asked for something it may not have, or that is not there.
+        // Nothing was attempted and nothing is broken — it must fix the request.
+        CoreError::OutsideVault(_)
+        | CoreError::InvalidName(_)
+        | CoreError::InvalidContent(_)
+        | CoreError::NotFound(_)
+        | CoreError::AlreadyExists(_) => reject(message),
+        // The vault was reached and the operation came apart there.
+        CoreError::Conflict(_)
+        | CoreError::Io(_)
+        | CoreError::Frontmatter(_)
+        | CoreError::Llm(_)
+        | CoreError::LocalAi(_) => fail(message),
     }
 }
 
@@ -417,7 +563,7 @@ fn dispatch_list(args_json: &str, provider: &dyn RetrievalProvider) -> ToolResul
     };
     let outcome = match provider.list_notes(args.folder.as_deref()) {
         Ok(o) => o,
-        Err(e) => return reject(format!("could not list notes: {e}")),
+        Err(e) => return settle_vault_error("could not list notes", &e),
     };
     let listed: Vec<Value> = outcome
         .notes
@@ -444,7 +590,7 @@ fn dispatch_list(args_json: &str, provider: &dyn RetrievalProvider) -> ToolResul
 fn dispatch_folders(provider: &dyn RetrievalProvider) -> ToolResult {
     let folders = match provider.list_folders() {
         Ok(f) => f,
-        Err(e) => return reject(format!("could not list folders: {e}")),
+        Err(e) => return settle_vault_error("could not list folders", &e),
     };
     let listed: Vec<Value> = folders
         .iter()
@@ -481,7 +627,7 @@ fn dispatch_search(
         .clamp(1, MAX_SEARCH_RESULTS);
     let outcome = match provider.search_notes(&args.query, max, args.folder.as_deref()) {
         Ok(o) => o,
-        Err(e) => return reject(format!("search failed: {e}")),
+        Err(e) => return settle_vault_error("search failed", &e),
     };
 
     let mut evidence = Vec::new();
@@ -550,7 +696,7 @@ fn dispatch_read(
         .clamp(1, MAX_READ_MAX_BYTES);
     let span = match provider.read_note_span(&args.rel_path, args.start_line, args.end_line, max) {
         Ok(s) => s,
-        Err(e) => return reject(format!("could not read note span: {e}")),
+        Err(e) => return settle_vault_error("could not read note span", &e),
     };
     let (rel_path, start_line, end_line) = (span.rel_path.clone(), span.start_line, span.end_line);
     let id = registry.register(span);
@@ -751,6 +897,58 @@ mod tests {
             &NoUserPrompt,
             &mut context,
         ))
+    }
+
+    #[test]
+    fn a_confinement_refusal_is_never_reported_as_a_failure() {
+        // The security spine, restated in the #116 vocabulary. A path that
+        // escapes the vault comes back through the SAME `Err` arm as a disk
+        // that vanished, so only the variant separates them — and settling a
+        // held guard as `Failed` would tell the user something broke at the
+        // exact moment the confinement worked.
+        for error in [
+            CoreError::OutsideVault("../../etc/passwd".into()),
+            CoreError::InvalidName("".into()),
+            CoreError::InvalidContent("embedded nul".into()),
+            CoreError::NotFound("absent.md".into()),
+            CoreError::AlreadyExists("n.md".into()),
+        ] {
+            assert_eq!(
+                settle_vault_error("could not read note span", &error).outcome,
+                ToolOutcome::Rejected,
+                "{error} must read as a refusal"
+            );
+        }
+        // …and the mirror: nothing here is the model's to fix.
+        for error in [
+            CoreError::Io("the vault volume disappeared".into()),
+            CoreError::Conflict("the note changed on disk".into()),
+            CoreError::Frontmatter("unterminated block".into()),
+            CoreError::Llm("transport reset".into()),
+            CoreError::LocalAi("the sidecar died".into()),
+        ] {
+            assert!(
+                matches!(
+                    settle_vault_error("search failed", &error).outcome,
+                    ToolOutcome::Failed { .. }
+                ),
+                "{error} must read as a failure"
+            );
+        }
+    }
+
+    #[test]
+    fn a_failure_tells_the_model_and_the_orchestrator_the_same_sentence() {
+        // `Failed` carries the message so the orchestrator never has to parse it
+        // back out of the model-facing envelope. That is only safe while the two
+        // accounts are built from one string and cannot drift.
+        let result = fail("search failed: io error: the vault volume disappeared".into());
+
+        let ToolOutcome::Failed { message } = &result.outcome else {
+            panic!("fail() must produce a failure, got {:?}", result.outcome);
+        };
+        let content: Value = serde_json::from_str(&result.content).unwrap();
+        assert_eq!(content["error"].as_str(), Some(message.as_str()));
     }
 
     #[test]

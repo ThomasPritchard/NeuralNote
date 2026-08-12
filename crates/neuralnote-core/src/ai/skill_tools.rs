@@ -6,10 +6,12 @@ use crate::ai::llm::UserPrompt;
 use crate::ai::orchestrator::{activation_failure_message, skill_activation_failed};
 use crate::ai::skills::YOUTUBE_DISTIL_SKILL_ID;
 use crate::ai::tools::{
-    action, function_tool, reject, reject_and_complete, ToolContext, ToolControl, ToolOutcome,
-    ToolResult, TOOL_ASK_USER, TOOL_SKILL_STEP, TOOL_USE_SKILL, TOOL_WRITE_NOTE,
+    action, function_tool, reject, reject_and_complete, settle_vault_error, ToolContext,
+    ToolControl, ToolOutcome, ToolResult, TOOL_ASK_USER, TOOL_SKILL_STEP, TOOL_USE_SKILL,
+    TOOL_WRITE_NOTE,
 };
 use crate::ai::write_policy::{write_note_policy, NoteKind, WriteOutcome};
+use crate::ai::youtube_tool_errors::settle_capture_error;
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -228,8 +230,13 @@ pub(super) fn dispatch_write_note(args_json: &str, context: &mut ToolContext<'_>
         Err(error) => return reject(format!("invalid write_note arguments: {error}")),
     };
     if let Some(session) = context.youtube_session.as_deref() {
+        // Settled at the capture seam, not decided here. This is the same
+        // confinement `fetch_video_info` and `fetch_captions` enforce against the
+        // same playlist run, so a second copy of the answer at this call site
+        // would agree only until the day the seam changes (#116). Guarded by
+        // `one_playlist_confinement_refusal_reads_the_same_through_write_note_and_capture`.
         if let Err(error) = session.validate_playlist_work_item(args.work_item) {
-            return reject(format!("write_note failed: {error}"));
+            return settle_capture_error(error);
         }
     }
     match write_note_policy(
@@ -269,6 +276,6 @@ pub(super) fn dispatch_write_note(args_json: &str, context: &mut ToolContext<'_>
             });
             action(json!({ "existed": true, "rel_path": rel_path }).to_string())
         }
-        Err(error) => reject(format!("write_note failed: {error}")),
+        Err(error) => settle_vault_error("write_note failed", &error),
     }
 }

@@ -42,6 +42,32 @@ struct ParkedApproval {
     receiver: oneshot::Receiver<ApprovalAnswer>,
 }
 
+/// What became of a waiter's own registration when it tried to claim it back.
+///
+/// **Three answers, not two, and the third is the whole reason this is not a
+/// `bool`.** The `bool` it replaced returned `true` both for "I removed mine"
+/// and for "the run's map is not there at all" — and
+/// [`answer`](PendingApprovals::answer) drops that map as soon as it empties,
+/// which is the *usual* case, because a turn parks one approval at a time. So
+/// the two states a waiter most needs told apart were the two the return value
+/// merged, and a guard keyed on it engaged almost never.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[must_use]
+enum RegistrationClaim {
+    /// Our registration was still parked and is now removed. Nothing else has
+    /// touched it, so this waiter owns the outcome outright.
+    Claimed,
+    /// The slot no longer holds our registration: `answer` took it under the
+    /// registry mutex, or a later park replaced it. Ours is gone either way, and
+    /// the channel — not the registry — is now the authority on the decision.
+    TakenByAnswer,
+    /// The run's whole map is gone. **Not proof that no answer is in flight**:
+    /// `answer` prunes the map as it empties, so this is precisely what the
+    /// common race looks like from here. Reading it as "nothing to wait for" is
+    /// the mistake the `bool` invited.
+    RunGone,
+}
+
 #[derive(Default)]
 struct ApprovalRegistryState {
     /// Keyed by run, then by the provider's tool-call id. Two runs can carry the
@@ -82,9 +108,12 @@ impl PendingApprovals {
         })
     }
 
-    /// Deliver the user's decision. `Err` when no live approval matches — a
-    /// missing run and a missing id read identically to the UI, so a stale sheet
-    /// cannot probe which runs exist.
+    /// Deliver the user's decision. `Err` when the decision did not land, which
+    /// is three things: no such run, no such approval, and — the one a caller is
+    /// most likely to forget — an approval whose waiter is no longer there to
+    /// receive it. All three read identically to the UI, so a stale sheet cannot
+    /// probe which runs exist, and `answer_tool_approval` returns this straight
+    /// to the webview: `Ok` here is the UI confirming the click to the user.
     pub(crate) fn answer(
         &self,
         run_id: Uuid,
@@ -103,45 +132,45 @@ impl PendingApprovals {
             }
             pending
         };
-        // A closed receiver means the waiter already gave up. That is not an
-        // error the user can act on, and reporting one would tell a stale sheet
-        // something about the run it should not learn.
-        let _ = pending.sender.send(answer);
+        // A closed receiver means nobody is left to receive this decision, so
+        // the command must NOT report that it landed: `answer_tool_approval`
+        // returns this straight to the webview, and a success there is the UI
+        // confirming a click the run never saw. The error is the same "not live"
+        // a missing entry produces, so a stale sheet still learns nothing about
+        // which runs exist.
+        pending.sender.send(answer).map_err(|_| not_live(call_id))?;
         Ok(())
     }
 
-    /// Remove the entry if it is still the one this waiter parked.
+    /// Take back the entry this waiter parked, reporting which of the three
+    /// states in [`RegistrationClaim`] the registry was actually in.
     ///
-    /// Returns `true` when it removed its own registration.
+    /// **Only [`Claimed`](RegistrationClaim::Claimed) means "no answer got in
+    /// first".** [`answer`](Self::answer) claims the entry under this mutex and
+    /// sends *after* releasing it, so each of the other two can be a decision
+    /// already in flight — including [`RunGone`](RegistrationClaim::RunGone),
+    /// which is what `answer` leaves behind in the ordinary single-approval turn.
+    /// A caller that treats anything but `Claimed` as an absence of an answer is
+    /// re-introducing the bug this contract replaced.
     ///
-    /// **It does NOT mean "no answer got in first" — which is what it looks like,
-    /// and what this doc used to claim.** `true` is also returned when the run's
-    /// map is absent entirely, and [`answer`](Self::answer) drops that map as soon
-    /// as it empties — the usual case, because a turn parks one approval at a
-    /// time. So `true` conflates "I removed mine" with "there is nothing here at
-    /// all", and only `false` carries information: an entry exists and belongs to
-    /// somebody else.
-    ///
-    /// TODO(approval-late-answer): that conflation hides a real defect. `answer`
-    /// removes the entry under this mutex and *then* sends, so an answer
-    /// committing as the 120s deadline lands can have its registration already
-    /// gone while its value is still in flight. The timeout arm settles
-    /// `TimedOut` and drops it — and because `answer` ignores a closed receiver,
-    /// the IPC command has already reported success to the UI, so the click
-    /// disappears silently. Fixing it needs a three-way outcome here
-    /// (removed-mine / someone-else's / absent) so the timeout arm can wait for a
-    /// committing answer rather than overrule it; that is a contract change wider
-    /// than this change-set. It is not fail-open: a dropped `Approved` denies and
-    /// a dropped `Denied` still refuses — the outcome is safe, the attribution is
-    /// wrong. Found by a frontier-GPT review of this diff; an attempted fix keyed
-    /// on the current `bool` was reverted precisely because the conflation above
-    /// makes it a no-op in the common case, and its test proved nothing.
-    fn remove_if_registration(&self, run_id: Uuid, call_id: &str, registration: u64) -> bool {
+    /// Guarded by `the_registry_tells_a_claim_apart_from_an_answer_that_took_it`.
+    fn claim_registration(
+        &self,
+        run_id: Uuid,
+        call_id: &str,
+        registration: u64,
+    ) -> RegistrationClaim {
         let Ok(mut state) = self.state.lock() else {
-            return true;
+            // The registry cannot be consulted at all, so nothing about an
+            // in-flight answer can be established from it. The waiter takes the
+            // outcome, which for a security control means expiry — it denies.
+            // Attribution survives without the registry: an answer whose value
+            // nobody receives now fails its `send` and is reported as not
+            // accepted rather than as success.
+            return RegistrationClaim::Claimed;
         };
         let Some(run) = state.entries.get_mut(&run_id) else {
-            return true;
+            return RegistrationClaim::RunGone;
         };
         match run.get(call_id) {
             Some(pending) if pending.registration == registration => {
@@ -149,10 +178,10 @@ impl PendingApprovals {
                 if run.is_empty() {
                     state.entries.remove(&run_id);
                 }
-                true
+                RegistrationClaim::Claimed
             }
             // Somebody else's entry, or none — leave it alone.
-            _ => false,
+            _ => RegistrationClaim::TakenByAnswer,
         }
     }
 
@@ -180,6 +209,21 @@ fn not_live(call_id: &str) -> CoreError {
     CoreError::NotFound(format!(
         "approval '{call_id}' is not live (it may have timed out or ended)"
     ))
+}
+
+/// What the `select!` in [`ask_approval`](ShellApprovalPrompt::ask_approval)
+/// came out with.
+///
+/// Expiry cannot always answer on its own, which is why this is not simply an
+/// [`ApprovalAnswer`]: when an answer claimed the registration first, the
+/// decision is in the channel and has to be read — and the arm itself cannot
+/// read it, because the `select!` still borrows the receiver.
+enum PromptOutcome {
+    /// A final answer for the turn.
+    Settled(ApprovalAnswer),
+    /// The deadline fired, but an answer had already claimed the registration
+    /// under the registry mutex, so its value is on its way. Read it.
+    AwaitCommittedAnswer,
 }
 
 /// Desktop implementation of core's approval seam.
@@ -250,9 +294,12 @@ impl ShellApprovalPrompt {
     fn resolve_interrupted(&self, call_id: &str, registration: u64) -> ApprovalAnswer {
         // Clear our own entry if it is still ours. Whether or not it is, the
         // outcome is the same: cancelled. The removal is housekeeping, not a
-        // decision.
-        self.pending
-            .remove_if_registration(self.run_id, call_id, registration);
+        // decision, so the claim is deliberately discarded here — teardown, unlike
+        // expiry, does not defer to an answer that raced it, for the reason
+        // documented above.
+        let _ = self
+            .pending
+            .claim_registration(self.run_id, call_id, registration);
         ApprovalAnswer::Cancelled
     }
 
@@ -275,6 +322,36 @@ impl ShellApprovalPrompt {
             return ApprovalAnswer::Cancelled;
         }
         answer
+    }
+
+    /// The 120-second deadline fired. Decide whether expiry actually gets to
+    /// settle the prompt.
+    ///
+    /// **It only does if it still owned the registration.**
+    /// [`answer`](PendingApprovals::answer) claims the entry under the registry
+    /// mutex and *then* sends, so anything other than
+    /// [`RegistrationClaim::Claimed`] means an answer won that mutex and its
+    /// value is already on its way. Settling `TimedOut` regardless would drop a
+    /// decision the user made — and drop it silently, because
+    /// `answer_tool_approval` has by then already returned success to the
+    /// webview. The user would be told the click landed while the run reported a
+    /// timeout: safe in outcome (a dropped `Approved` denies) and wrong in
+    /// attribution, which is not a thing a security control may be.
+    ///
+    /// The mutex is what orders the two. This respects that order rather than
+    /// letting poll timing overrule it.
+    ///
+    /// What goes red: `an_answer_committing_as_the_deadline_lands_is_delivered_not_expired`.
+    fn settle_expiry(&self, call_id: &str, registration: u64) -> PromptOutcome {
+        match self
+            .pending
+            .claim_registration(self.run_id, call_id, registration)
+        {
+            RegistrationClaim::Claimed => PromptOutcome::Settled(ApprovalAnswer::TimedOut),
+            RegistrationClaim::TakenByAnswer | RegistrationClaim::RunGone => {
+                PromptOutcome::AwaitCommittedAnswer
+            }
+        }
     }
 }
 
@@ -310,30 +387,31 @@ impl ApprovalPrompt for ShellApprovalPrompt {
         // and `a_denial_that_races_teardown_also_resolves_to_cancelled` drive both
         // arms to ready in one poll on the current-thread runtime, so moving the
         // receiver back above the close arm fails them with the committed answer.
-        tokio::select! {
+        let settled = tokio::select! {
             biased;
             () = self.close_signal.wait_closed() => {
-                Ok(self.resolve_interrupted(&request.id, registration))
+                PromptOutcome::Settled(self.resolve_interrupted(&request.id, registration))
             }
-            answer = &mut receiver => Ok(self.honour_unless_torn_down(
+            answer = &mut receiver => PromptOutcome::Settled(self.honour_unless_torn_down(
                 answer.unwrap_or(ApprovalAnswer::Cancelled),
             )),
-            () = &mut timeout => {
-                // Rust owns expiry. The webview's countdown is decoration.
-                //
-                // But expiry only gets to SETTLE the prompt if it actually
-                // claimed the registration. `answer` removes the entry under the
-                // registry mutex and then sends, so a `false` here means an answer
-                // won that mutex and its value is already on its way. Returning
-                // `TimedOut` anyway would drop a decision the user made — and
-                // drop it silently, because `answer` ignores a closed receiver and
-                // its command has already reported success to the UI. The mutex is
-                // what orders the two; this respects that order instead of letting
-                // poll timing overrule it.
-                self.pending
-                    .remove_if_registration(self.run_id, &request.id, registration);
-                Ok(ApprovalAnswer::TimedOut)
-            }
+            // Rust owns expiry; the webview's countdown is decoration. Whether
+            // expiry gets to settle the prompt is `settle_expiry`'s call.
+            () = &mut timeout => self.settle_expiry(&request.id, registration),
+        };
+
+        match settled {
+            PromptOutcome::Settled(answer) => Ok(answer),
+            // The registry mutex put an answer ahead of this deadline, so the
+            // decision is on its way and this reads it rather than overruling it.
+            //
+            // The wait is bounded by the sender, not by hope: `answer` sends
+            // within a few instructions of claiming, and a claimed sender dropped
+            // without sending closes the channel — which is the ordinary expiry
+            // after all, so that is what it resolves to.
+            PromptOutcome::AwaitCommittedAnswer => Ok(
+                self.honour_unless_torn_down(receiver.await.unwrap_or(ApprovalAnswer::TimedOut))
+            ),
         }
     }
 }
@@ -616,6 +694,154 @@ mod tests {
         assert_eq!(answer, ApprovalAnswer::Approved);
     }
 
+    /// Stage the state [`PendingApprovals::answer`] occupies between claiming the
+    /// entry under the registry mutex and sending its value: the registration is
+    /// gone, the sender is alive, and the channel is still empty.
+    ///
+    /// Production sits in that state for the handful of instructions between
+    /// `answer`'s removal and its `send`, and no test can suspend itself inside
+    /// them. So the claim is staged here — mirroring `answer` step for step,
+    /// pruning the run map as it empties, exactly as it does — while everything
+    /// the defect actually lives in stays real: the parked `ask_approval`, its
+    /// `select!`, the expiry arm, and the registry itself.
+    fn claim_as_answer_does(
+        pending: &PendingApprovals,
+        run_id: Uuid,
+        call_id: &str,
+    ) -> PendingApproval {
+        let mut state = pending.state.lock().expect("the registry lock is healthy");
+        let run = state
+            .entries
+            .get_mut(&run_id)
+            .expect("the run must still be parked");
+        let claimed = run
+            .remove(call_id)
+            .expect("the approval must still be parked");
+        if run.is_empty() {
+            state.entries.remove(&run_id);
+        }
+        claimed
+    }
+
+    /// Park one approval through the real `ask_approval` and hand back its task.
+    fn spawn_waiting_turn(
+        pending: &Arc<PendingApprovals>,
+        run_id: Uuid,
+        close_signal: &Arc<crate::ai::ChatRunCloseSignal>,
+    ) -> tokio::task::JoinHandle<CoreResult<ApprovalAnswer>> {
+        let pending = Arc::clone(pending);
+        let close_signal = Arc::clone(close_signal);
+        tokio::spawn(async move {
+            ShellApprovalPrompt::new(pending, run_id, close_signal)
+                .ask_approval(&request("call-1"))
+                .await
+        })
+    }
+
+    /// Yield until the spawned turn has parked its approval, without ever leaving
+    /// the runtime idle — under a paused clock an idle runtime auto-advances, and
+    /// the deadline would fire before the race could be staged.
+    async fn wait_until_parked(pending: &PendingApprovals, run_id: Uuid) {
+        while pending.live_count(run_id) == 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn an_answer_committing_as_the_deadline_lands_is_delivered_not_expired() {
+        // THE race this file's `TODO(approval-late-answer)` described. The user
+        // clicks yes at the last second: `answer` takes the registration under
+        // the registry mutex, and the 120s deadline lands before its value
+        // reaches the channel. Expiry must not overrule an answer the mutex
+        // already ordered ahead of it — `answer_tool_approval` has by then told
+        // the UI the click succeeded, so settling `TimedOut` makes the security
+        // control tell the user one thing and the run another.
+        let pending = Arc::new(PendingApprovals::default());
+        let run_id = Uuid::from_u128(14);
+        let close_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let waiting = spawn_waiting_turn(&pending, run_id, &close_signal);
+        wait_until_parked(&pending, run_id).await;
+
+        let committing = claim_as_answer_does(&pending, run_id, "call-1");
+        assert_eq!(
+            pending.live_count(run_id),
+            0,
+            "the staged claim must leave the registry exactly as `answer` leaves it"
+        );
+
+        // The deadline lands inside that window.
+        tokio::time::advance(APPROVAL_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+
+        // ...and now the send lands, which is what `answer` does next.
+        assert!(
+            committing.sender.send(ApprovalAnswer::Approved).is_ok(),
+            "expiry settled and dropped the receiver while the answer was in flight, \
+             so the user's click disappears into a closed channel"
+        );
+        assert_eq!(
+            waiting.await.unwrap().unwrap(),
+            ApprovalAnswer::Approved,
+            "the registry mutex ordered this answer ahead of the deadline; poll timing must not overrule it"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn a_committing_answer_that_never_arrives_falls_back_to_expiry() {
+        // The bound on the test above, and it is what keeps deferring to a
+        // committing answer from being an unbounded wait. Expiry hands over to
+        // the channel, and the channel is what closes it: a claimed sender
+        // dropped without sending (its caller panicked, say) resolves the wait
+        // rather than parking the turn forever, and resolves it as the expiry it
+        // is. The sender is dropped only AFTER the deadline has landed — drop it
+        // sooner and the ready-but-closed receiver wins the `select!` outright,
+        // which is a different path settling `Cancelled`.
+        let pending = Arc::new(PendingApprovals::default());
+        let run_id = Uuid::from_u128(15);
+        let close_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let waiting = spawn_waiting_turn(&pending, run_id, &close_signal);
+        wait_until_parked(&pending, run_id).await;
+
+        let committing = claim_as_answer_does(&pending, run_id, "call-1");
+        tokio::time::advance(APPROVAL_TIMEOUT + Duration::from_secs(1)).await;
+        tokio::task::yield_now().await;
+        drop(committing);
+
+        assert_eq!(waiting.await.unwrap().unwrap(), ApprovalAnswer::TimedOut);
+    }
+
+    #[tokio::test]
+    async fn an_answer_no_waiter_can_receive_is_reported_as_not_accepted() {
+        // The other half of the attribution. A decision that reaches nobody is
+        // not a decision that landed, and `answer_tool_approval` returns this
+        // result straight to the webview — so reporting success here is the UI
+        // confirming a click the run never saw. The turn is torn out from under
+        // the sheet (its future dropped) while its registration is still parked,
+        // which is the one way `answer` can hold an entry nobody is listening to.
+        let pending = Arc::new(PendingApprovals::default());
+        let run_id = Uuid::from_u128(16);
+        let close_signal = Arc::new(crate::ai::ChatRunCloseSignal::default());
+        let waiting = spawn_waiting_turn(&pending, run_id, &close_signal);
+        wait_until_parked(&pending, run_id).await;
+
+        waiting.abort();
+        assert!(waiting.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            pending.live_count(run_id),
+            1,
+            "the registration outlives the dropped turn — only the run guard clears it"
+        );
+
+        let error = pending
+            .answer(run_id, "call-1", ApprovalAnswer::Approved)
+            .expect_err("an answer nobody received must not be reported as accepted");
+        assert!(
+            matches!(error, CoreError::NotFound(_)),
+            "the same `not live` a stale sheet already gets, so this leaks nothing new: {error:?}"
+        );
+        assert_eq!(pending.live_count(run_id), 0, "the claim still happened");
+    }
+
     #[tokio::test]
     async fn an_answer_for_a_different_run_does_not_resolve_this_one() {
         let pending = Arc::new(PendingApprovals::default());
@@ -652,6 +878,43 @@ mod tests {
             .answer(Uuid::from_u128(8), "never-parked", ApprovalAnswer::Approved)
             .unwrap_err();
         assert!(matches!(error, CoreError::NotFound(_)));
+    }
+
+    #[test]
+    fn the_registry_tells_a_claim_apart_from_an_answer_that_took_it() {
+        // The contract the expiry arm reads. A `bool` could not separate the
+        // first case from the third — and the third is exactly what `answer`
+        // leaves behind in the ordinary one-approval turn, so a guard keyed on
+        // that `bool` read "an answer is in flight" as "there is nothing here"
+        // almost every time it mattered.
+        let pending = PendingApprovals::default();
+        let run_id = Uuid::from_u128(17);
+
+        let mine = pending.park(run_id, "call-1").unwrap();
+        assert_eq!(
+            pending.claim_registration(run_id, "call-1", mine.registration),
+            RegistrationClaim::Claimed
+        );
+        // The same claim again: the run map went with its last entry.
+        assert_eq!(
+            pending.claim_registration(run_id, "call-1", mine.registration),
+            RegistrationClaim::RunGone
+        );
+
+        let newer = pending.park(run_id, "call-1").unwrap();
+        assert_eq!(
+            pending.claim_registration(run_id, "call-1", mine.registration),
+            RegistrationClaim::TakenByAnswer
+        );
+        assert_eq!(
+            pending.live_count(run_id),
+            1,
+            "a registration that is not ours must be left alone"
+        );
+        assert_eq!(
+            pending.claim_registration(run_id, "call-1", newer.registration),
+            RegistrationClaim::Claimed
+        );
     }
 
     #[test]

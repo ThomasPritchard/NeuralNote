@@ -69,10 +69,21 @@ pub struct Elicitation {
 /// `settlement_tests`, which is where the mapping from `ApprovalResolution` to
 /// this enum actually lives.
 ///
-/// `Error` still has no producer, on purpose. It arrives when `ToolOutcome` gains
-/// a discriminant for "the tool ran and failed"; today every failure — malformed
-/// arguments and runtime failure alike — is one `ToolOutcome::Rejected`, so
-/// reporting `Error` would be a guess.
+/// `Error` is produced by `ToolOutcome::Failed` — a call that reached the vault,
+/// the network, or the extractor and came apart there (#116). It used to have no
+/// producer, because `ToolOutcome` could not tell that apart from a call the
+/// dispatcher refused; both arrived as one `Rejected`, and the timeline told the
+/// user NeuralNote had declined work it had in fact attempted.
+///
+/// The dividing line is whether anything was tried. Malformed arguments, an
+/// unknown or unauthorised tool, a path outside the vault, a URL outside the
+/// playlist the user picked: all `Rejected`, because the system protected the
+/// user and nothing is broken. Everything past that point is `Error`.
+///
+/// What goes red if they are re-collapsed:
+/// `a_malformed_argument_call_is_refused_and_never_collapses_into_a_failure`,
+/// in `orchestrator.rs`'s `tests`, which asserts the two settle differently in
+/// one run rather than merely asserting each in isolation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -100,7 +111,12 @@ pub enum ToolStatus {
 )]
 #[ts(export)]
 pub enum ChatEvent {
-    /// The backend accepted the run and is preparing the first model request.
+    /// The run is working and nothing more specific is true yet: the backend has
+    /// accepted it and is preparing a model request. Emitted once when the run is
+    /// accepted, and again before each tool-deciding round-trip — that turn can
+    /// take fifteen seconds and emits nothing else, so without it the last phase
+    /// word simply goes stale on screen (#126). Deliberately repeatable and
+    /// idempotent: it re-states the phase, it does not announce a new thing.
     Processing,
     /// A skill became active and granted its declared tools.
     SkillActivated { id: String, name: String },

@@ -413,7 +413,7 @@ fn a_failed_caption_fetch_reports_no_transcript_source() {
         &format!(r#"{{"url":"{URL}","lang":"en"}}"#),
     );
 
-    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    support::assert_tool_failed(&result.outcome);
     assert_eq!(transcript_sources(&events), []);
 }
 
@@ -426,7 +426,11 @@ fn prove_caption_absence(io: &dyn YoutubeIo, session: &mut YoutubeToolSession) {
         &format!(r#"{{"url":"{URL}"}}"#),
     );
     let value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
-    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    // Caption absence is the awkward case in the #116 split: the fetch ran and
+    // yielded nothing, which is neither "NeuralNote refused" nor a breakage. Of
+    // the two available stories it is a failure — NeuralNote declined nothing —
+    // and `next_action: offer_whisper` is what keeps it recoverable.
+    support::assert_tool_failed(&result.outcome);
     assert_eq!(value["error"]["kind"], "captions_absent");
     assert_eq!(value["error"]["next_action"], "offer_whisper");
 }
@@ -542,7 +546,7 @@ fn withheld_subtitle_listing_cannot_unlock_whisper_from_empty_maps() {
         &format!(r#"{{"url":"{URL}"}}"#),
     );
 
-    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    support::assert_tool_failed(&result.outcome);
     let value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
     assert_eq!(value["error"]["next_action"], "surface");
     assert!(value["error"]["message"]
@@ -569,7 +573,7 @@ fn host_failure_details_are_bounded_and_never_expose_paths_to_the_model() {
         &format!(r#"{{"url":"{URL}"}}"#),
     );
 
-    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    support::assert_tool_failed(&result.outcome);
     assert!(result.content.contains("metadata_unavailable"));
     assert!(!result.content.contains("/private/tmp"));
     assert!(result.content.len() < 1_000);
@@ -625,7 +629,10 @@ fn captions_surface_invalid_language_inventory_and_vtt_without_fallback() {
         TOOL_FETCH_CAPTIONS,
         &format!(r#"{{"url":"{URL}","lang":""}}"#),
     );
-    assert!(invalid_language.content.contains("invalid_metadata"));
+    // `invalid_source`: `lang` is the model's own argument and nothing has been
+    // fetched yet, so this is a refusal, not unusable data (#116).
+    assert_eq!(invalid_language.outcome, ToolOutcome::Rejected);
+    assert!(invalid_language.content.contains("invalid_source"));
 
     let unavailable_language = call(
         &ScriptedYoutubeIo::new(metadata(r#"{"fr":[{"ext":"vtt"}]}"#, "{}")),
@@ -919,7 +926,7 @@ fn exhausted_internal_extractor_retry_is_surfaced_not_offered_again() {
         &format!(r#"{{"url":"{URL}"}}"#),
     );
 
-    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    support::assert_tool_failed(&result.outcome);
     let value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
     assert_eq!(value["error"]["kind"], "extractor_stale");
     assert_eq!(value["error"]["next_action"], "surface");
@@ -937,7 +944,7 @@ fn only_genuine_caption_absence_unlocks_whisper_for_that_source() {
         TOOL_FETCH_CAPTIONS,
         &format!(r#"{{"url":"{URL}"}}"#),
     );
-    assert_eq!(absent_result.outcome, ToolOutcome::Rejected);
+    support::assert_tool_failed(&absent_result.outcome);
     assert!(absent_result.content.contains("captions_absent"));
     assert!(session.can_transcribe(&YoutubeUrl::new(URL).unwrap()));
 
@@ -986,7 +993,7 @@ fn blocked_caption_fetch_is_terminal_and_never_unlocks_whisper() {
         &format!(r#"{{"url":"{URL}"}}"#),
     );
 
-    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    support::assert_tool_failed(&result.outcome);
     assert!(result.content.contains("youtube_blocked"));
     assert!(result.content.contains("terminal"));
     assert!(!session.can_transcribe(&YoutubeUrl::new(URL).unwrap()));
@@ -1024,8 +1031,8 @@ fn block_latches_for_the_run_and_prevents_further_youtube_io() {
         &format!(r#"{{"url":"{URL}"}}"#),
     );
 
-    assert_eq!(first.outcome, ToolOutcome::Rejected);
-    assert_eq!(second.outcome, ToolOutcome::Rejected);
+    support::assert_tool_failed(&first.outcome);
+    support::assert_tool_failed(&second.outcome);
     assert!(second.content.contains("youtube_blocked"));
     assert_eq!(io.metadata.lock().unwrap().len(), 1);
     assert_eq!(io.captions.lock().unwrap().len(), 1);
@@ -1109,6 +1116,52 @@ fn cancellation_between_transcription_attempts_prevents_update_and_retry() {
     assert!(result.content.contains("cancelled"));
     assert_eq!(io.transcribe_calls.load(Ordering::SeqCst), 1);
     assert_eq!(io.updates.load(Ordering::SeqCst), 0);
+    // The guard keys on the cancellation FLAG, so it cannot know whether the
+    // attempt it interrupted was healthy. Whatever that attempt reported has to
+    // travel with the cancellation or it is gone for good.
+    assert!(
+        result.content.contains("audio extraction went stale"),
+        "the interrupted attempt's own error must survive: {}",
+        result.content
+    );
+}
+
+#[test]
+fn a_transcription_crash_that_coincides_with_a_stop_still_names_the_crash() {
+    // The silent-failure case. `whisper-cli` dies, and the user presses Stop a
+    // few milliseconds later — or the other way round; from here they are the
+    // same instant. The cancellation guard fires on the flag, not the cause, and
+    // it used to drop the error binding entirely (`Err(_error) if …`), so a real
+    // crash left NO trace: not in the tool result, not in the timeline, nowhere.
+    // That is the one thing this codebase does not do with failures.
+    //
+    // The outcome is still a refusal — the run ended, NeuralNote did not break —
+    // but the account it carries has to be the whole account.
+    let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
+    io.push_transcription(Err(CaptureError::TranscriptionFailed(
+        "whisper-cli exited with signal 11".into(),
+    )));
+    io.cancel_during_transcription();
+    let cancellation = CaptureCancellation::default();
+    let mut session = YoutubeToolSession::new(cancellation);
+    prove_caption_absence(&io, &mut session);
+
+    let result = call(
+        &io,
+        &mut session,
+        &environment(true),
+        TOOL_TRANSCRIBE_AUDIO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    assert!(result.content.contains("cancelled"), "{}", result.content);
+    assert!(
+        result.content.contains("whisper-cli exited with signal 11"),
+        "a crash that raced the Stop must not vanish: {}",
+        result.content
+    );
+    assert_eq!(io.transcribe_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -1138,4 +1191,11 @@ fn cancellation_during_extractor_update_prevents_transcription_retry() {
     assert!(result.content.contains("cancelled"));
     assert_eq!(io.transcribe_calls.load(Ordering::SeqCst), 1);
     assert_eq!(io.updates.load(Ordering::SeqCst), 1);
+    // Same rule one branch over: the staleness that PROMPTED the update is the
+    // only account of why this call went nowhere beyond "the run ended".
+    assert!(
+        result.content.contains("audio extraction went stale"),
+        "the error that triggered the update must survive: {}",
+        result.content
+    );
 }

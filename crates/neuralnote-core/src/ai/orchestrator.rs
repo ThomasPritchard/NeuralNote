@@ -916,11 +916,10 @@ impl ChatSession<'_> {
                 sink,
             )
             .await;
-        if result.outcome == ToolOutcome::Rejected
-            && youtube_session.playlist_is_active()
-            && call.name != tools::TOOL_SELECT_PLAYLIST_VIDEOS
-        {
-            youtube_session.fail_playlist_item(format!("tool '{}' was rejected", call.name));
+        if youtube_session.playlist_is_active() && call.name != tools::TOOL_SELECT_PLAYLIST_VIDEOS {
+            if let Some(reason) = playlist_failure_reason(&result.outcome, &call.name) {
+                youtube_session.fail_playlist_item(reason);
+            }
         }
         let settlement = settlement_for(&result);
         *context_chars += result.content.len();
@@ -1004,11 +1003,27 @@ impl ChatSession<'_> {
     /// implementation emits nothing, so its retry behaviour is unchanged.
     ///
     /// A non-transient failure or a user-stopped run is never retried either.
+    ///
+    /// **It opens by saying the run is working** (#126). Nothing else can reach the
+    /// user during this turn — only a `write_note` preview can, and only on a
+    /// provider that streams tool calls — so an answered question was followed by a
+    /// whole round-trip of silence, and by TWO on a provider that does not stream
+    /// tool turns and re-runs the turn buffered. The pane went on showing whichever
+    /// phase word it last had ("searching", while the model was composing). One
+    /// [`ChatEvent::Processing`] before the turn is the honest correction: it is the
+    /// variant that already means "working", which the run genuinely is.
     async fn complete_tool_turn(
         &self,
         request: &LlmRequest,
         sink: &mut dyn EventSink,
     ) -> CoreResult<Completion> {
+        // Sent through the raw sink, BEFORE the guard below wraps it, and once for
+        // the whole call rather than once per attempt. Both matter. The guard bars a
+        // retry on anything the user can already SEE — a half-composed note — and
+        // this beacon is neither the provider's output nor something a replay could
+        // rewind, so counting it would silently disable the one bounded retry. Once
+        // per call also keeps the turn to a single event no matter how it goes.
+        sink.send(ChatEvent::Processing);
         let mut retries = MAX_COMPLETE_RETRIES;
         let mut sink = EmissionGuard {
             inner: sink,
@@ -1079,6 +1094,9 @@ impl ChatSession<'_> {
             .with_youtube(self.skill_services.youtube_io, youtube_session)
             .with_youtube_requirements(self.skill_services.youtube_requirements)
             .with_vault_profile_io(self.skill_services.vault_profile_io)
+            // The same token `run_cancelled` reads. A call that comes apart
+            // because the user pressed Stop must not be attributed to the vault.
+            .with_cancellation(self.skill_services.capture_cancellation.clone())
             .with_plan(plan);
             if let Some(pricing) = self.skill_services.pricing {
                 context = context.with_pricing(pricing);
@@ -1125,9 +1143,14 @@ impl ChatSession<'_> {
                 });
                 push_unique(&mut coverage.notes_read, rel_path);
             }
-            // Metadata listing needs no event; a rejected call's error is in the tool
-            // result the model reads.
-            ToolOutcome::Listed | ToolOutcome::Action | ToolOutcome::Rejected => {}
+            // Metadata listing needs no event; a refused or failed call's error
+            // is in the tool result the model reads and in the settlement the
+            // timeline node renders.
+            ToolOutcome::Listed
+            | ToolOutcome::Action
+            | ToolOutcome::Rejected
+            | ToolOutcome::Cancelled
+            | ToolOutcome::Failed { .. } => {}
         }
         result
     }
@@ -1521,6 +1544,33 @@ fn emit_tool_result(sink: &mut dyn EventSink, id: &str, settlement: ToolSettleme
     });
 }
 
+/// Why the active playlist item cannot continue, if this call is what ended it.
+///
+/// Both a refusal and a failure stop the item — a capture that never ran and one
+/// that ran and came apart leave the item equally unable to proceed. But the
+/// recorded reason is read back to the user in the run summary, so it has to
+/// tell the true story rather than calling every non-delivery a rejection (#116).
+///
+/// Exhaustive, no wildcard arm: a new [`ToolOutcome`] must decide here whether
+/// it ends the item before it compiles.
+fn playlist_failure_reason(outcome: &ToolOutcome, tool: &str) -> Option<String> {
+    match outcome {
+        ToolOutcome::Rejected => Some(format!("tool '{tool}' was rejected")),
+        ToolOutcome::Failed { message } => Some(format!("tool '{tool}' failed: {message}")),
+        // A run the user stopped does not FAIL its work item, and recording it
+        // as failed would advance past the item and stamp the false story into
+        // the run summary the user reads back. The cancellation path already
+        // owns this: `cancel_playlist_remaining` marks this item and every one
+        // behind it `Cancelled`, from the batch loop on the next call or from
+        // `playlist_preflight` on the next turn.
+        ToolOutcome::Cancelled
+        | ToolOutcome::Listed
+        | ToolOutcome::Searched { .. }
+        | ToolOutcome::Read { .. }
+        | ToolOutcome::Action => None,
+    }
+}
+
 /// Read a dispatched result in the timeline's vocabulary. Every summary here is
 /// composed from the structured [`ToolOutcome`], never from model prose.
 fn settlement_for(result: &tools::ToolResult) -> ToolSettlement {
@@ -1537,7 +1587,16 @@ fn settlement_for(result: &tools::ToolResult) -> ToolSettlement {
             Some(format!("{rel_path}:{start_line}–{end_line}")),
         ),
         ToolOutcome::Listed | ToolOutcome::Action => (ToolStatus::Ok, None),
+        // The two refusals-that-are-not are kept apart here and nowhere else:
+        // `Rejected` says the system protected the user, `Error` says something
+        // broke (#116). A summary would only repeat the disclosure below.
         ToolOutcome::Rejected => (ToolStatus::Rejected, None),
+        ToolOutcome::Failed { .. } => (ToolStatus::Error, None),
+        // …and the third, which is neither: the run ended under the call. The
+        // status already exists and already renders as "run ended first"; it
+        // simply had no producer on this path until one could tell a user's Stop
+        // from a vault that broke.
+        ToolOutcome::Cancelled => (ToolStatus::Cancelled, None),
     };
     ToolSettlement {
         status,
@@ -2233,6 +2292,52 @@ mod settlement_tests {
     }
 
     #[test]
+    fn a_failed_call_settles_as_an_error_and_still_discloses_its_reason() {
+        let settlement = settlement_for(&tools::ToolResult {
+            content: r#"{"error":"search failed: io error: the volume disappeared"}"#.into(),
+            outcome: ToolOutcome::Failed {
+                message: "search failed: io error: the volume disappeared".into(),
+            },
+            control: tools::ToolControl::Continue,
+        });
+
+        assert_eq!(settlement.status, ToolStatus::Error);
+        assert_eq!(
+            settlement.detail,
+            Some("search failed: io error: the volume disappeared".into())
+        );
+    }
+
+    #[test]
+    fn a_playlist_item_records_why_it_stopped_not_merely_that_it_did() {
+        // Both stories end the item — a capture that never ran and one that ran
+        // and came apart leave it equally unable to proceed. But the reason is
+        // read back to the user in the run summary, so calling every
+        // non-delivery a rejection buries the actual cause (#116).
+        let refused = playlist_failure_reason(&ToolOutcome::Rejected, "fetch_captions")
+            .expect("a refusal ends the item");
+        let failed = playlist_failure_reason(
+            &ToolOutcome::Failed {
+                message: "Sign in to confirm you're not a bot".into(),
+            },
+            "fetch_captions",
+        )
+        .expect("a failure ends the item too");
+
+        assert!(refused.contains("rejected"), "{refused}");
+        assert!(
+            failed.contains("Sign in to confirm you're not a bot"),
+            "the item must record what actually went wrong: {failed}"
+        );
+        assert_ne!(refused, failed);
+        // A call that delivered leaves the item running.
+        assert_eq!(
+            playlist_failure_reason(&ToolOutcome::Action, "write_note"),
+            None
+        );
+    }
+
+    #[test]
     fn a_disclosure_is_bounded_and_never_splits_a_character() {
         // A tool result can be a whole transcript. The disclosure is a peek.
         let long = "é".repeat(MAX_TOOL_DETAIL_CHARS + 50);
@@ -2258,13 +2363,15 @@ mod tests {
     use crate::ai::llm::{Completion, NoUserPrompt};
     use crate::ai::local::HardwareSpec;
     use crate::ai::plan::{PlanStep, StepStatus};
-    use crate::ai::retrieval::KeywordRetriever;
+    use crate::ai::retrieval::{FolderMeta, KeywordRetriever, ListOutcome, SearchOutcome};
     use crate::ai::skills::{SkillEnvironment, SkillRegistry};
+    use crate::ai::tool_turn_reader::{StreamedToolTurn, ToolTurnReader};
     use crate::ai::write_policy::UnavailableNoteWriter;
     use crate::ai::{
         CaptionPayload, CaptionRequest, CaptureCancellation, Elicitation, MetadataPayload,
         NotePathState, NoteWriteBackend, NoteWriteParent, OpenedNoteParent, PlaylistPayload,
-        ThumbnailPayload, VideoId, YoutubeIo, YoutubeUrl, YOUTUBE_DISTIL_SKILL_ID,
+        ThumbnailPayload, VideoId, YoutubeIo, YoutubeUrl, FIXTURE_SKILL_ID,
+        YOUTUBE_DISTIL_SKILL_ID,
     };
     use crate::capture::{CaptureError, PricingInput};
     use crate::error::CoreError;
@@ -3462,7 +3569,304 @@ mod tests {
     }
 
     fn run(root: &Path, mock: &MockLlmClient, guards: &Guards) -> Vec<ChatEvent> {
-        let retriever = KeywordRetriever::new(root);
+        run_with_provider(root, &KeywordRetriever::new(root), mock, guards)
+    }
+
+    /// A provider whose every vault operation blows up the way a real one does
+    /// when the disk goes away mid-run: the call is dispatched, reaches the
+    /// vault, and fails there. Nothing here is a validation refusal.
+    struct FailingProvider;
+
+    impl RetrievalProvider for FailingProvider {
+        fn list_notes(&self, _folder: Option<&str>) -> CoreResult<ListOutcome> {
+            Err(CoreError::Io("the vault volume disappeared".into()))
+        }
+        fn list_folders(&self) -> CoreResult<Vec<FolderMeta>> {
+            Err(CoreError::Io("the vault volume disappeared".into()))
+        }
+        fn search_notes(
+            &self,
+            _query: &str,
+            _max_results: usize,
+            _folder: Option<&str>,
+        ) -> CoreResult<SearchOutcome> {
+            Err(CoreError::Io("the vault volume disappeared".into()))
+        }
+        fn read_note_span(
+            &self,
+            _rel_path: &str,
+            _start_line: u32,
+            _end_line: u32,
+            _max_bytes: usize,
+        ) -> CoreResult<crate::ai::evidence::EvidenceSpan> {
+            Err(CoreError::Io("the vault volume disappeared".into()))
+        }
+    }
+
+    /// How the timeline node for `call_id` settled.
+    fn settled_status(events: &[ChatEvent], call_id: &str) -> ToolStatus {
+        events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::ToolResult { id, status, .. } if id == call_id => Some(*status),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("call '{call_id}' never settled"))
+    }
+
+    /// The bounded disclosure the timeline node shows under a settled call.
+    fn settled_detail(events: &[ChatEvent], call_id: &str) -> String {
+        events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::ToolResult { id, detail, .. } if id == call_id => Some(detail.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("call '{call_id}' never settled"))
+            .unwrap_or_default()
+    }
+
+    /// A provider whose every vault call answers the way the shell's run-scoped
+    /// wrapper does once the user has pressed Stop: a `CoreError::Conflict`
+    /// raised by `ensure_run_active`
+    /// (`app/desktop/src-tauri/src/skills/note_writer.rs`), not by anything in
+    /// the vault going wrong.
+    struct StoppedRunProvider;
+
+    impl StoppedRunProvider {
+        fn stopped<T>() -> CoreResult<T> {
+            Err(CoreError::Conflict(
+                "chat run ended before the note write completed".into(),
+            ))
+        }
+    }
+
+    impl RetrievalProvider for StoppedRunProvider {
+        fn list_notes(&self, _folder: Option<&str>) -> CoreResult<ListOutcome> {
+            Self::stopped()
+        }
+        fn list_folders(&self) -> CoreResult<Vec<FolderMeta>> {
+            Self::stopped()
+        }
+        fn search_notes(
+            &self,
+            _query: &str,
+            _max_results: usize,
+            _folder: Option<&str>,
+        ) -> CoreResult<SearchOutcome> {
+            Self::stopped()
+        }
+        fn read_note_span(
+            &self,
+            _rel_path: &str,
+            _start_line: u32,
+            _end_line: u32,
+            _max_bytes: usize,
+        ) -> CoreResult<crate::ai::evidence::EvidenceSpan> {
+            Self::stopped()
+        }
+    }
+
+    #[test]
+    fn a_call_cut_short_by_the_user_pressing_stop_is_not_reported_as_a_failure() {
+        // `CoreError::Conflict` has three unrelated producers and only one of
+        // them is breakage. Two are not: the `write_note` cap refusal, and this
+        // one — the run-scoped wrapper answering "the run ended" once the user
+        // pressed Stop. The variant cannot separate them, so the state of the
+        // RUN has to. A call that came apart while the run was already
+        // cancelling did not fail, and painting a destructive-red "failed" node
+        // for something the user deliberately asked for is the one account that
+        // is certainly false.
+        //
+        // `Cancelled`, not `Rejected`: NeuralNote refused nothing either. The
+        // timeline already renders that status as "run ended first", in the calm
+        // register, which is exactly what happened.
+        let vault = vault();
+        let llm = MockLlmClient::new(
+            vec![Completion {
+                content: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "list_notes".into(),
+                        arguments: "{}".into(),
+                    },
+                    // Both stories in ONE run, so they cannot be checked against
+                    // different worlds: `c2` never reached the vault, and a Stop
+                    // arriving afterwards does not retrospectively make the
+                    // model's nonsense arguments the run's fault.
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "search_notes".into(),
+                        arguments: r#"{"not_a_query":1}"#.into(),
+                    },
+                ],
+            }],
+            "The run ended early.",
+        );
+        let cancellation = CaptureCancellation::default();
+        cancellation.cancel();
+
+        let events = run_with_provider_and_cancellation(
+            vault.path(),
+            &StoppedRunProvider,
+            &llm,
+            &Guards::default(),
+            cancellation,
+        );
+
+        assert_eq!(
+            settled_status(&events, "c1"),
+            ToolStatus::Cancelled,
+            "a user's own Stop is neither a failure nor a refusal"
+        );
+        assert_eq!(
+            settled_status(&events, "c2"),
+            ToolStatus::Rejected,
+            "a refusal stays a refusal: nothing was attempted, so the run ending changes nothing about it"
+        );
+        // Nothing is swallowed to buy the gentler status. The disclosure still
+        // carries the underlying error, so a genuine fault that happened to
+        // coincide with a Stop is still there to read — only the attribution
+        // changes.
+        assert!(
+            settled_detail(&events, "c1").contains("chat run ended"),
+            "the underlying error must survive the re-attribution, got {:?}",
+            settled_detail(&events, "c1")
+        );
+    }
+
+    #[test]
+    fn the_same_conflict_in_a_live_run_still_settles_as_a_failure() {
+        // The mirror, and the reason the test above cannot be satisfied by a
+        // guard that simply never reports failures. An atomic-note collision is
+        // the third `Conflict` producer and it IS breakage — the run is live,
+        // nobody stopped anything, and calling that "run ended first" would be
+        // the same false attribution pointed the other way.
+        let vault = vault();
+        let llm = MockLlmClient::new(vec![tool_call("c1", "list_notes", "{}")], "Nothing found.");
+
+        let events = run_with_provider(vault.path(), &StoppedRunProvider, &llm, &Guards::default());
+
+        assert_eq!(
+            settled_status(&events, "c1"),
+            ToolStatus::Error,
+            "a conflict in a run nobody stopped is still a failure"
+        );
+    }
+
+    #[test]
+    fn every_vault_tool_that_ran_and_failed_settles_as_an_error_not_a_refusal() {
+        // Issue #116. Each of these reached the vault and the vault blew up.
+        // Settling that as `Rejected` renders "· refused by NeuralNote", telling
+        // the user NeuralNote DECLINED a call it in fact attempted — the one
+        // account that is definitely false.
+        //
+        // All four read-only tools are pinned, not just the one that happened to
+        // have a test: they share the `settle_vault_error` seam, so a regression
+        // in any of them is the same regression.
+        let vault = vault();
+        let calls = [
+            ("c1", tools::TOOL_SEARCH_NOTES, r#"{"query":"widgets"}"#),
+            ("c2", tools::TOOL_LIST_NOTES, "{}"),
+            ("c3", tools::TOOL_LIST_FOLDERS, "{}"),
+            (
+                "c4",
+                tools::TOOL_READ_NOTE_SPAN,
+                r#"{"rel_path":"Research/widgets.md","start_line":1,"end_line":2}"#,
+            ),
+        ];
+        let llm = MockLlmClient::new(
+            vec![Completion {
+                content: None,
+                tool_calls: calls
+                    .iter()
+                    .map(|(id, name, arguments)| ToolCall {
+                        id: (*id).into(),
+                        name: (*name).into(),
+                        arguments: (*arguments).into(),
+                    })
+                    .collect(),
+            }],
+            "Nothing found.",
+        );
+
+        let events = run_with_provider(vault.path(), &FailingProvider, &llm, &Guards::default());
+
+        for (id, name, _) in &calls {
+            assert_eq!(
+                settled_status(&events, id),
+                ToolStatus::Error,
+                "{name} ran and failed; it must not be reported as a refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_argument_call_is_refused_and_never_collapses_into_a_failure() {
+        // The other half of the same split, asserted in ONE run so the two
+        // stories cannot be checked against different worlds: `c1` never
+        // reached the vault (the model sent nonsense), `c2` did and the vault
+        // failed. They must settle differently, or the status vocabulary is
+        // saying one thing about two events.
+        let vault = vault();
+        let llm = MockLlmClient::new(
+            vec![Completion {
+                content: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "search_notes".into(),
+                        arguments: r#"{"not_a_query":1}"#.into(),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "search_notes".into(),
+                        arguments: r#"{"query":"widgets"}"#.into(),
+                    },
+                ],
+            }],
+            "Nothing found.",
+        );
+
+        let events = run_with_provider(vault.path(), &FailingProvider, &llm, &Guards::default());
+        let (refused, failed) = (settled_status(&events, "c1"), settled_status(&events, "c2"));
+
+        assert_eq!(
+            refused,
+            ToolStatus::Rejected,
+            "arguments that never parsed are a refusal, not a failure"
+        );
+        assert_ne!(
+            refused, failed,
+            "a refusal and a failure must not settle as the same status"
+        );
+    }
+
+    fn run_with_provider(
+        root: &Path,
+        provider: &dyn RetrievalProvider,
+        mock: &MockLlmClient,
+        guards: &Guards,
+    ) -> Vec<ChatEvent> {
+        run_with_provider_and_cancellation(
+            root,
+            provider,
+            mock,
+            guards,
+            CaptureCancellation::default(),
+        )
+    }
+
+    /// The same run with the host's cancellation token supplied, for the cases
+    /// where what a settled call MEANS depends on whether the run is still live.
+    fn run_with_provider_and_cancellation(
+        root: &Path,
+        provider: &dyn RetrievalProvider,
+        mock: &MockLlmClient,
+        guards: &Guards,
+        cancellation: CaptureCancellation,
+    ) -> Vec<ChatEvent> {
         let skills = SkillRegistry::built_in(&[]).unwrap();
         let environment = SkillEnvironment {
             hardware: HardwareSpec {
@@ -3483,7 +3887,8 @@ mod tests {
             &NoUserPrompt,
             &UnavailableNoteWriter,
             1,
-        );
+        )
+        .with_capture_cancellation(cancellation);
         let mut sink = VecSink::default();
         block_on(run_chat(
             "how do widgets work?",
@@ -3491,7 +3896,7 @@ mod tests {
             Vec::new(),
             root,
             "test-model",
-            &retriever,
+            provider,
             mock,
             &services,
             &mut sink,
@@ -4394,9 +4799,21 @@ mod tests {
         let events = run(v.path(), &mock, &Guards::default());
 
         assert!(matches!(events.first(), Some(ChatEvent::Processing)));
+        // One beacon for the accepted run, then one more before each tool-deciding
+        // turn (#126) — never one per row of anything. Counted from the turns the
+        // mock was actually asked for rather than written as a number, so the
+        // bound is on the RATE rather than on this script's length.
+        //
+        // What it does NOT bound is beacons per ATTEMPT. Nothing in this run
+        // fails, so one `complete` call is one turn is one round-trip, and a
+        // beacon moved inside the retry loop would lift both sides of this
+        // equality together and leave the fixture green. That property — one
+        // beacon per CALL, not per try — is pinned by
+        // `a_streamed_tool_turn_that_failed_before_emitting_is_still_retried_once`,
+        // which retries once and still admits exactly one.
         assert_eq!(
             count(&events, |event| matches!(event, ChatEvent::Processing)),
-            1
+            1 + mock.completion_requests().len()
         );
         assert!(events
             .iter()
@@ -5732,7 +6149,17 @@ mod tests {
 
         assert!(result.is_err(), "both attempts failed");
         assert_eq!(llm.attempts(), 2, "retried exactly once");
-        assert!(sink.events.is_empty(), "nothing was ever published");
+        // This used to read `sink.events.is_empty()`. The turn now opens by saying
+        // the run is working (#126), and that beacon must NOT be mistaken for
+        // something a replay could rewind — if it were counted as an emission, the
+        // retry above would silently stop happening. So the claim is stated
+        // precisely instead of loosened: the provider published nothing across BOTH
+        // attempts, and the beacon went out once for the call rather than per try.
+        assert_eq!(
+            sink.events,
+            vec![ChatEvent::Processing],
+            "only the beacon, and only one of it"
+        );
     }
 
     #[test]
@@ -5756,5 +6183,193 @@ mod tests {
             .iter()
             .any(|event| matches!(event, ChatEvent::Error { .. })));
         assert_eq!(count(&events, |event| matches!(event, ChatEvent::Done)), 0);
+    }
+
+    // ── §5 the run says it is working across a model round-trip (#126) ──────
+    // An answered `ask_user` was followed by NOTHING for a whole provider
+    // round-trip — and by two of them on a provider that does not stream tool
+    // turns, which re-runs the turn buffered. The pane went on showing the last
+    // phase word it was handed, so the user watched "searching" for the fifteen
+    // seconds the model spent composing. Not a correctness bug; a stale phase
+    // word is still a dishonest one.
+
+    /// The fixture skill's question, answered by whoever the run was given.
+    const ASK_USER_ARGS: &str = r#"{"question":"Continue?","options":[{"id":"continue","label":"Continue","description":null,"imageDataUri":null}],"multi_select":false}"#;
+
+    /// Picks the first option, like a user who clicked one.
+    struct AnsweringPrompt;
+
+    #[async_trait]
+    impl UserPrompt for AnsweringPrompt {
+        async fn ask(&self, elicitation: Elicitation) -> CoreResult<Option<Vec<String>>> {
+            Ok(Some(vec![elicitation.options[0].id.clone()]))
+        }
+    }
+
+    /// A whole run with the fixture skill preloaded (so `ask_user` is granted)
+    /// and every question answered — the shape the fifteen seconds was measured
+    /// on.
+    fn run_answered_question(llm: &dyn LlmClient) -> Vec<ChatEvent> {
+        let env = retry_env();
+        let services = SkillServices::new(
+            &env.skills,
+            &env.environment,
+            &AnsweringPrompt,
+            &UnavailableNoteWriter,
+            1,
+        )
+        .with_approval(
+            unattended_policy(),
+            &TEST_APPROVAL_PROMPT,
+            &TEST_APPROVAL_CLASSIFIER,
+        );
+        let mut sink = VecSink::default();
+        block_on(run_chat(
+            "ask me what to do",
+            &[],
+            vec![FIXTURE_SKILL_ID.into()],
+            env._vault.path(),
+            "test-model",
+            &env.provider,
+            llm,
+            &services,
+            &mut sink,
+            &env.guards,
+        ))
+        .unwrap();
+        sink.events
+    }
+
+    #[test]
+    fn an_answered_question_is_followed_by_a_beacon_rather_than_silence() {
+        let llm = MockLlmClient::new(
+            vec![tool_call("prompt", "ask_user", ASK_USER_ARGS), final_turn()],
+            "done",
+        );
+
+        let events = run_answered_question(&llm);
+
+        let settled = events
+            .iter()
+            .position(|event| {
+                matches!(event, ChatEvent::ToolResult { id, status, .. }
+                    if id == "prompt" && *status == ToolStatus::Ok)
+            })
+            .expect("the answered question settles");
+        assert_eq!(
+            events.get(settled + 1),
+            Some(&ChatEvent::Processing),
+            "a full provider round-trip starts here, and nothing else can be \
+             emitted during it — so without a beacon the pane keeps showing \
+             whichever phase word it last had. Got: {:?}",
+            &events[settled..],
+        );
+        assert!(
+            matches!(events.last(), Some(ChatEvent::Done)),
+            "the run still finishes, so the assertion above is about a real run"
+        );
+    }
+
+    /// A provider that does not stream tool turns: the streamed attempt carries
+    /// nothing, the real [`ToolTurnReader`] settles that as `NotStreamed`, and
+    /// the turn is re-run buffered — the shell's fallback, in
+    /// `app/desktop/src-tauri/src/ai.rs`. Two round-trips, and neither publishes
+    /// anything of its own.
+    struct UnstreamableToolLlm {
+        completions: Mutex<VecDeque<Completion>>,
+        round_trips: std::sync::atomic::AtomicUsize,
+    }
+
+    impl UnstreamableToolLlm {
+        fn new(completions: Vec<Completion>) -> Self {
+            Self {
+                completions: Mutex::new(completions.into()),
+                round_trips: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn round_trips(&self) -> usize {
+            self.round_trips.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for UnstreamableToolLlm {
+        async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+            self.round_trips
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(self
+                .completions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(final_turn))
+        }
+
+        async fn complete_tool_streaming(
+            &self,
+            req: &LlmRequest,
+            sink: &mut dyn EventSink,
+        ) -> CoreResult<Completion> {
+            self.round_trips
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            // Read the empty turn through the real reader, so the `NotStreamed`
+            // verdict is that module's own rather than one this double invented.
+            let mut reader = ToolTurnReader::new();
+            assert!(
+                reader.push_bytes(b"data: [DONE]\n", sink)?,
+                "the terminator stops the read"
+            );
+            match reader.finish(sink)? {
+                StreamedToolTurn::Completed(_) => {
+                    panic!("a turn that carried nothing must ask for the buffered fallback")
+                }
+                StreamedToolTurn::NotStreamed => self.complete(req).await,
+            }
+        }
+
+        async fn complete_streaming(
+            &self,
+            _req: &LlmRequest,
+            _sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            unreachable!("this test settles the tool turn and never reaches the answer")
+        }
+    }
+
+    #[test]
+    fn a_turn_the_provider_reruns_buffered_still_gets_one_beacon_before_both_round_trips() {
+        let env = retry_env();
+        let services = SkillServices::new(
+            &env.skills,
+            &env.environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        );
+        let llm = UnstreamableToolLlm::new(vec![final_turn()]);
+        let session = ChatSession {
+            root: env._vault.path(),
+            model: "test-model",
+            provider: &env.provider,
+            llm: &llm,
+            skill_services: &services,
+            guards: &env.guards,
+        };
+        let mut sink = VecSink::default();
+
+        block_on(session.complete_tool_turn(&tool_decision_request(), &mut sink)).unwrap();
+
+        assert_eq!(
+            llm.round_trips(),
+            2,
+            "the worse case the issue names: this turn really did run twice"
+        );
+        assert_eq!(
+            sink.events,
+            vec![ChatEvent::Processing],
+            "the beacon precedes the pair, so ONE covers both — and the two \
+             round-trips publish nothing else between them"
+        );
     }
 }
