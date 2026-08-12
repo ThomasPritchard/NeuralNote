@@ -1,4 +1,4 @@
-import { render, screen, waitFor, within } from "@testing-library/react";
+import { act, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "../lib/api";
@@ -46,11 +46,29 @@ const mockSelect = vi.mocked(api.selectOpenRouterModel);
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
-  const promise = new Promise<T>((done) => {
+  let reject!: (reason: unknown) => void;
+  const promise = new Promise<T>((done, fail) => {
     resolve = done;
+    reject = fail;
   });
-  return { promise, resolve };
+  return { promise, resolve, reject };
 }
+
+/** Two catalogues with disjoint model names, so which one is on screen is
+ *  unambiguous no matter which request produced it. */
+const staleMenu: OpenRouterModelMenu = {
+  asOf: "2026-07-13",
+  selectedModel: "openai/gpt-5",
+  pinnedSelectedModel: null,
+  models: [{ id: "stale/model-one", name: "Stale Model One", contextLength: 128_000, rank: 1 }],
+};
+
+const freshMenu: OpenRouterModelMenu = {
+  asOf: "2026-07-14",
+  selectedModel: "openai/gpt-5",
+  pinnedSelectedModel: null,
+  models: [{ id: "fresh/model-two", name: "Fresh Model Two", contextLength: 128_000, rank: 1 }],
+};
 
 function setup(status: AiStatus = openRouterStatus(), busy = false) {
   const onStatusChange = vi.fn();
@@ -68,6 +86,10 @@ function setup(status: AiStatus = openRouterStatus(), busy = false) {
 
 async function openMenu() {
   await userEvent.click(screen.getByRole("button", { name: /choose ai model/i }));
+}
+
+async function closeMenu() {
+  await userEvent.keyboard("{Escape}");
 }
 
 describe("ChatModelMenu", () => {
@@ -142,6 +164,61 @@ describe("ChatModelMenu", () => {
     expect(screen.queryByRole("menuitemradio", { name: "gpt-5" })).not.toBeInTheDocument();
     expect(mockMenu).toHaveBeenCalledTimes(2);
     expect(mockMenu).toHaveBeenNthCalledWith(2, false);
+  });
+
+  // Both cases below hinge on RESOLUTION ORDER, not on the requests themselves:
+  // settling the first open before the second passes against unguarded code, so
+  // the older request is deliberately settled LAST.
+  it("discards an older catalogue response that resolves after a newer one", async () => {
+    const firstOpen = deferred<OpenRouterModelMenu>();
+    const secondOpen = deferred<OpenRouterModelMenu>();
+    mockMenu.mockReturnValueOnce(firstOpen.promise).mockReturnValueOnce(secondOpen.promise);
+    setup();
+
+    await openMenu();
+    await closeMenu();
+    await openMenu();
+    expect(mockMenu).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      secondOpen.resolve(freshMenu);
+      await secondOpen.promise;
+    });
+    expect(await screen.findByRole("menuitemradio", { name: "Fresh Model Two" })).toBeInTheDocument();
+
+    await act(async () => {
+      firstOpen.resolve(staleMenu);
+      await firstOpen.promise;
+    });
+
+    expect(screen.getByRole("menuitemradio", { name: "Fresh Model Two" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitemradio", { name: "Stale Model One" })).not.toBeInTheDocument();
+  });
+
+  it("discards an older catalogue rejection that arrives after a newer response", async () => {
+    const firstOpen = deferred<OpenRouterModelMenu>();
+    const secondOpen = deferred<OpenRouterModelMenu>();
+    mockMenu.mockReturnValueOnce(firstOpen.promise).mockReturnValueOnce(secondOpen.promise);
+    setup();
+
+    await openMenu();
+    await closeMenu();
+    await openMenu();
+    expect(mockMenu).toHaveBeenCalledTimes(2);
+
+    await act(async () => {
+      secondOpen.resolve(freshMenu);
+      await secondOpen.promise;
+    });
+    expect(await screen.findByRole("menuitemradio", { name: "Fresh Model Two" })).toBeInTheDocument();
+
+    await act(async () => {
+      firstOpen.reject(new Error("stale catalogue failure"));
+      await firstOpen.promise.catch(() => undefined);
+    });
+
+    expect(screen.getByRole("menuitemradio", { name: "Fresh Model Two" })).toBeInTheDocument();
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
   });
 
   it("keeps the current model and offers an explicit force-refresh retry", async () => {

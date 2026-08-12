@@ -1,4 +1,4 @@
-import { useCallback, useState } from "react";
+import { useCallback, useRef, useState } from "react";
 import { Check, ChevronDown, Loader2, Settings2, Zap } from "lucide-react";
 import {
   DropdownMenu,
@@ -47,14 +47,24 @@ export function ChatModelMenu({
   const [writing, setWriting] = useState(false);
   const [writeError, setWriteError] = useState<string | null>(null);
 
-  // TODO(model-catalogue-request-order): guard loads with a request generation
-  // (or abort signal) and cover an older close/reopen response resolving last.
+  /** Only the newest load may write the catalogue. A quick close/reopen (or a
+   *  forced refresh) leaves the older request in flight, and it can resolve —
+   *  or reject — last; both outcomes are discarded rather than applied. */
+  const loadGeneration = useRef(0);
+
   const load = useCallback(async (forceRefresh: boolean) => {
+    const generation = loadGeneration.current + 1;
+    loadGeneration.current = generation;
     setCatalogue({ kind: "loading" });
     try {
-      setCatalogue({ kind: "ready", menu: await api.openRouterModelMenu(forceRefresh) });
+      const menu = await api.openRouterModelMenu(forceRefresh);
+      if (loadGeneration.current === generation) {
+        setCatalogue({ kind: "ready", menu });
+      }
     } catch (error) {
-      setCatalogue({ kind: "error", message: errorMessage(error) });
+      if (loadGeneration.current === generation) {
+        setCatalogue({ kind: "error", message: errorMessage(error) });
+      }
     }
   }, []);
 
