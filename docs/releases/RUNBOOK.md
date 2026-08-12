@@ -24,41 +24,68 @@ Six version manifests:
 
 Plus:
 
-- `Cargo.lock` — refresh the workspace-crate versions (`cargo update -p neuralnote-core -p neuralnote-release`, or `cargo build` and commit the resulting lockfile change).
+- `Cargo.lock` — refresh the workspace-crate versions with `cargo update --workspace`. It should report exactly three packages moved (`desktop`, `neuralnote-core`, `neuralnote-release`) and touch nothing else; anything more means a dependency drifted and belongs in its own commit.
+- `app/desktop/package-lock.json` and `app/desktop/e2e-native/package-lock.json` — the root `"version"` on **lines 3 and 9 only** (two slots each: the top-level field and the `""` self-entry). Do not replace globally: `e2e-native/package-lock.json` also pins unrelated dependencies that happen to sit at the old version number.
 - `app/desktop/src/updater/release-config.test.ts` — the validator test that pins the app-local versions; update its expected string to `X.Y.Z`.
-- `.github/workflows/release-alpha.yml` — 14 version references (the `release_tag` default and description, the two `preflight`/`build` tag allow-lists, the two `RELEASE_VERSION` env values, the two manifest `notes` strings, the changelog copy path `docs/releases/vX.Y.Z.md`, the two `RELEASE_TITLE` strings, and the manifest commit message). Grep to confirm none were missed: `grep -c 'X\.Y\.Z' .github/workflows/release-alpha.yml` should report 14.
+- `scripts/check-release-workflow.mjs` — the contract test hard-codes the release version itself: `releaseVersion`, the `release_tag` default assertion, the changelog path (twice), the `# NeuralNote X.Y.Z ALPHA` heading assertion, and the test's own name. Bumping the workflow without bumping its checker leaves the gate asserting the previous release.
+- `.github/workflows/release-alpha.yml` — **14 lines** carrying 18 occurrences (four of the lines name the version twice): the `release_tag` description and default, the two `preflight`/`build` tag allow-lists (two lines each), the two `RELEASE_VERSION` env values, the two updater-manifest `notes` strings, the changelog copy path `docs/releases/vX.Y.Z.md`, the two `RELEASE_TITLE` strings, and the manifest commit message. The line count is what the `grep -c` below reports; the occurrence count is not.
+
+  Five of these are guarded by nothing — the two `RELEASE_TITLE` strings and the two manifest `notes` strings reach immutable published output, and a missed bump there publishes a correct build under the *previous* version's title or update note with every gate still green. Tracked in #145; until it is fixed, check those four lines by eye.
+
+**Do not bulk-replace the old version string.** Three places name a previous version on purpose and must survive the bump:
+
+- `.github/workflows/release-alpha.yml` and `scripts/check-release-workflow.mjs` each carry a comment recording that the 0.2.1 and 0.3.0 releases both published and then failed their manifest push. That is the evidence for the `git -C` fix; rewriting it destroys the record.
+- `docs/security/dependency-advisories.md` names `urlpattern 0.3.0`, a third-party crate version.
+
+So verify by counting the *new* string rather than searching for leftovers of the old one: `grep -c 'X\.Y\.Z' .github/workflows/release-alpha.yml` should report **14**, and a single `0.3.0` hit remaining in that file is correct.
 
 ## 2. Write the dual changelog
 
-Two files describe the same release and are cross-checked against each other by
-`scripts/check-release-workflow.mjs`. Keep them in lockstep.
+Two files describe the same release. **Write only one of them.**
 
-- `app/desktop/src/whats-new/releaseNotes.ts` — the in-app "What's new". `CURRENT_RELEASE_NOTES`
-  auto-selects the entry whose key matches `package.json`'s version, so the record must contain an
-  entry keyed `"X.Y.Z"` (version, title `What's new in NeuralNote X.Y.Z`, introduction, and
-  `groups[]`, each with a `title` and `items[]`).
-- `docs/releases/vX.Y.Z.md` — the immutable GitHub release body. The workflow copies it verbatim to
-  `RELEASE_NOTES.md` and publishes it as the release description.
+- `docs/releases/vX.Y.Z.md` — **the source you edit.** It is the immutable GitHub release body; the
+  workflow copies it verbatim to `RELEASE_NOTES.md` and publishes it as the release description.
+- `app/desktop/src/whats-new/releaseNotes.ts` — the in-app "What's new", **generated** from that
+  `.md`. Never hand-edit it.
 
-**The deepEqual contract.** The workflow-contract test asserts that the ordered list of `- ` bullet
-lines in `vX.Y.Z.md` (with backticks stripped) is exactly equal to the ordered list of every
-`items:` string in `releaseNotes.ts`. Two consequences:
+```bash
+npm --prefix app/desktop run gen:release-notes    # write the .ts from the .md
+npm --prefix app/desktop run check:release-notes  # verify it is current (exit 1 on drift)
+```
 
-- Each `.md` bullet must be byte-identical to its `.ts` item (backticks aside). Formatting a token
-  as `` `.txt` `` in the `.md` is fine because the test strips backticks before comparing; the `.ts`
-  item stores the plain text.
-- The test greps the **whole** `releaseNotes.ts` file, not one entry. The file must therefore hold
-  the current release's items only — do not leave a superseded version's entry in the record, or its
-  items will appear in `bundledItems` and the comparison against the single-version `.md` will fail.
+The generator reads the version from `app/desktop/package.json`, so run it *after* step 1.
 
-Also update the version-specific assertions the same test makes: the `# NeuralNote X.Y.Z ALPHA`
-H1, the four `## ` section headings (match your group titles), and the handful of representative
-substring checks. Keep the structural `deepEqual` assertion itself unchanged.
+**Why it is generated.** `scripts/check-release-workflow.mjs` asserts the ordered list of `- `
+bullet lines in the `.md` (backticks stripped) is `deepEqual` to the ordered list of every `items:`
+string in the `.ts`. Hand-maintaining both means drift is merely *detected*, at whatever point
+someone runs the gate; generating one from the other means there is a single place to edit and
+drift cannot exist. It also disposes of the old trap where a superseded release's entry left behind
+in the record put its items into the comparison and failed the release: the `.md` holds one release,
+so the generated `.ts` can only hold one.
 
-Update the two tests that mirror the shipped copy so the suite stays green:
+Write the `.md` to the house style: an H1 `# NeuralNote X.Y.Z ALPHA`, one introduction paragraph,
+then `## ` sections of `- ` bullets. Each bullet is one plain-English sentence describing something
+a *user* can observe. Keep `Application packages, updater checks, and the upgrade journey are
+aligned on version X.Y.Z.` as the last bullet of the last section.
 
-- `app/desktop/src/whats-new/ReleaseNotesArticle.test.tsx` — expects the current title, headings,
-  and representative items (keep the `CURRENT_RELEASE_NOTES.version === packageJson.version` check).
+Then update the version-specific assertions in `scripts/check-release-workflow.mjs`: the
+`# NeuralNote X.Y.Z ALPHA` H1, the list of `## ` section headings (match your section titles), and
+the handful of representative substring checks. Keep the structural `deepEqual` assertion unchanged.
+
+> Pick representative substrings that appear in **exactly one** place. The introduction paraphrases
+> every section, so a phrase it shares with a bullet matches twice — harmless in the `.md` checker,
+> but `getByText` in the article test throws on the ambiguity and the failure reads as absence.
+
+Update the two tests that mirror the shipped copy:
+
+- `app/desktop/src/whats-new/ReleaseNotesArticle.test.tsx` — the current title, the section
+  headings, and the representative items. It also asserts `Object.keys(RELEASE_NOTES)` equals the
+  built version, which is the check that a superseded entry is gone. Do **not** replace that with a
+  `queryByText` for the previous release's prose: the article renders only `CURRENT_RELEASE_NOTES`,
+  so a stale entry is never in the DOM and such an assertion passes whether or not the entry exists.
+  For the same reason `CURRENT_RELEASE_NOTES.version === packageJson.version` is self-referential —
+  the record is looked up *by* that version — and proves nothing about the release version. The real
+  version guards are `release-config.test.ts` and the hardcoded titles.
 - `app/desktop/src/App.test.tsx` — the "What's new" modal title and the version persisted on
   dismiss both track the current version.
 
