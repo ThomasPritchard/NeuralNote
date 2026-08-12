@@ -381,9 +381,19 @@ describe("a real horizontal wheel over a table row", () => {
     // scale a wheel, and pinning the number would measure the engine instead.
     expect(row.scrollLeft).toBeGreaterThan(WHEEL_DELTA_PX / 2);
     for (const other of rows) expect(other.scrollLeft).toBeCloseTo(row.scrollLeft, 0);
-    // "The rest of the note stays fixed." Not vacuous against the failure it
-    // guards: a wheel handler resolving the wrong element would move this.
-    expect(view.scrollDOM.scrollLeft).toBe(0);
+
+    // The rest of the note stays fixed, asked of something that could actually
+    // have moved. `view.scrollDOM.scrollLeft` cannot: the harness clamps
+    // `.cm-content` to the band (`:98`), so `scrollWidth === clientWidth` and
+    // the browser rejects any write. Measured, because that zero used to be
+    // asserted here as though it meant something — writing 500 to it and then
+    // asserting it is 0 PASSES. The second table's rows are the real control:
+    // they move independently, as "leaves a second table where it was" below
+    // shows, and aiming this loop at the wheeled table fails on 180 against 0.
+    for (const other of tableRowsFor(view, SECOND_TABLE_CELL)) {
+      expect(maxOffset(other)).toBeGreaterThan(WHEEL_DELTA_PX);
+      expect(other.scrollLeft).toBe(0);
+    }
   });
 
   it("leaves a vertical wheel over a row to the note", async () => {
@@ -392,6 +402,10 @@ describe("a real horizontal wheel over a table row", () => {
     const { view } = mount(LONG_SOURCE);
     const row = tableRowsFor(view, FIRST_CELL)[2]!;
     expect(view.scrollDOM.scrollTop).toBe(0);
+    // The row has somewhere to go on the inline axis, so the last assertion is
+    // about the gesture staying on the block axis rather than about a container
+    // that could not have moved anyway.
+    expect(maxOffset(row)).toBeGreaterThan(WHEEL_DELTA_PX);
 
     await userEvent.wheel(row, { delta: { y: 120 } });
     await settle();

@@ -93,6 +93,13 @@ const EMOJI_PRESENTATION = /^\p{Emoji_Presentation}$/u;
  * `U+FE0F`, with which a text-presentation symbol asks to be painted as an
  * emoji. It is the whole difference between `U+2600` — a narrow dingbat — and
  * `U+2600 U+FE0F`, which is a two-column emoji.
+ *
+ * Its opposite number `U+FE0E`, which asks for TEXT presentation, is read as an
+ * ordinary zero-width selector and narrows nothing: `U+2705 U+FE0E` still
+ * counts two columns. The asymmetry is deliberate rather than an oversight —
+ * renderers genuinely disagree about honouring it, and narrowing an emoji
+ * nobody has complained about is a behaviour change no test pins and no issue
+ * asked for.
  */
 const EMOJI_PRESENTATION_SELECTOR = 0xfe0f;
 

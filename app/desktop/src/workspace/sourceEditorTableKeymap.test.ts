@@ -28,7 +28,13 @@ import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView, keymap, type KeyBinding } from "@codemirror/view";
 import { describe, expect, it, vi } from "vitest";
 
-import { formatTable, revealTableSource, tableKeymap } from "./sourceEditorTableCommands";
+import {
+  formatTable,
+  formatTableChord,
+  revealTableSource,
+  revealTableSourceChord,
+  tableKeymap,
+} from "./sourceEditorTableCommands";
 import { revealedTableSource } from "./sourceEditorTableReveal";
 import { tableDelimiterGuard } from "./sourceEditorTableDelimiterGuard";
 
@@ -67,6 +73,20 @@ const TABLE = ["| A | B |", "| --- | --- |", "| 1 | 2 |"].join("\n");
 const RAGGED = ["| a | b |", "| --- | --- |", "| xxxx | yyyy |"].join("\n");
 const RAGGED_CARET = RAGGED.indexOf("xxxx");
 
+/**
+ * A table `formatTable` has nothing left to do to, so the command DECLINES
+ * inside it — and it is the state the user is in immediately after every
+ * successful format, which is what makes it the interesting case rather than a
+ * corner one. Each test that uses it proves the decline rather than assuming
+ * it, so a change to the width rules turns this fixture red instead of quietly
+ * turning the case into the one above.
+ */
+const ALIGNED = ["| A   | B   |", "| --- | --- |", "| 1   | 2   |"].join("\n");
+const ALIGNED_CARET = ALIGNED.indexOf("1");
+
+/** No table anywhere, so both commands decline for want of one. */
+const PROSE = "a paragraph with no table in it";
+
 /** Dispatch a keydown and hand back the event, so callers can read the verdict. */
 function press(view: EditorView, init: KeyboardEventInit): KeyboardEvent {
   const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
@@ -99,11 +119,22 @@ function claimedKeys(binding: KeyBinding): string[] {
 }
 
 /**
- * A real `Shift-Alt-\` keydown, as the DOM would deliver it.
+ * A hand-built `Shift-Alt-\` keydown carrying the UNSHIFTED base character.
  *
- * `key: "\\"` is the literal backslash — the base key, which is what a WebDriver
- * or synthetic press carries. It is NOT what macOS delivers for that chord from
- * a real keyboard; that is » and is covered separately below (#97).
+ * Nothing real delivers that shape, and the point of it is what it proves. A
+ * macOS keyboard sends » for this chord, and a driver sends `|`: a Playwright
+ * press of `Shift+Alt+Backslash` on macOS reports `key: "|"`, `keyCode: 220` on
+ * both WebKit and Chromium, which is the shape
+ * `sourceEditorTableCommands.test.ts` presses for the Windows/Linux half.
+ *
+ * `"\\"` is the ONE shape that still resolves the base binding on macOS. The
+ * base-layout fallback is switched off there
+ * (`@codemirror/view/dist/index.js:9189`), so the only remaining route is the
+ * retry at `:9199-9200`, which prefixes `Shift-` to the event's own `key` — and
+ * that matches only when the `key` is the base character. So this press is the
+ * live proof that the base name is still REGISTERED on macOS, which is exactly
+ * what keeping the `mac:` entries separate buys. The » chord a real keyboard
+ * sends is covered separately below (#97).
  */
 function pressRevealKey(view: EditorView): void {
   press(view, { key: "\\", altKey: true, shiftKey: true });
@@ -131,8 +162,13 @@ describe("the Shift-Alt-\\ binding", () => {
     const owners = (key: string) =>
       REGISTERED.filter((binding) => claimedKeys(binding).includes(key)).map((binding) => binding.run);
 
-    expect(owners(MAC_FORMAT_KEY)).toEqual([formatTable]);
-    expect(owners(MAC_REVEAL_KEY)).toEqual([revealTableSource]);
+    // The chord wrappers, not the bare commands: on macOS these keys run the
+    // command AND claim the keystroke when it declines inside a table, which is
+    // the whole of the contract below.
+    expect(owners(MAC_FORMAT_KEY)).toEqual([formatTableChord]);
+    expect(owners(MAC_REVEAL_KEY)).toEqual([revealTableSourceChord]);
+    // The base names keep the bare commands — reveal's is pinned above.
+    expect(owners("Shift-Alt-f")).toEqual([formatTable]);
   });
 
   it("gives the macOS alternates no cross-platform key", () => {
@@ -232,6 +268,10 @@ describe("the macOS Option chords (#97)", () => {
     // is on trial here is the keystroke reaching the command at all.
     expect(view.state.doc.toString()).toBe(formatted);
     expect(formatted).not.toBe(RAGGED);
+    // Documentation, not coverage: jsdom performs no default text insertion for
+    // a synthetic keydown, so this line cannot fail here whatever the keymap
+    // does. `defaultPrevented` below is the assertion carrying the weight — it
+    // is the mechanism by which the character is suppressed in a real engine.
     expect(view.state.doc.toString()).not.toContain(MAC_FORMAT_CHAR);
     expect(event.defaultPrevented).toBe(true);
     view.destroy();
@@ -250,6 +290,8 @@ describe("the macOS Option chords (#97)", () => {
 
     expect(view.state.field(revealedTableSource)).not.toBeNull();
     expect(view.state.doc.toString()).toBe(TABLE); // revealing changes no bytes
+    // Same as above: unfalsifiable at this tier, kept only as the statement of
+    // intent. `defaultPrevented` on the next line is what proves it.
     expect(view.state.doc.toString()).not.toContain(MAC_REVEAL_CHAR);
     expect(event.defaultPrevented).toBe(true);
     view.destroy();
@@ -273,6 +315,98 @@ describe("the macOS Option chords (#97)", () => {
 
     expect(event.defaultPrevented).toBe(false);
     expect(view.state.doc.toString()).toBe(TABLE);
+    view.destroy();
+  });
+});
+
+/**
+ * The contract the two macOS entries implement, one case per row (#97).
+ *
+ * > Inside a table the chord is a COMMAND; outside a table it is a CHARACTER.
+ *
+ * The middle case is the defect this block was written for. A CodeMirror
+ * binding only claims a keystroke when its `run` returns true, so a command
+ * that DECLINED inside a table — an already-aligned table, which is where every
+ * successful format leaves the user — left the chord unclaimed and `Ï` landed
+ * in the cell. Pressing Shift-Option-F twice was enough to reproduce it.
+ *
+ * `defaultPrevented` carries every assertion here, because it is the actual
+ * suppression mechanism and the only observable at this tier: jsdom implements
+ * no default text insertion for a synthetic keydown, so `doc` cannot gain a `Ï`
+ * however broken the binding is, and a `not.toContain` written against it would
+ * pass on a keymap that did nothing at all.
+ */
+describe("the macOS chord contract (#97)", () => {
+  const FORMAT_CHORD: KeyboardEventInit = {
+    key: MAC_FORMAT_CHAR,
+    altKey: true,
+    shiftKey: true,
+    keyCode: 70,
+  };
+  const REVEAL_CHORD: KeyboardEventInit = {
+    key: MAC_REVEAL_CHAR,
+    altKey: true,
+    shiftKey: true,
+    keyCode: 220,
+  };
+
+  it("claims the format chord inside a table it has nothing to reformat", () => {
+    // The precondition, not an aside: without a genuinely declining command
+    // this is the row above wearing a different fixture.
+    const probe = mounted(ALIGNED, ALIGNED_CARET);
+    expect(formatTable(probe)).toBe(false);
+    probe.destroy();
+
+    const view = mounted(ALIGNED, ALIGNED_CARET);
+    const event = press(view, FORMAT_CHORD);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(view.state.doc.toString()).toBe(ALIGNED);
+    view.destroy();
+  });
+
+  it("claims the reveal chord inside a table already showing its source", () => {
+    // Reveal toggles, so it cannot decline inside a table the way format does.
+    // Pressing it twice is the nearest thing: the second press is a command
+    // with a table under it either way, and the chord must stay claimed.
+    const view = mounted(TABLE, TABLE.indexOf("| 1 |") + 2);
+    expect(press(view, REVEAL_CHORD).defaultPrevented).toBe(true);
+    expect(view.state.field(revealedTableSource)).not.toBeNull();
+
+    const event = press(view, REVEAL_CHORD);
+
+    expect(event.defaultPrevented).toBe(true);
+    expect(view.state.field(revealedTableSource)).toBeNull();
+    view.destroy();
+  });
+
+  it.each<{ chord: string; init: KeyboardEventInit }>([
+    { chord: "format", init: FORMAT_CHORD },
+    { chord: "reveal", init: REVEAL_CHORD },
+  ])("leaves the $chord chord to the input method outside any table", ({ init }) => {
+    const view = mounted(PROSE, PROSE.indexOf("with"));
+    const event = press(view, init);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(view.state.doc.toString()).toBe(PROSE);
+    view.destroy();
+  });
+
+  it.each<{ chord: string; init: KeyboardEventInit }>([
+    { chord: "format", init: FORMAT_CHORD },
+    { chord: "reveal", init: REVEAL_CHORD },
+  ])("leaves the $chord chord alone where the table stops being active", ({ init }) => {
+    // `activeTableAt` is exclusive of `table.to`, because the preview layer
+    // still draws the read-only widget there and every other table command
+    // refuses at that position. The chords agree rather than deriving the
+    // boundary again: at exactly `to` the caret is outside the table, so the
+    // character is what the user asked for.
+    const view = mounted(TABLE, TABLE.length);
+    const event = press(view, init);
+
+    expect(event.defaultPrevented).toBe(false);
+    expect(view.state.doc.toString()).toBe(TABLE);
+    expect(view.state.field(revealedTableSource)).toBeNull();
     view.destroy();
   });
 });

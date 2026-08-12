@@ -532,11 +532,14 @@ describe("the table chords on Windows and Linux", () => {
   }
 
   it("still formats through the base-layout fallback macOS opts out of", () => {
-    // Shift-Alt-F arrives here as `key: "F"` — the SHIFTED character, never "f" —
-    // so only `base[keyCode]` gets CodeMirror back to the name the binding uses
+    // Shift-Alt-F arrives as `key: "F"` — the SHIFTED character, never "f" — so
+    // only `base[keyCode]` gets CodeMirror back to the name the binding uses
     // (`@codemirror/view/dist/index.js:9190-9191`). That fallback is exactly what
     // macOS skips, which is why #97 needed a second binding rather than an edit
     // to this one.
+    //
+    // Measured, not inferred: a Playwright press of `Shift+Alt+KeyF` reports
+    // `key: "F"`, `keyCode: 70` on both WebKit and Chromium.
     const byCommand = mounted(RAGGED, RAGGED.indexOf("xxxx"));
     expect(formatTable(byCommand)).toBe(true);
     const formatted = byCommand.state.doc.toString();
@@ -554,8 +557,13 @@ describe("the table chords on Windows and Linux", () => {
   });
 
   it("still reveals through that same fallback", () => {
-    // Shift-Alt-\ arrives as "|", the shifted backslash, on keyCode 220.
+    // Shift-Alt-\ arrives as "|", the shifted backslash, on keyCode 220 —
+    // measured the same way, on both engines.
     const view = mounted(ALIGNED, ALIGNED.indexOf("| --- |") + 2);
+    // Nothing was revealed before the press, so the assertion after it is about
+    // the keystroke rather than about the field's initial value.
+    expect(view.state.field(revealedTableSource)).toBeNull();
+
     const event = press(view, { key: "|", altKey: true, shiftKey: true, keyCode: 220 });
 
     expect(view.state.field(revealedTableSource)).not.toBeNull();

@@ -143,10 +143,24 @@ describe("monospaceWidth", () => {
     ["❤️", "U+2764 U+FE0F, the same, and the commonest one in prose"],
     ["1️⃣", "U+0031 U+FE0F U+20E3, a keycap sequence"],
     ["👍", "U+1F44D, already covered — the case issue #86 opened on"],
+    ["🫠", "U+1FAE0, astral and outside every hard-coded range"],
+    ["🩹", "U+1FA79, the same, in a different post-2019 block"],
     ["中", "U+4E2D, East Asian Wide"],
     ["Ａ", "U+FF21, Fullwidth"],
   ])("counts %s as two columns (%s)", (text) => {
     expect(monospaceWidth(text)).toBe(2);
+  });
+
+  it("has the two astral rows written as the code points they name", () => {
+    // Why those two: the emoji blocks `DOUBLE_WIDTH_RANGES` lists stop at
+    // U+1F9FF, and both of these sit above it, so a reader who assumes the
+    // pictograph ranges cover every astral emoji is wrong about exactly these.
+    // Only `\p{Emoji_Presentation}` can answer them, and a look-alike glyph
+    // would take that guard away without turning anything red — which is
+    // precisely how the combining-mark row below went unexercised. So the bytes
+    // are checked rather than read off the screen.
+    expect("🫠".codePointAt(0)).toBe(0x1fae0);
+    expect("🩹".codePointAt(0)).toBe(0x1fa79);
   });
 
   it.each([
@@ -155,9 +169,20 @@ describe("monospaceWidth", () => {
     ["★", "U+2605, a symbol with no emoji presentation at all"],
     ["☐", "U+2610, ditto — and common in a checklist column"],
     ["→", "U+2192, an arrow"],
-    ["é", "U+0065 U+0301, a base plus a zero-width combining mark"],
+    // An escape, not a glyph. This row used to hold a precomposed é (U+00E9),
+    // which looks identical, is a single non-combining code point, and so
+    // duplicated the ★ case above while claiming to cover the decomposed one —
+    // the file contained no code point in U+0300-U+036F at all, and
+    // `isZeroWidth`'s combining-mark branch was never entered.
+    ["e\u0301", "U+0065 U+0301, a base plus a zero-width combining mark"],
   ])("counts %s as one column (%s)", (text) => {
     expect(monospaceWidth(text)).toBe(1);
+  });
+
+  it("counts a cluster that is nothing but a combining mark as no columns", () => {
+    // `clusterWidth`'s documented `return 0`, which nothing else here reaches:
+    // the mark is zero-width and there is no base behind it to carry a width.
+    expect(monospaceWidth("\u0301")).toBe(0);
   });
 
   it("adds cluster widths across a mixed string", () => {
