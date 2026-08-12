@@ -38,6 +38,26 @@ type SyntaxNode = ReturnType<typeof syntaxTree>["topNode"];
  * itself (a `text` run), replaced by drawn chrome (a `widget` run), or hidden
  * outright (a {@link CellPaintPlan.hiddenRanges} entry). The three tile the
  * cell's span exactly.
+ *
+ * **Kept whole, deliberately — the decision behind #105.** The guardrail is
+ * `eslint/max-lines` in `.oxlintrc.json`, and it counts code with blank lines
+ * and comments skipped. Measured 2026-08-12: 513 physical lines but 327 lines
+ * of code against a budget of 500, with oxlint on this file exiting 0. The gap
+ * between the two numbers is documentation, which is the rule working as
+ * designed rather than an overage to pay down.
+ *
+ * What the file holds is one pipeline — scan the Markdown tree, merge
+ * Obsidian's spans over it, derive the painted runs, take their hidden
+ * complement, sign the result — and every seam in it is internal to that.
+ * Splitting the projection is the failure this module exists to prevent: the
+ * escaped-pipe and image alt text bugs fixed in #96 were that divergence
+ * returning, from the escape rule living at a single call site instead of here.
+ * Six production modules import from this one, so reshaping its export surface
+ * costs real churn for no behavioural change.
+ *
+ * Revisit when a genuinely independent responsibility appears here — something
+ * with its own reason to change that does not need the projection's own state —
+ * and not because the line count moved again.
  */
 
 /** Which half of a table a cell sits in. Header cells paint at their own weight. */

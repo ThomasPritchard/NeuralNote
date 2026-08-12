@@ -407,6 +407,38 @@ export const revealTableSource: Command = (view) => {
 };
 
 /**
+ * The chord contract the macOS bindings below are registered under:
+ *
+ * > Inside a table the chord is a COMMAND; outside a table it is a CHARACTER.
+ *
+ * A CodeMirror binding claims a keystroke only when its `run` returns true, so
+ * the command's own verdict is not enough: `formatTableAt` returns null for a
+ * table it has nothing left to align, which is the state the user is in
+ * immediately after every successful format, and the unclaimed keystroke then
+ * typed `Ï` into the cell — pressing Shift-Option-F twice was the whole
+ * reproduction. Claiming the key whenever a table is under the caret is the
+ * missing half.
+ *
+ * The table question is asked of {@link activeTableAt} rather than derived
+ * again here, so the chord agrees with what the preview layer draws and with
+ * every other command in this module, `table.to` exclusivity included: at
+ * exactly `to` there is no active table, so the character types, which is the
+ * right answer for a caret the user sees outside the rendered widget.
+ *
+ * `revealTableSourceAt` cannot currently decline while a table is active, so
+ * for that command this is a no-op today. It is applied to both because the
+ * contract is one rule about the chords, not a patch to the one command that
+ * exposed it.
+ */
+function claimedInsideTable(command: Command): Command {
+  return (view) =>
+    command(view) || activeTableAt(view.state, view.state.selection.main.head) !== null;
+}
+
+export const formatTableChord = claimedInsideTable(formatTable);
+export const revealTableSourceChord = claimedInsideTable(revealTableSource);
+
+/**
  * The table block of `SourceNoteEditor`'s keymap, in registration order.
  *
  * It lives here, with the commands, so the binding order is testable against
@@ -431,4 +463,51 @@ export const tableKeymap: readonly KeyBinding[] = [
   { key: "Enter", run: nextTableRow },
   { key: "Shift-Alt-f", run: formatTable },
   { key: "Shift-Alt-\\", run: revealTableSource },
+
+  // macOS never delivers those last two by their base key. `KeyboardEvent.key`
+  // carries the character Option PRODUCES, and CodeMirror deliberately declines
+  // to fall back to the base-layout name for Option combinations there —
+  // "Alt-combinations on macOS tend to be typed characters"
+  // (`@codemirror/view/dist/index.js:9188-9189`). `Shift-Alt-Ï` and
+  // `Shift-Alt-»` are therefore the only names its resolver ever looks up for
+  // these chords, and binding them is the whole of the fix for #97; without
+  // them the keystroke goes unclaimed and WebKit types the character into the
+  // cell.
+  //
+  // Separate entries rather than a `mac` field on the two above, because
+  // `buildKeymap` reads `binding[platform] || binding.key` and never both
+  // (`:9136`): folding them in would UNBIND the base names on macOS, and buy
+  // nothing for it — a separate entry already registers the Option characters.
+  //
+  // Those base names are NOT reached on macOS by the base-layout fallback; that
+  // is precisely the branch `:9189` switches off. One route to them survives:
+  // `:9199-9200` retries `Shift-` plus the event's OWN `key`, which matches
+  // when the event carries the unshifted base character (`f`, `\`). Nothing in
+  // production sends that — a macOS keyboard sends `Ï`/`»`, and a driver sends
+  // the SHIFTED character, measured rather than assumed: a Playwright press of
+  // `Shift+Alt+Backslash` on macOS reports `key: "|"` on both WebKit and
+  // Chromium, which is the Windows/Linux route (`:9190-9191`) where the base
+  // fallback is still on. So the surviving route is reached only by a
+  // hand-built synthetic press, and that is what `sourceEditorTableKeymap.test.ts`
+  // uses to prove the base names are still registered here. Keeping the entries
+  // separate is free; folding them in would spend that for nothing. Carrying no
+  // `key` is what keeps the two entries below from registering anywhere but
+  // macOS.
+  //
+  // `claimedInsideTable` is what makes the pair a contract rather than two
+  // lucky cases; its docblock carries the reasoning. The cost it accepts,
+  // recorded as a decision rather than left to be discovered: inside a table
+  // cell `Ï` and `»` become untypeable — and `»` is the French closing
+  // guillemet, which a macOS user types with exactly this chord. A keymap keyed
+  // on `key` cannot separate "the user meant the command" from "the user meant
+  // the character", so one of the two has to lose inside a cell; a table cell
+  // is the one place where the command is overwhelmingly the likelier intent,
+  // and the source is one Shift-Option-\ away for anyone who needs the
+  // character. `preventDefault: true` was the alternative and is worse: it pays
+  // the same cost across the whole note, prose included.
+  //
+  // The characters are the US layout's; a layout that puts something else on
+  // those chords is not covered, and no keymap keyed on `key` can be.
+  { mac: "Shift-Alt-Ï", run: formatTableChord },
+  { mac: "Shift-Alt-»", run: revealTableSourceChord },
 ];
