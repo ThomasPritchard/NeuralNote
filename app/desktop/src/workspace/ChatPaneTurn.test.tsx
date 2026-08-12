@@ -196,6 +196,45 @@ describe("ChatPane — chat view", () => {
     await waitFor(() => expect(screen.getByRole("button", { name: "Send" })).toBeDisabled());
   });
 
+  it("stays silent about stopping when the turn finished before the stop landed", async () => {
+    // The stop is in flight when `done` lands, and `chat` has not settled yet —
+    // native guard cleanup is still unwinding, so this is still the active turn
+    // and the cancelled outcome is delivered. It relabels nothing, so the live
+    // region must not claim a stop the user's screen reader would then hear
+    // contradicting the completed answer sitting above it.
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const run = deferred<string>();
+    const stop = deferred<{ turnId: string; status: "cancelled" }>();
+    let emit!: (event: ChatEvent) => void;
+    mockChat.mockImplementation((_turnId, _prompt, _history, onEvent) => {
+      emit = onEvent;
+      onEvent({ type: "answer", delta: "The whole answer landed." });
+      return run.promise;
+    });
+    mockCancelChat.mockReturnValue(stop.promise);
+    const { user } = setup();
+    await screen.findByLabelText("Ask across your vault");
+
+    await user.type(composer(), "distil the playlist");
+    await user.click(sendButton());
+    await user.click(await screen.findByRole("button", { name: "Stop response" }));
+
+    act(() => emit({ type: "done" }));
+    await act(async () => {
+      stop.resolve({ turnId: TURN_ID, status: "cancelled" });
+      await stop.promise;
+    });
+
+    expect(
+      screen.queryByText("Response stopped.", { selector: '[aria-live="polite"]' }),
+    ).not.toBeInTheDocument();
+    expect(screen.queryByText("Stopped")).not.toBeInTheDocument();
+    expect(screen.getByText("The whole answer landed.")).toBeInTheDocument();
+
+    run.resolve(TURN_ID);
+    await waitFor(() => expect(composer()).toBeEnabled());
+  });
+
   it("keeps a queued committed-note ledger after stop without reviving terminal chat events", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive());
     const run = deferred<string>();
