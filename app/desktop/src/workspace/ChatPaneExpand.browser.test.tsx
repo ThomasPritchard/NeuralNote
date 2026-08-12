@@ -78,22 +78,64 @@ afterEach(async () => {
   host?.remove();
   host = null;
   globalThis.localStorage.removeItem(WORKSPACE_LAYOUT_STORAGE_KEY);
+  document.documentElement.style.fontSize = "";
+  document.getElementById(STILL_STYLE_ID)?.remove();
   await page.viewport(1280, 800);
 });
 
-/** The navigation ribbon's compacted width and the sidebar's floor, mirrored
- *  from `workspaceLayout.ts`. The harness reserves them because the editor's
- *  share is what is left AFTER them: a row of just editor-plus-chat would leave
- *  the editor 250px of slack it does not have in the app, and the narrowest-
- *  window assertion below would then pass no matter how wide the pane grew. */
+const STILL_STYLE_ID = "nn-test-no-pane-transitions";
+
+/** Switch off the pane's width transitions for tests that sample RESTING
+ *  geometry at a series of window widths.
+ *
+ *  Not a convenience. Resizing restarts a 200ms transition, and every way of
+ *  waiting it out reads the pre-resize width if the resize has not committed
+ *  yet — which at a sweep's narrow end hands back the WIDER window's editor and
+ *  passes an assertion the real geometry fails. Removing the animation removes
+ *  the ambiguity rather than papering over it with a longer wait; it is the same
+ *  state the app's own `prefers-reduced-motion` reset produces, and the animated
+ *  path stays covered by the settle-based tests above. */
+function freezePaneTransitions(): void {
+  const style = document.createElement("style");
+  style.id = STILL_STYLE_ID;
+  style.textContent =
+    ".nn-chat-slot, .nn-chat-slot > .nn-chat-pane { transition: none !important; }";
+  document.head.append(style);
+}
+
+/** The navigation ribbon's two widths and the sidebar's floor, mirrored from
+ *  `workspaceLayout.ts`. The harness reserves them because the editor's share is
+ *  what is left AFTER them: a row of just editor-plus-chat would leave the
+ *  editor 250px of slack it does not have in the app, and the narrowest-window
+ *  assertion below would then pass no matter how wide the pane grew.
+ *
+ *  The sidebar stands at its floor rather than a user's real width because that
+ *  is the only configuration in which the editor's floor can break at all —
+ *  above it, `sidebarMaxWidth` clamps the sidebar precisely so the editor keeps
+ *  its 240px, and the shortfall lands on the sidebar instead. */
 const NAVIGATION_COMPACT_WIDTH = 56;
+const NAVIGATION_EXPANDED_WIDTH = 192;
 const SIDEBAR_MIN_WIDTH = 192;
 const SPLITTER_WIDTH = 8;
+
+/** The root font size the app applies for the "large" font-scale preference
+ *  (`preferences.tsx`, FONT_SCALE_PERCENT). Mirrored as a literal the same way
+ *  the pane widths above are, rather than importing the preferences module and
+ *  its provider graph into a geometry test. */
+const LARGE_FONT_SCALE = "112.5%";
 
 /** The workspace row the chat slot actually lives in: the navigation ribbon and
  *  sidebar at the sizes a squeezed window forces them to, a `flex-1` editor, and
  *  a `flex: 0 0 auto` slot. The widths are the real cascade's arithmetic, not a
- *  model of it — only the two fixed panels are stood in for. */
+ *  model of it — only the two fixed panels are stood in for.
+ *
+ *  The ribbon's width comes from the derivation exactly as it does in the app
+ *  (`Workspace.tsx` writes `--navigation-width` from the same field). Pinning it
+ *  at the compacted 56 — as this harness first did — is what made the ribbon
+ *  unobservable here: it was already compact before any toggle, so no test in
+ *  this tier could see one fail to compact. Nothing is proved by the mirroring
+ *  itself; what the browser contributes is the input, a chat width the real
+ *  cascade resolved, which jsdom reports as 0. */
 function Harness() {
   const layout = useWorkspaceLayout(true, "/vault");
   return (
@@ -101,7 +143,11 @@ function Harness() {
       ref={layout.workspacePanesRef}
       className="nn-workspace-panes flex min-h-0 flex-1 overflow-hidden"
     >
-      <div className="nn-ribbon shrink-0" style={{ width: NAVIGATION_COMPACT_WIDTH }} />
+      <div
+        className="nn-ribbon shrink-0"
+        data-navigation-expanded={layout.effectiveLayout.navigationExpanded}
+        style={{ width: layout.effectiveLayout.navigationWidth }}
+      />
       <div className="shrink-0" style={{ width: SIDEBAR_MIN_WIDTH }} />
       <div className="shrink-0" style={{ width: SPLITTER_WIDTH }} />
       <div data-testid="editor" className="flex min-w-0 flex-1" />
@@ -144,6 +190,12 @@ function slot(): HTMLElement {
 function editorWidth(): number {
   const el = host!.querySelector<HTMLElement>('[data-testid="editor"]');
   if (el === null) throw new Error("the editor stand-in did not render");
+  return el.getBoundingClientRect().width;
+}
+
+function ribbonWidth(): number {
+  const el = host!.querySelector<HTMLElement>(".nn-ribbon");
+  if (el === null) throw new Error("the navigation ribbon stand-in did not render");
   return el.getBoundingClientRect().width;
 }
 
@@ -245,6 +297,92 @@ describe("expand-to-wide", () => {
     // and the base `clamp(36rem, …)` reaches here as 576px of a 920px window,
     // which trips this before the floor above notices.
     expect(expanded).toBeLessThan(window.innerWidth / 2);
+  });
+
+  /** Window widths sampled from the widest down. Every tier boundary the two
+   *  width tokens are overridden at is sampled AT ITS FLOOR, because a value
+   *  derived per tier is exactly right in a tier's comfortable middle and wrong
+   *  at its edges — and the last tier has no floor at all, which is the defect:
+   *
+   *    1440  roomy; nothing spatial forces the ribbon to compact here
+   *    1281  one px above the ≤1280 tier, where the base clamp's 36rem floor wins
+   *    1200  inside ≤1280, above the band where widening HAPPENED to compact
+   *    1051  the ≤1280 tier's floor — the window its 34rem was derived at
+   *    1000  mid ≤1050
+   *     941  the ≤1050 tier's floor
+   *     920  the Tauri window's `minWidth`, and the ≤940 tier's derivation anchor
+   *     800  where this was reported, and below every anchor any tier was given
+   */
+  const WIDTH_SWEEP = [1440, 1281, 1200, 1051, 1000, 941, 920, 800] as const;
+
+  it("keeps the editor's floor and the yielded ribbon at every window width", async () => {
+    // Resting geometry only, so the transitions come off: see
+    // `freezePaneTransitions`. The animated path is what the tests above cover.
+    await page.viewport(WIDTH_SWEEP[0], 800);
+    freezePaneTransitions();
+    await mountHarness();
+    const collapsed = await settledSlotWidth();
+
+    await userEvent.click(toggle());
+    await expect.element(toggle()).toHaveAttribute("aria-pressed", "true");
+    // Vacuity guard: a sweep across a pane that never expanded would pass at
+    // every width and prove nothing about expanding.
+    await expect.poll(slotWidth, POLL).toBeGreaterThan(collapsed);
+
+    for (const width of WIDTH_SWEEP) {
+      await page.viewport(width, 800);
+      // Poll the window first. It cannot read true before the resize commits,
+      // which a "has it stopped moving?" wait can — and at the narrow end that
+      // hands back the previous, WIDER window's editor and passes.
+      await expect.poll(() => window.innerWidth, POLL).toBe(width);
+
+      // The product decision, as an invariant rather than a side effect: an
+      // expanded pane means a compacted ribbon, at every width, whether or not
+      // the arithmetic happens to demand it.
+      await expect.poll(ribbonWidth, POLL).toBe(NAVIGATION_COMPACT_WIDTH);
+      expect(editorWidth(), `editor at ${width}px`).toBeGreaterThanOrEqual(
+        EDITOR_MIN_WIDTH,
+      );
+    }
+  });
+
+  it("compacts the labelled ribbon when the toggle is pressed at a roomy window", async () => {
+    await page.viewport(1440, 900);
+    await mountHarness();
+    const collapsed = await settledSlotWidth();
+
+    // The premise that makes this the case worth watching. At 1440 there is no
+    // spatial reason to compact anything: even expanded, the row still has
+    // 1440 − 192 (labelled ribbon) − 634 (44vw) − 8 − 240 = 366px spare for the
+    // sidebar, comfortably over its 192px floor. A rule that compacts only when
+    // it runs out of room therefore leaves this ribbon exactly as it was, which
+    // is what shipped — the sweep above proves the resting state, and this
+    // proves the toggle is what changed it.
+    await expect.poll(ribbonWidth, POLL).toBe(NAVIGATION_EXPANDED_WIDTH);
+
+    await widenFrom(collapsed);
+
+    await expect.poll(ribbonWidth, POLL).toBe(NAVIGATION_COMPACT_WIDTH);
+  });
+
+  it("keeps the editor's floor at the largest font scale", async () => {
+    // The tokens are rem; the ribbon, sidebar, splitter and editor floor they
+    // were derived against are px written from JS. So the "large" font-scale
+    // preference grows the pane by an eighth and moves nothing it has to fit
+    // beside. 1051 is the ≤1280 tier's own derivation anchor, where 34rem was
+    // sized to leave the editor 251px — at 112.5% that target is 612px and the
+    // editor is left 183. Inside the supported window range, on a setting the
+    // Settings panel offers.
+    await page.viewport(1051, 800);
+    document.documentElement.style.fontSize = LARGE_FONT_SCALE;
+    await mountHarness();
+    const collapsed = await settledSlotWidth();
+
+    const expanded = await widenFrom(collapsed);
+
+    expect(editorWidth()).toBeGreaterThanOrEqual(EDITOR_MIN_WIDTH);
+    // What gets clamped is the target, not the feature: the pane still widened.
+    expect(expanded).toBeGreaterThan(collapsed);
   });
 });
 

@@ -194,8 +194,21 @@ export function deriveEffectiveWorkspaceLayout(
     reservedChatWidth -
     splitterWidth -
     EDITOR_MIN_WIDTH;
+  // An expanded chat pane takes the navigation's labels with it, at every window
+  // width. Running space cannot express that on its own: at a roomy window the
+  // wider pane still leaves the ribbon its labels, so a purely spatial rule left
+  // the ribbon exactly as it was and the toggle appeared to do nothing to it.
+  // Only in a narrow band (roughly 1051–1175px) did widening happen to cross the
+  // threshold, which is why this read as working.
+  //
+  // Gated on the pane actually occupying the row: `chatExpanded` persists while
+  // the chat is closed, and a hidden pane has no claim on anything. During the
+  // closing animation the reservation is still positive, so the labels come back
+  // once the pane has gone rather than halfway out.
+  const chatClaimsNavigation = preferred.chatExpanded && reservedChatWidth > 0;
   const navigationExpanded =
     preferred.navigationExpanded &&
+    !chatClaimsNavigation &&
     expandedSidebarSpace >= (panelOpen ? SIDEBAR_MIN_WIDTH : 0);
   const navigationWidth = navigationExpanded
     ? NAVIGATION_EXPANDED_WIDTH
@@ -226,10 +239,11 @@ export function deriveEffectiveWorkspaceLayout(
       : 0,
     sidebarMaxWidth,
     splitterWidth,
-    // Passed through rather than responsively clamped: an expanded chat pane
-    // reaches this derivation as a wider measured `chatWidth`, which compacts
-    // the navigation ribbon above. Expanding chat means the user wants chat, so
-    // the ribbon yielding is the intended trade rather than a fallback.
+    // Passed through rather than responsively clamped: how wide an expanded
+    // pane gets is the `--chat-width-wide` token's business, and that token
+    // already refuses to spend the editor's floor. What the flag decides HERE is
+    // the ribbon above (see `chatClaimsNavigation`) — expanding chat means the
+    // user wants chat, so the ribbon yielding is the intended trade.
     chatExpanded: preferred.chatExpanded,
   };
 }

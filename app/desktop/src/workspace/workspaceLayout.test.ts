@@ -391,24 +391,57 @@ describe("expanded chat pane", () => {
     navigationExpanded: true,
     sidebarWidth: 296,
     sidebarPanel: "files" as const,
-    chatExpanded: true,
+    chatExpanded: false,
   };
 
-  // `chatExpanded` reaches this derivation as the *measured* width of a wider
-  // pane, never as the flag itself — the width lives in the `--chat-width` CSS
-  // token and its responsive overrides, which are the browser tier's to own.
-  it("yields the navigation ribbon to a chat pane the user has expanded", () => {
+  // A window with room for a wide pane AND a labelled ribbon at the same time.
+  // The pair of widths are what the tokens really resolve to there: 28vw and
+  // 44vw of 1440.
+  const ROOMY_WORKSPACE_WIDTH = 1_440;
+  const ROOMY_COLLAPSED_CHAT_WIDTH = 420;
+  const ROOMY_EXPANDED_CHAT_WIDTH = 634;
+
+  // The flag itself yields the ribbon. It used to reach this derivation only as
+  // a wider measured `chatWidth`, on the reasoning that the width is the CSS
+  // token's business — but running out of room and being asked for room are
+  // different things, and only the second is what the toggle means. Width alone
+  // compacted nothing above ~1176px, so at any comfortable window the toggle
+  // left the ribbon exactly as it was.
+  it("yields the navigation ribbon whenever the pane is expanded, room or not", () => {
+    const measurements = {
+      workspaceWidth: ROOMY_WORKSPACE_WIDTH,
+      chatWidth: ROOMY_EXPANDED_CHAT_WIDTH,
+    };
+
     const collapsed = deriveEffectiveWorkspaceLayout(preferred, {
-      workspaceWidth: WORKSPACE_WIDTH,
-      chatWidth: COLLAPSED_CHAT_WIDTH,
+      workspaceWidth: ROOMY_WORKSPACE_WIDTH,
+      chatWidth: ROOMY_COLLAPSED_CHAT_WIDTH,
     });
-    const expanded = deriveEffectiveWorkspaceLayout(preferred, {
-      workspaceWidth: WORKSPACE_WIDTH,
-      chatWidth: EXPANDED_CHAT_WIDTH,
-    });
+    const expanded = deriveEffectiveWorkspaceLayout(
+      { ...preferred, chatExpanded: true },
+      measurements,
+    );
 
     expect(collapsed.navigationExpanded).toBe(true);
     expect(expanded.navigationExpanded).toBe(false);
+    // And it is the flag that did it, not the extra pixels: the same wide pane
+    // with the flag off keeps its labels. Without this the test passes on a rule
+    // that only ever reacts to width, which is the rule that shipped the defect.
+    expect(
+      deriveEffectiveWorkspaceLayout(preferred, measurements).navigationExpanded,
+    ).toBe(true);
+  });
+
+  // The pane has to be occupying the row to claim anything. `chatExpanded` is
+  // persisted, so it outlives the pane being closed, and a closed pane that took
+  // the labels with it would compact the ribbon for no visible reason.
+  it("leaves the ribbon alone while an expanded pane is closed", () => {
+    expect(
+      deriveEffectiveWorkspaceLayout(
+        { ...preferred, chatExpanded: true },
+        { workspaceWidth: ROOMY_WORKSPACE_WIDTH, chatWidth: 0 },
+      ).navigationExpanded,
+    ).toBe(true);
   });
 
   it("settles compaction as the pane widens instead of oscillating", () => {
@@ -418,6 +451,10 @@ describe("expanded chat pane", () => {
     // the ribbon, which would consume that space again and flap forever. The
     // frames dwell at the expanded width so a flapping rule gets caught mid-flap
     // rather than sampled once.
+    //
+    // `chatExpanded` stays OFF here on purpose. Only the width-driven path can
+    // flap — the flag holds still by definition, so running these frames with it
+    // on would pin the answer and prove nothing. This is the chat pane opening.
     const paneWidthFrames = [
       COLLAPSED_CHAT_WIDTH,
       520,
