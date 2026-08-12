@@ -73,7 +73,7 @@ Unavailable is never equivalent to passed. Do not start SonarQube or reset its v
 - `app/desktop/src/lib/bindings/`: generated TypeScript mirrors of Rust contracts.
 - `app/desktop/src/e2e/`: jsdom journeys through the real frontend IPC abstraction.
 - `app/desktop/e2e-native/`: WebdriverIO checks for the packaged native boundary on Linux and Windows CI.
-- `prototype/`: disposable design exploration. Do not import it into production code.
+- `docs/design-exploration/`: the record of the throwaway design prototype that chose the current theme. Documentation only; the code was removed at `4d87df3`.
 - `specs/`: authoritative feature and architecture contracts.
 
 ## Development rules

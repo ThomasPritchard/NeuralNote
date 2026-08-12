@@ -1,6 +1,10 @@
 # NeuralNote — Design Prototype Plan
 
-> Throwaway design exploration. Answers: **"What should the NeuralNote app workspace look and feel like?"**
+> **Historical record.** The prototype code this plan describes was removed in the commit that
+> added this note; it lives on in git history at `4d87df3`. Paths and commands below refer to that
+> deleted `prototype/` tree and are kept as a record of what was built, not as instructions.
+
+> Throwaway design exploration. Answered: **"What should the NeuralNote app workspace look and feel like?"**
 > Artifact = one route, N variants, switchable via `?variant=` + floating bottom bar (prototype skill, UI branch, sub-shape B).
 
 ## Decisions (from interview)

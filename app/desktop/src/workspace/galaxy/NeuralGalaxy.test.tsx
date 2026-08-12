@@ -13,6 +13,16 @@ const harness = vi.hoisted(() => ({
   fg: null as unknown as FakeForceGraph,
   props: null as any,
 }));
+const previewMocks = vi.hoisted(() => ({
+  readNote: vi.fn(),
+  useVault: vi.fn(),
+}));
+
+vi.mock("../../lib/api", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../../lib/api")>()),
+  readNote: previewMocks.readNote,
+}));
+vi.mock("../../lib/store", () => ({ useVault: previewMocks.useVault }));
 
 vi.mock("react-force-graph-3d", () => ({
   // React 19: function components receive `ref` as a plain prop (never
@@ -90,6 +100,28 @@ function hover(id: string | null) {
 beforeEach(() => {
   harness.fg = createFakeForceGraph();
   harness.props = null;
+  previewMocks.useVault.mockReturnValue({ vault: { name: "My Vault", path: "/vault" } });
+  previewMocks.readNote.mockReset();
+  previewMocks.readNote.mockImplementation((path: string) => {
+    const beta = path.endsWith("notes/beta.md");
+    const title = beta ? "Beta" : "Alpha";
+    const body = `${title} is available in the local graph preview.`;
+    return Promise.resolve({
+      path,
+      relPath: path.replace("/vault/", ""),
+      title,
+      frontmatter: null,
+      frontmatterRaw: null,
+      frontmatterError: null,
+      body,
+      raw: body,
+      contentHash: "hash",
+      binary: false,
+      lossyText: false,
+      exceedsEditableSize: false,
+      sizeBytes: 0,
+    });
+  });
 });
 
 describe("NeuralGalaxy", () => {
@@ -154,14 +186,51 @@ describe("NeuralGalaxy", () => {
     expect(input).toHaveValue("");
   });
 
-  it("opens the detail panel on node click with cluster badge and neighbours", () => {
+  it("lets Escape close a search-selected preview when the empty search keeps focus", async () => {
+    const user = userEvent.setup();
+    render(<NeuralGalaxy {...makeProps()} />);
+    const input = screen.getByRole("searchbox", { name: "Search the galaxy" });
+
+    await user.type(input, "bet");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.getByRole("heading", { name: "Beta" })).toBeInTheDocument();
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("");
+
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(screen.queryByRole("heading", { name: "Beta" })).not.toBeInTheDocument();
+  });
+
+  it("opens the note preview on node click with cluster context and neighbours", () => {
     render(<NeuralGalaxy {...makeProps()} />);
     clickNode("alpha.md");
     expect(screen.getByRole("heading", { name: "Alpha" })).toBeInTheDocument();
     expect(screen.getByText("1 connected note")).toBeInTheDocument();
-    const neighbour = screen.getByRole("button", { name: /Beta/ });
-    expect(neighbour).toHaveTextContent("Cross-folder");
+    expect(
+      screen.getByRole("button", { name: "Preview connected note Beta, cross-folder" }),
+    ).toBeInTheDocument();
     expect(harness.fg.cameraPosition).toHaveBeenCalled();
+  });
+
+  it("moves a compact focused star aside so the bubble can remain tethered", () => {
+    render(<NeuralGalaxy {...makeProps({ width: 429, height: 525 })} />);
+    const node = harness.props.graphData.nodes.find((candidate: any) => candidate.id === "alpha.md");
+    Object.assign(node, { x: 0, y: 0, z: 1 });
+
+    act(() => harness.props.onNodeClick(node));
+
+    const [, target] = harness.fg.cameraPosition.mock.calls.at(-1)!;
+    expect(target).not.toBe(node);
+    expect(target.x).toBeGreaterThan(0);
+  });
+
+  it("hides the large cluster legend while a preview owns a compact pane", () => {
+    render(<NeuralGalaxy {...makeProps({ width: 429, height: 525 })} />);
+
+    clickNode("alpha.md");
+
+    expect(screen.queryByText("Cross-folder link")).not.toBeInTheDocument();
   });
 
   it("keeps the neighbour count in step with the rendered rows when a link points at a missing node", () => {
@@ -191,9 +260,20 @@ describe("NeuralGalaxy", () => {
     render(<NeuralGalaxy {...makeProps()} />);
     clickNode("alpha.md");
     const flights = harness.fg.cameraPosition.mock.calls.length;
-    await user.click(screen.getByRole("button", { name: "Close" }));
+    await user.click(screen.getByRole("button", { name: "Close note preview" }));
     expect(screen.queryByRole("heading", { name: "Alpha" })).not.toBeInTheDocument();
     // One more flight: back out to the camera pose saved before the click-focus.
+    expect(harness.fg.cameraPosition.mock.calls.length).toBe(flights + 1);
+  });
+
+  it("closes the preview with Escape even when focus stayed on the graph", () => {
+    render(<NeuralGalaxy {...makeProps()} />);
+    clickNode("alpha.md");
+    const flights = harness.fg.cameraPosition.mock.calls.length;
+
+    fireEvent.keyDown(window, { key: "Escape" });
+
+    expect(screen.queryByRole("heading", { name: "Alpha" })).not.toBeInTheDocument();
     expect(harness.fg.cameraPosition.mock.calls.length).toBe(flights + 1);
   });
 
@@ -224,6 +304,16 @@ describe("NeuralGalaxy", () => {
     expect(harness.fg.__forces.charge.distanceMax).toHaveBeenLastCalledWith(p.chargeDistanceMax);
     expect(harness.fg.__forces.link.distance).toHaveBeenLastCalledWith(p.linkDistance);
     expect(harness.fg.d3ReheatSimulation).toHaveBeenCalled();
+  });
+
+  it("closes a selected preview before changing dimension", async () => {
+    const user = userEvent.setup();
+    render(<NeuralGalaxy {...makeProps()} />);
+    clickNode("alpha.md");
+
+    await user.click(screen.getByRole("button", { name: "2d" }));
+
+    expect(screen.queryByRole("heading", { name: "Alpha" })).not.toBeInTheDocument();
   });
 
   it("3D gravity pulls nodes toward the origin on all three axes", () => {

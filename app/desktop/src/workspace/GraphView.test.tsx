@@ -9,6 +9,8 @@ import { GraphView } from "./GraphView";
 
 const mocks = vi.hoisted(() => ({
   readLinkGraph: vi.fn(),
+  readNote: vi.fn(),
+  chat: vi.fn(),
   useVault: vi.fn(),
   onTreeChanged: vi.fn(),
 }));
@@ -23,6 +25,8 @@ const treeChanged = vi.hoisted(() => ({
 vi.mock("../lib/api", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../lib/api")>()),
   readLinkGraph: mocks.readLinkGraph,
+  readNote: mocks.readNote,
+  chat: mocks.chat,
   onTreeChanged: mocks.onTreeChanged,
 }));
 vi.mock("../lib/store", () => ({ useVault: mocks.useVault }));
@@ -83,6 +87,23 @@ beforeEach(() => {
   harness.fg = createFakeForceGraph();
   harness.props = null;
   mocks.readLinkGraph.mockReset();
+  mocks.readNote.mockReset();
+  mocks.readNote.mockResolvedValue({
+    path: "/v/notes/beta.md",
+    relPath: "notes/beta.md",
+    title: "Beta",
+    frontmatter: null,
+    frontmatterRaw: null,
+    frontmatterError: null,
+    body: "Beta explains the graph preview. More detail follows.",
+    raw: "Beta explains the graph preview. More detail follows.",
+    contentHash: "hash",
+    binary: false,
+    lossyText: false,
+    exceedsEditableSize: false,
+    sizeBytes: 0,
+  });
+  mocks.chat.mockReset();
   mocks.useVault.mockReturnValue({ vault: { name: "My Vault", path: "/v" } });
   treeChanged.cb = null;
   treeChanged.unlisten.mockReset();
@@ -304,6 +325,25 @@ describe("GraphView", () => {
     act(() => harness.props.onNodeClick(beta));
     await userEvent.click(screen.getByRole("button", { name: "Open in reader" }));
     expect(onOpenNote).toHaveBeenCalledWith("notes/beta.md");
+  });
+
+  it("opens the production local digest without resizing the graph or calling AI", async () => {
+    mocks.readLinkGraph.mockResolvedValue(linkGraph());
+    render(<GraphView onOpenNote={vi.fn()} />);
+    fireResize(800, 600);
+    await screen.findByTestId("force-graph-3d");
+
+    const beta = harness.props.graphData.nodes.find((n: any) => n.id === "notes/beta.md");
+    act(() => harness.props.onNodeClick(beta));
+
+    expect(await screen.findByText("Beta explains the graph preview.")).toBeInTheDocument();
+    expect(screen.getByText("Local digest")).toBeInTheDocument();
+    expect(screen.getByText("Derived on this device")).toBeInTheDocument();
+    expect(screen.getByText("No model called")).toBeInTheDocument();
+    expect(mocks.readNote).toHaveBeenCalledWith("/v/notes/beta.md");
+    expect(mocks.chat).not.toHaveBeenCalled();
+    expect(harness.props.width).toBe(800);
+    expect(harness.props.height).toBe(600);
   });
 });
 

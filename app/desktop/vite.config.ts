@@ -13,6 +13,10 @@ export default defineConfig(async () => ({
     alias: {
       "@": fileURLToPath(new URL("./src", import.meta.url)),
     },
+    // Explicit since @vitejs/plugin-react v5, which stopped adding these
+    // automatically. Two React copies in one graph breaks hooks at runtime, and
+    // the failure looks like a component bug rather than a resolution one.
+    dedupe: ["react", "react-dom"],
   },
 
   // Vite options tailored for Tauri development and only applied in `tauri dev` or `tauri build`

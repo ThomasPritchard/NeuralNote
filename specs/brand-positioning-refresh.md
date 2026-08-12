@@ -2,6 +2,11 @@
 
 > Status: approved and implemented
 > Scope: brand guidelines PDF, roadmap artwork, and the three landing-page prototypes
+>
+> **The landing-page prototypes were removed at `4d87df3`.** The messaging hierarchy below remains
+> the authoritative brand copy and applies to whatever surface renders it next. Sections that name
+> `prototype/` paths or commands are a record of where the copy was applied at the time, not
+> instructions that still run. The brand pack under `assets/brand/` is unaffected.
 
 ## Purpose
 
@@ -154,25 +159,24 @@ The footer may state `AI-powered`, `Markdown-compatible`, `local-first`, and `br
 - `assets/brand/README.md`
 - `assets/brand/build_brand_pack.py`
 - `specs/brand-positioning-refresh.md`
-- `prototype/neuralnote-proto/src/prototype/landing/content.ts`
-- `prototype/neuralnote-proto/src/prototype/landing/LandingGalaxy.tsx`
-- `prototype/neuralnote-proto/src/prototype/landing/LandingProduct.tsx`
-- `prototype/neuralnote-proto/src/prototype/landing/LandingGradient.tsx`
-- `prototype/neuralnote-proto/scripts/brand-smoke.mjs`
 - generated PDF, roadmap, prototype screenshots, and PDF render intermediates
+
+The landing components and their `brand-smoke.mjs` copy check lived under
+`prototype/neuralnote-proto/` and were removed at `4d87df3`:
+`src/prototype/landing/content.ts`, `LandingGalaxy.tsx`, `LandingProduct.tsx`,
+`LandingGradient.tsx`, and `scripts/brand-smoke.mjs`.
 
 No desktop application behaviour, Rust contract, generated binding, or production UI component is in scope.
 
 ## Verification
 
-Use a red-green copy check in `brand-smoke.mjs` before changing the landing components. The test should fail against the old copy and pass after the refresh.
+The landing copy was verified by a red-green check in `brand-smoke.mjs`, which failed against the
+old copy and passed after the refresh. That harness went with the prototype at `4d87df3`; a future
+landing surface needs its own equivalent.
 
-The final checks are:
+The brand-pack checks still run:
 
 ```bash
-npm --prefix prototype/neuralnote-proto run lint
-npm --prefix prototype/neuralnote-proto run build
-npm --prefix prototype/neuralnote-proto run test:brand
 python3 -m py_compile assets/brand/build_brand_pack.py
 python3 assets/brand/build_brand_pack.py
 pdfinfo output/pdf/neuralnote-brand-pack.pdf
