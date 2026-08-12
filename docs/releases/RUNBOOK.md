@@ -24,9 +24,18 @@ Six version manifests:
 
 Plus:
 
-- `Cargo.lock` — refresh the workspace-crate versions (`cargo update -p neuralnote-core -p neuralnote-release`, or `cargo build` and commit the resulting lockfile change).
+- `Cargo.lock` — refresh the workspace-crate versions with `cargo update --workspace`. It should report exactly three packages moved (`desktop`, `neuralnote-core`, `neuralnote-release`) and touch nothing else; anything more means a dependency drifted and belongs in its own commit.
+- `app/desktop/package-lock.json` and `app/desktop/e2e-native/package-lock.json` — the root `"version"` on **lines 3 and 9 only**. Both files also contain unrelated dependencies pinned at the old version number, so do not replace globally.
 - `app/desktop/src/updater/release-config.test.ts` — the validator test that pins the app-local versions; update its expected string to `X.Y.Z`.
-- `.github/workflows/release-alpha.yml` — 14 version references (the `release_tag` default and description, the two `preflight`/`build` tag allow-lists, the two `RELEASE_VERSION` env values, the two manifest `notes` strings, the changelog copy path `docs/releases/vX.Y.Z.md`, the two `RELEASE_TITLE` strings, and the manifest commit message). Grep to confirm none were missed: `grep -c 'X\.Y\.Z' .github/workflows/release-alpha.yml` should report 14.
+- `scripts/check-release-workflow.mjs` — the contract test hard-codes the release version itself: `releaseVersion`, the `release_tag` default assertion, the changelog path (twice), the `# NeuralNote X.Y.Z ALPHA` heading assertion, and the test's own name. Bumping the workflow without bumping its checker leaves the gate asserting the previous release.
+- `.github/workflows/release-alpha.yml` — 14 version references (the `release_tag` default and description, the two `preflight`/`build` tag allow-lists, the two `RELEASE_VERSION` env values, the two manifest `notes` strings, the changelog copy path `docs/releases/vX.Y.Z.md`, the two `RELEASE_TITLE` strings, and the manifest commit message).
+
+**Do not bulk-replace the old version string.** Three places name a previous version on purpose and must survive the bump:
+
+- `.github/workflows/release-alpha.yml` and `scripts/check-release-workflow.mjs` each carry a comment recording that the 0.2.1 and 0.3.0 releases both published and then failed their manifest push. That is the evidence for the `git -C` fix; rewriting it destroys the record.
+- `docs/security/dependency-advisories.md` names `urlpattern 0.3.0`, a third-party crate version.
+
+So verify by counting the *new* string rather than searching for leftovers of the old one: `grep -c 'X\.Y\.Z' .github/workflows/release-alpha.yml` should report **14**, and a single `0.3.0` hit remaining in that file is correct.
 
 ## 2. Write the dual changelog
 

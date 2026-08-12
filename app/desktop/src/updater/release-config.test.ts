@@ -9,11 +9,11 @@ import capability from "../../src-tauri/capabilities/default.json";
 import tauriConfig from "../../src-tauri/tauri.conf.json";
 
 describe("alpha release configuration", () => {
-  it("keeps app-local published versions fixed at 0.3.0", () => {
-    expect(packageJson.version).toBe("0.3.0");
-    expect(nativeE2ePackageJson.version).toBe("0.3.0");
-    expect(tauriConfig.version).toBe("0.3.0");
-    expect(cargoToml).toMatch(/^version = "0\.3\.0"$/m);
+  it("keeps app-local published versions fixed at 0.4.0", () => {
+    expect(packageJson.version).toBe("0.4.0");
+    expect(nativeE2ePackageJson.version).toBe("0.4.0");
+    expect(tauriConfig.version).toBe("0.4.0");
+    expect(cargoToml).toMatch(/^version = "0\.4\.0"$/m);
   });
 
   it("uses signed updater artifacts and the dedicated HTTPS alpha manifest", () => {
