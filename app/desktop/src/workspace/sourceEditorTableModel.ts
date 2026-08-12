@@ -42,8 +42,17 @@ const segmenter = typeof Intl.Segmenter === "function"
 
 /**
  * Code points that render two columns wide in a monospace font: the East Asian
- * Wide (W) and Fullwidth (F) classes of Unicode Annex #11, plus emoji. Ranges
- * rather than a per-character table, because the classes are contiguous blocks.
+ * Wide (W) and Fullwidth (F) classes of Unicode Annex #11, plus the
+ * supplementary-plane pictograph blocks. Ranges rather than a per-character
+ * table, because the classes are contiguous blocks.
+ *
+ * The pictograph blocks are taken WHOLE, though Annex #11 calls a couple of
+ * hundred of their members Neutral — the ones that default to text presentation,
+ * such as `U+1F321`. That is a deliberate over-approximation and not a claim
+ * about any font: those code points have counted as two columns since the ranges
+ * were written, narrowing them is a behaviour change nobody has asked for, and
+ * no test pins the narrow reading. Outside these blocks the property is too
+ * scattered to approximate, so {@link EMOJI_PRESENTATION} decides there instead.
  */
 const DOUBLE_WIDTH_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0x1100, 0x115f], // Hangul Jamo initial consonants
@@ -60,11 +69,32 @@ const DOUBLE_WIDTH_RANGES: ReadonlyArray<readonly [number, number]> = [
   [0xff00, 0xff60], // Fullwidth ASCII variants
   [0xffe0, 0xffe6], // Fullwidth signs
   [0x1f300, 0x1f64f], // Emoji: symbols, pictographs, emoticons
+  [0x1f680, 0x1f6ff], // Emoji: transport and map symbols
   [0x1f900, 0x1f9ff], // Emoji: supplemental symbols and pictographs
   [0x17000, 0x18aff], // Tangut
   [0x1b000, 0x1b12f], // Kana supplement
   [0x20000, 0x3fffd], // CJK Unified Ideographs Extensions B onward
 ];
+
+/**
+ * Symbols that default to emoji presentation, and so paint two columns wide
+ * wherever they appear — `U+2705` ✅, `U+2B50` ⭐, `U+231A` ⌚, and every
+ * regional indicator, which is how a flag gets its width.
+ *
+ * Read from the runtime's own Unicode tables rather than transcribed into
+ * {@link DOUBLE_WIDTH_RANGES}, because the property is scattered across the
+ * symbol blocks a character at a time: `U+2600` ☀ is narrow, `U+2614` ☔ two
+ * columns, `U+2705` ✅ two, `U+2714` ✔ narrow. A hand-copied list of that is
+ * both long and stale the next time Unicode adds an emoji.
+ */
+const EMOJI_PRESENTATION = /^\p{Emoji_Presentation}$/u;
+
+/**
+ * `U+FE0F`, with which a text-presentation symbol asks to be painted as an
+ * emoji. It is the whole difference between `U+2600` — a narrow dingbat — and
+ * `U+2600 U+FE0F`, which is a two-column emoji.
+ */
+const EMOJI_PRESENTATION_SELECTOR = 0xfe0f;
 
 /** Code points that occupy no column at all: combining marks and joiners. */
 function isZeroWidth(code: number): boolean {
@@ -82,13 +112,55 @@ function isDoubleWidth(code: number): boolean {
 }
 
 /**
+ * How many columns one grapheme cluster occupies.
+ *
+ * The cluster's width belongs to its BASE — its first code point that occupies
+ * a column at all — which is what makes an emoji ZWJ sequence such as a family
+ * emoji count as one glyph of width 2 rather than as its parts. A cluster
+ * carrying {@link EMOJI_PRESENTATION_SELECTOR} is settled before the base is
+ * consulted, because that selector is precisely a request to paint the base as
+ * a two-column emoji; the selector may sit anywhere after it, since a keycap
+ * sequence puts a second combining mark behind it.
+ *
+ * @returns 2 for a wide cluster, 1 for a narrow one, 0 for a cluster that is
+ *   nothing but combining marks
+ */
+function clusterWidth(cluster: string): number {
+  let baseCode: number | null = null;
+  let baseCharacter = "";
+  let requestsEmojiPresentation = false;
+
+  for (const character of cluster) {
+    const code = character.codePointAt(0);
+    if (code === undefined) continue;
+    if (code === EMOJI_PRESENTATION_SELECTOR) requestsEmojiPresentation = true;
+    if (baseCode === null && !isZeroWidth(code)) {
+      baseCode = code;
+      baseCharacter = character;
+    }
+  }
+
+  if (baseCode === null) return 0;
+  const wide = requestsEmojiPresentation
+    || isDoubleWidth(baseCode)
+    || EMOJI_PRESENTATION.test(baseCharacter);
+  return wide ? 2 : 1;
+}
+
+/**
  * How many columns a string occupies in a monospace font.
  *
  * Counting graphemes is wrong: CJK ideographs, Hangul syllables, fullwidth
  * forms and emoji all render two columns wide, so a grapheme count pads a CJK
- * table to visibly ragged columns (issue #86). A grapheme's width is taken from
- * its FIRST non-zero-width code point, which makes an emoji ZWJ sequence such
- * as a family emoji count as one glyph of width 2 rather than as its parts.
+ * table to visibly ragged columns (issue #86).
+ *
+ * The arguable case is settled here and pinned by `sourceEditorTableModel.test.ts`:
+ * outside the supplementary pictograph blocks, a symbol that defaults to TEXT
+ * presentation and was not given {@link EMOJI_PRESENTATION_SELECTOR} counts as
+ * ONE column. `U+2605` and `U+2610` are ordinary narrow symbols, and `U+2600` is
+ * one too until `U+FE0F` makes it an emoji. None of the three carries
+ * `Emoji_Presentation`, which is the property that separates them from `U+2705`
+ * and `U+2B50` in the same blocks.
  */
 export function monospaceWidth(text: string): number {
   const clusters = segmenter
@@ -96,16 +168,7 @@ export function monospaceWidth(text: string): number {
     : [...text];
 
   let width = 0;
-  for (const cluster of clusters) {
-    let clusterWidth = 0;
-    for (const character of cluster) {
-      const code = character.codePointAt(0);
-      if (code === undefined || isZeroWidth(code)) continue;
-      clusterWidth = isDoubleWidth(code) ? 2 : 1;
-      break;
-    }
-    width += clusterWidth;
-  }
+  for (const cluster of clusters) width += clusterWidth(cluster);
   return width;
 }
 
