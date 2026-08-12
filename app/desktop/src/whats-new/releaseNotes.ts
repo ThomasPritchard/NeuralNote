@@ -12,13 +12,19 @@ export interface ReleaseNotes {
   readonly groups: readonly ReleaseNotesGroup[];
 }
 
-// One release only. The workflow contract greps this WHOLE file for `items:`
-// and compares the result with the single-version `.md`, so a superseded entry
-// left behind here fails the release, not just this file's own test.
+// GENERATED FILE — do not edit by hand.
+// Source: docs/releases/v0.4.0.md. Regenerate with `npm run gen:release-notes`.
 //
-// Generated from docs/releases/v0.4.0.md — the two must stay byte-identical
-// bullet for bullet. Edit the .md, then regenerate rather than hand-editing both.
-const RELEASE_NOTES: Readonly<Record<string, ReleaseNotes>> = {
+// One release only. The workflow contract greps this WHOLE file for `items:` and
+// compares the result with the single-version `.md`, so a superseded entry left
+// behind here fails the release, not just this file's own test. Generating the file
+// is what guarantees that: the .md holds one release, so this can only hold one.
+//
+// Exported so a test can assert the key set directly. Asserting that a superseded
+// release's PROSE is absent from the DOM cannot work — the component renders only
+// CURRENT_RELEASE_NOTES, so a stale entry is never rendered and the query passes
+// whether or not the entry is there.
+export const RELEASE_NOTES: Readonly<Record<string, ReleaseNotes>> = {
   "0.4.0": {
     version: "0.4.0",
     title: "What's new in NeuralNote 0.4.0",
@@ -53,7 +59,7 @@ const RELEASE_NOTES: Readonly<Record<string, ReleaseNotes>> = {
           "Letting a model approve routine actions is unavailable while a local model is in use, with the reason stated in place, and your stored choice is kept for when you switch back to a cloud provider.",
           "Turning off asking altogether requires a confirmation that names, in plain language, the actions that cannot be undone.",
           "Every action covered by these settings leaves a record in the conversation showing whether you allowed it or it was approved on your behalf, and on what grounds.",
-          "The message box and the Stop button stay usable while an approval is waiting.",
+          "The Stop button stays usable while an approval is waiting, so a run can always be ended.",
           "An approval request that expired, or whose run ended before it was answered, says so and confirms that nothing ran.",
         ],
       },
@@ -83,6 +89,12 @@ const RELEASE_NOTES: Readonly<Record<string, ReleaseNotes>> = {
           "After you answer a question from the assistant, the pane keeps showing that the run is still working instead of rendering it as finished.",
           "Pressing Escape closes a graph note preview and returns the view to where it was before you selected the note.",
           "Switching the map between 2D and 3D closes the preview rather than leaving it pointing at the wrong place.",
+        ],
+      },
+      {
+        title: "Upgrading",
+        items: [
+          "Your vault, its notes and your saved settings are carried over unchanged.",
           "Application packages, updater checks, and the upgrade journey are aligned on version 0.4.0.",
         ],
       },

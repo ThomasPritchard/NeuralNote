@@ -245,6 +245,7 @@ test("the immutable GitHub release description includes the complete v0.4.0 chan
     "Approving what the assistant does",
     "Note previews in the graph",
     "Moving around the panes",
+    "Upgrading",
   ]) {
     assert.match(releaseNotes, new RegExp(`^## ${heading}$`, "m"));
   }
