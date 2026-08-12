@@ -545,18 +545,92 @@ export function stripCitationMarkers(answer: string): string {
  *  next answer usually needs. (The core separately caps tool-result content within a
  *  run via `max_context_chars`; this bounds the conversation history.) */
 const MAX_HISTORY_TURNS = 20;
+const MAX_CONTINUATION_PLAN_LABEL_CHARS = 240;
+
+function continuationPlanLabel(label: string): string {
+  const flattened = label.replace(/\s+/gu, " ").trim();
+  const chars = Array.from(flattened);
+  if (chars.length <= MAX_CONTINUATION_PLAN_LABEL_CHARS) return flattened;
+  return `${chars.slice(0, MAX_CONTINUATION_PLAN_LABEL_CHARS).join("")}…`;
+}
+
+/** A host-authored record of durable or incomplete run state for a later turn.
+ *  Provider errors are deliberately not copied into model context: the next turn
+ *  needs to know what completed, not receive transport prose as an instruction. */
+function continuationRecord(turn: AssistantMessage): string | null {
+  if (!turn.done) return null;
+  const hasRecord =
+    turn.writtenNotes.length > 0 ||
+    turn.existingNotes.length > 0 ||
+    turn.partialRun !== null ||
+    turn.stopped ||
+    turn.error !== null;
+  if (!hasRecord) return null;
+
+  const lines = ["NeuralNote continuation record:"];
+  if (turn.writtenNotes.length > 0) {
+    lines.push(
+      "Completed note writes:",
+      ...turn.writtenNotes.map((note) => `- ${note.relPath} (${note.kind})`),
+    );
+  }
+  if (turn.existingNotes.length > 0) {
+    lines.push(
+      "Notes already present and left unchanged:",
+      ...turn.existingNotes.map((note) => `- ${note.relPath} (${note.kind})`),
+    );
+  }
+  if (turn.planSteps.length > 0) {
+    lines.push(
+      "Plan state:",
+      ...turn.planSteps.map(
+        (step) => `- [${step.status}] ${continuationPlanLabel(step.label)}`,
+      ),
+    );
+  }
+  if (turn.partialRun !== null) {
+    lines.push(`Run ended early: ${turn.partialRun}`);
+  } else if (turn.stopped) {
+    lines.push("The run was stopped before it completed.");
+  }
+  if (turn.error !== null) {
+    const recordedWork =
+      turn.writtenNotes.length > 0 ||
+      turn.existingNotes.length > 0 ||
+      turn.planSteps.length > 0;
+    lines.push(
+      recordedWork
+        ? "The final answer failed after the recorded work."
+        : "The run failed before producing a final answer.",
+    );
+  }
+  lines.push(
+    turn.writtenNotes.length > 0
+      ? "Continue from this record without repeating completed note writes."
+      : "Use this status when responding to the next turn.",
+  );
+  return lines.join("\n");
+}
+
+function assistantHistoryContent(turn: AssistantMessage): string {
+  const answer = stripCitationMarkers(turn.answer);
+  const record = continuationRecord(turn);
+  if (answer.trim() === "") return record ?? "";
+  return record === null ? answer : `${answer}\n\n${record}`;
+}
 
 /** The prior conversation as plain `ChatTurn`s, for the next `chat` request.
- *  Empty assistant turns (errored / no answer) are dropped so the model isn't
- *  handed blank context; `[eN]` markers are stripped so stale ids can't re-enter a
- *  later run and mis-cite (see `stripCitationMarkers`); and the history is windowed
- *  to the last `MAX_HISTORY_TURNS` so per-turn cost stays bounded (see above). */
+ *  Empty assistant turns are dropped only when they have neither an answer nor a
+ *  host-authored continuation record; `[eN]` markers are stripped so stale ids
+ *  can't re-enter a later run and mis-cite (see `stripCitationMarkers`); and the
+ *  history is windowed to the last `MAX_HISTORY_TURNS` so per-turn cost stays
+ *  bounded (see above). */
 export function toHistory(messages: ChatMessage[]): ChatTurn[] {
   return messages
     .map((m): ChatTurn =>
       m.role === "user"
         ? { role: "user", content: m.content }
-        : { role: "assistant", content: stripCitationMarkers(m.answer) },
+        : { role: "assistant", content: assistantHistoryContent(m) },
     )
     .filter((turn) => turn.content.trim() !== "")
     .slice(-MAX_HISTORY_TURNS);
