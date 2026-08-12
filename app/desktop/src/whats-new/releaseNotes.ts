@@ -1,4 +1,4 @@
-import packageJson from "../../package.json";
+import { version } from "../../package.json";
 
 export interface ReleaseNotesGroup {
   readonly title: string;
@@ -102,12 +102,12 @@ export const RELEASE_NOTES: Readonly<Record<string, ReleaseNotes>> = {
   },
 };
 
-function releaseNotesFor(version: string): ReleaseNotes {
-  const notes = RELEASE_NOTES[version];
+function releaseNotesFor(releaseVersion: string): ReleaseNotes {
+  const notes = RELEASE_NOTES[releaseVersion];
   if (!notes) {
-    throw new Error(`No bundled release notes exist for NeuralNote ${version}.`);
+    throw new Error(`No bundled release notes exist for NeuralNote ${releaseVersion}.`);
   }
   return notes;
 }
 
-export const CURRENT_RELEASE_NOTES = releaseNotesFor(packageJson.version);
+export const CURRENT_RELEASE_NOTES = releaseNotesFor(version);
