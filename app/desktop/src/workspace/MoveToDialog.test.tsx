@@ -117,7 +117,10 @@ describe("MoveToDialog", () => {
   it("shows an empty state when the entry has no valid destination", () => {
     // The only folder offered is the entry's own parent (a no-op).
     setup(fileNode("Notes/a.md"), [dest("/v/Notes", "Notes")]);
-    expect(screen.getByText(/no available destinations/i)).toBeInTheDocument();
+    // Queried by role, not text: the empty state renders as a native <output>,
+    // whose implicit "status" role is what actually announces it. Asserting the
+    // text alone would stay green if that live region silently went away.
+    expect(screen.getByRole("status")).toHaveTextContent(/no available destinations/i);
     expect(screen.queryByRole("button", { name: /Notes/ })).not.toBeInTheDocument();
   });
 });

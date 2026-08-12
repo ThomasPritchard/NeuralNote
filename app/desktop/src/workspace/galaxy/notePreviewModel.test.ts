@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   buildLocalNoteDigest,
+  LEAD_CAPTURE_LIMIT,
   notePreviewFocusScreenX,
   notePreviewMetrics,
   notePreviewPlacement,
@@ -108,6 +109,100 @@ The **first useful sentence** links to [source material](https://example.com) an
     buildLocalNoteDigest("[".repeat(100_000));
 
     expect(performance.now() - started).toBeLessThan(500);
+  });
+
+  /** A link whose visible label is one character but whose source is 96 UTF-16
+   * units, so the module's capture budget is spent long before the lead's
+   * 132-character budget is. That is what lets a capture-boundary cut survive
+   * into the rendered lead instead of being truncated away later. */
+  const wideLink = `[a](https://example.com/${"p".repeat(70)}) `;
+
+  /** Build a body whose emoji starts exactly at `highSurrogateIndex`, asserting
+   * the alignment so the probe can never go vacuous if the padding drifts. */
+  const lineWithEmojiAt = (highSurrogateIndex: number) => {
+    const links = wideLink.repeat(10);
+    const padding = "z".repeat(highSurrogateIndex - links.length);
+    const line = `${links}${padding}😀 tail`;
+    expect(line.codePointAt(highSurrogateIndex)).toBe(0x1_f600);
+    return { line, expectedLead: `${"a ".repeat(10)}${padding}` };
+  };
+
+  it("never emits an unpaired surrogate, wherever the capture boundary falls", () => {
+    // Walks the emoji across the budget so the run is guaranteed to include the
+    // alignment that straddles it (high surrogate on the last captured unit).
+    for (const offset of [-3, -2, -1, 0]) {
+      const index = LEAD_CAPTURE_LIMIT + offset;
+      const { line } = lineWithEmojiAt(index);
+
+      expect(buildLocalNoteDigest(line).lead).not.toMatch(/[\uD800-\uDFFF]/u);
+    }
+  });
+
+  it("drops a character the capture budget cannot hold whole, keeping the rest", () => {
+    const { line, expectedLead } = lineWithEmojiAt(LEAD_CAPTURE_LIMIT - 1);
+
+    expect(buildLocalNoteDigest(line).lead).toBe(expectedLead);
+  });
+
+  it("counts CJK, emoji and explicit surrogate pairs as whitespace-delimited words", () => {
+    expect(buildLocalNoteDigest("汉字 😀😀 𝐀𝐁 plain")).toMatchObject({
+      wordCount: 4,
+    });
+  });
+
+  it("trims Unicode whitespace around an astral character without splitting it", () => {
+    expect(buildLocalNoteDigest("　 😀 tail   ")).toMatchObject({
+      lead: "😀 tail",
+      wordCount: 2,
+    });
+  });
+
+  it("strips CR from a CRLF body whose lines end in astral characters", () => {
+    expect(buildLocalNoteDigest("# 見出し\r\n本文です😀\nsecond line.")).toMatchObject({
+      lead: "本文です😀 second line.",
+      sectionCount: 1,
+      wordCount: 3,
+    });
+  });
+
+  it("strips an ASCII ordered-list marker without eating the CJK text after it", () => {
+    expect(buildLocalNoteDigest("12. 第一句话。第二句话。").lead).toBe("第一句话。");
+  });
+
+  it("leaves a full-width numeral alone: only ASCII digits mark an ordered list", () => {
+    expect(buildLocalNoteDigest("１２． 第一句话。").lead).toBe("１２． 第一句话。");
+  });
+
+  it("ends the lead at the first blank line, ignoring later paragraphs", () => {
+    expect(buildLocalNoteDigest("Opening line\n\nSecond paragraph").lead).toBe(
+      "Opening line",
+    );
+  });
+
+  it.each([
+    ["blockquote", "> Quoted opening 😀"],
+    ["bullet", "- Quoted opening 😀"],
+    ["star bullet", "* Quoted opening 😀"],
+    ["plus bullet", "+ Quoted opening 😀"],
+  ])("strips a %s marker from the lead", (_label, body) => {
+    expect(buildLocalNoteDigest(body).lead).toBe("Quoted opening 😀");
+  });
+
+  it("keeps a bullet character that does not open a list", () => {
+    expect(buildLocalNoteDigest("-not a bullet 漢字").lead).toBe("-not a bullet 漢字");
+  });
+
+  it("reduces an image and an alias-less wiki link to their visible text", () => {
+    expect(buildLocalNoteDigest("![図 😀](https://example.com/a.png) and [[漢字]].").lead).toBe(
+      "図 😀 and 漢字.",
+    );
+  });
+
+  it("keeps astral characters inside wiki-link aliases and inline-link labels", () => {
+    expect(
+      buildLocalNoteDigest("See [[Maps|地図 😀]] and [図表 𝐀](https://example.com).")
+        .lead,
+    ).toBe("See 地図 😀 and 図表 𝐀.");
   });
 });
 

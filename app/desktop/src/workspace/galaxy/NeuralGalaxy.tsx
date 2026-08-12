@@ -218,8 +218,8 @@ export function NeuralGalaxy({
         closeSelectedAndReturn();
       }
     };
-    window.addEventListener("keydown", closeOnEscape);
-    return () => window.removeEventListener("keydown", closeOnEscape);
+    globalThis.addEventListener("keydown", closeOnEscape);
+    return () => globalThis.removeEventListener("keydown", closeOnEscape);
   }, [closeSelectedAndReturn, selected]);
 
   // Search results for the dropdown. No auto-fly while typing — flying to

@@ -132,15 +132,15 @@ export function SourceNoteEditor({
   frontmatter = null,
   frontmatterRaw = null,
   frontmatterError = null,
-}: SourceNoteEditorProps) {
+}: Readonly<SourceNoteEditorProps>) {
   const hostRef = useRef<HTMLDivElement>(null);
   const viewRef = useRef<EditorView | null>(null);
   const ownershipRef = useRef({ sessionKey, onChange, onPreservationError });
-  if (ownershipRef.current.sessionKey !== sessionKey) {
-    ownershipRef.current = { sessionKey, onChange, onPreservationError };
-  } else {
+  if (ownershipRef.current.sessionKey === sessionKey) {
     ownershipRef.current.onChange = onChange;
     ownershipRef.current.onPreservationError = onPreservationError;
+  } else {
+    ownershipRef.current = { sessionKey, onChange, onPreservationError };
   }
   const ownedCallbacks = ownershipRef.current;
   const previewErrorRef = useRef(onPreviewError);
@@ -329,7 +329,10 @@ export function SourceNoteEditor({
       view.dispatch(formatSourceSelections(view.state, event.action as FormatAction));
       view.focus();
     }).then((release) => {
-      if (cancelled) void release();
+      // Unmounted before the subscription resolved: release it immediately so
+      // the listener can't outlive this view. `release` returns void, so there
+      // is nothing to await here.
+      if (cancelled) release();
       else unlisten = release;
     }).catch((error: unknown) => {
       console.error("failed to subscribe to source editor format actions:", error);
@@ -340,7 +343,7 @@ export function SourceNoteEditor({
 
     return () => {
       cancelled = true;
-      if (unlisten) void unlisten();
+      if (unlisten) unlisten();
       updateSourceEditorSession(sessionKey, {
         ...session,
         state: view.state,

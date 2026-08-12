@@ -119,6 +119,18 @@ export function useStickyScroll({
     setShowJump(false);
   }, [scrollToBottom]);
 
+  // Drop the anchor a frame after the observer would have delivered, so a
+  // disclosure that changes nothing leaves no stale anchor behind. The handle is
+  // tracked across both frames so a cancel reaches whichever one is pending.
+  const releaseAnchorAfterGrowth = useCallback(() => {
+    cancelAnimationFrame(anchorFrameRef.current);
+    anchorFrameRef.current = requestAnimationFrame(() => {
+      anchorFrameRef.current = requestAnimationFrame(() => {
+        anchorRef.current = null;
+      });
+    });
+  }, []);
+
   // Re-assert the pin inside the commit that changed the content, rather than a
   // frame later when the ResizeObserver reports it. The observer still covers
   // growth React never sees (fonts, images, a markdown block that reflows), but
@@ -168,14 +180,7 @@ export function useStickyScroll({
       const summary = target.closest("summary");
       if (summary === null) return;
       anchorRef.current = { element: summary, top: summary.getBoundingClientRect().top };
-      // Dropped a frame after the observer would have delivered, so a
-      // disclosure that changes nothing leaves no stale anchor behind.
-      cancelAnimationFrame(anchorFrameRef.current);
-      anchorFrameRef.current = requestAnimationFrame(() => {
-        anchorFrameRef.current = requestAnimationFrame(() => {
-          anchorRef.current = null;
-        });
-      });
+      releaseAnchorAfterGrowth();
     };
 
     const onGrow = () => {
@@ -214,7 +219,7 @@ export function useStickyScroll({
       observer.disconnect();
       cancelAnimationFrame(anchorFrameRef.current);
     };
-  }, [scrollToBottom, syncJump]);
+  }, [releaseAnchorAfterGrowth, scrollToBottom, syncJump]);
 
   useEffect(() => {
     followingRef.current = true;

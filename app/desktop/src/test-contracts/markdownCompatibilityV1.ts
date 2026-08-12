@@ -116,32 +116,32 @@ const DEFAULT_BROWSER_EXECUTION: Readonly<
   togglePropertiesSource: "browser:chromium-webkit:properties-source-and-tag",
 };
 
+/** Cases that execute an interaction differently from the table above — the
+ *  same interaction driven by a different gesture (Enter, Mod-Enter) or over a
+ *  different construct. Keyed `interaction/caseId`; the separator keeps a key
+ *  from ever colliding with an `Object.prototype` member name.
+ *
+ *  The key's interaction half is a template-literal type, so a stale or misspelt
+ *  interaction is a compile error here exactly as it was under the if-ladder
+ *  this table replaced. */
+const BROWSER_EXECUTION_OVERRIDES: Readonly<
+  Partial<Record<`${MarkdownAllowedInteractionV1}/${string}`, MarkdownBrowserExecutionV1>>
+> = {
+  "activateInternalLink/enter-activation": "browser:chromium-webkit:internal-link-enter",
+  "activateInternalLink/mod-enter-activation": "browser:chromium-webkit:internal-link-mod-enter",
+  "searchTag/yaml-frontmatter-properties": "browser:chromium-webkit:properties-source-and-tag",
+  "searchTag/enter-activation": "browser:chromium-webkit:tag-enter",
+  "searchTag/mod-enter-activation": "browser:chromium-webkit:tag-mod-enter",
+  "completeWikilink/wikilink-completion-alias": "browser:chromium-webkit:wikilink-alias-edit",
+  "completeWikilink/wikilink-fragment-continuation": "browser:chromium-webkit:wikilink-fragment-edit",
+};
+
 function browserExecutionFor(
   caseId: string,
   interaction: MarkdownAllowedInteractionV1,
 ): MarkdownBrowserExecutionV1 {
-  if (interaction === "activateInternalLink") {
-    if (caseId === "enter-activation") return "browser:chromium-webkit:internal-link-enter";
-    if (caseId === "mod-enter-activation") {
-      return "browser:chromium-webkit:internal-link-mod-enter";
-    }
-  }
-  if (interaction === "searchTag") {
-    if (caseId === "yaml-frontmatter-properties") {
-      return "browser:chromium-webkit:properties-source-and-tag";
-    }
-    if (caseId === "enter-activation") return "browser:chromium-webkit:tag-enter";
-    if (caseId === "mod-enter-activation") return "browser:chromium-webkit:tag-mod-enter";
-  }
-  if (interaction === "completeWikilink") {
-    if (caseId === "wikilink-completion-alias") {
-      return "browser:chromium-webkit:wikilink-alias-edit";
-    }
-    if (caseId === "wikilink-fragment-continuation") {
-      return "browser:chromium-webkit:wikilink-fragment-edit";
-    }
-  }
-  return DEFAULT_BROWSER_EXECUTION[interaction];
+  return BROWSER_EXECUTION_OVERRIDES[`${interaction}/${caseId}`]
+    ?? DEFAULT_BROWSER_EXECUTION[interaction];
 }
 
 function browserExecutionsFor(
@@ -153,6 +153,16 @@ function browserExecutionsFor(
   );
 }
 
+/** What the caret reveals for a construct at each support level, unless the case
+ *  states its own. */
+const DEFAULT_ACTIVE_CARET_BEHAVIOR: Readonly<
+  Record<MarkdownSupportLevelV1, MarkdownActiveCaretBehaviorV1>
+> = {
+  livePreview: "reveal source markers for the active construct",
+  inert: "reveal complete source while keeping the construct inert",
+  sourceOnly: "keep literal source visible and editable",
+};
+
 function defineCase(input: CaseInputV1): MarkdownCompatibilityCaseV1 {
   const allowedInteractions = input.allowedInteractions ?? SOURCE_INTERACTIONS;
   return {
@@ -161,13 +171,8 @@ function defineCase(input: CaseInputV1): MarkdownCompatibilityCaseV1 {
     supportLevel: input.supportLevel,
     expectedDecorations: input.expectedDecorations ?? [],
     expectedSemantics: input.expectedSemantics,
-    activeCaretBehavior: input.activeCaretBehavior ?? (
-      input.supportLevel === "livePreview"
-        ? "reveal source markers for the active construct"
-        : input.supportLevel === "inert"
-          ? "reveal complete source while keeping the construct inert"
-          : "keep literal source visible and editable"
-    ),
+    activeCaretBehavior:
+      input.activeCaretBehavior ?? DEFAULT_ACTIVE_CARET_BEHAVIOR[input.supportLevel],
     expectedSaveResult: input.source,
     allowedInteractions,
     interactionExecutions: browserExecutionsFor(input.id, allowedInteractions),
@@ -639,7 +644,7 @@ export const MARKDOWN_COMPATIBILITY_V1: MarkdownCompatibilityV1 = {
     }),
     sourceOnly({
       id: "escaped-markdown-literal",
-      source: "\\*literal emphasis\\* and \\#literal-tag and 1\\. literal list",
+      source: String.raw`\*literal emphasis\* and \#literal-tag and 1\. literal list`,
       expectedSemantics: ["escaped-literal-source"],
       projectSection: SECURITY,
       obsidianCategory: `${BASIC} > Escaping Markdown Syntax`,
@@ -839,7 +844,7 @@ export const MARKDOWN_COMPATIBILITY_V1: MarkdownCompatibilityV1 = {
     }),
     sourceOnly({
       id: "inline-math-source-only",
-      source: "Euler wrote $e^{i\\pi} + 1 = 0$.",
+      source: String.raw`Euler wrote $e^{i\pi} + 1 = 0$.`,
       expectedSemantics: ["literal-inline-math", "non-executing"],
       projectSection: SECURITY,
       obsidianCategory: "Advanced formatting syntax > Math",

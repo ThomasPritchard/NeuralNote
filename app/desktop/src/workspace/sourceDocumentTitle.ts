@@ -1,14 +1,18 @@
 const TOP_SCAN_LIMIT = 65_536;
 
+/** Width of the line separator sitting at `end`: 2 for a CRLF pair lying wholly
+ *  inside the scanned window, 1 for any other in-window break, and 0 at the
+ *  window edge, where the scan stopped without consuming a separator. */
+function separatorLength(source: string, end: number, limit: number): number {
+  if (end >= limit) return 0;
+  const isCrLfPair = source[end] === "\r" && source[end + 1] === "\n" && end + 1 < limit;
+  return isCrLfPair ? 2 : 1;
+}
+
 function nextLine(source: string, start: number, limit = source.length): { text: string; next: number } {
   let end = start;
   while (end < limit && source[end] !== "\r" && source[end] !== "\n") end += 1;
-  const separatorLength = source[end] === "\r" && source[end + 1] === "\n" && end + 1 < limit
-    ? 2
-    : end < limit
-      ? 1
-      : 0;
-  return { text: source.slice(start, end), next: end + separatorLength };
+  return { text: source.slice(start, end), next: end + separatorLength(source, end, limit) };
 }
 
 function bodyStart(source: string): number | null {

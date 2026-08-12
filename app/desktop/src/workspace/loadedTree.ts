@@ -27,7 +27,7 @@ export function loadedToTree(
   relPath = "",
 ): TreeNode[] {
   const listing = loaded.get(relPath);
-  if (!listing || listing.status !== "loaded") return [];
+  if (listing?.status !== "loaded") return [];
   return listing.children.map((node) =>
     node.kind === "folder"
       ? { ...node, children: loadedToTree(loaded, node.relPath) }
