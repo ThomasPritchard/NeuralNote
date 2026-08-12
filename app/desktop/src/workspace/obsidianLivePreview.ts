@@ -59,14 +59,28 @@ function boundedScanRanges(
  */
 const WIKILINK_CONTAINER_NODES = new Set(["Image", "Link"]);
 
+/**
+ * Whether a newer syntax tree arrived between these two states.
+ *
+ * CodeMirror announces the parse it finished on an idle callback with a
+ * transaction that changes no document, moves no selection and carries no
+ * effect of ours, so nothing else in `update` below notices it. Without this the
+ * ranges masked as unparsed would stay blank until the user happened to type.
+ * `sourceEditorDecorations.ts` keeps the same guard, and documents it at length.
+ */
+function reparsed(before: EditorState, after: EditorState): boolean {
+  return syntaxTree(before) !== syntaxTree(after);
+}
+
 function syntaxMaskedRanges(
   state: EditorState,
   scanRanges: readonly VisibleRange[],
   nodeNames: ReadonlySet<string>,
 ): Array<{ from: number; to: number }> {
   const ranges: Array<{ from: number; to: number }> = [];
+  const tree = syntaxTree(state);
   for (const scan of scanRanges) {
-    syntaxTree(state).iterate({
+    tree.iterate({
       from: scan.from,
       to: scan.to,
       enter({ name, from, to }) {
@@ -77,6 +91,29 @@ function syntaxMaskedRanges(
   const frontmatter = sourceFrontmatterRange(state);
   if (frontmatter) ranges.push({ from: frontmatter.from, to: frontmatter.to });
   return ranges;
+}
+
+/**
+ * The tail of the document nothing has parsed yet, masked for the render path.
+ *
+ * Past the end of the tree every masking node is missing simply because nothing
+ * has parsed there: `LanguageState.init` covers only the first 3,000 characters,
+ * abandons even that slice once its 20 ms of wall clock is spent, and leaves the
+ * rest to an idle callback (`@codemirror/language/dist/index.js:540-545`).
+ *
+ * The decorations here are found by scanning TEXT and suppressed by finding a
+ * node over them, so an absent node reads as "not masked" — the one direction in
+ * which a late tree paints something wrong rather than nothing at all, and it
+ * put a `#tag` inside an unparsed fenced block (issue #129). What has not been
+ * parsed is therefore masked until it has been; `reparsed` above repaints as
+ * soon as the tree catches up.
+ *
+ * {@link decorationAtCaret} declines this mask deliberately — see the reasoning
+ * there.
+ */
+function unparsedTail(state: EditorState): VisibleRange[] {
+  const parsedTo = syntaxTree(state).length;
+  return parsedTo < state.doc.length ? [{ from: parsedTo, to: state.doc.length }] : [];
 }
 
 function overlapsMasked(from: number, to: number, ranges: readonly { from: number; to: number }[]): boolean {
@@ -99,16 +136,29 @@ function insideVisible(from: number, to: number, ranges: readonly VisibleRange[]
   return ranges.some((range) => from >= range.from && to <= range.to);
 }
 
-export function collectObsidianPreview(
+interface PreviewScanOptions {
+  readonly visibleRanges: readonly VisibleRange[];
+  readonly selectionActive: boolean;
+  /**
+   * Ranges masked only because the parser has not reached them yet. Kept out of
+   * the exported signature on purpose: a render path that forgot it repaints
+   * issue #129, and a command path that took it edits the note (see
+   * {@link decorationAtCaret}). Neither caller should be choosing.
+   */
+  readonly unparsedMask: readonly VisibleRange[];
+}
+
+function collectPreview(
   state: EditorState,
   index: readonly NoteIndexEntry[],
-  visibleRanges: readonly VisibleRange[] = [{ from: 0, to: state.doc.length }],
-  selectionActive = true,
+  { visibleRanges, selectionActive, unparsedMask }: PreviewScanOptions,
 ): ObsidianPreviewDecoration[] {
   const scanRanges = boundedScanRanges(state.doc.length, visibleRanges);
-  const codeMasked = syntaxMaskedRanges(state, scanRanges, CODE_MASKED_NODES);
-  const wikilinkContainers = syntaxMaskedRanges(state, scanRanges, WIKILINK_CONTAINER_NODES);
-  const tagMasked = syntaxMaskedRanges(state, scanRanges, TAG_MASKED_NODES);
+  const masked = (nodeNames: ReadonlySet<string>) =>
+    [...syntaxMaskedRanges(state, scanRanges, nodeNames), ...unparsedMask];
+  const codeMasked = masked(CODE_MASKED_NODES);
+  const wikilinkContainers = masked(WIKILINK_CONTAINER_NODES);
+  const tagMasked = masked(TAG_MASKED_NODES);
   const output: ObsidianPreviewDecoration[] = [];
 
   for (const scan of scanRanges) {
@@ -182,14 +232,59 @@ export function collectObsidianPreview(
   return output.sort((left, right) => left.from - right.from || left.to - right.to);
 }
 
+/**
+ * What to paint, for the render path.
+ *
+ * Masks the tail nothing has parsed yet, so an unfinished parse renders nothing
+ * over the constructs it has not reached rather than the wrong thing (issue
+ * #129). Every caller that draws goes through here, precisely so none of them
+ * has to remember that.
+ */
+export function collectObsidianPreview(
+  state: EditorState,
+  index: readonly NoteIndexEntry[],
+  visibleRanges: readonly VisibleRange[] = [{ from: 0, to: state.doc.length }],
+  selectionActive = true,
+): ObsidianPreviewDecoration[] {
+  return collectPreview(state, index, {
+    visibleRanges,
+    selectionActive,
+    unparsedMask: unparsedTail(state),
+  });
+}
+
+/**
+ * The matching decoration under the caret, scanning the caret's line only.
+ *
+ * Declines {@link unparsedTail} on purpose, and that is the whole reason this
+ * exists apart from {@link collectObsidianPreview}. The two paths fail closed in
+ * opposite directions: suppressing a decoration draws nothing and is safe, but a
+ * command that finds nothing returns `false`, and CodeMirror then runs the next
+ * binding for that key. Bare Enter is bound to {@link openTagSearchAtCaret}
+ * ahead of `insertNewlineAndIndent` (`SourceNoteEditor.tsx`), so masking the
+ * caret's own line would not decline the action — it would insert a newline into
+ * the user's note. Text alone answers for one line the user is already pointing
+ * at.
+ */
+function decorationAtCaret(
+  state: EditorState,
+  index: readonly NoteIndexEntry[],
+  matches: (candidate: ObsidianPreviewDecoration) => boolean,
+): ObsidianPreviewDecoration | undefined {
+  const caret = state.selection.main.head;
+  const line = state.doc.lineAt(caret);
+  return collectPreview(state, index, {
+    visibleRanges: [{ from: line.from, to: line.to }],
+    selectionActive: true,
+    unparsedMask: [],
+  }).find((candidate) => caret >= candidate.from && caret <= candidate.to && matches(candidate));
+}
+
 export function openTagSearchAtCaret(
   onSearchTag: (tag: string) => void,
 ): (view: EditorView) => boolean {
   return (view) => {
-    const caret = view.state.selection.main.head;
-    const line = view.state.doc.lineAt(caret);
-    const item = collectObsidianPreview(view.state, [], [{ from: line.from, to: line.to }])
-      .find((candidate) => candidate.tag && caret >= candidate.from && caret <= candidate.to);
+    const item = decorationAtCaret(view.state, [], (candidate) => Boolean(candidate.tag));
     if (!item?.tag) return false;
     view.dispatch({ effects: EditorView.announce.of(`Searching for ${item.tag}`) });
     queueMicrotask(() => onSearchTag(item.tag!));
@@ -202,11 +297,12 @@ export function openResolvedWikilinkAtCaret(
   onOpenLink: (relPath: string) => void,
 ): (view: EditorView) => boolean {
   return (view) => {
-    const caret = view.state.selection.main.head;
-    const line = view.state.doc.lineAt(caret);
     const currentIndex = typeof index === "function" ? index() : index;
-    const item = collectObsidianPreview(view.state, currentIndex, [{ from: line.from, to: line.to }])
-      .find((candidate) => candidate.target && caret >= candidate.from && caret <= candidate.to);
+    const item = decorationAtCaret(
+      view.state,
+      currentIndex,
+      (candidate) => Boolean(candidate.target),
+    );
     if (!item?.target) return false;
     onOpenLink(item.target);
     view.dispatch({ effects: EditorView.announce.of(`Opening ${item.target}`) });
@@ -307,6 +403,7 @@ export function obsidianLivePreview(
           || update.selectionSet
           || update.focusChanged
           || indexChanged
+          || reparsed(update.startState, update.state)
         ) {
           this.decorations = build(update.view, currentIndex());
         }
