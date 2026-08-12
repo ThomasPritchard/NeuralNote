@@ -3,6 +3,13 @@ import { readFile } from "node:fs/promises";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
+// The manifest publisher's own suite, registered into this run for its side
+// effect. CI invokes this file directly (`node scripts/check-release-workflow.mjs`),
+// so importing the suite here is what makes the branch-exists, branch-absent and
+// probe-failed cases run on every pull request instead of only when a release is
+// cut - which is the entire reason the publisher was extracted (#104).
+import "./publish-release-manifest.test.mjs";
+
 const workflowUrl = new URL("../.github/workflows/release-alpha.yml", import.meta.url);
 const workflow = await readFile(fileURLToPath(workflowUrl), "utf8");
 
@@ -71,6 +78,21 @@ test("all production manifests use the release version", async () => {
   ]);
   for (const manifest of [desktopPackage, nativeE2ePackage, tauriConfig]) {
     assert.equal(JSON.parse(manifest).version, releaseVersion);
+  }
+
+  // CI and the release build install from the lockfiles, not the manifests, and
+  // npm records the project version in two independent places per lockfile. The
+  // 0.3.0 release shipped with `app/desktop/package-lock.json` still reading
+  // 0.2.1 because this contract never opened the file; both fields are asserted
+  // separately so a bump that lands on only one of them still fails closed.
+  const lockfiles = await Promise.all(
+    ["app/desktop/package-lock.json", "app/desktop/e2e-native/package-lock.json"].map(
+      async (path) => ({ path, lockfile: JSON.parse(await readRepositoryFile(path)) }),
+    ),
+  );
+  for (const { path, lockfile } of lockfiles) {
+    assert.equal(lockfile.version, releaseVersion, `${path} version`);
+    assert.equal(lockfile.packages[""].version, releaseVersion, `${path} packages[""].version`);
   }
 
   const cargoManifests = await Promise.all([
@@ -220,7 +242,7 @@ test("the publisher stages a draft prerelease and exposes the manifest last", ()
   assert.match(publishRelease, /--draft=false/);
   assert.match(publishRelease, /--prerelease/);
   assert.match(publishRelease, /--latest=false/);
-  assert.match(publishManifest, /HEAD:refs\/heads\/release-manifests/);
+  assert.match(publishManifest, /node "\$MANIFEST_PUBLISHER"/);
 
   const draftIndex = publish.indexOf("      - name: Create draft GitHub prerelease");
   const releaseIndex = publish.indexOf("      - name: Publish GitHub prerelease");
@@ -287,29 +309,14 @@ test("the publisher can safely resume after release or manifest publication", ()
   assert.match(publishRelease, /RELEASE_ALREADY_PUBLISHED/);
   assert.match(publishRelease, /--json isImmutable/);
   assert.match(publishRelease, /"\$RELEASE_IS_IMMUTABLE"\s*!=\s*"true"/);
-  // The probe must run INSIDE the manifest worktree. This job performs no
-  // checkout, so its own working directory is not a git repository and knows no
-  // `origin`; a bare `git ls-remote origin ...` fails there for that reason
-  // alone, and both the 0.2.1 and 0.3.0 releases published and then failed this
-  // push because that failure was read as "branch does not exist".
-  //
-  // The previous version of this test asserted the exact-ref STRING and passed
-  // the whole time the command was broken, which is why it is now pinned to the
-  // `-C <worktree>` form instead: the missing `-C` was the defect.
-  assert.match(
-    publishManifest,
-    /git -C "\$MANIFEST_WORKTREE" ls-remote --exit-code origin/,
-  );
-  assert.doesNotMatch(publishManifest, /^\s*git ls-remote/m);
-  assert.doesNotMatch(publishManifest, /git ls-remote[^\n]*--heads[^\n]*release-manifests/);
-  // A probe that cannot answer must stop the release, not fall through to the
-  // orphan path: `--exit-code` reserves 2 for "no matching refs", so anything
-  // else has to be distinguished rather than treated as absence.
-  assert.match(publishManifest, /probe_status/);
-  assert.match(publishManifest, /-eq 2/);
-  assert.doesNotMatch(publishManifest, /ls-remote[^\n]*2>\/dev\/null/);
-  assert.match(publishManifest, /release-manifests already contains this manifest/);
-  assert.doesNotMatch(publishManifest, /already contains this manifest[\s\S]*?exit 1/);
+  // The manifest half of "safely resume" - a re-run whose manifest is already
+  // published must exit 0 without pushing - is deliberately no longer asserted
+  // as workflow TEXT. It is exercised for real by
+  // publish-release-manifest.test.mjs, which runs the publisher against a live
+  // git remote whose branch already holds an identical manifest. Asserting the
+  // shell here is what let the defect ship twice: a command can be spelled
+  // correctly and still run in the wrong directory.
+  assert.ok(publishManifest, "release workflow is missing the manifest publication step");
 });
 
 test("release artifacts are allowlisted and integrity-checked between jobs", () => {
@@ -359,4 +366,61 @@ test("existing release quality and supply-chain controls remain enforced", () =>
   assert.ok(validateConfigIndex < fetchSidecarIndex);
   assert.ok(fetchSidecarIndex < adHocBuildIndex);
   assert.ok(fetchSidecarIndex < developerBuildIndex);
+});
+
+test("the manifest publisher the release runs is the file the tests cover", async () => {
+  // What the publisher DOES is proven by publish-release-manifest.test.mjs,
+  // imported at the top of this file. What is left to check here is the wiring:
+  // that the release fetches and runs THAT file, at the reviewed commit, rather
+  // than a lookalike. The paths below are read out of the workflow and then
+  // resolved, so a rename or a typo reds here instead of mid-release.
+  const publishManifest = stepBody(publish, "Publish dedicated release-manifests branch");
+
+  const fetchedPublisherPath = publishManifest.match(
+    /contents\/(scripts\/[\w.-]+\.mjs)\?ref=/,
+  )?.[1];
+  assert.ok(fetchedPublisherPath, "the step must fetch the manifest publisher from the repository");
+  const publisher = await readRepositoryFile(fetchedPublisherPath);
+
+  // Exactly one file is fetched, so the publisher has to stand alone. A helper
+  // extracted into a sibling module passes every test in this repository and
+  // then fails the release with "module not found".
+  const importedModules = [...publisher.matchAll(/^import[^"]*"([^"]+)";$/gm)].map(([, of]) => of);
+  assert.ok(importedModules.length > 0, "expected the publisher to import its node builtins");
+  for (const specifier of importedModules) {
+    assert.match(
+      specifier,
+      /^node:/,
+      `${fetchedPublisherPath} must import only node builtins; the release fetches it alone`,
+    );
+  }
+
+  const publisherFileName = fetchedPublisherPath.slice(fetchedPublisherPath.lastIndexOf("/") + 1);
+  const suite = await readRepositoryFile("scripts/publish-release-manifest.test.mjs");
+  assert.match(
+    suite,
+    new RegExp(`from "\\./${publisherFileName.replaceAll(".", "\\.")}"`),
+    "the release must run the publisher the unit tests import, not another script",
+  );
+
+  // Pinned to the verified release commit, never to a moving ref. `main` here
+  // would fetch whatever the branch holds at push time instead of the code that
+  // was reviewed, tagged, and built.
+  assert.deepEqual(
+    [...publishManifest.matchAll(/\?ref=([^"'\s&]+)/g)].map(([, ref]) => ref),
+    ["$RELEASE_SHA"],
+    "the publisher must be pinned to the revalidated release commit",
+  );
+
+  // An empty or truncated download must not read as a silent success.
+  assert.match(publishManifest, /test -s "\$MANIFEST_PUBLISHER"/);
+  assert.match(publishManifest, /node "\$MANIFEST_PUBLISHER"/);
+
+  // Delegation has to be total. A step that runs the publisher AND keeps a
+  // hand-rolled copy of its git plumbing is back to code no test ever runs.
+  assert.doesNotMatch(
+    publishManifest,
+    /^\s*(?:git|cp) /m,
+    "manifest publication must delegate, not re-inline the git plumbing",
+  );
 });
