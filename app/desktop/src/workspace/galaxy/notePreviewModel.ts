@@ -31,7 +31,11 @@ const TETHER_GAP = 48;
 const TIGHT_TETHER_GAP = 14;
 const PLACEMENT_EPSILON = 0.01;
 const LEAD_CHARACTER_LIMIT = 132;
-const LEAD_CAPTURE_LIMIT = 1_024;
+
+/** UTF-16 units of the opening passage that enter Markdown cleanup. Exported so
+ * a test probing the capture boundary walks the real budget rather than a copy
+ * of it that silently stops overlapping when this number changes. */
+export const LEAD_CAPTURE_LIMIT = 1_024;
 
 const clamp = (value: number, min: number, max: number) =>
   Math.min(Math.max(value, min), max);
@@ -51,55 +55,28 @@ export function buildLocalNoteDigest(
   let sectionCount = 0;
   let wordCount = 0;
   let openFence: FenceMarker | null = null;
-  let leadStarted = false;
-  let leadFinished = false;
-  let capturedLength = 0;
-  const leadParts: string[] = [];
+  const lead = new LeadPassage();
 
-  for (let start = 0; start <= body.length; ) {
-    const newline = body.indexOf("\n", start);
-    const end = newline === -1 ? body.length : newline;
-    const lineEnd = end > start && body.charCodeAt(end - 1) === 13 ? end - 1 : end;
-    const line = body.slice(start, lineEnd);
+  for (const line of noteLines(body)) {
     const fence = fenceMarker(line);
-
     if (fence) {
-      if (!openFence) {
-        openFence = fence;
-      } else if (
-        fence.closing &&
-        fence.character === openFence.character &&
-        fence.length >= openFence.length
-      ) {
-        openFence = null;
-      }
-    } else if (!openFence) {
-      const bounds = trimmedBounds(line);
-      if (atxHeading(line)) {
-        sectionCount += 1;
-      } else if (bounds) {
-        wordCount += countWords(line, bounds.start, bounds.end);
-        if (!leadFinished && capturedLength < LEAD_CAPTURE_LIMIT) {
-          const remaining = LEAD_CAPTURE_LIMIT - capturedLength;
-          const fragment = cleanInlineMarkdown(
-            line.slice(bounds.start, Math.min(bounds.end, bounds.start + remaining)),
-          );
-          if (fragment) {
-            leadParts.push(fragment);
-            capturedLength += fragment.length + 1;
-            leadStarted = true;
-          }
-        }
-      } else if (leadStarted) {
-        leadFinished = true;
-      }
+      openFence = nextFenceState(openFence, fence);
+      continue;
     }
+    if (openFence) continue;
 
-    if (newline === -1) break;
-    start = newline + 1;
+    const bounds = trimmedBounds(line);
+    if (atxHeading(line)) {
+      sectionCount += 1;
+    } else if (bounds) {
+      wordCount += countWords(line, bounds.start, bounds.end);
+      lead.offer(line, bounds);
+    } else {
+      lead.closeOnBlankLine();
+    }
   }
 
-  const passage = leadParts.join(" ").replace(/\s+/g, " ").trim() || "No readable text.";
+  const passage = lead.text();
   const firstSentence = /^.*?(?:[.!?](?:\s|$)|[。！？])/u.exec(passage)?.[0]?.trim();
   return {
     lead: truncateAtWord(firstSentence || passage, leadCharacterLimit),
@@ -109,10 +86,73 @@ export function buildLocalNoteDigest(
   };
 }
 
+/** Yield the body one line at a time, stripping the CR of a CRLF pair, without
+ * ever holding more than a single line beyond the body itself. */
+function* noteLines(body: string): Generator<string> {
+  for (let start = 0; start <= body.length; ) {
+    const newline = body.indexOf("\n", start);
+    const end = newline === -1 ? body.length : newline;
+    const lineEnd = end > start && body[end - 1] === "\r" ? end - 1 : end;
+    yield body.slice(start, lineEnd);
+    if (newline === -1) return;
+    start = newline + 1;
+  }
+}
+
+/** The note's opening prose passage, accumulated under a fixed capture budget
+ * so a multi-MiB body never becomes a multi-MiB string. */
+class LeadPassage {
+  private readonly parts: string[] = [];
+  private capturedLength = 0;
+  private started = false;
+  private finished = false;
+
+  /** Take the trimmed prose of one line. Ignored once the passage has closed or
+   * the budget is spent, and never captures a character it cannot hold whole. */
+  offer(line: string, bounds: { start: number; end: number }): void {
+    if (this.finished || this.capturedLength >= LEAD_CAPTURE_LIMIT) return;
+    const remaining = LEAD_CAPTURE_LIMIT - this.capturedLength;
+    const captureEnd = wholeCodePointEnd(
+      line,
+      Math.min(bounds.end, bounds.start + remaining),
+    );
+    const fragment = cleanInlineMarkdown(line.slice(bounds.start, captureEnd));
+    if (!fragment) return;
+    this.parts.push(fragment);
+    this.capturedLength += fragment.length + 1;
+    this.started = true;
+  }
+
+  /** A blank line ends the opening passage, but only once it has begun. */
+  closeOnBlankLine(): void {
+    if (this.started) this.finished = true;
+  }
+
+  text(): string {
+    return (
+      this.parts.join(" ").replace(/\s+/g, " ").trim() || "No readable text."
+    );
+  }
+}
+
 interface FenceMarker {
   character: "`" | "~";
   length: number;
   closing: boolean;
+}
+
+/** A fence opens a block when none is open, and only a longer-or-equal run of
+ * the same character with nothing after it closes the one already open. */
+function nextFenceState(
+  open: FenceMarker | null,
+  fence: FenceMarker,
+): FenceMarker | null {
+  if (!open) return fence;
+  const closes =
+    fence.closing &&
+    fence.character === open.character &&
+    fence.length >= open.length;
+  return closes ? null : open;
 }
 
 function fenceMarker(line: string): FenceMarker | null {
@@ -145,29 +185,52 @@ function atxHeading(line: string): boolean {
   );
 }
 
+/** Pull a cut index back off the trailing half of a surrogate pair, so the
+ * capture budget never emits a character it could not hold whole.
+ *
+ * `codePointAt(end - 1)` exceeds the BMP exactly when that unit is a high
+ * surrogate whose low surrogate sits at `end` — which is precisely the case
+ * where slicing at `end` would strand an unpaired half in the lead. */
+function wholeCodePointEnd(value: string, end: number): number {
+  const straddlesPair = (value.codePointAt(end - 1) ?? 0) > 0xffff;
+  return straddlesPair ? end - 1 : end;
+}
+
 function trimmedBounds(value: string): { start: number; end: number } | null {
   let start = 0;
   let end = value.length;
-  while (start < end && isWhitespace(value.charCodeAt(start))) start += 1;
-  while (end > start && isWhitespace(value.charCodeAt(end - 1))) end -= 1;
+  while (start < end && isWhitespaceCodePoint(value.codePointAt(start))) start += 1;
+  while (end > start && isWhitespaceCodePoint(value.codePointAt(end - 1))) end -= 1;
   return start === end ? null : { start, end };
 }
 
 function countWords(value: string, start: number, end: number): number {
   let words = 0;
   let insideWord = false;
-  for (let index = start; index < end; index += 1) {
-    if (isWhitespace(value.charCodeAt(index))) {
+  for (let index = start; index < end; ) {
+    const code = value.codePointAt(index);
+    if (isWhitespaceCodePoint(code)) {
       insideWord = false;
     } else if (!insideWord) {
       words += 1;
       insideWord = true;
     }
+    index += unitLength(code);
   }
   return words;
 }
 
-function isWhitespace(code: number): boolean {
+/** UTF-16 units a code point occupies. Astral characters take two, so a scan
+ * reading whole code points must advance by this rather than by one. Unreadable
+ * indices report one unit, which keeps every caller's loop advancing. */
+function unitLength(code: number | undefined): number {
+  return code !== undefined && code > 0xffff ? 2 : 1;
+}
+
+/** Whitespace and C0 controls, by code point. Every member is in the BMP, so an
+ * astral character can never be mistaken for a word break. */
+function isWhitespaceCodePoint(code: number | undefined): boolean {
+  if (code === undefined) return false;
   return (
     code <= 0x20 ||
     code === 0x00a0 ||
@@ -182,61 +245,93 @@ function isWhitespace(code: number): boolean {
   );
 }
 
-/** Small inline-Markdown projection for the already bounded lead fragment. */
+/** Only ASCII digits open a Markdown ordered-list marker. A full-width numeral
+ * is ordinary prose and must survive into the lead. Reading past the end yields
+ * `undefined`, which ends the scan. */
+function isAsciiDigit(character: string | undefined): boolean {
+  return character !== undefined && character >= "0" && character <= "9";
+}
+
+const EMPHASIS_MARKERS = new Set(["*", "_", "~", "`"]);
+const BULLET_MARKERS = new Set(["-", "*", "+"]);
+
+const isSpaceOrTab = (character: string | undefined) =>
+  character === " " || character === "\t";
+
+/** Index of the first prose character, past any blockquote, bullet or ordered
+ * list marker opening the line. */
+function blockMarkerEnd(value: string): number {
+  if (value[0] === ">") return isSpaceOrTab(value[1]) ? 2 : 1;
+  if (BULLET_MARKERS.has(value[0]) && isSpaceOrTab(value[1])) return 2;
+  return orderedMarkerEnd(value);
+}
+
+/** Length of a `12. ` style ordered-list marker, or 0 when the line opens with
+ * something else. */
+function orderedMarkerEnd(value: string): number {
+  let digitEnd = 0;
+  while (isAsciiDigit(value[digitEnd])) digitEnd += 1;
+  const marked =
+    digitEnd > 0 && value[digitEnd] === "." && isSpaceOrTab(value[digitEnd + 1]);
+  return marked ? digitEnd + 2 : 0;
+}
+
+interface InlineLink {
+  text: string;
+  end: number;
+}
+
+/** Read the link starting at `index` — Obsidian wiki link or Markdown inline
+ * link, image `!` included — or null when nothing there parses as one. */
+function linkAt(value: string, index: number): InlineLink | null {
+  const image = value[index] === "!" && value[index + 1] === "[";
+  const start = image ? index + 1 : index;
+  if (value[start] !== "[") return null;
+  return value[start + 1] === "["
+    ? wikiLinkAt(value, start)
+    : inlineLinkAt(value, start);
+}
+
+/** `[[Target|alias]]` — the alias wins when present, else the whole target. */
+function wikiLinkAt(value: string, start: number): InlineLink | null {
+  const close = value.indexOf("]]", start + 2);
+  if (close === -1) return null;
+  const content = value.slice(start + 2, close);
+  const alias = content.indexOf("|");
+  return {
+    text: alias === -1 ? content : content.slice(alias + 1),
+    end: close + 2,
+  };
+}
+
+/** `[label](target)` — only the label survives into the lead. */
+function inlineLinkAt(value: string, start: number): InlineLink | null {
+  const labelEnd = value.indexOf("]", start + 1);
+  if (labelEnd === -1 || value[labelEnd + 1] !== "(") return null;
+  const targetEnd = value.indexOf(")", labelEnd + 2);
+  if (targetEnd === -1) return null;
+  return { text: value.slice(start + 1, labelEnd), end: targetEnd + 1 };
+}
+
+/** Small inline-Markdown projection for the already bounded lead fragment.
+ *
+ * Copies whole UTF-16 units, so a surrogate pair always travels together: the
+ * only place a character can be cut in half is the capture budget, which
+ * `wholeCodePointEnd` guards. */
 function cleanInlineMarkdown(value: string): string {
   const output: string[] = [];
-  let index = 0;
-
-  if (value[index] === ">") {
-    index += 1;
-    if (value[index] === " " || value[index] === "\t") index += 1;
-  } else if (
-    (value[index] === "-" || value[index] === "*" || value[index] === "+") &&
-    (value[index + 1] === " " || value[index + 1] === "\t")
-  ) {
-    index += 2;
-  } else {
-    let digitEnd = index;
-    while (digitEnd < value.length && value.charCodeAt(digitEnd) >= 48 && value.charCodeAt(digitEnd) <= 57) {
-      digitEnd += 1;
-    }
-    if (
-      digitEnd > index &&
-      value[digitEnd] === "." &&
-      (value[digitEnd + 1] === " " || value[digitEnd + 1] === "\t")
-    ) {
-      index = digitEnd + 2;
-    }
-  }
+  let index = blockMarkerEnd(value);
 
   while (index < value.length) {
-    const image = value[index] === "!" && value[index + 1] === "[";
-    const linkStart = image ? index + 1 : index;
-    if (value[linkStart] === "[" && value[linkStart + 1] === "[") {
-      const close = value.indexOf("]]", linkStart + 2);
-      if (close !== -1) {
-        const content = value.slice(linkStart + 2, close);
-        const alias = content.indexOf("|");
-        output.push(alias === -1 ? content : content.slice(alias + 1));
-        index = close + 2;
-        continue;
-      }
-    } else if (value[linkStart] === "[") {
-      const labelEnd = value.indexOf("]", linkStart + 1);
-      if (labelEnd !== -1 && value[labelEnd + 1] === "(") {
-        const targetEnd = value.indexOf(")", labelEnd + 2);
-        if (targetEnd !== -1) {
-          output.push(value.slice(linkStart + 1, labelEnd));
-          index = targetEnd + 1;
-          continue;
-        }
-      }
+    const link = linkAt(value, index);
+    if (link) {
+      output.push(link.text);
+      index = link.end;
+      continue;
     }
 
     const character = value[index];
-    if (character !== "*" && character !== "_" && character !== "~" && character !== "`") {
-      output.push(character);
-    }
+    if (!EMPHASIS_MARKERS.has(character)) output.push(character);
     index += 1;
   }
 

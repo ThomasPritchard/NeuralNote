@@ -59,6 +59,75 @@ export function loadSourceText(source: string): SourceText {
   return { text, separators, defaultSeparator: dominantSeparator(separators) };
 }
 
+/** One replacement reported by `ChangeSet.iterChanges`. */
+interface ChangedRange {
+  readonly oldFrom: number;
+  readonly oldTo: number;
+  readonly newFrom: number;
+  readonly newTo: number;
+}
+
+/** An old newline competing to donate its separator to a rewritten one. */
+interface SeparatorCandidate {
+  readonly distance: number;
+  readonly position: number;
+  readonly separator: LineSeparator;
+}
+
+/** Where a position in the rewritten span falls back in the span it replaced,
+ *  interpolated by length. A pure insertion or a pure deletion has no span to
+ *  interpolate across, so it projects onto the start of the change. */
+function projectedOldPosition(range: ChangedRange, position: number): number {
+  const oldSpan = range.oldTo - range.oldFrom;
+  const newSpan = range.newTo - range.newFrom;
+  if (oldSpan <= 0 || newSpan <= 0) return range.oldFrom;
+  return range.oldFrom + ((position - range.newFrom) / newSpan) * oldSpan;
+}
+
+/** Did this change consume the newline that sat at `oldPosition`? An insertion
+ *  consumes nothing, so it can only draw on a newline sitting exactly at the
+ *  point of insertion. */
+function isReplacedBy(range: ChangedRange, oldPosition: number): boolean {
+  const isInsideReplacement = oldPosition >= range.oldFrom && oldPosition < range.oldTo;
+  const isInsertionAtBoundary = range.oldTo === range.oldFrom
+    && oldPosition === range.oldFrom;
+  return isInsideReplacement || isInsertionAtBoundary;
+}
+
+function isNearer(
+  candidate: SeparatorCandidate,
+  incumbent: SeparatorCandidate | undefined,
+): boolean {
+  if (incumbent === undefined) return true;
+  if (candidate.distance === incumbent.distance) {
+    return candidate.position < incumbent.position;
+  }
+  return candidate.distance < incumbent.distance;
+}
+
+/** The separator a newline written by `range` inherits: the one carried by the
+ *  nearest newline that change consumed, ties going to the earliest. Undefined
+ *  when the change consumed no newline to inherit from. */
+function inheritedSeparator(
+  source: SourceText,
+  oldPositions: readonly number[],
+  range: ChangedRange,
+  position: number,
+): LineSeparator | undefined {
+  const target = projectedOldPosition(range, position);
+  let nearest: SeparatorCandidate | undefined;
+  for (const [index, oldPosition] of oldPositions.entries()) {
+    if (!isReplacedBy(range, oldPosition)) continue;
+    const candidate: SeparatorCandidate = {
+      distance: Math.abs(oldPosition - target),
+      position: oldPosition,
+      separator: source.separators[index] ?? source.defaultSeparator,
+    };
+    if (isNearer(candidate, nearest)) nearest = candidate;
+  }
+  return nearest?.separator;
+}
+
 export function applySourceChanges(source: SourceText, changes: ChangeSet): SourceText {
   assertValid(source);
   if (changes.length !== source.text.length) {
@@ -82,7 +151,7 @@ export function applySourceChanges(source: SourceText, changes: ChangeSet): Sour
     }
   });
 
-  const changedRanges: Array<{ oldFrom: number; oldTo: number; newFrom: number; newTo: number }> = [];
+  const changedRanges: ChangedRange[] = [];
   changes.iterChanges((oldFrom, oldTo, newFrom, newTo) => {
     changedRanges.push({ oldFrom, oldTo, newFrom, newTo });
   }, true);
@@ -95,44 +164,10 @@ export function applySourceChanges(source: SourceText, changes: ChangeSet): Sour
     const range = changedRanges.find(
       ({ newFrom, newTo }) => position >= newFrom && position < Math.max(newFrom + 1, newTo),
     );
+    if (range === undefined) return source.defaultSeparator;
 
-    if (range) {
-      const oldSpan = range.oldTo - range.oldFrom;
-      const newSpan = range.newTo - range.newFrom;
-      const projectedOldPosition =
-        oldSpan > 0 && newSpan > 0
-          ? range.oldFrom + ((position - range.newFrom) / newSpan) * oldSpan
-          : range.oldFrom;
-      let nearest:
-        | { distance: number; position: number; separator: LineSeparator }
-        | undefined;
-
-      for (const [index, oldPosition] of oldPositions.entries()) {
-        const isInsideReplacement =
-          oldPosition >= range.oldFrom && oldPosition < range.oldTo;
-        const isInsertionAtBoundary =
-          oldSpan === 0 && oldPosition === range.oldFrom;
-        if (!isInsideReplacement && !isInsertionAtBoundary) continue;
-
-        const candidate = {
-          distance: Math.abs(oldPosition - projectedOldPosition),
-          position: oldPosition,
-          separator: source.separators[index] ?? source.defaultSeparator,
-        };
-        if (
-          !nearest ||
-          candidate.distance < nearest.distance ||
-          (candidate.distance === nearest.distance &&
-            candidate.position < nearest.position)
-        ) {
-          nearest = candidate;
-        }
-      }
-
-      if (nearest) return nearest.separator;
-    }
-
-    return source.defaultSeparator;
+    return inheritedSeparator(source, oldPositions, range, position)
+      ?? source.defaultSeparator;
   });
 
   return { text: nextText, separators, defaultSeparator: source.defaultSeparator };

@@ -109,31 +109,11 @@ fn search_vault_inner(
     let mut skipped_files: u32 = 0;
 
     for node in text_note_files(&tree) {
-        // Reuse content an earlier search in this run already loaded (issue #67),
-        // matched on the SAME absolute path string as [`FileHit::path`] — an exact-key
-        // hit only, so a mismatched path can never inject the wrong file. A pooled
-        // value is itself this scan's own `decode_note_text` output, so for identical
-        // file bytes it equals a fresh read below by construction. When the pool does
-        // not cover this path we fall back to reading it from disk, decoding via the
-        // ONE shared policy [`decode_note_text`] so the text search indexes is
-        // byte-identical to what the reader ([`read_note`]) presents — a Latin-1 note
-        // is searchable exactly as shown, and the citation moat (retrieval reusing
-        // this content, then hashing it to match the reader's) holds by construction,
-        // not coincidence (issue #33). An unreadable file is skipped loudly (logged
-        // AND counted), never fatal.
-        let pooled: Option<&str> = injected
-            .and_then(|pool| pool.get(node.path.as_str()))
-            .map(|content| content.as_ref());
-        let raw: Cow<str> = match pooled {
-            Some(content) => Cow::Borrowed(content),
-            None => match std::fs::read(&node.path) {
-                Ok(bytes) => Cow::Owned(decode_note_text(bytes).0),
-                Err(e) => {
-                    log::warn!("search: skipping unreadable file {}: {e}", node.path);
-                    skipped_files = skipped_files.saturating_add(1);
-                    continue;
-                }
-            },
+        // An unreadable file is skipped loudly — logged by the loader, counted here
+        // — never fatal.
+        let Some(raw) = note_scan_text(node, injected) else {
+            skipped_files = skipped_files.saturating_add(1);
+            continue;
         };
         let budget = MAX_MATCHES_PER_FILE.min(MAX_TOTAL_MATCHES - total);
         let (hit, clipped) = match &mode {
@@ -168,6 +148,41 @@ fn search_vault_inner(
         },
         content_by_path,
     ))
+}
+
+/// The text one note is scanned against: content an earlier search in this run
+/// already loaded, else a fresh read from disk.
+///
+/// A pooled value is reused only on an EXACT absolute-path key — the same string
+/// as [`FileHit::path`] — so a mismatched path can never inject the wrong file
+/// (issue #67); and that value is itself this scan's own `decode_note_text`
+/// output, so for identical file bytes it equals a fresh read by construction. A
+/// path the pool does not cover falls back to a disk read, decoded via the ONE
+/// shared policy [`decode_note_text`] so the text search indexes is byte-identical
+/// to what the reader ([`crate::note::read_note`]) presents — a Latin-1 note is
+/// searchable exactly as shown, and the citation moat (retrieval reusing this
+/// content, then hashing it to match the reader's) holds by construction, not
+/// coincidence (issue #33).
+///
+/// `None` means the file could not be read: logged here, counted as skipped by the
+/// caller.
+fn note_scan_text<'a>(
+    node: &TreeNode,
+    injected: Option<&'a HashMap<String, Arc<str>>>,
+) -> Option<Cow<'a, str>> {
+    let pooled: Option<&str> = injected
+        .and_then(|pool| pool.get(node.path.as_str()))
+        .map(|content| content.as_ref());
+    if let Some(content) = pooled {
+        return Some(Cow::Borrowed(content));
+    }
+    match std::fs::read(&node.path) {
+        Ok(bytes) => Some(Cow::Owned(decode_note_text(bytes).0)),
+        Err(e) => {
+            log::warn!("search: skipping unreadable file {}: {e}", node.path);
+            None
+        }
+    }
 }
 
 fn empty_response() -> SearchResponse {
@@ -552,25 +567,40 @@ fn is_numeric_tag_char(ch: char) -> bool {
 /// inline tag. Every input char maps to exactly one output char and all newlines
 /// survive, so line and scalar offsets remain valid against the original body.
 fn mask_tag_syntax(body: &str) -> String {
-    let code_masked = mask_code(body);
-    let mut chars: Vec<char> = code_masked.chars().collect();
-    let mut reference_labels = HashSet::new();
-    let line_ranges = markdown_line_ranges(&chars);
+    let mut chars: Vec<char> = mask_code(body).chars().collect();
+    // Order matters: the definition pass feeds the labels the inline pass needs to
+    // recognise a shortcut reference link, and each pass reads what the previous
+    // one blanked.
+    let reference_labels = blank_reference_definitions(&mut chars);
+    blank_indented_code(&mut chars);
+    blank_inline_constructs(&mut chars, &reference_labels);
+    chars.into_iter().collect()
+}
 
+/// Blank every link reference definition, returning the labels they define — a
+/// later bare `[label]` is syntax rather than text only if its label was defined
+/// here, so [`blank_inline_constructs`] needs this set.
+fn blank_reference_definitions(chars: &mut [char]) -> HashSet<String> {
+    let mut reference_labels = HashSet::new();
+    let line_ranges = markdown_line_ranges(chars);
     let mut definition_index = 0usize;
     while definition_index < line_ranges.len() {
         if let Some((label, span_end, last_line)) =
-            reference_definition_span(&chars, &line_ranges, definition_index)
+            reference_definition_span(chars, &line_ranges, definition_index)
         {
             reference_labels.insert(label);
-            blank_chars(&mut chars, line_ranges[definition_index].0, span_end);
+            blank_chars(chars, line_ranges[definition_index].0, span_end);
             definition_index = last_line + 1;
         } else {
             definition_index += 1;
         }
     }
+    reference_labels
+}
 
-    // Four-space/tab-indented code is not covered by the shared fence/span mask.
+/// Blank four-space/tab-indented code lines — the shared fence/span mask
+/// ([`mask_code`]) does not cover them.
+fn blank_indented_code(chars: &mut [char]) {
     let mut line_start = 0usize;
     while line_start < chars.len() {
         let line_end = chars[line_start..]
@@ -578,83 +608,104 @@ fn mask_tag_syntax(body: &str) -> String {
             .position(|&ch| ch == '\n')
             .map(|offset| line_start + offset)
             .unwrap_or(chars.len());
-        let mut columns = 0usize;
-        for &ch in &chars[line_start..line_end] {
-            match ch {
-                ' ' => columns += 1,
-                '\t' => {
-                    columns = 4;
-                    break;
-                }
-                _ => break,
-            }
-        }
-        if columns >= 4 {
-            blank_chars(&mut chars, line_start, line_end);
+        if is_indented_code_line(&chars[line_start..line_end]) {
+            blank_chars(chars, line_start, line_end);
         }
         line_start = line_end.saturating_add(1);
     }
+}
 
+/// Whether a line's leading whitespace reaches the four-column indented-code
+/// threshold. A tab in that whitespace always reaches it, however few spaces
+/// came before it.
+fn is_indented_code_line(line: &[char]) -> bool {
+    let mut columns = 0usize;
+    for &ch in line {
+        match ch {
+            ' ' => columns += 1,
+            '\t' => return true,
+            _ => break,
+        }
+    }
+    columns >= 4
+}
+
+/// Blank the inline constructs whose tag-like text is syntax, walking the body
+/// once and skipping past each construct it masks.
+fn blank_inline_constructs(chars: &mut [char], reference_labels: &HashSet<String>) {
     let mut i = 0usize;
     while i < chars.len() {
-        if starts_with_chars(&chars, i, "<!--") {
-            let end = find_chars(&chars, i + 4, "-->")
-                .map(|end| end + 3)
-                .unwrap_or(chars.len());
-            blank_chars(&mut chars, i, end);
-            i = end;
-            continue;
+        match inline_construct_end(chars, i, reference_labels) {
+            Some(end) => {
+                blank_chars(chars, i, end);
+                i = end;
+            }
+            None => i += 1,
         }
-        if chars[i] == '<' {
-            let end = chars[i + 1..]
+    }
+}
+
+/// Where the maskable construct starting at `at` ends — an HTML comment, a raw
+/// HTML tag, a wikilink/embed, or a link. An unterminated construct runs to the
+/// end of the body (its opener still isn't tag text). `None` means nothing
+/// maskable starts at `at`, so the char stands as written.
+fn inline_construct_end(
+    chars: &[char],
+    at: usize,
+    reference_labels: &HashSet<String>,
+) -> Option<usize> {
+    if starts_with_chars(chars, at, "<!--") {
+        return Some(
+            find_chars(chars, at + 4, "-->")
+                .map(|end| end + 3)
+                .unwrap_or(chars.len()),
+        );
+    }
+    if chars[at] == '<' {
+        return Some(
+            chars[at + 1..]
                 .iter()
                 .position(|&ch| ch == '>')
-                .map(|offset| i + 1 + offset + 1)
-                .unwrap_or(chars.len());
-            blank_chars(&mut chars, i, end);
-            i = end;
-            continue;
-        }
-        if starts_with_chars(&chars, i, "[[") {
-            let end = find_chars(&chars, i + 2, "]]")
-                .map(|end| end + 2)
-                .unwrap_or(chars.len());
-            blank_chars(&mut chars, i, end);
-            i = end;
-            continue;
-        }
-        if chars[i] == '[' {
-            if let Some(label_end) = chars[i + 1..].iter().position(|&ch| ch == ']') {
-                let label_end = i + 1 + label_end;
-                let after = label_end + 1;
-                let destination_end = match chars.get(after) {
-                    Some('(') => chars[after + 1..]
-                        .iter()
-                        .position(|&ch| ch == ')')
-                        .map(|offset| after + 1 + offset + 1),
-                    Some('[') => chars[after + 1..]
-                        .iter()
-                        .position(|&ch| ch == ']')
-                        .map(|offset| after + 1 + offset + 1),
-                    _ => None,
-                };
-                if let Some(end) = destination_end {
-                    blank_chars(&mut chars, i, end);
-                    i = end;
-                    continue;
-                }
-                let label = normalize_reference_label(&chars[i + 1..label_end]);
-                if reference_labels.contains(&label) {
-                    let end = label_end + 1;
-                    blank_chars(&mut chars, i, end);
-                    i = end;
-                    continue;
-                }
-            }
-        }
-        i += 1;
+                .map(|offset| at + 1 + offset + 1)
+                .unwrap_or(chars.len()),
+        );
     }
-    chars.into_iter().collect()
+    if starts_with_chars(chars, at, "[[") {
+        return Some(
+            find_chars(chars, at + 2, "]]")
+                .map(|end| end + 2)
+                .unwrap_or(chars.len()),
+        );
+    }
+    if chars[at] == '[' {
+        return link_end(chars, at, reference_labels);
+    }
+    None
+}
+
+/// Where the link opening at `[` ends: an inline `[text](destination)` or
+/// collapsed `[text][ref]` first, else a shortcut `[label]` whose label a
+/// definition declared. `None` when the bracket opens no link — an unclosed
+/// `[`, or a label nothing defines, is ordinary text that may carry a tag.
+fn link_end(chars: &[char], at: usize, reference_labels: &HashSet<String>) -> Option<usize> {
+    let label_end = at + 1 + chars[at + 1..].iter().position(|&ch| ch == ']')?;
+    let after = label_end + 1;
+    let destination_end = match chars.get(after) {
+        Some('(') => chars[after + 1..]
+            .iter()
+            .position(|&ch| ch == ')')
+            .map(|offset| after + 1 + offset + 1),
+        Some('[') => chars[after + 1..]
+            .iter()
+            .position(|&ch| ch == ']')
+            .map(|offset| after + 1 + offset + 1),
+        _ => None,
+    };
+    if destination_end.is_some() {
+        return destination_end;
+    }
+    let label = normalize_reference_label(&chars[at + 1..label_end]);
+    reference_labels.contains(&label).then_some(label_end + 1)
 }
 
 fn markdown_line_ranges(chars: &[char]) -> Vec<(usize, usize)> {
@@ -1073,7 +1124,50 @@ fn build_snippet(
 
 #[cfg(test)]
 mod tag_parser_tests {
-    use super::{matching_tag_ranges, SearchMode};
+    use super::{mask_tag_syntax, matching_tag_ranges, SearchMode};
+
+    /// An unterminated construct masks to the end of the body — its opener is
+    /// still syntax, so what follows cannot be trusted as tag text — while an
+    /// unclosed `[` opens no link at all and leaves its text (and any tag in it)
+    /// standing. Both are asserted char-for-char because every masked body must
+    /// stay 1:1 with its source: tag offsets, and so the citations built from
+    /// them, are read back against the ORIGINAL line.
+    #[test]
+    fn unterminated_constructs_mask_to_the_end_without_moving_an_offset() {
+        let cases = [
+            (
+                "[[note #project\n#project after\n",
+                "               \n              \n",
+            ),
+            (
+                "<!-- #project never closed\n#project after\n",
+                "                          \n              \n",
+            ),
+            (
+                "<span #project\nmore #project\n",
+                "              \n             \n",
+            ),
+            // No closing bracket, so no link: the tag survives as ordinary text.
+            (
+                "[abc #project\n#project after\n",
+                "[abc #project\n#project after\n",
+            ),
+        ];
+        for (body, expected) in cases {
+            let masked = mask_tag_syntax(body);
+            assert_eq!(masked, expected, "masking {body:?}");
+            assert_eq!(
+                masked.chars().count(),
+                body.chars().count(),
+                "masking must be 1:1 in chars for {body:?}"
+            );
+            assert_eq!(
+                masked.matches('\n').count(),
+                body.matches('\n').count(),
+                "every newline must survive masking for {body:?}"
+            );
+        }
+    }
 
     #[test]
     fn dense_single_line_stops_collecting_ranges_outside_the_snippet_window() {

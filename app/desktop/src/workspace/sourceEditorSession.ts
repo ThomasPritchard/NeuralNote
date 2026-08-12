@@ -20,7 +20,7 @@ function retain(sessionKey: string, session: SourceEditorSession): SourceEditorS
   sessions.delete(sessionKey);
   sessions.set(sessionKey, session);
   while (sessions.size > MAX_RETAINED_SESSIONS) {
-    const oldest = sessions.keys().next().value as string | undefined;
+    const oldest = sessions.keys().next().value;
     if (oldest === undefined) break;
     sessions.delete(oldest);
     activeTokens.delete(oldest);

@@ -144,7 +144,7 @@ export function GalaxyNotePreview({
     },
     onPointerMove: (event) => {
       const drag = dragRef.current;
-      if (!drag || drag.pointerId !== event.pointerId) return;
+      if (drag?.pointerId !== event.pointerId) return;
       if (!event.currentTarget.hasPointerCapture(event.pointerId)) return;
       setDraggedPosition(
         drag.startBubbleX + event.clientX - drag.startClientX,
@@ -197,6 +197,18 @@ export function GalaxyNotePreview({
         Previewing {selected.title}
       </p>
       <PreviewTether />
+      {/* Escape closes the preview from anywhere inside it, and preventDefault is
+          the handshake that stops the galaxy's window-level Escape listener
+          firing the same close twice.
+
+          Sonar's S6847 (keyboard handler on a non-interactive element) is
+          knowingly left OPEN here, unsuppressed. The panel is a labelled
+          container whose every focusable child is a real button, so no role it
+          could honestly claim clears the rule. The one alternative that silences
+          it — registering the listener with `addEventListener` on a ref — merely
+          hides the handler from the analyser, and being native it would run
+          before React's synthetic dispatch, so `closeOnEscape`'s stopPropagation
+          would truncate React's keydown path for this whole subtree. */}
       <aside
         className="nn-graph-preview"
         aria-labelledby={titleId}
@@ -321,16 +333,14 @@ function PreviewBody({
   onRetry: () => void;
 }>) {
   return (
-    <div
-      className="nn-graph-preview-body"
-      role="region"
-      aria-label={`Preview of ${title}`}
-    >
+    <section className="nn-graph-preview-body" aria-label={`Preview of ${title}`}>
+      {/* <output> is role="status" natively; .nn-graph-preview-state already sets
+          display:flex, so the swap changes no box. */}
       {state.phase === "loading" && (
-        <div className="nn-graph-preview-state" role="status">
+        <output className="nn-graph-preview-state">
           <Loader2 className="size-4 animate-spin text-primary motion-reduce:animate-none" aria-hidden />
           Loading note…
-        </div>
+        </output>
       )}
       {state.phase === "error" && (
         <div className="nn-graph-preview-state" role="alert">
@@ -344,7 +354,7 @@ function PreviewBody({
         </div>
       )}
       {state.phase === "ready" && <LoadedNote note={state.note} metrics={metrics} />}
-    </div>
+    </section>
   );
 }
 

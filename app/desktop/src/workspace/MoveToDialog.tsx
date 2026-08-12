@@ -89,10 +89,12 @@ export function MoveToDialog({
         {valid.length === 0 ? (
           <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-6 py-12 text-center">
             <FolderOpen className="size-7 text-muted-foreground/40" aria-hidden />
-            <p role="status" className="text-[0.8125rem] leading-relaxed text-muted-foreground">
+            {/* <output> is role="status" natively. It is a flex item here, so it
+                blockifies exactly as the <p> did — same wrapping, same box. */}
+            <output className="text-[0.8125rem] leading-relaxed text-muted-foreground">
               No available destinations for{" "}
               <span className="font-medium text-foreground">{node.name}</span>.
-            </p>
+            </output>
           </div>
         ) : (
           <div className="flex min-h-0 flex-1 flex-col p-3">

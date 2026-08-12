@@ -114,8 +114,7 @@ export function useNoteTabs(): NoteTabsController {
   const reconcileOpenTab = useCallback(async (id: string) => {
     const tab = stateRef.current.tabs.find((item) => item.id === id);
     if (
-      !tab ||
-      !tab.note ||
+      !tab?.note ||
       tab.loading ||
       tab.saving ||
       savingTabIds.current.has(id)
@@ -146,7 +145,7 @@ export function useNoteTabs(): NoteTabsController {
     } catch (error) {
       if (reconcileRevisions.current.get(id) !== revision) return;
       const current = stateRef.current.tabs.find((item) => item.id === id);
-      if (!current || current.path !== path) return;
+      if (current?.path !== path) return;
       if (isNotFound(error)) {
         dispatch({ type: "external-delete", id });
         return;
