@@ -55,6 +55,15 @@ function isSpaceOrTab(character: string | undefined): boolean {
  * the match at the beginning of the maximal gap, which is exactly where the
  * third run stops.
  *
+ * Exported with no consumer outside this module, which is a smell worth naming.
+ * It is the only place the linearity guarantee can be MEASURED: the heading text
+ * arrives here as a fresh primitive out of `RegExp.exec`, so the character-read
+ * probe in `sourceDocumentTitle.redos.test.ts` cannot reach it through
+ * `sourceTitleMode` and would report a quadratic strip as linear. The stripped
+ * text is invisible from outside for the same reason — `leadingH1` reports only
+ * whether it is empty — so a differential run through the public function would
+ * map almost every input to the same answer.
+ *
  * @param text - everything after the opening `#` run and its following spaces
  */
 export function withoutAtxClosingSequence(text: string): string {

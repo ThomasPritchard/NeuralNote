@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { SUPERLINEAR_RATIO, growthRatio } from "../test/superlinearGrowth";
+import { LINEAR_GROWTH_CEILING, characterReads } from "../test/characterReads";
 import { sourceTitleMode, withoutAtxClosingSequence } from "./sourceDocumentTitle";
 
 /**
@@ -16,24 +16,60 @@ import { sourceTitleMode, withoutAtxClosingSequence } from "./sourceDocumentTitl
  * NeuralNote captures whole sources — articles, transcripts, pasted data — so a
  * captured note with one enormous line is the realistic way in.
  *
- * Two halves, and the fix needs both. {@link SUPERLINEAR_RATIO} says the cost
- * grew linearly; the differential corpus says the answers did not move.
+ * Two halves, and the fix needs both. {@link characterReads} says the work grew
+ * linearly; the differential corpus says the answers did not move.
+ *
+ * The count is taken on `withoutAtxClosingSequence` rather than through
+ * `sourceTitleMode`, and it has to be: the heading text reaches the strip as a
+ * fresh primitive out of `RegExp.exec`, so a probe on the DOCUMENT cannot see a
+ * single read inside the strip and would report the quadratic version as
+ * linear. That false green is why the function is exported.
  */
 
 /** The pathological shape: a heading whose text is one character then padding. */
 const paddedHeading = (padding: number): string => `# x${" ".repeat(padding)}`;
 
+/** The same line as the strip itself receives it — everything after `# `. */
+const headingText = (padding: number): string => `x${" ".repeat(padding)}`;
+
 const SMALL_PADDING = 8_192;
 const LARGE_PADDING = SMALL_PADDING * 4;
 
+/**
+ * One backward pass in three phases, each resuming where the last stopped, so a
+ * character is read once plus at most one re-read per phase boundary. A
+ * quadratic strip exceeds this by three orders of magnitude at these sizes, so
+ * the bound discriminates without being tuned.
+ */
+const READS_PER_CHARACTER = 2;
+
 describe("source title computation, on a pathologically padded heading", () => {
+  it("reads each character a bounded number of times", () => {
+    for (const padding of [SMALL_PADDING, LARGE_PADDING]) {
+      const text = headingText(padding);
+      const reads = characterReads(withoutAtxClosingSequence, text);
+      // A regex reads zero characters through this instrument, so an
+      // implementation that skipped the scan would otherwise look free.
+      expect(reads).toBeGreaterThanOrEqual(text.length);
+      expect(reads).toBeLessThanOrEqual(READS_PER_CHARACTER * text.length + 8);
+    }
+  });
+
   it("stays linear in the length of the heading line", () => {
-    const small = paddedHeading(SMALL_PADDING);
-    const large = paddedHeading(LARGE_PADDING);
+    const small = headingText(SMALL_PADDING);
+    const large = headingText(LARGE_PADDING);
     expect(large.length / small.length).toBeCloseTo(4, 1);
 
-    expect(growthRatio(() => void sourceTitleMode(small), () => void sourceTitleMode(large)))
-      .toBeLessThanOrEqual(SUPERLINEAR_RATIO);
+    const growth = characterReads(withoutAtxClosingSequence, large)
+      / characterReads(withoutAtxClosingSequence, small);
+    expect(growth).toBeLessThanOrEqual(LINEAR_GROWTH_CEILING);
+  });
+
+  it("reads each character a bounded number of times on every corpus case too", () => {
+    for (const text of NAMED_CORPUS) {
+      expect(characterReads(withoutAtxClosingSequence, text))
+        .toBeLessThanOrEqual(READS_PER_CHARACTER * text.length + 8);
+    }
   });
 
   it("still reads the padded heading as a source-backed title", () => {

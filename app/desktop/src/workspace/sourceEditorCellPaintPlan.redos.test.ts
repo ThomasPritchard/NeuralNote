@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 
-import { SUPERLINEAR_RATIO, growthRatio } from "../test/superlinearGrowth";
+import { LINEAR_GROWTH_CEILING, characterReads } from "../test/characterReads";
 import { type InlineWikilink, inlineWikilinks } from "./sourceEditorCellPaintPlan";
 
 /**
@@ -19,8 +19,8 @@ import { type InlineWikilink, inlineWikilinks } from "./sourceEditorCellPaintPla
  * `collectObsidianPreview`'s `visibleRanges` parameter DEFAULTS to
  * `[{ from: 0, to: state.doc.length }]`, so a non-view caller scans everything.
  *
- * Two halves, and the fix needs both. {@link SUPERLINEAR_RATIO} says the cost
- * grew linearly; the differential corpus says the answers did not move. A faster
+ * Two halves, and the fix needs both. {@link characterReads} says the work grew
+ * linearly; the differential corpus says the answers did not move. A faster
  * scanner that disagreed with the old one by a single character would replace a
  * performance bug with a rendering-corruption bug, because `obsidianLivePreview`
  * and `cellPaintPlan` share THIS function precisely so that the span one
@@ -33,14 +33,40 @@ const unclosedOpeners = (length: number): string => "[[".repeat(length / 2);
 const SMALL_LENGTH = 8_192;
 const LARGE_LENGTH = SMALL_LENGTH * 4;
 
+/**
+ * Each character can be read by the outer scan that looks for `[[`, by the run
+ * that consumes a target, and once more where a candidate ends — a small
+ * constant. A quadratic scan exceeds this by three orders of magnitude at these
+ * sizes, so the bound discriminates without being tuned.
+ */
+const READS_PER_CHARACTER = 3;
+
 describe("inlineWikilinks, on a line of unclosed openers", () => {
+  it("reads each character a bounded number of times", () => {
+    for (const length of [SMALL_LENGTH, LARGE_LENGTH]) {
+      const line = unclosedOpeners(length);
+      const reads = characterReads(inlineWikilinks, line);
+      // A regex reads zero characters through this instrument, so an
+      // implementation that skipped the scan would otherwise look free.
+      expect(reads).toBeGreaterThanOrEqual(line.length);
+      expect(reads).toBeLessThanOrEqual(READS_PER_CHARACTER * line.length + 8);
+    }
+  });
+
   it("stays linear in the length of the line", () => {
     const small = unclosedOpeners(SMALL_LENGTH);
     const large = unclosedOpeners(LARGE_LENGTH);
     expect(large.length / small.length).toBeCloseTo(4, 1);
 
-    expect(growthRatio(() => void inlineWikilinks(small), () => void inlineWikilinks(large)))
-      .toBeLessThanOrEqual(SUPERLINEAR_RATIO);
+    const growth = characterReads(inlineWikilinks, large) / characterReads(inlineWikilinks, small);
+    expect(growth).toBeLessThanOrEqual(LINEAR_GROWTH_CEILING);
+  });
+
+  it("reads each character a bounded number of times on every corpus case too", () => {
+    for (const source of NAMED_CORPUS) {
+      expect(characterReads(inlineWikilinks, source))
+        .toBeLessThanOrEqual(READS_PER_CHARACTER * source.length + 8);
+    }
   });
 
   it("still finds nothing in a line that never closes an opener", () => {
