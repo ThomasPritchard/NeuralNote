@@ -1,11 +1,11 @@
 {
-  "version": "0.3.0",
-  "notes": "NeuralNote 0.3.0 ALPHA. Ad-hoc signed and unnotarized.",
-  "pub_date": "2026-08-01T15:27:50.510Z",
+  "version": "0.4.0",
+  "notes": "NeuralNote 0.4.0 ALPHA. Ad-hoc signed and unnotarized.",
+  "pub_date": "2026-08-12T11:43:59.916Z",
   "platforms": {
     "darwin-aarch64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUbVFEQWpLQS8yUXdwN2RlSldva3l4N0pURzlKY0hvMzdYRGZubDZGL3RNTytBTmNmYmhDWlhyV1c1aFpaSlZ5cG1GRmhNRDhqRDQxNDNrR3llY0llNEdyMy85eFFjVmdzPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg1NTk4MDY1CWZpbGU6TmV1cmFsTm90ZS5hcHAudGFyLmd6CndqaHdtUi9XVmFvckorMHlIS2NxWkJXUUc0b01oRHdGejFtQkM5dVNUbnVRZFlqcWwwWE5GajJsZ0E1MGE2QmQwczFVQi91dlZtZGVTRnRvbkZISEFRPT0K",
-      "url": "https://github.com/ThomasPritchard/NeuralNote/releases/download/v0.3.0/NeuralNote.app.tar.gz"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVUbVFEQWpLQS8yUTF0OGl5b0k5RE40UFBmY1BobHJYZjZ6MzVNSnhQRVNDWGQyek9Va25naFMyd3NxOVhBZkt6c2UzN0JlTmc4M3pFQUVEQ2tLbEhvaStPZDlSaTExOVFBPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzg2NTM1MDM1CWZpbGU6TmV1cmFsTm90ZS5hcHAudGFyLmd6ClhYbkRaaFdIbmJPdUtiWHRWdERsSFRxNlNUbEd5UGZLR2Q2bGJZR0h3cXRQYjlhL3lCWHl2TmRiMDQ1Rk1hN3VTcEhxZGJSWFhkd3Vianpaa2hyMEFBPT0K",
+      "url": "https://github.com/ThomasPritchard/NeuralNote/releases/download/v0.4.0/NeuralNote.app.tar.gz"
     }
   }
 }
