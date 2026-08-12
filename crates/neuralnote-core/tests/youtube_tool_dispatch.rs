@@ -1116,6 +1116,52 @@ fn cancellation_between_transcription_attempts_prevents_update_and_retry() {
     assert!(result.content.contains("cancelled"));
     assert_eq!(io.transcribe_calls.load(Ordering::SeqCst), 1);
     assert_eq!(io.updates.load(Ordering::SeqCst), 0);
+    // The guard keys on the cancellation FLAG, so it cannot know whether the
+    // attempt it interrupted was healthy. Whatever that attempt reported has to
+    // travel with the cancellation or it is gone for good.
+    assert!(
+        result.content.contains("audio extraction went stale"),
+        "the interrupted attempt's own error must survive: {}",
+        result.content
+    );
+}
+
+#[test]
+fn a_transcription_crash_that_coincides_with_a_stop_still_names_the_crash() {
+    // The silent-failure case. `whisper-cli` dies, and the user presses Stop a
+    // few milliseconds later — or the other way round; from here they are the
+    // same instant. The cancellation guard fires on the flag, not the cause, and
+    // it used to drop the error binding entirely (`Err(_error) if …`), so a real
+    // crash left NO trace: not in the tool result, not in the timeline, nowhere.
+    // That is the one thing this codebase does not do with failures.
+    //
+    // The outcome is still a refusal — the run ended, NeuralNote did not break —
+    // but the account it carries has to be the whole account.
+    let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
+    io.push_transcription(Err(CaptureError::TranscriptionFailed(
+        "whisper-cli exited with signal 11".into(),
+    )));
+    io.cancel_during_transcription();
+    let cancellation = CaptureCancellation::default();
+    let mut session = YoutubeToolSession::new(cancellation);
+    prove_caption_absence(&io, &mut session);
+
+    let result = call(
+        &io,
+        &mut session,
+        &environment(true),
+        TOOL_TRANSCRIBE_AUDIO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    assert!(result.content.contains("cancelled"), "{}", result.content);
+    assert!(
+        result.content.contains("whisper-cli exited with signal 11"),
+        "a crash that raced the Stop must not vanish: {}",
+        result.content
+    );
+    assert_eq!(io.transcribe_calls.load(Ordering::SeqCst), 1);
 }
 
 #[test]
@@ -1145,4 +1191,11 @@ fn cancellation_during_extractor_update_prevents_transcription_retry() {
     assert!(result.content.contains("cancelled"));
     assert_eq!(io.transcribe_calls.load(Ordering::SeqCst), 1);
     assert_eq!(io.updates.load(Ordering::SeqCst), 1);
+    // Same rule one branch over: the staleness that PROMPTED the update is the
+    // only account of why this call went nowhere beyond "the run ended".
+    assert!(
+        result.content.contains("audio extraction went stale"),
+        "the error that triggered the update must survive: {}",
+        result.content
+    );
 }

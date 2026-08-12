@@ -1094,6 +1094,9 @@ impl ChatSession<'_> {
             .with_youtube(self.skill_services.youtube_io, youtube_session)
             .with_youtube_requirements(self.skill_services.youtube_requirements)
             .with_vault_profile_io(self.skill_services.vault_profile_io)
+            // The same token `run_cancelled` reads. A call that comes apart
+            // because the user pressed Stop must not be attributed to the vault.
+            .with_cancellation(self.skill_services.capture_cancellation.clone())
             .with_plan(plan);
             if let Some(pricing) = self.skill_services.pricing {
                 context = context.with_pricing(pricing);
@@ -1146,6 +1149,7 @@ impl ChatSession<'_> {
             ToolOutcome::Listed
             | ToolOutcome::Action
             | ToolOutcome::Rejected
+            | ToolOutcome::Cancelled
             | ToolOutcome::Failed { .. } => {}
         }
         result
@@ -1553,7 +1557,14 @@ fn playlist_failure_reason(outcome: &ToolOutcome, tool: &str) -> Option<String> 
     match outcome {
         ToolOutcome::Rejected => Some(format!("tool '{tool}' was rejected")),
         ToolOutcome::Failed { message } => Some(format!("tool '{tool}' failed: {message}")),
-        ToolOutcome::Listed
+        // A run the user stopped does not FAIL its work item, and recording it
+        // as failed would advance past the item and stamp the false story into
+        // the run summary the user reads back. The cancellation path already
+        // owns this: `cancel_playlist_remaining` marks this item and every one
+        // behind it `Cancelled`, from the batch loop on the next call or from
+        // `playlist_preflight` on the next turn.
+        ToolOutcome::Cancelled
+        | ToolOutcome::Listed
         | ToolOutcome::Searched { .. }
         | ToolOutcome::Read { .. }
         | ToolOutcome::Action => None,
@@ -1581,6 +1592,11 @@ fn settlement_for(result: &tools::ToolResult) -> ToolSettlement {
         // broke (#116). A summary would only repeat the disclosure below.
         ToolOutcome::Rejected => (ToolStatus::Rejected, None),
         ToolOutcome::Failed { .. } => (ToolStatus::Error, None),
+        // …and the third, which is neither: the run ended under the call. The
+        // status already exists and already renders as "run ended first"; it
+        // simply had no producer on this path until one could tell a user's Stop
+        // from a vault that broke.
+        ToolOutcome::Cancelled => (ToolStatus::Cancelled, None),
     };
     ToolSettlement {
         status,
@@ -3598,6 +3614,155 @@ mod tests {
             .unwrap_or_else(|| panic!("call '{call_id}' never settled"))
     }
 
+    /// The bounded disclosure the timeline node shows under a settled call.
+    fn settled_detail(events: &[ChatEvent], call_id: &str) -> String {
+        events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::ToolResult { id, detail, .. } if id == call_id => Some(detail.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("call '{call_id}' never settled"))
+            .unwrap_or_default()
+    }
+
+    /// A provider whose every vault call answers the way the shell's run-scoped
+    /// wrapper does once the user has pressed Stop: a `CoreError::Conflict`
+    /// raised by `ensure_run_active`
+    /// (`app/desktop/src-tauri/src/skills/note_writer.rs`), not by anything in
+    /// the vault going wrong.
+    struct StoppedRunProvider;
+
+    impl StoppedRunProvider {
+        fn stopped<T>() -> CoreResult<T> {
+            Err(CoreError::Conflict(
+                "chat run ended before the note write completed".into(),
+            ))
+        }
+    }
+
+    impl RetrievalProvider for StoppedRunProvider {
+        fn list_notes(&self, _folder: Option<&str>) -> CoreResult<ListOutcome> {
+            Self::stopped()
+        }
+        fn list_folders(&self) -> CoreResult<Vec<FolderMeta>> {
+            Self::stopped()
+        }
+        fn search_notes(
+            &self,
+            _query: &str,
+            _max_results: usize,
+            _folder: Option<&str>,
+        ) -> CoreResult<SearchOutcome> {
+            Self::stopped()
+        }
+        fn read_note_span(
+            &self,
+            _rel_path: &str,
+            _start_line: u32,
+            _end_line: u32,
+            _max_bytes: usize,
+        ) -> CoreResult<crate::ai::evidence::EvidenceSpan> {
+            Self::stopped()
+        }
+    }
+
+    #[test]
+    fn a_call_cut_short_by_the_user_pressing_stop_is_not_reported_as_a_failure() {
+        // `CoreError::Conflict` has three unrelated producers and only one of
+        // them is breakage. Two are not: the `write_note` cap refusal, and this
+        // one — the run-scoped wrapper answering "the run ended" once the user
+        // pressed Stop. The variant cannot separate them, so the state of the
+        // RUN has to. A call that came apart while the run was already
+        // cancelling did not fail, and painting a destructive-red "failed" node
+        // for something the user deliberately asked for is the one account that
+        // is certainly false.
+        //
+        // `Cancelled`, not `Rejected`: NeuralNote refused nothing either. The
+        // timeline already renders that status as "run ended first", in the calm
+        // register, which is exactly what happened.
+        let vault = vault();
+        let llm = MockLlmClient::new(
+            vec![Completion {
+                content: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "list_notes".into(),
+                        arguments: "{}".into(),
+                    },
+                    // Both stories in ONE run, so they cannot be checked against
+                    // different worlds: `c2` never reached the vault, and a Stop
+                    // arriving afterwards does not retrospectively make the
+                    // model's nonsense arguments the run's fault.
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "search_notes".into(),
+                        arguments: r#"{"not_a_query":1}"#.into(),
+                    },
+                ],
+            }],
+            "The run ended early.",
+        );
+        let cancellation = CaptureCancellation::default();
+        cancellation.cancel();
+
+        let events = run_with_provider_and_cancellation(
+            vault.path(),
+            &StoppedRunProvider,
+            &llm,
+            &Guards::default(),
+            cancellation,
+        );
+
+        assert_eq!(
+            settled_status(&events, "c1"),
+            ToolStatus::Cancelled,
+            "a user's own Stop is neither a failure nor a refusal"
+        );
+        assert_eq!(
+            settled_status(&events, "c2"),
+            ToolStatus::Rejected,
+            "a refusal stays a refusal: nothing was attempted, so the run ending changes nothing about it"
+        );
+        // Nothing is swallowed to buy the gentler status. The disclosure still
+        // carries the underlying error, so a genuine fault that happened to
+        // coincide with a Stop is still there to read — only the attribution
+        // changes.
+        assert!(
+            settled_detail(&events, "c1").contains("chat run ended"),
+            "the underlying error must survive the re-attribution, got {:?}",
+            settled_detail(&events, "c1")
+        );
+    }
+
+    #[test]
+    fn the_same_conflict_in_a_live_run_still_settles_as_a_failure() {
+        // The mirror, and the reason the test above cannot be satisfied by a
+        // guard that simply never reports failures. An atomic-note collision is
+        // the third `Conflict` producer and it IS breakage — the run is live,
+        // nobody stopped anything, and calling that "run ended first" would be
+        // the same false attribution pointed the other way.
+        let vault = vault();
+        let llm = MockLlmClient::new(
+            vec![tool_call("c1", "list_notes", "{}")],
+            "Nothing found.",
+        );
+
+        let events = run_with_provider(
+            vault.path(),
+            &StoppedRunProvider,
+            &llm,
+            &Guards::default(),
+        );
+
+        assert_eq!(
+            settled_status(&events, "c1"),
+            ToolStatus::Error,
+            "a conflict in a run nobody stopped is still a failure"
+        );
+    }
+
     #[test]
     fn every_vault_tool_that_ran_and_failed_settles_as_an_error_not_a_refusal() {
         // Issue #116. Each of these reached the vault and the vault blew up.
@@ -3692,6 +3857,24 @@ mod tests {
         mock: &MockLlmClient,
         guards: &Guards,
     ) -> Vec<ChatEvent> {
+        run_with_provider_and_cancellation(
+            root,
+            provider,
+            mock,
+            guards,
+            CaptureCancellation::default(),
+        )
+    }
+
+    /// The same run with the host's cancellation token supplied, for the cases
+    /// where what a settled call MEANS depends on whether the run is still live.
+    fn run_with_provider_and_cancellation(
+        root: &Path,
+        provider: &dyn RetrievalProvider,
+        mock: &MockLlmClient,
+        guards: &Guards,
+        cancellation: CaptureCancellation,
+    ) -> Vec<ChatEvent> {
         let skills = SkillRegistry::built_in(&[]).unwrap();
         let environment = SkillEnvironment {
             hardware: HardwareSpec {
@@ -3712,7 +3895,8 @@ mod tests {
             &NoUserPrompt,
             &UnavailableNoteWriter,
             1,
-        );
+        )
+        .with_capture_cancellation(cancellation);
         let mut sink = VecSink::default();
         block_on(run_chat(
             "how do widgets work?",

@@ -4,7 +4,7 @@ use crate::ai::elicitation::{elicit_user, ElicitationOutcome};
 use crate::ai::events::{ElicitOption, Elicitation};
 use crate::ai::llm::UserPrompt;
 use crate::ai::skills::YOUTUBE_DISTIL_SKILL_ID;
-use crate::ai::tools::{action, reject, ToolContext, ToolResult};
+use crate::ai::tools::{action, reject, settle_vault_error, ToolContext, ToolResult};
 use crate::ai::youtube_tool_errors::settle_capture_error;
 use crate::capture::{
     parse_vault_profile, resolve_distil_route, serialize_vault_profile, CaptureError, MocPolicy,
@@ -36,7 +36,7 @@ pub(super) async fn dispatch_resolve_distil_route(
     };
     let (inventory, truncated, skipped) = match build_inventory(provider) {
         Ok(inventory) => inventory,
-        Err(error) => return settle_capture_error(error),
+        Err(result) => return result,
     };
     let mut profile = match load_profile(context) {
         Ok(profile) => profile,
@@ -67,15 +67,28 @@ pub(super) async fn dispatch_resolve_distil_route(
     action(route_json(&route, truncated, skipped).to_string())
 }
 
+/// Read the vault's shape for the route decision.
+///
+/// These are the SAME two calls `list_folders` and `list_notes` dispatch, so
+/// their failures settle through the same seam — [`settle_vault_error`] — rather
+/// than through a second, private classification here. They used to be
+/// blanket-wrapped as `CaptureError::ProfileInvalid`, which said two false things
+/// at once: it reported a refusal (`NotFound`, `OutsideVault`, `InvalidName`) as
+/// a failure, and it told the model the stored profile was broken when the
+/// profile had not even been read yet.
+///
+/// Failing with a `ToolResult` rather than an error keeps the classification at
+/// one seam. It is the shape `elicit_and_persist_route` already uses in this
+/// file, for the same reason.
 fn build_inventory(
     provider: &dyn crate::ai::retrieval::RetrievalProvider,
-) -> Result<(VaultInventory, bool, u32), CaptureError> {
-    let folders = provider.list_folders().map_err(|error| {
-        CaptureError::ProfileInvalid(format!("could not inspect vault folders: {error}"))
-    })?;
-    let notes = provider.list_notes(None).map_err(|error| {
-        CaptureError::ProfileInvalid(format!("could not inspect vault notes: {error}"))
-    })?;
+) -> Result<(VaultInventory, bool, u32), ToolResult> {
+    let folders = provider
+        .list_folders()
+        .map_err(|error| settle_capture_error(CaptureError::ProfileInvalid(format!("could not inspect vault folders: {error}"))))?;
+    let notes = provider
+        .list_notes(None)
+        .map_err(|error| settle_vault_error("could not inspect vault notes", &error))?;
     let inventory = VaultInventory {
         folders: folders
             .into_iter()

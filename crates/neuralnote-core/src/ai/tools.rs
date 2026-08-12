@@ -18,7 +18,9 @@ use crate::ai::retrieval::RetrievalProvider;
 use crate::ai::skill_tools;
 use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
 use crate::ai::write_policy::{NoteWriteBackend, WriteSession};
-use crate::ai::youtube::{YoutubeIo, YoutubeToolSession, UNAVAILABLE_YOUTUBE_IO};
+use crate::ai::youtube::{
+    CaptureCancellation, YoutubeIo, YoutubeToolSession, UNAVAILABLE_YOUTUBE_IO,
+};
 use crate::ai::youtube_tools;
 use crate::capture::{PricingInput, UnavailableVaultProfileIo, VaultProfileIo};
 use crate::error::CoreError;
@@ -87,6 +89,21 @@ pub enum ToolOutcome {
     /// carried structurally so the orchestrator can report the failure without
     /// parsing it back out of the model-facing envelope.
     Failed { message: String },
+    /// The call did not deliver because the RUN ended underneath it — the user
+    /// pressed Stop, or the window closed. Nobody refused anything and nothing
+    /// broke.
+    ///
+    /// A third account for the same reason [`Self::Rejected`] and [`Self::Failed`]
+    /// are two: it is the only one where nothing is wrong. It settles as
+    /// [`ToolStatus::Cancelled`](crate::ai::events::ToolStatus::Cancelled), which
+    /// the timeline already renders as "run ended first" in the calm register.
+    ///
+    /// Produced only by [`settle_against_run_state`], never by a dispatcher —
+    /// which is deliberate. No error variant can identify this case, because the
+    /// producers are indistinguishable at the point they are raised (see that
+    /// function). Only the state of the run can, and only the dispatch boundary
+    /// can see both.
+    Cancelled,
 }
 
 /// Internal orchestration control carried alongside a normal tool result.
@@ -127,6 +144,13 @@ pub struct ToolContext<'a> {
     /// `update_plan` then rejects rather than pretending to record a plan.
     pub(super) plan: Option<&'a mut RunPlan>,
     authorized_tools: &'a BTreeSet<String>,
+    /// The run's cancellation token, shared with the host. Read once, after the
+    /// tool has run, by [`settle_against_run_state`].
+    ///
+    /// Defaults to a token nobody can cancel, so a caller that wires none simply
+    /// never re-attributes — today's behaviour exactly, rather than a silently
+    /// different one.
+    cancellation: CaptureCancellation,
 }
 
 impl<'a> ToolContext<'a> {
@@ -156,7 +180,15 @@ impl<'a> ToolContext<'a> {
             pricing: None,
             plan: None,
             authorized_tools,
+            cancellation: CaptureCancellation::default(),
         }
+    }
+
+    /// Wire the run's cancellation token, so a call that comes apart *because*
+    /// the run ended is reported as the run ending rather than as a failure.
+    pub fn with_cancellation(mut self, cancellation: CaptureCancellation) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     /// Wire the run's plan, so `update_plan` has somewhere to record one.
@@ -326,6 +358,55 @@ fn read_note_span_schema() -> Value {
 /// cannot produce one for a gated tool, and the private one inside
 /// [`approval::decide`](crate::ai::approval::decide).
 pub async fn dispatch(
+    approved: &ApprovedCall,
+    provider: &dyn RetrievalProvider,
+    registry: &mut EvidenceRegistry,
+    user_prompt: &dyn UserPrompt,
+    context: &mut ToolContext<'_>,
+) -> ToolResult {
+    let result = run_tool(approved, provider, registry, user_prompt, context).await;
+    settle_against_run_state(result, context)
+}
+
+/// Re-read a settled call against the state of the RUN, which no error variant
+/// can see.
+///
+/// [`settle_vault_error`] and its capture-side twin classify on the variant,
+/// because that is the only thing that separates the stories *within* one call.
+/// It is not enough on its own: `CoreError::Conflict` has three unrelated
+/// producers and only one of them is breakage —
+///
+/// * a user Stop — the shell's run-scoped wrapper (`ensure_run_active` in
+///   `app/desktop/src-tauri/src/skills/note_writer.rs`) answers `Conflict` for
+///   every write once the close signal is set;
+/// * a policy refusal — the `write_note` cap in `write_policy`;
+/// * a genuine conflict — an atomic-note collision, also in `write_policy`.
+///
+/// They arrive identical, so no amount of care at the variant seam can tell them
+/// apart. What separates them is whether the run was still live, and the
+/// dispatch boundary is the one place that sees both that and the result.
+///
+/// Only [`ToolOutcome::Failed`] is re-attributed. A refusal stays a refusal: the
+/// model's arguments were nonsense whether or not the user later pressed Stop,
+/// and nothing was attempted either way.
+///
+/// **The content is deliberately untouched.** Nothing is swallowed to buy the
+/// gentler status: the model still reads the real error, and the timeline's
+/// disclosure still shows it. A genuine fault that happened to coincide with a
+/// Stop is therefore still legible — only the blame moves, and it moves off the
+/// user, who is the one party certainly not at fault.
+fn settle_against_run_state(result: ToolResult, context: &ToolContext<'_>) -> ToolResult {
+    if !matches!(result.outcome, ToolOutcome::Failed { .. }) || !context.cancellation.is_cancelled()
+    {
+        return result;
+    }
+    ToolResult {
+        outcome: ToolOutcome::Cancelled,
+        ..result
+    }
+}
+
+async fn run_tool(
     approved: &ApprovedCall,
     provider: &dyn RetrievalProvider,
     registry: &mut EvidenceRegistry,

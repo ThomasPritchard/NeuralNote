@@ -3,10 +3,13 @@ mod route_support;
 mod support;
 mod youtube_support;
 
-use neuralnote_core::ai::tools::{ToolOutcome, TOOL_RESOLVE_DISTIL_ROUTE};
+use neuralnote_core::ai::tools::{ToolOutcome, TOOL_LIST_FOLDERS, TOOL_RESOLVE_DISTIL_ROUTE};
 use neuralnote_core::ai::{KeywordRetriever, YoutubeToolSession};
 use neuralnote_core::capture::{parse_vault_profile, PersistedVaultScheme};
-use route_support::{write_note, ErrorProfileIo, FailingRetrieval, RetrievalFailure};
+use neuralnote_core::CoreError;
+use route_support::{
+    write_note, ChosenVaultError, ErrorProfileIo, FailingRetrieval, RetrievalFailure,
+};
 use std::fs;
 use std::sync::Mutex;
 use youtube_support::{call, MemoryProfileIo, PlaylistIo, ScriptedPrompt};
@@ -143,6 +146,74 @@ fn route_refuses_bad_arguments_but_reports_a_failed_inventory_read_as_a_failure(
         );
         support::assert_tool_failed(&result.outcome);
         assert!(result.content.contains(expected), "{}", result.content);
+    }
+}
+
+#[test]
+fn one_vault_error_reads_the_same_through_the_route_and_the_listing_dispatchers() {
+    // `resolve_distil_route` inspects the vault with the SAME two calls
+    // `list_folders` and `list_notes` make — `provider.list_folders()` and
+    // `provider.list_notes(None)`. Nothing tied the two accounts together, so
+    // the route path could blanket-wrap every `CoreError` as `ProfileInvalid`
+    // (a failure, and a lie about the stored profile) while the listing path
+    // settled the identical error through `settle_vault_error` as a refusal.
+    // One `CoreError::NotFound`, two contradictory stories, seconds apart.
+    //
+    // This is the check nobody had: it does not name the right answer per seam,
+    // it asserts they AGREE, which is the property that was actually broken. The
+    // per-seam correctness is pinned separately by `settle_vault_error`'s own
+    // exhaustive test.
+    //
+    // Both buckets are exercised deliberately: the earlier fixture used only
+    // `Io`, which is the one variant where the two seams already agreed, so it
+    // could never have caught this.
+    let vault = tempfile::tempdir().unwrap();
+    let profile = MemoryProfileIo::default();
+    let prompt = ScriptedPrompt::default();
+
+    for error in [
+        CoreError::NotFound("Reference".into()),
+        CoreError::OutsideVault("../../etc".into()),
+        CoreError::InvalidName("".into()),
+        CoreError::Io("the vault volume disappeared".into()),
+    ] {
+        let provider = ChosenVaultError(error.clone());
+        let listed = call(
+            vault.path(),
+            &provider,
+            &PlaylistIo::default(),
+            &mut YoutubeToolSession::default(),
+            &profile,
+            &prompt,
+            TOOL_LIST_FOLDERS,
+            "{}",
+        );
+        let routed = call(
+            vault.path(),
+            &provider,
+            &PlaylistIo::default(),
+            &mut YoutubeToolSession::default(),
+            &profile,
+            &prompt,
+            TOOL_RESOLVE_DISTIL_ROUTE,
+            r#"{"topic":"Testing"}"#,
+        );
+
+        assert_eq!(
+            std::mem::discriminant(&listed.outcome),
+            std::mem::discriminant(&routed.outcome),
+            "{error} settles as {:?} through list_folders and {:?} through \
+             resolve_distil_route — one event cannot have two accounts",
+            listed.outcome,
+            routed.outcome
+        );
+        // …and the route no longer blames the stored profile for something the
+        // profile had nothing to do with.
+        assert!(
+            !routed.content.contains("profile_invalid"),
+            "a vault-inspection error is not an invalid stored profile: {}",
+            routed.content
+        );
     }
 }
 

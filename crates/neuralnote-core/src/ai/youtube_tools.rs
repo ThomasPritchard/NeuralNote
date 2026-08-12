@@ -561,15 +561,17 @@ async fn transcription_with_retry(
         .transcribe_audio(url, model, session.cancellation())
         .await
     {
-        Err(_error) if session.cancellation().is_cancelled() => Err(CaptureError::Cancelled(
-            "transcription was cancelled before a fallback retry".into(),
+        Err(error) if session.cancellation().is_cancelled() => Err(cancelled_after(
+            "transcription was cancelled before a fallback retry",
+            &error,
         )),
         Err(error) => match session.decide(&error) {
             CaptureAction::UpdateExtractorAndRetry => {
                 update_extractor(io, session).await;
                 if session.cancellation().is_cancelled() {
-                    Err(CaptureError::Cancelled(
-                        "transcription was cancelled during extractor update".into(),
+                    Err(cancelled_after(
+                        "transcription was cancelled during extractor update",
+                        &error,
                     ))
                 } else {
                     io.transcribe_audio(url, model, session.cancellation())
@@ -580,6 +582,25 @@ async fn transcription_with_retry(
         },
         success => success,
     }
+}
+
+/// A cancellation that interrupted an attempt which had ALREADY failed.
+///
+/// Both call sites above key on the cancellation *flag*, never on the cause — so
+/// they fire identically whether the run was healthy when the user pressed Stop
+/// or `whisper-cli` had just died. The flag cannot carry that difference and the
+/// original error is the only thing that can, so it travels in the detail rather
+/// than being dropped on the floor. `settle_capture_error` projects `detail()` to
+/// both the model and the timeline, so this is where a crash that raced a Stop
+/// stays visible.
+///
+/// It stays a `Cancelled`, not a `TranscriptionFailed`: the run is over either
+/// way and the user asked for that, so the headline is still "the run ended".
+/// What changes is that the headline is no longer the whole story.
+fn cancelled_after(what_happened: &str, cause: &CaptureError) -> CaptureError {
+    CaptureError::Cancelled(format!(
+        "{what_happened}; the attempt in flight had already failed ({cause})"
+    ))
 }
 
 pub(super) async fn update_extractor(io: &dyn YoutubeIo, session: &mut YoutubeToolSession) {
