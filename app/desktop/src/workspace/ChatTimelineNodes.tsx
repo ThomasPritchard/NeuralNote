@@ -106,8 +106,10 @@ export function ThinkingNode({
  *  exactly that reason. The gate distinguishes them on the wire and the
  *  orchestrator now carries the distinction through, so a request that expired
  *  while the user was away no longer reports itself as something they refused.
- *  (`error` still has no producer — it is rendered correctly now so the wire
- *  contract has a consumer.)
+ *  (`error` is a fourth, and it is the one that is not about *who* stopped the
+ *  call: `ToolOutcome::Failed` means the call ran and broke. Keep it distinct
+ *  from `denied` — telling a user NeuralNote refused something it actually
+ *  attempted and failed at is the same lie in the opposite direction.)
  *
  *  The glyph column reads before any text, so each of the three now carries its
  *  own, matching the approval node's vocabulary in `approvalCopy` (one act, two
