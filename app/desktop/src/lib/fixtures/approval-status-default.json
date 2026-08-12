@@ -1,0 +1,19 @@
+{
+  "mode": "alwaysAsk",
+  "toolOverrides": {},
+  "effectiveModes": {
+    "fetch_captions": "alwaysAsk",
+    "fetch_video_info": "alwaysAsk",
+    "resolve_distil_route": "alwaysAsk",
+    "select_playlist_videos": "alwaysAsk",
+    "transcribe_audio": "alwaysAsk",
+    "use_skill": "alwaysAsk",
+    "write_note": "alwaysAsk"
+  },
+  "classifierAvailable": false,
+  "irreversibleActions": [
+    "saving how it files your notes",
+    "fetching pages and captions from the internet",
+    "running audio transcription on your machine"
+  ]
+}
