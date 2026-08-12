@@ -3,6 +3,7 @@ use neuralnote_core::ai::approval::{
     self, ApprovalContext, ApprovalDecision, ApprovalGate, ApprovalMode, ApprovalPolicy,
     ApprovedCall, DenyingApprovalPrompt, UnavailableApprovalClassifier,
 };
+use neuralnote_core::ai::tools::ToolOutcome;
 use neuralnote_core::ai::{
     ChatEvent, EventSink, NotePathState, NoteWriteBackend, NoteWriteParent, OpenedNoteParent,
     ToolCall, TOOL_TRANSCRIBE_AUDIO,
@@ -12,6 +13,22 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
+
+/// Assert a call settled in the "I tried this and it failed" bucket rather than
+/// the "I refused this" one (#116).
+///
+/// A bucket check on purpose: `ToolOutcome::Failed` carries the model-facing
+/// sentence, and the suites using this already assert that sentence through
+/// `content`. Shared so the three YouTube suites state the distinction
+/// identically rather than each inventing a spelling for it.
+#[allow(dead_code)]
+#[track_caller]
+pub fn assert_tool_failed(outcome: &ToolOutcome) {
+    assert!(
+        matches!(outcome, ToolOutcome::Failed { .. }),
+        "expected a call that ran and failed, got {outcome:?}"
+    );
+}
 
 pub struct FsBackend;
 

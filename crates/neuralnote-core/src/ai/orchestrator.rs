@@ -916,11 +916,10 @@ impl ChatSession<'_> {
                 sink,
             )
             .await;
-        if result.outcome == ToolOutcome::Rejected
-            && youtube_session.playlist_is_active()
-            && call.name != tools::TOOL_SELECT_PLAYLIST_VIDEOS
-        {
-            youtube_session.fail_playlist_item(format!("tool '{}' was rejected", call.name));
+        if youtube_session.playlist_is_active() && call.name != tools::TOOL_SELECT_PLAYLIST_VIDEOS {
+            if let Some(reason) = playlist_failure_reason(&result.outcome, &call.name) {
+                youtube_session.fail_playlist_item(reason);
+            }
         }
         let settlement = settlement_for(&result);
         *context_chars += result.content.len();
@@ -1125,9 +1124,13 @@ impl ChatSession<'_> {
                 });
                 push_unique(&mut coverage.notes_read, rel_path);
             }
-            // Metadata listing needs no event; a rejected call's error is in the tool
-            // result the model reads.
-            ToolOutcome::Listed | ToolOutcome::Action | ToolOutcome::Rejected => {}
+            // Metadata listing needs no event; a refused or failed call's error
+            // is in the tool result the model reads and in the settlement the
+            // timeline node renders.
+            ToolOutcome::Listed
+            | ToolOutcome::Action
+            | ToolOutcome::Rejected
+            | ToolOutcome::Failed { .. } => {}
         }
         result
     }
@@ -1521,6 +1524,26 @@ fn emit_tool_result(sink: &mut dyn EventSink, id: &str, settlement: ToolSettleme
     });
 }
 
+/// Why the active playlist item cannot continue, if this call is what ended it.
+///
+/// Both a refusal and a failure stop the item — a capture that never ran and one
+/// that ran and came apart leave the item equally unable to proceed. But the
+/// recorded reason is read back to the user in the run summary, so it has to
+/// tell the true story rather than calling every non-delivery a rejection (#116).
+///
+/// Exhaustive, no wildcard arm: a new [`ToolOutcome`] must decide here whether
+/// it ends the item before it compiles.
+fn playlist_failure_reason(outcome: &ToolOutcome, tool: &str) -> Option<String> {
+    match outcome {
+        ToolOutcome::Rejected => Some(format!("tool '{tool}' was rejected")),
+        ToolOutcome::Failed { message } => Some(format!("tool '{tool}' failed: {message}")),
+        ToolOutcome::Listed
+        | ToolOutcome::Searched { .. }
+        | ToolOutcome::Read { .. }
+        | ToolOutcome::Action => None,
+    }
+}
+
 /// Read a dispatched result in the timeline's vocabulary. Every summary here is
 /// composed from the structured [`ToolOutcome`], never from model prose.
 fn settlement_for(result: &tools::ToolResult) -> ToolSettlement {
@@ -1537,7 +1560,11 @@ fn settlement_for(result: &tools::ToolResult) -> ToolSettlement {
             Some(format!("{rel_path}:{start_line}–{end_line}")),
         ),
         ToolOutcome::Listed | ToolOutcome::Action => (ToolStatus::Ok, None),
+        // The two refusals-that-are-not are kept apart here and nowhere else:
+        // `Rejected` says the system protected the user, `Error` says something
+        // broke (#116). A summary would only repeat the disclosure below.
         ToolOutcome::Rejected => (ToolStatus::Rejected, None),
+        ToolOutcome::Failed { .. } => (ToolStatus::Error, None),
     };
     ToolSettlement {
         status,
@@ -2233,6 +2260,52 @@ mod settlement_tests {
     }
 
     #[test]
+    fn a_failed_call_settles_as_an_error_and_still_discloses_its_reason() {
+        let settlement = settlement_for(&tools::ToolResult {
+            content: r#"{"error":"search failed: io error: the volume disappeared"}"#.into(),
+            outcome: ToolOutcome::Failed {
+                message: "search failed: io error: the volume disappeared".into(),
+            },
+            control: tools::ToolControl::Continue,
+        });
+
+        assert_eq!(settlement.status, ToolStatus::Error);
+        assert_eq!(
+            settlement.detail,
+            Some("search failed: io error: the volume disappeared".into())
+        );
+    }
+
+    #[test]
+    fn a_playlist_item_records_why_it_stopped_not_merely_that_it_did() {
+        // Both stories end the item — a capture that never ran and one that ran
+        // and came apart leave it equally unable to proceed. But the reason is
+        // read back to the user in the run summary, so calling every
+        // non-delivery a rejection buries the actual cause (#116).
+        let refused = playlist_failure_reason(&ToolOutcome::Rejected, "fetch_captions")
+            .expect("a refusal ends the item");
+        let failed = playlist_failure_reason(
+            &ToolOutcome::Failed {
+                message: "Sign in to confirm you're not a bot".into(),
+            },
+            "fetch_captions",
+        )
+        .expect("a failure ends the item too");
+
+        assert!(refused.contains("rejected"), "{refused}");
+        assert!(
+            failed.contains("Sign in to confirm you're not a bot"),
+            "the item must record what actually went wrong: {failed}"
+        );
+        assert_ne!(refused, failed);
+        // A call that delivered leaves the item running.
+        assert_eq!(
+            playlist_failure_reason(&ToolOutcome::Action, "write_note"),
+            None
+        );
+    }
+
+    #[test]
     fn a_disclosure_is_bounded_and_never_splits_a_character() {
         // A tool result can be a whole transcript. The disclosure is a peek.
         let long = "é".repeat(MAX_TOOL_DETAIL_CHARS + 50);
@@ -2258,7 +2331,7 @@ mod tests {
     use crate::ai::llm::{Completion, NoUserPrompt};
     use crate::ai::local::HardwareSpec;
     use crate::ai::plan::{PlanStep, StepStatus};
-    use crate::ai::retrieval::KeywordRetriever;
+    use crate::ai::retrieval::{FolderMeta, KeywordRetriever, ListOutcome, SearchOutcome};
     use crate::ai::skills::{SkillEnvironment, SkillRegistry};
     use crate::ai::write_policy::UnavailableNoteWriter;
     use crate::ai::{
@@ -3462,7 +3535,145 @@ mod tests {
     }
 
     fn run(root: &Path, mock: &MockLlmClient, guards: &Guards) -> Vec<ChatEvent> {
-        let retriever = KeywordRetriever::new(root);
+        run_with_provider(root, &KeywordRetriever::new(root), mock, guards)
+    }
+
+    /// A provider whose every vault operation blows up the way a real one does
+    /// when the disk goes away mid-run: the call is dispatched, reaches the
+    /// vault, and fails there. Nothing here is a validation refusal.
+    struct FailingProvider;
+
+    impl RetrievalProvider for FailingProvider {
+        fn list_notes(&self, _folder: Option<&str>) -> CoreResult<ListOutcome> {
+            Err(CoreError::Io("the vault volume disappeared".into()))
+        }
+        fn list_folders(&self) -> CoreResult<Vec<FolderMeta>> {
+            Err(CoreError::Io("the vault volume disappeared".into()))
+        }
+        fn search_notes(
+            &self,
+            _query: &str,
+            _max_results: usize,
+            _folder: Option<&str>,
+        ) -> CoreResult<SearchOutcome> {
+            Err(CoreError::Io("the vault volume disappeared".into()))
+        }
+        fn read_note_span(
+            &self,
+            _rel_path: &str,
+            _start_line: u32,
+            _end_line: u32,
+            _max_bytes: usize,
+        ) -> CoreResult<crate::ai::evidence::EvidenceSpan> {
+            Err(CoreError::Io("the vault volume disappeared".into()))
+        }
+    }
+
+    /// How the timeline node for `call_id` settled.
+    fn settled_status(events: &[ChatEvent], call_id: &str) -> ToolStatus {
+        events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::ToolResult { id, status, .. } if id == call_id => Some(*status),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("call '{call_id}' never settled"))
+    }
+
+    #[test]
+    fn every_vault_tool_that_ran_and_failed_settles_as_an_error_not_a_refusal() {
+        // Issue #116. Each of these reached the vault and the vault blew up.
+        // Settling that as `Rejected` renders "· refused by NeuralNote", telling
+        // the user NeuralNote DECLINED a call it in fact attempted — the one
+        // account that is definitely false.
+        //
+        // All four read-only tools are pinned, not just the one that happened to
+        // have a test: they share the `settle_vault_error` seam, so a regression
+        // in any of them is the same regression.
+        let vault = vault();
+        let calls = [
+            ("c1", tools::TOOL_SEARCH_NOTES, r#"{"query":"widgets"}"#),
+            ("c2", tools::TOOL_LIST_NOTES, "{}"),
+            ("c3", tools::TOOL_LIST_FOLDERS, "{}"),
+            (
+                "c4",
+                tools::TOOL_READ_NOTE_SPAN,
+                r#"{"rel_path":"Research/widgets.md","start_line":1,"end_line":2}"#,
+            ),
+        ];
+        let llm = MockLlmClient::new(
+            vec![Completion {
+                content: None,
+                tool_calls: calls
+                    .iter()
+                    .map(|(id, name, arguments)| ToolCall {
+                        id: (*id).into(),
+                        name: (*name).into(),
+                        arguments: (*arguments).into(),
+                    })
+                    .collect(),
+            }],
+            "Nothing found.",
+        );
+
+        let events = run_with_provider(vault.path(), &FailingProvider, &llm, &Guards::default());
+
+        for (id, name, _) in &calls {
+            assert_eq!(
+                settled_status(&events, id),
+                ToolStatus::Error,
+                "{name} ran and failed; it must not be reported as a refusal"
+            );
+        }
+    }
+
+    #[test]
+    fn a_malformed_argument_call_is_refused_and_never_collapses_into_a_failure() {
+        // The other half of the same split, asserted in ONE run so the two
+        // stories cannot be checked against different worlds: `c1` never
+        // reached the vault (the model sent nonsense), `c2` did and the vault
+        // failed. They must settle differently, or the status vocabulary is
+        // saying one thing about two events.
+        let vault = vault();
+        let llm = MockLlmClient::new(
+            vec![Completion {
+                content: None,
+                tool_calls: vec![
+                    ToolCall {
+                        id: "c1".into(),
+                        name: "search_notes".into(),
+                        arguments: r#"{"not_a_query":1}"#.into(),
+                    },
+                    ToolCall {
+                        id: "c2".into(),
+                        name: "search_notes".into(),
+                        arguments: r#"{"query":"widgets"}"#.into(),
+                    },
+                ],
+            }],
+            "Nothing found.",
+        );
+
+        let events = run_with_provider(vault.path(), &FailingProvider, &llm, &Guards::default());
+        let (refused, failed) = (settled_status(&events, "c1"), settled_status(&events, "c2"));
+
+        assert_eq!(
+            refused,
+            ToolStatus::Rejected,
+            "arguments that never parsed are a refusal, not a failure"
+        );
+        assert_ne!(
+            refused, failed,
+            "a refusal and a failure must not settle as the same status"
+        );
+    }
+
+    fn run_with_provider(
+        root: &Path,
+        provider: &dyn RetrievalProvider,
+        mock: &MockLlmClient,
+        guards: &Guards,
+    ) -> Vec<ChatEvent> {
         let skills = SkillRegistry::built_in(&[]).unwrap();
         let environment = SkillEnvironment {
             hardware: HardwareSpec {
@@ -3491,7 +3702,7 @@ mod tests {
             Vec::new(),
             root,
             "test-model",
-            &retriever,
+            provider,
             mock,
             &services,
             &mut sink,

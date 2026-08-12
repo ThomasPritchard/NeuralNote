@@ -6,8 +6,9 @@ use crate::ai::llm::UserPrompt;
 use crate::ai::orchestrator::{activation_failure_message, skill_activation_failed};
 use crate::ai::skills::YOUTUBE_DISTIL_SKILL_ID;
 use crate::ai::tools::{
-    action, function_tool, reject, reject_and_complete, ToolContext, ToolControl, ToolOutcome,
-    ToolResult, TOOL_ASK_USER, TOOL_SKILL_STEP, TOOL_USE_SKILL, TOOL_WRITE_NOTE,
+    action, function_tool, reject, reject_and_complete, settle_vault_error, ToolContext,
+    ToolControl, ToolOutcome, ToolResult, TOOL_ASK_USER, TOOL_SKILL_STEP, TOOL_USE_SKILL,
+    TOOL_WRITE_NOTE,
 };
 use crate::ai::write_policy::{write_note_policy, NoteKind, WriteOutcome};
 use serde::Deserialize;
@@ -269,6 +270,6 @@ pub(super) fn dispatch_write_note(args_json: &str, context: &mut ToolContext<'_>
             });
             action(json!({ "existed": true, "rel_path": rel_path }).to_string())
         }
-        Err(error) => reject(format!("write_note failed: {error}")),
+        Err(error) => settle_vault_error("write_note failed", &error),
     }
 }

@@ -88,7 +88,7 @@ fn unknown_large_vault_pages_route_options_instead_of_rejecting() {
 }
 
 #[test]
-fn route_rejects_malformed_arguments_invalid_topics_and_inventory_failures() {
+fn route_refuses_bad_arguments_but_reports_a_failed_inventory_read_as_a_failure() {
     let vault = tempfile::tempdir().unwrap();
     let retriever = KeywordRetriever::new(vault.path());
     let profile = MemoryProfileIo::default();
@@ -120,8 +120,13 @@ fn route_rejects_malformed_arguments_invalid_topics_and_inventory_failures() {
         r#"{"topic":""}"#,
     );
     assert_eq!(invalid_topic.outcome, ToolOutcome::Rejected);
-    assert!(invalid_topic.content.contains("invalid_metadata"));
+    // `invalid_source`, not `invalid_metadata`: the topic is the model's own
+    // argument and nothing has been fetched yet, so there is no metadata for it
+    // to be. The old kind called a refusal a data problem (#116).
+    assert!(invalid_topic.content.contains("invalid_source"));
 
+    // Inspecting the vault is not validating a request: these reached the
+    // retriever and it came apart, so they are failures, not refusals.
     for (failure, expected) in [
         (RetrievalFailure::Folders, "could not inspect vault folders"),
         (RetrievalFailure::Notes, "could not inspect vault notes"),
@@ -136,7 +141,7 @@ fn route_rejects_malformed_arguments_invalid_topics_and_inventory_failures() {
             TOOL_RESOLVE_DISTIL_ROUTE,
             r#"{"topic":"Testing"}"#,
         );
-        assert_eq!(result.outcome, ToolOutcome::Rejected);
+        support::assert_tool_failed(&result.outcome);
         assert!(result.content.contains(expected), "{}", result.content);
     }
 }
@@ -160,7 +165,7 @@ fn route_surfaces_profile_load_parse_and_save_failures() {
         TOOL_RESOLVE_DISTIL_ROUTE,
         r#"{"topic":"Testing"}"#,
     );
-    assert_eq!(load_failure.outcome, ToolOutcome::Rejected);
+    support::assert_tool_failed(&load_failure.outcome);
     assert!(load_failure.content.contains("profile load failed"));
 
     let malformed_profile = MemoryProfileIo {
@@ -177,7 +182,7 @@ fn route_surfaces_profile_load_parse_and_save_failures() {
         TOOL_RESOLVE_DISTIL_ROUTE,
         r#"{"topic":"Testing"}"#,
     );
-    assert_eq!(parse_failure.outcome, ToolOutcome::Rejected);
+    support::assert_tool_failed(&parse_failure.outcome);
     assert!(parse_failure.content.contains("profile_invalid"));
 
     let prompt = ScriptedPrompt::with_answers([vec!["flat_zettelkasten".into()]]);
@@ -194,7 +199,7 @@ fn route_surfaces_profile_load_parse_and_save_failures() {
         TOOL_RESOLVE_DISTIL_ROUTE,
         r#"{"topic":"Testing"}"#,
     );
-    assert_eq!(save_failure.outcome, ToolOutcome::Rejected);
+    support::assert_tool_failed(&save_failure.outcome);
     assert!(save_failure.content.contains("profile save failed"));
 }
 

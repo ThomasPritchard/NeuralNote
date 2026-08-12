@@ -412,7 +412,9 @@ fn playlist_enumeration_surfaces_errors_and_stops_after_a_block() {
         TOOL_SELECT_PLAYLIST_VIDEOS,
         r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-scripted_123"}"#,
     );
-    assert_eq!(first.outcome, ToolOutcome::Rejected);
+    // Being blocked by YouTube is not NeuralNote declining the call — the
+    // enumeration was attempted and the far end refused it (#116).
+    support::assert_tool_failed(&first.outcome);
     assert!(first.content.contains("youtube_blocked"));
     assert!(session.terminal_error().is_some());
 
@@ -426,7 +428,7 @@ fn playlist_enumeration_surfaces_errors_and_stops_after_a_block() {
         TOOL_SELECT_PLAYLIST_VIDEOS,
         r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-scripted_123"}"#,
     );
-    assert_eq!(second.outcome, ToolOutcome::Rejected);
+    support::assert_tool_failed(&second.outcome);
     assert_eq!(io.enumeration_calls.load(Ordering::SeqCst), 1);
 }
 
@@ -591,7 +593,7 @@ fn playlist_picker_keeps_a_blocked_thumbnail_fetch_terminal() {
         r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-scripted_123"}"#,
     );
 
-    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    support::assert_tool_failed(&result.outcome);
     let value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
     assert_eq!(value["error"]["kind"], "youtube_blocked");
     assert_eq!(value["error"]["next_action"], "terminal");
