@@ -1,10 +1,21 @@
-// Journeys 12–13: the graph view.
+// Journeys 12–14: the graph view.
 //   12. Ribbon → graph mounts with REAL link-graph data (mockVault implements
 //       read_link_graph faithfully, so wikilink/md-link resolution, clusters,
 //       and cross-folder bridges are honestly end-to-end); node click → detail
 //       local digest with neighbours → "Open in reader" lands back in the note view.
 //   13. Graph navigation preserves dirty note tabs, and a backend failure shows
 //       the in-pane error + Retry — never a silent empty galaxy.
+//   14. The MOUNTED graph follows the vault (issue #34): an external edit and an
+//       in-app delete each refresh it in place, and a watcher burst coalesces
+//       into one read.
+//
+// Journey 14 reads the graph twice, so it runs on its own contract scenario
+// whose two `read_link_graph` exchanges are the REAL core output for the vault
+// before and after that exact change (crates/neuralnote-core/tests/
+// mock_ipc_contract_v1.rs). The vault itself changes for real either side of the
+// event: the in-app delete goes through the genuine `delete_entry` IPC, and the
+// external edit lands through applyExternalEdit — the same out-of-band write
+// external-reload.e2e.test.tsx uses — never a hand-written "changed" response.
 //
 // Only the WebGL renderer is stubbed: react-force-graph-3d is module-mocked to
 // record its props (the DATA path stays real), mirroring the unit suites in
@@ -18,6 +29,8 @@
 
 import { beforeEach, describe, it, expect, vi } from "vitest";
 import { act, screen, waitFor, within } from "@testing-library/react";
+import { emit } from "@tauri-apps/api/event";
+import { TREE_CHANGED } from "../lib/bindings/events";
 import { createFakeForceGraph, type FakeForceGraph } from "../test/fakeForceGraph";
 import { renderApp, type RenderAppResult } from "./renderApp";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
@@ -85,11 +98,45 @@ const LINKED_SEED: SeedEntry[] = [
   },
 ];
 
-async function openVault(seed: SeedEntry[]): Promise<RenderAppResult> {
-  const result = renderApp({ seed, recents, mockIpcScenario: "graph-linked" });
+async function openVault(
+  seed: SeedEntry[],
+  mockIpcScenario = "graph-linked",
+): Promise<RenderAppResult> {
+  const result = renderApp({ seed, recents, mockIpcScenario });
   await result.user.click(await screen.findByRole("button", { name: "Open My Brain" }));
   await screen.findByLabelText("Filter files by name"); // workspace is up
   return result;
+}
+
+/** Source of truth: GraphView's live-refresh debounce (workspace/GraphView.tsx).
+ *  Deliberately NOT shared with external-reload.e2e.test.tsx's identical-looking
+ *  constant — that one tracks useNoteTabs.EXTERNAL_RELOAD_DEBOUNCE_MS, a
+ *  different window that merely happens to have the same value today. */
+const GRAPH_REFRESH_DEBOUNCE_MS = 300;
+
+/** How many times the graph was actually read across the whole journey. */
+const graphReads = (backend: RenderAppResult["backend"]) =>
+  backend.calls.filter((cmd) => cmd === "read_link_graph").length;
+
+/** Play a file-watcher burst through the real event bus and let GraphView's
+ *  debounce expire, without wall-clock time. `beforeExpiry` observes the state
+ *  one millisecond short of the window — where a burst must still be pending. */
+async function fireWatcherAfterDebounce(times = 1, beforeExpiry?: () => void): Promise<void> {
+  vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  try {
+    await act(async () => {
+      for (let i = 0; i < times; i += 1) await emit(TREE_CHANGED);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(GRAPH_REFRESH_DEBOUNCE_MS - 1);
+    });
+    beforeExpiry?.();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(1);
+    });
+  } finally {
+    vi.useRealTimers();
+  }
 }
 
 /** Ribbon → graph view → size the pane → wait for the stubbed renderer. */
@@ -294,5 +341,73 @@ describe("Journey 13: graph guard and failure surfacing", () => {
     expect(await screen.findByText("Linked to Beta.")).toBeInTheDocument();
     expect(backend.calls.filter((command) => command === "read_note")).toHaveLength(2);
     expect(backend.calls).not.toContain("chat");
+  });
+});
+
+describe("Journey 14: the mounted graph follows the vault (issue #34)", () => {
+  it("refreshes in place after an external edit, coalescing a watcher burst into one read", async () => {
+    const { user, backend } = await openVault(LINKED_SEED, "graph-live-external-edit");
+    await enterGraphView(user);
+    expect(graphReads(backend)).toBe(1);
+    expect(harness.props.graphData.links).toHaveLength(2);
+
+    // Another editor adds a cross-folder wikilink to Beta — the same edit the
+    // contract's second read_link_graph was recorded against.
+    backend.applyExternalEdit("notes/Beta.md", "Beta body.\n\nSee also [[Gamma]].");
+
+    await fireWatcherAfterDebounce(3, () => {
+      // One millisecond short of the window: the burst has not cost a read yet.
+      expect(graphReads(backend)).toBe(1);
+      expect(harness.props.graphData.links).toHaveLength(2);
+    });
+
+    // The galaxy now carries the new bridge, resolved by the real core.
+    await waitFor(() => expect(harness.props.graphData.links).toHaveLength(3), { timeout: 3000 });
+    expect(harness.props.graphData.links).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          source: "notes/Beta.md",
+          target: "essays/Gamma.md",
+          bridge: true,
+        }),
+      ]),
+    );
+    expect(screen.getByText("3 notes · 3 links · 2 cross-folder links")).toBeInTheDocument();
+    // A burst of three pings cost exactly one reload, run in the background:
+    // the galaxy never blinked out for a spinner.
+    expect(graphReads(backend)).toBe(2);
+    expect(screen.queryByLabelText("Loading graph")).not.toBeInTheDocument();
+  });
+
+  it("refreshes after an in-app delete performed while the graph is on screen", async () => {
+    const { user, backend } = await openVault(LINKED_SEED, "graph-live-in-app-delete");
+
+    // essays/ is collapsed by default (lazy tree) — expand it to reach Gamma.
+    await user.click(await screen.findByRole("button", { name: /^essays/ }));
+    await enterGraphView(user);
+    expect(harness.props.graphData.nodes).toHaveLength(3);
+
+    // Delete through the sidebar, with the graph still the centre pane.
+    await user.click(await screen.findByRole("button", { name: "Delete Gamma.md" }));
+    const dialog = await screen.findByRole("alertdialog");
+    await user.click(within(dialog).getByRole("button", { name: "Move to Trash" }));
+    await waitFor(() => expect(screen.queryByText("Gamma.md")).not.toBeInTheDocument());
+    expect(backend.calls).toContain("delete_entry");
+    expect(screen.getByTestId("force-graph-3d")).toBeInTheDocument(); // still in graph view
+
+    // The shell's watcher pings once the write lands on disk.
+    await fireWatcherAfterDebounce();
+
+    // The deleted note and its cross-folder bridge are both gone.
+    await waitFor(() => expect(harness.props.graphData.nodes).toHaveLength(2), { timeout: 3000 });
+    expect(harness.props.graphData.nodes.map((n: any) => n.id).sort()).toEqual([
+      "notes/Alpha.md",
+      "notes/Beta.md",
+    ]);
+    expect(harness.props.graphData.links).toEqual([
+      expect.objectContaining({ source: "notes/Alpha.md", target: "notes/Beta.md", bridge: false }),
+    ]);
+    expect(screen.getByText("2 notes · 1 link · 0 cross-folder links")).toBeInTheDocument();
+    expect(graphReads(backend)).toBe(2);
   });
 });

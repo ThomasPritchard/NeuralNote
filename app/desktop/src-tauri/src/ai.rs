@@ -8,6 +8,8 @@
 //! [`TauriChannelSink`] that forwards [`ChatEvent`]s to the frontend over a Tauri
 //! channel. The `#[tauri::command]`s that expose this are in `commands/ai.rs`.
 
+use crate::key_revision::{self, KeyRevision};
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use neuralnote_core::ai::approval::{self, ToolApprovalSubject};
@@ -48,12 +50,66 @@ const fn keychain_service() -> &'static str {
     }
 }
 
-const fn keychain_account() -> &'static str {
+const fn compiled_keychain_account() -> &'static str {
     if cfg!(feature = "native-e2e") {
         E2E_KEY_ACCOUNT
     } else {
         KEY_ACCOUNT
     }
+}
+
+#[cfg(not(test))]
+fn keychain_account() -> &'static str {
+    compiled_keychain_account()
+}
+
+/// Name of the environment variable a test process sets to move itself off the
+/// real credential. Test builds only — see [`keychain_account`].
+#[cfg(test)]
+pub(crate) const TEST_KEYCHAIN_ACCOUNT_SUFFIX_ENV: &str = "NEURALNOTE_TEST_KEYCHAIN_ACCOUNT_SUFFIX";
+
+/// The keychain account this process reads and writes.
+///
+/// Test builds honour [`TEST_KEYCHAIN_ACCOUNT_SUFFIX_ENV`] so a test that needs the
+/// *real* OS keychain (the two-instance acceptance tests in
+/// `ai_key_revision_tests.rs`, which cannot fake the process boundary) gets a
+/// throwaway credential of its own instead of the developer's. The seam is a
+/// suffix, never a whole account name: whatever the variable says, the result is
+/// `<compiled account>-test-<sanitised suffix>`, so it can never resolve to the
+/// production account, and it does not exist outside `cfg(test)` at all.
+///
+/// Resolved once per process — a worker sets the variable in the child's
+/// environment before exec, which is the only supported way to use it. Setting it
+/// from inside a running process after the first keychain touch has no effect.
+#[cfg(test)]
+fn keychain_account() -> &'static str {
+    static ACCOUNT: OnceLock<Option<String>> = OnceLock::new();
+    ACCOUNT
+        .get_or_init(|| {
+            std::env::var(TEST_KEYCHAIN_ACCOUNT_SUFFIX_ENV)
+                .ok()
+                .map(|suffix| throwaway_keychain_account(&suffix))
+        })
+        .as_deref()
+        .unwrap_or_else(compiled_keychain_account)
+}
+
+/// Derive a throwaway account from a requested suffix. Whatever arrives — empty,
+/// a path, punctuation — the result keeps the `-test-` infix and drops everything
+/// that is not alphanumeric or a dash, so no value of the environment variable can
+/// steer a test onto the production credential.
+#[cfg(test)]
+fn throwaway_keychain_account(suffix: &str) -> String {
+    let sanitised: String = suffix
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
+        .collect();
+    let sanitised = if sanitised.is_empty() {
+        "unnamed"
+    } else {
+        &sanitised
+    };
+    format!("{}-test-{sanitised}", compiled_keychain_account())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
@@ -64,14 +120,38 @@ pub struct ApiKeyStatus {
     pub model: String,
 }
 
-struct CacheState {
-    generation: u64,
-    value: Option<Option<String>>,
+/// What a save or clear reports beyond "it worked". The keychain change itself is
+/// committed by the time this is returned; this carries the *other* guarantee —
+/// whether every other running instance was told to stop trusting what it cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct KeyChangeOutcome {
+    /// `false` when the cross-process revision could not be published on one or
+    /// both sides of the keychain change. The key really is stored (or really is
+    /// gone), but another running instance keeps using the previous one until it
+    /// restarts — so this must not be reported as an unqualified success, least
+    /// of all for a revocation, where the user believes they revoked access.
+    pub revision_published: bool,
 }
 
-// TODO(cross-process-key-cache): remove this process-lifetime cache or bind it
-// to a cross-process key revision, then prove two running instances observe a
-// save/clear before their next provider request.
+/// A key read from the keychain, and the [`KeyRevision`] it was read under. The
+/// revision is what makes reuse safe across processes: it is republished by every
+/// save and clear, so a value cached against an older one can never be served.
+struct CachedKey {
+    revision: KeyRevision,
+    key: Option<String>,
+}
+
+struct CacheState {
+    generation: u64,
+    cached: Option<CachedKey>,
+}
+
+/// The in-memory key cache. It exists because [`read_api_key`] is called from
+/// polled status paths, not only from provider-request paths, and each keychain
+/// read is an XPC round trip. It is bound to the cross-process revision in
+/// `key_revision` so it can no longer outlive the truth (issue #132).
 static API_KEY_CACHE: OnceLock<Mutex<CacheState>> = OnceLock::new();
 static OPENROUTER_PRICING_CACHE: OnceLock<Mutex<BTreeMap<String, ModelPricing>>> = OnceLock::new();
 /// Catalogue `context_length` per model id, warmed opportunistically from the public
@@ -86,7 +166,7 @@ fn api_key_cache() -> &'static Mutex<CacheState> {
     API_KEY_CACHE.get_or_init(|| {
         Mutex::new(CacheState {
             generation: 0,
-            value: None,
+            cached: None,
         })
     })
 }
@@ -105,16 +185,15 @@ fn bump_cache_generation(state: &mut CacheState) {
     state.generation = state.generation.wrapping_add(1);
 }
 
-fn set_api_key_cache(value: Option<String>) {
+/// Drop the cached key and answer the generation that retirement left behind.
+/// The generation is read under the same lock as the bump, deliberately: reading
+/// it separately could observe a value another save or clear had already moved
+/// on, which is the very interleaving it exists to detect.
+fn clear_api_key_cache() -> u64 {
     let mut state = cache_guard();
     bump_cache_generation(&mut state);
-    state.value = Some(normalized_api_key(value));
-}
-
-fn clear_api_key_cache() {
-    let mut state = cache_guard();
-    bump_cache_generation(&mut state);
-    state.value = None;
+    state.cached = None;
+    state.generation
 }
 
 fn entry(account: &str) -> Result<keyring::Entry, CoreError> {
@@ -135,20 +214,39 @@ fn read_secret(account: &str) -> Result<Option<String>, CoreError> {
 /// The stored OpenRouter API key, or `None` if the user hasn't set one. An
 /// empty/whitespace stored value is treated as unset — defence in depth so a blank
 /// key can never read as present (the setup UI also blocks empty saves).
-pub fn read_api_key() -> Result<Option<String>, CoreError> {
+///
+/// `config_dir` is where the **non-secret** key revision lives, never the key: the
+/// secret is only ever in the OS keychain. The revision is consulted first because
+/// it is far cheaper than a keychain round trip, and the in-memory value is reused
+/// only while the revision it was read under is still current — so a save or clear
+/// in *another running instance* is observed before the next provider request
+/// (issue #132). A revision that cannot be read at all disables reuse: re-reading
+/// the keychain is always safe, serving a key the user replaced or revoked is not.
+pub fn read_api_key(config_dir: &Path) -> Result<Option<String>, CoreError> {
+    let observed = key_revision::observe(config_dir);
     let generation = {
-        let state = cache_guard();
-        if let Some(cached) = state.value.as_ref() {
-            return Ok(cached.clone());
+        let mut state = cache_guard();
+        match (&observed, &state.cached) {
+            (Some(observed), Some(cached)) if cached.revision == *observed => {
+                return Ok(cached.key.clone());
+            }
+            // Superseded, or unverifiable: drop it rather than leave a value behind
+            // that a later read could mistake for current.
+            _ => state.cached = None,
         }
         state.generation
     };
 
     let key = normalized_api_key(read_secret(keychain_account())?);
-    {
+    if let Some(revision) = observed {
         let mut state = cache_guard();
-        if state.generation == generation && state.value.is_none() {
-            state.value = Some(key.clone());
+        // A save or clear that landed while the keychain was being read has already
+        // moved the generation on; caching this read would resurrect what it replaced.
+        if state.generation == generation && state.cached.is_none() {
+            state.cached = Some(CachedKey {
+                revision,
+                key: key.clone(),
+            });
         }
     }
     Ok(key)
@@ -181,43 +279,147 @@ pub(crate) fn error_detail(error: CoreError) -> String {
 pub fn api_key_status(config_dir: &Path) -> Result<ApiKeyStatus, CoreError> {
     let config = provider_config::read_provider_config(config_dir)?;
     Ok(ApiKeyStatus {
-        has_key: read_api_key()?.is_some(),
+        has_key: read_api_key(config_dir)?.is_some(),
         model: config.model,
     })
 }
 
-/// Store the API key in the OS keychain and refresh the in-session cache. This is
-/// the *keychain-only* half of saving a key: it performs no config I/O and takes no
-/// lock, so the caller can persist the non-secret model preference under the
-/// config-mutation gate WITHOUT that lock ever spanning this keychain write (issue
-/// #21 AC #2). An empty/whitespace key is rejected before anything is written, so a
-/// bad request never mutates the keychain or the config that follows it.
-pub fn set_keychain_api_key(key: &str) -> Result<(), CoreError> {
+/// One published key revision, and the cache generation it left behind.
+struct Revision {
+    published: Result<KeyRevision, CoreError>,
+    generation: u64,
+}
+
+/// Publish a new key revision and drop this process's cached key, so that from
+/// this moment no instance — the caller's included — can serve a key it read
+/// before now. Called on both sides of every keychain mutation; see
+/// [`set_keychain_api_key`] for why both.
+fn revise_key(config_dir: &Path) -> Revision {
+    let published = key_revision::publish(config_dir);
+    Revision {
+        published,
+        generation: clear_api_key_cache(),
+    }
+}
+
+/// A revision that could not be published leaves other running instances unable to
+/// learn the key changed — they keep whatever they cached until they restart,
+/// which is where this code started (issue #132).
+///
+/// It is logged rather than returned as an error, and deliberately so. The keychain
+/// is the source of truth and its change has already committed; failing here would
+/// abort the caller *before* it persists the model preference or the reasoning-probe
+/// invalidation, turning one degraded guarantee into a second, worse, half-applied
+/// save. The caller is told through [`KeyChangeOutcome`] instead — this is not a
+/// state the caller is about to fail on anyway: a perfectly writable config
+/// directory with a *directory* sitting where the sidecar belongs fails every
+/// rename here while `ai.json` writes fine, so the save returns success and #132 is
+/// silently back until the app restarts.
+fn log_unpublished_revision(outcome: &Result<KeyRevision, CoreError>, when: &str) {
+    if let Err(error) = outcome {
+        log::error!(
+            "could not publish the API key revision {when} the keychain change: {error} — other \
+             running instances may keep using the previous key until they restart"
+        );
+    }
+}
+
+/// Cache the key this process just stored, against the revision it just published,
+/// so the save the user made costs no extra keychain round trip.
+///
+/// `began_at` is the generation the save's FIRST revision left behind, and exactly
+/// one bump — the save's own second revision — may have happened since. Anything
+/// more means another save or clear interleaved with the keychain write, so the
+/// key in hand may already have been replaced or revoked; [`read_api_key`] applies
+/// the same guard to what *it* reads. Without it here, a clear whose delete lands
+/// after this write leaves the revoked key cached against the live revision, and
+/// every later read serves it for the rest of the process's life.
+///
+/// A publish by another *instance* needs no guard: that only pins this entry to a
+/// superseded revision, which can miss but never serve a stale key.
+fn adopt_saved_key(revision: KeyRevision, began_at: u64, key: String) {
+    let mut state = cache_guard();
+    if state.generation != began_at.wrapping_add(1) {
+        return;
+    }
+    state.cached = Some(CachedKey {
+        revision,
+        key: Some(key),
+    });
+}
+
+/// Store the API key in the OS keychain and invalidate every instance's cached
+/// copy. This is the *keychain-only* half of saving a key: it performs no config
+/// I/O and takes no lock, so the caller can persist the non-secret model preference
+/// under the config-mutation gate WITHOUT that lock ever spanning this keychain
+/// write (issue #21 AC #2). An empty/whitespace key is rejected before anything is
+/// written, so a bad request never mutates the keychain or the config that follows it.
+///
+/// The revision is republished on **both** sides of the keychain write, and both
+/// publishes earn their place (issue #132):
+/// * *Before*, so that a crash between the write and the publish still leaves every
+///   instance invalidated. Re-reading the keychain is always correct; trusting
+///   memory after an interrupted write is not.
+/// * *After*, because an instance that re-read during the write would otherwise
+///   have cached the OLD secret against the new revision and kept it indefinitely.
+///
+/// Either publish can fail without the keychain write failing, so success here is
+/// qualified: the returned [`KeyChangeOutcome`] says whether the change actually
+/// reached the other instances, and a caller that reports it as a plain success
+/// tells the user something that is not true.
+pub fn set_keychain_api_key(config_dir: &Path, key: &str) -> Result<KeyChangeOutcome, CoreError> {
     let key = key.trim();
     if key.is_empty() {
         return Err(CoreError::InvalidName("API key cannot be empty".into()));
     }
-    entry(keychain_account())?
+    let before = revise_key(config_dir);
+    // Logged here rather than after the write: an unavailable keychain returns from
+    // the very next line, and the half of the story already known would go with it.
+    log_unpublished_revision(&before.published, "before");
+    let stored = entry(keychain_account())?
         .set_password(key)
-        .map_err(|e| CoreError::Io(format!("could not store API key in the keychain: {e}")))?;
-    set_api_key_cache(Some(key.to_string()));
-    Ok(())
+        .map_err(|e| CoreError::Io(format!("could not store API key in the keychain: {e}")));
+    let after = revise_key(config_dir);
+    log_unpublished_revision(&after.published, "after");
+
+    stored?;
+    let revision_published = before.published.is_ok() && after.published.is_ok();
+    if let Ok(revision) = after.published {
+        adopt_saved_key(revision, before.generation, key.to_string());
+    }
+    Ok(KeyChangeOutcome { revision_published })
 }
 
-/// Remove the stored key from the OS keychain and empty the in-session cache. The
-/// keychain-only half of clearing a key — no config I/O, no lock (see
-/// [`set_keychain_api_key`]). Idempotent: deleting an already-absent entry is
-/// success, so a double-clear, or a clear before anything was ever set, is fine. The
-/// cache is emptied *before* the delete so no concurrent reader can observe a key the
-/// delete is about to remove.
-pub fn clear_keychain_api_key() -> Result<(), CoreError> {
-    clear_api_key_cache();
-    match entry(keychain_account())?.delete_credential() {
+/// Remove the stored key from the OS keychain and invalidate every instance's
+/// cached copy. The keychain-only half of clearing a key — no config I/O, no lock
+/// (see [`set_keychain_api_key`], which also explains the two revisions).
+/// Idempotent: deleting an already-absent entry is success, so a double-clear, or a
+/// clear before anything was ever set, is fine. The revision is republished and the
+/// cache emptied *before* the delete so no reader can observe a key the delete is
+/// about to remove — and unlike a save, nothing is cached afterwards: a revocation
+/// leaves every reader having to ask the keychain again.
+///
+/// Success is qualified the same way a save's is, and it matters more here: a
+/// [`KeyChangeOutcome`] with `revision_published: false` means another running
+/// instance can still transmit the key the user just revoked.
+pub fn clear_keychain_api_key(config_dir: &Path) -> Result<KeyChangeOutcome, CoreError> {
+    let before = revise_key(config_dir);
+    // Logged here rather than after the delete, for the reason given in
+    // [`set_keychain_api_key`]: the next line can return without it.
+    log_unpublished_revision(&before.published, "before");
+    let deleted = match entry(keychain_account())?.delete_credential() {
         Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
         Err(e) => Err(CoreError::Io(format!(
             "could not remove API key from the keychain: {e}"
         ))),
-    }
+    };
+    let after = revise_key(config_dir);
+    log_unpublished_revision(&after.published, "after");
+
+    deleted?;
+    Ok(KeyChangeOutcome {
+        revision_published: before.published.is_ok() && after.published.is_ok(),
+    })
 }
 
 #[cfg(test)]
@@ -877,6 +1079,21 @@ impl RetryDelay for TokioRetryDelay {
     }
 }
 
+/// The two-instance acceptance tests for issue #132. They live in their own file
+/// because they run **real child processes against the real OS keychain** — the
+/// defect they pin (two instances disagreeing about the key) is invisible to any
+/// single-process test, so none of the fakes below can be used.
+///
+/// macOS only, because that is where a real cross-process credential store exists:
+/// `keyring` is pulled in with the `apple-native` feature alone (see Cargo.toml),
+/// so on every other target it falls back to a *per-process* store, against which
+/// two processes could never agree and this would fail for a reason that has
+/// nothing to do with the code under test. PR CI runs the workspace suite on
+/// Linux. Widen this `cfg` when `windows-native` or `sync-secret-service` land.
+#[cfg(all(test, target_os = "macos"))]
+#[path = "ai_key_revision_tests.rs"]
+mod key_revision_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1020,6 +1237,30 @@ mod tests {
     }
 
     #[test]
+    fn a_throwaway_keychain_account_can_never_name_the_production_one() {
+        // The test-only redirection is a seam onto the developer's real credential
+        // store. It takes a suffix, not an account, and this is what keeps that
+        // true: every input lands under `<account>-test-…`, however hostile.
+        for suffix in ["save-1", "", "   ", "../../openrouter-api-key", "\0\n"] {
+            let account = throwaway_keychain_account(suffix);
+
+            assert!(
+                account.starts_with(&format!("{}-test-", compiled_keychain_account())),
+                "a suffix of {suffix:?} escaped the throwaway namespace: {account}"
+            );
+            assert_ne!(account, compiled_keychain_account());
+            assert!(account
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-'));
+        }
+        assert_eq!(
+            throwaway_keychain_account("   "),
+            throwaway_keychain_account(""),
+            "a suffix that sanitises to nothing must still be a named account"
+        );
+    }
+
+    #[test]
     fn chat_turn_maps_roles_and_defaults_to_user() {
         let a: LlmMessage = ChatTurn {
             role: "assistant".into(),
@@ -1050,6 +1291,7 @@ mod tests {
         deletes: Arc<AtomicUsize>,
         after_next_read: AfterReadHook,
         after_next_write: AfterReadHook,
+        after_next_delete: AfterReadHook,
         /// When set, `get_secret` returns a hard keychain failure (not `NoEntry`), so
         /// tests can prove a genuine keychain error is surfaced honestly rather than
         /// read as "no key".
@@ -1101,6 +1343,17 @@ mod tests {
 
         fn take_after_write_hook(&self) -> Option<Box<dyn FnOnce() + Send + 'static>> {
             self.after_next_write.lock().unwrap().take()
+        }
+
+        fn after_next_delete<F>(&self, hook: F)
+        where
+            F: FnOnce() + Send + 'static,
+        {
+            *self.after_next_delete.lock().unwrap() = Some(Box::new(hook));
+        }
+
+        fn take_after_delete_hook(&self) -> Option<Box<dyn FnOnce() + Send + 'static>> {
+            self.after_next_delete.lock().unwrap().take()
         }
 
         fn contains(&self, service: &str, user: &str) -> bool {
@@ -1186,13 +1439,16 @@ mod tests {
 
         fn delete_credential(&self) -> KeyringResult<()> {
             self.store.deletes.fetch_add(1, Ordering::SeqCst);
-            self.store
+            let removed = self
+                .store
                 .secrets
                 .lock()
                 .unwrap()
-                .remove(&(self.service.clone(), self.user.clone()))
-                .map(|_| ())
-                .ok_or(KeyringError::NoEntry)
+                .remove(&(self.service.clone(), self.user.clone()));
+            if let Some(hook) = self.store.take_after_delete_hook() {
+                hook();
+            }
+            removed.map(|_| ()).ok_or(KeyringError::NoEntry)
         }
 
         fn as_any(&self) -> &dyn Any {
@@ -1212,6 +1468,13 @@ mod tests {
 
     fn read_config_text(config_dir: &Path) -> String {
         fs::read_to_string(config_file(config_dir)).unwrap()
+    }
+
+    /// The revision sidecar, as `key_revision` names it on disk. Putting a
+    /// *directory* here is how these tests reach the state where the keychain and
+    /// `ai.json` both write fine and every revision publish fails permanently.
+    fn key_revision_file(config_dir: &Path) -> PathBuf {
+        config_dir.join(".openrouter-key-revision")
     }
 
     fn provider_config(model: &str) -> ProviderConfig {
@@ -1912,9 +2175,10 @@ mod tests {
             .lock()
             .unwrap();
         let keychain = TestKeychain::install();
+        let config_dir = temp_config_dir("chat-key-routing");
         keychain.fail_reads();
 
-        match crate::commands::ai::resolve_key_presence(read_api_key()) {
+        match crate::commands::ai::resolve_key_presence(read_api_key(&config_dir)) {
             Err(ChatEvent::Error { message }) => {
                 assert!(
                     message.contains("Couldn't read the API key"),
@@ -1996,7 +2260,10 @@ mod tests {
             );
             assert_eq!(read_config_text(&config_dir), original_config);
             assert_eq!(keychain.writes.load(Ordering::SeqCst), original_writes);
-            assert_eq!(read_api_key().unwrap().as_deref(), Some("sk-or-original"));
+            assert_eq!(
+                read_api_key(&config_dir).unwrap().as_deref(),
+                Some("sk-or-original")
+            );
             assert_eq!(
                 keychain.reads.load(Ordering::SeqCst),
                 original_reads,
@@ -2006,7 +2273,7 @@ mod tests {
     }
 
     #[test]
-    fn save_api_key_caches_written_key_when_config_persistence_fails() {
+    fn save_api_key_still_reads_the_written_key_when_config_persistence_fails() {
         let _guard = KEYCHAIN_TEST_LOCK
             .get_or_init(|| StdMutex::new(()))
             .lock()
@@ -2050,14 +2317,19 @@ mod tests {
             Some("sk-or-session")
         );
         assert_eq!(
-            read_api_key().unwrap().as_deref(),
+            read_api_key(&blocked_config_dir).unwrap().as_deref(),
             Some("sk-or-session"),
-            "chat in this session should see the key cached from the successful keychain write"
+            "chat in this session should still see the key the keychain write committed"
         );
+        // One read, not zero: this config dir cannot hold a key revision either, so
+        // the cache has nothing to bind to and fails closed to the keychain. That is
+        // the intended trade — a directory this broken costs a round trip per read
+        // rather than risking a key no revision can ever invalidate (issue #132).
         assert_eq!(
             keychain.reads.load(Ordering::SeqCst),
-            0,
-            "the cached key should be used without an extra keychain read"
+            1,
+            "an unusable config dir must disable cache reuse, not silently keep a key \
+             nothing can invalidate"
         );
     }
 
@@ -2163,7 +2435,7 @@ mod tests {
             2,
             "clearing the legacy effective OpenRouter target must invalidate old probe ownership"
         );
-        assert_eq!(read_api_key().unwrap(), None);
+        assert_eq!(read_api_key(&config_dir).unwrap(), None);
         assert_eq!(
             keychain.reads.load(Ordering::SeqCst),
             1,
@@ -2224,9 +2496,12 @@ mod tests {
             clear_api_key_in(&clear_config_dir, &clear_gate).unwrap();
         });
 
-        assert_eq!(read_api_key().unwrap().as_deref(), Some("sk-or-old"));
+        assert_eq!(
+            read_api_key(&config_dir).unwrap().as_deref(),
+            Some("sk-or-old")
+        );
         assert!(!keychain.contains(keychain_service(), keychain_account()));
-        assert_eq!(read_api_key().unwrap(), None);
+        assert_eq!(read_api_key(&config_dir).unwrap(), None);
         assert_eq!(
             keychain.reads.load(Ordering::SeqCst),
             2,
@@ -2241,15 +2516,276 @@ mod tests {
             .lock()
             .unwrap();
         let keychain = TestKeychain::install();
+        let config_dir = temp_config_dir("cache-reuse");
         keychain.set(keychain_service(), keychain_account(), "sk-or-cached");
 
-        assert_eq!(read_api_key().unwrap().as_deref(), Some("sk-or-cached"));
-        assert_eq!(read_api_key().unwrap().as_deref(), Some("sk-or-cached"));
+        assert_eq!(
+            read_api_key(&config_dir).unwrap().as_deref(),
+            Some("sk-or-cached")
+        );
+        assert_eq!(
+            read_api_key(&config_dir).unwrap().as_deref(),
+            Some("sk-or-cached")
+        );
 
         assert_eq!(
             keychain.reads.load(Ordering::SeqCst),
             1,
             "the keychain should be read only on the first cache miss"
+        );
+    }
+
+    #[test]
+    fn a_revision_published_by_another_instance_retires_the_cached_key() {
+        // The single-process shadow of the two-instance acceptance test in
+        // `ai_key_revision_tests.rs`: that one proves the real boundary, this one
+        // pins the mechanism deterministically and cheaply. What goes red here is
+        // comparing the cache against anything other than the published revision.
+        let _guard = KEYCHAIN_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let keychain = TestKeychain::install();
+        let config_dir = temp_config_dir("revision-retires-cache");
+        keychain.set(keychain_service(), keychain_account(), "sk-or-first");
+
+        assert_eq!(
+            read_api_key(&config_dir).unwrap().as_deref(),
+            Some("sk-or-first")
+        );
+
+        // What another running instance's save looks like from here: the keychain
+        // holds something new, and a revision nothing has seen is published.
+        keychain.set(keychain_service(), keychain_account(), "sk-or-second");
+        key_revision::publish(&config_dir).unwrap();
+
+        assert_eq!(
+            read_api_key(&config_dir).unwrap().as_deref(),
+            Some("sk-or-second"),
+            "a key cached against a superseded revision must not be served"
+        );
+        assert_eq!(keychain.reads.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_save_retires_cached_keys_both_before_and_after_it_writes_the_keychain() {
+        // Neither publish is redundant, and the two-instance test cannot see either
+        // on its own — it only proves the end state.
+        //
+        // BEFORE the write, because a crash in between would otherwise leave every
+        // other instance serving a key that no longer exists, with nothing left to
+        // tell them. AFTER it, because an instance that re-read *during* the write
+        // would otherwise have cached the OLD secret against the new revision and
+        // kept it indefinitely.
+        //
+        // What goes red: moving either publish to the other side of the write, or
+        // dropping one of them.
+        let _guard = KEYCHAIN_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let keychain = TestKeychain::install();
+        let config_dir = temp_config_dir("revision-around-write");
+        key_revision::publish(&config_dir).unwrap();
+        let before_save = key_revision::observe(&config_dir);
+
+        let observed_mid_write = Arc::new(StdMutex::new(None));
+        let recorder = Arc::clone(&observed_mid_write);
+        let recorder_dir = config_dir.clone();
+        keychain.after_next_write(move || {
+            *recorder.lock().unwrap() = key_revision::observe(&recorder_dir);
+        });
+
+        set_keychain_api_key(&config_dir, "sk-or-ordered").unwrap();
+
+        let mid_write = observed_mid_write.lock().unwrap().clone();
+        assert!(
+            mid_write.is_some() && mid_write != before_save,
+            "the revision must already have moved when the keychain write lands, or a \
+             crash before the second publish strands every other instance"
+        );
+        assert!(
+            key_revision::observe(&config_dir) != mid_write,
+            "the revision must move again after the write, or an instance that re-read \
+             mid-write keeps the old secret against a revision that never changes again"
+        );
+    }
+
+    #[test]
+    fn a_clear_retires_cached_keys_both_before_and_after_it_deletes_the_credential() {
+        // The clear path's counterpart to the save's ordering test above, and the
+        // more security-relevant of the two: this is the revocation. Until now
+        // either publish could be deleted and the whole suite stayed green.
+        //
+        // BEFORE the delete, because a crash in between would otherwise leave
+        // every other instance still serving a key the user just revoked, with
+        // nothing left to tell them. AFTER it, because an instance that re-read
+        // *during* the delete could have cached the still-present secret against
+        // the new revision and kept it indefinitely.
+        //
+        // What goes red: dropping either publish, or moving one to the other side
+        // of the delete.
+        let _guard = KEYCHAIN_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let keychain = TestKeychain::install();
+        let config_dir = temp_config_dir("revision-around-delete");
+        keychain.set(keychain_service(), keychain_account(), "sk-or-revoked");
+        key_revision::publish(&config_dir).unwrap();
+        let before_clear = key_revision::observe(&config_dir);
+
+        let observed_mid_delete = Arc::new(StdMutex::new(None));
+        let recorder = Arc::clone(&observed_mid_delete);
+        let recorder_dir = config_dir.clone();
+        keychain.after_next_delete(move || {
+            *recorder.lock().unwrap() = key_revision::observe(&recorder_dir);
+        });
+
+        clear_keychain_api_key(&config_dir).unwrap();
+
+        let mid_delete = observed_mid_delete.lock().unwrap().clone();
+        assert!(
+            mid_delete.is_some() && mid_delete != before_clear,
+            "the revision must already have moved when the delete lands, or a crash \
+             before the second publish leaves every other instance sending a revoked key"
+        );
+        assert!(
+            key_revision::observe(&config_dir) != mid_delete,
+            "the revision must move again after the delete, or an instance that re-read \
+             mid-delete keeps the revoked secret against a revision that never changes again"
+        );
+    }
+
+    #[test]
+    fn a_clear_landing_mid_save_is_not_undone_by_the_saves_own_cache_adoption() {
+        // `set_keychain_api_key` and `clear_keychain_api_key` are both lock-free
+        // commands, so a user rotating a key in one window while revoking it in
+        // another interleaves exactly like this: the save writes the new key, the
+        // clear then publishes, deletes the credential and publishes again, and
+        // only afterwards does the save publish its own second revision and adopt
+        // what it wrote. The sidecar's current token is the save's, so an
+        // unguarded adoption leaves a REVOKED key cached against the live
+        // revision — and every later read hits it, for as long as the process
+        // runs. That is the class of bug the revision exists to kill.
+        //
+        // What goes red: dropping the generation guard in `adopt_saved_key`.
+        let _guard = KEYCHAIN_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let keychain = TestKeychain::install();
+        let config_dir = temp_config_dir("save-racing-a-clear");
+
+        let clearing_dir = config_dir.clone();
+        keychain.after_next_write(move || {
+            clear_keychain_api_key(&clearing_dir).unwrap();
+        });
+
+        set_keychain_api_key(&config_dir, "sk-or-rotated").unwrap();
+
+        assert!(
+            !keychain.contains(keychain_service(), keychain_account()),
+            "the clear won the race, so the credential must be gone"
+        );
+        assert_eq!(
+            read_api_key(&config_dir).unwrap(),
+            None,
+            "a key revoked while the save was in flight must not be served from the cache"
+        );
+        assert_eq!(
+            keychain.reads.load(Ordering::SeqCst),
+            1,
+            "the read must have asked the keychain rather than answered from a cache \
+             the save adopted after the revocation"
+        );
+    }
+
+    #[test]
+    fn an_ordinary_save_and_clear_report_their_revision_as_published() {
+        // The other half of the pair below: without this, hardwiring
+        // `revision_published: false` would pass every other test in the file.
+        let _guard = KEYCHAIN_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let _keychain = TestKeychain::install();
+        let config_dir = temp_config_dir("revision-published");
+
+        let saved = set_keychain_api_key(&config_dir, "sk-or-published").unwrap();
+        let cleared = clear_keychain_api_key(&config_dir).unwrap();
+
+        assert!(saved.revision_published);
+        assert!(cleared.revision_published);
+    }
+
+    #[test]
+    fn a_key_change_that_cannot_publish_its_revision_says_so_rather_than_reporting_a_clean_change()
+    {
+        // Reachable with nothing else wrong, and this repo's own
+        // `key_revision_tests` builds the state: a perfectly writable config
+        // directory with a DIRECTORY sitting where the sidecar belongs. The
+        // keychain still takes the change, `ai.json` still writes, and every
+        // rename fails permanently. Reported as a plain success, that is issue
+        // #132 silently re-armed — and on the clear path the user is told their
+        // key is revoked while another instance keeps transmitting it.
+        //
+        // What goes red: reporting `revision_published: true` unconditionally, or
+        // deciding it from only one of the two publishes.
+        let _guard = KEYCHAIN_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let keychain = TestKeychain::install();
+        let config_dir = temp_config_dir("revision-unpublishable");
+        fs::create_dir(key_revision_file(&config_dir)).unwrap();
+
+        let saved = set_keychain_api_key(&config_dir, "sk-or-unpublishable").unwrap();
+
+        assert!(
+            !saved.revision_published,
+            "a save whose revision never landed must not report a clean save"
+        );
+        assert_eq!(
+            keychain
+                .get(keychain_service(), keychain_account())
+                .as_deref(),
+            Some("sk-or-unpublishable"),
+            "the keychain change itself committed — that is why this is reported, not returned"
+        );
+
+        let cleared = clear_keychain_api_key(&config_dir).unwrap();
+
+        assert!(
+            !cleared.revision_published,
+            "a revocation whose revision never landed must not report a clean revocation"
+        );
+        assert!(!keychain.contains(keychain_service(), keychain_account()));
+    }
+
+    #[test]
+    fn a_revision_that_cannot_be_read_disables_reuse_rather_than_trusting_memory() {
+        let _guard = KEYCHAIN_TEST_LOCK
+            .get_or_init(|| StdMutex::new(()))
+            .lock()
+            .unwrap();
+        let keychain = TestKeychain::install();
+        let config_dir = temp_config_dir("revision-unreadable");
+        keychain.set(keychain_service(), keychain_account(), "sk-or-unverifiable");
+        fs::write(key_revision_file(&config_dir), "not a token").unwrap();
+
+        for _ in 0..3 {
+            assert_eq!(
+                read_api_key(&config_dir).unwrap().as_deref(),
+                Some("sk-or-unverifiable")
+            );
+        }
+
+        assert_eq!(
+            keychain.reads.load(Ordering::SeqCst),
+            3,
+            "with no trustworthy revision every read must re-ask the keychain — a spare \
+             round trip is the safe direction, a key nothing can invalidate is not"
         );
     }
 }

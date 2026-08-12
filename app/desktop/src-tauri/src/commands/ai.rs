@@ -52,7 +52,7 @@ pub(crate) fn save_api_key(
     state: SharedState<'_>,
     key: String,
     model: String,
-) -> Result<(), CoreError> {
+) -> Result<ai::KeyChangeOutcome, CoreError> {
     let model = model.trim();
     let model = if model.is_empty() {
         neuralnote_core::ai::DEFAULT_MODEL
@@ -85,19 +85,23 @@ pub(crate) fn save_api_key(
 /// after a save the effective OpenRouter target exists, so any stale verdict is
 /// dropped. `false` for the "before" side is fail-safe — it can only over-invalidate
 /// (a harmless re-probe), never keep a stale verdict — and needs no keychain read.
+///
+/// The keychain half's [`ai::KeyChangeOutcome`] is carried through unchanged. It
+/// says whether other running instances were actually told the key moved; a caller
+/// that discards it reports a clean save the user cannot rely on.
 pub(crate) fn save_api_key_in(
     config_dir: &Path,
     mutation_gate: &ProviderConfigMutationGate,
     key: &str,
     model: &str,
-) -> Result<(), CoreError> {
-    ai::set_keychain_api_key(key)?;
+) -> Result<ai::KeyChangeOutcome, CoreError> {
+    let outcome = ai::set_keychain_api_key(config_dir, key)?;
     mutation_gate
         .update_with_key_transition(config_dir, false, true, |cfg| {
             cfg.model = model.to_string();
             Ok(())
         })
-        .map(|_| ())
+        .map(|_| outcome)
         .map_err(|e| {
             CoreError::Io(format!(
                 "API key was stored in the keychain, but the AI preference file could not be updated: {}",
@@ -107,7 +111,10 @@ pub(crate) fn save_api_key_in(
 }
 
 #[tauri::command]
-pub(crate) fn clear_api_key(app: AppHandle, state: SharedState<'_>) -> Result<(), CoreError> {
+pub(crate) fn clear_api_key(
+    app: AppHandle,
+    state: SharedState<'_>,
+) -> Result<ai::KeyChangeOutcome, CoreError> {
     let dir = config_dir(&app)?;
     clear_api_key_in(&dir, &provider_config_mutation_gate(&state))
 }
@@ -121,14 +128,18 @@ pub(crate) fn clear_api_key(app: AppHandle, state: SharedState<'_>) -> Result<()
 /// succeeded, the failure is surfaced and a corrupt config is left untouched rather
 /// than clobbered to a default. `true` for the "before" side is fail-safe — it can
 /// only over-invalidate — and needs no keychain read.
+///
+/// The keychain half's [`ai::KeyChangeOutcome`] is carried through unchanged, and
+/// on this path it is the one worth acting on: `revision_published: false` means
+/// another running instance can still transmit the key the user just revoked.
 pub(crate) fn clear_api_key_in(
     config_dir: &Path,
     mutation_gate: &ProviderConfigMutationGate,
-) -> Result<(), CoreError> {
-    ai::clear_keychain_api_key()?;
+) -> Result<ai::KeyChangeOutcome, CoreError> {
+    let outcome = ai::clear_keychain_api_key(config_dir)?;
     mutation_gate
         .update_with_key_transition(config_dir, true, false, |_cfg| Ok(()))
-        .map(|_| ())
+        .map(|_| outcome)
         .map_err(|e| {
             CoreError::Io(format!(
                 "The keychain was cleared, but the AI preference file could not be updated: {}",
@@ -201,8 +212,9 @@ pub(crate) struct LocalStatus {
 
 #[tauri::command]
 pub(crate) fn ai_status(app: AppHandle) -> Result<AiStatus, CoreError> {
-    let cfg = neuralnote_core::ai::read_provider_config(&config_dir(&app)?)?;
-    Ok(build_ai_status(cfg, ai::read_api_key()?.is_some()))
+    let dir = config_dir(&app)?;
+    let cfg = neuralnote_core::ai::read_provider_config(&dir)?;
+    Ok(build_ai_status(cfg, ai::read_api_key(&dir)?.is_some()))
 }
 
 /// Return today's validated OpenRouter model choices. A successful result,
@@ -232,7 +244,7 @@ pub(crate) async fn openrouter_model_menu(
         }
     }
 
-    let api_key = ai::read_api_key()?.ok_or_else(|| {
+    let api_key = ai::read_api_key(&dir)?.ok_or_else(|| {
         CoreError::Llm("Set an OpenRouter API key before loading model choices.".into())
     })?;
     let transport = openrouter_catalogue::ReqwestCatalogueTransport::new()?;
@@ -263,9 +275,10 @@ pub(crate) fn select_openrouter_model(
         let app_state = lock_state(&state);
         openrouter_selection_context(&app_state)
     };
-    let key_present = ai::read_api_key()?.is_some();
+    let dir = config_dir(&app)?;
+    let key_present = ai::read_api_key(&dir)?.is_some();
     let config = openrouter_catalogue::persist_selected_model(
-        &config_dir(&app)?,
+        &dir,
         &mutation_gate,
         key_present,
         &offered,
@@ -381,7 +394,7 @@ pub(crate) fn set_active_provider(
         }
     }
     let dir = config_dir(&app)?;
-    let key_present = ai::read_api_key()?.is_some();
+    let key_present = ai::read_api_key(&dir)?.is_some();
     provider_config_mutation_gate(&state)
         .update(&dir, key_present, move |cfg| {
             cfg.active_provider = Some(provider);
@@ -409,7 +422,7 @@ pub(crate) fn set_reasoning(
     enabled: bool,
 ) -> Result<AiStatus, CoreError> {
     let dir = config_dir(&app)?;
-    let key_present = ai::read_api_key()?.is_some();
+    let key_present = ai::read_api_key(&dir)?.is_some();
     set_reasoning_in(
         &dir,
         &provider_config_mutation_gate(&state),
@@ -444,7 +457,7 @@ pub(crate) fn set_approval_mode(
     mode: neuralnote_core::ai::approval::ApprovalMode,
 ) -> Result<AiStatus, CoreError> {
     let dir = config_dir(&app)?;
-    let key_present = ai::read_api_key()?.is_some();
+    let key_present = ai::read_api_key(&dir)?.is_some();
     set_approval_mode_in(
         &dir,
         &provider_config_mutation_gate(&state),
@@ -484,7 +497,7 @@ pub(crate) fn set_tool_approval_override(
     mode: Option<neuralnote_core::ai::approval::ApprovalMode>,
 ) -> Result<AiStatus, CoreError> {
     let dir = config_dir(&app)?;
-    let key_present = ai::read_api_key()?.is_some();
+    let key_present = ai::read_api_key(&dir)?.is_some();
     set_tool_approval_override_in(
         &dir,
         &provider_config_mutation_gate(&state),
@@ -526,7 +539,7 @@ pub(crate) async fn refresh_reasoning_support(
 ) -> Result<AiStatus, CoreError> {
     let dir = config_dir(&app)?;
     let mutation_gate = provider_config_mutation_gate(&state);
-    let key_present = ai::read_api_key()?.is_some();
+    let key_present = ai::read_api_key(&dir)?.is_some();
     let (cfg, target) = begin_reasoning_probe(&dir, &mutation_gate, key_present)?;
 
     match target {
@@ -980,7 +993,7 @@ pub(crate) async fn chat(
     // Key presence (the keychain — the authoritative source, issue #14) resolves the
     // effective OpenRouter provider for a legacy install with no explicit choice. A
     // keychain failure here is surfaced, never silently routed as "no provider".
-    let key_present = match resolve_key_presence(ai::read_api_key()) {
+    let key_present = match resolve_key_presence(ai::read_api_key(&ai_config_dir)) {
         Ok(present) => present,
         Err(event) => {
             sink.send(event);
@@ -1070,6 +1083,7 @@ pub(crate) async fn chat(
         history: &history,
         active_skills: &active_skills,
         root: &root,
+        ai_config_dir: &ai_config_dir,
         retriever: &retriever,
         skill_registry: &skill_registry,
         skill_environment: &skill_environment,
@@ -1332,6 +1346,10 @@ struct ChatRun<'a> {
     history: &'a [neuralnote_core::ai::LlmMessage],
     active_skills: &'a [String],
     root: &'a Path,
+    /// Where the non-secret AI preferences and key revision live — NOT the key,
+    /// which stays in the OS keychain. Carried on the run so a provider request
+    /// reads the key against the current revision (issue #132).
+    ai_config_dir: &'a Path,
     retriever: &'a neuralnote_core::ai::KeywordRetriever,
     skill_registry: &'a neuralnote_core::ai::SkillRegistry,
     skill_environment: &'a neuralnote_core::ai::SkillEnvironment,
@@ -1380,7 +1398,7 @@ async fn chat_via_openrouter(
     if stop_if_chat_run_closed(run) {
         return None;
     }
-    let key = match ai::read_api_key() {
+    let key = match ai::read_api_key(run.ai_config_dir) {
         Ok(Some(k)) => k,
         Ok(None) => {
             run.sink.send(ChatEvent::Error {

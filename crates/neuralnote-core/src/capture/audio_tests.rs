@@ -351,6 +351,68 @@ fn streaming_resampler_finalises_an_exact_chunk_without_pending_input() {
     );
 }
 
+/// The RIFF/WAVE header length Whisper-compatible WAV output always carries.
+/// Declared here rather than imported from the encoder, so that changing the
+/// emitted header size turns these assertions red instead of moving with them.
+const WAV_HEADER_LEN: usize = 44;
+
+/// Source rates a YouTube AAC-LC rendition realistically decodes to. Each one
+/// gives the resampler a different internal FFT chunk size, so a rate that is
+/// only exercised in production would otherwise never meet the flush loop.
+const STREAM_SOURCE_RATES: [u32; 8] = [
+    8_000, 11_025, 16_000, 22_050, 24_000, 32_000, 44_100, 48_000,
+];
+
+/// Stream lengths that end mid-chunk, including lengths shorter than a single
+/// resampler chunk. These are where the flush loop and the WAV truncation
+/// arithmetic have to agree.
+const STREAM_FRAME_COUNTS: [usize; 9] = [1, 2, 3, 100, 441, 1_023, 1_024, 1_025, 4_097];
+
+#[test]
+fn streaming_resampler_finishes_short_and_odd_length_streams_at_every_source_rate() {
+    for rate in STREAM_SOURCE_RATES {
+        for frames in STREAM_FRAME_COUNTS {
+            let mut streaming = StreamingWavResampler::new(rate).unwrap();
+            // 97-sample packets never align with a resampler chunk, so every
+            // stream finishes with a partial chunk still pending.
+            for packet in vec![0.25_f32; frames].chunks(97) {
+                streaming.push(packet).unwrap();
+            }
+
+            let wav = streaming
+                .finish()
+                .unwrap_or_else(|error| panic!("{rate} Hz / {frames} frames: {error:?}"));
+
+            let declared_data_len = u32::from_le_bytes(wav[40..44].try_into().unwrap()) as usize;
+            assert_eq!(
+                wav.len(),
+                WAV_HEADER_LEN + declared_data_len,
+                "{rate} Hz / {frames} frames: header declares a payload the buffer does not hold"
+            );
+            assert_eq!(
+                declared_data_len / 2,
+                (frames * 16_000).div_ceil(rate as usize),
+                "{rate} Hz / {frames} frames: resampled sample count drifted from the source duration"
+            );
+        }
+    }
+}
+
+#[test]
+fn streaming_resampler_treats_a_stream_of_empty_packets_as_no_audio() {
+    let mut streaming = StreamingWavResampler::new(44_100).unwrap();
+    for _ in 0..8 {
+        streaming.push(&[]).unwrap();
+    }
+
+    let error = streaming.finish().unwrap_err();
+
+    assert!(
+        matches!(&error, CaptureError::AudioDecodeFailed(detail) if detail.contains("zero frames")),
+        "unexpected error: {error:?}"
+    );
+}
+
 #[test]
 fn resample_capacity_is_bounded_before_allocation() {
     assert!(validate_resample_capacity(MAX_RESAMPLED_SAMPLES).is_ok());

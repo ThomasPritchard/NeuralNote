@@ -152,6 +152,149 @@
         }
       }
     ],
+    "graph-live-external-edit": [
+      {
+        "command": "read_link_graph",
+        "arguments": {},
+        "result": {
+          "links": [
+            {
+              "bridge": true,
+              "source": "essays/Gamma.md",
+              "target": "notes/Alpha.md"
+            },
+            {
+              "bridge": false,
+              "source": "notes/Alpha.md",
+              "target": "notes/Beta.md"
+            }
+          ],
+          "nodes": [
+            {
+              "cluster": "essays",
+              "id": "essays/Gamma.md",
+              "title": "Gamma"
+            },
+            {
+              "cluster": "notes",
+              "id": "notes/Alpha.md",
+              "title": "Alpha"
+            },
+            {
+              "cluster": "notes",
+              "id": "notes/Beta.md",
+              "title": "Beta"
+            }
+          ],
+          "skippedFiles": 0
+        }
+      },
+      {
+        "command": "read_link_graph",
+        "arguments": {},
+        "result": {
+          "links": [
+            {
+              "bridge": true,
+              "source": "essays/Gamma.md",
+              "target": "notes/Alpha.md"
+            },
+            {
+              "bridge": false,
+              "source": "notes/Alpha.md",
+              "target": "notes/Beta.md"
+            },
+            {
+              "bridge": true,
+              "source": "notes/Beta.md",
+              "target": "essays/Gamma.md"
+            }
+          ],
+          "nodes": [
+            {
+              "cluster": "essays",
+              "id": "essays/Gamma.md",
+              "title": "Gamma"
+            },
+            {
+              "cluster": "notes",
+              "id": "notes/Alpha.md",
+              "title": "Alpha"
+            },
+            {
+              "cluster": "notes",
+              "id": "notes/Beta.md",
+              "title": "Beta"
+            }
+          ],
+          "skippedFiles": 0
+        }
+      }
+    ],
+    "graph-live-in-app-delete": [
+      {
+        "command": "read_link_graph",
+        "arguments": {},
+        "result": {
+          "links": [
+            {
+              "bridge": true,
+              "source": "essays/Gamma.md",
+              "target": "notes/Alpha.md"
+            },
+            {
+              "bridge": false,
+              "source": "notes/Alpha.md",
+              "target": "notes/Beta.md"
+            }
+          ],
+          "nodes": [
+            {
+              "cluster": "essays",
+              "id": "essays/Gamma.md",
+              "title": "Gamma"
+            },
+            {
+              "cluster": "notes",
+              "id": "notes/Alpha.md",
+              "title": "Alpha"
+            },
+            {
+              "cluster": "notes",
+              "id": "notes/Beta.md",
+              "title": "Beta"
+            }
+          ],
+          "skippedFiles": 0
+        }
+      },
+      {
+        "command": "read_link_graph",
+        "arguments": {},
+        "result": {
+          "links": [
+            {
+              "bridge": false,
+              "source": "notes/Alpha.md",
+              "target": "notes/Beta.md"
+            }
+          ],
+          "nodes": [
+            {
+              "cluster": "notes",
+              "id": "notes/Alpha.md",
+              "title": "Alpha"
+            },
+            {
+              "cluster": "notes",
+              "id": "notes/Beta.md",
+              "title": "Beta"
+            }
+          ],
+          "skippedFiles": 0
+        }
+      }
+    ],
     "note-read-binary": [
       {
         "command": "read_note",
