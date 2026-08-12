@@ -339,6 +339,58 @@ fn build_contract() -> Contract {
         )],
     );
 
+    // The three tool-approval commands. Component tests `vi.mock` the whole api
+    // module, so a WRONG command name or a renamed argument passes them — only
+    // this contract, driven through the e2e mockVault seam, catches it. The
+    // approval payload is composed from the same Rust tables the gate consults,
+    // so a reclassification shows up here too.
+    let approval_status = json!({
+        "mode": "alwaysAsk",
+        "toolOverrides": {},
+        "effectiveModes": neuralnote_core::ai::approval::ALL_GATED_TOOLS
+            .into_iter()
+            .map(|tool| (tool.name().to_string(), json!("alwaysAsk")))
+            .collect::<serde_json::Map<_, _>>(),
+        "classifierAvailable": false,
+        "irreversibleActions": neuralnote_core::ai::approval::irreversible_display_names(),
+    });
+    let ai_status_with = |approval: &Value| {
+        json!({
+            "activeProvider": "openRouter",
+            "reasoningSupported": "unknown",
+            "openrouter": { "hasKey": true, "model": neuralnote_core::ai::DEFAULT_MODEL, "reasoning": false },
+            "local": { "activeModelTag": Value::Null },
+            "approval": approval,
+        })
+    };
+    scenarios.insert(
+        "tool-approval-answer",
+        vec![ok(
+            "answer_tool_approval",
+            json!({ "turnId": "00000000-0000-0000-0000-000000000001", "id": "call-1", "approved": false }),
+            Value::Null,
+        )],
+    );
+    scenarios.insert(
+        "tool-approval-set-mode",
+        vec![ok(
+            "set_approval_mode",
+            json!({ "mode": "yolo" }),
+            ai_status_with(&approval_status),
+        )],
+    );
+    scenarios.insert(
+        "tool-approval-set-override",
+        vec![ok(
+            "set_tool_approval_override",
+            json!({
+                "tool": neuralnote_core::ai::TOOL_WRITE_NOTE,
+                "mode": "alwaysAsk",
+            }),
+            ai_status_with(&approval_status),
+        )],
+    );
+
     let errors = Errors {
         not_found: CoreError::NotFound("fixture".into()),
         already_exists: CoreError::AlreadyExists("fixture".into()),

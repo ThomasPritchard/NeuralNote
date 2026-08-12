@@ -1,7 +1,7 @@
 //! Model-facing schemas and dispatch policy for the YouTube distil skill.
 
 use crate::ai::elicitation::{elicit_user, ElicitationOutcome};
-use crate::ai::events::{ElicitOption, Elicitation};
+use crate::ai::events::{ChatEvent, ElicitOption, Elicitation};
 use crate::ai::llm::UserPrompt;
 use crate::ai::skills::{Eligibility, YOUTUBE_DISTIL_SKILL_ID};
 use crate::ai::tools::{action, reject, ToolContext, ToolResult};
@@ -137,6 +137,7 @@ pub(super) async fn dispatch_fetch_captions(
     let mut annotations = combined_annotations(session, payload.annotations);
     let cost_estimate =
         transcript_cost_or_annotation(rendered.word_count, pricing, &mut annotations);
+    report_transcript_source(context, &rendered.provenance);
     action(
         json!({
             "video_id": metadata.video_id,
@@ -148,6 +149,17 @@ pub(super) async fn dispatch_fetch_captions(
         })
         .to_string(),
     )
+}
+
+/// Report how a transcript was actually obtained, from the tool that obtained it.
+/// The label is the same string the model receives, so the timeline and the model
+/// can never disagree about provenance — and the UI never has to read it back out
+/// of the model's prose. No note exists yet at this point, hence no `rel_path`.
+fn report_transcript_source(context: &mut ToolContext<'_>, provenance: &str) {
+    context.sink.send(ChatEvent::TranscriptSource {
+        label: provenance.to_string(),
+        rel_path: None,
+    });
 }
 
 async fn inspect_validated_metadata(
@@ -267,6 +279,7 @@ pub(super) async fn dispatch_transcribe_audio(
     let mut annotations = combined_annotations(session, payload.annotations);
     let cost_estimate =
         transcript_cost_or_annotation(rendered.word_count, pricing, &mut annotations);
+    report_transcript_source(context, &rendered.provenance);
     action(
         json!({
             "transcript": rendered.text,

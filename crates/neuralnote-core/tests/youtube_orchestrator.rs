@@ -166,7 +166,9 @@ fn preloaded_youtube_skill_reaches_host_io_through_the_orchestrator() {
     let registry = SkillRegistry::built_in(&[]).unwrap();
     let environment = environment();
     let io = MetadataIo(AtomicUsize::new(0));
+    let (policy, approval_prompt, approval_classifier) = support::unattended_approval();
     let services = SkillServices::new(&registry, &environment, &NoUserPrompt, &FsBackend, 1)
+        .with_approval(policy, approval_prompt, approval_classifier)
         .with_youtube_io(&io)
         .with_vault_profile_io(&UnavailableVaultProfileIo)
         .with_capture_cancellation(CaptureCancellation::default());
@@ -229,7 +231,9 @@ fn youtube_skill_context_override_allows_routing_after_a_long_transcript() {
     let registry = SkillRegistry::built_in(&[]).unwrap();
     let environment = environment();
     let io = LargeTranscriptIo(AtomicUsize::new(0));
+    let (policy, approval_prompt, approval_classifier) = support::unattended_approval();
     let services = SkillServices::new(&registry, &environment, &NoUserPrompt, &FsBackend, 1)
+        .with_approval(policy, approval_prompt, approval_classifier)
         .with_youtube_io(&io);
     let llm = ScriptedLlm {
         turns: Mutex::new(VecDeque::from([

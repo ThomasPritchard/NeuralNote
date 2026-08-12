@@ -63,21 +63,29 @@ source, so a Rust↔TS mismatch can never reach a user silently.
 ## Quality gates
 
 ```bash
-bash scripts/rust-quality-gate.sh          # clippy -D warnings + rustfmt --check + ts-rs bindings drift + llvm-cov ≥90% (neuralnote-core) + cargo-audit
+bash scripts/rust-quality-gate.sh          # clippy -D warnings + rustfmt --check + ts-rs bindings drift + llvm-cov ≥90% (neuralnote-core) + cargo-deny advisories
 ```
 
 The gate prints **GREEN (all categories enforced)** on a clean tree. If it doesn't,
 that's a real finding — treat it as yours until you've proved otherwise.
 
-**On `cargo-audit` advisories.** They are usually Tauri-transitive rather than app
+**On RUSTSEC advisories.** They are usually Tauri-transitive rather than app
 code, and it's tempting to shrug them off as "inherited, not mine". Don't. Prove
 provenance *and then try to fix it* — a transitive advisory is often a lockfile bump
 away, and a permanently-red security gate teaches everyone to ignore it.
 
 ```bash
 cargo tree -i <crate> -e normal            # where does it come from?
+cargo tree -i <crate> --target all         # ...on any platform, not just this host?
 cargo update --dry-run -p <parent>         # would a bump of the parent carry it forward?
 ```
+
+If `cargo tree -i <crate> --target all` prints "nothing to print", the crate is in
+`Cargo.lock` but is **not compiled** — an optional dependency no feature activates.
+That is why the gate runs `cargo-deny` (resolved feature graph) rather than
+`cargo audit` (lockfile union); see `deny.toml`. Never reach for an ignore-list to
+silence one of these: an ignore entry is armed forever and would also suppress the
+advisory on the day the crate genuinely does get compiled in.
 
 Worked example (2026-07-10): `quick-xml 0.39.4` (RUSTSEC-2026-0194/0195, fix
 `>=0.41.0`) arrived via `plist → tauri`. It looked unfixable — 0.39→0.41 is a
@@ -86,9 +94,10 @@ already done it upstream. `cargo update -p plist` moved both, four lines of
 `Cargo.lock`, no manifest change, all tests green, and `cargo audit` went to exit 0.
 The gate had been red for months for want of one command.
 
-`cargo audit` fails only on **vulnerabilities**. The ~17 remaining `unmaintained` /
+The gate fails only on **vulnerabilities**. The ~17 remaining `unmaintained` /
 `unsound` warnings (gtk-rs GTK3 bindings, unused on macOS) do not fail it and need no
-ignore-list.
+ignore-list — `deny.toml` relaxes those two advisory *classes*, so if one of those
+same crates is ever issued a vulnerability advisory the gate still goes red.
 
 Coverage in the gate is scoped to `neuralnote-core` (the shell's network/keychain
 paths aren't unit-coverable — they're exercised by integration + the manual run).

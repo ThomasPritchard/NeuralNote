@@ -3,7 +3,7 @@
 // bare "done" — and a failure keeps a "Retry undo" affordance, because the
 // backend restores its authority over failed runs.
 
-import { render, screen } from "@testing-library/react";
+import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { UndoReport } from "../lib/types";
@@ -83,6 +83,50 @@ describe("SkillReportCard", () => {
     expect(filename).toHaveClass("min-w-0", "truncate");
     expect(filename.closest("[title]")).toHaveAttribute("title", relPath);
     expect(filename.closest("li")).toHaveClass("min-w-0");
+  });
+
+  it("keeps notes that already existed apart from the ones this run wrote", () => {
+    render(
+      <SkillReportCard
+        files={FILES}
+        existing={[{ relPath: "Literature/Already here.md", kind: "literature" }]}
+        runId="run-1"
+        done
+      />,
+    );
+
+    // Counted apart, listed apart, and said out loud: a create-only write that
+    // hit an existing note wrote nothing, and the no-op must still reach the user.
+    expect(screen.getByText("2 notes written")).toBeInTheDocument();
+    expect(screen.getByText("1 note already in your vault")).toBeInTheDocument();
+    const existing = screen.getByRole("list", { name: "Notes that already existed" });
+    expect(within(existing).getByText("Already here.md")).toBeInTheDocument();
+    expect(within(existing).getByText(/Left as it was/)).toBeInTheDocument();
+    // It is still the user's note, so it opens like any other.
+    expect(
+      within(existing).getByRole("button", { name: "Open Literature/Already here.md" }),
+    ).toBeEnabled();
+    // The already-present note never appears among the written ones.
+    const written = screen.getByRole("list", { name: "Written notes" });
+    expect(within(written).queryByText("Already here.md")).not.toBeInTheDocument();
+  });
+
+  it("offers no Undo when the run wrote nothing because every note already existed", () => {
+    render(
+      <SkillReportCard
+        files={[]}
+        existing={[{ relPath: "Literature/Already here.md", kind: "literature" }]}
+        runId="run-1"
+        done
+      />,
+    );
+
+    // Nothing landed on disk, so there is nothing of this run's to remove —
+    // an Undo here would delete the user's own note.
+    expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/notes? written/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("list", { name: "Written notes" })).not.toBeInTheDocument();
+    expect(screen.getByText("1 note already in your vault")).toBeInTheDocument();
   });
 
   it("labels a partial playlist result and keeps transcript provenance inspectable", () => {

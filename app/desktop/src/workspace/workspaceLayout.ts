@@ -4,6 +4,12 @@ export interface WorkspaceLayoutState {
   navigationExpanded: boolean;
   sidebarWidth: number;
   sidebarPanel: SidebarPanel;
+  /**
+   * Whether the chat pane is widened to its expanded size. The width itself
+   * belongs to the `--chat-width` CSS token, responsive overrides included;
+   * this flag only records which of the two sizes the user asked for.
+   */
+  chatExpanded: boolean;
 }
 
 export interface WorkspaceMeasurements {
@@ -33,6 +39,7 @@ export const DEFAULT_WORKSPACE_LAYOUT: WorkspaceLayoutState = {
   navigationExpanded: true,
   sidebarWidth: 296,
   sidebarPanel: "files",
+  chatExpanded: false,
 };
 
 interface LayoutStorage {
@@ -54,6 +61,16 @@ function defaultStorage(): LayoutStorage | undefined {
 
 function isSidebarPanel(value: unknown): value is SidebarPanel {
   return value === "files" || value === "search" || value === null;
+}
+
+/**
+ * Reads the chat expand flag tolerantly, so a stored payload written before the
+ * toggle existed keeps the sidebar geometry saved alongside it. Rejecting the
+ * whole payload over an absent or junk flag would reset every user's pane width,
+ * which is why this stays on version 2 rather than becoming a version 3.
+ */
+function readChatExpanded(value: unknown): boolean {
+  return value === true;
 }
 
 function parseLegacyWorkspaceLayout(raw: string | null): WorkspaceLayoutState | null {
@@ -79,6 +96,7 @@ function parseLegacyWorkspaceLayout(raw: string | null): WorkspaceLayoutState | 
         SIDEBAR_MAX_WIDTH,
       ),
       sidebarPanel: "files",
+      chatExpanded: false,
     };
   } catch {
     return null;
@@ -109,6 +127,7 @@ export function parseWorkspaceLayout(raw: string | null): WorkspaceLayoutState {
         SIDEBAR_MAX_WIDTH,
       ),
       sidebarPanel: candidate.sidebarPanel,
+      chatExpanded: readChatExpanded(candidate.chatExpanded),
     };
   } catch {
     return { ...DEFAULT_WORKSPACE_LAYOUT };
@@ -175,8 +194,21 @@ export function deriveEffectiveWorkspaceLayout(
     reservedChatWidth -
     splitterWidth -
     EDITOR_MIN_WIDTH;
+  // An expanded chat pane takes the navigation's labels with it, at every window
+  // width. Running space cannot express that on its own: at a roomy window the
+  // wider pane still leaves the ribbon its labels, so a purely spatial rule left
+  // the ribbon exactly as it was and the toggle appeared to do nothing to it.
+  // Only in a narrow band (roughly 1051–1175px) did widening happen to cross the
+  // threshold, which is why this read as working.
+  //
+  // Gated on the pane actually occupying the row: `chatExpanded` persists while
+  // the chat is closed, and a hidden pane has no claim on anything. During the
+  // closing animation the reservation is still positive, so the labels come back
+  // once the pane has gone rather than halfway out.
+  const chatClaimsNavigation = preferred.chatExpanded && reservedChatWidth > 0;
   const navigationExpanded =
     preferred.navigationExpanded &&
+    !chatClaimsNavigation &&
     expandedSidebarSpace >= (panelOpen ? SIDEBAR_MIN_WIDTH : 0);
   const navigationWidth = navigationExpanded
     ? NAVIGATION_EXPANDED_WIDTH
@@ -207,5 +239,11 @@ export function deriveEffectiveWorkspaceLayout(
       : 0,
     sidebarMaxWidth,
     splitterWidth,
+    // Passed through rather than responsively clamped: how wide an expanded
+    // pane gets is the `--chat-width-wide` token's business, and that token
+    // already refuses to spend the editor's floor. What the flag decides HERE is
+    // the ribbon above (see `chatClaimsNavigation`) — expanding chat means the
+    // user wants chat, so the ribbon yielding is the intended trade.
+    chatExpanded: preferred.chatExpanded,
   };
 }

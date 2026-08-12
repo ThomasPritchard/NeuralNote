@@ -29,8 +29,19 @@ const mockOpenYoutube = vi.mocked(api.openYoutubeTimestamp);
 const mockDownloadRequirement = vi.mocked(api.downloadRequirement);
 const mockCancelRequirementDownload = vi.mocked(api.cancelRequirementDownload);
 
-const MISSING_YTDLP_STEP =
+// The backend reports an activation failure twice: a display-only narration step
+// and the structured event that carries the remedy. Both strings are composed in
+// Rust and identical, which is what lets the UI drop the duplicate row without
+// matching any prose of its own — `missingBinary` is what drives the install
+// affordance now, so re-wording this sentence can no longer disable it.
+const MISSING_YTDLP_MESSAGE =
   "Skill 'youtube-distil' could not be activated: skill 'youtube-distil' is not eligible: unmet requirements: required binary 'yt-dlp' is missing from the app-data bin directory — continuing without it";
+const MISSING_YTDLP_FAILURE = {
+  id: "youtube-distil",
+  name: "YouTube distil",
+  message: MISSING_YTDLP_MESSAGE,
+  missingBinary: "yt-dlp",
+};
 
 const PLAYFUL_PROGRESS_PAIRS = [
   ["Sending message", "Thinking"],
@@ -126,6 +137,18 @@ describe("ChatMessages — skill turns", () => {
   it("labels provider failure context as Failed rather than Stopped", () => {
     renderMessages(
       skillTurn({
+        toolCalls: [
+          {
+            id: "call-1",
+            name: "search_notes",
+            title: "Search notes",
+            arguments: '{"query":"provider"}',
+            status: "ok",
+            summary: "0 spans",
+            detail: null,
+            stepId: null,
+          },
+        ],
         activity: [{ kind: "search", query: "provider" }],
         error: "provider failed",
         done: true,
@@ -261,17 +284,54 @@ describe("ChatMessages — skill turns", () => {
     expect(rows[1]).toHaveTextContent("Transcribing locally — this takes a few minutes");
   });
 
-  it("renders an activation failure as an honest destructive notice, not normal progress", () => {
+  it("renders an activation failure from the structured event, once, not from its narration", () => {
+    const message =
+      "Skill 'fixture-note-workflow' could not be activated: it is disabled — continuing without it";
     renderMessages(
       skillTurn({
-        skillSteps: [
-          "Skill 'fixture-note-workflow' could not be activated: it is disabled — continuing without it",
+        // The backend emits both, exactly as it does in a real run.
+        skillSteps: [message],
+        skillActivationFailures: [
+          {
+            id: "fixture-note-workflow",
+            name: "Fixture note workflow",
+            message,
+            missingBinary: null,
+          },
         ],
       }),
     );
-    const row = screen.getByText(/could not be activated/);
-    expect(row.className).toContain("text-destructive");
+
+    // Exactly one row: the structured node wins and the duplicate narration is
+    // dropped, so the same problem is never stated twice in one turn.
+    const rows = screen.getAllByText(message);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].className).toContain("text-destructive");
+    // No structured remedy → no install action is invented for it.
     expect(screen.queryByRole("button", { name: /Download yt-dlp/ })).not.toBeInTheDocument();
+  });
+
+  it("shows no install action for a missing binary this app cannot fetch", () => {
+    renderMessages(
+      skillTurn({
+        skillActivationFailures: [
+          {
+            id: "transcribe",
+            name: "Transcribe",
+            message: "Skill 'transcribe' could not be activated: ffmpeg is missing",
+            missingBinary: "ffmpeg",
+          },
+        ],
+      }),
+    );
+
+    expect(
+      screen.getByText(/Skill 'transcribe' could not be activated/),
+    ).toBeInTheDocument();
+    // The download allowlist holds yt-dlp alone; offering to fetch anything else
+    // would be a promise the app cannot keep.
+    expect(screen.queryByRole("region", { name: "Set up YouTube imports" })).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: /Download/ })).not.toBeInTheDocument();
   });
 
   it("offers the pinned yt-dlp download inline for the exact missing requirement", async () => {
@@ -281,7 +341,12 @@ describe("ChatMessages — skill turns", () => {
       return Promise.resolve();
     });
     const { user } = renderMessages(
-      skillTurn({ skillActivations: [], skillSteps: [MISSING_YTDLP_STEP], done: true }),
+      skillTurn({
+        skillActivations: [],
+        skillSteps: [MISSING_YTDLP_MESSAGE],
+        skillActivationFailures: [MISSING_YTDLP_FAILURE],
+        done: true,
+      }),
     );
 
     const card = screen.getByRole("region", { name: "Set up YouTube imports" });
@@ -323,7 +388,12 @@ describe("ChatMessages — skill turns", () => {
       return new Promise(() => undefined);
     });
     const { user } = renderMessages(
-      skillTurn({ skillActivations: [], skillSteps: [MISSING_YTDLP_STEP], done: true }),
+      skillTurn({
+        skillActivations: [],
+        skillSteps: [MISSING_YTDLP_MESSAGE],
+        skillActivationFailures: [MISSING_YTDLP_FAILURE],
+        done: true,
+      }),
     );
 
     await user.click(screen.getByRole("button", { name: "Download yt-dlp" }));

@@ -5,6 +5,7 @@
 
 import type {
   AiStatus,
+  ApprovalMode,
   ApiKeyStatus,
   InstalledModel,
   OpenRouterModelMenu,
@@ -28,6 +29,7 @@ import {
 import { emitToChannel } from "./mockVaultChannel";
 import type { MockScheduler } from "./mockScheduler";
 import type { MockScheduledTask } from "./mockScheduler";
+import { ALWAYS_ASK_APPROVAL_STATUS } from "../lib/approvalStatusFixture";
 
 type CommandHandler = (a: Record<string, unknown>) => unknown;
 
@@ -89,6 +91,43 @@ export const createAiBackend = (
       reasoning: keyState.reasoning,
     },
     local: { activeModelTag: aiState.localActiveTag },
+    approval: buildApprovalStatus(),
+  });
+
+  // Mirror of the Rust `ApprovalStatus`: the stored mode and overrides, plus the
+  // EFFECTIVE mode per tool, which the shell computes by clamping each stored (or
+  // compiled-in) preference against the global ceiling. Mirrored here rather than
+  // echoed back so a journey can prove the clamp survives the IPC round trip —
+  // the UI must never derive a security value for itself.
+  const approvalState = {
+    mode: ALWAYS_ASK_APPROVAL_STATUS.mode,
+    overrides: { ...ALWAYS_ASK_APPROVAL_STATUS.toolOverrides } as Record<
+      string,
+      ApprovalMode
+    >,
+  };
+  const RESTRICTIVENESS: readonly ApprovalMode[] = ["alwaysAsk", "approveForMe", "yolo"];
+  /** `min` in the Rust ordering: the more restrictive of the two wins. */
+  const moreRestrictive = (a: ApprovalMode, b: ApprovalMode): ApprovalMode =>
+    RESTRICTIVENESS.indexOf(a) <= RESTRICTIVENESS.indexOf(b) ? a : b;
+  const buildApprovalStatus = (): AiStatus["approval"] => ({
+    mode: approvalState.mode,
+    toolOverrides: { ...approvalState.overrides },
+    effectiveModes: Object.fromEntries(
+      Object.keys(ALWAYS_ASK_APPROVAL_STATUS.effectiveModes).map((tool) => [
+        tool,
+        moreRestrictive(
+          approvalState.mode,
+          // The compiled-in default: always-ask for the tool that spawns a host
+          // process, unconstrained for the rest.
+          approvalState.overrides[tool] ??
+            (tool === "transcribe_audio" ? "alwaysAsk" : "yolo"),
+        ),
+      ]),
+    ),
+    // The mock has no cloud judge, matching a local-lane run.
+    classifierAvailable: false,
+    irreversibleActions: [...ALWAYS_ASK_APPROVAL_STATUS.irreversibleActions],
   });
 
   const rankedOpenRouterModels = [
@@ -152,6 +191,25 @@ export const createAiBackend = (
       // renders this rather than re-reading, so a failed re-read can never show
       // "off" while the config says "on".
       keyState.reasoning = a.enabled as boolean;
+      return buildAiStatus();
+    },
+    set_approval_mode: (a) => {
+      approvalState.mode = a.mode as ApprovalMode;
+      return buildAiStatus();
+    },
+    set_tool_approval_override: (a) => {
+      const tool = a.tool as string;
+      if (!(tool in ALWAYS_ASK_APPROVAL_STATUS.effectiveModes)) {
+        // The real command refuses a tool this build does not gate rather than
+        // storing an entry the next read would drop.
+        throw { kind: "invalidName", message: tool };
+      }
+      const mode = a.mode as ApprovalMode | null;
+      if (mode === null) {
+        delete approvalState.overrides[tool];
+      } else {
+        approvalState.overrides[tool] = mode;
+      }
       return buildAiStatus();
     },
     refresh_reasoning_support: () => {

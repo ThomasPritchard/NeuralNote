@@ -37,6 +37,7 @@ export interface WorkspaceLayoutController {
   workspacePanesRef: RefObject<HTMLDivElement | null>;
   setLayoutPreference: Dispatch<SetStateAction<WorkspaceLayoutState>>;
   toggleNavigation: () => void;
+  toggleChatExpanded: () => void;
   selectFiles: () => void;
   selectSearch: () => void;
   handleSearchTag: (tag: string) => void;
@@ -88,6 +89,19 @@ export function useWorkspaceLayout(
       // temporarily compacted an expanded preference, an attempted expansion
       // remains expanded in preference rather than silently reversing it.
       navigationExpanded: !effectiveNavigationExpandedRef.current,
+    }));
+  }, []);
+
+  const toggleChatExpanded = useCallback(() => {
+    // Deliberately NOT the "toggle what you can see" dance `toggleNavigation`
+    // does above. That one exists because responsive layout can compact an
+    // expanded navigation preference, so the preference and the visible state
+    // can disagree. `chatExpanded` is never clamped here — the `--chat-width`
+    // token and its breakpoints own the width — so the preference IS the
+    // visible state and a plain negation is the honest read.
+    setLayoutPreference((current) => ({
+      ...current,
+      chatExpanded: !current.chatExpanded,
     }));
   }, []);
 
@@ -170,6 +184,7 @@ export function useWorkspaceLayout(
     workspacePanesRef,
     setLayoutPreference,
     toggleNavigation,
+    toggleChatExpanded,
     selectFiles,
     selectSearch,
     handleSearchTag,

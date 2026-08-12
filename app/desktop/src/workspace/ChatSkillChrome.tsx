@@ -1,32 +1,22 @@
 // A skill turn's chrome: the labelled activation header (so a doing-turn is
 // never dressed as a plain answer), the skill's own progress narration, and the
-// actionable "set up YouTube imports" card that replaces the machine-oriented
-// missing-yt-dlp failure row. Presentational only.
+// actionable "set up YouTube imports" card.
+//
+// The card used to be reached by exact-matching a full sentence composed in
+// Rust and hand-copied across the FFI boundary — re-wording that sentence would
+// have silently disabled the install affordance, and nothing would have gone
+// red. It is now driven by the structured `skillActivationFailed` event's
+// `missingBinary` field (see `ChatTimelineNodes.tsx`), so this module no longer
+// reads backend prose at all. Presentational only.
 
 import { useState } from "react";
-import { AlertTriangle, Check, ChevronRight, Download, Loader2, Wand2 } from "lucide-react";
+import { Check, ChevronRight, Download, Loader2, Wand2 } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import type { PullEvent } from "../lib/types";
 import { buttonVariants } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { GLYPH, ROW } from "./chatRow";
-
-// The orchestrator's activation-failure marker: a skill the user asked for
-// that couldn't load arrives as a SkillStep carrying this phrase, and it must
-// render as an honest notice, never as normal progress. Two-site coupling —
-// the Rust source of truth is the SKILL_ACTIVATION_FAILURE_MARK const in
-// crates/neuralnote-core/src/ai/orchestrator.rs; keep the literals in lockstep.
-const ACTIVATION_FAILURE_MARK = "could not be activated";
-const MISSING_YTDLP_STEP =
-  "Skill 'youtube-distil' could not be activated: skill 'youtube-distil' is not eligible: unmet requirements: required binary 'yt-dlp' is missing from the app-data bin directory — continuing without it";
-
-/** Recognise only the core's complete, deterministic missing-yt-dlp step. Any
- * wording drift or different activation failure stays in the ordinary visible
- * error lane instead of gaining an unrelated install action. */
-function downloadableYoutubeRequirement(message: string): "yt-dlp" | null {
-  return message === MISSING_YTDLP_STEP ? "yt-dlp" : null;
-}
 
 type RequirementInstallState =
   | { status: "idle" }
@@ -35,7 +25,12 @@ type RequirementInstallState =
   | { status: "ready" }
   | { status: "error"; message: string };
 
-function YoutubeRequirementCard({ requirement }: Readonly<{ requirement: "yt-dlp" }>) {
+/** The actionable remedy for the one skill requirement this app can install.
+ *  Rendered by the timeline's activation-failure node when the backend reported
+ *  a missing binary it knows how to fetch. */
+export function YoutubeRequirementCard({
+  requirement,
+}: Readonly<{ requirement: "yt-dlp" }>) {
   const [install, setInstall] = useState<RequirementInstallState>({ status: "idle" });
 
   const onEvent = (event: PullEvent) => {
@@ -197,9 +192,11 @@ export function SkillActivations({
  *  visible — no windowing, no disclosure. The last row spins while the run is
  *  genuinely working (not while it waits on the user or streams the answer);
  *  settled rows keep a neutral marker — a run can end mid-step, so a
- *  completion glyph would over-claim. Activation failures render in the
- *  destructive register: the skill the user asked for isn't running, and that
- *  is never dressed as progress. */
+ *  completion glyph would over-claim.
+ *
+ *  Activation failures are no longer recognised here: they arrive structurally
+ *  and render on the timeline rail, so the caller filters their duplicate
+ *  narration out before this list ever sees it. */
 export function SkillSteps({
   steps,
   working,
@@ -216,25 +213,6 @@ export function SkillSteps({
   return (
     <ul aria-label="Skill progress" className="flex flex-col gap-1.5">
       {keyed.map(({ message, key }, i) => {
-        const requirement = downloadableYoutubeRequirement(message);
-        if (requirement !== null) {
-          // Replace this one machine-oriented failure row with the actionable
-          // card. Rendering both would repeat the same problem directly above
-          // its explanation; every non-exact failure still takes the row below.
-          return (
-            <li key={key} className="min-w-0">
-              <YoutubeRequirementCard requirement={requirement} />
-            </li>
-          );
-        }
-        if (message.includes(ACTIVATION_FAILURE_MARK)) {
-          return (
-            <li key={key} className={ROW}>
-              <AlertTriangle className={`${GLYPH} text-destructive`} aria-hidden />
-              <span className="min-w-0 break-words text-destructive">{message}</span>
-            </li>
-          );
-        }
         const active = working && i === last;
         return (
           <li key={key} className={ROW}>

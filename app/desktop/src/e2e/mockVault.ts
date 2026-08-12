@@ -74,6 +74,7 @@ export {
   VAULT_ROOT,
 } from "./mockVaultTypes";
 export type {
+  ApprovalAnswerRecord,
   ChatCallRecord,
   CoreErrorLike,
   CreateMockVaultOptions,
@@ -505,6 +506,7 @@ export function createMockVault(opts: CreateMockVaultOptions = {}): MockVault {
     },
     calls,
     chatCalls: chatRuntime.chatCalls,
+    approvalAnswers: chatRuntime.approvalAnswers,
     apiKeySaveAttempts: aiBackend.apiKeySaveAttempts,
     get profileFolder() {
       return chatRuntime.profileFolder;

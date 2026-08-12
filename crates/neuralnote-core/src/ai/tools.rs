@@ -9,9 +9,11 @@
 //! *tool result* the model reads and recovers from, never a hard failure — an
 //! agentic loop must tolerate the model asking for something impossible.
 
+use crate::ai::approval::ApprovedCall;
 use crate::ai::events::EventSink;
 use crate::ai::evidence::EvidenceRegistry;
 use crate::ai::llm::UserPrompt;
+use crate::ai::plan::{self, RunPlan};
 use crate::ai::retrieval::RetrievalProvider;
 use crate::ai::skill_tools;
 use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
@@ -24,19 +26,15 @@ use serde_json::{json, Value};
 use std::collections::BTreeSet;
 use std::path::Path;
 
-pub const TOOL_LIST_NOTES: &str = "list_notes";
-pub const TOOL_LIST_FOLDERS: &str = "list_folders";
-pub const TOOL_SEARCH_NOTES: &str = "search_notes";
-pub const TOOL_READ_NOTE_SPAN: &str = "read_note_span";
-pub const TOOL_USE_SKILL: &str = "use_skill";
-pub const TOOL_SKILL_STEP: &str = "skill_step";
-pub const TOOL_ASK_USER: &str = "ask_user";
-pub const TOOL_WRITE_NOTE: &str = "write_note";
-pub const TOOL_FETCH_VIDEO_INFO: &str = "fetch_video_info";
-pub const TOOL_FETCH_CAPTIONS: &str = "fetch_captions";
-pub const TOOL_TRANSCRIBE_AUDIO: &str = "transcribe_audio";
-pub const TOOL_SELECT_PLAYLIST_VIDEOS: &str = "select_playlist_videos";
-pub const TOOL_RESOLVE_DISTIL_ROUTE: &str = "resolve_distil_route";
+// The tool names live with the title table in `tool_registry`, so a name and its
+// human label can never drift apart. Re-exported here because this is the module
+// every caller already reaches for.
+pub use crate::ai::tool_registry::{
+    RegisteredTool, TOOL_ASK_USER, TOOL_FETCH_CAPTIONS, TOOL_FETCH_VIDEO_INFO, TOOL_LIST_FOLDERS,
+    TOOL_LIST_NOTES, TOOL_READ_NOTE_SPAN, TOOL_RESOLVE_DISTIL_ROUTE, TOOL_SEARCH_NOTES,
+    TOOL_SELECT_PLAYLIST_VIDEOS, TOOL_SKILL_STEP, TOOL_TRANSCRIBE_AUDIO, TOOL_UPDATE_PLAN,
+    TOOL_USE_SKILL, TOOL_WRITE_NOTE,
+};
 
 static UNAVAILABLE_VAULT_PROFILE_IO: UnavailableVaultProfileIo = UnavailableVaultProfileIo;
 
@@ -112,6 +110,9 @@ pub struct ToolContext<'a> {
     pub(super) youtube_session: Option<&'a mut YoutubeToolSession>,
     pub(super) vault_profile_io: &'a dyn VaultProfileIo,
     pub(super) pricing: Option<&'a PricingInput>,
+    /// The run's declared plan. `None` only for a caller that never wired one —
+    /// `update_plan` then rejects rather than pretending to record a plan.
+    pub(super) plan: Option<&'a mut RunPlan>,
     authorized_tools: &'a BTreeSet<String>,
 }
 
@@ -140,8 +141,15 @@ impl<'a> ToolContext<'a> {
             youtube_session: None,
             vault_profile_io: &UNAVAILABLE_VAULT_PROFILE_IO,
             pricing: None,
+            plan: None,
             authorized_tools,
         }
+    }
+
+    /// Wire the run's plan, so `update_plan` has somewhere to record one.
+    pub fn with_plan(mut self, plan: &'a mut RunPlan) -> Self {
+        self.plan = Some(plan);
+        self
     }
 
     /// Opt into the host YouTube seam for this run. Existing clients keep the
@@ -183,6 +191,10 @@ pub fn tool_schemas(active_skill_tools: &BTreeSet<String>) -> Vec<Value> {
         search_notes_schema(),
         read_note_span_schema(),
         skill_tools::use_skill_schema(),
+        // Always advertised. A plan is a general agent affordance, not something
+        // a skill grants — and a model that never calls it simply produces a
+        // timeline with no step grouping, which is the pre-plan behaviour.
+        plan::update_plan_schema(),
     ];
     for (name, schema) in skill_tools::active_schemas() {
         if active_skill_tools.contains(name) {
@@ -290,42 +302,57 @@ fn read_note_span_schema() -> Value {
     )
 }
 
-/// Run the named tool. Spans it produces are registered (assigning citable ids) so
-/// the ids appear in the model-facing JSON and the verifier can find them later.
+/// Run the approved tool. Spans it produces are registered (assigning citable
+/// ids) so the ids appear in the model-facing JSON and the verifier can find them
+/// later.
+///
+/// Taking an [`ApprovedCall`] rather than a raw name and argument blob is what
+/// makes "no call reaches execution without a decision" a **compile error to
+/// violate**: the only two constructors are
+/// [`ApprovedCall::ungated`](crate::ai::approval::ApprovedCall::ungated), which
+/// cannot produce one for a gated tool, and the private one inside
+/// [`approval::decide`](crate::ai::approval::decide).
 pub async fn dispatch(
-    call_id: &str,
-    name: &str,
-    args_json: &str,
+    approved: &ApprovedCall,
     provider: &dyn RetrievalProvider,
     registry: &mut EvidenceRegistry,
     user_prompt: &dyn UserPrompt,
     context: &mut ToolContext<'_>,
 ) -> ToolResult {
-    if !known_tool(name) {
+    let (call_id, name, args_json) = (approved.call_id(), approved.name(), approved.arguments());
+    // Routing on the registry enum, not on the raw string, is what makes the title
+    // table exhaustive: a new tool cannot be dispatched until it is a variant, and
+    // a new variant does not compile until it has a title.
+    let Some(tool) = RegisteredTool::from_name(name) else {
         return reject(format!("unknown tool '{name}'"));
-    }
+    };
     if !context.authorized_tools.contains(name) {
         return reject(format!(
             "tool '{name}' is not active; activate a skill that grants it first"
         ));
     }
-    match name {
-        TOOL_LIST_NOTES => dispatch_list(args_json, provider),
-        TOOL_LIST_FOLDERS => dispatch_folders(provider),
-        TOOL_SEARCH_NOTES => dispatch_search(args_json, provider, registry),
-        TOOL_READ_NOTE_SPAN => dispatch_read(args_json, provider, registry),
-        TOOL_USE_SKILL => skill_tools::dispatch_use_skill(args_json, context),
-        TOOL_SKILL_STEP => skill_tools::dispatch_skill_step(args_json, context),
-        TOOL_ASK_USER => {
+    match tool {
+        RegisteredTool::ListNotes => dispatch_list(args_json, provider),
+        RegisteredTool::ListFolders => dispatch_folders(provider),
+        RegisteredTool::SearchNotes => dispatch_search(args_json, provider, registry),
+        RegisteredTool::ReadNoteSpan => dispatch_read(args_json, provider, registry),
+        RegisteredTool::UseSkill => skill_tools::dispatch_use_skill(args_json, context),
+        RegisteredTool::SkillStep => skill_tools::dispatch_skill_step(args_json, context),
+        RegisteredTool::UpdatePlan => plan::dispatch_update_plan(args_json, context),
+        RegisteredTool::AskUser => {
             skill_tools::dispatch_ask_user(call_id, args_json, user_prompt, context).await
         }
-        TOOL_WRITE_NOTE => skill_tools::dispatch_write_note(args_json, context),
-        TOOL_FETCH_VIDEO_INFO => youtube_tools::dispatch_fetch_video_info(args_json, context).await,
-        TOOL_FETCH_CAPTIONS => youtube_tools::dispatch_fetch_captions(args_json, context).await,
-        TOOL_TRANSCRIBE_AUDIO => {
+        RegisteredTool::WriteNote => skill_tools::dispatch_write_note(args_json, context),
+        RegisteredTool::FetchVideoInfo => {
+            youtube_tools::dispatch_fetch_video_info(args_json, context).await
+        }
+        RegisteredTool::FetchCaptions => {
+            youtube_tools::dispatch_fetch_captions(args_json, context).await
+        }
+        RegisteredTool::TranscribeAudio => {
             youtube_tools::dispatch_transcribe_audio(call_id, args_json, user_prompt, context).await
         }
-        TOOL_SELECT_PLAYLIST_VIDEOS => {
+        RegisteredTool::SelectPlaylistVideos => {
             crate::ai::youtube_selection::dispatch_select_playlist_videos(
                 call_id,
                 args_json,
@@ -334,7 +361,7 @@ pub async fn dispatch(
             )
             .await
         }
-        TOOL_RESOLVE_DISTIL_ROUTE => {
+        RegisteredTool::ResolveDistilRoute => {
             crate::ai::youtube_route::dispatch_resolve_distil_route(
                 call_id,
                 args_json,
@@ -344,27 +371,7 @@ pub async fn dispatch(
             )
             .await
         }
-        other => reject(format!("unknown tool '{other}'")),
     }
-}
-
-fn known_tool(name: &str) -> bool {
-    matches!(
-        name,
-        TOOL_LIST_NOTES
-            | TOOL_LIST_FOLDERS
-            | TOOL_SEARCH_NOTES
-            | TOOL_READ_NOTE_SPAN
-            | TOOL_USE_SKILL
-            | TOOL_SKILL_STEP
-            | TOOL_ASK_USER
-            | TOOL_WRITE_NOTE
-            | TOOL_FETCH_VIDEO_INFO
-            | TOOL_FETCH_CAPTIONS
-            | TOOL_TRANSCRIBE_AUDIO
-            | TOOL_SELECT_PLAYLIST_VIDEOS
-            | TOOL_RESOLVE_DISTIL_ROUTE
-    )
 }
 
 pub(super) fn reject(message: String) -> ToolResult {
@@ -577,7 +584,7 @@ mod tests {
     use super::*;
     use crate::ai::events::VecSink;
     use crate::ai::evidence::EvidenceSpan;
-    use crate::ai::llm::NoUserPrompt;
+    use crate::ai::llm::{NoUserPrompt, ToolCall};
     use crate::ai::local::HardwareSpec;
     use crate::ai::retrieval::{FolderMeta, ListOutcome, NoteMeta, SearchOutcome};
     use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
@@ -728,15 +735,35 @@ mod tests {
             &mut sink,
             &allowed,
         );
+        // Every tool exercised here is ungated, so the one constructor that
+        // cannot authorise a gated call is the right one — and it fails loudly if
+        // a gated tool is ever added to these cases, which is the point.
+        let approved = ApprovedCall::ungated(&ToolCall {
+            id: "test-call".into(),
+            name: name.into(),
+            arguments: args_json.into(),
+        })
+        .expect("the tools dispatched here are ungated");
         block_on(dispatch(
-            "test-call",
-            name,
-            args_json,
+            &approved,
             provider,
             registry,
             &NoUserPrompt,
             &mut context,
         ))
+    }
+
+    #[test]
+    fn the_advertised_schemas_and_the_tool_registry_agree_exactly() {
+        // Two independent sources: schemas are assembled from three modules, the
+        // registry is one table. A tool that gains a schema but no registry entry
+        // would render with no title; one registered but never advertised is dead.
+        let registered: BTreeSet<String> = RegisteredTool::ALL
+            .iter()
+            .map(|tool| tool.name().to_string())
+            .collect();
+        let advertised = advertised_tool_names(&tool_schemas(&registered));
+        assert_eq!(advertised, registered);
     }
 
     #[test]
@@ -753,6 +780,9 @@ mod tests {
                 TOOL_SEARCH_NOTES,
                 TOOL_READ_NOTE_SPAN,
                 TOOL_USE_SKILL,
+                // Always advertised: a plan is a general agent affordance, not
+                // something a skill grants.
+                TOOL_UPDATE_PLAN,
             ]
         );
     }

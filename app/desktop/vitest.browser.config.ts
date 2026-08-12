@@ -28,11 +28,20 @@ export default defineConfig({
     // The Chromium-only graph smoke imports these lazily. Pre-bundling them
     // keeps Vite from reloading the running test (and loading a second React)
     // when that spec is the first graph consumer in a fresh cache.
+    //
+    // The Radix entries are here for the same reason and cost a red run to
+    // find: the expand-to-wide spec mounts the whole ChatPane, which is the
+    // first browser-tier consumer of the model menu and the icon-button
+    // tooltip. Discovering them mid-run re-optimizes and reloads the test with
+    // a SECOND copy of React, and every hook in the tree then throws "Invalid
+    // hook call" — which reads as a broken component, not a cold cache.
     include: [
       "react-force-graph-3d",
       "three",
       "three/examples/jsm/postprocessing/UnrealBloomPass.js",
       "three-spritetext",
+      "@radix-ui/react-dropdown-menu",
+      "@radix-ui/react-tooltip",
     ],
   },
   resolve: {

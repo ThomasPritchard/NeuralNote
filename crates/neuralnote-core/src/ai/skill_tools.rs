@@ -3,7 +3,7 @@
 use crate::ai::elicitation::{elicit_user, ElicitationOutcome};
 use crate::ai::events::{ChatEvent, ElicitOption, Elicitation};
 use crate::ai::llm::UserPrompt;
-use crate::ai::orchestrator::SKILL_ACTIVATION_FAILURE_MARK;
+use crate::ai::orchestrator::{activation_failure_message, skill_activation_failed};
 use crate::ai::skills::YOUTUBE_DISTIL_SKILL_ID;
 use crate::ai::tools::{
     action, function_tool, reject, reject_and_complete, ToolContext, ToolControl, ToolOutcome,
@@ -123,11 +123,14 @@ pub(super) fn dispatch_use_skill(args_json: &str, context: &mut ToolContext<'_>)
             Ok(activation) => activation,
             Err(error) => {
                 context.sink.send(ChatEvent::SkillStep {
-                    message: format!(
-                    "Skill '{}' {SKILL_ACTIVATION_FAILURE_MARK}: {error} — continuing without it",
-                        args.id
-                    ),
+                    message: activation_failure_message(&args.id, &error),
                 });
+                context.sink.send(skill_activation_failed(
+                    &args.id,
+                    &error,
+                    context.skills,
+                    context.environment,
+                ));
                 return if needs_missing_ytdlp_recovery(&args.id, &error) {
                     reject_and_complete(error)
                 } else {
@@ -256,6 +259,14 @@ pub(super) fn dispatch_write_note(args_json: &str, context: &mut ToolContext<'_>
             if let Some(session) = context.youtube_session.as_deref_mut() {
                 session.record_playlist_write(args.work_item, args.kind);
             }
+            // #108: this arm used to return here having emitted nothing, so a
+            // create-only write that collided with a note the user already had
+            // was invisible. `kind` is the kind that was REQUESTED — nothing was
+            // written, so there is no written kind to report.
+            context.sink.send(ChatEvent::NoteExists {
+                rel_path: rel_path.clone(),
+                kind: args.kind,
+            });
             action(json!({ "existed": true, "rel_path": rel_path }).to_string())
         }
         Err(error) => reject(format!("write_note failed: {error}")),

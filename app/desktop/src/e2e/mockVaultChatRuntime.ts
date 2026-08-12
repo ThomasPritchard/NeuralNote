@@ -7,10 +7,18 @@
 // stream exactly as `UserPrompt::ask` parks the Rust run (the remainder plays
 // only after a validated `answer_elicitation`); `undo_skill_run` reports
 // per-file outcomes over what the run actually wrote.
+//
+// A `toolApprovalRequested` frame parks the same way, and for the same reason:
+// the gate blocks the dispatch until the user answers. The two parks are kept
+// separate all the way down — separate state, separate command — because a
+// webview answer meant for a model-authored question must never be able to
+// satisfy a security prompt. Answering emits the settlement itself, as Rust
+// does, so the sheet is cleared by the EVENT and never by the click.
 
 import type { ChatEvent, PullEvent, UndoReport } from "../lib/types";
 import {
   fail,
+  type ApprovalAnswerRecord,
   type ChatCallRecord,
   type CreateMockVaultOptions,
 } from "./mockVaultTypes";
@@ -24,6 +32,7 @@ export interface ChatRuntime {
   handlers: Record<string, CommandHandler>;
   expireElicitation: () => void;
   readonly chatCalls: readonly ChatCallRecord[];
+  readonly approvalAnswers: readonly ApprovalAnswerRecord[];
   readonly profileFolder: string | null;
 }
 
@@ -34,9 +43,19 @@ export const createChatRuntime = (
   const chatScript = opts.chatScript ?? [];
 
   const chatCalls: ChatCallRecord[] = [];
+  const approvalAnswers: ApprovalAnswerRecord[] = [];
   const writtenByRun = new Map<string, string[]>();
   const completedChatRuns = new Set<string>();
   let profileFolder: string | null = null;
+
+  interface ParkedApproval {
+    id: string;
+    send: (message: unknown) => void;
+    remainder: ChatEvent[];
+    runId: string;
+    finish: () => void;
+  }
+  let parkedApproval: ParkedApproval | null = null;
 
   interface ParkedElicitation {
     id: string;
@@ -80,6 +99,13 @@ export const createChatRuntime = (
         const written = writtenByRun.get(runId) ?? [];
         written.push(event.relPath);
         writtenByRun.set(runId, written);
+      }
+      if (event.type === "toolApprovalRequested") {
+        // The gate blocks the dispatch here. The `chat` invoke stays pending,
+        // exactly as it does for an elicitation — a run waiting on a security
+        // answer has not finished.
+        parkedApproval = { id: event.id, send, remainder: events.slice(i + 1), runId, finish };
+        return;
       }
       if (event.type === "elicit") {
         parkedElicitation = {
@@ -152,6 +178,45 @@ export const createChatRuntime = (
         );
       });
       return { turnId, status: "cancelled" };
+    },
+    answer_tool_approval: (a) => {
+      // A SEPARATE command from `answer_elicitation`, mirroring the shell, so a
+      // webview answer meant for a model-authored question can never satisfy a
+      // security prompt.
+      const id = a.id as string;
+      const turnId = a.turnId as string;
+      // Anything that is not an explicit `true` denies, as the shell does. The
+      // fail-safe direction is the only one a coercion may go in here.
+      const approved = a.approved === true;
+      const parked = parkedApproval;
+      // Rust is the only expiry authority, and the answer is scoped to its own
+      // run: an id reused by a sibling run must never resolve this one. With
+      // nothing parked, a late "yes" gets exactly what it gets from the shell
+      // once the 120s expiry has fired.
+      if (parked === null || parked.id !== id || parked.runId !== turnId) {
+        return fail(
+          "notFound",
+          `approval '${id}' is not live (it may have timed out or ended)`,
+        );
+      }
+      approvalAnswers.push({ turnId, id, approved });
+      parkedApproval = null;
+      const branch = opts.approvalTails;
+      const tail = branch === undefined
+        ? parked.remainder
+        : (approved ? branch.approved : branch.denied);
+      advanceChatScript(
+        parked.send,
+        // The settlement is the BACKEND's, exactly as in the shell: the UI's
+        // sheet is cleared by this event, never by its own click.
+        [
+          { type: "toolApprovalResolved", id, decision: approved ? "approved" : "denied" },
+          ...tail,
+        ],
+        parked.runId,
+        parked.finish,
+      );
+      return undefined;
     },
     answer_elicitation: (a) => {
       // Validation mirrors the shell (skills/elicitation.rs `answer`):
@@ -288,6 +353,7 @@ export const createChatRuntime = (
     handlers,
     expireElicitation,
     chatCalls,
+    approvalAnswers,
     get profileFolder() {
       return profileFolder;
     },

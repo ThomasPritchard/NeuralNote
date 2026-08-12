@@ -7,11 +7,18 @@
 //! `Done`. Any error is surfaced as a [`ChatEvent::Error`] and stops the run — never
 //! a panic, never silent.
 
-use crate::ai::events::{ChatEvent, EventSink};
+use crate::ai::approval::{
+    self, ApprovalClassifier, ApprovalContext, ApprovalDecision, ApprovalGate, ApprovalPolicy,
+    ApprovalPrompt, ApprovalResolution, ApprovedCall, DenyingApprovalPrompt,
+    UnavailableApprovalClassifier,
+};
+use crate::ai::events::{ChatEvent, EventSink, TokenUsage, ToolStatus};
 use crate::ai::evidence::EvidenceRegistry;
 use crate::ai::llm::{Completion, LlmClient, LlmMessage, LlmRequest, Role, ToolCall, UserPrompt};
+use crate::ai::plan::RunPlan;
 use crate::ai::retrieval::RetrievalProvider;
-use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
+use crate::ai::skills::{missing_required_binary, ActiveSkills, SkillEnvironment, SkillRegistry};
+use crate::ai::tool_registry;
 use crate::ai::tools::{self, dispatch, ToolOutcome};
 use crate::ai::verify::CitationVerifier;
 use crate::ai::write_policy::{NoteWriteBackend, UndoLedger, WriteSession};
@@ -23,7 +30,7 @@ use crate::capture::{PricingInput, UnavailableVaultProfileIo, VaultProfileIo};
 use crate::error::CoreResult;
 use async_trait::async_trait;
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 const MAX_PLAYLIST_TURNS_PER_ITEM: usize = 8;
 
@@ -38,6 +45,12 @@ pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.5";
 /// in `tests/skill_orchestrator.rs`, which asserts the emitted `SkillStep`
 /// message contains this constant.
 pub const SKILL_ACTIVATION_FAILURE_MARK: &str = "could not be activated";
+
+/// Why a run ended short. Both are the orchestrator's own knowledge — a guard it
+/// tripped, or a stop it honoured — so neither is ever inferred from model prose.
+const PARTIAL_RUN_GUARD_TRIPPED: &str =
+    "the run reached a work limit before finishing, so it covered only part of the task";
+const PARTIAL_RUN_CANCELLED: &str = "the run was stopped before it finished every item";
 
 /// Loop guards — cost- and runaway-protection (spec §4). Defaults suit a single
 /// own-vault user; the host may tune them.
@@ -83,6 +96,9 @@ RESEARCH — you MUST search before answering:
   `list_notes` to scope to it and its subfolders; omit `folder` to cover the whole vault.
 - Cite every claim with the evidence id in square brackets, e.g. [e1] or [e2]. Cite ids
   only — never a file path, and never a quote you did not retrieve.
+- If the work genuinely needs three or more distinct steps, call `update_plan` once
+  before you start, then keep it current as you go. Skip it for a direct answer or a
+  single search — a plan for one step is noise.
 
 These hold in both modes:
 - Never answer a factual question from your own knowledge. Your knowledge is for
@@ -128,7 +144,14 @@ pub struct SkillServices<'a> {
     pricing: Option<&'a PricingInput>,
     extractor_updates: ExtractorUpdateSession,
     retry_delay: &'a dyn RetryDelay,
+    approval_policy: ApprovalPolicy,
+    approval_prompt: &'a dyn ApprovalPrompt,
+    approval_classifier: &'a dyn ApprovalClassifier,
 }
+
+static DENYING_APPROVAL_PROMPT: DenyingApprovalPrompt = DenyingApprovalPrompt;
+static UNAVAILABLE_APPROVAL_CLASSIFIER: UnavailableApprovalClassifier =
+    UnavailableApprovalClassifier;
 
 static UNAVAILABLE_VAULT_PROFILE_IO: UnavailableVaultProfileIo = UnavailableVaultProfileIo;
 
@@ -156,7 +179,29 @@ impl<'a> SkillServices<'a> {
             extractor_updates: ExtractorUpdateSession::default(),
             // No-op backoff by default; the desktop shell wires its runtime timer.
             retry_delay: &NO_RETRY_DELAY,
+            // Fail-closed defaults: ask about everything, deny when nobody is
+            // listening, and have no judge. A client that forgets to wire the
+            // approval seams therefore cannot run gated tools unattended — the
+            // opposite default would turn a missed wiring step into silent
+            // unattended vault writes.
+            approval_policy: ApprovalPolicy::default(),
+            approval_prompt: &DENYING_APPROVAL_PROMPT,
+            approval_classifier: &UNAVAILABLE_APPROVAL_CLASSIFIER,
         }
+    }
+
+    /// Wire the tool-approval gate: the persisted policy, the host's approval
+    /// sheet, and the judge.
+    pub fn with_approval(
+        mut self,
+        policy: ApprovalPolicy,
+        prompt: &'a dyn ApprovalPrompt,
+        classifier: &'a dyn ApprovalClassifier,
+    ) -> Self {
+        self.approval_policy = policy;
+        self.approval_prompt = prompt;
+        self.approval_classifier = classifier;
+        self
     }
 
     pub fn with_youtube_io(mut self, youtube_io: &'a dyn YoutubeIo) -> Self {
@@ -241,6 +286,13 @@ pub async fn run_chat(
         skill_services,
         guards,
     };
+    // Started before anything else so the elapsed time in the footer is the run
+    // the user waited for, not the part of it after setup. Reading a monotonic
+    // clock is a measurement, not a timer — the core still owns no waiting; that
+    // stays behind `RetryDelay`.
+    let started = Instant::now();
+    let mut meter = UsageMeter::new(sink, started, model);
+    let sink = &mut meter;
     let mut writes = match WriteSession::new(skill_services.work_items) {
         Ok(writes) => writes,
         Err(error) => {
@@ -250,9 +302,20 @@ pub async fn run_chat(
             return Ok(UndoLedger::default());
         }
     };
+    // Per-run, and deliberately never serialised: an approval cannot survive a
+    // restart, and a verdict cached across runs would have been derived from a
+    // vault state that no longer exists.
+    let mut gate = ApprovalGate::new(skill_services.approval_policy.clone());
     sink.send(ChatEvent::Processing);
     if let Err(e) = session
-        .drive(user_input, history, &active_skills, &mut writes, sink)
+        .drive(
+            user_input,
+            history,
+            &active_skills,
+            &mut writes,
+            &mut gate,
+            sink,
+        )
         .await
     {
         // Surface the failure explicitly and stop — never a panic, never silent.
@@ -285,6 +348,130 @@ struct CoverageAcc {
 struct ThinkingCounter<'a> {
     inner: &'a mut dyn EventSink,
     count: usize,
+}
+
+/// A pass-through sink that remembers whether anything went out through it.
+///
+/// The one fact `complete_tool_turn` needs before it may retry: nothing the user
+/// can already see was published. Watching the sink means the answer holds for
+/// any client, including one whose streaming implementation this crate has never
+/// seen — rather than trusting each implementation to report it honestly.
+struct EmissionGuard<'a> {
+    inner: &'a mut dyn EventSink,
+    emitted: bool,
+}
+
+impl EventSink for EmissionGuard<'_> {
+    fn send(&mut self, event: ChatEvent) {
+        self.emitted = true;
+        self.inner.send(event);
+    }
+
+    /// Metering is not an emission: a token report is not something the user can
+    /// see, so it must not bar the retry this guard exists to bar.
+    fn record_usage(&mut self, usage: Option<TokenUsage>) {
+        self.inner.record_usage(usage);
+    }
+}
+
+/// Totals what the run's model calls cost, and emits the one user-facing
+/// [`ChatEvent::Usage`] immediately before the event that ends the run — either
+/// [`ChatEvent::Done`] or [`ChatEvent::Error`].
+///
+/// It wraps the run's sink rather than being called at the end of `drive`
+/// because a run has several terminal sites — `Done` and `Error` alike, some of
+/// them outside `drive` entirely — and one more would forget. Intercepting the
+/// terminal events makes "exactly once, immediately before the run ends" a
+/// property of the type instead of a rule every site has to remember.
+///
+/// **A total is reported only when every model call reported.** One unmetered
+/// call and the whole run's counts go absent, because a total that silently
+/// omits a turn is a wrong number — and a wrong number in a cost footer is worse
+/// than no number, for the same reason a wrong citation is worse than no answer.
+struct UsageMeter<'a> {
+    inner: &'a mut dyn EventSink,
+    started: Instant,
+    model: String,
+    tokens_in: u64,
+    tokens_out: u64,
+    /// How many model calls reported a real measurement. Zero means nothing to
+    /// total; the run still gets its elapsed time and model.
+    metered_calls: usize,
+    /// Set by the first call that reported no usage. From then on the run's
+    /// counts are unknowable, and no later report can un-set it.
+    incomplete: bool,
+    emitted: bool,
+}
+
+impl<'a> UsageMeter<'a> {
+    fn new(inner: &'a mut dyn EventSink, started: Instant, model: &str) -> Self {
+        Self {
+            inner,
+            started,
+            model: model.to_string(),
+            tokens_in: 0,
+            tokens_out: 0,
+            metered_calls: 0,
+            incomplete: false,
+            emitted: false,
+        }
+    }
+
+    /// The run's totals, or `None` when they would be a guess.
+    ///
+    /// `u32` is the wire type; a run that somehow exceeded it reports absent
+    /// rather than a wrapped number — saturating would invent a measurement.
+    fn totals(&self) -> Option<(u32, u32)> {
+        if self.incomplete || self.metered_calls == 0 {
+            return None;
+        }
+        Some((
+            u32::try_from(self.tokens_in).ok()?,
+            u32::try_from(self.tokens_out).ok()?,
+        ))
+    }
+
+    fn emit(&mut self) {
+        if self.emitted {
+            return;
+        }
+        self.emitted = true;
+        let (tokens_in, tokens_out) = match self.totals() {
+            Some((tokens_in, tokens_out)) => (Some(tokens_in), Some(tokens_out)),
+            None => (None, None),
+        };
+        self.inner.send(ChatEvent::Usage {
+            elapsed_ms: u64::try_from(self.started.elapsed().as_millis()).unwrap_or(u64::MAX),
+            tokens_in,
+            tokens_out,
+            model: self.model.clone(),
+        });
+    }
+}
+
+impl EventSink for UsageMeter<'_> {
+    fn send(&mut self, event: ChatEvent) {
+        // `Done` is not the only terminal event: an `Error` ends the run too, and
+        // the UI settles the turn on either. Metering only `Done` lost the cost of
+        // every failed run (#123) — the run whose cost a user most wants, since it
+        // spent tokens and produced no answer. `emit` is idempotent, so a run that
+        // somehow ended twice over still reports once.
+        if matches!(event, ChatEvent::Done | ChatEvent::Error { .. }) {
+            self.emit();
+        }
+        self.inner.send(event);
+    }
+
+    fn record_usage(&mut self, usage: Option<TokenUsage>) {
+        match usage {
+            Some(usage) => {
+                self.metered_calls += 1;
+                self.tokens_in += u64::from(usage.tokens_in);
+                self.tokens_out += u64::from(usage.tokens_out);
+            }
+            None => self.incomplete = true,
+        }
+    }
 }
 
 #[derive(Default)]
@@ -336,15 +523,23 @@ impl EventSink for ThinkingCounter<'_> {
         }
         self.inner.send(event);
     }
+
+    /// Forwarded, not defaulted: the answer turn is the run's largest model call,
+    /// and a wrapper that swallowed its report would cost every run its footer.
+    fn record_usage(&mut self, usage: Option<TokenUsage>) {
+        self.inner.record_usage(usage);
+    }
 }
 
 impl ChatSession<'_> {
+    #[allow(clippy::too_many_arguments)]
     async fn drive(
         &self,
         user_input: &str,
         history: &[LlmMessage],
         preloaded_skills: &[String],
         writes: &mut WriteSession,
+        gate: &mut ApprovalGate,
         sink: &mut dyn EventSink,
     ) -> CoreResult<()> {
         // Sanitise history in the core (strip stale `[eN]` markers, window to a char
@@ -366,10 +561,14 @@ impl ChatSession<'_> {
                 Ok(activation) => activation,
                 Err(error) => {
                     sink.send(ChatEvent::SkillStep {
-                        message: format!(
-                            "Skill '{id}' {SKILL_ACTIVATION_FAILURE_MARK}: {error} — continuing without it"
-                        ),
+                        message: activation_failure_message(id, &error),
                     });
+                    sink.send(skill_activation_failed(
+                        id,
+                        &error,
+                        self.skill_services.registry,
+                        self.skill_services.environment,
+                    ));
                     // A preload has no genuine tool-call id. Preserve protocol order
                     // with system context carrying the same recoverable JSON error a
                     // rejected `use_skill` call would return, then continue ungranted.
@@ -403,14 +602,20 @@ impl ChatSession<'_> {
             self.skill_services.capture_cancellation.clone(),
             self.skill_services.extractor_updates.clone(),
         );
+        // Empty unless the model declares one. Nothing below requires a plan — a
+        // run without one is the common case, and it renders exactly as it did
+        // before plans existed.
+        let mut plan = RunPlan::default();
         let collection = self
             .collect_evidence(
                 &mut messages,
                 &mut active_skills,
                 writes,
                 &mut youtube_session,
+                &mut plan,
                 &mut registry,
                 &mut coverage,
+                gate,
                 sink,
             )
             .await?;
@@ -421,6 +626,13 @@ impl ChatSession<'_> {
                 return Ok(());
             }
         };
+        // The loop stopped the model mid-work. That is authoritative here — the UI
+        // must never have to infer it from an answer that merely says "partial".
+        if guard_tripped {
+            sink.send(ChatEvent::PartialRun {
+                reason: PARTIAL_RUN_GUARD_TRIPPED.to_string(),
+            });
+        }
 
         // Verify + answer phase. Verifying is the UI cue that the answer is being
         // grounded; the actual citation checks run once we have the streamed text.
@@ -487,8 +699,10 @@ impl ChatSession<'_> {
         active_skills: &mut ActiveSkills,
         writes: &mut WriteSession,
         youtube_session: &mut YoutubeToolSession,
+        plan: &mut RunPlan,
         registry: &mut EvidenceRegistry,
         coverage: &mut CoverageAcc,
+        gate: &mut ApprovalGate,
         sink: &mut dyn EventSink,
     ) -> CoreResult<EvidenceCollection> {
         let mut consumed = 0usize;
@@ -523,7 +737,7 @@ impl ChatSession<'_> {
             // This tool-DECIDING turn is idempotent (no tool has run yet), so a single
             // transient transport failure is retried once rather than aborting the run.
             let completion = self
-                .complete_tool_turn(&self.request(&budgeted.messages, &tools))
+                .complete_tool_turn(&self.request(&budgeted.messages, &tools), sink)
                 .await?;
             consumed += 1;
             if completion.tool_calls.is_empty() {
@@ -548,9 +762,11 @@ impl ChatSession<'_> {
                     active_skills,
                     writes,
                     youtube_session,
+                    plan,
                     &authorized_tools,
                     registry,
                     coverage,
+                    gate,
                     sink,
                     &mut playlist.context_chars,
                 )
@@ -570,9 +786,11 @@ impl ChatSession<'_> {
         active_skills: &mut ActiveSkills,
         writes: &mut WriteSession,
         youtube_session: &mut YoutubeToolSession,
+        plan: &mut RunPlan,
         authorized_tools: &std::collections::BTreeSet<String>,
         registry: &mut EvidenceRegistry,
         coverage: &mut CoverageAcc,
+        gate: &mut ApprovalGate,
         sink: &mut dyn EventSink,
         context_chars: &mut usize,
     ) -> ToolBatchControl {
@@ -583,8 +801,14 @@ impl ChatSession<'_> {
             .map(|(index, _, _)| index);
         let mut playlist_batch_closed = false;
         for call in calls {
+            // Announce the call BEFORE anything can go wrong with it, so one that
+            // is skipped, cancelled, rejected or fails still reaches the timeline
+            // instead of vanishing. Every branch below settles it exactly once.
+            // This is also where the step affiliation is stamped — the plan as it
+            // stands at THIS call's dispatch, not as it ends up.
+            emit_tool_call(sink, call, plan);
             if playlist_batch_closed {
-                push_stale_playlist_tool_result(messages, call);
+                settle_skipped(messages, sink, call, SkippedCall::StalePlaylistBatch);
                 continue;
             }
             if !playlist_cancelled
@@ -593,30 +817,38 @@ impl ChatSession<'_> {
             {
                 youtube_session.cancel_playlist_remaining();
                 playlist_cancelled = true;
+                // The orchestrator knows the run is ending short. Say so once,
+                // rather than leaving the UI to infer it from the model's prose.
+                sink.send(ChatEvent::PartialRun {
+                    reason: PARTIAL_RUN_CANCELLED.to_string(),
+                });
             }
             if playlist_cancelled {
-                push_cancelled_tool_result(messages, call);
+                settle_skipped(messages, sink, call, SkippedCall::PlaylistCancelled);
                 continue;
             }
             if control.budget_hit {
-                push_skipped_tool_result(messages, call);
+                settle_skipped(messages, sink, call, SkippedCall::EvidenceBudgetSpent);
                 continue;
             }
-            control.complete_turn |= self
+            let (tool_control, settlement) = self
                 .push_tool_result(
                     messages,
                     call,
                     active_skills,
                     writes,
                     youtube_session,
+                    plan,
                     authorized_tools,
                     registry,
                     coverage,
+                    gate,
                     sink,
                     context_chars,
                 )
-                .await
-                == tools::ToolControl::CompleteTurn;
+                .await;
+            control.complete_turn |= tool_control == tools::ToolControl::CompleteTurn;
+            emit_tool_result(sink, &call.id, settlement);
             let current_playlist_item = youtube_session
                 .playlist_current()
                 .map(|(index, _, _)| index);
@@ -642,18 +874,42 @@ impl ChatSession<'_> {
         active_skills: &mut ActiveSkills,
         writes: &mut WriteSession,
         youtube_session: &mut YoutubeToolSession,
+        plan: &mut RunPlan,
         authorized_tools: &std::collections::BTreeSet<String>,
         registry: &mut EvidenceRegistry,
         coverage: &mut CoverageAcc,
+        gate: &mut ApprovalGate,
         sink: &mut dyn EventSink,
         context_chars: &mut usize,
-    ) -> tools::ToolControl {
+    ) -> (tools::ToolControl, ToolSettlement) {
+        // The gate is the single door in front of dispatch, and the ONLY producer
+        // of the `ApprovedCall` dispatch requires. A refusal still pushes exactly
+        // one result for this call and settles its node: denial is not
+        // run-cancellation, and the remaining calls in the batch stay gated.
+        let approved = match self.approve(gate, call, writes, sink).await {
+            Ok(approved) => approved,
+            Err(refusal) => {
+                messages.push(LlmMessage::tool_result(
+                    &call.id,
+                    &call.name,
+                    refusal.tool_result_content(),
+                ));
+                if youtube_session.playlist_is_active()
+                    && call.name != tools::TOOL_SELECT_PLAYLIST_VIDEOS
+                {
+                    youtube_session
+                        .fail_playlist_item(format!("tool '{}' was not approved", call.name));
+                }
+                return (tools::ToolControl::Continue, refusal.settlement());
+            }
+        };
         let result = self
             .handle_tool_call(
-                call,
+                &approved,
                 active_skills,
                 writes,
                 youtube_session,
+                plan,
                 authorized_tools,
                 registry,
                 coverage,
@@ -666,13 +922,48 @@ impl ChatSession<'_> {
         {
             youtube_session.fail_playlist_item(format!("tool '{}' was rejected", call.name));
         }
+        let settlement = settlement_for(&result);
         *context_chars += result.content.len();
         messages.push(LlmMessage::tool_result(
             &call.id,
             &call.name,
             result.content,
         ));
-        result.control
+        (result.control, settlement)
+    }
+
+    /// Take one declared call through the approval gate.
+    ///
+    /// An **ungated** tool needs no decision at all — the four read-only vault
+    /// tools, `skill_step`, `ask_user`, and any name the model invented — so it is
+    /// admitted by [`ApprovedCall::ungated`], the one constructor that provably
+    /// cannot authorise a gated call. Everything the gate covers goes through
+    /// [`approval::decide`], which is its only other constructor.
+    async fn approve(
+        &self,
+        gate: &mut ApprovalGate,
+        call: &ToolCall,
+        writes: &WriteSession,
+        sink: &mut dyn EventSink,
+    ) -> Result<ApprovedCall, RefusedCall> {
+        if let Some(approved) = ApprovedCall::ungated(call) {
+            return Ok(approved);
+        }
+        // Budget headroom is one of the classified scalars and one clause of the
+        // eligibility rule. It comes from the run's already-enforced budget, so
+        // the gate reads the same number the write path will enforce.
+        let budget = writes.budget();
+        let writes_remaining = budget.total_cap().saturating_sub(budget.total_writes());
+        let context = ApprovalContext {
+            root: self.root,
+            classifier: self.skill_services.approval_classifier,
+            prompt: self.skill_services.approval_prompt,
+        };
+        match approval::decide(gate, &context, call, writes_remaining, sink).await {
+            ApprovalDecision::Approved(approved) => Ok(approved),
+            ApprovalDecision::Denied(resolution) => Err(RefusedCall::Denied(resolution)),
+            ApprovalDecision::HardDenied(denial) => Err(RefusedCall::HardDenied(denial.message())),
+        }
     }
 
     fn evidence_budget_spent(
@@ -695,19 +986,42 @@ impl ChatSession<'_> {
             .await
     }
 
-    /// Run one idempotent tool-DECIDING `complete` turn with a single bounded retry on a
-    /// transient transport failure. The call only decides tool calls — no tool has
-    /// executed yet at this point in the loop (dispatch happens after this returns) — so
-    /// a retry can never double-execute a tool. A non-transient failure or a user-stopped
-    /// run is never retried, and this is the non-streamed path, so the streamed answer
-    /// turn is untouched.
-    async fn complete_tool_turn(&self, request: &LlmRequest) -> CoreResult<Completion> {
+    /// Run one tool-DECIDING turn with a single bounded retry on a transient
+    /// transport failure.
+    ///
+    /// Retrying is safe on two counts, and BOTH have to hold. The turn only
+    /// decides tool calls — no tool has executed yet at this point in the loop,
+    /// dispatch happens after this returns — so a retry can never double-execute a
+    /// tool. And, historically, the turn emitted nothing, so a retry was invisible.
+    ///
+    /// That second half no longer holds by construction: this turn is now streamed
+    /// ([`LlmClient::complete_tool_streaming`]), and a client that streams it emits
+    /// live note previews as it goes. **So the turn is never retried once anything
+    /// has been emitted** — a replay would stream a second copy of a half-composed
+    /// note over the first, and the user would watch their note rewind. The guard
+    /// spans the whole loop, not one attempt: an attempt that emitted and then
+    /// failed bars every later attempt too. A client on the default (non-streaming)
+    /// implementation emits nothing, so its retry behaviour is unchanged.
+    ///
+    /// A non-transient failure or a user-stopped run is never retried either.
+    async fn complete_tool_turn(
+        &self,
+        request: &LlmRequest,
+        sink: &mut dyn EventSink,
+    ) -> CoreResult<Completion> {
         let mut retries = MAX_COMPLETE_RETRIES;
+        let mut sink = EmissionGuard {
+            inner: sink,
+            emitted: false,
+        };
         loop {
-            match self.llm.complete(request).await {
+            match self.llm.complete_tool_streaming(request, &mut sink).await {
                 Ok(completion) => return Ok(completion),
                 Err(error) => {
-                    let retryable = retries > 0 && error.is_retryable() && !self.run_cancelled();
+                    let retryable = retries > 0
+                        && error.is_retryable()
+                        && !self.run_cancelled()
+                        && !sink.emitted;
                     if !retryable {
                         return Err(error);
                     }
@@ -735,18 +1049,19 @@ impl ChatSession<'_> {
     #[allow(clippy::too_many_arguments)]
     async fn handle_tool_call(
         &self,
-        call: &ToolCall,
+        call: &ApprovedCall,
         active_skills: &mut ActiveSkills,
         writes: &mut WriteSession,
         youtube_session: &mut YoutubeToolSession,
+        plan: &mut RunPlan,
         authorized_tools: &std::collections::BTreeSet<String>,
         registry: &mut EvidenceRegistry,
         coverage: &mut CoverageAcc,
         sink: &mut dyn EventSink,
     ) -> tools::ToolResult {
         // The "searching…" cue precedes the search so the UI shows it live.
-        if call.name == tools::TOOL_SEARCH_NOTES {
-            if let Some(query) = peek_query(&call.arguments) {
+        if call.name() == tools::TOOL_SEARCH_NOTES {
+            if let Some(query) = peek_query(call.arguments()) {
                 sink.send(ChatEvent::Searching { query });
             }
         }
@@ -763,14 +1078,13 @@ impl ChatSession<'_> {
             )
             .with_youtube(self.skill_services.youtube_io, youtube_session)
             .with_youtube_requirements(self.skill_services.youtube_requirements)
-            .with_vault_profile_io(self.skill_services.vault_profile_io);
+            .with_vault_profile_io(self.skill_services.vault_profile_io)
+            .with_plan(plan);
             if let Some(pricing) = self.skill_services.pricing {
                 context = context.with_pricing(pricing);
             }
             dispatch(
-                &call.id,
-                &call.name,
-                &call.arguments,
+                call,
                 self.provider,
                 registry,
                 self.skill_services.user_prompt,
@@ -1008,31 +1322,274 @@ fn compact_completed_playlist_context(messages: &mut [LlmMessage], context_chars
         .sum();
 }
 
-fn push_skipped_tool_result(messages: &mut Vec<LlmMessage>, call: &ToolCall) {
-    // Over budget already this turn: don't dispatch further, but the protocol
-    // still needs a result for every declared call, so the model is told the call
-    // was skipped rather than left dangling.
-    messages.push(LlmMessage::tool_result(
-        &call.id,
-        &call.name,
-        r#"{"error":"skipped: evidence budget reached"}"#,
-    ));
+/// Bound on the `detail` text crossing the event wire. A tool result can be a
+/// whole transcript; the disclosure is a peek at one, not a copy of it.
+const MAX_TOOL_DETAIL_CHARS: usize = 600;
+
+/// The [`ChatEvent::ToolResult`] payload for one settled call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ToolSettlement {
+    status: ToolStatus,
+    summary: Option<String>,
+    detail: Option<String>,
 }
 
-fn push_cancelled_tool_result(messages: &mut Vec<LlmMessage>, call: &ToolCall) {
-    messages.push(LlmMessage::tool_result(
-        &call.id,
-        &call.name,
-        r#"{"error":{"kind":"capture_cancelled","message":"skipped: playlist capture was cancelled before this call"}}"#,
-    ));
+/// Why a declared call never reached the dispatcher. Closed on purpose: each
+/// variant both answers the model and settles the timeline node, so a new
+/// short-circuit cannot be added that leaves a node spinning forever.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SkippedCall {
+    StalePlaylistBatch,
+    PlaylistCancelled,
+    EvidenceBudgetSpent,
 }
 
-fn push_stale_playlist_tool_result(messages: &mut Vec<LlmMessage>, call: &ToolCall) {
+impl SkippedCall {
+    /// The `role:"tool"` content the model reads. The protocol still needs a
+    /// result for every declared call, so the model is told the call was skipped
+    /// rather than left waiting on one that never comes.
+    const fn tool_result_content(self) -> &'static str {
+        match self {
+            Self::StalePlaylistBatch => {
+                r#"{"error":{"kind":"stale_playlist_batch","message":"skipped: the playlist work item for this assistant batch has already resolved"}}"#
+            }
+            Self::PlaylistCancelled => {
+                r#"{"error":{"kind":"capture_cancelled","message":"skipped: playlist capture was cancelled before this call"}}"#
+            }
+            Self::EvidenceBudgetSpent => r#"{"error":"skipped: evidence budget reached"}"#,
+        }
+    }
+
+    /// The same story in the user's words, for the timeline node.
+    const fn reason(self) -> &'static str {
+        match self {
+            Self::StalePlaylistBatch => "skipped: this playlist item had already finished",
+            Self::PlaylistCancelled => "skipped: the run was stopped before this call ran",
+            Self::EvidenceBudgetSpent => "skipped: the run reached its evidence budget",
+        }
+    }
+
+    fn settlement(self) -> ToolSettlement {
+        ToolSettlement {
+            // The call never ran, so this is the orchestrator declining it — not a
+            // tool failure and not a user denial.
+            status: ToolStatus::Rejected,
+            summary: None,
+            detail: Some(self.reason().to_string()),
+        }
+    }
+}
+
+/// A declared call the approval gate refused.
+///
+/// Like [`SkippedCall`], each variant both answers the model and settles the
+/// timeline node, so a refusal can never leave a node spinning forever. And like
+/// a skip, a refusal is **not** run-cancellation: one result is still pushed for
+/// this call, and the rest of the batch stays gated. Ending the turn on a denial
+/// is the tempting shortcut and it breaks the protocol invariant.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum RefusedCall {
+    /// The gate asked and did not get a yes, carrying **which** kind of no it
+    /// was. Deliberately not collapsed: "the user declined" is a claim about a
+    /// person, and it is false for a prompt that expired unanswered or a window
+    /// that closed. The gate distinguishes these on the wire already; this is the
+    /// step that used to throw the distinction away.
+    Denied(ApprovalResolution),
+    /// Refused without asking: a vault escape, an invalid path, arguments that
+    /// never parsed, or a subject the user has already declined twice. Validation
+    /// and confinement, not authorisation — so this happens in every mode,
+    /// `Yolo` included.
+    HardDenied(String),
+}
+
+impl RefusedCall {
+    /// The `role:"tool"` content the model reads and recovers from.
+    ///
+    /// The three refusals read differently to the model too, and that is not
+    /// cosmetic: "the user declined" invites a reworded retry aimed at changing
+    /// their mind, while "nobody answered" and "the session ended" do not.
+    fn tool_result_content(&self) -> String {
+        let message = match self {
+            Self::Denied(resolution) => Self::refusal_message(*resolution),
+            Self::HardDenied(detail) => detail,
+        };
+        serde_json::json!({ "error": message }).to_string()
+    }
+
+    /// The same story in the user's words, for the timeline node. `Denied` (the
+    /// user refused) and `Rejected` (the orchestrator refused) are different
+    /// stories and must render differently — and so are the three refusals.
+    fn settlement(&self) -> ToolSettlement {
+        match self {
+            Self::Denied(resolution) => ToolSettlement {
+                status: Self::refusal_status(*resolution),
+                summary: None,
+                detail: Some(Self::refusal_detail(*resolution).to_string()),
+            },
+            Self::HardDenied(detail) => ToolSettlement {
+                status: ToolStatus::Rejected,
+                summary: None,
+                detail: Some(detail.clone()),
+            },
+        }
+    }
+
+    /// Exhaustive, no wildcard arm, so a new [`ApprovalResolution`] has to be
+    /// classified here before it compiles. `Approved` and `Unavailable` cannot
+    /// reach a refusal — the first is the other decision, the second precedes a
+    /// prompt rather than settling one — so they fall to the most conservative
+    /// status rather than being waved through.
+    const fn refusal_status(resolution: ApprovalResolution) -> ToolStatus {
+        match resolution {
+            ApprovalResolution::Denied => ToolStatus::Denied,
+            ApprovalResolution::TimedOut => ToolStatus::TimedOut,
+            ApprovalResolution::Cancelled => ToolStatus::Cancelled,
+            ApprovalResolution::Approved | ApprovalResolution::Unavailable => ToolStatus::Denied,
+        }
+    }
+
+    /// The user-facing sentence. All three end by saying nothing was written,
+    /// because that is the fact the user most needs and it holds in every case.
+    const fn refusal_detail(resolution: ApprovalResolution) -> &'static str {
+        match resolution {
+            ApprovalResolution::TimedOut => "The request expired unanswered. Nothing was written.",
+            ApprovalResolution::Cancelled => {
+                "The run ended before this was answered. Nothing was written."
+            }
+            ApprovalResolution::Denied
+            | ApprovalResolution::Approved
+            | ApprovalResolution::Unavailable => "Denied. Nothing was written.",
+        }
+    }
+
+    /// The model-facing sentence, composed in Rust from the resolution — never
+    /// model prose echoed back.
+    const fn refusal_message(resolution: ApprovalResolution) -> &'static str {
+        match resolution {
+            ApprovalResolution::TimedOut => {
+                "the approval request expired without an answer, so it did not run"
+            }
+            ApprovalResolution::Cancelled => {
+                "the session ended before this was approved, so it did not run"
+            }
+            ApprovalResolution::Denied
+            | ApprovalResolution::Approved
+            | ApprovalResolution::Unavailable => "the user declined this action, so it did not run",
+        }
+    }
+}
+
+/// Answer the model and settle the timeline node for a call that never ran — in
+/// one place, so the two accounts can never drift apart.
+fn settle_skipped(
+    messages: &mut Vec<LlmMessage>,
+    sink: &mut dyn EventSink,
+    call: &ToolCall,
+    skipped: SkippedCall,
+) {
     messages.push(LlmMessage::tool_result(
         &call.id,
         &call.name,
-        r#"{"error":{"kind":"stale_playlist_batch","message":"skipped: the playlist work item for this assistant batch has already resolved"}}"#,
+        skipped.tool_result_content(),
     ));
+    emit_tool_result(sink, &call.id, skipped.settlement());
+}
+
+/// Announce a declared call before anything can go wrong with it. The title comes
+/// from the Rust-side table in [`tool_registry`] — never from the model, and never
+/// composed by the UI.
+///
+/// The step affiliation is read off `plan` **here**, at dispatch, because that is
+/// when it is true. Resolving it later — at render, or from the plan's final state
+/// — would re-parent nodes every time a step moved.
+fn emit_tool_call(sink: &mut dyn EventSink, call: &ToolCall, plan: &RunPlan) {
+    sink.send(ChatEvent::ToolCall {
+        id: call.id.clone(),
+        name: call.name.clone(),
+        title: tool_registry::title_for(&call.name).to_string(),
+        arguments: call.arguments.clone(),
+        step_id: plan.running_step_id().map(str::to_string),
+    });
+}
+
+fn emit_tool_result(sink: &mut dyn EventSink, id: &str, settlement: ToolSettlement) {
+    sink.send(ChatEvent::ToolResult {
+        id: id.to_string(),
+        status: settlement.status,
+        summary: settlement.summary,
+        detail: settlement.detail,
+    });
+}
+
+/// Read a dispatched result in the timeline's vocabulary. Every summary here is
+/// composed from the structured [`ToolOutcome`], never from model prose.
+fn settlement_for(result: &tools::ToolResult) -> ToolSettlement {
+    let (status, summary) = match &result.outcome {
+        ToolOutcome::Searched { hit_count, .. } => {
+            (ToolStatus::Ok, Some(format!("{hit_count} spans")))
+        }
+        ToolOutcome::Read {
+            rel_path,
+            start_line,
+            end_line,
+        } => (
+            ToolStatus::Ok,
+            Some(format!("{rel_path}:{start_line}–{end_line}")),
+        ),
+        ToolOutcome::Listed | ToolOutcome::Action => (ToolStatus::Ok, None),
+        ToolOutcome::Rejected => (ToolStatus::Rejected, None),
+    };
+    ToolSettlement {
+        status,
+        summary,
+        detail: disclosure(&result.content),
+    }
+}
+
+/// The bounded disclosure text for a settled call. A rejection's own sentence
+/// reads better than the JSON envelope the model receives, so unwrap it when it
+/// is there. Absent detail stays absent rather than becoming a blank line.
+fn disclosure(content: &str) -> Option<String> {
+    let text = serde_json::from_str::<serde_json::Value>(content)
+        .ok()
+        .and_then(|value| value.get("error")?.as_str().map(str::to_string))
+        .unwrap_or_else(|| content.to_string());
+    let bounded = truncate_chars(text.trim(), MAX_TOOL_DETAIL_CHARS);
+    (!bounded.is_empty()).then_some(bounded)
+}
+
+/// Truncate on a char boundary, so a multi-byte character is never split.
+fn truncate_chars(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let kept: String = text.chars().take(max).collect();
+    format!("{kept}…")
+}
+
+/// The structured report for a skill that could not be activated. `missing_binary`
+/// is the only remedy the UI can offer, and it is derived from the requirement set
+/// — never from `message`, so re-wording the sentence cannot disable the remedy.
+pub(super) fn skill_activation_failed(
+    id: &str,
+    error: &str,
+    registry: &SkillRegistry,
+    environment: &SkillEnvironment,
+) -> ChatEvent {
+    let manifest = registry.lookup(id).ok();
+    ChatEvent::SkillActivationFailed {
+        id: id.to_string(),
+        // An id nobody recognises has no name of its own; the id the caller asked
+        // for is the only identity there is.
+        name: manifest.map_or_else(|| id.to_string(), |manifest| manifest.name.clone()),
+        message: activation_failure_message(id, error),
+        missing_binary: manifest
+            .and_then(|manifest| missing_required_binary(&manifest.requirements, environment)),
+    }
+}
+
+pub(super) fn activation_failure_message(id: &str, error: &str) -> String {
+    format!("Skill '{id}' {SKILL_ACTIVATION_FAILURE_MARK}: {error} — continuing without it")
 }
 
 fn emit_coverage(coverage: CoverageAcc, guard_tripped: bool, sink: &mut dyn EventSink) {
@@ -1503,11 +2060,204 @@ const MAX_COMPLETE_RETRIES: usize = 1;
 const RETRY_BACKOFF: Duration = Duration::from_millis(500);
 
 #[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use crate::ai::events::VecSink;
+    use std::collections::BTreeSet;
+
+    fn call(name: &str) -> ToolCall {
+        ToolCall {
+            id: "c1".into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn a_timeout_is_not_reported_as_a_user_denial() {
+        // THE regression this split exists for. All three refusals mean the call
+        // did not run, and exactly one of them means a person decided that. The
+        // UI reads the status, so a timeout that arrives as `Denied` renders as
+        // "denied by you" to a user who never saw the sheet.
+        //
+        // What goes red: make `refusal_status` return `ToolStatus::Denied` for
+        // every resolution — the shape this shipped in — and all three
+        // assertions below fail at once.
+        let expected = [
+            (ApprovalResolution::Denied, ToolStatus::Denied),
+            (ApprovalResolution::TimedOut, ToolStatus::TimedOut),
+            (ApprovalResolution::Cancelled, ToolStatus::Cancelled),
+        ];
+        for (resolution, status) in expected {
+            assert_eq!(
+                RefusedCall::Denied(resolution).settlement().status,
+                status,
+                "{resolution:?} settled as the wrong status"
+            );
+        }
+        // Distinct in the user's words and in the model's, not only in the enum:
+        // an identical sentence under three statuses would leave the timeline
+        // saying "Denied" beneath a `timedOut` glyph.
+        let details: BTreeSet<String> = expected
+            .iter()
+            .map(|(resolution, _)| {
+                RefusedCall::Denied(*resolution)
+                    .settlement()
+                    .detail
+                    .expect("a refusal always explains itself")
+            })
+            .collect();
+        assert_eq!(
+            details.len(),
+            3,
+            "two refusals tell the user the same story"
+        );
+        let messages: BTreeSet<String> = expected
+            .iter()
+            .map(|(resolution, _)| RefusedCall::Denied(*resolution).tool_result_content())
+            .collect();
+        assert_eq!(
+            messages.len(),
+            3,
+            "two refusals tell the model the same story"
+        );
+        // Only the genuine refusal may blame the user. The other two must not,
+        // because the model reads this and a false "the user declined" invites a
+        // retry aimed at changing a mind that was never made up.
+        for resolution in [ApprovalResolution::TimedOut, ApprovalResolution::Cancelled] {
+            let message = RefusedCall::Denied(resolution).tool_result_content();
+            assert!(!message.contains("declined"), "{resolution:?}: {message}");
+        }
+    }
+
+    #[test]
+    fn a_refusal_never_claims_something_was_written() {
+        // The one fact that holds across every refusal, stated once so a future
+        // reworded sentence cannot quietly drop it.
+        for resolution in [
+            ApprovalResolution::Denied,
+            ApprovalResolution::TimedOut,
+            ApprovalResolution::Cancelled,
+        ] {
+            let detail = RefusedCall::Denied(resolution)
+                .settlement()
+                .detail
+                .expect("a refusal always explains itself");
+            assert!(detail.contains("Nothing was written"), "{detail}");
+        }
+    }
+
+    #[test]
+    fn every_skipped_call_both_answers_the_model_and_settles_the_node() {
+        // The two accounts must never drift: the model is told the call was
+        // skipped, and the node stops spinning. Both, for every reason.
+        for skipped in [
+            SkippedCall::StalePlaylistBatch,
+            SkippedCall::PlaylistCancelled,
+            SkippedCall::EvidenceBudgetSpent,
+        ] {
+            let mut messages = Vec::new();
+            let mut sink = VecSink::default();
+
+            settle_skipped(&mut messages, &mut sink, &call("search_notes"), skipped);
+
+            assert_eq!(messages.len(), 1, "the model needs one result per call");
+            assert!(messages[0]
+                .content
+                .as_deref()
+                .expect("a tool result always carries content")
+                .contains("skipped"));
+            assert_eq!(
+                sink.events,
+                vec![ChatEvent::ToolResult {
+                    id: "c1".into(),
+                    status: ToolStatus::Rejected,
+                    summary: None,
+                    detail: Some(skipped.reason().to_string()),
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn a_skipped_reason_never_repeats_across_causes() {
+        // Three different stories — "already finished", "stopped", "out of
+        // budget" — must read differently, or the node explains nothing.
+        let reasons = [
+            SkippedCall::StalePlaylistBatch.reason(),
+            SkippedCall::PlaylistCancelled.reason(),
+            SkippedCall::EvidenceBudgetSpent.reason(),
+        ];
+        let distinct: std::collections::BTreeSet<&str> = reasons.into_iter().collect();
+        assert_eq!(distinct.len(), reasons.len());
+    }
+
+    #[test]
+    fn a_search_settles_with_its_span_count_and_a_read_with_its_range() {
+        let searched = settlement_for(&tools::ToolResult {
+            content: r#"{"query":"x"}"#.into(),
+            outcome: ToolOutcome::Searched {
+                query: "x".into(),
+                hit_count: 12,
+                truncated: false,
+                skipped_files: 0,
+                notes_read: Vec::new(),
+            },
+            control: tools::ToolControl::Continue,
+        });
+        assert_eq!(searched.status, ToolStatus::Ok);
+        assert_eq!(searched.summary, Some("12 spans".into()));
+
+        let read = settlement_for(&tools::ToolResult {
+            content: "{}".into(),
+            outcome: ToolOutcome::Read {
+                rel_path: "Notes/A.md".into(),
+                start_line: 12,
+                end_line: 28,
+            },
+            control: tools::ToolControl::Continue,
+        });
+        assert_eq!(read.summary, Some("Notes/A.md:12–28".into()));
+    }
+
+    #[test]
+    fn a_rejection_discloses_its_own_sentence_not_the_json_envelope() {
+        let settlement = settlement_for(&tools::ToolResult {
+            content: r#"{"error":"unknown tool 'nope'"}"#.into(),
+            outcome: ToolOutcome::Rejected,
+            control: tools::ToolControl::Continue,
+        });
+
+        assert_eq!(settlement.status, ToolStatus::Rejected);
+        assert_eq!(settlement.detail, Some("unknown tool 'nope'".into()));
+    }
+
+    #[test]
+    fn a_disclosure_is_bounded_and_never_splits_a_character() {
+        // A tool result can be a whole transcript. The disclosure is a peek.
+        let long = "é".repeat(MAX_TOOL_DETAIL_CHARS + 50);
+        let bounded = disclosure(&long).expect("long content still discloses");
+
+        assert_eq!(bounded.chars().count(), MAX_TOOL_DETAIL_CHARS + 1);
+        assert!(bounded.ends_with('…'));
+        assert!(bounded.starts_with('é'), "a multi-byte char must survive");
+    }
+
+    #[test]
+    fn empty_content_discloses_nothing_rather_than_a_blank_line() {
+        assert_eq!(disclosure(""), None);
+        assert_eq!(disclosure("   "), None);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::approval::ApprovalMode;
     use crate::ai::events::VecSink;
     use crate::ai::llm::{Completion, NoUserPrompt};
     use crate::ai::local::HardwareSpec;
+    use crate::ai::plan::{PlanStep, StepStatus};
     use crate::ai::retrieval::KeywordRetriever;
     use crate::ai::skills::{SkillEnvironment, SkillRegistry};
     use crate::ai::write_policy::UnavailableNoteWriter;
@@ -1520,6 +2270,34 @@ mod tests {
     use crate::error::CoreError;
     use async_trait::async_trait;
     use futures::executor::block_on;
+
+    /// A gate that approves everything, for the tests in this module — none of
+    /// which is about approval. It still runs the real `decide()`, so the gate
+    /// stays on the dispatch path here rather than being bypassed. The approval
+    /// behaviour itself is tested in `ai::approval` and in
+    /// `tests/tool_approval*.rs`.
+    fn open_gate() -> ApprovalGate {
+        ApprovalGate::new(unattended_policy())
+    }
+
+    static TEST_APPROVAL_PROMPT: DenyingApprovalPrompt = DenyingApprovalPrompt;
+    static TEST_APPROVAL_CLASSIFIER: UnavailableApprovalClassifier = UnavailableApprovalClassifier;
+
+    /// YOLO, plus an explicit unpin of `transcribe_audio`, so a test that is not
+    /// about approval is not blocked by it. Written out rather than hidden behind
+    /// a "disable the gate" switch: there is no such switch, and the gate still
+    /// runs for every call these tests make.
+    fn unattended_policy() -> ApprovalPolicy {
+        ApprovalPolicy::new(
+            ApprovalMode::Yolo,
+            std::collections::BTreeMap::from([(
+                tools::TOOL_TRANSCRIBE_AUDIO.to_string(),
+                ApprovalMode::Yolo,
+            )]),
+            false,
+        )
+    }
+
     use std::collections::{BTreeSet, VecDeque};
     use std::fs;
     use std::fs::OpenOptions;
@@ -2175,6 +2953,11 @@ mod tests {
         };
         let pricing = PricingInput::Local;
         let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+            .with_approval(
+                unattended_policy(),
+                &TEST_APPROVAL_PROMPT,
+                &TEST_APPROVAL_CLASSIFIER,
+            )
             .with_youtube_io(&PlaylistIo(21))
             .with_pricing(&pricing);
         let mut sink = VecSink::default();
@@ -2301,6 +3084,11 @@ mod tests {
         let cancellation = CaptureCancellation::default();
         let writer = CancellingWriter(cancellation.clone());
         let services = SkillServices::new(&skills, &environment, &prompt, &writer, 1)
+            .with_approval(
+                unattended_policy(),
+                &TEST_APPROVAL_PROMPT,
+                &TEST_APPROVAL_CLASSIFIER,
+            )
             .with_youtube_io(&PlaylistIo(2))
             .with_capture_cancellation(cancellation);
         let mut sink = VecSink::default();
@@ -2423,6 +3211,11 @@ mod tests {
             available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
         };
         let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+            .with_approval(
+                unattended_policy(),
+                &TEST_APPROVAL_PROMPT,
+                &TEST_APPROVAL_CLASSIFIER,
+            )
             .with_youtube_io(&PlaylistIo(2));
         let mut sink = VecSink::default();
         let ledger = block_on(run_chat(
@@ -2529,8 +3322,13 @@ mod tests {
         let retriever = KeywordRetriever::new(vault.path());
         let skills = SkillRegistry::built_in(&[]).unwrap();
         let environment = youtube_test_environment();
-        let services =
-            SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1).with_youtube_io(&io);
+        let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+            .with_approval(
+                unattended_policy(),
+                &TEST_APPROVAL_PROMPT,
+                &TEST_APPROVAL_CLASSIFIER,
+            )
+            .with_youtube_io(&io);
         let mut sink = VecSink::default();
         let ledger = block_on(run_chat(
             "Distil this playlist",
@@ -2624,8 +3422,13 @@ mod tests {
         let retriever = KeywordRetriever::new(vault.path());
         let skills = SkillRegistry::built_in(&[]).unwrap();
         let environment = youtube_test_environment();
-        let services =
-            SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1).with_youtube_io(&io);
+        let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+            .with_approval(
+                unattended_policy(),
+                &TEST_APPROVAL_PROMPT,
+                &TEST_APPROVAL_CLASSIFIER,
+            )
+            .with_youtube_io(&io);
         let mut sink = VecSink::default();
         let ledger = block_on(run_chat(
             "Distil this playlist",
@@ -2698,6 +3501,665 @@ mod tests {
         sink.events
     }
 
+    /* ────────────────  Plan declaration, and what the run cost  ──────────────── */
+
+    /// A client that prices every turn, so a run can be totalled end to end.
+    ///
+    /// It reports through the sink it is handed — which is whatever wrapper stack
+    /// the orchestrator has built around it — so a test using it exercises
+    /// propagation through the real stack rather than a shortcut into the meter.
+    struct MeteredLlm {
+        completions: Mutex<VecDeque<Completion>>,
+        tool_turn_usage: Option<TokenUsage>,
+        answer_usage: Option<TokenUsage>,
+    }
+
+    impl MeteredLlm {
+        fn new(
+            completions: Vec<Completion>,
+            tool_turn_usage: Option<TokenUsage>,
+            answer_usage: Option<TokenUsage>,
+        ) -> Self {
+            Self {
+                completions: Mutex::new(completions.into()),
+                tool_turn_usage,
+                answer_usage,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for MeteredLlm {
+        async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+            unreachable!("the tool turn is streamed here, so `complete` is never reached")
+        }
+
+        async fn complete_tool_streaming(
+            &self,
+            _req: &LlmRequest,
+            sink: &mut dyn EventSink,
+        ) -> CoreResult<Completion> {
+            sink.record_usage(self.tool_turn_usage);
+            Ok(self
+                .completions
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(final_turn))
+        }
+
+        async fn complete_streaming(
+            &self,
+            _req: &LlmRequest,
+            sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            sink.send(ChatEvent::Answer {
+                delta: "ready".into(),
+            });
+            sink.record_usage(self.answer_usage);
+            Ok("ready".into())
+        }
+    }
+
+    fn run_metered(root: &Path, llm: &MeteredLlm) -> Vec<ChatEvent> {
+        let retriever = KeywordRetriever::new(root);
+        let skills = SkillRegistry::built_in(&[]).unwrap();
+        let environment = SkillEnvironment {
+            hardware: HardwareSpec {
+                total_ram_bytes: 1,
+                cpu_cores: 1,
+                cpu_brand: "test".into(),
+                gpu_label: None,
+                arch: "aarch64".into(),
+                os: "macos".into(),
+                free_disk_bytes: 1,
+            },
+            app_data_bin_dir: std::path::PathBuf::from("/app-data/bin"),
+            available_binaries: BTreeSet::new(),
+        };
+        let services = SkillServices::new(
+            &skills,
+            &environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        );
+        let mut sink = VecSink::default();
+        block_on(run_chat(
+            "how do widgets work?",
+            &[],
+            Vec::new(),
+            root,
+            "test-model",
+            &retriever,
+            llm,
+            &services,
+            &mut sink,
+            &Guards::default(),
+        ))
+        .unwrap();
+        sink.events
+    }
+
+    fn plan_call(id: &str, steps: serde_json::Value) -> Completion {
+        tool_call(
+            id,
+            tools::TOOL_UPDATE_PLAN,
+            &serde_json::json!({ "steps": steps }).to_string(),
+        )
+    }
+
+    fn usage_events(events: &[ChatEvent]) -> Vec<&ChatEvent> {
+        events
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::Usage { .. }))
+            .collect()
+    }
+
+    fn plan_transitions(events: &[ChatEvent]) -> Vec<(&str, StepStatus)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::PlanStepStatus { id, status } => Some((id.as_str(), *status)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_run_where_the_model_declares_no_plan_emits_no_plan_events() {
+        // The common case, and the whole reason this phase is last: a model that
+        // never plans must produce exactly the run it produced before plans
+        // existed — not an empty plan, not a placeholder step.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![tool_call("c1", "search_notes", r#"{"query":"widgets"}"#)],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        assert_eq!(
+            count(&events, |e| matches!(
+                e,
+                ChatEvent::Plan { .. } | ChatEvent::PlanStepStatus { .. }
+            )),
+            0
+        );
+        assert!(matches!(events.last(), Some(ChatEvent::Done)));
+    }
+
+    #[test]
+    fn a_declared_plan_reaches_the_timeline_with_its_steps_pending() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![
+                plan_call(
+                    "p1",
+                    serde_json::json!([
+                        { "id": "s1", "label": "Search the vault", "status": "running" },
+                        { "id": "s2", "label": "Read the best matches" },
+                    ]),
+                ),
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+            ],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        let declared = events
+            .iter()
+            .find_map(|event| match event {
+                ChatEvent::Plan { steps } => Some(steps.clone()),
+                _ => None,
+            })
+            .expect("the declared plan reaches the timeline");
+        assert_eq!(
+            declared,
+            vec![
+                PlanStep {
+                    id: "s1".into(),
+                    label: "Search the vault".into()
+                },
+                PlanStep {
+                    id: "s2".into(),
+                    label: "Read the best matches".into()
+                },
+            ]
+        );
+        // Only the departure from pending is announced; `s2` is pending by
+        // virtue of having been declared.
+        assert_eq!(plan_transitions(&events), vec![("s1", StepStatus::Running)]);
+    }
+
+    #[test]
+    fn a_plan_whose_steps_are_skipped_or_fail_reports_both_endings() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let steps = |first: &str, second: &str| {
+            serde_json::json!([
+                { "id": "s1", "label": "Search the vault", "status": first },
+                { "id": "s2", "label": "Transcribe the talk", "status": second },
+            ])
+        };
+        let llm = MockLlmClient::new(
+            vec![
+                plan_call("p1", steps("running", "pending")),
+                plan_call("p2", steps("failed", "skipped")),
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+            ],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        assert_eq!(
+            plan_transitions(&events),
+            vec![
+                ("s1", StepStatus::Running),
+                ("s1", StepStatus::Failed),
+                ("s2", StepStatus::Skipped),
+            ],
+            "a step that was abandoned and one that broke are two different accounts"
+        );
+        // One declaration, however many times the plan is re-sent.
+        assert_eq!(count(&events, |e| matches!(e, ChatEvent::Plan { .. })), 1);
+    }
+
+    #[test]
+    fn re_declaring_a_different_plan_is_refused_in_full_view() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![
+                plan_call(
+                    "p1",
+                    serde_json::json!([{ "id": "s1", "label": "Search the vault" }]),
+                ),
+                plan_call(
+                    "p2",
+                    serde_json::json!([{ "id": "s9", "label": "Something else" }]),
+                ),
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+            ],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        // Refused, and visibly so — the node settles `rejected` rather than the
+        // call quietly succeeding against a plan it did not change.
+        assert!(events.iter().any(|event| matches!(
+            event,
+            ChatEvent::ToolResult { id, status, detail, .. }
+                if id == "p2"
+                    && *status == ToolStatus::Rejected
+                    && detail.as_deref().is_some_and(|d| d.contains("declared once"))
+        )));
+        assert_eq!(count(&events, |e| matches!(e, ChatEvent::Plan { .. })), 1);
+    }
+
+    /// Every announced call as `(id, step_id)`, in emission order — the pairing
+    /// the timeline nests on.
+    fn call_affiliations(events: &[ChatEvent]) -> Vec<(&str, Option<&str>)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::ToolCall { id, step_id, .. } => Some((id.as_str(), step_id.as_deref())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tool_dispatched_under_a_running_step_is_affiliated_with_it() {
+        // `s2` is pinned as a literal on purpose: reading the expectation back
+        // out of the same `RunPlan` the code read it from would compare a value
+        // against its own source and pass whatever the affiliation logic did.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![
+                plan_call(
+                    "p1",
+                    serde_json::json!([
+                        { "id": "s1", "label": "Plan the work", "status": "done" },
+                        { "id": "s2", "label": "Search the vault", "status": "running" },
+                        { "id": "s3", "label": "Answer", "status": "pending" },
+                    ]),
+                ),
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+            ],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        assert_eq!(
+            call_affiliations(&events),
+            vec![
+                // The plan call itself went out before any plan existed.
+                ("p1", None),
+                ("c1", Some("s2")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_run_with_no_plan_leaves_every_tool_call_unaffiliated() {
+        // Unaffiliated is ordinary, not a failure — and the turn still folds and
+        // answers exactly as it did before plans existed.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+                tool_call(
+                    "c2",
+                    "read_note_span",
+                    r#"{"rel_path":"w.md","start_line":1,"end_line":1}"#,
+                ),
+            ],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        assert_eq!(call_affiliations(&events), vec![("c1", None), ("c2", None)]);
+        assert_eq!(
+            count(&events, |e| matches!(e, ChatEvent::Plan { .. })),
+            0,
+            "no plan was declared, so none may be synthesised"
+        );
+        // The pre-plan run is unchanged: it still searches, reads, verifies,
+        // cites and completes.
+        assert!(count(&events, |e| matches!(e, ChatEvent::Answer { .. })) >= 1);
+        assert_eq!(
+            count(&events, |e| matches!(e, ChatEvent::Citation { .. })),
+            1
+        );
+        assert!(matches!(events.last(), Some(ChatEvent::Done)));
+    }
+
+    #[test]
+    fn a_plan_declared_after_a_call_does_not_retroactively_affiliate_it() {
+        // The affiliation is a fact about WHEN the call was dispatched, so it is
+        // stamped then. An implementation that resolved it at render time — or
+        // re-read the plan once the run finished — would hand `c1` the step that
+        // was running later, and this is the test that catches it.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+                plan_call(
+                    "p1",
+                    serde_json::json!([
+                        { "id": "s1", "label": "Read the best matches", "status": "running" },
+                    ]),
+                ),
+                tool_call(
+                    "c2",
+                    "read_note_span",
+                    r#"{"rel_path":"w.md","start_line":1,"end_line":1}"#,
+                ),
+            ],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        assert_eq!(
+            call_affiliations(&events),
+            vec![
+                // Dispatched before the plan existed, and it stays that way.
+                ("c1", None),
+                // The declaring call is itself pre-plan.
+                ("p1", None),
+                ("c2", Some("s1")),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_tool_result_still_settles_its_call_across_a_step_boundary() {
+        // Settlement correlates on `id` alone. A step that moves on between the
+        // call and its result must not leave the node spinning.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![
+                plan_call(
+                    "p1",
+                    serde_json::json!([
+                        { "id": "s1", "label": "Search the vault", "status": "running" },
+                        { "id": "s2", "label": "Read the best matches" },
+                    ]),
+                ),
+                tool_call("c1", "search_notes", r#"{"query":"widgets"}"#),
+                plan_call(
+                    "p2",
+                    serde_json::json!([
+                        { "id": "s1", "label": "Search the vault", "status": "done" },
+                        { "id": "s2", "label": "Read the best matches", "status": "running" },
+                    ]),
+                ),
+                tool_call(
+                    "c2",
+                    "read_note_span",
+                    r#"{"rel_path":"w.md","start_line":1,"end_line":1}"#,
+                ),
+            ],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        assert_eq!(
+            call_affiliations(&events),
+            vec![
+                ("p1", None),
+                ("c1", Some("s1")),
+                ("p2", Some("s1")),
+                ("c2", Some("s2"))
+            ]
+        );
+        for id in ["p1", "c1", "p2", "c2"] {
+            assert_eq!(
+                count(&events, |e| matches!(
+                    e,
+                    ChatEvent::ToolResult { id: settled, .. } if settled == id
+                )),
+                1,
+                "call '{id}' did not settle exactly once"
+            );
+        }
+    }
+
+    #[test]
+    fn usage_is_emitted_exactly_once_immediately_before_done() {
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![tool_call("c1", "search_notes", r#"{"query":"widgets"}"#)],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        assert_eq!(usage_events(&events).len(), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [.., ChatEvent::Usage { .. }, ChatEvent::Done]
+        ));
+    }
+
+    #[test]
+    fn usage_is_emitted_exactly_once_immediately_before_a_terminal_error() {
+        // `Done` is not the only way a run ends, and an errored run is exactly when
+        // the cost matters most: it spent tokens and produced nothing. The footer
+        // must therefore take the same position before `Error` that it holds
+        // before `Done` — not merely appear somewhere in the stream.
+        let v = vault();
+        let mock = MockLlmClient::failing();
+        let events = run(v.path(), &mock, &Guards::default());
+
+        assert_eq!(usage_events(&events).len(), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [.., ChatEvent::Usage { .. }, ChatEvent::Error { .. }]
+        ));
+    }
+
+    #[test]
+    fn a_run_that_errors_after_a_successful_tool_call_still_reports_usage() {
+        // The observed failure (#123): a tool call landed, the model then returned
+        // an empty answer, and the settled turn carried no footer at all.
+        let v = vault();
+        let mock = MockLlmClient::new(
+            vec![
+                tool_call("c1", "search_notes", r#"{"query":"components"}"#),
+                final_turn(),
+            ],
+            "   ",
+        );
+        let events = run(v.path(), &mock, &Guards::default());
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::ToolResult {
+                    status: ToolStatus::Ok,
+                    ..
+                }
+            )),
+            "the run must reach the error with a settled, successful tool call behind it"
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [.., ChatEvent::Usage { .. }, ChatEvent::Error { .. }]
+        ));
+        match usage_events(&events).as_slice() {
+            [ChatEvent::Usage {
+                tokens_in,
+                tokens_out,
+                ..
+            }] => {
+                // The mock prices nothing, and absent must stay absent here: a `0`
+                // would claim a measurement this run never made.
+                assert_eq!(*tokens_in, None);
+                assert_eq!(*tokens_out, None);
+            }
+            other => panic!("expected one Usage event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_run_that_ends_twice_over_reports_usage_once() {
+        // Two terminal events through one meter. Asserted on the stream the sink
+        // actually received — the flag guarding it is an implementation detail.
+        let mut sink = VecSink::default();
+        let mut meter = UsageMeter::new(&mut sink, Instant::now(), "test-model");
+        meter.send(ChatEvent::Error {
+            message: "boom".into(),
+        });
+        meter.send(ChatEvent::Done);
+
+        assert!(matches!(
+            sink.events.as_slice(),
+            [
+                ChatEvent::Usage { .. },
+                ChatEvent::Error { .. },
+                ChatEvent::Done
+            ]
+        ));
+    }
+
+    #[test]
+    fn an_unmetered_run_reports_absent_token_counts_rather_than_zero() {
+        // `MockLlmClient` never prices a turn, exactly like a provider that does
+        // not report usage. A `0` here would read as a real measurement of a run
+        // that cost nothing — the failure this phase exists to prevent.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MockLlmClient::new(
+            vec![tool_call("c1", "search_notes", r#"{"query":"widgets"}"#)],
+            "Widgets spin [e1].",
+        );
+        let events = run(vault.path(), &llm, &Guards::default());
+
+        match usage_events(&events).as_slice() {
+            [ChatEvent::Usage {
+                tokens_in,
+                tokens_out,
+                model,
+                ..
+            }] => {
+                assert_eq!(*tokens_in, None);
+                assert_eq!(*tokens_out, None);
+                assert_eq!(model, "test-model");
+            }
+            other => panic!("expected one Usage event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn usage_survives_the_whole_sink_stack_and_totals_every_turn() {
+        // The check behind `EventSink::record_usage`'s discarding default: the run
+        // builds a stack of wrapper sinks, and one that forgot to forward would
+        // cost the footer its numbers silently. Two priced turn kinds must arrive
+        // as their sum, through the whole stack, not as the answer turn alone.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MeteredLlm::new(
+            vec![tool_call("c1", "search_notes", r#"{"query":"widgets"}"#)],
+            Some(TokenUsage {
+                tokens_in: 100,
+                tokens_out: 20,
+            }),
+            Some(TokenUsage {
+                tokens_in: 400,
+                tokens_out: 5,
+            }),
+        );
+        let events = run_metered(vault.path(), &llm);
+
+        match usage_events(&events).as_slice() {
+            [ChatEvent::Usage {
+                tokens_in,
+                tokens_out,
+                ..
+            }] => {
+                // Two tool turns run (the search, then the turn that stops calling
+                // tools), so the total covers every priced call, not just the last.
+                assert_eq!(*tokens_in, Some(100 + 100 + 400));
+                assert_eq!(*tokens_out, Some(20 + 20 + 5));
+            }
+            other => panic!("expected one Usage event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn one_unpriced_call_makes_the_whole_run_absent_rather_than_understated() {
+        // A total that silently omits a turn is a wrong number, and a wrong number
+        // in a cost footer is worse than no number at all.
+        let vault = tempfile::tempdir().unwrap();
+        std::fs::write(vault.path().join("w.md"), "Widgets spin.").unwrap();
+        let llm = MeteredLlm::new(
+            vec![tool_call("c1", "search_notes", r#"{"query":"widgets"}"#)],
+            None,
+            Some(TokenUsage {
+                tokens_in: 400,
+                tokens_out: 5,
+            }),
+        );
+        let events = run_metered(vault.path(), &llm);
+
+        match usage_events(&events).as_slice() {
+            [ChatEvent::Usage {
+                tokens_in,
+                tokens_out,
+                ..
+            }] => {
+                assert_eq!(*tokens_in, None, "400 would be the answer turn alone");
+                assert_eq!(*tokens_out, None);
+            }
+            other => panic!("expected one Usage event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_usage_report_does_not_count_as_something_the_user_has_seen() {
+        // `EmissionGuard` bars a retry once anything has been emitted. A token
+        // report is not visible, so it must pass through without barring one —
+        // otherwise the trait default's `record_usage(None)` would silently
+        // disable every tool-turn retry.
+        struct BufferedToolTurn;
+        #[async_trait]
+        impl LlmClient for BufferedToolTurn {
+            async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+                Ok(final_turn())
+            }
+            async fn complete_streaming(
+                &self,
+                _req: &LlmRequest,
+                _sink: &mut dyn EventSink,
+            ) -> CoreResult<String> {
+                Ok("ready".into())
+            }
+        }
+
+        let mut sink = VecSink::default();
+        let mut guard = EmissionGuard {
+            inner: &mut sink,
+            emitted: false,
+        };
+        block_on(BufferedToolTurn.complete_tool_streaming(
+            &LlmRequest {
+                model: "m".into(),
+                messages: Vec::new(),
+                tools: Vec::new(),
+            },
+            &mut guard,
+        ))
+        .unwrap();
+        assert!(!guard.emitted);
+    }
+
     #[test]
     fn terminal_skill_recovery_finishes_every_parallel_tool_result_before_stopping() {
         let vault = tempfile::tempdir().unwrap();
@@ -2767,8 +4229,10 @@ mod tests {
             &mut active_skills,
             &mut writes,
             &mut youtube_session,
+            &mut RunPlan::default(),
             &mut registry,
             &mut coverage,
+            &mut open_gate(),
             &mut sink,
         ))
         .unwrap();
@@ -3757,8 +5221,10 @@ mod tests {
             &mut active_skills,
             &mut writes,
             &mut youtube_session,
+            &mut RunPlan::default(),
             &mut registry,
             &mut coverage,
+            &mut open_gate(),
             &mut sink,
         ))
         .unwrap();
@@ -3833,8 +5299,10 @@ mod tests {
             &mut active_skills,
             &mut writes,
             &mut youtube_session,
+            &mut RunPlan::default(),
             &mut registry,
             &mut coverage,
+            &mut open_gate(),
             &mut sink,
         ))
         .unwrap();
@@ -3975,7 +5443,8 @@ mod tests {
             guards: &env.guards,
         };
 
-        block_on(session.complete_tool_turn(&tool_decision_request())).unwrap();
+        block_on(session.complete_tool_turn(&tool_decision_request(), &mut VecSink::default()))
+            .unwrap();
 
         assert_eq!(llm.completion_requests().len(), 2, "retried exactly once");
         assert_eq!(
@@ -4009,7 +5478,8 @@ mod tests {
             guards: &env.guards,
         };
 
-        let result = block_on(session.complete_tool_turn(&tool_decision_request()));
+        let result =
+            block_on(session.complete_tool_turn(&tool_decision_request(), &mut VecSink::default()));
 
         assert!(result.is_err(), "a 400 is permanent — no retry");
         assert_eq!(llm.completion_requests().len(), 1);
@@ -4041,7 +5511,9 @@ mod tests {
             guards: &env.guards,
         };
 
-        let completion = block_on(session.complete_tool_turn(&tool_decision_request())).unwrap();
+        let completion =
+            block_on(session.complete_tool_turn(&tool_decision_request(), &mut VecSink::default()))
+                .unwrap();
 
         assert!(completion.content.is_some());
         assert_eq!(
@@ -4076,7 +5548,8 @@ mod tests {
             guards: &env.guards,
         };
 
-        block_on(session.complete_tool_turn(&tool_decision_request())).unwrap();
+        block_on(session.complete_tool_turn(&tool_decision_request(), &mut VecSink::default()))
+            .unwrap();
 
         assert_eq!(llm.completion_requests().len(), 2);
     }
@@ -4103,7 +5576,8 @@ mod tests {
             guards: &env.guards,
         };
 
-        let result = block_on(session.complete_tool_turn(&tool_decision_request()));
+        let result =
+            block_on(session.complete_tool_turn(&tool_decision_request(), &mut VecSink::default()));
 
         assert!(result.is_err(), "a 400 is permanent — no retry");
         assert_eq!(llm.completion_requests().len(), 1);
@@ -4134,7 +5608,8 @@ mod tests {
             guards: &env.guards,
         };
 
-        let result = block_on(session.complete_tool_turn(&tool_decision_request()));
+        let result =
+            block_on(session.complete_tool_turn(&tool_decision_request(), &mut VecSink::default()));
 
         assert!(result.is_err(), "a cancelled run must not retry");
         assert_eq!(
@@ -4142,6 +5617,122 @@ mod tests {
             1,
             "cancellation short-circuits the retry"
         );
+    }
+
+    /// A client whose streamed tool turn fails transiently, optionally after
+    /// putting a live preview on screen. The failure is retryable and the run is
+    /// not cancelled, so the emission guard is the only thing that can stop a
+    /// retry — which makes these two tests a direct measurement of it.
+    struct StreamingToolLlm {
+        previews_before_failing: bool,
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    impl StreamingToolLlm {
+        fn new(previews_before_failing: bool) -> Self {
+            Self {
+                previews_before_failing,
+                attempts: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn attempts(&self) -> usize {
+            self.attempts.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait]
+    impl LlmClient for StreamingToolLlm {
+        async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+            panic!("a client that streams tool turns must not fall back to the buffered one")
+        }
+
+        async fn complete_tool_streaming(
+            &self,
+            _req: &LlmRequest,
+            sink: &mut dyn EventSink,
+        ) -> CoreResult<Completion> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.previews_before_failing {
+                sink.send(ChatEvent::NoteEditPreview {
+                    id: "call-1".into(),
+                    rel_path: None,
+                    kind: None,
+                    body: "half a note".into(),
+                    complete: false,
+                });
+            }
+            Err(CoreError::Llm(
+                "openrouter returned 429 Too Many Requests".into(),
+            ))
+        }
+
+        async fn complete_streaming(
+            &self,
+            _req: &LlmRequest,
+            _sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            unreachable!("the tool turn fails before any answer is streamed")
+        }
+    }
+
+    fn run_streamed_tool_turn(llm: &StreamingToolLlm) -> (CoreResult<Completion>, VecSink) {
+        let env = retry_env();
+        let services = SkillServices::new(
+            &env.skills,
+            &env.environment,
+            &NoUserPrompt,
+            &UnavailableNoteWriter,
+            1,
+        );
+        let session = ChatSession {
+            root: env._vault.path(),
+            model: "test-model",
+            provider: &env.provider,
+            llm,
+            skill_services: &services,
+            guards: &env.guards,
+        };
+        let mut sink = VecSink::default();
+        let result = block_on(session.complete_tool_turn(&tool_decision_request(), &mut sink));
+        (result, sink)
+    }
+
+    #[test]
+    fn a_streamed_tool_turn_is_never_retried_once_it_has_emitted() {
+        // The retry was only ever safe because the turn published nothing. Now
+        // that it streams live previews, replaying it would stream a second copy
+        // of a half-composed note over the first — the user would watch their
+        // note rewind. So a transient, retryable failure is NOT retried here.
+        let llm = StreamingToolLlm::new(true);
+
+        let (result, sink) = run_streamed_tool_turn(&llm);
+
+        assert!(result.is_err(), "the failure is surfaced, not swallowed");
+        assert_eq!(llm.attempts(), 1, "emitted, so no replay");
+        assert_eq!(
+            sink.events
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::NoteEditPreview { .. }))
+                .count(),
+            1,
+            "exactly one preview reached the user"
+        );
+    }
+
+    #[test]
+    fn a_streamed_tool_turn_that_failed_before_emitting_is_still_retried_once() {
+        // The guard keys on what the user can already see, not on whether the turn
+        // was streamed. A pre-first-event failure is as invisible as the buffered
+        // turn's was, so the one bounded retry survives.
+        let llm = StreamingToolLlm::new(false);
+
+        let (result, sink) = run_streamed_tool_turn(&llm);
+
+        assert!(result.is_err(), "both attempts failed");
+        assert_eq!(llm.attempts(), 2, "retried exactly once");
+        assert!(sink.events.is_empty(), "nothing was ever published");
     }
 
     #[test]

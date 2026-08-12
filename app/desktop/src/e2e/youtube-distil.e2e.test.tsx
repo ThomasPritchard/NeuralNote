@@ -46,8 +46,18 @@ describe("Journey 9: YouTube distil failures and fallbacks", () => {
   it("installs a first-use yt-dlp requirement from the failed skill turn", async () => {
     const missingRequirement =
       "Skill 'youtube-distil' could not be activated: skill 'youtube-distil' is not eligible: unmet requirements: required binary 'yt-dlp' is missing from the app-data bin directory — continuing without it";
+    // Both frames, exactly as the orchestrator emits them: the display-only
+    // narration step, then the structured failure whose `missingBinary` is what
+    // reaches the install affordance now. The sentence is no longer load-bearing.
     const script: ChatEvent[] = [
       { type: "skillStep", message: missingRequirement },
+      {
+        type: "skillActivationFailed",
+        id: "youtube-distil",
+        name: "YouTube distil",
+        message: missingRequirement,
+        missingBinary: "yt-dlp",
+      },
       { type: "done" },
     ];
     const { user, backend, advanceNextFrame, advanceAllFrames } = await openWorkspace({
@@ -123,6 +133,9 @@ describe("Journey 9: YouTube distil failures and fallbacks", () => {
       },
       { type: "skillStep", message: "Compiling whisper-cli locally…" },
       { type: "skillStep", message: "Transcribing locally with whisper:small.en…" },
+      // The transcribing tool reports its own provenance, before any note exists
+      // to attach it to — mirroring `dispatch_transcribe_audio`.
+      { type: "transcriptSource", label: "whisper:small.en", relPath: null },
       { type: "noteWritten", relPath: "Transcripts/Quiet talk transcript.md", kind: "transcript" },
       { type: "answer", delta: "Transcript provenance: whisper:small.en." },
       {
@@ -188,13 +201,20 @@ describe("Journey 10: YouTube playlist selection", () => {
         multiSelect: false,
       },
       { type: "skillStep", message: "Video 1 of 21: Agent talk 1 — captions:en-auto" },
+      { type: "transcriptSource", label: "captions:en-auto", relPath: null },
       { type: "noteWritten", relPath: "Literature/Agent talk 1.md", kind: "literature" },
       { type: "noteWritten", relPath: "Transcripts/Agent talk 1 transcript.md", kind: "transcript" },
     ];
     const { user, backend, advanceAllFrames } = await openWorkspace({
       chatScript: script,
-      cancelChatAfterEvents: 6,
+      cancelChatAfterEvents: 7,
       cancelChatTail: [
+        // The orchestrator reports the short run itself; the prose below is kept
+        // deliberately, to prove the report no longer comes from reading it.
+        {
+          type: "partialRun",
+          reason: "the run was stopped before it finished every item",
+        },
         { type: "skillStep", message: "Cancelled after video 1 of 21." },
         {
           type: "answer",

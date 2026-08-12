@@ -30,6 +30,7 @@ vi.mock("../lib/api", async (importActual) => {
 
 import * as api from "../lib/api";
 import { ChatPane } from "./ChatPane";
+import { ALWAYS_ASK_APPROVAL_STATUS } from "../lib/approvalStatusFixture";
 
 const mockAiStatus = vi.mocked(api.aiStatus);
 const mockChat = vi.mocked(api.chat);
@@ -43,6 +44,7 @@ const openRouterActive = (): AiStatus => ({
   reasoningSupported: "unknown",
   openrouter: { hasKey: true, model: DEFAULT_MODEL, reasoning: false },
   local: { activeModelTag: null },
+  approval: ALWAYS_ASK_APPROVAL_STATUS,
 });
 
 /** The backend catalogue a test seeds — the fixture skill as `list_skills`
@@ -60,7 +62,7 @@ const skillListing = (over: Partial<SkillListing> = {}): SkillListing => ({
 function setup() {
   const user = userEvent.setup();
   render(
-    <ChatPane openNoteAt={vi.fn()} onOpenSettings={vi.fn()} refreshSignal={0} />,
+    <ChatPane openNoteAt={vi.fn()} onOpenSettings={vi.fn()} refreshSignal={0} expanded={false} onToggleExpanded={vi.fn()} />,
   );
   return { user };
 }
@@ -201,7 +203,7 @@ describe("ChatPane — async skill catalogue", () => {
   it("keeps the stale catalogue when a REFRESH fails, surfacing the failure on the shared channel", async () => {
     const user = userEvent.setup();
     const { rerender } = render(
-      <ChatPane openNoteAt={vi.fn()} onOpenSettings={vi.fn()} refreshSignal={0} />,
+      <ChatPane openNoteAt={vi.fn()} onOpenSettings={vi.fn()} refreshSignal={0} expanded={false} onToggleExpanded={vi.fn()} />,
     );
     const box = await screen.findByLabelText("Ask across your vault");
 
@@ -216,7 +218,7 @@ describe("ChatPane — async skill catalogue", () => {
     // Settings closes → the signal bumps → the catalogue re-read fails.
     mockListSkills.mockRejectedValueOnce({ kind: "io", message: "registry exploded" });
     rerender(
-      <ChatPane openNoteAt={vi.fn()} onOpenSettings={vi.fn()} refreshSignal={1} />,
+      <ChatPane openNoteAt={vi.fn()} onOpenSettings={vi.fn()} refreshSignal={1} expanded={false} onToggleExpanded={vi.fn()} />,
     );
     await vi.waitFor(() =>
       expect(reportError).toHaveBeenCalledWith("registry exploded"),

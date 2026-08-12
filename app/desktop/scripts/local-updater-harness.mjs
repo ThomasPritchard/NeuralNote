@@ -1,4 +1,9 @@
 #!/usr/bin/env node
+// oxlint-disable eslint/max-lines -- A maintainer-only local updater harness:
+// a single-file, single-purpose script that is run by hand, not shipped in the
+// app bundle and not imported by anything. Splitting it into modules would buy
+// indirection and no comprehension. Remove this directive if it ever grows a
+// second consumer.
 
 import { createReadStream } from "node:fs";
 import {

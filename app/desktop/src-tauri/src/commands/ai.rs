@@ -150,6 +150,34 @@ pub(crate) struct AiStatus {
     reasoning_supported: neuralnote_core::ai::ReasoningSupport,
     openrouter: OpenRouterStatus,
     local: LocalStatus,
+    approval: ApprovalStatus,
+}
+
+/// Everything the Settings page needs to render the approval controls, computed
+/// in Rust so the UI never derives a security value for itself.
+#[derive(serde::Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub(crate) struct ApprovalStatus {
+    /// The stored global default.
+    mode: neuralnote_core::ai::approval::ApprovalMode,
+    /// The stored per-tool exceptions, exactly as persisted.
+    tool_overrides: std::collections::BTreeMap<String, neuralnote_core::ai::approval::ApprovalMode>,
+    /// What each gated tool ACTUALLY resolves to once the global ceiling and the
+    /// compiled-in defaults are applied. A stored override that is less
+    /// restrictive than the global is inert, and the UI has to be able to show it
+    /// as inactive — an override that silently does nothing is its own small lie.
+    effective_modes:
+        std::collections::BTreeMap<String, neuralnote_core::ai::approval::ApprovalMode>,
+    /// Whether the active provider can run the judge. `false` on the local lane,
+    /// where "Approve for me" renders disabled with its reason inline and the
+    /// user's stored preference is left untouched.
+    classifier_available: bool,
+    /// The plain-language consequences of every irreversible tool, in order,
+    /// generated from the reversibility classification. The UI composes the
+    /// sentence around this list; it must never hand-write one, or the warning can
+    /// rot into a stale list and silently omit a newly-added destructive tool.
+    irreversible_actions: Vec<String>,
 }
 
 #[derive(serde::Serialize, TS)]
@@ -267,6 +295,12 @@ pub(crate) fn open_openrouter_rankings(app: AppHandle) -> Result<(), CoreError> 
 /// `AppHandle`.
 fn build_ai_status(cfg: neuralnote_core::ai::ProviderConfig, key_present: bool) -> AiStatus {
     let reasoning_supported = cfg.cached_reasoning_support(key_present);
+    let approval_policy = cfg.approval_policy(key_present);
+    let effective_modes: std::collections::BTreeMap<String, _> =
+        neuralnote_core::ai::approval::ALL_GATED_TOOLS
+            .into_iter()
+            .map(|tool| (tool.name().to_string(), cfg.effective_approval_mode(tool)))
+            .collect();
     AiStatus {
         active_provider: cfg.effective_provider(key_present),
         reasoning_supported,
@@ -277,6 +311,16 @@ fn build_ai_status(cfg: neuralnote_core::ai::ProviderConfig, key_present: bool) 
         },
         local: LocalStatus {
             active_model_tag: cfg.local_model_tag,
+        },
+        approval: ApprovalStatus {
+            mode: cfg.approval_mode,
+            effective_modes,
+            tool_overrides: cfg.tool_approval_overrides,
+            classifier_available: approval_policy.classifier_available,
+            irreversible_actions: neuralnote_core::ai::approval::irreversible_display_names()
+                .into_iter()
+                .map(str::to_string)
+                .collect(),
         },
     }
 }
@@ -382,6 +426,91 @@ fn set_reasoning_in(
 ) -> Result<AiStatus, CoreError> {
     let cfg = mutation_gate.update(config_dir, key_present, |cfg| {
         cfg.reasoning = enabled;
+        Ok(())
+    })?;
+    Ok(build_ai_status(cfg, key_present))
+}
+
+/// Choose the global approval mode.
+///
+/// Returns the freshly persisted `AiStatus` for the same reason `set_reasoning`
+/// does: a follow-up read that failed after the write landed would leave the
+/// radio showing one mode while the config held another — and for this setting
+/// that gap is the difference between "it asks me" and "it does not".
+#[tauri::command]
+pub(crate) fn set_approval_mode(
+    app: AppHandle,
+    state: SharedState<'_>,
+    mode: neuralnote_core::ai::approval::ApprovalMode,
+) -> Result<AiStatus, CoreError> {
+    let dir = config_dir(&app)?;
+    let key_present = ai::read_api_key()?.is_some();
+    set_approval_mode_in(
+        &dir,
+        &provider_config_mutation_gate(&state),
+        key_present,
+        mode,
+    )
+}
+
+fn set_approval_mode_in(
+    config_dir: &Path,
+    mutation_gate: &ProviderConfigMutationGate,
+    key_present: bool,
+    mode: neuralnote_core::ai::approval::ApprovalMode,
+) -> Result<AiStatus, CoreError> {
+    let cfg = mutation_gate.update(config_dir, key_present, |cfg| {
+        cfg.approval_mode = mode;
+        Ok(())
+    })?;
+    Ok(build_ai_status(cfg, key_present))
+}
+
+/// Set or clear one per-tool approval override.
+///
+/// `mode: None` clears the entry, which restores that tool's COMPILED default —
+/// inherit-the-global for six of the seven, and always-ask for the tool that
+/// spawns a host process. Clearing is therefore not the same as storing the
+/// global mode, and the two must stay distinguishable.
+///
+/// An unknown tool name is rejected here rather than stored: an override for a
+/// tool this build does not gate would be dead weight the next read drops anyway,
+/// and accepting it would let a caller believe it took effect.
+#[tauri::command]
+pub(crate) fn set_tool_approval_override(
+    app: AppHandle,
+    state: SharedState<'_>,
+    tool: String,
+    mode: Option<neuralnote_core::ai::approval::ApprovalMode>,
+) -> Result<AiStatus, CoreError> {
+    let dir = config_dir(&app)?;
+    let key_present = ai::read_api_key()?.is_some();
+    set_tool_approval_override_in(
+        &dir,
+        &provider_config_mutation_gate(&state),
+        key_present,
+        &tool,
+        mode,
+    )
+}
+
+fn set_tool_approval_override_in(
+    config_dir: &Path,
+    mutation_gate: &ProviderConfigMutationGate,
+    key_present: bool,
+    tool: &str,
+    mode: Option<neuralnote_core::ai::approval::ApprovalMode>,
+) -> Result<AiStatus, CoreError> {
+    if neuralnote_core::ai::approval::GatedTool::from_name(tool).is_none() {
+        return Err(CoreError::InvalidName(format!(
+            "'{tool}' is not a tool this build asks about"
+        )));
+    }
+    let cfg = mutation_gate.update(config_dir, key_present, |cfg| {
+        match mode {
+            Some(mode) => cfg.tool_approval_overrides.insert(tool.to_string(), mode),
+            None => cfg.tool_approval_overrides.remove(tool),
+        };
         Ok(())
     })?;
     Ok(build_ai_status(cfg, key_present))
@@ -771,20 +900,30 @@ pub(crate) async fn chat(
     // take the same outer lock while incrementing the pending registry's
     // generation, so a command paused before registration can never bind itself
     // to a workspace that has already unmounted.
-    let Some((pending, root, lifecycle_generation, youtube_host, requirement_download)) = ({
+    let Some((
+        pending,
+        pending_approvals,
+        root,
+        lifecycle_generation,
+        youtube_host,
+        requirement_download,
+    )) = ({
         let state = lock_state(&state);
         state.session.as_ref().map(|session| {
             let pending = std::sync::Arc::clone(&state.pending_elicitations);
+            let pending_approvals = std::sync::Arc::clone(&state.pending_approvals);
             let generation = pending.lifecycle_generation();
             (
                 pending,
+                pending_approvals,
                 session.root.clone(),
                 generation,
                 state.youtube.clone(),
                 state.requirement_download.clone(),
             )
         })
-    }) else {
+    })
+    else {
         sink.send(ChatEvent::Error {
             message: "No vault is open.".into(),
         });
@@ -909,6 +1048,18 @@ pub(crate) async fn chat(
     // run_chat emits its own Done/Error, and a returned Err (defensive) is surfaced
     // as a final Error so a failure is never silent.
     let cancellation_observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    // The approval seams. The policy is read from the same config snapshot the
+    // provider decision came from, and its `classifier_available` flag is decided
+    // in RUST from the effective provider — not by the Settings page, which a
+    // stale config or a direct IPC call would walk straight past.
+    let approval_policy = cfg.approval_policy(key_present);
+    let approval_prompt = skills::ShellApprovalPrompt::new(
+        std::sync::Arc::clone(&pending_approvals),
+        turn_id,
+        std::sync::Arc::clone(&close_signal),
+    );
+    let _approval_cleanup =
+        skills::RunApprovalGuard::new(std::sync::Arc::clone(&pending_approvals), turn_id);
     let mut causal_sink = CausalRunEventSink::new(
         &mut sink,
         std::sync::Arc::clone(&close_signal),
@@ -932,6 +1083,8 @@ pub(crate) async fn chat(
         sink: &mut causal_sink,
         close_signal: &close_signal,
         cancellation_observed,
+        approval_policy,
+        approval_prompt: &approval_prompt,
     };
     let ledger = match cfg.effective_provider(key_present) {
         None => {
@@ -1125,6 +1278,38 @@ impl neuralnote_core::ai::LlmClient for RunLlmClient<'_> {
             .ok_or_else(|| self.closed_error())?
     }
 
+    /// The streamed tool turn has to be forwarded explicitly, not left to the
+    /// trait default — the default would delegate to `complete`, and the shell's
+    /// streaming implementation would never run at all.
+    ///
+    /// It also owns the one abandonment nothing else can send. A stop drops the
+    /// inner future together with its accumulator, so the notes it had on screen
+    /// outlive the only thing that knew about them; [`LivePreviews`] keeps their
+    /// ids out here, in the frame that survives, and clears them.
+    ///
+    /// [`LivePreviews`]: neuralnote_core::ai::tool_stream::LivePreviews
+    async fn complete_tool_streaming(
+        &self,
+        request: &neuralnote_core::ai::LlmRequest,
+        sink: &mut dyn neuralnote_core::ai::EventSink,
+    ) -> neuralnote_core::CoreResult<neuralnote_core::ai::Completion> {
+        use neuralnote_core::ai::tool_stream::{LivePreviews, ABANDONED_CANCELLED};
+
+        let mut tracked = LivePreviews::new(sink);
+        let outcome = await_run_or_close(
+            self.inner.complete_tool_streaming(request, &mut tracked),
+            self.close_signal,
+        )
+        .await;
+        match outcome {
+            Some(result) => result,
+            None => {
+                tracked.abandon_live(ABANDONED_CANCELLED);
+                Err(self.closed_error())
+            }
+        }
+    }
+
     async fn complete_streaming(
         &self,
         request: &neuralnote_core::ai::LlmRequest,
@@ -1160,6 +1345,10 @@ struct ChatRun<'a> {
     sink: &'a mut dyn neuralnote_core::ai::EventSink,
     close_signal: &'a ai::ChatRunCloseSignal,
     cancellation_observed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// The persisted approval policy, already resolved against whether the active
+    /// provider can run the judge. Read once per run, in Rust.
+    approval_policy: neuralnote_core::ai::approval::ApprovalPolicy,
+    approval_prompt: &'a dyn neuralnote_core::ai::approval::ApprovalPrompt,
 }
 
 fn stop_if_chat_run_closed(run: &mut ChatRun<'_>) -> bool {
@@ -1219,6 +1408,10 @@ async fn chat_via_openrouter(
         run.close_signal,
         std::sync::Arc::clone(&run.cancellation_observed),
     );
+    // The judge rides the same HTTP client and the same model the turn already
+    // uses; the local arm below wires none at all, which is what makes
+    // `ApproveForMe` fall back to asking there (§9.5.2).
+    let judge = ai::ApprovalJudge::new(&transport, model);
     let mut skill_services = SkillServices::new(
         run.skill_registry,
         run.skill_environment,
@@ -1226,6 +1419,7 @@ async fn chat_via_openrouter(
         run.note_writer,
         1,
     )
+    .with_approval(run.approval_policy.clone(), run.approval_prompt, &judge)
     .with_youtube_io(run.youtube_io)
     .with_youtube_requirements(run.youtube_requirements)
     .with_capture_cancellation(run.capture_cancellation.clone())
@@ -1345,6 +1539,14 @@ async fn chat_via_local(
         std::sync::Arc::clone(&run.cancellation_observed),
     );
     let pricing = neuralnote_core::capture::PricingInput::Local;
+    // No judge on the local lane. `qwen3.5:9b` is the bundled default and is
+    // already known-marginal for structured output in this repo, and a model that
+    // returns well-formed JSON a third of the time is not a security control —
+    // under fail-closed it is a 3-second pause before the prompt the user was
+    // going to get anyway. The policy the caller built already says the judge is
+    // unavailable, so `ApproveForMe` resolves to asking and says so once per run.
+    static NO_JUDGE: neuralnote_core::ai::approval::UnavailableApprovalClassifier =
+        neuralnote_core::ai::approval::UnavailableApprovalClassifier;
     let skill_services = SkillServices::new(
         run.skill_registry,
         run.skill_environment,
@@ -1352,6 +1554,7 @@ async fn chat_via_local(
         run.note_writer,
         1,
     )
+    .with_approval(run.approval_policy.clone(), run.approval_prompt, &NO_JUDGE)
     .with_youtube_io(run.youtube_io)
     .with_youtube_requirements(run.youtube_requirements)
     .with_pricing(&pricing)
@@ -2578,6 +2781,180 @@ mod tests {
         assert_eq!(client.context_window_tokens(), Some(123_456));
     }
 
+    /// Streams a note preview, then never finishes — so a stop always lands
+    /// mid-compose, with a card on screen.
+    struct PreviewsThenHangs {
+        started: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait::async_trait]
+    impl LlmClient for PreviewsThenHangs {
+        async fn complete(&self, _request: &LlmRequest) -> CoreResult<Completion> {
+            unreachable!(
+                "this probe streams its tool turn; reaching the buffered one means the \
+                 cancellation wrapper fell through to the trait default and the shell's \
+                 streaming implementation is never used"
+            )
+        }
+
+        async fn complete_tool_streaming(
+            &self,
+            _request: &LlmRequest,
+            sink: &mut dyn EventSink,
+        ) -> CoreResult<Completion> {
+            sink.send(ChatEvent::NoteEditPreview {
+                id: "call-1".into(),
+                rel_path: None,
+                kind: None,
+                body: "half a note".into(),
+                complete: false,
+            });
+            self.started.notify_one();
+            std::future::pending().await
+        }
+
+        async fn complete_streaming(
+            &self,
+            _request: &LlmRequest,
+            _sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            unreachable!("the run is stopped during the tool turn")
+        }
+    }
+
+    #[derive(Default)]
+    struct RecordEvents(Vec<ChatEvent>);
+
+    impl EventSink for RecordEvents {
+        fn send(&mut self, event: ChatEvent) {
+            self.0.push(event);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_run_stopped_mid_compose_clears_the_note_card_it_left_on_screen() {
+        // Stopping the run drops the streaming future — and with it the
+        // accumulator that would have cleared its own cards. Without this, a
+        // half-composed note sits on screen forever looking like one that landed.
+        let signal = ai::ChatRunCloseSignal::default();
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let inner = PreviewsThenHangs {
+            started: std::sync::Arc::clone(&started),
+        };
+        let client = RunLlmClient::new(
+            &inner,
+            &signal,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let request = LlmRequest {
+            model: "test".into(),
+            messages: vec![],
+            tools: vec![],
+        };
+        let mut sink = RecordEvents::default();
+
+        let result = {
+            let run = client.complete_tool_streaming(&request, &mut sink);
+            let cancel = async {
+                started.notified().await;
+                assert!(signal.stop_by_user());
+            };
+            let (result, ()) = tokio::join!(run, cancel);
+            result
+        };
+
+        assert!(result.is_err(), "a stopped run surfaces as an error");
+        let abandoned: Vec<(&str, &str)> = sink
+            .0
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::NoteEditAbandoned { id, reason } => Some((id.as_str(), reason.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            abandoned,
+            vec![(
+                "call-1",
+                neuralnote_core::ai::tool_stream::ABANDONED_CANCELLED
+            )],
+            "the card the stop orphaned must be cleared, exactly once"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_streamed_tool_turn_that_completes_passes_straight_through() {
+        // The wrapper must not manufacture an abandonment on the happy path: the
+        // turn resolved its own cards, and a second one would report a note the
+        // user is about to see written as abandoned.
+        struct PreviewsThenCompletes;
+
+        #[async_trait::async_trait]
+        impl LlmClient for PreviewsThenCompletes {
+            async fn complete(&self, _request: &LlmRequest) -> CoreResult<Completion> {
+                unreachable!("this probe streams its tool turn")
+            }
+
+            async fn complete_tool_streaming(
+                &self,
+                _request: &LlmRequest,
+                sink: &mut dyn EventSink,
+            ) -> CoreResult<Completion> {
+                sink.send(ChatEvent::NoteEditPreview {
+                    id: "call-1".into(),
+                    rel_path: None,
+                    kind: None,
+                    body: "a whole note".into(),
+                    complete: true,
+                });
+                Ok(Completion {
+                    content: None,
+                    tool_calls: vec![ToolCall {
+                        id: "call-1".into(),
+                        name: "write_note".into(),
+                        arguments: "{}".into(),
+                    }],
+                })
+            }
+
+            async fn complete_streaming(
+                &self,
+                _request: &LlmRequest,
+                _sink: &mut dyn EventSink,
+            ) -> CoreResult<String> {
+                unreachable!("the tool turn is what this exercises")
+            }
+        }
+
+        let signal = ai::ChatRunCloseSignal::default();
+        let inner = PreviewsThenCompletes;
+        let client = RunLlmClient::new(
+            &inner,
+            &signal,
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        );
+        let request = LlmRequest {
+            model: "test".into(),
+            messages: vec![],
+            tools: vec![],
+        };
+        let mut sink = RecordEvents::default();
+
+        let completion = client
+            .complete_tool_streaming(&request, &mut sink)
+            .await
+            .unwrap();
+
+        assert_eq!(completion.tool_calls.first().unwrap().id, "call-1");
+        assert!(
+            !sink
+                .0
+                .iter()
+                .any(|event| matches!(event, ChatEvent::NoteEditAbandoned { .. })),
+            "a turn that completed must not have its card abandoned"
+        );
+    }
+
     struct CloseAfterWriteLlm {
         calls: AtomicUsize,
         close_signal: std::sync::Arc<ai::ChatRunCloseSignal>,
@@ -2644,7 +3021,10 @@ mod tests {
             available_binaries: BTreeSet::new(),
         };
         let note_writer = skills::RunNoteWriteBackend::new(std::sync::Arc::clone(&close_signal));
-        let services = SkillServices::new(&registry, &environment, &NoUserPrompt, &note_writer, 1);
+        let (policy, approval_prompt, approval_classifier) =
+            skills::unattended_approval_for_tests();
+        let services = SkillServices::new(&registry, &environment, &NoUserPrompt, &note_writer, 1)
+            .with_approval(policy, approval_prompt, approval_classifier);
         let retriever = KeywordRetriever::new(vault.path());
         let mut sink = DiscardEvents;
 

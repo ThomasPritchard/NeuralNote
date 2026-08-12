@@ -144,6 +144,37 @@ pub trait LlmClient: Send + Sync {
     /// calls). Not streamed, so `tool_calls` parse cleanly.
     async fn complete(&self, req: &LlmRequest) -> CoreResult<Completion>;
 
+    /// The same tool-deciding turn, streamed, so a note the model is composing can
+    /// be previewed while it composes it
+    /// ([`ChatEvent::NoteEditPreview`](crate::ai::events::ChatEvent::NoteEditPreview)).
+    /// The returned [`Completion`] must be what a buffered [`LlmClient::complete`]
+    /// would have returned for the same turn.
+    ///
+    /// **The default delegates to `complete` and emits nothing.** A client that
+    /// cannot stream tool calls — or that has not been taught to — therefore keeps
+    /// working exactly as it does today and simply has no live preview. That is
+    /// the honest degradation: a provider without the capability shows no preview
+    /// rather than an empty card that never fills.
+    ///
+    /// **Retry contract.** A client that emits ANY event here has published state
+    /// the user can already see, so the turn must not be retried afterwards — a
+    /// replay would stream a second copy of a half-written note over the first.
+    /// The orchestrator enforces this by watching the sink
+    /// (`complete_tool_turn`); an implementation must not retry internally either.
+    async fn complete_tool_streaming(
+        &self,
+        req: &LlmRequest,
+        sink: &mut dyn EventSink,
+    ) -> CoreResult<Completion> {
+        let completion = self.complete(req).await?;
+        // `complete` has no sink and so cannot price itself. Declaring this turn
+        // unmetered is what stops the run's total quietly omitting it: without
+        // this, a client that streams the answer but buffers its tool turns would
+        // report the answer's tokens as if they were the whole run.
+        sink.record_usage(None);
+        Ok(completion)
+    }
+
     /// Stream the final answer: push each chunk as a [`ChatEvent::Answer`] via
     /// `sink` and return the full assembled text (the orchestrator scans it for the
     /// evidence ids the model cited).

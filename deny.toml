@@ -1,0 +1,71 @@
+# cargo-deny configuration — backs the Security / Vulnerabilities category of
+# scripts/rust-quality-gate.sh.
+#
+# WHY cargo-deny INSTEAD OF cargo-audit
+# -------------------------------------
+# `cargo audit` scans Cargo.lock. A lockfile records the UNION of every optional
+# dependency of every crate in the graph, whether or not a feature ever turns one
+# on — so cargo-audit reports advisories against code this workspace never
+# compiles. That is not a hypothetical: it held this gate red on
+# RUSTSEC-2026-0235 (`rkyv` 0.7.46), an optional dependency of `rust_decimal`
+# reached via `rust_decimal -> byte-unit -> tauri-plugin-log -> desktop` whose
+# enabling feature nothing activates:
+#
+#   cargo tree -i rkyv                 -> "nothing to print."
+#   cargo tree -i rkyv --target all    -> "nothing to print."
+#
+# The advisory's own remedy (upgrade to >=0.8.17) was unreachable anyway: it is a
+# breaking bump under Cargo's 0.x rules and could only ever come from the parent,
+# which is already at its latest published release.
+#
+# cargo-deny builds its graph from `cargo metadata` — the RESOLVED feature graph
+# — so an optional dependency that no feature activates is simply not in it. The
+# fix is to check the right graph, not to silence the advisory.
+#
+# There is deliberately NO `ignore` list here. An ignore entry is armed forever
+# and would suppress that advisory ID even on the day the crate is genuinely
+# pulled in and the advisory genuinely applies. Checking the resolved graph has
+# the opposite property: the moment anything activates `rkyv`, this gate goes red
+# on exactly that advisory, with no config change needed.
+#
+# Verified 2026-08-11 against cargo-deny 0.20.2, whose graph contains
+# `rust_decimal` (the parent edge is real) but not `rkyv`, while still containing
+# the Linux-only gtk-rs stack and dev-only crates.
+
+# No [graph] section on purpose:
+#   * no `targets` filter — the Linux-only GTK stack stays in the graph even when
+#     the gate runs on macOS, so a cross-platform advisory can never hide behind
+#     the host triple;
+#   * dev-dependencies stay in (cargo-deny's default) — test-only code still
+#     compiles on developer machines and in CI, so it still deserves auditing;
+#   * default feature resolution, not `all-features` — the gate should audit what
+#     actually ships. Turning on every feature would re-import exactly the class
+#     of false positive this file exists to remove.
+
+[advisories]
+# Vulnerabilities always fail the gate. That check has no off switch and is the
+# category's actual job — nothing below weakens it.
+#
+# `unmaintained` and `unsound` advisories do NOT fail the gate. This preserves,
+# rather than changes, the contract the previous `cargo audit` step had: it
+# failed on vulnerabilities only. The 17 current warnings — Tauri's unmaintained
+# gtk-rs GTK3 bindings, the `unic-*` family via `urlpattern`, and the `glib`
+# unsoundness — are all upstream-blocked and are documented crate by crate, with
+# their upgrade triggers, in docs/security/dependency-advisories.md.
+#
+# Note the difference from an ignore list, which is the whole point: these two
+# settings relax the unmaintained/unsound CLASSES only. If any of those same
+# crates is later issued a *vulnerability* advisory, it is reported and the gate
+# goes red. An `ignore = ["RUSTSEC-..."]` entry would have hidden that too.
+unmaintained = "none"
+unsound = "none"
+
+# A yanked crate is a supply-chain signal but not a vulnerability, so it warns
+# instead of failing — matching the vulnerabilities-only contract above. Set
+# explicitly so a future change to cargo-deny's default cannot silently move the
+# gate's verdict.
+yanked = "warn"
+
+# Flag an `ignore` entry that no longer matches anything, so this file cannot
+# quietly accumulate dead suppressions if one is ever added as a bridge.
+unused-ignored-advisory = "warn"

@@ -13,6 +13,7 @@ import {
   reduceAssistant,
   reduceAssistantForTurn,
   resolveAnswerMarkers,
+  searchOutcome,
   showsNothingFoundCard,
   stripCitationMarkers,
   summarizeActivity,
@@ -26,15 +27,12 @@ import {
 } from "./chatMessage";
 
 describe("skill report context", () => {
-  it("extracts distinct caption and Whisper provenance in first-seen order", () => {
-    const turn = {
-      ...emptyAssistant(),
-      skillSteps: [
-        "Video 1 of 3 landed with captions:en-auto.",
-        "Video 2 of 3 landed with whisper:small.en; captions:en-auto was already used.",
-      ],
-      answer: "Transcript provenance: whisper:small.en",
-    };
+  it("reports the transcript sources the backend named, in first-seen order", () => {
+    const turn = run([
+      { type: "transcriptSource", label: "captions:en-auto", relPath: null },
+      { type: "transcriptSource", label: "whisper:small.en", relPath: null },
+      { type: "transcriptSource", label: "captions:en-auto", relPath: null },
+    ]);
 
     expect(modelReportedProvenance(turn)).toEqual([
       "captions:en-auto",
@@ -42,25 +40,52 @@ describe("skill report context", () => {
     ]);
   });
 
-  it("marks a settled skill run partial only when output survived a stop", () => {
+  it("never mistakes a transcript label mentioned in prose for a real source", () => {
+    // The old regex scraped `captions:`/`whisper:` out of concatenated model
+    // prose, so any answer that merely QUOTED a label claimed it as provenance.
+    const turn = {
+      ...emptyAssistant(),
+      skillSteps: ["Video 1 of 3 landed with captions:en-auto."],
+      answer: "Transcript provenance: whisper:small.en",
+    };
+
+    expect(modelReportedProvenance(turn)).toEqual([]);
+  });
+
+  it("marks a settled skill run partial only when the backend said it was", () => {
     const partial = {
       ...emptyAssistant(),
       done: true,
       skillActivations: [{ id: "youtube-distil", name: "YouTube distil" }],
       writtenNotes: [{ relPath: "Literature/One.md", kind: "literature" as const }],
-      skillSteps: ["Cancelled after video 1 of 4."],
+      partialRun: "the run was stopped before it finished every item",
     };
     expect(isPartialSkillRun(partial)).toBe(true);
     expect(isPartialSkillRun({ ...partial, writtenNotes: [] })).toBe(false);
     expect(isPartialSkillRun({ ...partial, done: false })).toBe(false);
+    expect(isPartialSkillRun({ ...partial, skillActivations: [] })).toBe(false);
     expect(
       isPartialSkillRun({
         ...partial,
+        partialRun: null,
         stopped: true,
-        skillSteps: [],
-        answer: "",
       }),
     ).toBe(true);
+  });
+
+  it("never calls a whole run partial just because the answer says 'cancelled'", () => {
+    // The old regex matched any answer that MENTIONED the word, so asking
+    // "why was my flight cancelled?" reported the run as incomplete.
+    const complete = {
+      ...emptyAssistant(),
+      done: true,
+      skillActivations: [{ id: "youtube-distil", name: "YouTube distil" }],
+      writtenNotes: [{ relPath: "Literature/One.md", kind: "literature" as const }],
+      skillSteps: ["Cancelled after video 1 of 4."],
+      answer: "The talk explains why the launch was cancelled.",
+    };
+
+    expect(isPartialSkillRun(complete)).toBe(false);
   });
 });
 
@@ -257,7 +282,386 @@ describe("reduceAssistant — skills bank", () => {
       { relPath: "Atomic/Idea.md", kind: "atomic" },
     ]);
   });
+
+  it("keeps a collided note out of the written ledger but never loses it", () => {
+    // #108: a create-only write that hit an existing note wrote nothing, so it
+    // must not be reported as written — and must not vanish either.
+    const turn = run([
+      { type: "noteWritten", relPath: "Atomic/Idea.md", kind: "atomic" },
+      { type: "noteExists", relPath: "Atomic/Idea.md", kind: "atomic" },
+    ]);
+
+    expect(turn.writtenNotes).toEqual([
+      { relPath: "Atomic/Idea.md", kind: "atomic" },
+    ]);
+    expect(turn.existingNotes).toEqual([
+      { relPath: "Atomic/Idea.md", kind: "atomic" },
+    ]);
+  });
+
+  it("records an activation failure with its structured install remedy", () => {
+    const turn = run([
+      {
+        type: "skillActivationFailed",
+        id: "youtube-distil",
+        name: "YouTube distil",
+        message: "Skill 'youtube-distil' could not be activated: …",
+        missingBinary: "yt-dlp",
+      },
+    ]);
+
+    expect(turn.skillActivationFailures).toEqual([
+      {
+        id: "youtube-distil",
+        name: "YouTube distil",
+        message: "Skill 'youtube-distil' could not be activated: …",
+        missingBinary: "yt-dlp",
+      },
+    ]);
+  });
+
+  it("keeps an absent install remedy absent rather than inventing one", () => {
+    const turn = run([
+      {
+        type: "skillActivationFailed",
+        id: "no-such-skill",
+        name: "no-such-skill",
+        message: "unknown skill",
+        missingBinary: null,
+      },
+    ]);
+
+    expect(turn.skillActivationFailures[0].missingBinary).toBeNull();
+  });
+
+  it("keeps the first partial-run reason rather than overwriting it", () => {
+    const turn = run([
+      { type: "partialRun", reason: "the run was stopped" },
+      { type: "partialRun", reason: "and also hit a limit" },
+    ]);
+
+    expect(turn.partialRun).toBe("the run was stopped");
+  });
 });
+
+describe("reduceAssistant — the tool timeline", () => {
+  it("opens a node when a call is announced and settles it in place", () => {
+    const turn = run([
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: '{"query":"spaced repetition"}',
+        stepId: null,
+      },
+      {
+        type: "toolResult",
+        id: "c1",
+        status: "ok",
+        summary: "12 spans",
+        detail: null,
+      },
+    ]);
+
+    expect(turn.toolCalls).toEqual([
+      {
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: '{"query":"spaced repetition"}',
+        status: "ok",
+        summary: "12 spans",
+        detail: null,
+        stepId: null,
+      },
+    ]);
+  });
+
+  it("leaves an unsettled call visibly in flight rather than guessing at it", () => {
+    const turn = run([
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "list_notes",
+        title: "List notes",
+        arguments: "{}",
+        stepId: null,
+      },
+    ]);
+
+    expect(turn.toolCalls[0].status).toBeNull();
+    expect(turn.toolCalls[0].summary).toBeNull();
+  });
+
+  it("settles each call against its own id, not the most recent one", () => {
+    const turn = run([
+      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}",
+        stepId: null, },
+      { type: "toolCall", id: "c2", name: "list_folders", title: "List folders", arguments: "{}",
+        stepId: null, },
+      { type: "toolResult", id: "c2", status: "rejected", summary: null, detail: "nope" },
+    ]);
+
+    expect(turn.toolCalls.map((call) => call.status)).toEqual([null, "rejected"]);
+    expect(turn.toolCalls[1].detail).toBe("nope");
+  });
+
+  it("keeps a settlement whose call never arrived rather than dropping it", () => {
+    // Mirrors `withHitCount`: a backend that breaks its own pairing contract
+    // must produce a visible anomaly, never a silently discarded event.
+    const turn = run([
+      { type: "toolResult", id: "ghost", status: "error", summary: null, detail: "boom" },
+    ]);
+
+    expect(turn.toolCalls).toEqual([
+      {
+        id: "ghost",
+        name: "",
+        title: "",
+        arguments: "",
+        status: "error",
+        summary: null,
+        detail: "boom",
+        // No announcement means no dispatch we ever saw, so there is no step to
+        // affiliate it with. Null, never a guess at whichever step is current.
+        stepId: null,
+      },
+    ]);
+  });
+
+  it("carries the step the call was dispatched under onto the node", () => {
+    const turn = run([
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: "{}",
+        stepId: "s2",
+      },
+    ]);
+
+    expect(turn.toolCalls[0].stepId).toBe("s2");
+  });
+
+  it("leaves a call dispatched under no plan unaffiliated, and folds it as before", () => {
+    // The pre-plan case, which is the common one: no step, no grouping, and a
+    // node otherwise identical to the one the reducer built before plans existed.
+    const turn = run([
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: '{"query":"widgets"}',
+        stepId: null,
+      },
+      { type: "toolResult", id: "c1", status: "ok", summary: "3 spans", detail: null },
+    ]);
+
+    expect(turn.planSteps).toEqual([]);
+    expect(turn.toolCalls).toEqual([
+      {
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: '{"query":"widgets"}',
+        status: "ok",
+        summary: "3 spans",
+        detail: null,
+        stepId: null,
+      },
+    ]);
+  });
+
+  it("settles a call on its id alone, whatever step it was affiliated with", () => {
+    // `toolResult` carries no step of its own, and the affiliation must play no
+    // part in the match — nor be blanked by the settlement that lands on it.
+    const turn = run([
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: "{}",
+        stepId: "s1",
+      },
+      {
+        type: "toolCall",
+        id: "c2",
+        name: "list_notes",
+        title: "List notes",
+        arguments: "{}",
+        stepId: null,
+      },
+      { type: "toolResult", id: "c2", status: "ok", summary: null, detail: null },
+      { type: "toolResult", id: "c1", status: "rejected", summary: null, detail: "nope" },
+    ]);
+
+    expect(turn.toolCalls.map((call) => [call.id, call.status, call.stepId])).toEqual([
+      ["c1", "rejected", "s1"],
+      ["c2", "ok", null],
+    ]);
+  });
+
+  it("does not re-parent an already-dispatched node when a later step starts", () => {
+    // The affiliation is stamped by the backend at dispatch. A plan arriving
+    // afterwards restatuses the rail; it must never reach back into a node that
+    // already went out.
+    const turn = run([
+      {
+        type: "toolCall",
+        id: "c1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: "{}",
+        stepId: null,
+      },
+      {
+        type: "plan",
+        steps: [
+          { id: "s1", label: "Search the vault" },
+          { id: "s2", label: "Read the best matches" },
+        ],
+      },
+      { type: "planStepStatus", id: "s1", status: "running" },
+    ]);
+
+    expect(turn.planSteps.map((step) => step.status)).toEqual(["running", "pending"]);
+    expect(turn.toolCalls[0].stepId).toBeNull();
+  });
+
+  it("never re-settles a call that already settled", () => {
+    const turn = run([
+      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}",
+        stepId: null, },
+      { type: "toolResult", id: "c1", status: "ok", summary: null, detail: null },
+      { type: "toolResult", id: "c1", status: "rejected", summary: null, detail: "late" },
+    ]);
+
+    expect(turn.toolCalls).toHaveLength(2);
+    expect(turn.toolCalls[0].status).toBe("ok");
+  });
+
+  it("leaves the progress phase to the events that actually name one", () => {
+    // A tool node is not a phase. Announcing a call must not overwrite the
+    // phase a `searching`/`reading` event established.
+    const turn = run([
+      { type: "reading", relPath: "n.md", startLine: 1, endLine: 2 },
+      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}",
+        stepId: null, },
+    ]);
+
+    expect(turn.phase).toBe("reading");
+  });
+});
+
+/** One live-preview event. A settled preview also carries the path and kind,
+ *  because those only finish arriving once the arguments have closed. */
+function preview(body: string, complete = false, id = "c1"): ChatEvent {
+  return {
+    type: "noteEditPreview",
+    id,
+    relPath: complete ? "Zettelkasten/Spaced.md" : null,
+    kind: complete ? "atomic" : null,
+    body,
+    complete,
+  };
+}
+
+describe("reduceAssistant — the live note preview", () => {
+  it("replaces the growing body in place rather than stacking rows", () => {
+    // The backend re-sends the whole body each time, so a second preview for one
+    // call is the SAME note further along — appending would render the note once
+    // per fragment, hundreds of times.
+    const turn = run([
+      preview("# Spa"),
+      preview("# Spaced rep"),
+      preview("# Spaced repetition", true),
+    ]);
+
+    expect(turn.noteEdits).toHaveLength(1);
+    expect(turn.noteEdits[0]).toEqual({
+      id: "c1",
+      relPath: "Zettelkasten/Spaced.md",
+      kind: "atomic",
+      body: "# Spaced repetition",
+      complete: true,
+      abandoned: null,
+    });
+  });
+
+  it("keeps two concurrent edits apart by their call id", () => {
+    const turn = run([preview("first", false, "c1"), preview("second", false, "c2")]);
+
+    expect(turn.noteEdits.map((edit) => [edit.id, edit.body])).toEqual([
+      ["c1", "first"],
+      ["c2", "second"],
+    ]);
+  });
+
+  it("a settled preview is not a written note", () => {
+    // `complete` means the arguments parsed, not that a file exists — the tool
+    // still has to be dispatched, and can still be rejected.
+    const turn = run([preview("# Spaced repetition", true)]);
+
+    expect(turn.noteEdits[0].complete).toBe(true);
+    expect(turn.writtenNotes).toEqual([]);
+  });
+
+  it("marks an abandoned edit so its diff stops reading as committed", () => {
+    const turn = run([
+      preview("# Half a n"),
+      { type: "noteEditAbandoned", id: "c1", reason: "the model stopped" },
+    ]);
+
+    expect(turn.noteEdits).toHaveLength(1);
+    expect(turn.noteEdits[0].abandoned).toBe("the model stopped");
+    expect(turn.noteEdits[0].body).toBe("# Half a n");
+  });
+
+  it("surfaces an abandonment whose preview never arrived rather than dropping it", () => {
+    // The backend abandons only what it previewed, so an unmatched one is a
+    // broken contract — and a broken contract has to be visible.
+    const turn = run([{ type: "noteEditAbandoned", id: "ghost", reason: "gone" }]);
+
+    expect(turn.noteEdits).toEqual([
+      {
+        id: "ghost",
+        relPath: null,
+        kind: null,
+        body: "",
+        complete: false,
+        abandoned: "gone",
+      },
+    ]);
+  });
+
+  it("never revives an edit the backend already abandoned", () => {
+    const turn = run([
+      preview("# Half"),
+      { type: "noteEditAbandoned", id: "c1", reason: "the model stopped" },
+      preview("# Half a note more"),
+    ]);
+
+    expect(turn.noteEdits[0].abandoned).toBe("the model stopped");
+  });
+});
+
+/** One search, with its `retrieved` report or without it. `null` leaves the hit
+ *  count undefined — the in-flight shape, which is not zero. */
+const settledSearch = (query: string, hitCount: number | null): ChatEvent[] =>
+  hitCount === null
+    ? [{ type: "searching", query }]
+    : [{ type: "searching", query }, { type: "retrieved", query, hitCount }];
+
+/** Close a run with a coverage footer that read no note — the state the empty-
+ *  retrieval card is eligible in. */
+const finishHavingReadNothing = (searchedTerms: string[]): ChatEvent[] => [
+  { type: "coverage", searchedTerms, notesRead: [], truncated: false, skippedFiles: 0 },
+  { type: "done" },
+];
 
 describe("showsNothingFoundCard", () => {
   // A genuine miss: the search surfaced nothing worth reading, so the turn read
@@ -329,6 +733,37 @@ describe("showsNothingFoundCard", () => {
       text: "Active recall improves retention.",
     };
     expect(showsNothingFoundCard({ ...finishedMiss, citations: [citation] })).toBe(false);
+  });
+
+  // ── The retrieval veto (#122) ─────────────────────────────────────────────
+  // Built from events through the real reducer, because the property under test
+  // is that a hit count which crossed the wire reaches this decision at all.
+
+  it("stays hidden when the searches returned spans the model never opened", () => {
+    // The reported run: no note read and no citation survived, which used to be
+    // the whole test — but eleven spans came back, so the vault plainly does
+    // cover this. "Nothing in your vault covers this" is then a false statement
+    // about the user's own notes, and a louder one than the rail summary's.
+    const turn = run([
+      ...settledSearch("markdown", 6),
+      ...settledSearch("spaced repetition", 5),
+      ...finishHavingReadNothing(["markdown", "spaced repetition"]),
+    ]);
+    expect(showsNothingFoundCard(turn)).toBe(false);
+  });
+
+  it("still shows when every search reported and every one of them was empty", () => {
+    // The veto must not swallow the card's real purpose: this is a genuine miss,
+    // and the on-ramp is exactly what the user needs here.
+    const turn = run([...settledSearch("quokka", 0), ...finishHavingReadNothing(["quokka"])]);
+    expect(showsNothingFoundCard(turn)).toBe(true);
+  });
+
+  it("stays hidden when a search never reported what it found", () => {
+    // The run ended with the count still undefined. Nothing established that the
+    // vault is empty, so "not yet known" must not be rendered as "no".
+    const turn = run([...settledSearch("focus", null), ...finishHavingReadNothing(["focus"])]);
+    expect(showsNothingFoundCard(turn)).toBe(false);
   });
 });
 
@@ -619,5 +1054,59 @@ describe("summarizeActivity", () => {
       verified: false,
       totalSteps: 0,
     });
+  });
+});
+
+describe("searchOutcome", () => {
+  // The type exists because #122 collapsed three states into two: the summary
+  // asked whether anything had been READ and then reported whether anything had
+  // been FOUND. Each state is pinned separately here because each one licenses a
+  // different sentence in front of the user.
+
+  it("reports no retrieval at all when no search ran", () => {
+    expect(searchOutcome([])).toEqual({ kind: "none" });
+    expect(searchOutcome([{ kind: "verifying" }])).toEqual({ kind: "none" });
+  });
+
+  it("totals the spans across every search that reported", () => {
+    const steps: ActivityStep[] = [
+      { kind: "search", query: "markdown", hitCount: 6 },
+      { kind: "search", query: "spaced repetition", hitCount: 5 },
+    ];
+    // The total the head prints has to be the sum of what the nodes beneath it
+    // print, or the summary contradicts its own children — which is the bug.
+    expect(searchOutcome(steps)).toEqual({ kind: "hits", spans: 11 });
+  });
+
+  it("reports empty only when every search reported and every one was zero", () => {
+    const steps: ActivityStep[] = [
+      { kind: "search", query: "quokka", hitCount: 0 },
+      { kind: "search", query: "wallaby", hitCount: 0 },
+    ];
+    expect(searchOutcome(steps)).toEqual({ kind: "empty" });
+  });
+
+  it("reports pending, never empty, while a search has yet to report", () => {
+    // `hitCount` is undefined between `searching` and `retrieved`. Reading that
+    // as zero is what let "nothing found" appear before the vault had answered.
+    expect(searchOutcome([{ kind: "search", query: "focus" }])).toEqual({ kind: "pending" });
+  });
+
+  it("still reports pending when the searches that HAVE reported found nothing", () => {
+    const steps: ActivityStep[] = [
+      { kind: "search", query: "quokka", hitCount: 0 },
+      { kind: "search", query: "focus" },
+    ];
+    expect(searchOutcome(steps)).toEqual({ kind: "pending" });
+  });
+
+  it("lets a reported hit outrank a straggler that has not answered", () => {
+    // Once one search has come back with spans, retrieval demonstrably found
+    // something and a later straggler cannot unsay it.
+    const steps: ActivityStep[] = [
+      { kind: "search", query: "markdown", hitCount: 6 },
+      { kind: "search", query: "focus" },
+    ];
+    expect(searchOutcome(steps)).toEqual({ kind: "hits", spans: 6 });
   });
 });

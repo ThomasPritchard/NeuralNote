@@ -43,7 +43,7 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
   These checks are secret-free and must pass before merge.
 - **Rust-native gate** — `./scripts/rust-quality-gate.sh` prints **GREEN (all categories
   enforced)** and exits `0`: `clippy -D warnings`, `rustfmt --check`, `cargo llvm-cov
-  --fail-under-lines 90`, `cargo-audit`. The exit code is the contract automation reads:
+  --fail-under-lines 90`, `cargo-deny`. The exit code is the contract automation reads:
   `0` GREEN (every category ran and passed), `1` RED (real findings — a code verdict), `2`
   INCOMPLETE (a required category could not run — the tool is absent or the advisory DB was
   unreachable/offline). **INCOMPLETE is not green:** the gate exits non-zero (`2`) and never
@@ -132,8 +132,9 @@ risk surface broadly — **not on every commit.**
   `new_coverage ≥ 80 %`, and `new_duplicated_lines ≤ 3 %`; also hold overall coverage at
   90 % or above with no vulnerabilities or open security hotspots. An unavailable local service
   is reported as unavailable, never passed. See [Local SonarQube](local-sonarqube.md).
-- **Dependency audit** — `cargo-audit` runs inside the Rust gate every time; run `npm audit` and
-  review transitive bumps periodically.
+- **Dependency audit** — `cargo-deny check advisories` runs inside the Rust gate every time,
+  against the resolved feature graph (see `deny.toml`); run `npm audit` and review transitive
+  bumps periodically.
 - **a11y + UX pass** — `ux-audit` after a user-facing flow ships; keyboard/focus/contrast check.
 - **Performance check** — for anything on the capture→embed→retrieve hot path once it exists.
 
@@ -195,7 +196,7 @@ codesign --verify --deep --strict target/dev-builds/NeuralNote-Dev.app
 
 # Rust (from repo root)
 cargo test --workspace --locked
-./scripts/rust-quality-gate.sh           # clippy + fmt + llvm-cov(≥90) + audit
+./scripts/rust-quality-gate.sh           # clippy + fmt + llvm-cov(≥90) + cargo-deny advisories
 cargo llvm-cov -p neuralnote-core --lcov --output-path lcov-rust.info
 
 # Repository and dependency security

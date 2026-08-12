@@ -175,7 +175,7 @@ jobs:
       - name: Install pinned Rust gate tools
         run: |
           cargo install cargo-llvm-cov --locked --version 0.8.7
-          cargo install cargo-audit --locked --version 0.22.2
+          cargo install cargo-deny --locked --version 0.20.2
 
       - name: Run release gates
         # These checks compile the Tauri shell but do not package or exercise

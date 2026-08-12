@@ -8,12 +8,13 @@
 // composer) and lays out what they resolve.
 
 import { useCallback, useState } from "react";
-import { Cpu, Database, Loader2, Sparkles } from "lucide-react";
+import { Cpu, Database, Loader2, Maximize2, Minimize2, Sparkles } from "lucide-react";
 import { cn } from "../lib/cn";
 import { useVault } from "../lib/store";
 import { buttonVariants } from "@/components/ui/button";
+import { IconButton } from "@/components/ui/icon-button";
 import { StatusPill as NeuralStatusPill } from "@/components/neural/patterns";
-import { ChatMessages } from "./ChatMessages";
+import { ChatTranscript } from "./ChatTranscript";
 import type { CitationView } from "./chatMessage";
 import { ChatComposer } from "./ChatComposer";
 import { DisconnectedPane, KeySetupPanel } from "./KeySetupPanel";
@@ -28,7 +29,7 @@ import { useChatPaneProvider, type View } from "./useChatPaneProvider";
 function ChatStatusPill({ view }: Readonly<{ view: View }>) {
   if (view === "disconnected") {
     return (
-      <NeuralStatusPill status="neutral" className="ml-auto shrink-0 gap-1.5 px-2.5 py-1 text-[0.6875rem]">
+      <NeuralStatusPill status="neutral" className="shrink-0 gap-1.5 px-2.5 py-1 text-[0.6875rem]">
         <Database className="size-3" aria-hidden /> Not connected
       </NeuralStatusPill>
     );
@@ -36,10 +37,38 @@ function ChatStatusPill({ view }: Readonly<{ view: View }>) {
   return null;
 }
 
+/** Widen the pane, and narrow it back.
+ *
+ *  The accessible name is FROZEN across both states and the state itself rides
+ *  `aria-pressed` (the `IconButton` idiom the title bar already uses for its
+ *  navigation and chat toggles). A name that flipped with the state would
+ *  re-anchor every `getByRole("button", { name })` the moment it was pressed —
+ *  the same class of breakage as selecting by position. The tooltip is free to
+ *  name the action, because it is not the accessible name. */
+function ExpandToggle({
+  expanded,
+  onToggle,
+}: Readonly<{ expanded: boolean; onToggle: () => void }>) {
+  const Icon = expanded ? Minimize2 : Maximize2;
+  return (
+    <IconButton
+      label="Toggle wide chat pane"
+      tooltip={expanded ? "Restore the chat pane width" : "Widen the chat pane"}
+      pressed={expanded}
+      onClick={onToggle}
+      className="size-7 shrink-0"
+    >
+      <Icon className="size-3.5" aria-hidden />
+    </IconButton>
+  );
+}
+
 export function ChatPane({
   openNoteAt,
   onOpenSettings,
   refreshSignal = 0,
+  expanded,
+  onToggleExpanded,
 }: Readonly<{
   openNoteAt: (absPath: string) => void;
   /** Opens the settings modal on the AI section (local setup lives there). */
@@ -48,6 +77,10 @@ export function ChatPane({
    *  there (e.g. a first local model) is reflected without remounting — and
    *  without wiping an in-progress transcript. */
   refreshSignal?: number;
+  /** The slot around this pane is widened. Presentational only — the width
+   *  itself is the `--chat-width-expanded` token's business, not React's. */
+  expanded: boolean;
+  onToggleExpanded: () => void;
 }>) {
   const { vault, reportError } = useVault();
   const vaultPath = vault?.path;
@@ -101,10 +134,17 @@ export function ChatPane({
           <span className="grid size-7 place-items-center rounded-lg border border-primary/25 bg-primary/12 text-primary">
             <Sparkles className="size-3.5" aria-hidden />
           </span>
-          <span className="nn-heading shrink-0 text-sm font-semibold">
+          {/* Truncating, not `shrink-0`: the row now carries a trailing control
+              as well as the status pill, and at the narrowest breakpoint's
+              18rem pane the three together exceed the header's content box. A
+              clipped title is recoverable; a row in horizontal overflow is not. */}
+          <span className="nn-heading min-w-0 truncate text-sm font-semibold">
             Neural Assistant AI
           </span>
-          <ChatStatusPill view={view} />
+          <div className="ml-auto flex shrink-0 items-center gap-1.5">
+            <ChatStatusPill view={view} />
+            <ExpandToggle expanded={expanded} onToggle={onToggleExpanded} />
+          </div>
         </div>
         <p className="mt-2 text-[0.6875rem] leading-snug text-muted-foreground">
           Ask questions across everything in your vault. Every claim is
@@ -168,32 +208,14 @@ export function ChatPane({
 
       {view === "chat" && (
         <>
-          <div className="min-h-0 flex-1 overflow-y-auto px-4 py-4">
-            {chat.messages.length === 0 ? (
-              <div className="flex h-full flex-col items-center justify-center gap-3 px-6 text-center">
-                <span className="grid size-11 place-items-center rounded-xl bg-primary/10 text-primary ring-1 ring-inset ring-primary/20">
-                  <Sparkles className="size-5" aria-hidden />
-                </span>
-                <div className="flex flex-col gap-1.5">
-                  <p className="text-[0.8125rem] font-medium text-foreground/90">
-                    Ask anything across your vault
-                  </p>
-                  <p className="mx-auto max-w-[15rem] text-[0.75rem] leading-relaxed text-muted-foreground">
-                    Watch the answer get searched, read and citation-checked live.
-                  </p>
-                </div>
-              </div>
-            ) : (
-              <ChatMessages
-                messages={chat.messages}
-                onOpenCitation={openCitation}
-                onOpenNote={openWrittenNote}
-                onSendFollowUp={chat.sendPrompt}
-                busy={chat.busy}
-                runIds={chat.runIds}
-              />
-            )}
-          </div>
+          <ChatTranscript
+            messages={chat.messages}
+            onOpenCitation={openCitation}
+            onOpenNote={openWrittenNote}
+            onSendFollowUp={chat.sendPrompt}
+            busy={chat.busy}
+            runIds={chat.runIds}
+          />
 
           <ChatComposer
             stopError={chat.stopError}

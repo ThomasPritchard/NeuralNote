@@ -4,6 +4,7 @@ import { beforeEach, describe, expect, it, vi } from "vitest";
 import * as api from "../lib/api";
 import type { AiStatus, OpenRouterModelMenu } from "../lib/types";
 import { ChatModelMenu } from "./ChatModelMenu";
+import { ALWAYS_ASK_APPROVAL_STATUS } from "../lib/approvalStatusFixture";
 
 vi.mock("../lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("../lib/api")>();
@@ -19,6 +20,7 @@ const openRouterStatus = (model = "openai/gpt-5"): AiStatus => ({
   reasoningSupported: "supported",
   openrouter: { hasKey: true, model, reasoning: false },
   local: { activeModelTag: null },
+  approval: ALWAYS_ASK_APPROVAL_STATUS,
 });
 
 const localStatus: AiStatus = {
@@ -26,6 +28,7 @@ const localStatus: AiStatus = {
   reasoningSupported: "unknown",
   openrouter: { hasKey: false, model: "openai/gpt-5", reasoning: false },
   local: { activeModelTag: "qwen3:8b" },
+  approval: ALWAYS_ASK_APPROVAL_STATUS,
 };
 
 const menu: OpenRouterModelMenu = {

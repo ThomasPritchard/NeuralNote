@@ -1,5 +1,14 @@
-use neuralnote_core::ai::{NotePathState, NoteWriteBackend, NoteWriteParent, OpenedNoteParent};
+use futures::executor::block_on;
+use neuralnote_core::ai::approval::{
+    self, ApprovalContext, ApprovalDecision, ApprovalGate, ApprovalMode, ApprovalPolicy,
+    ApprovedCall, DenyingApprovalPrompt, UnavailableApprovalClassifier,
+};
+use neuralnote_core::ai::{
+    ChatEvent, EventSink, NotePathState, NoteWriteBackend, NoteWriteParent, OpenedNoteParent,
+    ToolCall, TOOL_TRANSCRIBE_AUDIO,
+};
 use neuralnote_core::{CoreError, CoreResult};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -77,4 +86,72 @@ impl NoteWriteParent for FsParent {
             .map(|_| ())
             .map_err(|error| CoreError::from(error.error))
     }
+}
+
+/// Take one call through the **real** approval gate under an unattended policy,
+/// so a dispatch-level test can drive a gated tool.
+///
+/// There is deliberately no bypass here and no test-only constructor on
+/// `ApprovedCall`: this runs `approval::decide` exactly as the orchestrator does,
+/// just with a policy that says yes. Hard-deny (an invalid path, a vault escape,
+/// unparseable arguments) therefore still applies, which is what makes these
+/// tests honest — a test that could not be refused would not be testing dispatch
+/// under the gate at all.
+// `tests/support` is compiled into EVERY integration-test binary, but only the
+// three that dispatch a gated tool need the two helpers below. The narrow allow
+// is the price of the shared module; it is on the individual functions rather
+// than the file so genuinely dead code here still warns.
+#[allow(dead_code)]
+pub fn approve_unattended(vault_root: &Path, call: &ToolCall) -> ApprovedCall {
+    struct Discard;
+    impl EventSink for Discard {
+        fn send(&mut self, _event: ChatEvent) {}
+    }
+
+    let policy = ApprovalPolicy::new(
+        ApprovalMode::Yolo,
+        // `transcribe_audio` is pinned to always-ask even under YOLO, so an
+        // unattended dispatch test has to clear the pin explicitly rather than
+        // inherit past it.
+        BTreeMap::from([(TOOL_TRANSCRIBE_AUDIO.to_string(), ApprovalMode::Yolo)]),
+        false,
+    );
+    let mut gate = ApprovalGate::new(policy);
+    let context = ApprovalContext {
+        root: vault_root,
+        classifier: &UnavailableApprovalClassifier,
+        prompt: &DenyingApprovalPrompt,
+    };
+    match block_on(approval::decide(
+        &mut gate,
+        &context,
+        call,
+        neuralnote_core::ai::WRITES_PER_WORK_ITEM,
+        &mut Discard,
+    )) {
+        ApprovalDecision::Approved(approved) => approved,
+        other => panic!("the unattended gate refused '{}': {other:?}", call.name),
+    }
+}
+
+/// The approval seams for an orchestrator test that is not *about* approval:
+/// YOLO with the `transcribe_audio` pin cleared. The gate still runs on every
+/// gated call — there is no bypass — it just says yes.
+///
+/// A test that IS about approval builds its own policy and its own prompt; those
+/// live in `tests/tool_approval.rs` and `tests/tool_approval_adversarial.rs`.
+#[allow(dead_code)]
+pub fn unattended_approval() -> (
+    ApprovalPolicy,
+    &'static DenyingApprovalPrompt,
+    &'static UnavailableApprovalClassifier,
+) {
+    static PROMPT: DenyingApprovalPrompt = DenyingApprovalPrompt;
+    static CLASSIFIER: UnavailableApprovalClassifier = UnavailableApprovalClassifier;
+    let policy = ApprovalPolicy::new(
+        ApprovalMode::Yolo,
+        BTreeMap::from([(TOOL_TRANSCRIBE_AUDIO.to_string(), ApprovalMode::Yolo)]),
+        false,
+    );
+    (policy, &PROMPT, &CLASSIFIER)
 }

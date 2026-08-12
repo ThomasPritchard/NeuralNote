@@ -61,6 +61,7 @@ import {
   writeNote,
 } from "./api";
 import type { AiStatus, ChatEvent, PullEvent } from "./types";
+import { ALWAYS_ASK_APPROVAL_STATUS } from "./approvalStatusFixture";
 
 const mockInvoke = vi.mocked(invoke);
 const mockListen = vi.mocked(listen);
@@ -104,6 +105,7 @@ const makeStatus = (model: string, reasoning: boolean): AiStatus => ({
   reasoningSupported: "unknown",
   openrouter: { hasKey: true, model, reasoning },
   local: { activeModelTag: null },
+  approval: ALWAYS_ASK_APPROVAL_STATUS,
 });
 
 describe("AI config mutation sequencing", () => {

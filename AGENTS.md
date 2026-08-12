@@ -26,7 +26,7 @@ An agent that has not worked in this checkout must establish the local baseline 
    ```bash
    rustup toolchain install 1.96.0 --component clippy,rustfmt,llvm-tools-preview
    cargo install cargo-llvm-cov --locked --version 0.8.7
-   cargo install cargo-audit --locked --version 0.22.2
+   cargo install cargo-deny --locked --version 0.20.2
    ```
 
 4. Fetch the Ollama sidecar only when the task exercises the native local-AI path. Downloads and service startup require the user's approval.
@@ -89,6 +89,7 @@ Unavailable is never equivalent to passed. Do not start SonarQube or reset its v
 - Do not rely on secrecy of prompts or source code. Assume public source and attacker-controlled model input.
 - Use platform or maintained library protections before hand-written parser or validator approximations.
 - Keep scope narrow. Do not refactor adjacent code, change formatting broadly, or rewrite contracts without an explicit requirement.
+- Keep a frontend source file under 500 lines of code. This is enforced by `eslint/max-lines` in `app/desktop/.oxlintrc.json` (blank lines and comments are not counted), so a breach fails `npm --prefix app/desktop run lint`. Test files are exempt on purpose — split a suite by concern, never by line count. An unavoidable exception is a per-file `// oxlint-disable eslint/max-lines` carrying its reason, never an entry in `ignorePatterns`.
 
 ## Security-sensitive changes
 

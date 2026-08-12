@@ -267,14 +267,154 @@ fn call_with_pricing(
     .with_pricing(pricing);
 
     block_on(tools::dispatch(
-        "youtube-call",
-        name,
-        arguments,
+        &support::approve_unattended(vault.path(), &tool_call("youtube-call", name, arguments)),
         &retriever,
         &mut evidence,
         &NoUserPrompt,
         &mut context,
     ))
+}
+
+fn tool_call(id: &str, name: &str, arguments: &str) -> neuralnote_core::ai::ToolCall {
+    neuralnote_core::ai::ToolCall {
+        id: id.into(),
+        name: name.into(),
+        arguments: arguments.into(),
+    }
+}
+
+/// Like [`call`], but keeps the events instead of dropping them — for the
+/// assertions that are about what reached the user, not what reached the model.
+fn call_collecting_events(
+    io: &dyn YoutubeIo,
+    session: &mut YoutubeToolSession,
+    environment: &SkillEnvironment,
+    name: &str,
+    arguments: &str,
+) -> (tools::ToolResult, Vec<ChatEvent>) {
+    #[derive(Default)]
+    struct CollectingSink(Vec<ChatEvent>);
+    impl EventSink for CollectingSink {
+        fn send(&mut self, event: ChatEvent) {
+            self.0.push(event);
+        }
+    }
+
+    let vault = tempfile::tempdir().unwrap();
+    let retriever = KeywordRetriever::new(vault.path());
+    let skills = SkillRegistry::built_in(&[]).unwrap();
+    let mut active = ActiveSkills::new(8);
+    let mut writes = WriteSession::new(1).unwrap();
+    let mut sink = CollectingSink::default();
+    let allowed = BTreeSet::from([name.to_string()]);
+    let mut evidence = EvidenceRegistry::new();
+    let pricing = PricingInput::Local;
+    let result = {
+        let mut context = ToolContext::new(
+            vault.path(),
+            &skills,
+            environment,
+            &mut active,
+            &FsBackend,
+            &mut writes,
+            &mut sink,
+            &allowed,
+        )
+        .with_youtube(io, session)
+        .with_pricing(&pricing);
+
+        block_on(tools::dispatch(
+            &support::approve_unattended(vault.path(), &tool_call("youtube-call", name, arguments)),
+            &retriever,
+            &mut evidence,
+            &NoUserPrompt,
+            &mut context,
+        ))
+    };
+    (result, sink.0)
+}
+
+fn transcript_sources(events: &[ChatEvent]) -> Vec<(String, Option<String>)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::TranscriptSource { label, rel_path } => {
+                Some((label.clone(), rel_path.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn fetched_captions_report_their_provenance_on_the_wire() {
+    // Provenance used to reach the UI only by regexing `captions:` out of the
+    // model's prose. The tool that obtained the transcript now reports it.
+    let io = ScriptedYoutubeIo::new(metadata(r#"{"en":[{"ext":"vtt"}]}"#, "{}"));
+    io.push_caption(Ok(CaptionPayload {
+        vtt: VTT.to_vec(),
+        annotations: Vec::new(),
+    }));
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_CAPTIONS,
+        &format!(r#"{{"url":"{URL}","lang":"en"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(
+        transcript_sources(&events),
+        [(value["provenance"].as_str().unwrap().to_string(), None)],
+        "the label on the wire must be the one the tool reported to the model"
+    );
+    assert_eq!(transcript_sources(&events)[0].0, "captions:en");
+}
+
+#[test]
+fn a_whisper_transcription_reports_its_provenance_on_the_wire() {
+    let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
+    let mut session = YoutubeToolSession::default();
+    prove_caption_absence(&io, &mut session);
+    io.push_transcription(Ok(CaptionPayload {
+        vtt: VTT.to_vec(),
+        annotations: Vec::new(),
+    }));
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut session,
+        &environment(true),
+        TOOL_TRANSCRIBE_AUDIO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    assert_eq!(
+        transcript_sources(&events),
+        [("whisper:small.en".to_string(), None)]
+    );
+}
+
+#[test]
+fn a_failed_caption_fetch_reports_no_transcript_source() {
+    // No transcript was obtained, so naming a source would be a claim about
+    // where text that does not exist came from.
+    let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_CAPTIONS,
+        &format!(r#"{{"url":"{URL}","lang":"en"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    assert_eq!(transcript_sources(&events), []);
 }
 
 fn prove_caption_absence(io: &dyn YoutubeIo, session: &mut YoutubeToolSession) {
@@ -321,9 +461,14 @@ fn call_with_installer(
     .with_youtube_requirements(installer)
     .with_pricing(&pricing);
     block_on(tools::dispatch(
-        "install-call",
-        TOOL_TRANSCRIBE_AUDIO,
-        &format!(r#"{{"url":"{URL}"}}"#),
+        &support::approve_unattended(
+            vault.path(),
+            &tool_call(
+                "install-call",
+                TOOL_TRANSCRIBE_AUDIO,
+                &format!(r#"{{"url":"{URL}"}}"#),
+            ),
+        ),
         &retriever,
         &mut evidence,
         prompt,

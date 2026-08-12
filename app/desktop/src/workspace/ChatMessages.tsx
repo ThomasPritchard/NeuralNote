@@ -1,10 +1,10 @@
-// Renders the chat transcript: user prompts, and assistant turns as the live
-// "harness" trace — a step-by-step activity log (searching / reading /
-// verifying / dropped), optional collapsed reasoning, the streamed markdown
-// answer, clickable source chips, a coverage footer, and a surfaced inline
-// error. Presentational only; all state folding lives in `chatMessage.ts`. The
-// per-part views (activity trace, skill chrome, sources, turn notices) live in
-// sibling modules; this file composes them into a turn and the transcript.
+// Renders the chat transcript: user prompts, and assistant turns as the
+// timeline rail of what the assistant did (reasoning, tool calls, verification,
+// dropped citations), the streamed markdown answer, clickable source chips, a
+// coverage footer, and a surfaced inline error. Presentational only; all state
+// folding lives in `chatMessage.ts`. The per-part views (the timeline, skill
+// chrome, sources, turn notices) live in sibling modules; this file composes
+// them into a turn and the transcript.
 
 import { useCallback, useState } from "react";
 import { AlertTriangle, Square } from "lucide-react";
@@ -22,10 +22,17 @@ import type {
   ChatMessage,
   CitationView,
 } from "./chatMessage";
-import { ActivityTrace } from "./ChatActivityTrace";
+import { ChatNoteEdits } from "./ChatNoteEditCard";
+import { ChatTimeline } from "./ChatTimeline";
+import { ToolApprovalSheet } from "./ToolApprovalSheet";
 import { SkillActivations, SkillSteps } from "./ChatSkillChrome";
 import { Sources } from "./ChatSources";
-import { CoverageFooter, NothingFoundCard, Reasoning } from "./ChatTurnNotices";
+import {
+  CoverageFooter,
+  MissingReasoningNotice,
+  NothingFoundCard,
+  UsageFooter,
+} from "./ChatTurnNotices";
 
 // Re-exported so `playfulProgressCopy.test.ts` (and any other importer) can keep
 // pulling it from "./ChatMessages" even though it now lives in its own module.
@@ -60,43 +67,90 @@ function AssistantTurn({
   // citation must never linger as a live reference in the answer (the moat).
   const answer = resolveAnswerMarkers(turn.answer, turn.citations, turn.done);
   const answering = turn.answer.trim() !== "";
-  // The run is parked on the user, not working: the question is live (not yet
-  // answered) and the run hasn't ended. No spinner may claim progress here.
+  // The run is parked on the user, not working: a question or a security prompt
+  // is live (not yet answered) and the run hasn't ended. No spinner may claim
+  // progress here.
+  //
+  // `checking` is deliberately NOT in this test. The gate genuinely is working
+  // while the judge runs, and its own node pulses to say so; only a prompt
+  // waiting on an answer parks the run on the user.
+  const awaitingApproval = turn.pendingApproval !== null && !turn.done;
   const awaitingUser =
-    turn.pendingElicitation !== null && elicitAnswer === undefined && !turn.done;
+    (turn.pendingElicitation !== null && elicitAnswer === undefined && !turn.done) ||
+    awaitingApproval;
+  // `awaitingUser`, NOT a bare `pendingElicitation !== null`. Nothing on the wire
+  // ever clears that field — it is set by the `elicit` event and cleared only by
+  // a fresh turn or a stop, because the answer is recorded out of band (there is
+  // no resolution event to fold). So testing it directly means a turn that asked
+  // ONE question suppresses its live head for the whole rest of the run, and the
+  // settled summary renders over a run that is still working. `awaitingUser`
+  // joins the same field with the recorded answer, which is the distinction that
+  // matters: parked on the user, versus merely having asked at some point.
   const hasSkillNarrative =
-    turn.skillActivations.length > 0 ||
-    turn.skillSteps.length > 0 ||
-    turn.pendingElicitation !== null;
+    turn.skillActivations.length > 0 || turn.skillSteps.length > 0 || awaitingUser;
+  // An activation failure arrives twice: once as narration and once as the
+  // structured event that carries the remedy. Both strings are backend-composed
+  // and identical, so comparing them is a set membership test over data that
+  // crossed the same wire — not the hand-copied sentence this phase deleted. The
+  // structured node wins; its duplicate narration row is dropped.
+  const failureMessages = new Set(
+    turn.skillActivationFailures.map((failure) => failure.message),
+  );
+  const narratedSteps = turn.skillSteps.filter((step) => !failureMessages.has(step));
   return (
     // No turn-wide aria-live: the per-row activity churn (15–20 mutations a run)
     // must stay silent. Liveness is scoped instead to the phase line (role=status),
     // the streamed answer, and the error box (role=alert).
-    <div className="flex flex-col gap-3 rounded-xl border border-border bg-background/30 px-3 py-3">
+    //
+    // `@container` makes the turn the query container for everything inside it,
+    // so a card can lay itself out against the width it actually has rather than
+    // against a boolean threaded down from the workspace. That keeps the widened
+    // pane honest at every breakpoint: at the narrow tiers the expanded width is
+    // still too small for two columns, and nothing switches.
+    //
+    // Deliberately here and not on `.nn-chat-pane`: `container-type: inline-size`
+    // brings layout containment, which makes the element a containing block for
+    // fixed-position descendants. On the pane that would re-anchor any overlay
+    // rendered inside it; on one turn of a transcript there is nothing to catch.
+    <div className="@container flex flex-col gap-3 rounded-xl border border-border bg-background/30 px-3 py-3">
       <SkillActivations activations={turn.skillActivations} />
       <SkillSteps
-        steps={turn.skillSteps}
+        steps={narratedSteps}
         working={!turn.done && !answering && !awaitingUser && turn.error === null}
       />
-      <ActivityTrace
-        activity={turn.activity}
-        phase={turn.phase}
+      <ChatTimeline
+        turn={turn}
         prompt={prompt}
         answering={answering}
-        done={turn.done}
-        errored={turn.error !== null}
         suppressLive={hasSkillNarrative}
       />
+      {/* Directly under the rail, above the answer: a write composing is the
+          thing to watch while it happens, and each card folds itself away the
+          moment its write settles, so a finished turn does not pay for it. */}
+      <ChatNoteEdits turn={turn} />
+      {turn.pendingApproval !== null && turn.turnId !== null && (
+        // Under the composing-write card on purpose: for a `write_note` the
+        // card IS what the user is being asked to allow, so the ask reads best
+        // directly beneath the thing it is about. Keyed by the call id, so a
+        // second gated call in one turn is a fresh mount (fresh focus, no
+        // half-answered reuse of the previous request's state).
+        <ToolApprovalSheet
+          key={turn.pendingApproval.id}
+          approval={turn.pendingApproval}
+          turnId={turn.turnId}
+          dormant={turn.done}
+        />
+      )}
       {turn.stopped && (
         <p className="flex items-center gap-1.5 text-[0.6875rem] font-medium text-muted-foreground">
           <Square className="size-3 fill-current" aria-hidden />
           Stopped
         </p>
       )}
-      <Reasoning
+      <MissingReasoningNotice
         text={turn.thinking}
         requested={turn.reasoningRequested}
-        showMissing={turn.done && turn.error === null && !turn.stopped && answering}
+        show={turn.done && turn.error === null && !turn.stopped && answering}
       />
       {turn.pendingElicitation !== null && turn.turnId !== null && (
         // Keyed by elicitation id: a follow-up question in the same turn is a
@@ -134,9 +188,13 @@ function AssistantTurn({
       {showsNothingFoundCard(turn) && turn.coverage && (
         <NothingFoundCard terms={turn.coverage.searchedTerms} />
       )}
-      {turn.writtenNotes.length > 0 && (
+      {(turn.writtenNotes.length > 0 || turn.existingNotes.length > 0) && (
+        // A run that wrote nothing because every note already existed still gets
+        // the card: the no-op has to reach the user (#108), and the card is where
+        // the ledger lives.
         <SkillReportCard
           files={turn.writtenNotes}
+          existing={turn.existingNotes}
           runId={runId}
           done={turn.done}
           partial={isPartialSkillRun(turn)}
@@ -146,6 +204,11 @@ function AssistantTurn({
       )}
       <Sources citations={turn.citations} onOpen={onOpenCitation} />
       {turn.coverage && <CoverageFooter coverage={turn.coverage} />}
+      {/* Last, and quietest. What the run cost is a fact about the turn worth
+          having on the record, not a thing to read on the way to the answer —
+          and a turn whose provider never reported usage renders exactly as it
+          did before this existed. */}
+      <UsageFooter usage={turn.usage} />
       {turn.error && (
         <div
           role="alert"

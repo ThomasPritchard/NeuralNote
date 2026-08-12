@@ -7,8 +7,8 @@ use neuralnote_core::ai::tools::{
 };
 use neuralnote_core::ai::{
     ActiveSkills, ChatEvent, Elicitation, EventSink, EvidenceRegistry, HardwareSpec,
-    KeywordRetriever, Requirement, SkillEnvironment, SkillManifest, SkillRegistry, UserPrompt,
-    WriteSession, FIXTURE_SKILL_ID,
+    KeywordRetriever, NoteKind, Requirement, SkillEnvironment, SkillManifest, SkillRegistry,
+    UserPrompt, WriteSession, FIXTURE_SKILL_ID,
 };
 use neuralnote_core::CoreResult;
 use std::collections::{BTreeSet, VecDeque};
@@ -115,6 +115,14 @@ impl Harness {
         arguments: &str,
         allowed: &BTreeSet<String>,
     ) -> tools::ToolResult {
+        let approved = support::approve_unattended(
+            self.vault.path(),
+            &neuralnote_core::ai::ToolCall {
+                id: call_id.to_string(),
+                name: name.to_string(),
+                arguments: arguments.to_string(),
+            },
+        );
         let mut evidence = EvidenceRegistry::new();
         let mut context = ToolContext::new(
             self.vault.path(),
@@ -127,9 +135,7 @@ impl Harness {
             allowed,
         );
         block_on(tools::dispatch(
-            call_id,
-            name,
-            arguments,
+            &approved,
             &self.retriever,
             &mut evidence,
             &self.prompt,
@@ -527,6 +533,47 @@ fn write_note_dispatch_reports_actual_create_and_not_atomic_existing() {
         .filter(|event| matches!(event, ChatEvent::NoteWritten { .. }))
         .count();
     assert_eq!(written_after, written_before);
+}
+
+#[test]
+fn a_create_only_write_that_hits_an_existing_note_says_so_instead_of_going_silent() {
+    // Issue #108: this arm recorded the playlist write and returned, emitting
+    // nothing at all — so a collision with a note the user already had was
+    // invisible. "Failures are never silent" forbids that.
+    let mut harness = Harness::built_in();
+    fs::write(harness.vault.path().join("Atomic.md"), "already here").unwrap();
+    harness.call(
+        "activate",
+        TOOL_USE_SKILL,
+        &format!(r#"{{"id":"{FIXTURE_SKILL_ID}"}}"#),
+    );
+    // Consume the run's one collision-safe create so the next write lands on the
+    // existing-note arm rather than being renamed.
+    harness.call(
+        "write-1",
+        TOOL_WRITE_NOTE,
+        r#"{"rel_path":"Atomic.md","content":"new","kind":"literature","work_item":0}"#,
+    );
+
+    let existing = harness.call(
+        "write-2",
+        TOOL_WRITE_NOTE,
+        r#"{"rel_path":"Atomic.md","content":"ignored","kind":"atomic","work_item":0}"#,
+    );
+
+    assert!(existing.content.contains(r#""existed":true"#));
+    assert_eq!(
+        harness
+            .events()
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::NoteExists { rel_path, kind } => Some((rel_path.clone(), *kind)),
+                _ => None,
+            })
+            .collect::<Vec<_>>(),
+        [("Atomic.md".to_string(), NoteKind::Atomic)],
+        "the no-op write must reach the user, and say which note it collided with"
+    );
 }
 
 #[test]

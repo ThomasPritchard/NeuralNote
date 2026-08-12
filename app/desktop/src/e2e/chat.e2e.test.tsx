@@ -26,12 +26,47 @@ const recents = [{ name: "My Brain", path: VAULT_ROOT, lastOpened: 1_700_000_000
 const NOTE_REL = "Sources/Photosynthesis.md";
 const NOTE_BODY = "Light energy is converted into chemical energy in the chloroplast.";
 
-// A full, successful run: searching → retrieved → reading → verifying →
-// answer (streamed in two deltas) → citation → coverage → done.
-const successScript: ChatEvent[] = [
+// The dispatched calls of a successful run, in the frame order the orchestrator
+// emits: announced before dispatch, then the searching/reading cue they raise,
+// then exactly one settlement each. Titles and summaries are the Rust-composed
+// ones — the UI never builds a tool label.
+const searchCall: ChatEvent[] = [
+  {
+    type: "toolCall",
+    id: "call-search",
+    name: "search_notes",
+    title: "Search notes",
+    arguments: '{"query":"photosynthesis"}',
+    stepId: null,
+  },
   { type: "searching", query: "photosynthesis" },
   { type: "retrieved", query: "photosynthesis", hitCount: 3 },
+  { type: "toolResult", id: "call-search", status: "ok", summary: "3 spans", detail: null },
+];
+const readCall: ChatEvent[] = [
+  {
+    type: "toolCall",
+    id: "call-read",
+    name: "read_note_span",
+    title: "Read note",
+    arguments: `{"rel_path":"${NOTE_REL}","start_line":12,"end_line":18}`,
+    stepId: null,
+  },
   { type: "reading", relPath: NOTE_REL, startLine: 12, endLine: 18 },
+  {
+    type: "toolResult",
+    id: "call-read",
+    status: "ok",
+    summary: `${NOTE_REL}:12–18`,
+    detail: null,
+  },
+];
+
+// A full, successful run: two tool calls → verifying → answer (streamed in two
+// deltas) → citation → coverage → done.
+const successScript: ChatEvent[] = [
+  ...searchCall,
+  ...readCall,
   { type: "verifying" },
   { type: "answer", delta: "Plants turn sunlight " },
   { type: "answer", delta: "into sugar." },
@@ -58,9 +93,8 @@ const successScript: ChatEvent[] = [
 // and never into the answer body: the answer is the text citations are verified
 // against, so contaminating it would corrupt provenance.
 const reasoningScript: ChatEvent[] = [
-  { type: "searching", query: "photosynthesis" },
-  { type: "retrieved", query: "photosynthesis", hitCount: 3 },
-  { type: "reading", relPath: NOTE_REL, startLine: 12, endLine: 18 },
+  ...searchCall,
+  ...readCall,
   { type: "thinking", delta: "The note names chloroplasts, " },
   { type: "thinking", delta: "so the answer should too." },
   { type: "verifying" },
@@ -181,7 +215,7 @@ describe("Journey 7: cited chat — streamed run", () => {
     expect(screen.queryByText("Plants need light.")).not.toBeInTheDocument();
 
     expect(await advanceNextFrame()).toBe(true);
-    expect(screen.getByText("searching")).toBeInTheDocument();
+    expect(screen.getByText("Searching your vault")).toBeInTheDocument();
     expect(screen.queryByText("Plants need light.")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Stop response" })).toBeInTheDocument();
 
@@ -208,11 +242,13 @@ describe("Journey 7: cited chat — streamed run", () => {
     await advanceAllFrames();
 
     expect(await screen.findByText("Hello — what would you like to explore?")).toBeInTheDocument();
-    expect(screen.queryByRole("list", { name: "Search activity" })).not.toBeInTheDocument();
+    expect(
+      screen.queryByRole("region", { name: "What the assistant did" }),
+    ).not.toBeInTheDocument();
     expect(screen.queryByText("Nothing in your vault covers this")).not.toBeInTheDocument();
     expect(screen.queryByRole("list", { name: "Cited sources" })).not.toBeInTheDocument();
   });
-  it("renders the harness trace, the streamed answer, a source chip and coverage", async () => {
+  it("renders the timeline rail, the streamed answer, a source chip and coverage", async () => {
     const { user, advanceAllFrames } = await openWorkspace({
       seed: [{ kind: "file", relPath: NOTE_REL, content: NOTE_BODY }],
       chatScript: successScript,
@@ -223,21 +259,22 @@ describe("Journey 7: cited chat — streamed run", () => {
 
     // The finished run collapses to one summary line (collapsed by default), not
     // the row wall — so the answer sits right under the prompt.
-    const summaryLine = await screen.findByText(/1 search · 1 note · verified/);
+    const summaryLine = await screen.findByText(/2 tools · 1 search · 1 note · verified/);
     const disclosure = summaryLine.closest("details");
     expect(disclosure).not.toHaveAttribute("open");
 
-    // Expanding it audits the full deduped trace: searching (folded with its
-    // retrieval count), reading the note (basename:range stays legible), and
-    // verifying — provenance stays inspectable.
+    // Expanding it audits the whole rail: the search call with the query it ran
+    // and the spans it got back, the read with its span, and the verify step —
+    // provenance stays inspectable, and every label crossed the IPC seam.
     await user.click(disclosure!.querySelector("summary")!);
-    const activity = screen.getByRole("list", { name: "Search activity" });
-    expect(within(activity).getByText("searching")).toBeInTheDocument();
-    expect(within(activity).getByText(/3 notes/)).toBeInTheDocument();
+    const rail = screen.getByRole("region", { name: "What the assistant did" });
+    expect(within(rail).getByText("Search notes")).toBeInTheDocument();
+    expect(within(rail).getByText("· photosynthesis")).toBeInTheDocument();
+    expect(within(rail).getByText("· 3 spans")).toBeInTheDocument();
     expect(
-      within(activity).getByText(/Photosynthesis\.md:12/),
+      within(rail).getByText(/Photosynthesis\.md:12–18/),
     ).toBeInTheDocument();
-    expect(within(activity).getByText("verifying citations")).toBeInTheDocument();
+    expect(within(rail).getByText("verifying citations")).toBeInTheDocument();
 
     // The answer, folded delta-by-delta.
     expect(
@@ -304,6 +341,217 @@ describe("Journey 7: cited chat — streamed run", () => {
     expect(
       await screen.findByRole("heading", { name: "Photosynthesis", level: 1 }),
     ).toBeInTheDocument();
+  });
+});
+
+describe("Journey 7: cited chat — the timeline rail", () => {
+  it("puts a successful, a rejected and a failed call on the rail, each told apart", async () => {
+    // Every one of these frames crosses the real IPC seam: `api.chat` hands a
+    // Tauri Channel to the mock backend, which replays them exactly as the Rust
+    // core would. The component tests stub the whole api module, so this is the
+    // only tier that proves `toolCall` / `toolResult` actually arrive.
+    const script: ChatEvent[] = [
+      {
+        type: "toolCall",
+        id: "ok-1",
+        name: "search_notes",
+        title: "Search notes",
+        arguments: '{"query":"photosynthesis"}',
+        stepId: null,
+      },
+      { type: "searching", query: "photosynthesis" },
+      { type: "retrieved", query: "photosynthesis", hitCount: 3 },
+      { type: "toolResult", id: "ok-1", status: "ok", summary: "3 spans", detail: null },
+      {
+        type: "toolCall",
+        id: "rejected-1",
+        name: "read_note_span",
+        title: "Read note",
+        arguments: '{"rel_path":"Missing.md","start_line":1,"end_line":9}',
+        stepId: null,
+      },
+      {
+        type: "toolResult",
+        id: "rejected-1",
+        status: "rejected",
+        summary: null,
+        detail: "note not found: Missing.md",
+      },
+      {
+        type: "toolCall",
+        id: "error-1",
+        name: "fetch_captions",
+        title: "Fetch captions",
+        arguments: '{"url":"https://youtu.be/jNQXAC9IVRw"}',
+        stepId: null,
+      },
+      {
+        type: "toolResult",
+        id: "error-1",
+        status: "error",
+        summary: null,
+        detail: "the caption service timed out",
+      },
+      { type: "answer", delta: "Here is what I could find." },
+      { type: "done" },
+    ];
+    const { user, advanceAllFrames } = await openWorkspace({ chatScript: script });
+
+    await ask(user, "How does photosynthesis work?");
+    await advanceAllFrames();
+
+    // A failed call is something to act on, so the rail stays open on its own.
+    const rail = await screen.findByRole("region", { name: "What the assistant did" });
+    const [ok, rejected, errored] = within(rail).getAllByRole("listitem");
+
+    // 1. Succeeded: calm, with the query it ran and what came back.
+    expect(within(ok).getByText("Search notes")).toBeInTheDocument();
+    expect(within(ok).getByText("· 3 spans")).toBeInTheDocument();
+    expect(ok).not.toHaveTextContent(/failed|refused|denied/);
+
+    // 2. The orchestrator refused it — and that is not the user refusing.
+    expect(rejected).toHaveTextContent("refused by NeuralNote");
+    expect(rejected).not.toHaveTextContent("denied by you");
+    expect(within(rejected).getByText("note not found: Missing.md")).toBeInTheDocument();
+
+    // 3. It ran and failed — a third, distinct story.
+    expect(errored).toHaveTextContent("failed");
+    expect(within(errored).getByText("the caption service timed out")).toBeInTheDocument();
+
+    // The head counts them without burying the two that went wrong.
+    expect(within(rail).getByText(/2 calls failed/)).toBeInTheDocument();
+  });
+
+  it("reports a note the run left alone, and offers no Undo for it", async () => {
+    const { user, advanceAllFrames } = await openWorkspace({
+      chatScript: [
+        { type: "noteWritten", relPath: "Atomic/Fresh insight.md", kind: "atomic" },
+        { type: "noteExists", relPath: "Literature/Already here.md", kind: "literature" },
+        { type: "answer", delta: "One was already there." },
+        { type: "done" },
+      ],
+    });
+
+    await ask(user, "capture both of these");
+    await advanceAllFrames();
+
+    // Nothing was written for the second one, so it is counted and listed apart —
+    // silently dropping the no-op is what #108 was about.
+    expect(await screen.findByText("1 note written")).toBeInTheDocument();
+    const existing = screen.getByRole("list", { name: "Notes that already existed" });
+    expect(within(existing).getByText("Already here.md")).toBeInTheDocument();
+    // Undo removes what this run wrote; it must never reach the user's own note.
+    await user.click(screen.getByRole("button", { name: "Undo" }));
+    expect(await screen.findByText(/Undo finished — 1 note removed\./)).toBeInTheDocument();
+    expect(within(existing).getByText(/Left as it was/)).toBeInTheDocument();
+  });
+});
+
+describe("Journey 7: cited chat — a note write, previewed as it composes", () => {
+  const WRITE_REL = "Atomic/Spaced recall.md";
+  const WRITE_BODY = "# Spaced recall\n\nRetrieval beats rereading, reliably.\n";
+  const previewFrame = (body: string, complete: boolean, named = true): ChatEvent => ({
+    type: "noteEditPreview",
+    id: "call-write",
+    relPath: named ? WRITE_REL : null,
+    kind: named ? "atomic" : null,
+    body,
+    complete,
+  });
+
+  it("streams the composing note across the IPC seam, then settles it in place", async () => {
+    // The card and its tool call share an id, and the frames arrive in the order
+    // the orchestrator actually emits them: the preview streams DURING the turn
+    // and the call is announced when the turn settles. Only this tier proves
+    // those frames cross the Channel — the component tests stub the whole api
+    // module, so a `noteEditPreview` that never serialised would still pass there.
+    const script: ChatEvent[] = [
+      previewFrame("", false, false),
+      previewFrame("# Spaced recall\n", false),
+      previewFrame("# Spaced recall\n\nRetrieval beats", false),
+      previewFrame(WRITE_BODY, true),
+      {
+        type: "toolCall",
+        id: "call-write",
+        name: "write_note",
+        title: "Write note",
+        arguments: JSON.stringify({
+          rel_path: WRITE_REL,
+          kind: "atomic",
+          content: WRITE_BODY,
+        }),
+        stepId: null,
+      },
+      { type: "toolResult", id: "call-write", status: "ok", summary: null, detail: null },
+      { type: "noteWritten", relPath: WRITE_REL, kind: "atomic" },
+      { type: "answer", delta: "Captured it." },
+      { type: "done" },
+    ];
+    const { user, advanceAllFrames, advanceNextFrame } = await openWorkspace({
+      chatScript: script,
+    });
+
+    await ask(user, "capture that idea about recall");
+
+    // Frame at a time, so the card is caught MID-RUN: it exists before any
+    // settlement frame has been delivered, which is the ordering that makes the
+    // preview a preview rather than a receipt.
+    for (
+      let guard = 0;
+      guard < 4 && screen.queryByRole("region", { name: /^Note write/ }) === null;
+      guard += 1
+    ) {
+      expect(await advanceNextFrame()).toBe(true);
+    }
+    const card = screen.getByRole("region", { name: /^Note write/ });
+    expect(card).toHaveTextContent("writing");
+    expect(card).not.toHaveTextContent("written");
+
+    await advanceAllFrames();
+
+    // Upgraded in place: still exactly one card, now reporting the write.
+    const settledCards = screen.getAllByRole("region", { name: /^Note write/ });
+    expect(settledCards).toHaveLength(1);
+    expect(settledCards[0]).toHaveTextContent("written");
+    expect(within(settledCards[0]).getByText("+3")).toBeInTheDocument();
+    // Its rail node stood down — one act, one surface. The write was this run's
+    // only tool call, so the rail is left with nothing to show at all.
+    expect(screen.queryByText("Write note")).toBeNull();
+    expect(screen.queryByRole("region", { name: "What the assistant did" })).toBeNull();
+    // Undo is offered on settle, exactly once: the run's report card owns it,
+    // because only it carries the path the write actually RESOLVED to.
+    expect(screen.getAllByRole("button", { name: "Undo" })).toHaveLength(1);
+    expect(await screen.findByText("1 note written")).toBeInTheDocument();
+  });
+
+  it("clears an abandoned preview instead of leaving a fragment looking committed", async () => {
+    // The captured turn's real failure: the provider died with the last call
+    // truncated mid-sentence. No write happened, and no `noteWritten` follows.
+    const { user, advanceAllFrames } = await openWorkspace({
+      chatScript: [
+        previewFrame("# Spaced recall\n\nRetrieval beats rer", false),
+        {
+          type: "noteEditAbandoned",
+          id: "call-write",
+          reason: "the provider stream ended mid-call",
+        },
+        { type: "error", message: "The model provider is unreachable." },
+      ],
+    });
+
+    await ask(user, "capture that idea about recall");
+    await advanceAllFrames();
+
+    const card = await screen.findByRole("region", { name: /^Note write/ });
+    expect(card).toHaveTextContent("not written");
+    expect(
+      within(card).getByText(
+        "This note was never written — the provider stream ended mid-call",
+      ),
+    ).toBeInTheDocument();
+    // The fragment is gone, and nothing offers to undo a write that never was.
+    expect(screen.queryByText(/Retrieval beats rer/)).not.toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Undo" })).toBeNull();
   });
 });
 

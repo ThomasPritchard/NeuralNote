@@ -244,12 +244,16 @@ jobs:
         if: github.event_name != 'pull_request'
         run: |
           cargo install cargo-llvm-cov --locked --version 0.8.7
-          cargo install cargo-audit --locked --version 0.22.2
+          cargo install cargo-deny --locked --version 0.20.2
 
       - name: Enforce 90 percent Rust line coverage
         if: github.event_name != 'pull_request'
         run: cargo llvm-cov -p neuralnote-core --fail-under-lines 90 --lcov --output-path lcov-rust.info
 
       - name: Audit Rust dependencies
+        # cargo-deny, not cargo-audit: it audits the resolved feature graph
+        # rather than Cargo.lock's union of every optional dependency, so an
+        # optional dep that no feature activates cannot hold this step red.
+        # Policy and evidence live in deny.toml.
         if: github.event_name != 'pull_request'
-        run: cargo audit
+        run: cargo deny check advisories

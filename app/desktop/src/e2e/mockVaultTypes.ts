@@ -102,8 +102,15 @@ export interface CreateMockVaultOptions {
    *  A script containing an `elicit` event pauses THERE, exactly as the Rust
    *  run parks on `UserPrompt::ask`: the remainder streams only after a valid
    *  `answer_elicitation`, and the `chat` invoke resolves (with its run id)
-   *  once the script is drained. */
+   *  once the script is drained. A `toolApprovalRequested` event pauses the same
+   *  way — the gate blocks the dispatch until `answer_tool_approval` lands. */
   chatScript?: ChatEvent[];
+  /** How a scripted run continues once a parked `toolApprovalRequested` is
+   *  answered. The branch IS the journey: an approved call goes on to dispatch
+   *  and write, a denied one must not — and "no write happened" only means
+   *  something if the approved arm proves the same script would have written.
+   *  Absent, both answers replay the script's own remainder. */
+  approvalTails?: { approved: ChatEvent[]; denied: ChatEvent[] };
   /** Pause a scripted chat after this many frames until `cancel_chat_run`.
    *  The optional tail is then streamed as the backend's honest wind-down. */
   cancelChatAfterEvents?: number;
@@ -151,6 +158,15 @@ export interface ChatCallRecord {
   activeSkills: readonly string[];
 }
 
+/** One `answer_tool_approval` as the backend received it. The decision is a bare
+ *  bool — there is no option set to smuggle anything through — and the run id is
+ *  kept so a journey can prove the answer was scoped to its own run. */
+export interface ApprovalAnswerRecord {
+  turnId: string;
+  id: string;
+  approved: boolean;
+}
+
 export interface ApiKeySaveAttempt {
   readonly keyMatchesExpected: boolean;
   readonly model: string;
@@ -186,6 +202,10 @@ export interface MockVault {
   readonly calls: readonly string[];
   /** Every `chat` invoke, with the `activeSkills` it carried. */
   readonly chatCalls: readonly ChatCallRecord[];
+  /** Every `answer_tool_approval`, with the run it was scoped to and the bare
+   *  bool it carried. Component tests `vi.mock` the whole api module, so this is
+   *  the only place the command's argument NAMES are actually checked. */
+  readonly approvalAnswers: readonly ApprovalAnswerRecord[];
   /** Secret-safe provider-save probes. Submitted key material is never kept. */
   readonly apiKeySaveAttempts: readonly ApiKeySaveAttempt[];
   /** Folder persisted by the scripted unknown-scheme picker, if answered. */

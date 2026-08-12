@@ -208,6 +208,8 @@ fn model_selection_changes_only_the_model_and_rejects_unoffered_values() {
         }),
         reasoning_probe_generation: 7,
         disabled_skills: vec!["youtube-distil".into()],
+        approval_mode: neuralnote_core::ai::approval::ApprovalMode::ApproveForMe,
+        tool_approval_overrides: std::collections::BTreeMap::new(),
     };
     neuralnote_core::ai::write_provider_config(dir.path(), &original).unwrap();
     let offered = ["vendor/new".to_string()].into_iter().collect();
