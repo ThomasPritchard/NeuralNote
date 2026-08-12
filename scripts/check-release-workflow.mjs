@@ -70,7 +70,7 @@ const build = jobBody("build");
 const publish = jobBody("publish");
 
 test("all production manifests use the release version", async () => {
-  const releaseVersion = "0.3.0";
+  const releaseVersion = "0.4.0";
   const [desktopPackage, nativeE2ePackage, tauriConfig] = await Promise.all([
     readRepositoryFile("app/desktop/package.json"),
     readRepositoryFile("app/desktop/e2e-native/package.json"),
@@ -108,7 +108,7 @@ test("all production manifests use the release version", async () => {
 test("release publication is manual-only and requires an explicit signing choice", () => {
   assert.match(trigger, /\n  workflow_dispatch:\s*$/m);
   assert.doesNotMatch(trigger, /^  (?:push|pull_request|schedule|release|workflow_run|workflow_call):/m);
-  assert.match(trigger, /release_tag:[\s\S]*?required:\s*true[\s\S]*?default:\s*v0\.3\.0/);
+  assert.match(trigger, /release_tag:[\s\S]*?required:\s*true[\s\S]*?default:\s*v0\.4\.0/);
   assert.match(
     trigger,
     /signing_mode:[\s\S]*?type:\s*choice[\s\S]*?required:\s*true[\s\S]*?default:\s*ad-hoc[\s\S]*?options:[\s\S]*?- ad-hoc[\s\S]*?- developer-id/,
@@ -255,26 +255,27 @@ test("the publisher stages a draft prerelease and exposes the manifest last", ()
   );
 });
 
-test("the immutable GitHub release description includes the complete v0.3.0 changelog", async () => {
-  const releaseNotes = await readRepositoryFile("docs/releases/v0.3.0.md");
+test("the immutable GitHub release description includes the complete v0.4.0 changelog", async () => {
+  const releaseNotes = await readRepositoryFile("docs/releases/v0.4.0.md");
   const bundledReleaseNotes = await readRepositoryFile("app/desktop/src/whats-new/releaseNotes.ts");
   const validate = stepBody(publish, "Validate downloaded release artifacts");
   const draft = stepBody(publish, "Create draft GitHub prerelease");
 
-  assert.match(releaseNotes, /^# NeuralNote 0\.3\.0 ALPHA$/m);
+  assert.match(releaseNotes, /^# NeuralNote 0\.4\.0 ALPHA$/m);
   for (const heading of [
-    "Tables you can edit in place",
-    "Editing and Markdown",
-    "Neural Assistant AI",
-    "Large notes and reliability",
+    "What the assistant is doing",
+    "Approving what the assistant does",
+    "Note previews in the graph",
+    "Moving around the panes",
+    "Upgrading",
   ]) {
     assert.match(releaseNotes, new RegExp(`^## ${heading}$`, "m"));
   }
-  assert.match(releaseNotes, /stay drawn as a table while you type/);
-  assert.match(releaseNotes, /re-measure once the app's fonts finish loading/);
-  assert.match(releaseNotes, /real context window/);
-  assert.match(releaseNotes, /no longer freezes the window/);
-  assert.match(releaseNotes, /aligned on version 0\.3\.0/);
+  assert.match(releaseNotes, /ordered account of everything it did/);
+  assert.match(releaseNotes, /or runs a program on your machine/);
+  assert.match(releaseNotes, /worked out on your own machine from the note itself/);
+  assert.match(releaseNotes, /follows an answer as it streams/);
+  assert.match(releaseNotes, /aligned on version 0\.4\.0/);
   const bundledItems = [...bundledReleaseNotes.matchAll(/items:\s*\[([\s\S]*?)\]/g)].flatMap(
     ([, items]) => [...items.matchAll(/"(?:[^"\\]|\\.)*"/g)].map(([item]) => JSON.parse(item)),
   );
@@ -283,7 +284,7 @@ test("the immutable GitHub release description includes the complete v0.3.0 chan
     .filter((line) => line.startsWith("- "))
     .map((line) => line.slice(2).replaceAll("`", ""));
   assert.deepEqual(publishedItems, bundledItems);
-  assert.match(build, /docs\/releases\/v0\.3\.0\.md/);
+  assert.match(build, /docs\/releases\/v0\.4\.0\.md/);
   assert.match(build, /ad-hoc signed and unnotarized/);
   assert.match(build, /Developer ID signed and notarized/);
   assert.match(validate, /RELEASE_NOTES/);

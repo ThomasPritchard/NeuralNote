@@ -1,7 +1,7 @@
 {
   "name": "desktop",
   "private": true,
-  "version": "0.3.0",
+  "version": "0.4.0",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "engines": {
@@ -28,6 +28,8 @@
     "coverage": "VITEST_COVERAGE=1 vitest run --coverage",
     "audit:all": "npm audit --audit-level=high && node ../../scripts/audit-e2e-native.mjs",
     "gen:bindings": "cargo test --manifest-path ../../Cargo.toml --workspace export",
+    "gen:release-notes": "node ../../scripts/generate-release-notes.mjs",
+    "check:release-notes": "node ../../scripts/generate-release-notes.mjs --check",
     "check:bindings": "npm run gen:bindings && git -C ../.. add --intent-to-add -- app/desktop/src/lib/bindings && git -C ../.. diff --exit-code -- app/desktop/src/lib/bindings",
     "updater:local": "node scripts/local-updater-harness.mjs",
     "tauri": "tauri"
