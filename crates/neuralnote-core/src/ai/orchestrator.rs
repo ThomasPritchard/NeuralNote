@@ -375,12 +375,14 @@ impl EventSink for EmissionGuard<'_> {
 }
 
 /// Totals what the run's model calls cost, and emits the one user-facing
-/// [`ChatEvent::Usage`] immediately before [`ChatEvent::Done`].
+/// [`ChatEvent::Usage`] immediately before the event that ends the run — either
+/// [`ChatEvent::Done`] or [`ChatEvent::Error`].
 ///
 /// It wraps the run's sink rather than being called at the end of `drive`
-/// because `drive` has two `Done` sites and a third would forget. Intercepting
-/// `Done` makes "exactly once, immediately before `Done`" a property of the type
-/// instead of a rule two call sites have to remember.
+/// because a run has several terminal sites — `Done` and `Error` alike, some of
+/// them outside `drive` entirely — and one more would forget. Intercepting the
+/// terminal events makes "exactly once, immediately before the run ends" a
+/// property of the type instead of a rule every site has to remember.
 ///
 /// **A total is reported only when every model call reported.** One unmetered
 /// call and the whole run's counts go absent, because a total that silently
@@ -449,7 +451,12 @@ impl<'a> UsageMeter<'a> {
 
 impl EventSink for UsageMeter<'_> {
     fn send(&mut self, event: ChatEvent) {
-        if matches!(event, ChatEvent::Done) {
+        // `Done` is not the only terminal event: an `Error` ends the run too, and
+        // the UI settles the turn on either. Metering only `Done` lost the cost of
+        // every failed run (#123) — the run whose cost a user most wants, since it
+        // spent tokens and produced no answer. `emit` is idempotent, so a run that
+        // somehow ended twice over still reports once.
+        if matches!(event, ChatEvent::Done | ChatEvent::Error { .. }) {
             self.emit();
         }
         self.inner.send(event);
@@ -3938,6 +3945,87 @@ mod tests {
         assert!(matches!(
             events.as_slice(),
             [.., ChatEvent::Usage { .. }, ChatEvent::Done]
+        ));
+    }
+
+    #[test]
+    fn usage_is_emitted_exactly_once_immediately_before_a_terminal_error() {
+        // `Done` is not the only way a run ends, and an errored run is exactly when
+        // the cost matters most: it spent tokens and produced nothing. The footer
+        // must therefore take the same position before `Error` that it holds
+        // before `Done` — not merely appear somewhere in the stream.
+        let v = vault();
+        let mock = MockLlmClient::failing();
+        let events = run(v.path(), &mock, &Guards::default());
+
+        assert_eq!(usage_events(&events).len(), 1);
+        assert!(matches!(
+            events.as_slice(),
+            [.., ChatEvent::Usage { .. }, ChatEvent::Error { .. }]
+        ));
+    }
+
+    #[test]
+    fn a_run_that_errors_after_a_successful_tool_call_still_reports_usage() {
+        // The observed failure (#123): a tool call landed, the model then returned
+        // an empty answer, and the settled turn carried no footer at all.
+        let v = vault();
+        let mock = MockLlmClient::new(
+            vec![
+                tool_call("c1", "search_notes", r#"{"query":"components"}"#),
+                final_turn(),
+            ],
+            "   ",
+        );
+        let events = run(v.path(), &mock, &Guards::default());
+
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                ChatEvent::ToolResult {
+                    status: ToolStatus::Ok,
+                    ..
+                }
+            )),
+            "the run must reach the error with a settled, successful tool call behind it"
+        );
+        assert!(matches!(
+            events.as_slice(),
+            [.., ChatEvent::Usage { .. }, ChatEvent::Error { .. }]
+        ));
+        match usage_events(&events).as_slice() {
+            [ChatEvent::Usage {
+                tokens_in,
+                tokens_out,
+                ..
+            }] => {
+                // The mock prices nothing, and absent must stay absent here: a `0`
+                // would claim a measurement this run never made.
+                assert_eq!(*tokens_in, None);
+                assert_eq!(*tokens_out, None);
+            }
+            other => panic!("expected one Usage event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_run_that_ends_twice_over_reports_usage_once() {
+        // Two terminal events through one meter. Asserted on the stream the sink
+        // actually received — the flag guarding it is an implementation detail.
+        let mut sink = VecSink::default();
+        let mut meter = UsageMeter::new(&mut sink, Instant::now(), "test-model");
+        meter.send(ChatEvent::Error {
+            message: "boom".into(),
+        });
+        meter.send(ChatEvent::Done);
+
+        assert!(matches!(
+            sink.events.as_slice(),
+            [
+                ChatEvent::Usage { .. },
+                ChatEvent::Error { .. },
+                ChatEvent::Done
+            ]
         ));
     }
 

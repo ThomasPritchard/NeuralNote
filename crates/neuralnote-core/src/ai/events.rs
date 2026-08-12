@@ -301,8 +301,9 @@ pub enum ChatEvent {
     Plan { steps: Vec<PlanStep> },
     /// A declared step moved. `id` is the step's own id from [`ChatEvent::Plan`].
     PlanStepStatus { id: String, status: StepStatus },
-    /// What the run cost. Emitted exactly once, immediately before
-    /// [`ChatEvent::Done`].
+    /// What the run cost. Emitted exactly once, immediately before whichever
+    /// event ends the run — [`ChatEvent::Done`], or [`ChatEvent::Error`] when the
+    /// run failed. A failed run still spent tokens, so it still reports them.
     ///
     /// The token counts are `Option` because a provider may report none — the
     /// local (Ollama) lane reports nothing unless asked, and a client that has
