@@ -78,11 +78,16 @@ function AssistantTurn({
   const awaitingUser =
     (turn.pendingElicitation !== null && elicitAnswer === undefined && !turn.done) ||
     awaitingApproval;
+  // `awaitingUser`, NOT a bare `pendingElicitation !== null`. Nothing on the wire
+  // ever clears that field — it is set by the `elicit` event and cleared only by
+  // a fresh turn or a stop, because the answer is recorded out of band (there is
+  // no resolution event to fold). So testing it directly means a turn that asked
+  // ONE question suppresses its live head for the whole rest of the run, and the
+  // settled summary renders over a run that is still working. `awaitingUser`
+  // joins the same field with the recorded answer, which is the distinction that
+  // matters: parked on the user, versus merely having asked at some point.
   const hasSkillNarrative =
-    turn.skillActivations.length > 0 ||
-    turn.skillSteps.length > 0 ||
-    turn.pendingElicitation !== null ||
-    awaitingApproval;
+    turn.skillActivations.length > 0 || turn.skillSteps.length > 0 || awaitingUser;
   // An activation failure arrives twice: once as narration and once as the
   // structured event that carries the remedy. Both strings are backend-composed
   // and identical, so comparing them is a set membership test over data that
