@@ -8,7 +8,7 @@
 //
 // If any command can eat a trailing pipe or newline, this goes red.
 
-import { ensureSyntaxTree } from "@codemirror/language";
+import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
@@ -95,21 +95,45 @@ function guardedState(doc: string, anchor: number) {
       tableDelimiterGuard,
     ],
   });
-  // Parse the WHOLE document before anyone reads the tree.
+  // Parse the WHOLE document, and PUBLISH it, before anyone reads the tree.
   //
   // `LanguageState.init` parses only `Work.InitViewport` (3,000) characters and
-  // abandons even that after 20ms of WALL CLOCK, so on a busy machine two states
-  // built from the same text can hold different trees. This test derives its
-  // expected set from one state and its observed behaviour from another, so that
-  // divergence showed up as the guard "failing to refuse" at a position it had
-  // never parsed — a flake in the one test that guards byte fidelity.
+  // abandons even that after `Work.Apply` (20ms of WALL CLOCK), so on a busy
+  // machine two states built from the same text can hold different trees. This
+  // test derives its expected set from one state and its observed behaviour from
+  // another, so that divergence showed up as the guard "failing to refuse" at a
+  // position it had never parsed — a flake in the one test that guards byte
+  // fidelity.
+  //
+  // `ensureSyntaxTree` ALONE does not close it, which is why this stayed flaky
+  // with that call already in place. It advances the parse CONTEXT in place and
+  // returns the finished tree, but `syntaxTree()` — what `hiddenTableDelimiters`
+  // reads — returns `LanguageState.tree`, a snapshot taken in that class's
+  // constructor (`@codemirror/language/dist/index.js:527-546`). The snapshot
+  // stays truncated, and `syntaxTreeAvailable()` answers `true` either way, so it
+  // cannot detect this. Publishing the advanced parse takes a transaction, which
+  // is precisely what `forceParsing` dispatches for a view (`ibid.:225-230`).
+  // This is that, for a bare state.
   //
   // Production cannot hit this: the filter and the paint path read the SAME
-  // state, so they agree by construction whatever the parse has reached.
-  if (!ensureSyntaxTree(editor, doc.length, 30_000)) {
+  // state, so they agree by construction whatever the parse has reached, and
+  // `reparsed` (`sourceEditorDecorations.ts:73`) recomputes every decoration once
+  // the finished tree lands.
+  const parsed = ensureSyntaxTree(editor, doc.length, 30_000);
+  if (!parsed) {
     throw new Error("the fixture did not parse in full; every assertion below would be unsound");
   }
-  return editor;
+  if (parsed === syntaxTree(editor)) return editor;
+
+  const published = editor.update({}).state;
+  // Identity, not truthiness: `ensureSyntaxTree` answering with a tree proves
+  // only that the context reached the end, never that the field hands that tree
+  // to the guard. If an upgrade stops republishing here, this throws rather than
+  // quietly restoring the flake.
+  if (syntaxTree(published) !== parsed) {
+    throw new Error("the finished parse was not published; the guard would read a truncated tree");
+  }
+  return published;
 }
 
 /**

@@ -17,6 +17,7 @@
 
 import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { forceParsing } from "@codemirror/language";
 import { EditorView } from "@codemirror/view";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 
@@ -47,13 +48,30 @@ function explode() {
 }
 
 /**
- * tableRanges only runs for a table the caret is INSIDE. Mounting with the
- * default caret at offset 0 leaves the table rendered as an inactive widget and
- * the failing path is never entered — which would make every assertion here a
- * false green.
+ * Put the failing path within reach, which takes two guarantees rather than one.
+ *
+ * **The table has to be in the published tree.** `tableRanges` finds a table by
+ * walking `syntaxTree(state)`, and `LanguageState.init` publishes only what it
+ * parsed inside `Work.Apply` — 20ms of WALL CLOCK
+ * (`@codemirror/language/dist/index.js:527-546`). A loaded machine loses that
+ * race even on a note this short, and CodeMirror then finishes the parse on an
+ * IDLE callback, long after a synchronous assertion has run. That is not a
+ * production defect — `reparsed` (`sourceEditorDecorations.ts:73`) recomputes
+ * every decoration when the finished tree lands — but it does mean a test must
+ * force the parse instead of assuming it. `forceParsing` both completes the
+ * parse and dispatches the transaction that publishes it (`ibid.:225-230`).
+ *
+ * **The caret has to be INSIDE the table.** `tableRanges` only runs for a table
+ * the caret is in; mounting with the default caret at offset 0 leaves the table
+ * an inactive widget and never enters the failing path.
+ *
+ * Miss either one and every assertion here is a false green.
  */
 function caretIntoTable(container: HTMLElement): EditorView {
   const view = EditorView.findFromDOM(container.querySelector<HTMLElement>(".cm-editor")!)!;
+  if (!forceParsing(view, view.state.doc.length, 30_000)) {
+    throw new Error("the note did not parse in full; the table path would never be entered");
+  }
   view.dispatch({ selection: { anchor: NOTE.indexOf("DJ gig") } });
   return view;
 }
