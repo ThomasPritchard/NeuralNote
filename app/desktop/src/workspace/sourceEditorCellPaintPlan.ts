@@ -202,22 +202,72 @@ function wikilinkLabel(rawTarget: string): string {
   return base || rawTarget;
 }
 
+/** What ends a wikilink target: its own closer, a line break, or the text. */
+function endsTarget(character: string | undefined): boolean {
+  return character === undefined
+    || character === "]"
+    || character === "\r"
+    || character === "\n";
+}
+
 /**
  * Every `[[wikilink]]` in `source`, at document offsets. THE scanner —
  * `obsidianLivePreview.ts` uses it too, so the span the paint layer replaces and
  * the span this plan projects can never be two different answers.
  *
+ * A single forward pass, not `/(!)?\[\[([^\]\r\n]+)\]\]/g` (issue #143,
+ * `typescript:S5852`). That pattern is quadratic in the length of a LINE: the
+ * target run excludes `]`, so it reaches the next `]` or line break, and on a
+ * line of unclosed `[[` — no `]` anywhere — every opener rescans the whole line.
+ * A captured source with one enormous line took 3.7 s at 64 KiB, and
+ * `collectObsidianPreview` defaults its scan range to the WHOLE document.
+ *
+ * Every character is visited a bounded number of times, because both ways out of
+ * a candidate move `cursor` past everything the candidate examined:
+ *
+ * - **It closes.** Emit it and resume after the `]]`.
+ * - **It does not.** Resume at the terminator — nothing between an opener and
+ *   the terminator that defeated it can open a link either, since every later
+ *   `[[` runs to that same terminator and fails on it for the same reason.
+ *
+ * That second rule is what the regex could not express, and skipping it is safe
+ * rather than approximate: a shortened target run ends on a character the run
+ * had already accepted, which is by construction not the `]` a closer needs.
+ *
  * @param source - the text to scan
  * @param base - the document offset `source` starts at
  */
 export function inlineWikilinks(source: string, base = 0): InlineWikilink[] {
-  return [...source.matchAll(/(!)?\[\[([^\]\r\n]+)\]\]/g)].map((match) => ({
-    from: base + match.index,
-    to: base + match.index + match[0].length,
-    embed: match[1] === "!",
-    rawTarget: match[2],
-    label: wikilinkLabel(match[2]),
-  }));
+  const links: InlineWikilink[] = [];
+  let cursor = 0;
+
+  while (cursor < source.length) {
+    if (source[cursor] !== "[" || source[cursor + 1] !== "[") {
+      cursor += 1;
+      continue;
+    }
+    let end = cursor + 2;
+    while (!endsTarget(source[end])) end += 1;
+    if (end === cursor + 2 || source[end] !== "]" || source[end + 1] !== "]") {
+      cursor = end;
+      continue;
+    }
+
+    // `![[…]]` matches from the `!`. No need to check that the `!` is outside
+    // the previous match, the way the regex's `lastIndex` would have: a match
+    // ends in `]]`, so the character before a resume point is never a `!`.
+    const embed = cursor > 0 && source[cursor - 1] === "!";
+    const rawTarget = source.slice(cursor + 2, end);
+    links.push({
+      from: base + cursor - (embed ? 1 : 0),
+      to: base + end + 2,
+      embed,
+      rawTarget,
+      label: wikilinkLabel(rawTarget),
+    });
+    cursor = end + 2;
+  }
+  return links;
 }
 
 /**
