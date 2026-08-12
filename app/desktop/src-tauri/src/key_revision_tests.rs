@@ -66,19 +66,28 @@ fn every_publish_supersedes_the_last() {
 }
 
 #[test]
-fn tokens_never_repeat_even_when_published_back_to_back() {
-    // What goes red: swapping the token for a counter seeded from the file, which
-    // repeats whenever the config directory is recreated, or for a bare clock
-    // reading, which repeats at this resolution.
-    let config_dir = tempfile::tempdir().unwrap();
+fn tokens_never_repeat_back_to_back_or_across_a_recreated_config_directory() {
+    // Both hazards the module note names, and each needs its own loop. Back-to-back
+    // publishes into one directory catch a bare clock reading, which repeats at this
+    // resolution. Only a *fresh* directory catches a counter seeded from the file,
+    // which is perfectly unique within any one directory and restarts at zero every
+    // time the directory is recreated — so a live instance holding a cached token
+    // would meet it again in an unrelated save.
+    //
+    // Every directory is held open to the end, so no two can share a path.
     let mut seen = HashSet::new();
+    let mut directories = Vec::new();
 
-    for _ in 0..200 {
-        publish(config_dir.path()).unwrap();
-        assert!(
-            seen.insert(published_token(config_dir.path())),
-            "a token was published twice"
-        );
+    for _ in 0..20 {
+        let config_dir = tempfile::tempdir().unwrap();
+        for _ in 0..10 {
+            publish(config_dir.path()).unwrap();
+            assert!(
+                seen.insert(published_token(config_dir.path())),
+                "a token was published twice"
+            );
+        }
+        directories.push(config_dir);
     }
 }
 
@@ -223,6 +232,93 @@ fn a_publish_that_cannot_write_is_surfaced_rather_than_swallowed() {
         ),
         other => panic!("expected an Io failure, got {other:?}"),
     }
+}
+
+#[test]
+fn a_sidecar_that_disappears_after_publishing_stops_being_cacheable() {
+    // The one ABA a unique token cannot close on its own: `Unpublished →
+    // Published(t) → Unpublished` compares equal at both ends, so a key cached
+    // before the save is served again after it. An external deletion of the config
+    // directory is all it takes, and every existing install starts Unpublished, so
+    // this is the upgrade path rather than an exotic one.
+    //
+    // What goes red: treating a missing sidecar as `Unpublished` unconditionally.
+    let config_dir = tempfile::tempdir().unwrap();
+    assert_eq!(observe(config_dir.path()), Some(KeyRevision::Unpublished));
+
+    publish(config_dir.path()).unwrap();
+    fs::remove_file(revision_file(config_dir.path())).unwrap();
+
+    assert_eq!(
+        observe(config_dir.path()),
+        None,
+        "a sidecar that was published and then removed must not read as the pristine \
+         state a key cached before the publish still matches"
+    );
+}
+
+#[test]
+fn a_staged_write_that_never_lands_is_reaped_rather_than_left_behind() {
+    // Only the rename branch used to clean up, so a `create_new` that succeeded
+    // followed by a failing write — a full disk — left a zero-byte file with a name
+    // nothing else ever collects, in a directory the user can open.
+    //
+    // What goes red: dropping the `remove_file` from the reaper.
+    let config_dir = tempfile::tempdir().unwrap();
+    let staged = config_dir.path().join("half-written.tmp");
+    fs::write(&staged, "").unwrap();
+
+    drop(StagedFile::ours(&staged));
+
+    assert!(!staged.exists(), "the staged file was left behind");
+}
+
+#[test]
+fn a_claimed_staged_file_is_disarmed_rather_than_reaped() {
+    // What `publish` does once the rename has moved the file into place: the reaper
+    // must not then chase the revision it just published.
+    let config_dir = tempfile::tempdir().unwrap();
+    let landed = revision_file(config_dir.path());
+    fs::write(&landed, "token\n").unwrap();
+
+    StagedFile::ours(&landed).claim();
+
+    assert!(
+        landed.exists(),
+        "claiming must disarm the reaper, not delay it"
+    );
+}
+
+#[test]
+fn each_config_directory_gets_its_own_warning_budget_and_it_comes_back() {
+    // One unkeyed process-global latch is spent by the first transient failure
+    // anywhere — an EMFILE at startup, say. A sidecar that is permanently corrupt
+    // afterwards then costs a keychain round trip per status poll for the rest of
+    // the run, with nothing in the log to say why.
+    //
+    // What goes red: a single shared latch (the second directory's assertion), or
+    // one that never refreshes (the last assertion).
+    let noisy = Path::new("/nowhere/noisy-config");
+    let quiet = Path::new("/nowhere/quiet-config");
+    let start = Instant::now();
+
+    assert!(warning_is_due(noisy, start));
+    assert!(
+        !warning_is_due(noisy, start),
+        "the same complaint must not repeat on the next poll"
+    );
+    assert!(
+        warning_is_due(quiet, start),
+        "one directory's complaint must not silence another's"
+    );
+    assert!(!warning_is_due(
+        noisy,
+        start + WARN_INTERVAL - Duration::from_secs(1)
+    ));
+    assert!(
+        warning_is_due(noisy, start + WARN_INTERVAL),
+        "a permanently unusable sidecar must say so again rather than degrade in silence"
+    );
 }
 
 #[cfg(unix)]

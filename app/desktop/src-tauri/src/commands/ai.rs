@@ -52,7 +52,7 @@ pub(crate) fn save_api_key(
     state: SharedState<'_>,
     key: String,
     model: String,
-) -> Result<(), CoreError> {
+) -> Result<ai::KeyChangeOutcome, CoreError> {
     let model = model.trim();
     let model = if model.is_empty() {
         neuralnote_core::ai::DEFAULT_MODEL
@@ -85,19 +85,23 @@ pub(crate) fn save_api_key(
 /// after a save the effective OpenRouter target exists, so any stale verdict is
 /// dropped. `false` for the "before" side is fail-safe — it can only over-invalidate
 /// (a harmless re-probe), never keep a stale verdict — and needs no keychain read.
+///
+/// The keychain half's [`ai::KeyChangeOutcome`] is carried through unchanged. It
+/// says whether other running instances were actually told the key moved; a caller
+/// that discards it reports a clean save the user cannot rely on.
 pub(crate) fn save_api_key_in(
     config_dir: &Path,
     mutation_gate: &ProviderConfigMutationGate,
     key: &str,
     model: &str,
-) -> Result<(), CoreError> {
-    ai::set_keychain_api_key(config_dir, key)?;
+) -> Result<ai::KeyChangeOutcome, CoreError> {
+    let outcome = ai::set_keychain_api_key(config_dir, key)?;
     mutation_gate
         .update_with_key_transition(config_dir, false, true, |cfg| {
             cfg.model = model.to_string();
             Ok(())
         })
-        .map(|_| ())
+        .map(|_| outcome)
         .map_err(|e| {
             CoreError::Io(format!(
                 "API key was stored in the keychain, but the AI preference file could not be updated: {}",
@@ -107,7 +111,10 @@ pub(crate) fn save_api_key_in(
 }
 
 #[tauri::command]
-pub(crate) fn clear_api_key(app: AppHandle, state: SharedState<'_>) -> Result<(), CoreError> {
+pub(crate) fn clear_api_key(
+    app: AppHandle,
+    state: SharedState<'_>,
+) -> Result<ai::KeyChangeOutcome, CoreError> {
     let dir = config_dir(&app)?;
     clear_api_key_in(&dir, &provider_config_mutation_gate(&state))
 }
@@ -121,14 +128,18 @@ pub(crate) fn clear_api_key(app: AppHandle, state: SharedState<'_>) -> Result<()
 /// succeeded, the failure is surfaced and a corrupt config is left untouched rather
 /// than clobbered to a default. `true` for the "before" side is fail-safe — it can
 /// only over-invalidate — and needs no keychain read.
+///
+/// The keychain half's [`ai::KeyChangeOutcome`] is carried through unchanged, and
+/// on this path it is the one worth acting on: `revision_published: false` means
+/// another running instance can still transmit the key the user just revoked.
 pub(crate) fn clear_api_key_in(
     config_dir: &Path,
     mutation_gate: &ProviderConfigMutationGate,
-) -> Result<(), CoreError> {
-    ai::clear_keychain_api_key(config_dir)?;
+) -> Result<ai::KeyChangeOutcome, CoreError> {
+    let outcome = ai::clear_keychain_api_key(config_dir)?;
     mutation_gate
         .update_with_key_transition(config_dir, true, false, |_cfg| Ok(()))
-        .map(|_| ())
+        .map(|_| outcome)
         .map_err(|e| {
             CoreError::Io(format!(
                 "The keychain was cleared, but the AI preference file could not be updated: {}",

@@ -20,17 +20,27 @@
 //! same next one, and a config directory that is deleted and recreated restarts
 //! the count, so a live instance could hold a cached token that a later, unrelated
 //! save reproduces. Both are ABA hazards that silently resurrect a stale key. A
-//! per-publish-unique token cannot repeat, and needs no read-modify-write at all.
+//! per-publish-unique token needs no read-modify-write at all, and repeats only
+//! under a clock that hands a restarted process an instant an earlier one already
+//! used — see [`next_token`], which states exactly what that rests on.
 //!
-//! **Reads fail closed.** Anything unreadable, unparsable, or otherwise unknown
-//! resolves to `None`, which callers must treat as "may not reuse the cache" — a
-//! spurious keychain read is the safe direction; a stale key is not.
+//! **Reads fail closed, with one carve-out.** Anything unreadable, unparsable or
+//! otherwise unknown resolves to `None`, which callers must treat as "may not reuse
+//! the cache" — a spurious keychain read is the safe direction, a stale key is not.
+//! The carve-out is a sidecar that has never existed: until this process has seen
+//! one published in that directory, its absence is [`KeyRevision::Unpublished`], a
+//! cacheable state of its own. Afterwards, an absence means the file was *removed*,
+//! which would otherwise complete an `Unpublished → Published → Unpublished` round
+//! trip that compares equal at both ends — so from then on it fails closed like
+//! everything else.
 
 use neuralnote_core::CoreError;
+use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// The sidecar, alongside the AI preference file and its lock.
 const KEY_REVISION_FILE: &str = ".openrouter-key-revision";
@@ -40,13 +50,22 @@ const KEY_REVISION_FILE: &str = ".openrouter-key-revision";
 /// a comparison on a hot path.
 const MAX_TOKEN_BYTES: usize = 128;
 
+/// How long a directory's sidecar complaint stays quiet before it repeats. Long
+/// enough that a permanently unusable sidecar cannot flood a polled path's log,
+/// short enough that it is still visible in a session's worth of one.
+const WARN_INTERVAL: Duration = Duration::from_secs(300);
+
 /// What the sidecar said at one instant.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum KeyRevision {
-    /// No sidecar: no instance has saved or cleared a key since this config
-    /// directory existed, so nothing can have changed underneath a cached value.
-    /// A distinct, self-equal state rather than "unknown", so the common case of
-    /// an install that never configured a key still gets to cache.
+    /// No sidecar, and none seen in this directory since the process started: no
+    /// instance has saved or cleared a key, so nothing can have changed underneath
+    /// a cached value. A distinct, self-equal state rather than "unknown", so the
+    /// common case of an install that never configured a key still gets to cache.
+    ///
+    /// Only reachable *before* the first published revision is observed, which is
+    /// what stops it reopening the ABA a unique token exists to close: afterwards
+    /// a missing sidecar means one was removed, and resolves to `None`.
     Unpublished,
     /// The token written by the most recent save or clear.
     Published(String),
@@ -57,20 +76,56 @@ pub(crate) enum KeyRevision {
 pub(crate) fn observe(config_dir: &Path) -> Option<KeyRevision> {
     match read_capped(&config_dir.join(KEY_REVISION_FILE)) {
         Ok(contents) => match parse(&contents) {
-            Some(revision) => Some(revision),
+            Some(revision) => {
+                remember_published(config_dir);
+                Some(revision)
+            }
             None => {
-                warn_once(|| unusable_sidecar(config_dir, "does not hold a valid revision"));
+                warn_about_sidecar(config_dir, || "does not hold a valid revision".to_string());
                 None
             }
         },
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if has_ever_published(config_dir) {
+                warn_about_sidecar(config_dir, || {
+                    "was published earlier but is now gone".to_string()
+                });
+                return None;
+            }
             Some(KeyRevision::Unpublished)
         }
         Err(error) => {
-            warn_once(|| unusable_sidecar(config_dir, &format!("could not be read: {error}")));
+            warn_about_sidecar(config_dir, || format!("could not be read: {error}"));
             None
         }
     }
+}
+
+/// Config directories this process has seen a published revision in — one entry in
+/// a running app, which only ever has one; the test binary is what makes it a set.
+static PUBLISHED_DIRECTORIES: OnceLock<Mutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn published_directories() -> MutexGuard<'static, HashSet<PathBuf>> {
+    PUBLISHED_DIRECTORIES
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Record that this directory has a revision on disk, so a later *absence* of the
+/// sidecar can be told apart from one that was never there. Latching this way, and
+/// never unlatching, is what keeps [`KeyRevision::Unpublished`] safe to cache: it
+/// stays reachable only while the round trip that would resurrect a stale key is
+/// still impossible.
+fn remember_published(config_dir: &Path) {
+    let mut published = published_directories();
+    if !published.contains(config_dir) {
+        published.insert(config_dir.to_path_buf());
+    }
+}
+
+fn has_ever_published(config_dir: &Path) -> bool {
+    published_directories().contains(config_dir)
 }
 
 /// The operator-facing explanation for a sidecar that cannot be trusted: what is
@@ -114,13 +169,42 @@ pub(crate) fn publish(config_dir: &Path) -> Result<KeyRevision, CoreError> {
         ))
     })?;
     let token = next_token();
-    let staged = config_dir.join(format!("{KEY_REVISION_FILE}.{token}.tmp"));
-    write_new_file(&staged, &token)?;
-    std::fs::rename(&staged, config_dir.join(KEY_REVISION_FILE)).map_err(|error| {
-        let _ = std::fs::remove_file(&staged);
+    let staged_path = config_dir.join(format!("{KEY_REVISION_FILE}.{token}.tmp"));
+    let staged = write_new_file(&staged_path, &token)?;
+    std::fs::rename(&staged_path, config_dir.join(KEY_REVISION_FILE)).map_err(|error| {
         CoreError::Io(format!("could not publish the API key revision: {error}"))
     })?;
+    staged.claim();
+    remember_published(config_dir);
     Ok(KeyRevision::Published(token))
+}
+
+/// A staged sidecar write, removed on drop unless the rename claimed it. Every way
+/// out of [`publish`] once the file exists then reaps it the same way — only the
+/// rename branch used to, so a `create_new` that succeeded followed by a write that
+/// failed (a full disk) left a zero-byte file behind that nothing ever collects, in
+/// a directory the user can open.
+struct StagedFile(Option<PathBuf>);
+
+impl StagedFile {
+    /// Take responsibility for a file this call has just created. Never handed a
+    /// path that was already there: reaping is only ever ours to do.
+    fn ours(path: &Path) -> Self {
+        Self(Some(path.to_path_buf()))
+    }
+
+    /// The rename took the file; there is nothing left to remove.
+    fn claim(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
 }
 
 fn parse(contents: &str) -> Option<KeyRevision> {
@@ -135,22 +219,29 @@ fn parse(contents: &str) -> Option<KeyRevision> {
 
 /// `create_new` refuses to follow a symlink or clobber an existing file, so a
 /// staged write can never be redirected onto something else in a shared config
-/// directory.
-fn write_new_file(path: &Path, token: &str) -> Result<(), CoreError> {
-    let staged = std::fs::OpenOptions::new()
+/// directory. It is also the line that makes the file *ours*: everything after it
+/// is guarded by [`StagedFile`], and nothing before it can remove a file this call
+/// did not create.
+fn write_new_file(path: &Path, token: &str) -> Result<StagedFile, CoreError> {
+    let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(path);
-    let mut staged = staged
+        .open(path)
         .map_err(|error| CoreError::Io(format!("could not stage the API key revision: {error}")))?;
-    writeln!(staged, "{token}")
-        .map_err(|error| CoreError::Io(format!("could not write the API key revision: {error}")))
+    let staged = StagedFile::ours(path);
+    writeln!(file, "{token}")
+        .map_err(|error| CoreError::Io(format!("could not write the API key revision: {error}")))?;
+    Ok(staged)
 }
 
-/// Unique for every call in every process: the clock supplies uniqueness across
-/// time, the process id across concurrent instances, and the sequence within one
-/// process — so no two publishes can ever produce the same token, even if the
-/// clock is broken or steps backwards.
+/// Unique for every call within one process (the sequence) and among processes
+/// running at the same time (the process id). Across process *restarts* it rests
+/// entirely on the clock: a pid can be reused and the sequence restarts at zero, so
+/// a clock that hands a later run an instant an earlier one already used — stepped
+/// backwards, or set before the epoch, where `duration_since` fails and the reading
+/// collapses to 0 for every call — can reproduce that run's token. Stated rather
+/// than defended: closing it needs a source of entropy, and reaching it needs a
+/// third instance that cached the repeated token and stayed alive across both runs.
 fn next_token() -> String {
     static SEQUENCE: AtomicU64 = AtomicU64::new(0);
     let nanos = SystemTime::now()
@@ -160,13 +251,37 @@ fn next_token() -> String {
     format!("{nanos}-{}-{sequence}", std::process::id())
 }
 
-/// An unusable sidecar degrades performance rather than correctness, and
-/// [`observe`] runs on polled status paths — so it is reported once per process
-/// instead of on every read, which would bury the log it belongs in.
-fn warn_once(message: impl FnOnce() -> String) {
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if !WARNED.swap(true, Ordering::Relaxed) {
-        log::warn!("{}", message());
+/// Report a sidecar this process cannot trust. An unusable one degrades performance
+/// rather than correctness, and [`observe`] runs on polled status paths, so this is
+/// suppressed between complaints — a line per poll would bury the log it belongs in.
+///
+/// Suppressed per config directory and per interval, rather than once per process.
+/// A single unkeyed latch is spent by the first transient failure at startup, and a
+/// sidecar that goes permanently corrupt afterwards then costs a keychain round trip
+/// per status poll for the rest of the run with nothing in the log to say why.
+fn warn_about_sidecar(config_dir: &Path, problem: impl FnOnce() -> String) {
+    if warning_is_due(config_dir, Instant::now()) {
+        log::warn!("{}", unusable_sidecar(config_dir, &problem()));
+    }
+}
+
+/// When each config directory last had a complaint logged about it.
+static LAST_WARNED: OnceLock<Mutex<HashMap<PathBuf, Instant>>> = OnceLock::new();
+
+/// Whether this directory's complaint is due now, recording it when it is. Split
+/// from the logging so the suppression can be asserted at an arbitrary instant
+/// rather than by waiting out a real interval.
+fn warning_is_due(config_dir: &Path, now: Instant) -> bool {
+    let mut warned = LAST_WARNED
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match warned.get(config_dir) {
+        Some(last) if now.saturating_duration_since(*last) < WARN_INTERVAL => false,
+        _ => {
+            warned.insert(config_dir.to_path_buf(), now);
+            true
+        }
     }
 }
 

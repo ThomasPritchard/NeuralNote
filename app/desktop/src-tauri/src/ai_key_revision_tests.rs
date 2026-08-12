@@ -19,9 +19,9 @@
 //! and [`Throwaway`] deletes it on the way out even when a test panics.
 
 use super::*;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, Command, Stdio};
 use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -35,6 +35,15 @@ const WORKER_REPLY: &str = "#worker#";
 
 /// Full path of the worker test, as libtest names it for `--exact`.
 const WORKER_TEST: &str = "ai::key_revision_tests::key_revision_worker_process";
+
+/// The arguments that turn a re-execution of this binary into the worker test.
+const WORKER_ARGS: [&str; 5] = [
+    "--exact",
+    WORKER_TEST,
+    "--ignored",
+    "--nocapture",
+    "--test-threads=1",
+];
 
 /// How long a worker gets to answer. Generous: this is a hang detector, not a
 /// performance assertion — the failure it exists to name is a keychain access
@@ -51,13 +60,40 @@ const NO_KEY: &str = "<none>";
 /// Registered as an ignored test so it is never run by a normal suite, and it
 /// exits immediately unless [`WORKER_CONFIG_DIR_ENV`] marks this process as a
 /// worker — so `cargo test -- --ignored` cannot leave it blocked on stdin.
+///
+/// Being marked a worker is not on its own enough to serve: the throwaway
+/// credential is a *separate* variable, and without it every command below would
+/// run against the developer's real key. That is checked against the account this
+/// process actually resolved rather than against the variable, because the
+/// variable is only half the story — a value that is not valid UTF-8, say, leaves
+/// [`keychain_account`] on the compiled account with the variable plainly set.
 #[test]
 #[ignore = "spawned as a child process by the two-instance acceptance tests"]
 fn key_revision_worker_process() {
     let Ok(config_dir) = std::env::var(WORKER_CONFIG_DIR_ENV) else {
         return;
     };
+    assert_ne!(
+        keychain_account(),
+        compiled_keychain_account(),
+        "refusing to serve: {WORKER_CONFIG_DIR_ENV} is set but this process still resolved the \
+         real {} credential, which `read` would print and `clear` would delete. Set \
+         {TEST_KEYCHAIN_ACCOUNT_SUFFIX_ENV} to a throwaway suffix as well, or unset both",
+        compiled_keychain_account()
+    );
     serve_worker_commands(Path::new(&config_dir));
+}
+
+/// A key change reports as plain `ok` only when the cross-process revision landed
+/// too. The distinction matters here more than anywhere: these tests exist to prove
+/// the *other* instance observed the change, so an unpublished revision must not be
+/// able to hide behind a bare success.
+fn worker_change_reply(outcome: KeyChangeOutcome) -> String {
+    if outcome.revision_published {
+        "ok".to_string()
+    } else {
+        "ok-but-unpublished".to_string()
+    }
 }
 
 fn serve_worker_commands(config_dir: &Path) {
@@ -78,11 +114,11 @@ fn serve_worker_commands(config_dir: &Path) {
                 Err(error) => format!("error {error:?}"),
             },
             "save" => match set_keychain_api_key(config_dir, argument) {
-                Ok(()) => "ok".to_string(),
+                Ok(outcome) => worker_change_reply(outcome),
                 Err(error) => format!("error {error:?}"),
             },
             "clear" => match clear_keychain_api_key(config_dir) {
-                Ok(()) => "ok".to_string(),
+                Ok(outcome) => worker_change_reply(outcome),
                 Err(error) => format!("error {error:?}"),
             },
             "quit" => return,
@@ -112,13 +148,7 @@ impl Instance {
     fn try_spawn(name: &'static str, throwaway: &Throwaway) -> Result<Self, String> {
         let executable = std::env::current_exe().map_err(|e| e.to_string())?;
         let mut child = Command::new(executable)
-            .args([
-                "--exact",
-                WORKER_TEST,
-                "--ignored",
-                "--nocapture",
-                "--test-threads=1",
-            ])
+            .args(WORKER_ARGS)
             .env(WORKER_CONFIG_DIR_ENV, throwaway.config_dir())
             .env(TEST_KEYCHAIN_ACCOUNT_SUFFIX_ENV, &throwaway.suffix)
             .stdin(Stdio::piped())
@@ -276,4 +306,69 @@ fn a_second_instance_observes_a_cleared_key_before_its_next_request() {
         "the second instance must stop sending a key the user revoked, rather than \
          keep working until it restarts"
     );
+}
+
+#[test]
+fn a_worker_without_the_account_redirection_refuses_to_serve() {
+    // The config directory alone does not make a worker safe to run. The keychain
+    // account is redirected by a SEPARATE variable, and `keychain_account()` falls
+    // back to the compiled account whenever it is unset — so a developer
+    // reproducing a flake by hand with only the directory exported would get a
+    // worker sitting on their REAL credential, where `read` prints it to the
+    // terminal and `clear` deletes it. This seam exists to make that impossible,
+    // so the worker has to refuse before it serves anything, and say why.
+    //
+    // Nothing is ever sent to this child: the refusal is the whole subject, and
+    // sending `read` to demonstrate the unguarded behaviour would be the exact
+    // harm being guarded against. What goes red without the guard is the wait
+    // below — an unguarded worker parks on stdin waiting for commands and never
+    // exits at all.
+    let directory = tempfile::tempdir().expect("a temp config dir");
+    let executable = std::env::current_exe().expect("the test binary's own path");
+    let mut child = Command::new(executable)
+        .args(WORKER_ARGS)
+        .env(WORKER_CONFIG_DIR_ENV, directory.path())
+        .env_remove(TEST_KEYCHAIN_ACCOUNT_SUFFIX_ENV)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("could not start the worker");
+    // Held open deliberately: closing stdin would end the command loop on its own,
+    // which is not the refusal under test.
+    let _stdin = child.stdin.take().expect("child stdin was not piped");
+    let complaint = complaint_until_exit(child.stderr.take().expect("child stderr was not piped"));
+
+    let status = child.wait().expect("the worker could not be waited on");
+    assert!(
+        !status.success(),
+        "a worker that declines to serve must exit as a failure, got {status}"
+    );
+    assert!(
+        complaint.contains(TEST_KEYCHAIN_ACCOUNT_SUFFIX_ENV),
+        "the refusal must name the variable that is missing, got: {complaint}"
+    );
+    assert!(
+        complaint.contains(compiled_keychain_account()),
+        "the refusal must name the credential it declined to operate on, got: {complaint}"
+    );
+}
+
+/// Everything a child wrote to stderr, up to the moment it exited. The read is
+/// its own completion signal — the pipe closes when the process does — so this
+/// doubles as "did it exit at all?", with a bounded wait rather than a hang for
+/// the case where it never does.
+fn complaint_until_exit(stderr: ChildStderr) -> String {
+    let (written_tx, written) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut complaint = String::new();
+        let _ = BufReader::new(stderr).read_to_string(&mut complaint);
+        let _ = written_tx.send(complaint);
+    });
+    written.recv_timeout(WORKER_TIMEOUT).unwrap_or_else(|_| {
+        panic!(
+            "the worker was still running after {WORKER_TIMEOUT:?}: it served commands against \
+             the real credential instead of refusing"
+        )
+    })
 }
