@@ -431,4 +431,25 @@ export const tableKeymap: readonly KeyBinding[] = [
   { key: "Enter", run: nextTableRow },
   { key: "Shift-Alt-f", run: formatTable },
   { key: "Shift-Alt-\\", run: revealTableSource },
+
+  // macOS never delivers those last two by their base key. `KeyboardEvent.key`
+  // carries the character Option PRODUCES, and CodeMirror deliberately declines
+  // to fall back to the base-layout name for Option combinations there —
+  // "Alt-combinations on macOS tend to be typed characters"
+  // (`@codemirror/view/dist/index.js:9188-9189`). `Shift-Alt-Ï` and
+  // `Shift-Alt-»` are therefore the only names its resolver ever looks up for
+  // these chords, and binding them is the whole of the fix for #97; without
+  // them the keystroke goes unclaimed and WebKit types the character into the
+  // cell.
+  //
+  // Separate entries rather than a `mac` field on the two above, because
+  // `buildKeymap` reads `binding[platform] || binding.key` and never both
+  // (`:9136`): folding them in would UNBIND the base names on macOS, where a
+  // WebDriver-injected `Shift-Alt-f` still arrives by base key. Carrying no
+  // `key` is what keeps them from registering anywhere but macOS.
+  //
+  // The characters are the US layout's; a layout that puts something else on
+  // those chords is not covered, and no keymap keyed on `key` can be.
+  { mac: "Shift-Alt-Ï", run: formatTable },
+  { mac: "Shift-Alt-»", run: revealTableSource },
 ];
