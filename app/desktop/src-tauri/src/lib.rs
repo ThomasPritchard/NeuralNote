@@ -26,6 +26,7 @@ mod ai;
 mod authorized_paths;
 mod commands;
 mod event_names;
+mod key_revision;
 mod local;
 mod menu;
 mod openrouter_catalogue;
