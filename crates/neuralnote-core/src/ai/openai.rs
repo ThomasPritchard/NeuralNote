@@ -314,6 +314,15 @@ fn answer_event(chunk: StreamChunk) -> SseEvent {
     };
     let finish_reason = choice.finish_reason;
     let delta = choice.delta;
+    // This is the no-tools final-answer path. A provider that continues the prior
+    // tool protocol has violated that boundary; surface the real cause immediately
+    // instead of discarding every fragment and later reporting a generic empty stream.
+    if finish_reason.as_deref() == Some("tool_calls") || !delta.tool_calls.is_empty() {
+        return SseEvent::Error(
+            "the model tried to call a tool while NeuralNote was generating the final answer"
+                .into(),
+        );
+    }
     // Read reasoning BEFORE the empty-content filter — the same reason the error
     // frame is read first. A reasoning-only chunk carries an empty `delta.content`,
     // so filtering first would silently drop every reasoning token, the exact
@@ -750,9 +759,9 @@ struct StreamDelta {
     /// `reasoning_details` array — so both are supported, the array preferred.
     #[serde(default)]
     reasoning: Option<String>,
-    /// Streamed tool-call fragments. Read only by the tool-turn path
-    /// ([`parse_tool_sse_line`]); the answer turn advertises no tools, so a frame
-    /// carrying these there is nothing it can act on.
+    /// Streamed tool-call fragments. Accumulated by the tool-turn path
+    /// ([`parse_tool_sse_line`]); rejected explicitly by the final-answer path,
+    /// which advertises no tools and therefore cannot act on them.
     #[serde(default)]
     tool_calls: Vec<StreamToolCall>,
 }
@@ -825,8 +834,8 @@ mod tests {
     }
 
     #[test]
-    fn sse_toolcall_only_delta_is_ignored_on_answer_stream() {
-        // A delta with no `content` field (e.g. a tool_calls fragment) is not text.
+    fn sse_role_only_delta_is_ignored_on_answer_stream() {
+        // A metadata-only delta with no content, reasoning, or tool call is not text.
         let line = r#"data: {"choices":[{"delta":{"role":"assistant"}}]}"#;
         assert!(matches!(parse_sse_line(line), SseEvent::Other));
     }
@@ -1270,15 +1279,21 @@ mod tests {
     }
 
     #[test]
-    fn sse_tool_call_finish_is_not_truncated() {
-        // A tool-call finish is distinct from a length cut and must not be surfaced as
-        // truncation (tool turns aren't streamed, but a defensive parser must still
-        // distinguish the reason).
+    fn sse_tool_call_on_the_answer_turn_is_an_explicit_error() {
+        // Captured from GMICloud through OpenRouter: despite receiving no tool
+        // schemas on NeuralNote's final-answer request, the provider continued the
+        // preceding tool protocol. Silently classifying these frames as Other turns
+        // the real provider violation into a misleading generic empty-answer error.
+        let fragment = r#"data: {"choices":[{"delta":{"content":null,"tool_calls":[{"index":0,"id":"call_1","type":"function","function":{"name":"write_note","arguments":""}}]},"finish_reason":null}]}"#;
         assert!(matches!(
-            parse_sse_line(
-                r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"tool_calls"}]}"#
-            ),
-            SseEvent::Other
+            parse_sse_line(fragment),
+            SseEvent::Error(message) if message.contains("tried to call a tool")
+        ));
+
+        let finish = r#"data: {"choices":[{"delta":{"content":""},"finish_reason":"tool_calls"}]}"#;
+        assert!(matches!(
+            parse_sse_line(finish),
+            SseEvent::Error(message) if message.contains("tried to call a tool")
         ));
     }
 
