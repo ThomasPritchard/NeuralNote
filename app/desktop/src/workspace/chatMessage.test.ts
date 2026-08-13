@@ -901,7 +901,7 @@ describe("reduceAssistant — citations, coverage, terminal events", () => {
 });
 
 describe("toHistory", () => {
-  it("maps turns to ChatTurns and drops blank assistant turns", () => {
+  it("maps turns to ChatTurns and preserves an answerless failure as status", () => {
     const messages: ChatMessage[] = [
       userMessage("what is spacing?"),
       { ...emptyAssistant(), answer: "It's spacing.", done: true },
@@ -912,6 +912,14 @@ describe("toHistory", () => {
       { role: "user", content: "what is spacing?" },
       { role: "assistant", content: "It's spacing." },
       { role: "user", content: "and recall?" },
+      {
+        role: "assistant",
+        content: [
+          "NeuralNote continuation record:",
+          "The run failed before producing a final answer.",
+          "Use this status when responding to the next turn.",
+        ].join("\n"),
+      },
     ]);
   });
 
@@ -939,6 +947,68 @@ describe("toHistory", () => {
       { role: "user", content: "q" },
       { role: "assistant", content: "Spacing is 8px and grids use it." },
     ]);
+  });
+
+  it("preserves durable progress when a failed run produced no prose answer", () => {
+    const failed = {
+      ...emptyAssistant(),
+      done: true,
+      error: "the model returned an empty answer",
+      writtenNotes: [
+        { relPath: "Areas/OpSec/Reference/Literature.md", kind: "literature" as const },
+        { relPath: "Areas/OpSec/Reference/Transcript.md", kind: "transcript" as const },
+      ],
+      planSteps: [
+        { id: "collect", label: "Collect the source", status: "done" as const },
+        { id: "write", label: "Write the remaining note", status: "running" as const },
+      ],
+      partialRun: "the run reached a work limit before finishing",
+    };
+
+    const history = toHistory([userMessage("Distil this video"), failed]);
+
+    expect(history).toEqual([
+      { role: "user", content: "Distil this video" },
+      {
+        role: "assistant",
+        content: [
+          "NeuralNote continuation record:",
+          "Completed note writes:",
+          "- Areas/OpSec/Reference/Literature.md (literature)",
+          "- Areas/OpSec/Reference/Transcript.md (transcript)",
+          "Plan state:",
+          "- [done] Collect the source",
+          "- [running] Write the remaining note",
+          "Run ended early: the run reached a work limit before finishing",
+          "The final answer failed after the recorded work.",
+          "Continue from this record without repeating completed note writes.",
+        ].join("\n"),
+      },
+    ]);
+    expect(history[1].content).not.toContain("the model returned an empty answer");
+  });
+
+  it("flattens and bounds model-authored plan labels in continuation history", () => {
+    const failed = {
+      ...emptyAssistant(),
+      done: true,
+      error: "provider failed",
+      planSteps: [
+        {
+          id: "hostile",
+          label: `Keep context\n${"x".repeat(2_000)}`,
+          status: "running" as const,
+        },
+      ],
+    };
+
+    const history = toHistory([userMessage("continue"), failed]);
+    const content = history[1].content;
+
+    expect(content.split("\n")).toHaveLength(5);
+    expect(Array.from(content).length).toBeLessThan(500);
+    expect(content).toContain("- [running] Keep context ");
+    expect(content).toContain("…\nThe final answer failed after the recorded work.");
   });
 });
 
