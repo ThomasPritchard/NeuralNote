@@ -17,11 +17,18 @@ const PRIVATE_PREFIX = "/private";
 //
 // Recognising only the double quote is the obvious-looking choice and it fails
 // open twice over. Excluding `'` from the value class stopped the scan at the
-// quote and emitted the marker FOLLOWED BY the secret —
-// `token='sk-live-abc123'` became `<REDACTED>'sk-live-abc123'`, which reads as
-// redacted at a glance and is not. And accepting only `"` after the keyword
-// meant a single-quoted KEY never matched at all: `{'token': 'sk-live-abc123'}`
-// passed through whole, with no marker to hint anything had been attempted.
+// quote and emitted the marker FOLLOWED BY the secret, so a single-quoted value
+// came out as the marker with the whole key still sitting next to it — which
+// reads as redacted at a glance and is not. And accepting only `"` after the
+// keyword meant a single-quoted KEY never matched at all: a value written as
+// `{'token': …}` passed through whole, with no marker to hint anything had even
+// been attempted.
+//
+// The shapes are spelled out as executable cases in native-artifacts.test.ts
+// rather than inline here. A comment illustrating them with a realistic-looking
+// key is itself a finding — the first version of this one tripped the Gitleaks
+// `generic-api-key` rule, and that scan reads ALL history, so the example
+// outlives the commit that removes it. See .gitleaksignore.
 // Both shapes are ordinary — a shell-quoted argument, a Python-side repr — and
 // `redactedErrorMessage` writes its output into a CI artifact that is uploaded
 // and retained for a week.
