@@ -1,8 +1,8 @@
-import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
+import { withPublishedParse } from "../test/publishedParse";
 import type { CellPaintPlan } from "./sourceEditorCellPaintPlan";
 import {
   CELL_TRACK_GUTTER_CH,
@@ -16,34 +16,32 @@ import {
   type TableRenderPlan,
 } from "./sourceEditorTableModel";
 
-function state(doc: string) {
-  return EditorState.create({
-    doc,
-    extensions: [
-      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
-    ],
-  });
-}
-
 /**
- * A state whose syntax tree covers the WHOLE document, for a fixture longer than
- * the parser's initial window.
+ * A state whose syntax tree covers the WHOLE document.
  *
- * Two steps, because neither is enough alone. `LanguageState.init` parses only
- * `Work.InitViewport` (3,000) characters, and `ensureSyntaxTree` then advances
- * the parse CONTEXT without any transaction carrying the result into the state
- * the model reads (`sourceEditorTableRender.test.ts:75-78`) — so the empty
- * update is what makes the finished tree visible to `syntaxTree(state)`.
+ * `tableModelAt` finds its table by walking `syntaxTree(state)`, and a bare
+ * `EditorState.create` publishes only what `LanguageState.init` reached inside
+ * `Work.InitViewport` (3,000 characters) and `Work.Apply` (20 ms of WALL CLOCK)
+ * — `@codemirror/language/dist/index.js:539-545`. Either bound leaves the model
+ * measuring a document with no table in it, so every fixture here goes through
+ * the shared publisher; `src/test/publishedParse.ts` carries the full argument,
+ * including why `ensureSyntaxTree` alone does not close it.
+ *
+ * The long-fixture case at "sizes a wide column past the 3,000 characters the
+ * parser reads up front" used to have a builder of its own for this. It does not
+ * need one: the bound it is written against applies to every fixture in the
+ * file, short ones included, whenever the machine is busy enough.
  */
-function fullyParsedState(doc: string): EditorState {
-  const editor = state(doc);
-  ensureSyntaxTree(editor, doc.length, 30_000);
-  const settled = editor.update({}).state;
-  const parsedTo = syntaxTree(settled).length;
-  if (parsedTo < doc.length) {
-    throw new Error(`parse settled at ${parsedTo} of ${doc.length} characters`);
-  }
-  return settled;
+function state(doc: string) {
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      extensions: [
+        markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+      ],
+    }),
+    doc,
+  );
 }
 
 function slotText(doc: string, model: TableModel, row: number, column: number): string {
@@ -238,7 +236,7 @@ describe("tableColumnWidths", () => {
     // "日本語です🚀" is 6 clusters and 12 monospace columns.
     const doc = `${"Filler paragraph line.\n\n".repeat(200)}| a | b |\n| --- | --- |\n| 日本語です🚀 | y |`;
     expect(doc.length).toBeGreaterThan(3_000);
-    const editor = fullyParsedState(doc);
+    const editor = state(doc);
 
     const model = tableModelAt(editor, doc.indexOf("日本語"))!;
     expect(tableColumnWidths(editor, model)[0]).toBe(12);

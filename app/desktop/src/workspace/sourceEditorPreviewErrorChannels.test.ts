@@ -11,6 +11,7 @@
 // This file covers the wiring: that each pass reaches the channel it belongs to.
 
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { forceParsing } from "@codemirror/language";
 import { EditorState, StateEffect } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it } from "vitest";
@@ -51,6 +52,18 @@ const failingMetricsExtensions = (
   }),
 ];
 
+/**
+ * Mount the editor with that failure armed, and with the parse finished.
+ *
+ * The parse is not incidental: the table `StateField` reaches the injected
+ * probe only for a table it can find in `syntaxTree(state)`, and
+ * `LanguageState.init` publishes only what it parsed inside `Work.Apply` — 20 ms
+ * of WALL CLOCK (`@codemirror/language/dist/index.js:539-545`). Lose that race
+ * and there is no table, the probe never throws, and every assertion here reads
+ * a channel that was never asked to report. `forceParsing` finishes the parse
+ * AND dispatches the transaction that publishes it (`ibid.:225-230`); see
+ * `src/test/publishedParse.ts` for the same argument in full.
+ */
 function mountWithFailingTableMetrics(
   doc: string,
   caretAt: number,
@@ -68,6 +81,9 @@ function mountWithFailingTableMetrics(
     parent: host,
   });
   mounted.push(view);
+  if (!forceParsing(view, view.state.doc.length, 30_000)) {
+    throw new Error("the note did not parse in full; the table channel would never be reached");
+  }
   return { view, messages };
 }
 

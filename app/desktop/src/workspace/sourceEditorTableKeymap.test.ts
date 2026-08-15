@@ -23,7 +23,7 @@
 import { completionKeymap } from "@codemirror/autocomplete";
 import { defaultKeymap, history, historyKeymap } from "@codemirror/commands";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { foldKeymap } from "@codemirror/language";
+import { foldKeymap, forceParsing } from "@codemirror/language";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView, keymap, type KeyBinding } from "@codemirror/view";
 import { describe, expect, it, vi } from "vitest";
@@ -195,9 +195,21 @@ describe("the Shift-Alt-\\ binding", () => {
   });
 });
 
-/** The editor as `SourceNoteEditor` configures it, with the full ordered keymap. */
+/**
+ * The editor as `SourceNoteEditor` configures it, with the full ordered keymap.
+ *
+ * The parse is forced because the whole file turns on distinguishing "the
+ * binding never ran" from "the binding ran and the command declined", and an
+ * unpublished tree collapses that distinction: `LanguageState.init` publishes
+ * only what it parsed inside `Work.Apply` — 20 ms of WALL CLOCK
+ * (`@codemirror/language/dist/index.js:539-545`) — so on a loaded machine the
+ * reveal and format commands find no table and decline, which reads exactly
+ * like the shadowed binding these tests exist to catch. `forceParsing` both
+ * finishes the parse and dispatches the transaction that publishes it
+ * (`ibid.:225-230`); `src/test/publishedParse.ts` carries the full argument.
+ */
 function mounted(doc: string, anchor: number, extra: readonly KeyBinding[] = []) {
-  return new EditorView({
+  const view = new EditorView({
     state: EditorState.create({
       doc,
       selection: EditorSelection.cursor(anchor),
@@ -211,6 +223,10 @@ function mounted(doc: string, anchor: number, extra: readonly KeyBinding[] = [])
     }),
     parent: document.body,
   });
+  if (!forceParsing(view, view.state.doc.length, 30_000)) {
+    throw new Error("the note did not parse in full; a declining command would be indistinguishable from a shadowed binding");
+  }
+  return view;
 }
 
 describe("the binding resolved by CodeMirror itself", () => {

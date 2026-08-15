@@ -2,6 +2,7 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
+import { withPublishedParse } from "../test/publishedParse";
 import type { NoteIndexEntry } from "./linkResolve";
 import { collectObsidianPreview } from "./obsidianLivePreview";
 import {
@@ -16,12 +17,21 @@ import { tableModelAt } from "./sourceEditorTableModel";
 
 const INDEX: NoteIndexEntry[] = [{ relPath: "Roadmap.md", stem: "roadmap" }];
 
+// `cellPaintPlan` is entirely a reading of `syntaxTree(state)`: no `Emphasis`
+// node in the tree means no marker is hidden and `visibleText` comes back as the
+// raw source. A state built but never republished can hold a truncated tree, so
+// every plan below goes through the shared publisher — see
+// `src/test/publishedParse.ts`. Measured red: "hides an escape's backslash and
+// paints the character it protects", at 20 CPU burners.
 function editorState(doc: string, anchor = 0) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: { anchor },
+      extensions: [markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false })],
+    }),
     doc,
-    selection: { anchor },
-    extensions: [markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false })],
-  });
+  );
 }
 
 /** The span of `cellText` inside `doc`, as the table model would report it. */

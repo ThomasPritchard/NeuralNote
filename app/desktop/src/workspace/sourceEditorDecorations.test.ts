@@ -4,6 +4,7 @@ import { EditorSelection, EditorState, StateEffect } from "@codemirror/state";
 import { EditorView, type DecorationSet } from "@codemirror/view";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { withPublishedParse } from "../test/publishedParse";
 import * as previewModule from "./sourceEditorDecorationsPreview";
 import { MAX_TABLE_PREVIEW_ROWS } from "./sourceEditorDecorationsPreview";
 import {
@@ -15,17 +16,36 @@ import {
 } from "./sourceEditorDecorations";
 import { tableModelAt } from "./sourceEditorTableModel";
 
+/**
+ * A state whose finished parse the syntax tree actually holds.
+ *
+ * Every collector below reads `syntaxTree(state)`, so a state left holding
+ * whatever `LanguageState.init` reached inside its 20 ms wall-clock budget makes
+ * the whole file report on an empty document — and it reports it as a
+ * DECORATION MISSING, which is indistinguishable from the collector being
+ * broken. Measured red: "plans live preview for the supported standard Markdown
+ * constructs", once in 8 full-suite runs under 20 CPU burners. See
+ * `src/test/publishedParse.ts`.
+ *
+ * The `describe("decorations after a deferred parse")` block at the foot of this
+ * file is the deliberate exception and must NOT come through here: it asserts
+ * `syntaxTreeAvailable(...) === false` and drives the parse itself, so it builds
+ * its states through the unpublished `withDecorations` below.
+ */
 function state(doc: string, ranges: Array<{ anchor: number; head?: number }> = [{ anchor: doc.length }]) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.create(
+        ranges.map(({ anchor, head }) => EditorSelection.range(anchor, head ?? anchor)),
+      ),
+      extensions: [
+        EditorState.allowMultipleSelections.of(true),
+        markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+      ],
+    }),
     doc,
-    selection: EditorSelection.create(
-      ranges.map(({ anchor, head }) => EditorSelection.range(anchor, head ?? anchor)),
-    ),
-    extensions: [
-      EditorState.allowMultipleSelections.of(true),
-      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
-    ],
-  });
+  );
 }
 
 const classes = (items: PreviewDecoration[]) => items.map((item) => item.className);
@@ -447,6 +467,12 @@ describe("tableAtomicRanges", () => {
   });
 });
 
+/**
+ * Deliberately UNPUBLISHED, unlike `state` above: the deferred-parse block at
+ * the foot of this file mounts through it and asserts that the tree has NOT
+ * reached the table yet, so publishing here would delete the very condition
+ * those tests reproduce.
+ */
 const withDecorations = (doc: string) => EditorState.create({
   doc,
   extensions: [
@@ -455,12 +481,19 @@ const withDecorations = (doc: string) => EditorState.create({
   ],
 });
 
+/**
+ * The same extensions, with the parse published — for the two tests below, which
+ * ask what the composed extension array REGISTERS and need the table to be found
+ * for either answer to mean anything.
+ */
+const withParsedDecorations = (doc: string) => withPublishedParse(withDecorations(doc), doc);
+
 describe("sourceEditorDecorations extensions", () => {
   it("registers the delimiter guard, so the editor component needs no wiring", () => {
     // The array returned here is already consumed at SourceNoteEditor.tsx:139.
     // Registering the filter alongside the decorations is what makes the
     // refusal reach the running editor without touching the component.
-    const editor = withDecorations(FIRST_TABLE);
+    const editor = withParsedDecorations(FIRST_TABLE);
     const gap = { from: FIRST_TABLE.indexOf("aa") + 2, to: FIRST_TABLE.indexOf("bb") };
     const transaction = editor.update({ changes: { from: gap.from, to: gap.to } });
 
@@ -469,7 +502,7 @@ describe("sourceEditorDecorations extensions", () => {
   });
 
   it("registers an atomic-ranges provider that reads the live viewport", () => {
-    const editor = withDecorations(TWO_TABLES);
+    const editor = withParsedDecorations(TWO_TABLES);
     const providers = editor.facet(EditorView.atomicRanges);
     expect(providers).toHaveLength(1);
 

@@ -15,6 +15,8 @@ import { EditorSelection, EditorState, type Transaction } from "@codemirror/stat
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it, vi } from "vitest";
 
+import { withPublishedParse } from "../test/publishedParse";
+
 // The model is mocked as a pass-through so one test can make it explode. A
 // throw from a transaction filter is fatal in a way an ordinary throw is not
 // (see the last describe block), so that path needs its own proof.
@@ -48,18 +50,39 @@ const TABLE = ["| aa | bb |", "| --- | --- |", "| cc | dd |"].join("\n");
 
 const DIVIDER = { from: TABLE.indexOf("aa") + 2, to: TABLE.indexOf("bb") };
 
+/**
+ * A guarded state whose finished parse the tree actually holds.
+ *
+ * The guard is a transaction filter that finds the table it protects by walking
+ * `syntaxTree(state)`. A truncated tree therefore does not merely weaken these
+ * tests, it INVERTS them: with no table in the tree there is nothing to protect,
+ * the corrupting change sails through, and the refusal these assertions look for
+ * never happens. Measured red: "groups the hidden spans of every table in the
+ * requested ranges" found 1 table of 2, once in 8 full-suite runs under 20 CPU
+ * burners. See `src/test/publishedParse.ts`.
+ *
+ * The oversized fixture needs it most of all. `tableWithBodyRows(201)` is 3,033
+ * characters, past the 3,000 `Work.InitViewport` slice
+ * (`@codemirror/language/dist/index.js:539-545`), so an unpublished parse can
+ * report FEWER body rows than the fixture has — and "no chrome for an oversized
+ * table" would then pass because the table looked small, which is the opposite
+ * of what it claims.
+ */
 function guarded(doc: string, ranges: Array<{ anchor: number; head?: number }> = [{ anchor: 0 }]) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.create(
+        ranges.map(({ anchor, head }) => EditorSelection.range(anchor, head ?? anchor)),
+      ),
+      extensions: [
+        EditorState.allowMultipleSelections.of(true),
+        markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+        tableDelimiterGuard,
+      ],
+    }),
     doc,
-    selection: EditorSelection.create(
-      ranges.map(({ anchor, head }) => EditorSelection.range(anchor, head ?? anchor)),
-    ),
-    extensions: [
-      EditorState.allowMultipleSelections.of(true),
-      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
-      tableDelimiterGuard,
-    ],
-  });
+  );
 }
 
 /** A table with `count` body rows, after a heading so the caret can sit outside it. */
@@ -318,11 +341,17 @@ describe("drawsCellChrome agrees with the preview at the exact bound", () => {
 
   /** Whether the preview draws the table as a widget, with the caret outside. */
   function previewDrawsWidget(doc: string): boolean {
-    const outside = EditorState.create({
+    // Published for the reason `guarded` is, and for one more: this arm is
+    // compared against that one, so the two have to be reading the same tree or
+    // "they agree" is a comparison of two different documents.
+    const outside = withPublishedParse(
+      EditorState.create({
+        doc,
+        selection: EditorSelection.cursor(0),
+        extensions: [markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false })],
+      }),
       doc,
-      selection: EditorSelection.cursor(0),
-      extensions: [markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false })],
-    });
+    );
     const table = collectMarkdownPreview(outside).find((item) => item.className.startsWith("nn-lp-table"));
     expect(table).toBeDefined();
     return table!.kind === "widget";
@@ -408,15 +437,22 @@ describe("the filter cannot protect undo or redo — and does not need to", () =
     // The whole safety argument, executable: because the corrupting transaction
     // is refused before it is applied, it never becomes a history entry, so
     // there is nothing corrupt for the unfiltered undo path to replay.
-    let editor = EditorState.create({
-      doc: TABLE,
-      selection: EditorSelection.cursor(3),
-      extensions: [
-        history(),
-        markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
-        tableDelimiterGuard,
-      ],
-    });
+    // Built here rather than through `guarded` because it needs `history()`,
+    // but published exactly as `guarded` publishes: the refusal in the middle of
+    // this sequence is the whole argument, and an unparsed table would let the
+    // corrupting change through and leave undo replaying it.
+    let editor = withPublishedParse(
+      EditorState.create({
+        doc: TABLE,
+        selection: EditorSelection.cursor(3),
+        extensions: [
+          history(),
+          markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+          tableDelimiterGuard,
+        ],
+      }),
+      TABLE,
+    );
     const dispatch = (transaction: Transaction) => { editor = transaction.state; };
 
     editor = editor.update({ changes: { from: 3, insert: "x" } }).state;

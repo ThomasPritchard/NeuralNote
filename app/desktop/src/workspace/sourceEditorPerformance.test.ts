@@ -6,6 +6,24 @@ import { collectObsidianPreview } from "./obsidianLivePreview";
 import { collectMarkdownPreview } from "./sourceEditorDecorations";
 import { applySourceChanges, loadSourceText, serializeSourceText, type SourceText } from "./sourceText";
 
+// EVERY state in this file is deliberately left with the parse CodeMirror gave
+// it, which is the opposite of the rule the rest of the suite now follows (see
+// `src/test/publishedParse.ts`). Nothing here reads the tree for its CONTENT:
+// both assertions are a cost, so a short tree makes this file cheaper and never
+// wrong, and there is no "found nothing" failure for a published parse to
+// prevent.
+//
+// Publishing was tried and measured, because forcing a parse looks free and is
+// not. `LanguageState.apply` bounds an UNFINISHED parse to the mapped tree
+// length or the viewport, whichever is further
+// (`@codemirror/language/dist/index.js:527-538`) — a small, equal charge on both
+// arms — while a FINISHED one is re-advanced across the whole document on every
+// keystroke, inside the timed region and in proportion to note size. Measured on
+// this machine at 20 CPU burners, 9 samples each: unpublished held 3.73-4.57,
+// published spread 2.53-5.08, and a published run of the full suite hit 8.97
+// against a ceiling of 8. The parse is not what this file measures, and paying
+// for it here only makes the ratio noisier.
+
 // v8 coverage instrumentation multiplies wall-clock time per instrumented
 // function call, so these wall-clock budgets measure the *instrument*, not the
 // code, when run under `npm run coverage` (which sets VITEST_COVERAGE=1). The
@@ -124,6 +142,8 @@ describe("source editor performance budgets", () => {
     expect(new TextEncoder().encode(FIXTURE).byteLength).toBeGreaterThanOrEqual(500 * 1024);
     const samples: number[] = [];
     for (let run = 0; run < 5; run += 1) {
+      // The bounded first parse is inside the timed region on purpose: it is
+      // part of what opening a note costs the user.
       const started = performance.now();
       const state = EditorState.create({
         doc: loadSourceText(FIXTURE).text,

@@ -1,4 +1,5 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { forceParsing } from "@codemirror/language";
 import {
   EditorSelection,
   EditorState,
@@ -8,6 +9,7 @@ import {
 import { EditorView, keymap } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
+import { withPublishedParse } from "../test/publishedParse";
 import { MAX_TABLE_PREVIEW_ROWS } from "./sourceEditorDecorationsPreview";
 import {
   formatTable,
@@ -39,21 +41,34 @@ const MARKDOWN = markdown({
   pasteURLAsLink: false,
 });
 
+// Every builder in this file publishes the finished parse before a command
+// reads it. All of these commands find their table by walking
+// `syntaxTree(state)`, and a state that lost the 20 ms `Work.Apply` race holds
+// no table at all — so the command declines, and a `not.toBeNull()` here goes
+// red for a reason that has nothing to do with the command. See
+// `src/test/publishedParse.ts`; the negative assertions are as exposed as the
+// positive ones, since an unparsed table also makes a command decline.
 function state(doc: string, anchor: number) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.cursor(anchor),
+      extensions: [MARKDOWN],
+    }),
     doc,
-    selection: EditorSelection.cursor(anchor),
-    extensions: [MARKDOWN],
-  });
+  );
 }
 
 /** The editor as the app configures it, where several cursors are allowed. */
 function multiCursorState(doc: string, anchors: readonly number[]) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.create(anchors.map((anchor) => EditorSelection.cursor(anchor))),
+      extensions: [EditorState.allowMultipleSelections.of(true), MARKDOWN],
+    }),
     doc,
-    selection: EditorSelection.create(anchors.map((anchor) => EditorSelection.cursor(anchor))),
-    extensions: [EditorState.allowMultipleSelections.of(true), MARKDOWN],
-  });
+  );
 }
 
 /** Apply a spec and return the resulting document plus the selected text. */
@@ -419,15 +434,18 @@ describe("guardTableDelimiter", () => {
 });
 
 function guardedState(doc: string, anchors: readonly number[]) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.create(anchors.map((anchor) => EditorSelection.cursor(anchor))),
+      extensions: [
+        EditorState.allowMultipleSelections.of(true),
+        MARKDOWN,
+        tableDelimiterGuard,
+      ],
+    }),
     doc,
-    selection: EditorSelection.create(anchors.map((anchor) => EditorSelection.cursor(anchor))),
-    extensions: [
-      EditorState.allowMultipleSelections.of(true),
-      MARKDOWN,
-      tableDelimiterGuard,
-    ],
-  });
+  );
 }
 
 /** A command target that applies what it is given and keeps the transactions. */
@@ -519,9 +537,17 @@ describe("the table chords on Windows and Linux", () => {
   const RAGGED = ["| a | b |", "| --- | --- |", "| xxxx | yyyy |"].join("\n");
   const ALIGNED = ["| A | B |", "| --- | --- |", "| 1 | 2 |"].join("\n");
 
-  /** A real view — `target` above is a fake one, and cannot receive key events. */
+  /**
+   * A real view — `target` above is a fake one, and cannot receive key events.
+   *
+   * `forceParsing` is the view-shaped form of the same precondition the state
+   * builders above meet: it finishes the parse and dispatches the transaction
+   * that publishes it (`@codemirror/language/dist/index.js:225-230`). Without
+   * it the chord resolves, the command finds no table, and the press looks
+   * unhandled for a reason that is not about the keymap.
+   */
   function mounted(doc: string, anchor: number) {
-    return new EditorView({
+    const view = new EditorView({
       state: EditorState.create({
         doc,
         selection: EditorSelection.cursor(anchor),
@@ -529,6 +555,10 @@ describe("the table chords on Windows and Linux", () => {
       }),
       parent: document.body,
     });
+    if (!forceParsing(view, view.state.doc.length, 30_000)) {
+      throw new Error("the table did not parse in full; the chord would have nothing to act on");
+    }
+    return view;
   }
 
   it("still formats through the base-layout fallback macOS opts out of", () => {

@@ -10,6 +10,7 @@ import { EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 
+import { withPublishedParse } from "../test/publishedParse";
 import { cellPaintPlan, type CellPaintPlan } from "./sourceEditorCellPaintPlan";
 import { TABLE_CONTRACT_FIXTURE } from "./sourceEditorTableContractFixture";
 import {
@@ -21,11 +22,20 @@ import {
   textMetricsPrimer,
 } from "./sourceEditorTextMetrics";
 
+// The plan is a reading of `syntaxTree(state)`, so the parse has to be published
+// into the state before `cellPaintPlan` runs — see `src/test/publishedParse.ts`.
+// Without it a lost 20 ms `Work.Apply` race leaves `**DJ gig**` with no
+// `StrongEmphasis` node, the plan paints the asterisks it should hide, and the
+// probe is measured against a string the screen never shows: the signature tests
+// below would compare two raw sources and agree for the wrong reason.
 function planFor(source: string, cell: string, context: "header" | "body" = "body"): CellPaintPlan {
-  const state = EditorState.create({
-    doc: source,
-    extensions: [markdown({ base: markdownLanguage })],
-  });
+  const state = withPublishedParse(
+    EditorState.create({
+      doc: source,
+      extensions: [markdown({ base: markdownLanguage })],
+    }),
+    source,
+  );
   const from = source.indexOf(cell);
   expect(from).toBeGreaterThanOrEqual(0);
   return cellPaintPlan(state, { from, to: from + cell.length }, { context, index: [] });
