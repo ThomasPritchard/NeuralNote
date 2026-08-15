@@ -9,6 +9,7 @@ import { errorMessage } from "../lib/api";
 import { cn } from "../lib/cn";
 import type { AiStatus } from "../lib/types";
 import { buttonVariants } from "@/components/ui/button";
+import { KeyChangeCaveat } from "./KeyChangeCaveat";
 import { FIELD, LABEL } from "./KeySetupPanel";
 import { InlineError, ProviderCard } from "./ProviderCard";
 import { reasoningCapability } from "./reasoningSupport";
@@ -42,6 +43,13 @@ export function OpenRouterCard({
   const [modelValue, setModelValue] = useState("");
   const [savingKey, setSavingKey] = useState(false);
   const [keyError, setKeyError] = useState<string | null>(null);
+  // The last save landed in the keychain but could not be announced to the app's
+  // other windows. A receipt of THAT save, not a standing claim about the world:
+  // the frontend can't tell whether a second window exists or has since been
+  // restarted, so it is dismissible and it is cleared the moment another save is
+  // set up. Separate from `keyError` on purpose — the save worked, and reusing
+  // the red channel would report the opposite failure to the one being fixed.
+  const [keyChangeCaveat, setKeyChangeCaveat] = useState(false);
   const [orError, setOrError] = useState<string | null>(null);
   const [savingReasoning, setSavingReasoning] = useState(false);
   const [reasoningError, setReasoningError] = useState<string | null>(null);
@@ -67,6 +75,9 @@ export function OpenRouterCard({
 
   const openKeyForm = () => {
     setKeyError(null);
+    // The notice describes the save it came from; a new one is about to replace
+    // that save, so keeping it would attach it to the wrong key.
+    setKeyChangeCaveat(false);
     setModelValue(status?.openrouter.model ?? "");
     setKeyFormOpen(true);
   };
@@ -77,7 +88,15 @@ export function OpenRouterCard({
     setSavingKey(true);
     setKeyError(null);
     try {
-      await api.saveApiKey(key, modelValue.trim() || (status?.openrouter.model ?? ""));
+      const outcome = await api.saveApiKey(
+        key,
+        modelValue.trim() || (status?.openrouter.model ?? ""),
+      );
+      // Read before anything else can fail. The keychain write is committed by
+      // now, so the caveat is true whatever the follow-up status read does — and
+      // `refreshStatus` records its own failure rather than rejecting, so there
+      // is no path here that should swallow it.
+      setKeyChangeCaveat(!outcome.revisionPublished);
       await refreshStatus();
       setKeyFormOpen(false);
       setKeyValue("");
@@ -135,6 +154,13 @@ export function OpenRouterCard({
           </span>
         )}
       </p>
+
+      {/* Directly under the status line, because that is the claim it qualifies:
+          "Key connected" is true of THIS window, and the notice says what is
+          still true of any other. */}
+      {keyChangeCaveat && (
+        <KeyChangeCaveat onDismiss={() => setKeyChangeCaveat(false)} />
+      )}
 
       <div className="flex flex-wrap items-center gap-2">
         {!orActive && (
