@@ -12,8 +12,30 @@ const TRUNCATION_SUFFIX = "...";
 const UNREADABLE_ERROR_MESSAGE = "<unreadable error>";
 const UNREADABLE_ERROR_TYPE = "<unreadable error type>";
 const PRIVATE_PREFIX = "/private";
+// Single quotes count as quotes, on BOTH sides, and the value runs to
+// whitespace, comma or semicolon and to NOTHING else.
+//
+// Recognising only the double quote is the obvious-looking choice and it fails
+// open twice over. Excluding `'` from the value class stopped the scan at the
+// quote and emitted the marker FOLLOWED BY the secret —
+// `token='sk-live-abc123'` became `<REDACTED>'sk-live-abc123'`, which reads as
+// redacted at a glance and is not. And accepting only `"` after the keyword
+// meant a single-quoted KEY never matched at all: `{'token': 'sk-live-abc123'}`
+// passed through whole, with no marker to hint anything had been attempted.
+// Both shapes are ordinary — a shell-quoted argument, a Python-side repr — and
+// `redactedErrorMessage` writes its output into a CI artifact that is uploaded
+// and retained for a week.
+//
+// The value class over-consumes deliberately: a quoted value takes its closing
+// quote with it, and an unterminated JSON object takes its closing brace. The
+// output is a redacted error string, not a document anything parses, so
+// over-redacting costs a legible character while under-redacting costs the
+// credential. Fail safe, in the direction the DoD's boundary rule names.
+//
+// Every shape named above is pinned in native-artifacts.test.ts as the
+// adversarial corpus DoD §2 requires for hand-rolled detection.
 const CREDENTIAL_PATTERN =
-  /\b(api[_-]?key|authorization|password|secret|token)"?\s*[:=]\s*(?:bearer\s+)?"?[^\s,;"']*/gi;
+  /\b(api[_-]?key|authorization|password|secret|token)["']?\s*[:=]\s*(?:bearer\s+)?["']?[^\s,;]*/gi;
 const NATIVE_SPEC_ALLOWLIST = new Set([
   "00-startup.spec.ts",
   "10-authority-lifecycle.spec.ts",

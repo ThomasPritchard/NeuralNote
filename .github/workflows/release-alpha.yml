@@ -122,6 +122,30 @@ jobs:
             echo "::error::Release tag must point at the current main commit"
             exit 1
           fi
+          # The manifest publisher must exist AT THE RELEASE COMMIT, and that has
+          # to be settled here rather than where it is used.
+          #
+          # The publish step fetches the script from the repository at
+          # $RELEASE_SHA, deliberately, so a compromised dependency cannot choose
+          # the code that later runs with repository write scope. The cost of
+          # that pinning is that a tag predating the script fails the fetch — and
+          # that step is
+          # LAST, after the GitHub prerelease is public and immutable. Its own
+          # `test -s` guard catches this far too late to matter.
+          #
+          # Not hypothetical: `release_tag` defaults to v0.4.0, which is also the
+          # documented recovery path, and v0.4.0 predates the extraction of this
+          # script from inline YAML. Re-dispatching it would publish, then 404,
+          # then leave exactly the manual manifest recovery that 0.2.1 and 0.3.0
+          # each cost and that the extraction exists to end.
+          #
+          # Checking the working tree is equivalent to checking $RELEASE_SHA: the
+          # two comparisons above have just proven the checkout IS that commit.
+          if [ ! -s scripts/publish-release-manifest.mjs ]; then
+            echo "::error::scripts/publish-release-manifest.mjs is missing at $RELEASE_TAG ($RELEASE_SHA)."
+            echo "::error::The publish step reads it from that commit, so this release would go public and then fail to publish its manifest. Re-tag from a commit that carries the script."
+            exit 1
+          fi
           printf 'RELEASE_SHA=%s\n' "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Configure temporary release paths

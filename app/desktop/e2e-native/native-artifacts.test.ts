@@ -299,3 +299,44 @@ test("redacts a bearer authorization header value", () => {
   assert.equal(redacted.includes("sk-live-SECRET"), false);
   assert.match(redacted, /<REDACTED>/);
 });
+
+// The adversarial corpus DoD §2 requires for hand-rolled detection. Every case
+// below leaked before the value class stopped excluding quote characters: the
+// scan halted at the quote and emitted `<REDACTED>` FOLLOWED BY the secret,
+// which is worse than no redaction because it reads as done.
+//
+// Asserted one string per case rather than in a loop so a regression names the
+// shape that broke rather than an index.
+for (const [shape, line] of [
+  ["single-quoted", "native invoke failed: token='sk-live-SECRET'"],
+  ["single-quoted api_key", "config rejected: api_key='sk-live-SECRET'"],
+  ["single-quoted with colon", "auth: password: 'sk-live-SECRET'"],
+  ["apostrophe inside the value", "token=sk-live'SECRET"],
+  ["JSON single-quoted", "state: {'token': 'sk-live-SECRET'}"],
+  ["JSON without a trailing comma", 'state: {"secret":"sk-live-SECRET"}'],
+  ["bearer, single-quoted", "header: Authorization: Bearer 'sk-live-SECRET'"],
+] as const) {
+  test(`redacts a credential value: ${shape}`, () => {
+    const redacted = redactArtifactText(line, FIXTURE_ROOT);
+
+    assert.equal(
+      redacted.includes("sk-live-SECRET"),
+      false,
+      `${shape}: the secret survived redaction as ${JSON.stringify(redacted)}`,
+    );
+    assert.match(redacted, /<REDACTED>/);
+  });
+}
+
+test("redacting a credential does not consume the next field", () => {
+  // The value class over-consumes on purpose, but it must still stop at a
+  // separator: a redactor that ate the rest of the line would destroy the
+  // diagnosis the artifact exists to carry.
+  const redacted = redactArtifactText(
+    "native invoke failed: token='sk-live-SECRET', spec=30-markdown-source.spec.ts",
+    FIXTURE_ROOT,
+  );
+
+  assert.equal(redacted.includes("sk-live-SECRET"), false);
+  assert.match(redacted, /30-markdown-source\.spec\.ts/);
+});
