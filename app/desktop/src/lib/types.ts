@@ -73,6 +73,7 @@ export type { SkillListing } from "./bindings/SkillListing";
 
 // ── Generated: AI provider selection (provider_config.rs + ai/local/*.rs) ─────
 export type { ProviderKind } from "./bindings/ProviderKind";
+export type { KeyChangeOutcome } from "./bindings/KeyChangeOutcome";
 export type { AiStatus } from "./bindings/AiStatus";
 export type { OpenRouterStatus } from "./bindings/OpenRouterStatus";
 export type { OpenRouterModelChoice } from "./bindings/OpenRouterModelChoice";

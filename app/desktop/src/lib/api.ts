@@ -35,6 +35,7 @@ import type {
   HardwareSpec,
   HfModelMeta,
   InstalledModel,
+  KeyChangeOutcome,
   LinkGraph,
   NoteDoc,
   OpenRouterModelMenu,
@@ -269,12 +270,29 @@ function sequenceAiConfigMutation<T>(operation: () => Promise<T>): Promise<T> {
   return result;
 }
 
+/**
+ * Both of these resolve to a {@link KeyChangeOutcome}, and callers must read it.
+ *
+ * The keychain write is committed by the time the promise resolves — that part
+ * either threw or worked. `revisionPublished` carries the OTHER guarantee: that
+ * every other running instance was told to stop trusting the key it cached. When
+ * it is `false`, the key really is stored (or really is gone) and a second open
+ * window keeps using the previous one until it restarts.
+ *
+ * These were typed `invoke<void>` while the Rust side had already moved to
+ * `Result<KeyChangeOutcome, CoreError>` (`commands/ai.rs:55`, `:117`). Because
+ * `void` erases the payload rather than conflicting with it, TypeScript had
+ * nothing to complain about and the outcome was discarded in silence at both
+ * call sites — so a revocation that failed to publish reported as a clean
+ * success, which is the one case the Rust doc comment singles out as
+ * unacceptable. Type it, so dropping it has to be a decision someone writes down.
+ */
 export const saveApiKey = (key: string, model: string) =>
-  sequenceAiConfigMutation(() => invoke<void>("save_api_key", { key, model }));
+  sequenceAiConfigMutation(() => invoke<KeyChangeOutcome>("save_api_key", { key, model }));
 
-/** Remove the stored API key. */
+/** Remove the stored API key. See {@link saveApiKey} on reading the outcome. */
 export const clearApiKey = () =>
-  sequenceAiConfigMutation(() => invoke<void>("clear_api_key"));
+  sequenceAiConfigMutation(() => invoke<KeyChangeOutcome>("clear_api_key"));
 
 /** Run one cited-chat turn. `onEvent` fires for each streamed `ChatEvent`
  *  (searching / reading / verifying / answer / citation / coverage) as it

@@ -337,7 +337,7 @@ describe("ChatPane — key setup", () => {
     mockAiStatus
       .mockResolvedValueOnce(unconfigured())
       .mockResolvedValueOnce(openRouterActive());
-    mockSave.mockResolvedValue(undefined);
+    mockSave.mockResolvedValue({ revisionPublished: true });
     const { user } = setup();
     await openKeySetup(user);
 
@@ -353,7 +353,7 @@ describe("ChatPane — key setup", () => {
     mockAiStatus
       .mockResolvedValueOnce(unconfigured())
       .mockResolvedValueOnce(openRouterActive("openai/gpt-4o"));
-    mockSave.mockResolvedValue(undefined);
+    mockSave.mockResolvedValue({ revisionPublished: true });
     const { user } = setup();
     await openKeySetup(user);
 
