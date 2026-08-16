@@ -255,6 +255,19 @@ pub fn run() {
         // default. A failure here would leave the app menu-less — surface it in
         // the log rather than dropping it silently (PA-007 discipline).
         .setup(|app| {
+            // Bind the credential namespace to THIS build's identity before any
+            // command can read a key. A separately-identified build (the
+            // `com.neuralnote.desktop.dev` smoke bundle) must not reach into the
+            // shipped app's keychain item — that is the whole point of giving it
+            // its own identity, and it is also what avoids an ACL prompt against
+            // an item the dev binary was never on the trusted-application list for.
+            //
+            // Fatal on failure: a build that cannot name itself refuses to start
+            // rather than fall back to the shipped app's credential. It runs here
+            // in `setup()` deliberately — the log plugin attaches its logger during
+            // `build()`, so this is the earliest point at which the namespace it
+            // binds is actually recorded in the app's own log file.
+            ai::init_keychain_service(&app.config().identifier)?;
             #[cfg(desktop)]
             {
                 if updater_public_key_is_configured(app.config()) {
@@ -376,6 +389,63 @@ pub fn run() {
                 local::shutdown_ollama(&state);
             }
         });
+}
+
+/// The credential namespace is bound from configuration by exactly one line, in
+/// `run()` — and no test executes that line, because a test binary never calls
+/// `run()`. A refactor of the `setup()` closure that drops or reorders it would
+/// therefore leave every gate green while the build silently returns to reading
+/// the shipped app's keychain item. This module reads `run()` back as source and
+/// pins the call, which is the only check available short of launching the app.
+#[cfg(test)]
+mod startup_wiring_tests {
+    use std::fs;
+    use std::path::Path;
+
+    /// The body of `pub fn run()`, taken from this file on disk. `run()` ends at
+    /// the first closing brace in column zero after it starts; every brace inside
+    /// it is indented.
+    fn run_body() -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("src/lib.rs");
+        let source = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+        let start = source
+            .find("pub fn run() {")
+            .unwrap_or_else(|| panic!("{} no longer defines `pub fn run()`", path.display()));
+        let tail = &source[start..];
+        let end = tail.find("\n}\n").unwrap_or_else(|| {
+            panic!("`run()` in {} is not closed in column zero", path.display())
+        });
+        let body = tail[..end].to_string();
+        // Prove the slice really is `run()` before anything is concluded from it.
+        assert!(
+            body.contains("tauri::Builder::default()"),
+            "the extracted region is not `run()`, so the assertions below prove nothing"
+        );
+        body
+    }
+
+    /// What goes red: delete or move `ai::init_keychain_service` out of `run()`.
+    ///
+    /// Without it the process never binds a namespace, `keychain_service()` falls
+    /// back to the legacy constant, and the separately-identified smoke build
+    /// reads — and can clear — the real user's production API key.
+    #[test]
+    fn run_binds_the_keychain_namespace_before_the_app_starts() {
+        let body = run_body();
+        assert!(
+            body.contains("init_keychain_service("),
+            "`run()` no longer calls `ai::init_keychain_service`: nothing binds the credential \
+             namespace, so every build falls back to the shipped app's keychain item and a \
+             separately-identified build reads the real user's API key"
+        );
+        assert!(
+            body.contains("config().identifier"),
+            "`run()` binds the credential namespace from something other than the running \
+             configuration's bundle identifier; that identifier is the only thing that \
+             distinguishes this build from the shipped app"
+        );
+    }
 }
 
 #[cfg(test)]

@@ -253,7 +253,26 @@ fn downmix_packet(
                 "decoded audio contains a non-finite sample".into(),
             ));
         }
-        mono.push(frame.iter().sum::<f32>() / channels as f32);
+        // Accumulate in f64, exactly as `reference_append_downmixed` does. Summing in
+        // f32 saturates to inf — two finite `f32::MAX` samples average to inf, which
+        // escaped into `rubato` and panicked there instead of surfacing as a decode
+        // failure. `validate_audio_spec` rejects channels > 2, so at most two operands
+        // reach here; their f64 sum is at most 6.81e38 and halves to exactly f32::MAX,
+        // which means a non-finite result is impossible by construction rather than
+        // merely caught. Widening also keeps this in step with the f64 oracle that
+        // `downmix_packet_matches_reference_across_packet_boundaries` asserts equality
+        // against — the two used to diverge at the extreme.
+        let sum = frame.iter().map(|sample| f64::from(*sample)).sum::<f64>();
+        let downmixed = (sum / channels as f64) as f32;
+        // Kept as a fail-closed backstop, matching `append_pcm_sample` on the resampled
+        // side, so a later change to the arithmetic above still cannot leak a non-finite
+        // sample into `rubato`.
+        if !downmixed.is_finite() {
+            return Err(CaptureError::AudioDecodeFailed(
+                "downmixed audio contains a non-finite sample".into(),
+            ));
+        }
+        mono.push(downmixed);
     }
     Ok(mono)
 }

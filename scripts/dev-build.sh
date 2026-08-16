@@ -36,11 +36,70 @@ npm --prefix app/desktop run tauri build -- \
   --config "{\"productName\":\"${product}\",\"app\":{\"windows\":[{\"title\":\"${product}\"}]}}"
 
 app_path="${repo_root}/target/${profile_name}/bundle/macos/${product}.app"
-if [[ -d "$app_path" ]]; then
-  echo
-  echo "Built: ${app_path}"
-  echo "Open with: open '${app_path}'"
-else
+if [[ ! -d "$app_path" ]]; then
   echo "Expected bundle not found at ${app_path}" >&2
   exit 1
+fi
+
+# Sign with a STABLE identity when one is available.
+#
+# Keychain ACLs bind to the Designated Requirement of the writing process. An
+# ad-hoc signature derives its requirement from the code hash, so every rebuild
+# looks like a different application to the keychain and macOS re-prompts for the
+# login password every single time — "Always Allow" can never stick. A stable
+# identity yields `certificate leaf = H"<cert hash>"`, which does not change
+# between rebuilds, so one authorisation holds for good.
+#
+# Falls back to ad-hoc when the identity is absent (CI, a fresh clone, another
+# maintainer's machine) — exactly the previous behaviour. Create the identity
+# once with: bash scripts/ensure-dev-signing-identity.sh
+#
+# No `-v` on find-identity: that filters to *trusted* identities and a
+# self-signed root never passes it, though codesign signs with it fine.
+signing_identity="${NEURALNOTE_DEV_SIGNING_IDENTITY:-NeuralNote Dev Signing}"
+signing_note=""
+if [[ "$(uname -s)" == "Darwin" ]]; then
+  # stderr is captured rather than discarded, and the listing is materialised
+  # before grepping: a locked or unreadable keychain must not be reported as
+  # "identity absent", and `grep -q` exiting early must not SIGPIPE the producer
+  # into a `pipefail` false negative.
+  identity_listing=""
+  identity_query_ok=0
+  if ! identity_listing="$(security find-identity -p codesigning 2>&1)"; then
+    identity_query_ok=1
+  fi
+
+  if [[ "$identity_query_ok" -eq 0 ]] && printf '%s' "$identity_listing" | grep -qF "$signing_identity"; then
+    echo "Signing with stable identity: ${signing_identity}"
+    codesign --force --sign "$signing_identity" "$app_path"
+  else
+    if [[ "$identity_query_ok" -ne 0 ]]; then
+      signing_note="AD-HOC: could not query code-signing identities (keychain locked or unreadable)"
+      echo "Could not query code-signing identities:" >&2
+      printf '%s\n' "$identity_listing" >&2
+    else
+      signing_note="AD-HOC: no stable signing identity '${signing_identity}' found"
+    fi
+    echo "${signing_note}. Falling back to ad-hoc signing." >&2
+    echo "The keychain will re-prompt on EVERY rebuild until you run:" >&2
+    echo "  bash scripts/ensure-dev-signing-identity.sh" >&2
+    codesign --force --sign - "$app_path"
+  fi
+  codesign --verify --strict "$app_path"
+fi
+
+echo
+echo "Built: ${app_path}"
+echo "Open with: open '${app_path}'"
+# Repeated on stdout on purpose. The warning above goes to stderr, and a build
+# this slow is routinely run as `> build.log` or with stderr dropped — which
+# would leave a success banner visible and the degradation invisible. An ad-hoc
+# signature re-prompts the keychain on every rebuild, so it must not be separable
+# from the success message that qualifies it.
+if [[ -n "$signing_note" ]]; then
+  echo
+  echo "WARNING — ${signing_note}."
+  echo "          Signed ad-hoc, so macOS will re-prompt for the login keychain"
+  echo "          on every rebuild. Fix with:"
+  echo "            bash scripts/ensure-dev-signing-identity.sh"
 fi

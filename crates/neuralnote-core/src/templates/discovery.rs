@@ -304,6 +304,68 @@ mod tests {
     use super::*;
     use std::fs;
 
+    /// Captures the crate's `log` output so the tolerated-fault branches can be
+    /// asserted, not just executed. Every warning below is the only trace a
+    /// silently-ignored config or scan failure leaves; without a logger installed
+    /// the `log::warn!` arguments are never even evaluated, so "it warned" would
+    /// be an untested claim.
+    mod warnings {
+        use std::sync::{Mutex, Once, OnceLock};
+
+        static MESSAGES: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        static INSTALL: Once = Once::new();
+        static LOGGER: Capturing = Capturing;
+
+        struct Capturing;
+
+        impl log::Log for Capturing {
+            fn enabled(&self, metadata: &log::Metadata) -> bool {
+                metadata.level() <= log::Level::Warn
+            }
+
+            fn log(&self, record: &log::Record) {
+                if self.enabled(record.metadata()) {
+                    messages().lock().unwrap().push(record.args().to_string());
+                }
+            }
+
+            fn flush(&self) {}
+        }
+
+        fn messages() -> &'static Mutex<Vec<String>> {
+            MESSAGES.get_or_init(Mutex::default)
+        }
+
+        /// Install the capturing logger for the whole test binary and return a mark:
+        /// the number of warnings already recorded. `log` allows one logger per
+        /// process, so installation is idempotent and must run before the code under
+        /// test warns. Pass the mark to [`recorded`].
+        pub(super) fn capture() -> usize {
+            INSTALL.call_once(|| {
+                log::set_logger(&LOGGER).expect("no other logger may own this test binary");
+                log::set_max_level(log::LevelFilter::Warn);
+            });
+            messages().lock().unwrap().len()
+        }
+
+        /// Whether any warning recorded **since `mark`** contains `needle`.
+        ///
+        /// The buffer is process-global and deliberately never cleared, so a parallel
+        /// test cannot destroy another's evidence. That alone is not enough: without a
+        /// mark a test can also *inherit* evidence, passing on a warning that some
+        /// other test in this binary emitted from the same production site. Scanning
+        /// forward from the caller's own mark keeps each assertion scoped to what that
+        /// test provoked, so it goes red when its own path stops warning.
+        pub(super) fn recorded(mark: usize, needle: &str) -> bool {
+            messages()
+                .lock()
+                .unwrap()
+                .iter()
+                .skip(mark)
+                .any(|message| message.contains(needle))
+        }
+    }
+
     /// True when the filesystem actually enforces the `0o000`/`0o555` permission
     /// bits the permission tests rely on. Running as root (as some CI images do)
     /// bypasses them, so those tests would see an unexpected success — skip there.
@@ -330,6 +392,7 @@ mod tests {
 
     #[test]
     fn remove_helper_survives_a_path_it_cannot_delete() {
+        let mark = warnings::capture();
         let vault = tempfile::tempdir().unwrap();
         // A non-empty directory cannot be removed with `remove_file`, exercising the
         // "could not clean up" warn branch without ever panicking.
@@ -343,10 +406,15 @@ mod tests {
             dir.exists(),
             "the directory must be left intact, not removed"
         );
+        assert!(warnings::recorded(
+            mark,
+            "failed to clean up note after template write error"
+        ));
     }
 
     #[test]
     fn malformed_obsidian_template_config_is_ignored_and_falls_back_to_default() {
+        let mark = warnings::capture();
         // Invalid JSON, a non-object document, and a config that is a directory all
         // reach a distinct guard in `read_obsidian_template_config`; every one must
         // be refused so the settings fall back to the built-in default folder.
@@ -372,6 +440,19 @@ mod tests {
             assert_eq!(loaded.settings.folder, DEFAULT_TEMPLATE_FOLDER);
             assert!(list_templates(vault.path()).unwrap().is_empty());
         }
+
+        // Each refusal is tolerated, so the warning is the only evidence the user's
+        // config was disregarded rather than honoured.
+        for expected in [
+            "could not parse Obsidian template config",
+            "is not a JSON object",
+            "could not read Obsidian template config",
+        ] {
+            assert!(
+                warnings::recorded(mark, expected),
+                "no warning matched {expected}"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -379,6 +460,7 @@ mod tests {
     fn obsidian_template_config_symlinked_outside_the_vault_is_refused() {
         use std::os::unix::fs::symlink;
 
+        let mark = warnings::capture();
         let vault = tempfile::tempdir().unwrap();
         let outside = tempfile::NamedTempFile::new().unwrap();
         fs::write(outside.path(), r#"{"folder":"Escaped"}"#).unwrap();
@@ -393,6 +475,10 @@ mod tests {
 
         assert_eq!(loaded.source, TemplateSettingsSource::Default);
         assert_eq!(loaded.settings.folder, DEFAULT_TEMPLATE_FOLDER);
+        assert!(warnings::recorded(
+            mark,
+            "refused Obsidian template config outside vault"
+        ));
     }
 
     #[cfg(unix)]
@@ -403,6 +489,7 @@ mod tests {
         if !permission_restrictions_apply() {
             return;
         }
+        let mark = warnings::capture();
         let vault = tempfile::tempdir().unwrap();
         // Execute-but-not-read: `canonicalize` still resolves the path, but the
         // template-folder scan's `read_dir` is denied, hitting the warn-and-continue
@@ -413,5 +500,58 @@ mod tests {
 
         fs::set_permissions(vault.path(), fs::Permissions::from_mode(0o755)).unwrap();
         assert!(result.unwrap().is_empty());
+        assert!(warnings::recorded(
+            mark,
+            "could not scan vault root for template folders"
+        ));
+    }
+
+    #[test]
+    fn a_vault_root_that_does_not_exist_is_an_explicit_error_not_an_empty_list() {
+        let parent = tempfile::tempdir().unwrap();
+        let missing = parent.path().join("was-here");
+
+        let list_error = list_templates(&missing).unwrap_err();
+        let create_error =
+            create_note_from_template(&missing, &missing, "Note", None, Local::now()).unwrap_err();
+
+        // An unreachable vault must never read as "this vault has no templates";
+        // that would hide the real fault behind an empty picker.
+        for error in [list_error, create_error] {
+            assert!(
+                error.to_string().contains("vault root unreadable"),
+                "unexpected error: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_template_too_large_to_write_leaves_no_half_created_note_behind() {
+        let vault = tempfile::tempdir().unwrap();
+        fs::create_dir(vault.path().join("Templates")).unwrap();
+        // One byte past the editable-note ceiling: the template reads fine and
+        // renders fine, and only the write refuses it. The note file already exists
+        // by then, so the cleanup path is the only thing standing between the user
+        // and an empty note left behind by a failed creation.
+        let oversized = "x".repeat(crate::note::MAX_EDITABLE_NOTE_BYTES + 1);
+        fs::write(vault.path().join("Templates/Huge.md"), &oversized).unwrap();
+
+        let error = create_note_from_template(
+            vault.path(),
+            vault.path(),
+            "From huge template",
+            Some("Templates/Huge.md"),
+            Local::now(),
+        )
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("editable notes are limited"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            !vault.path().join("From huge template.md").exists(),
+            "the failed creation must not leave an empty note in the vault"
+        );
     }
 }

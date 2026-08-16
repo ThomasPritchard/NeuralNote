@@ -341,6 +341,70 @@ fn a_state_file_that_cannot_be_stat_ed_surfaces_a_read_error() {
         .contains("could not read workspace state"));
 }
 
+#[test]
+fn a_vault_root_that_is_a_regular_file_is_an_explicit_error_on_both_paths() {
+    // A root that is a file canonicalises fine, so the refusal has to come from
+    // inspecting `.neuralnote` underneath it — an ENOTDIR, which is not the
+    // "no state yet" NotFound the loader treats as an empty vault. Reading it as
+    // "no state yet" would silently discard whatever the real vault holds.
+    let file = tempfile::NamedTempFile::new().unwrap();
+
+    let load_error = load_workspace_state(file.path()).unwrap_err();
+    let reset_error = reset_workspace_state(file.path()).unwrap_err();
+
+    assert!(load_error
+        .to_string()
+        .contains("could not inspect workspace state directory"));
+    assert!(reset_error
+        .to_string()
+        .contains("could not create workspace state directory"));
+}
+
+#[test]
+fn a_vault_root_that_does_not_exist_surfaces_an_unreadable_root_error() {
+    let vault = tempfile::tempdir().unwrap();
+    let missing = vault.path().join("was-here");
+
+    let load_error = load_workspace_state(&missing).unwrap_err();
+    let save_error = save_workspace_state(&missing, &WorkspaceState::default()).unwrap_err();
+    let reset_error = reset_workspace_state(&missing).unwrap_err();
+
+    for error in [load_error, save_error, reset_error] {
+        assert!(
+            error.to_string().contains("vault root unreadable"),
+            "unexpected error: {error}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_state_file_that_cannot_be_opened_surfaces_a_read_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !permission_restrictions_apply() {
+        return;
+    }
+    let vault = tempfile::tempdir().unwrap();
+    fs::create_dir(vault.path().join(".neuralnote")).unwrap();
+    let path = vault.path().join(".neuralnote/workspace-state.json");
+    fs::write(&path, r#"{"openPaths":[],"activePath":null}"#).unwrap();
+    // Stat-able (the directory stays searchable) but not readable: the loader gets
+    // past every size and file-type check and only fails when it opens the file.
+    // An unreadable state file must not be mistaken for a missing one — that would
+    // silently drop the user's open tabs and then overwrite them on the next save.
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = load_workspace_state(vault.path());
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    let error = result.unwrap_err();
+    assert!(
+        error.to_string().contains("could not read workspace state"),
+        "unexpected error: {error}"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn a_read_only_vault_root_surfaces_the_state_dir_creation_failure() {

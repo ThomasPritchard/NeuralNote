@@ -24,6 +24,43 @@ import {
 } from "@/components/ui/dialog";
 import { buttonVariants } from "@/components/ui/button";
 
+/**
+ * Tauri's plugin dispatcher rejects an invoke call with this exact,
+ * fixed-format string — `` `plugin ${name} not found` `` — when the command
+ * targets a plugin that was never registered with the app (Tauri core,
+ * `crates/tauri/src/plugin.rs`, `PluginStore::extend_api`). It is emitted by
+ * Tauri itself before the updater plugin's own logic ever runs, so it never
+ * overlaps with any of `tauri-plugin-updater`'s own error variants (network,
+ * signature, malformed manifest, HTTP) — those are worded completely
+ * differently and some legitimately contain "not found" as substrings (e.g.
+ * a manifest missing the current platform), which is exactly why this match
+ * is an exact string, not a substring test. See
+ * `app/desktop/src-tauri/src/lib.rs:183-191`: the updater plugin is
+ * registered only when `plugins.updater.pubkey` resolves to a non-empty
+ * string (that is the whole check — emptiness, not validity). The base
+ * `tauri.conf.json` ships an `updater` block carrying `endpoints` and no
+ * `pubkey` at all; release builds merge the key in, while `tauri dev` and
+ * the unsigned local/smoke build inherit that base config unchanged and so
+ * leave the plugin unregistered. Their automatic check therefore always
+ * fails this exact way. That is expected app configuration — not a genuine
+ * update-check failure — so
+ * UpdateCoordinator downgrades it below sticky error severity (see the
+ * `subscribeAutomaticErrors` handler below). The Rust shell still logs
+ * `updater disabled: no public verification key configured` whenever this
+ * happens, so the condition is never silent even when suppressed here.
+ * Regression-pinned in UpdateCoordinator.test.tsx.
+ *
+ * TODO(#158): GeneralSettingsPage.tsx still renders lastAutomaticError
+ * unconditionally under "Last automatic update check failed", so it
+ * mislabels this same expected condition in Settings. Export this
+ * classifier once that page is in scope and reuse it there.
+ */
+const MISSING_UPDATER_PLUGIN_MESSAGE = "plugin updater not found";
+
+function isMissingUpdaterPluginError(message: string): boolean {
+  return message === MISSING_UPDATER_PLUGIN_MESSAGE;
+}
+
 function installProgressAnnouncement(status: UpdateState["status"]): string {
   if (status === "installing") return "Installing update.";
   if (status === "relaunching") return "Update installed. Relaunching NeuralNote.";
@@ -61,6 +98,11 @@ export function UpdateCoordinator({ children }: Readonly<{ children: ReactNode }
     () =>
       updateService.subscribeAutomaticErrors((message) => {
         setLastAutomaticError(message);
+        // Expected dev/unsigned-build configuration, not a failure — see
+        // isMissingUpdaterPluginError above. The message is still retained
+        // in lastAutomaticError above for anything that reads it; only the
+        // sticky, unmissable error toast is skipped.
+        if (isMissingUpdaterPluginError(message)) return;
         toast.error(`Automatic update check failed. ${message}`, {
           dedupKey: "automatic-update-error",
         });

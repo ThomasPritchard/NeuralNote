@@ -1,13 +1,28 @@
 //! Streaming sample-rate conversion and Whisper-compatible WAV emission.
 //!
 //! Coverage note (issue #55): this module deliberately sits below the 90%
-//! line-coverage target. The uncovered lines are defensive guards that are
-//! unreachable with valid inputs and cannot be exercised without a mock
-//! resampler/allocator seam we chose not to add to this security-sensitive
-//! path: the `checked_add`/`checked_mul` overflow arms (would need ~usize::MAX
-//! samples), the `try_reserve` allocation-failure arms, the "flush made no
-//! progress" guard, and the `InterleavedSlice`/`process_into_buffer`
-//! error arms on buffers this code always sizes correctly. See
+//! line-coverage target. What remains uncovered is defensive guards that no
+//! input can reach, because this code bounds the values they check before they
+//! run — exercising them would need a mock allocator or a mock resampler seam,
+//! which is not worth adding to a security-sensitive decode path:
+//!
+//! - the `checked_add`/`checked_mul` overflow arms in `push`, `finish` and
+//!   `append_output`: `validate_frame_budget` and `validate_resample_capacity`
+//!   reject the input long before ~`usize::MAX` samples could reach them (the
+//!   one arm an argument *can* reach, `write_wav_header`, is covered);
+//! - the `try_reserve` allocation-failure arms, which need a failing allocator;
+//! - the `InterleavedSlice::new`/`new_mut` error arms: `audioadapter-buffers`
+//!   (the crate this imports from — distinct from `audioadapter`) only rejects a
+//!   buffer shorter than `channels * frames`, and every buffer here is allocated
+//!   at exactly that length;
+//! - the `process_into_buffer` error arm, which comes from `rubato`'s own
+//!   `validate_buffers` rather than from any length check on our side;
+//! - the "resampler produced an invalid frame count" arm: `rubato` consumes the
+//!   whole fixed input chunk for every `partial_len` (measured across the range),
+//!   so `consumed` always equals the expected count.
+//!
+//! The two guards a test *can* reach live in `audio_stream_tests.rs`; the
+//! behavioural suite is in `audio_tests.rs`. See
 //! `docs/security/dependency-advisories.md` neighbours for the auditing stance.
 
 use super::{validate_frame_budget, MAX_AUDIO_DURATION_SECONDS};
@@ -298,3 +313,7 @@ pub(super) fn write_wav_header(wav: &mut [u8], sample_count: usize) -> Result<()
     wav[40..44].copy_from_slice(&data_len_u32.to_le_bytes());
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "audio_stream_tests.rs"]
+mod tests;
