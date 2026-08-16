@@ -261,7 +261,7 @@ const isSpaceOrTab = (character: string | undefined) =>
 /** Index of the first prose character, past any blockquote, bullet or ordered
  * list marker opening the line. */
 function blockMarkerEnd(value: string): number {
-  if (value[0] === ">") return isSpaceOrTab(value[1]) ? 2 : 1;
+  if (value.startsWith(">")) return isSpaceOrTab(value[1]) ? 2 : 1;
   if (BULLET_MARKERS.has(value[0]) && isSpaceOrTab(value[1])) return 2;
   return orderedMarkerEnd(value);
 }

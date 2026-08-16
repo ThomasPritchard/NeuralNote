@@ -137,10 +137,18 @@ function ToastViewport({
     // reds the empty-stack case in `ToastViewport.browser.test.tsx`, which is
     // the only test that looks before a notification has been raised.
     //
-    // `role="region"` because a bare `div` is `role="generic"` and browsers drop
-    // an `aria-label` on one. In flow rather than floating over the app, the
-    // dock is a real landmark, so the label now survives to name it.
-    <div role="region" aria-label="Notifications" className="shrink-0">
+    // A `section` rather than a labelled `div`, because a bare `div` is
+    // `role="generic"` and browsers drop an `aria-label` on one. In flow rather
+    // than floating over the app, the dock is a real landmark, so the label has
+    // to survive to name it.
+    //
+    // `section` carries the `region` role implicitly ONCE IT HAS AN ACCESSIBLE
+    // NAME, which is why the label here is load-bearing rather than decorative:
+    // strip `aria-label` and this silently stops being a landmark at all. The
+    // earlier `<div role="region">` named the same landmark and said so twice;
+    // Sonar `typescript:S6819` prefers the native element, and so does anything
+    // that maps HTML to platform accessibility APIs without consulting ARIA.
+    <section aria-label="Notifications" className="shrink-0">
       <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
         {politeAnnouncement}
       </div>
@@ -172,7 +180,7 @@ function ToastViewport({
           </ol>
         </div>
       )}
-    </div>
+    </section>
   );
 }
 
