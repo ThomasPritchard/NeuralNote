@@ -212,6 +212,22 @@ fn a_case_only_rename_lands_the_new_casing() {
     );
 }
 
+/// The filesystem root is the one path with no parent to rename within. It is
+/// only reachable when the vault root *is* `/`, but a caller that opened one must
+/// get a refusal rather than an unwrap on the missing parent.
+#[cfg(unix)]
+#[test]
+fn renaming_the_vault_root_itself_is_refused() {
+    let root = Path::new("/");
+
+    let error = rename_entry(root, root, "renamed-root").unwrap_err();
+
+    assert!(
+        error.to_string().contains("outside vault"),
+        "unexpected error: {error}"
+    );
+}
+
 #[test]
 fn deleting_a_missing_entry_reports_not_found() {
     let vault = vault();
@@ -219,6 +235,56 @@ fn deleting_a_missing_entry_reports_not_found() {
     let error = delete_entry(vault.path(), &vault.path().join("ghost.md")).unwrap_err();
 
     assert!(error.to_string().contains("not found"));
+}
+
+/// True when the filesystem enforces the restrictive permission bits the delete
+/// test below relies on (running as root bypasses them).
+#[cfg(all(unix, not(target_os = "macos")))]
+fn permission_restrictions_apply() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let file = tempfile::NamedTempFile::new().unwrap();
+    fs::set_permissions(file.path(), fs::Permissions::from_mode(0o000)).unwrap();
+    fs::read(file.path()).is_err()
+}
+
+/// A delete the OS refuses must surface as an error and leave the note in place.
+/// Reporting success would tell the UI to drop a note from the tree that is still
+/// on disk — content lost from the user's view without being lost from the vault.
+///
+/// Not run on macOS: there `trash::delete` asks Finder over AppleScript, and a
+/// refusal returns only when the Apple Event times out — a measured 120 s, which
+/// no test suite can carry. (That timeout is the product's behaviour too: a
+/// refused delete blocks the caller for two minutes on macOS.)
+#[cfg(all(unix, not(target_os = "macos")))]
+#[test]
+fn a_delete_the_os_refuses_surfaces_an_error_and_keeps_the_note() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !permission_restrictions_apply() {
+        return;
+    }
+    let vault = vault();
+    let locked = vault.path().join("locked");
+    fs::create_dir(&locked).unwrap();
+    let note = locked.join("stays.md");
+    fs::write(&note, "still here").unwrap();
+    // Trashing has to unlink the entry from its parent, and the copy-then-remove
+    // fallback has to read it. A read-only folder blocks the first and an
+    // unreadable note blocks the second, so the delete fails without anything
+    // being copied into the real Trash.
+    fs::set_permissions(&note, fs::Permissions::from_mode(0o000)).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o555)).unwrap();
+
+    let result = delete_entry(vault.path(), &note);
+
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::set_permissions(&note, fs::Permissions::from_mode(0o644)).unwrap();
+    let error = result.unwrap_err();
+    assert!(
+        error.to_string().contains("could not move to trash"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(fs::read_to_string(&note).unwrap(), "still here");
 }
 
 // Opt-in: `delete_entry` moves the file to the *real* OS Trash (`trash::delete`
