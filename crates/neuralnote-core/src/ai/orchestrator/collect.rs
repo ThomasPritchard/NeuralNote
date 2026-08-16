@@ -31,6 +31,7 @@ pub(super) enum EvidenceCollection {
 struct ToolBatchControl {
     budget_hit: bool,
     complete_turn: bool,
+    cancelled: bool,
 }
 
 impl ChatSession<'_> {
@@ -159,11 +160,12 @@ impl ChatSession<'_> {
             {
                 youtube_session.cancel_playlist_remaining();
                 playlist_cancelled = true;
-                // The orchestrator knows the run is ending short. Say so once,
-                // rather than leaving the UI to infer it from the model's prose.
-                sink.send(ChatEvent::PartialRun {
-                    reason: PARTIAL_RUN_CANCELLED.to_string(),
-                });
+                if !control.cancelled {
+                    control.cancelled = true;
+                    sink.send(ChatEvent::PartialRun {
+                        reason: PARTIAL_RUN_CANCELLED.to_string(),
+                    });
+                }
             }
             if playlist_cancelled {
                 settle_skipped(messages, sink, call, SkippedCall::PlaylistCancelled);
@@ -190,6 +192,13 @@ impl ChatSession<'_> {
                 )
                 .await;
             control.complete_turn |= tool_control == tools::ToolControl::CompleteTurn;
+            if settlement.status() == crate::ai::events::ToolStatus::Cancelled && !control.cancelled
+            {
+                control.cancelled = true;
+                sink.send(ChatEvent::PartialRun {
+                    reason: PARTIAL_RUN_CANCELLED.to_string(),
+                });
+            }
             emit_tool_result(sink, &call.id, settlement);
             let current_playlist_item = youtube_session
                 .playlist_current()
@@ -504,6 +513,13 @@ fn collection_after_tool_batch(
 ) -> Option<EvidenceCollection> {
     if control.complete_turn {
         return Some(EvidenceCollection::CompleteTurn);
+    }
+    if control.cancelled {
+        // PartialRun was already emitted with the cancelled reason. Do not
+        // report this as a tripped work-limit — that sentence is false for Stop.
+        return Some(EvidenceCollection::Answer {
+            guard_tripped: false,
+        });
     }
     if youtube_session.playlist_is_finished() {
         return Some(EvidenceCollection::Answer {

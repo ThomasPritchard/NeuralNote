@@ -1,5 +1,6 @@
 //! Per-video playlist control: bounded turns, announcements, and context eviction.
 
+use super::PARTIAL_RUN_CANCELLED;
 use crate::ai::events::{ChatEvent, EventSink};
 use crate::ai::llm::{LlmMessage, Role};
 use crate::ai::youtube::YoutubeToolSession;
@@ -49,7 +50,10 @@ pub(super) fn playlist_preflight(
     if youtube_session.cancellation().is_cancelled() {
         youtube_session.cancel_playlist_remaining();
         state.sync(messages, youtube_session, sink);
-        return LoopControl::Return(true);
+        sink.send(ChatEvent::PartialRun {
+            reason: PARTIAL_RUN_CANCELLED.to_string(),
+        });
+        return LoopControl::Return(false);
     }
     let over_turn_limit = youtube_session
         .record_playlist_turn()

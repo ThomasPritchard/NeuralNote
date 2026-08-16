@@ -1530,6 +1530,14 @@ mod tests {
             "a user's own Stop is neither a failure nor a refusal"
         );
         assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::PartialRun { .. }))
+                .count(),
+            1,
+            "stopping mid-run must announce PartialRun once, not leave the UI to infer it"
+        );
+        assert_eq!(
             settled_status(&events, "c2"),
             ToolStatus::Rejected,
             "a refusal stays a refusal: nothing was attempted, so the run ending changes nothing about it"

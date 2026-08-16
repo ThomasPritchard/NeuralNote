@@ -1112,7 +1112,7 @@ fn cancellation_between_transcription_attempts_prevents_update_and_retry() {
         &format!(r#"{{"url":"{URL}"}}"#),
     );
 
-    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    assert_eq!(result.outcome, ToolOutcome::Cancelled);
     assert!(result.content.contains("cancelled"));
     assert_eq!(io.transcribe_calls.load(Ordering::SeqCst), 1);
     assert_eq!(io.updates.load(Ordering::SeqCst), 0);
@@ -1135,8 +1135,8 @@ fn a_transcription_crash_that_coincides_with_a_stop_still_names_the_crash() {
     // crash left NO trace: not in the tool result, not in the timeline, nowhere.
     // That is the one thing this codebase does not do with failures.
     //
-    // The outcome is still a refusal — the run ended, NeuralNote did not break —
-    // but the account it carries has to be the whole account.
+    // The outcome is Cancelled — the run ended, NeuralNote did not refuse and
+    // did not break — but the account it carries has to be the whole account.
     let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
     io.push_transcription(Err(CaptureError::TranscriptionFailed(
         "whisper-cli exited with signal 11".into(),
@@ -1154,7 +1154,7 @@ fn a_transcription_crash_that_coincides_with_a_stop_still_names_the_crash() {
         &format!(r#"{{"url":"{URL}"}}"#),
     );
 
-    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    assert_eq!(result.outcome, ToolOutcome::Cancelled);
     assert!(result.content.contains("cancelled"), "{}", result.content);
     assert!(
         result.content.contains("whisper-cli exited with signal 11"),
@@ -1187,7 +1187,7 @@ fn cancellation_during_extractor_update_prevents_transcription_retry() {
         &format!(r#"{{"url":"{URL}"}}"#),
     );
 
-    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    assert_eq!(result.outcome, ToolOutcome::Cancelled);
     assert!(result.content.contains("cancelled"));
     assert_eq!(io.transcribe_calls.load(Ordering::SeqCst), 1);
     assert_eq!(io.updates.load(Ordering::SeqCst), 1);

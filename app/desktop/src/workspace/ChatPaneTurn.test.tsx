@@ -700,6 +700,27 @@ describe("ChatPane — chat view", () => {
     expect(composer()).toBeEnabled();
   });
 
+  it("keeps the usage footer after the error card on a failed turn", async () => {
+    await askInChat("q", [
+      { type: "searching", query: "x" },
+      {
+        type: "usage",
+        elapsedMs: 8412,
+        tokensIn: 3120,
+        tokensOut: 486,
+        model: "qwen3.5:9b",
+      },
+      { type: "error", message: "stream ended without content" },
+    ]);
+
+    const error = screen.getByRole("alert");
+    const usage = screen.getByRole("list", { name: "What this turn cost" });
+    expect(error).toHaveTextContent("stream ended without content");
+    expect(
+      error.compareDocumentPosition(usage) & Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
   it("surfaces a partial-coverage warning when results were truncated", async () => {
     await askInChat("q", [
       {

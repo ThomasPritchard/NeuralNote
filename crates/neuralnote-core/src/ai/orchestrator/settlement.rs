@@ -20,6 +20,12 @@ pub(super) struct ToolSettlement {
     detail: Option<String>,
 }
 
+impl ToolSettlement {
+    pub(super) fn status(&self) -> ToolStatus {
+        self.status
+    }
+}
+
 /// Why a declared call never reached the dispatcher. Closed on purpose: each
 /// variant both answers the model and settles the timeline node, so a new
 /// short-circuit cannot be added that leaves a node spinning forever.

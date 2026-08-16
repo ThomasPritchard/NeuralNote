@@ -802,9 +802,13 @@ fn high_usage_confirmation_surfaces_cancel_and_no_response() {
     let selected = (0..21)
         .map(|index| format!("V{index:010}"))
         .collect::<Vec<_>>();
-    for (confirmation, expected) in [
-        (Some(vec!["cancel".into()]), "cancelled"),
-        (None, "playlist confirmation failed"),
+    for (confirmation, expected_outcome, expected_text) in [
+        (
+            Some(vec!["cancel".into()]),
+            ToolOutcome::Cancelled,
+            "cancelled",
+        ),
+        (None, ToolOutcome::Rejected, "playlist confirmation failed"),
     ] {
         let vault = tempfile::tempdir().unwrap();
         let retriever = KeywordRetriever::new(vault.path());
@@ -826,8 +830,8 @@ fn high_usage_confirmation_surfaces_cancel_and_no_response() {
             r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-paged_123"}"#,
         );
 
-        assert_eq!(result.outcome, ToolOutcome::Rejected);
-        assert!(result.content.contains(expected), "{}", result.content);
+        assert_eq!(result.outcome, expected_outcome);
+        assert!(result.content.contains(expected_text), "{}", result.content);
     }
 }
 

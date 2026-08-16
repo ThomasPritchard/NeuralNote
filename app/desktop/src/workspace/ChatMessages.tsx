@@ -204,11 +204,6 @@ function AssistantTurn({
       )}
       <Sources citations={turn.citations} onOpen={onOpenCitation} />
       {turn.coverage && <CoverageFooter coverage={turn.coverage} />}
-      {/* Last, and quietest. What the run cost is a fact about the turn worth
-          having on the record, not a thing to read on the way to the answer —
-          and a turn whose provider never reported usage renders exactly as it
-          did before this existed. */}
-      <UsageFooter usage={turn.usage} />
       {turn.error && (
         <div
           role="alert"
@@ -218,6 +213,11 @@ function AssistantTurn({
           <span className="min-w-0 flex-1 break-words leading-snug">{turn.error}</span>
         </div>
       )}
+      {/* Last, and quietest. What the run cost is a fact about the turn worth
+          having on the record, not a thing to read on the way to the answer —
+          and a turn whose provider never reported usage renders exactly as it
+          did before this existed. */}
+      <UsageFooter usage={turn.usage} />
     </div>
   );
 }

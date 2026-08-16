@@ -550,6 +550,30 @@ fn playlist_parser_validates_and_deduplicates_in_source_order() {
 }
 
 #[test]
+fn playlist_parser_accepts_null_titles_instead_of_rejecting_the_whole_playlist() {
+    // yt-dlp emits `"title": null` for some playlists and for deleted
+    // entries. A required String makes serde fail the entire payload
+    // ("null value was rejected where a string was expected") and the
+    // picker never appears.
+    let raw = br#"{
+        "_type":"playlist",
+        "id":"PL-safe_123",
+        "title":null,
+        "entries":[
+            {"_type":"url","id":"iG9CE55wbtY","title":null,"duration":10},
+            {"_type":"url","id":"UF8uR6Z6KLc","title":"Second","duration":20}
+        ]
+    }"#;
+
+    let parsed = parse_playlist(raw).expect("null titles must not fail the playlist");
+    assert_eq!(parsed.playlist_id, "PL-safe_123");
+    assert_eq!(parsed.title, "PL-safe_123");
+    assert_eq!(parsed.entries.len(), 2);
+    assert_eq!(parsed.entries[0].title, "iG9CE55wbtY");
+    assert_eq!(parsed.entries[1].title, "Second");
+}
+
+#[test]
 fn playlist_parser_skips_unavailable_entries_and_reports_the_count() {
     let parsed = parse_playlist(&playlist_json(
         r#"[
