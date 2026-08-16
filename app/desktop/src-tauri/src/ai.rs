@@ -48,18 +48,38 @@ const E2E_KEY_ACCOUNT: &str = "openrouter-api-key-e2e";
 /// out of the shipped app's credential namespace.
 static KEYCHAIN_SERVICE_OVERRIDE: OnceLock<String> = OnceLock::new();
 
+/// The running build could not name itself, so its credential namespace cannot be
+/// derived. Fatal on purpose: carrying on means falling back to the shipped app's
+/// namespace, which is the very defect a per-identity namespace prevents.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct BlankBundleIdentifier;
+
+impl std::fmt::Display for BlankBundleIdentifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the running bundle identifier is blank, so this build's keychain namespace cannot be \
+             derived; refusing to start rather than binding it to the shipped app's credential \
+             under '{KEYCHAIN_SERVICE}'"
+        )
+    }
+}
+
+impl std::error::Error for BlankBundleIdentifier {}
+
 /// Bind `slot` to a bundle identifier. The slot is injected rather than read from
 /// the static so the rules below are testable without a process-global race.
 ///
-/// A blank identifier is refused: an empty namespace is not a safer default than
-/// the historical one, it is just a different, wrong one. Only the first non-blank
-/// value is kept, so nothing can move the namespace out from under a session that
-/// has already read a key.
-fn bind_identifier(slot: &OnceLock<String>, identifier: &str) {
+/// A blank identifier is an error, not a fallback: an empty namespace is not a
+/// safer default than the historical one, and the historical one is the shipped
+/// app's. Only the first non-blank value is kept, so nothing can move the
+/// namespace out from under a session that has already read a key — a rejected
+/// rebind is logged rather than fatal, because the namespace already in force is
+/// a real one.
+fn bind_identifier(slot: &OnceLock<String>, identifier: &str) -> Result<(), BlankBundleIdentifier> {
     let identifier = identifier.trim();
     if identifier.is_empty() {
-        log::warn!("blank bundle identifier ignored; keychain stays on {KEYCHAIN_SERVICE}");
-        return;
+        return Err(BlankBundleIdentifier);
     }
     if let Err(rejected) = slot.set(identifier.to_string()) {
         let bound = slot.get().map_or(KEYCHAIN_SERVICE, String::as_str);
@@ -67,12 +87,22 @@ fn bind_identifier(slot: &OnceLock<String>, identifier: &str) {
             log::warn!("keychain namespace already bound to {bound}; ignoring {rejected}");
         }
     }
+    Ok(())
 }
 
 /// Bind the credential namespace to the running app's bundle identifier. Called
 /// once from the shell's Tauri `setup()` hook, before any command can read a key.
-pub(crate) fn init_keychain_service(identifier: &str) {
-    bind_identifier(&KEYCHAIN_SERVICE_OVERRIDE, identifier);
+///
+/// The resolved service is logged because "the dev build forgot my API key" has
+/// exactly one first question — which keychain service did this process use — and
+/// nothing else in a shipped run answers it. A service name is a bundle
+/// identifier, never a secret; the account name and the key itself stay out of
+/// the log.
+pub(crate) fn init_keychain_service(identifier: &str) -> Result<(), BlankBundleIdentifier> {
+    bind_identifier(&KEYCHAIN_SERVICE_OVERRIDE, identifier)
+        .inspect_err(|error| log::error!("{error}"))?;
+    log::info!("keychain namespace bound to {}", keychain_service());
+    Ok(())
 }
 
 /// Which keychain service this build uses, given whatever identifier was bound.
@@ -1290,20 +1320,158 @@ mod tests {
         }
     }
 
+    /// The top-level bundle `identifier` a config declares, or `None` when it
+    /// leaves the identifier to the config it overlays.
+    ///
+    /// Only the top-level key names the application. `app.security.capabilities[]`
+    /// entries carry an `identifier` too — that is a capability name and has
+    /// nothing to do with the credential namespace, so a search that went looking
+    /// anywhere in the tree would report the wrong thing.
+    fn declared_identifier(path: &Path) -> Option<String> {
+        let raw = fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+        let config: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
+        config.get("identifier").map(|identifier| {
+            identifier
+                .as_str()
+                .unwrap_or_else(|| panic!("{} declares a non-string `identifier`", path.display()))
+                .to_string()
+        })
+    }
+
     /// The bundle identifier a shipped configuration actually carries, read from
     /// the real file so an edit to it trips the pins below instead of silently
     /// moving the keychain namespace.
     fn configured_identifier(config_file_name: &str) -> String {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(config_file_name);
-        let raw = fs::read_to_string(&path)
-            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
-        let config: serde_json::Value = serde_json::from_str(&raw)
-            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
-        config
-            .get("identifier")
-            .and_then(serde_json::Value::as_str)
+        declared_identifier(&path)
             .unwrap_or_else(|| panic!("{} has no string `identifier`", path.display()))
-            .to_string()
+    }
+
+    /// Config files that may legitimately carry an identifier other than the
+    /// shipped one, because neither can produce a build a user installs: the
+    /// macOS smoke bundle and the WebdriverIO automation bundle.
+    ///
+    /// Repository-relative and listed one by one on purpose. Matching on the file
+    /// name alone would let a new `tauri.dev-build.conf.json` in some other
+    /// directory inherit the exemption by accident.
+    const NON_SHIPPING_CONFIG_OVERLAYS: [&str; 2] = [
+        "app/desktop/e2e-native/tauri.e2e.conf.json",
+        "app/desktop/src-tauri/tauri.dev-build.conf.json",
+    ];
+
+    /// Directories with no authored configuration in them. `target` and
+    /// `node_modules` in particular hold vendored copies that are not ours.
+    const UNSEARCHED_DIRECTORIES: [&str; 3] = [".git", "node_modules", "target"];
+
+    /// The repository root, proven to be the repository root. A walk rooted at
+    /// the wrong directory finds no configs at all and would pass vacuously.
+    fn repository_root() -> PathBuf {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .ancestors()
+            .nth(3)
+            .expect("the desktop crate sits three directories below the repository root")
+            .to_path_buf();
+        assert!(
+            root.join("Cargo.toml").is_file() && root.join(".github").is_dir(),
+            "{} is not the repository root; the config walk below would search nothing",
+            root.display()
+        );
+        root
+    }
+
+    /// Every Tauri configuration file in the repository, collected as paths
+    /// relative to `root` and separator-normalised so they can be compared
+    /// against the literals above.
+    ///
+    /// `.conf.json` is the whole search space, not a guess: `tauri` and
+    /// `tauri-build` are both built with `features = []`, so `config-json5` and
+    /// `config-toml` are off and a `tauri.conf.json5` or `Tauri.toml` would be
+    /// ignored by the build rather than merged.
+    fn tauri_config_files(root: &Path) -> Vec<String> {
+        fn walk(directory: &Path, root: &Path, found: &mut Vec<String>) {
+            let entries = fs::read_dir(directory)
+                .unwrap_or_else(|e| panic!("could not read {}: {e}", directory.display()));
+            for entry in entries {
+                let entry =
+                    entry.unwrap_or_else(|e| panic!("could not read {}: {e}", directory.display()));
+                let name = entry.file_name().to_string_lossy().into_owned();
+                // `file_type` does not follow symlinks, so a link pointing back up
+                // the tree is skipped rather than walked forever.
+                let file_type = entry
+                    .file_type()
+                    .unwrap_or_else(|e| panic!("could not stat {}: {e}", entry.path().display()));
+                if file_type.is_dir() {
+                    if !UNSEARCHED_DIRECTORIES.contains(&name.as_str()) {
+                        walk(&entry.path(), root, found);
+                    }
+                } else if file_type.is_file() && name.ends_with(".conf.json") {
+                    let relative = entry
+                        .path()
+                        .strip_prefix(root)
+                        .expect("the walk never leaves the repository root")
+                        .to_string_lossy()
+                        .replace('\\', "/");
+                    found.push(relative);
+                }
+            }
+        }
+
+        let mut found = Vec::new();
+        walk(root, root, &mut found);
+        found.sort();
+        found
+    }
+
+    /// The other half of the no-migration pin. The production `tauri.conf.json`
+    /// is not the only file that can set the shipped identifier: Tauri merges
+    /// platform overlays (`tauri.macos.conf.json`) with no flag at all, and any
+    /// file can be passed to `tauri build --config`. Pinning only the base config
+    /// leaves every one of those free to move the keychain namespace.
+    ///
+    /// What goes red: add an in-repo config that sets an `identifier` other than
+    /// the shipped one without declaring it non-shipping.
+    ///
+    /// What this cannot see: an overlay that never lands in the repository —
+    /// `--config` with inline JSON, or the `TAURI_CONFIG` environment variable.
+    /// The release workflow's own overlay is covered by
+    /// `scripts/check-release-workflow.mjs`.
+    #[test]
+    fn no_in_repository_config_overlay_moves_the_keychain_namespace() {
+        let root = repository_root();
+        let configs = tauri_config_files(&root);
+
+        // The walk proves itself before it is trusted: one that cannot find the
+        // configs we know exist could not find a new one either, and its silence
+        // would mean nothing.
+        for known in std::iter::once("app/desktop/src-tauri/tauri.conf.json")
+            .chain(NON_SHIPPING_CONFIG_OVERLAYS)
+        {
+            assert!(
+                configs.iter().any(|found| found == known),
+                "the config walk did not find {known}, so it cannot be trusted to find a new \
+                 overlay either — found: {configs:?}"
+            );
+        }
+
+        for config in &configs {
+            if NON_SHIPPING_CONFIG_OVERLAYS.contains(&config.as_str()) {
+                continue;
+            }
+            let Some(identifier) = declared_identifier(&root.join(config)) else {
+                continue;
+            };
+            assert_eq!(
+                identifier, KEYCHAIN_SERVICE,
+                "{config} sets the bundle identifier to '{identifier}'. The keychain service \
+                 follows the running identifier, so a build carrying this config would look for \
+                 the API key under '{identifier}' while every existing user's key is stored under \
+                 '{KEYCHAIN_SERVICE}' — theirs would be orphaned and the app would simply report \
+                 no key configured. Ship a keychain migration first, or add the file to \
+                 NON_SHIPPING_CONFIG_OVERLAYS if it can never produce an installed build"
+            );
+        }
     }
 
     /// The no-migration pin. Deriving the keychain namespace from the bundle
@@ -1371,16 +1539,8 @@ mod tests {
     fn binding_takes_the_first_non_blank_identifier_and_nothing_later() {
         let slot = OnceLock::new();
 
-        for blank in ["", "   ", "\t\n"] {
-            bind_identifier(&slot, blank);
-            assert_eq!(
-                slot.get(),
-                None,
-                "a blank identifier must never become a keychain namespace"
-            );
-        }
-
-        bind_identifier(&slot, "  com.neuralnote.desktop.dev  ");
+        bind_identifier(&slot, "  com.neuralnote.desktop.dev  ")
+            .expect("a non-blank identifier binds");
         assert_eq!(
             slot.get().map(String::as_str),
             Some("com.neuralnote.desktop.dev"),
@@ -1388,12 +1548,65 @@ mod tests {
         );
 
         // First write wins: nothing may move the namespace out from under a
-        // session that has already read a key.
-        bind_identifier(&slot, "com.neuralnote.desktop");
+        // session that has already read a key. A rebind is rejected, not fatal —
+        // the namespace in force is still a real one.
+        bind_identifier(&slot, "com.neuralnote.desktop").expect("a rebind is refused, not fatal");
         assert_eq!(
             slot.get().map(String::as_str),
             Some("com.neuralnote.desktop.dev")
         );
+    }
+
+    /// A blank identifier is the one case where "carry on" and "fall back" are
+    /// the same wrong answer: falling back binds this build to the shipped app's
+    /// credential, which is the exact defect the identifier-scoped namespace
+    /// exists to prevent. A build that cannot name itself refuses to start.
+    ///
+    /// What goes red: return `Ok(())` from the blank branch. The process would
+    /// start, resolve to the legacy constant, and a `warn` line nobody reads
+    /// would be the only trace that a build took the real user's API key.
+    #[test]
+    fn a_blank_identifier_refuses_to_start_instead_of_falling_back() {
+        let slot = OnceLock::new();
+
+        for blank in ["", "   ", "\t\n"] {
+            assert_eq!(
+                bind_identifier(&slot, blank),
+                Err(BlankBundleIdentifier),
+                "a blank identifier must fail closed, not be warned about and ignored"
+            );
+            assert_eq!(
+                slot.get(),
+                None,
+                "a blank identifier must never become a keychain namespace"
+            );
+        }
+
+        // The shell calls the entry point, not the helper, so the refusal has to
+        // hold there too. Safe against the process-wide static in a parallel
+        // suite: a blank identifier is rejected before the slot is ever touched.
+        assert_eq!(
+            init_keychain_service("   "),
+            Err(BlankBundleIdentifier),
+            "the shell's entry point must refuse a blank identifier, not just the helper"
+        );
+
+        // The refusal aborts startup, so its message is all a maintainer gets. It
+        // has to name what was refused and what it refused to fall back to.
+        let refusal = BlankBundleIdentifier.to_string();
+        assert!(
+            refusal.contains(KEYCHAIN_SERVICE) && refusal.contains("refusing to start"),
+            "the refusal must explain itself, got: {refusal}"
+        );
+
+        // The stakes, made explicit: this is the namespace the process would have
+        // gone on to use had the refusal above been a fallback instead.
+        if !cfg!(feature = "native-e2e") {
+            assert_eq!(
+                resolve_keychain_service(slot.get().map(String::as_str)),
+                KEYCHAIN_SERVICE
+            );
+        }
     }
 
     /// The real process-wide static, end to end: `init_keychain_service` and
@@ -1407,7 +1620,7 @@ mod tests {
     #[test]
     fn the_shell_binds_the_process_wide_namespace() {
         let identifier = configured_identifier("tauri.conf.json");
-        init_keychain_service(&identifier);
+        init_keychain_service(&identifier).expect("the production identifier is not blank");
 
         // Reading the real static is what distinguishes "bound" from "silently
         // ignored" — the resolved service alone cannot, while the production

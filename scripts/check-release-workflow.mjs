@@ -1,5 +1,9 @@
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { readFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
@@ -62,6 +66,51 @@ function runBodies(source) {
   }
 
   return bodies;
+}
+
+// The body of a `<<'MARKER'` heredoc inside a step, dedented back to column zero
+// so it can be run as a script in its own right.
+function heredocBody(step, marker) {
+  const opening = `<<'${marker}'\n`;
+  const start = step.indexOf(opening);
+  if (start === -1) return "";
+  const body = step.slice(start + opening.length);
+  const end = body.search(new RegExp(`^\\s*${marker}\\s*$`, "m"));
+  if (end === -1) return "";
+
+  const lines = body.slice(0, end).split("\n");
+  const indent = Math.min(
+    ...lines.filter((line) => line.trim()).map((line) => line.length - line.trimStart().length),
+  );
+  return lines.map((line) => line.slice(indent)).join("\n");
+}
+
+// Run the workflow's own config generator and return what it actually wrote.
+//
+// Asserting against the generator's *source* would only test this file's idea of
+// it; running it tests the artifact that is merged into the shipped bundle.
+function generateReleaseConfig(generatorSource, signingMode) {
+  const directory = mkdtempSync(join(tmpdir(), "neuralnote-release-config-"));
+  try {
+    const generator = join(directory, "generate-release-config.cjs");
+    const releaseConfig = join(directory, "tauri.release.conf.json");
+    writeFileSync(generator, generatorSource);
+    execFileSync(process.execPath, [generator], {
+      env: {
+        ...process.env,
+        RELEASE_CONFIG: releaseConfig,
+        SIGNING_MODE: signingMode,
+        // Shaped only to clear the generator's own validation: long enough, and
+        // not a private key. No real credential is involved.
+        TAURI_UPDATER_PUBLIC_KEY: "release-workflow-contract-test-public-verification-key",
+        APPLE_SIGNING_IDENTITY: "Developer ID Application: Example (TEAMID)",
+      },
+      stdio: "pipe",
+    });
+    return JSON.parse(readFileSync(releaseConfig, "utf8"));
+  } finally {
+    rmSync(directory, { recursive: true, force: true });
+  }
 }
 
 const trigger = between("on:\n", "\nconcurrency:");
@@ -341,6 +390,58 @@ test("release artifacts are allowlisted and integrity-checked between jobs", () 
   assert.match(validate, /\.app\.tar\.gz/);
   assert.match(validate, /\.dmg/);
   assert.match(validate, /latest-alpha\.json/);
+});
+
+// The keychain namespace of the shipped app follows its bundle identifier
+// (`app/desktop/src-tauri/src/ai.rs`). The Rust pin there reads the identifier out
+// of the in-repo configs, so it cannot see a build-time overlay — and this workflow
+// generates exactly such an overlay and merges it into the signed bundle. This test
+// is that overlay's half of the pin.
+test("no release-build overlay moves the shipped bundle identifier", () => {
+  const orphanWarning =
+    "the shipped bundle identifier would move: the macOS keychain service follows it, so every " +
+    "existing user's stored API key is orphaned under the old service and the app reports no key " +
+    "configured — ship a keychain migration before changing it";
+
+  const validateConfig = stepBody(build, "Validate public release configuration");
+  assert.ok(validateConfig, "release workflow is missing the release-configuration step");
+  const generator = heredocBody(validateConfig, "NODE");
+  assert.match(generator, /RELEASE_CONFIG/, "the release-config generator could not be extracted");
+
+  for (const signingMode of ["ad-hoc", "developer-id"]) {
+    const releaseConfig = generateReleaseConfig(generator, signingMode);
+    // Proves the generator really ran and produced the release overlay, so the
+    // identifier assertion below is measuring the artifact and not an empty object.
+    assert.ok(
+      releaseConfig.plugins?.updater?.pubkey,
+      `the ${signingMode} release config is not the generated release overlay`,
+    );
+    assert.ok(
+      !Object.hasOwn(releaseConfig, "identifier"),
+      `the ${signingMode} release config declares an identifier — ${orphanWarning}`,
+    );
+  }
+
+  // A second overlay would reach the packaged bundle without passing through the
+  // generator above, so the generated file must be the only one.
+  const configArguments = [...workflow.matchAll(/tauri build[^\n]*?--config (\S+)/g)].map(
+    ([, argument]) => argument,
+  );
+  assert.deepEqual(
+    configArguments,
+    ['"$RELEASE_CONFIG"', '"$RELEASE_CONFIG"'],
+    `every packaging build must merge only the generated release config — ${orphanWarning}`,
+  );
+  for (const step of [
+    stepBody(build, "Build ad-hoc Apple Silicon bundles"),
+    stepBody(build, "Build Developer ID Apple Silicon bundles"),
+  ]) {
+    assert.doesNotMatch(
+      step,
+      /TAURI_CONFIG:/,
+      `a packaging build must not merge a config through the environment — ${orphanWarning}`,
+    );
+  }
 });
 
 test("existing release quality and supply-chain controls remain enforced", () => {
