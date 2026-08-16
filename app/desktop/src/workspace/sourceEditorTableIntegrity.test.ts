@@ -8,12 +8,12 @@
 //
 // If any command can eat a trailing pipe or newline, this goes red.
 
-import { ensureSyntaxTree } from "@codemirror/language";
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
+import { withPublishedParse } from "../test/publishedParse";
 import {
   formatTableAt,
   tableCellStep,
@@ -76,40 +76,35 @@ const FIXTURE = [
   "",
 ].join("\n");
 
+// Both helpers publish the finished parse before anyone reads the tree — see
+// `src/test/publishedParse.ts` for why, and for why fixing only `guardedState`
+// (as #118 and #142 did) left the blank-row test below still failing at 20 CPU
+// burners through `state()`.
 function state(doc: string, anchor: number) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.cursor(anchor),
+      extensions: [
+        markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+      ],
+    }),
     doc,
-    selection: EditorSelection.cursor(anchor),
-    extensions: [
-      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
-    ],
-  });
+  );
 }
 
 function guardedState(doc: string, anchor: number) {
-  const editor = EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.cursor(anchor),
+      extensions: [
+        markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+        tableDelimiterGuard,
+      ],
+    }),
     doc,
-    selection: EditorSelection.cursor(anchor),
-    extensions: [
-      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
-      tableDelimiterGuard,
-    ],
-  });
-  // Parse the WHOLE document before anyone reads the tree.
-  //
-  // `LanguageState.init` parses only `Work.InitViewport` (3,000) characters and
-  // abandons even that after 20ms of WALL CLOCK, so on a busy machine two states
-  // built from the same text can hold different trees. This test derives its
-  // expected set from one state and its observed behaviour from another, so that
-  // divergence showed up as the guard "failing to refuse" at a position it had
-  // never parsed — a flake in the one test that guards byte fidelity.
-  //
-  // Production cannot hit this: the filter and the paint path read the SAME
-  // state, so they agree by construction whatever the parse has reached.
-  if (!ensureSyntaxTree(editor, doc.length, 30_000)) {
-    throw new Error("the fixture did not parse in full; every assertion below would be unsound");
-  }
-  return editor;
+  );
 }
 
 /**

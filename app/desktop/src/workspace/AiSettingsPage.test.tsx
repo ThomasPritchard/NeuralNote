@@ -155,7 +155,9 @@ function mockDefaults() {
   mockHfMeta.mockRejectedValue(new Error("offline"));
   mockInstalled.mockResolvedValue([]);
   mockSetActive.mockResolvedValue(OR_ACTIVE);
-  mockSaveKey.mockResolvedValue(undefined);
+  // The Rust command reports whether the cross-process key revision was
+  // published; the default is the ordinary success (`commands/ai.rs:55`).
+  mockSaveKey.mockResolvedValue({ revisionPublished: true });
   // `set_reasoning` returns the freshly persisted status, like the Rust command.
   mockSetReasoning.mockResolvedValue(UNCONFIGURED);
   mockCancel.mockResolvedValue(undefined);

@@ -17,6 +17,7 @@ import { StatusPill as NeuralStatusPill } from "@/components/neural/patterns";
 import { ChatTranscript } from "./ChatTranscript";
 import type { CitationView } from "./chatMessage";
 import { ChatComposer } from "./ChatComposer";
+import { KeyChangeCaveat } from "./KeyChangeCaveat";
 import { DisconnectedPane, KeySetupPanel } from "./KeySetupPanel";
 import { ProviderPicker } from "./ProviderPicker";
 import type { SkillPickerEntry } from "./skillAutocomplete";
@@ -151,6 +152,15 @@ export function ChatPane({
           citation-checked against its source.
         </p>
       </header>
+
+      {/* Between the chrome and whichever body the view resolves to, so it
+          survives the setup panel being swapped out for the transcript — the
+          save that raises it is the same save that ends the setup view. */}
+      {provider.keyChangeCaveat && (
+        <div className="shrink-0 px-5 pt-3">
+          <KeyChangeCaveat onDismiss={provider.dismissKeyChangeCaveat} />
+        </div>
+      )}
 
       {view === "loading" && (
         <output className="flex min-h-0 flex-1 items-center justify-center gap-2 text-[0.75rem] text-muted-foreground/70">

@@ -1,8 +1,8 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
-import { ensureSyntaxTree } from "@codemirror/language";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
+import { withPublishedParse } from "../test/publishedParse";
 import { collectObsidianPreview } from "../workspace/obsidianLivePreview";
 import {
   collectMarkdownPreview,
@@ -141,18 +141,35 @@ function compatibilityCase(id: string): MarkdownCompatibilityCaseV1 {
   return found;
 }
 
+/**
+ * A contract fixture whose finished parse the syntax tree actually holds.
+ *
+ * Every construct this contract pins is read out of `syntaxTree(state)`, so a
+ * truncated tree does not weaken a case — it deletes it, and
+ * `expect(classNames).toEqual(expect.arrayContaining(...))` reports a compat
+ * REGRESSION for a construct the parser simply had not reached. `LanguageState.
+ * init` gives that parse 20 ms of wall clock
+ * (`@codemirror/language/dist/index.js:539-545`), which a loaded machine can
+ * spend before a one-line fixture is done. See `src/test/publishedParse.ts`,
+ * which also explains why the `ensureSyntaxTree` call this replaced could not
+ * close it: it advanced the parse context and left `syntaxTree` reading the
+ * snapshot taken in the field's constructor.
+ */
 function state(source: string, anchors?: readonly number[]): EditorState {
   const logicalSource = loadSourceText(source).text;
-  return EditorState.create({
-    doc: logicalSource,
-    selection: EditorSelection.create(
-      (anchors ?? [logicalSource.length]).map((anchor) => EditorSelection.cursor(anchor)),
-    ),
-    extensions: [
-      EditorState.allowMultipleSelections.of(true),
-      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
-    ],
-  });
+  return withPublishedParse(
+    EditorState.create({
+      doc: logicalSource,
+      selection: EditorSelection.create(
+        (anchors ?? [logicalSource.length]).map((anchor) => EditorSelection.cursor(anchor)),
+      ),
+      extensions: [
+        EditorState.allowMultipleSelections.of(true),
+        markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+      ],
+    }),
+    logicalSource,
+  );
 }
 
 function constructAnchor(item: MarkdownCompatibilityCaseV1, source: string): number {
@@ -172,8 +189,9 @@ function assertParserBehavior(
   item: MarkdownCompatibilityCaseV1,
   editorState: EditorState,
 ): void {
+  // The parse is guaranteed by `state` itself, which throws rather than hand
+  // back a fixture the parser did not finish.
   const parserState = item.id === "narrow-viewport-bounded" ? state("# Visible") : editorState;
-  expect(ensureSyntaxTree(parserState, parserState.doc.length, 1_000)).not.toBeNull();
   const markdownDecorations = collectMarkdownPreview(parserState);
   const obsidianDecorations = collectObsidianPreview(parserState, INDEX, undefined, false);
   const allDecorations = [...markdownDecorations, ...obsidianDecorations];
@@ -216,11 +234,25 @@ function assertParserBehavior(
     && editorState.doc.toString() === loadSourceText(item.source).text;
   expect(item.id !== "decoration-failure-recovery" || recoveryCorrect).toBe(true);
 
+  // `viewport-bounded-decoration`: the collector decorates the requested window
+  // and nothing else, across a 40 KB note whose only construct is at the very
+  // end.
+  //
+  // Stated as "found the heading, strayed nowhere" rather than as a decoration
+  // COUNT. The count this replaces (`<= 1`) was satisfied by finding nothing at
+  // all, which is exactly what used to happen: with the fixture's parse
+  // unpublished the tree stopped at `Work.InitViewport` (3,000 characters), the
+  // heading at 40,000 was not in it, and the case passed against an empty
+  // result. Now that `state` publishes the finished parse the window really does
+  // hold two decorations — the `nn-lp-heading-1` mark and the revealed `#`
+  // marker, the caret sitting in the heading — and a cap of one would have to be
+  // raised to two, which measures today's decoration set instead of the bound
+  // the case is named for.
   const headingStart = editorState.doc.toString().lastIndexOf("# Visible");
   const bounded = item.id === "narrow-viewport-bounded"
     ? collectMarkdownPreview(editorState, [{ from: headingStart, to: editorState.doc.length }])
     : [];
-  const boundedCorrect = bounded.length <= 1
+  const boundedCorrect = bounded.some(({ className }) => className === "nn-lp-heading-1")
     && bounded.every(({ from, to }) => from >= headingStart && to <= editorState.doc.length);
   expect(item.id !== "narrow-viewport-bounded" || boundedCorrect).toBe(true);
 

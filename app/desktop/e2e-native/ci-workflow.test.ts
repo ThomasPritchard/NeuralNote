@@ -1,26 +1,75 @@
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 const here = path.dirname(fileURLToPath(import.meta.url));
-const workflow = readFileSync(
-  path.resolve(here, "..", "..", "..", ".github", "workflows", "e2e.yml"),
-  "utf8",
-);
-const ciWorkflow = readFileSync(
-  path.resolve(here, "..", "..", "..", ".github", "workflows", "ci.yml"),
-  "utf8",
-);
+const repoRoot = path.resolve(here, "..", "..", "..");
 
-function jobBody(source: string, start: string, end?: string): string {
+declare const lineFeedNormalised: unique symbol;
+
+/**
+ * Workflow source whose line endings are guaranteed to be `\n`.
+ *
+ * Only `readWorkflow` can produce one, so a future `readFileSync` call site
+ * cannot feed a CRLF checkout into `jobBody` without failing
+ * `npm --prefix app/desktop/e2e-native run typecheck`. That is the gate that
+ * covers this file: `app/desktop`'s own `npm run typecheck` compiles
+ * `include: ["src"]` and never sees it.
+ */
+type LineFeedSource = string & { readonly [lineFeedNormalised]: true };
+
+/**
+ * Reads a workflow file and normalises its line endings to `\n`.
+ *
+ * No `.gitattributes` covers `.github/workflows`. The repository's only one
+ * sits under `fixtures/note-test-vault/` and applies to that directory alone,
+ * so `git check-attr text -- .github/workflows/ci.yml` reports `unspecified`
+ * and Windows runners check these files out with CRLF. Normalising once here -
+ * rather than at each call site - keeps every `\n`-bearing lookup below
+ * platform-independent.
+ *
+ * @param filePath Absolute path to the workflow file.
+ * @returns The file's contents with CRLF line endings converted to `\n`.
+ */
+function readWorkflow(filePath: string): LineFeedSource {
+  return readFileSync(filePath, "utf8").replace(/\r\n/gu, "\n") as LineFeedSource;
+}
+
+const workflow = readWorkflow(path.resolve(repoRoot, ".github", "workflows", "e2e.yml"));
+const ciWorkflow = readWorkflow(path.resolve(repoRoot, ".github", "workflows", "ci.yml"));
+
+function jobBody(source: LineFeedSource, start: string, end?: string): string {
   const from = source.indexOf(start);
   assert.notEqual(from, -1, `missing workflow job ${start.trim()}`);
   const to = end ? source.indexOf(end, from + start.length) : source.length;
   assert.notEqual(to, -1, `missing workflow job ${end?.trim()}`);
   return source.slice(from, to);
 }
+
+test("resolves job bodies from a CRLF checkout", (t) => {
+  const scratch = mkdtempSync(path.join(tmpdir(), "neuralnote-crlf-"));
+  t.after(() => rmSync(scratch, { recursive: true, force: true }));
+  const crlfWorkflow = path.join(scratch, "ci.yml");
+  writeFileSync(
+    crlfWorkflow,
+    [
+      "jobs:",
+      "  frontend:",
+      "    runs-on: ubuntu-latest",
+      "  rust:",
+      "    runs-on: macos-latest",
+      "",
+    ].join("\r\n"),
+  );
+
+  const frontend = jobBody(readWorkflow(crlfWorkflow), "  frontend:\n", "  rust:\n");
+
+  assert.match(frontend, /runs-on: ubuntu-latest/u);
+  assert.doesNotMatch(frontend, /runs-on: macos-latest/u);
+});
 
 test("gates relevant pull requests on 15-minute Ubuntu and macOS native lanes", () => {
   assert.match(workflow, /pull_request:/);

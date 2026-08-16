@@ -34,6 +34,8 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 
 import { obsidianLivePreview } from "./obsidianLivePreview";
 import { sourceEditorDecorations } from "./sourceEditorDecorations";
+import { revealTableSourceAt } from "./sourceEditorTableCommands";
+import { revealedTableSource } from "./sourceEditorTableReveal";
 import {
   TABLE_CONTRACT_FIXTURE,
   type ContractChild,
@@ -435,5 +437,53 @@ describe("decoration precedence", () => {
 
     expect(cellsOf(header)).toHaveLength(2);
     expect(header.querySelector(".nn-lp-cell > .probe-inner")).not.toBeNull();
+  });
+});
+
+describe("revealing a table's source repaints it", () => {
+  // The reveal chord's ONLY observable effect in production is what the editor
+  // paints, and until now nothing tested it through the paint. The state-level
+  // tests in `sourceEditorTableReveal.test.ts` assert the field flips, and
+  // `sourceEditorTableKeymap.test.ts` asserts the binding runs — both of which
+  // stayed green while `Shift-Option-\` did nothing at all in the shipped app.
+  //
+  // Found by hand in a real WKWebView build (issue #97): the chord is claimed,
+  // no `»` is typed, the field updates, and the table keeps its drawn cells.
+  // `previewPlugin` recomputes on doc/viewport/selection/focus changes, a link
+  // refresh, or a reparse — a reveal is none of those, so the paint never re-ran.
+  //
+  // The oversized-table case above renders as source too, but reaches that state
+  // by SIZE at mount, so it never exercised this transition.
+  const DOC = ["Lead line", "", "| Key | Value |", "| --- | --- |", "| set | 1 |", ""].join("\n");
+
+  it("swaps drawn cells for literal pipes when the reveal effect lands", () => {
+    const view = mount(DOC, DOC.indexOf("set"));
+
+    // Precondition: the table is drawn, not literal. Without this the assertion
+    // below could pass against a table that was never rendered in the first place.
+    expect(view.dom.querySelectorAll(".nn-lp-cell").length).toBeGreaterThan(0);
+    expect(view.dom.querySelector(".nn-lp-table-source")).toBeNull();
+
+    const spec = revealTableSourceAt(view.state);
+    expect(spec, "the caret is inside the table, so a reveal must be offered").not.toBeNull();
+    view.dispatch(spec!);
+
+    expect(view.state.field(revealedTableSource)).not.toBeNull();
+    expect(view.dom.querySelector(".nn-lp-table-source")).not.toBeNull();
+    expect(view.dom.querySelectorAll(".nn-lp-cell")).toHaveLength(0);
+  });
+
+  it("redraws the cells when the reveal is toggled back off", () => {
+    const view = mount(DOC, DOC.indexOf("set"));
+    view.dispatch(revealTableSourceAt(view.state)!);
+    expect(view.dom.querySelector(".nn-lp-table-source")).not.toBeNull();
+
+    // The same command toggles, so hiding travels the identical path and would
+    // strand the note showing raw pipes if only the reveal direction repainted.
+    view.dispatch(revealTableSourceAt(view.state)!);
+
+    expect(view.state.field(revealedTableSource)).toBeNull();
+    expect(view.dom.querySelector(".nn-lp-table-source")).toBeNull();
+    expect(view.dom.querySelectorAll(".nn-lp-cell").length).toBeGreaterThan(0);
   });
 });

@@ -5,7 +5,7 @@ use crate::ai::events::{ElicitOption, Elicitation};
 use crate::ai::llm::UserPrompt;
 use crate::ai::tools::{action, reject, ToolContext, ToolResult};
 use crate::ai::youtube::{PlaylistPayload, VideoId, YoutubeIo, YoutubeToolSession, YoutubeUrl};
-use crate::ai::youtube_tool_errors::{capture_reject, session_capture_reject};
+use crate::ai::youtube_tool_errors::{settle_capture_error, settle_session_capture_error};
 use crate::ai::youtube_tools::{update_extractor, validate_youtube_url};
 use crate::capture::{
     estimate_transcript_cost, parse_playlist, validate_thumbnail, CaptureAction, CaptureError,
@@ -37,23 +37,23 @@ pub(super) async fn dispatch_select_playlist_videos(
     };
     let url = match validate_youtube_url(&args.playlist_url) {
         Ok(url) => url,
-        Err(error) => return capture_reject(error),
+        Err(error) => return settle_capture_error(error),
     };
     let io = context.youtube_io;
     let Some(session) = context.youtube_session.as_deref_mut() else {
-        return capture_reject(CaptureError::RequirementMissing(
+        return settle_capture_error(CaptureError::RequirementMissing(
             "YouTube per-run state is not wired".into(),
         ));
     };
     if let Some(error) = session.terminal_error().cloned() {
-        return session_capture_reject(session, error);
+        return settle_session_capture_error(session, error);
     }
     if let Err(error) = session.ensure_playlist_uninitialized() {
-        return session_capture_reject(session, error);
+        return settle_session_capture_error(session, error);
     }
     let playlist = match load_playlist(io, session, &url).await {
         Ok(playlist) => playlist,
-        Err(error) => return session_capture_reject(session, error),
+        Err(error) => return settle_session_capture_error(session, error),
     };
     let selected =
         match elicit_playlist_selection(call_id, &playlist, io, session, user_prompt, context.sink)
@@ -76,7 +76,7 @@ pub(super) async fn dispatch_select_playlist_videos(
     }
     let selected_video_ids = selected_ids_in_source_order(&playlist.entries, &selected);
     if let Err(error) = configure_playlist_run(context.writes, session, &selected_video_ids) {
-        return session_capture_reject(session, error);
+        return settle_session_capture_error(session, error);
     }
     action(
         json!({
@@ -149,7 +149,7 @@ async fn build_page_options(
     let mut options = Vec::with_capacity(entries.len());
     for entry in entries {
         let video_id = VideoId::new(&entry.video_id)
-            .map_err(|error| session_capture_reject(session, error))?;
+            .map_err(|error| settle_session_capture_error(session, error))?;
         let image_data_uri = thumbnail_for_entry(io, session, &video_id, &entry.video_id).await?;
         options.push(ElicitOption {
             id: entry.video_id.clone(),
@@ -174,13 +174,13 @@ async fn thumbnail_for_entry(
                 annotate_thumbnail_unavailable(session, raw_id, &error);
                 Ok(None)
             }
-            Err(error) => Err(session_capture_reject(session, error)),
+            Err(error) => Err(settle_session_capture_error(session, error)),
         },
         Err(error @ CaptureError::ThumbnailRejected(_)) => {
             annotate_thumbnail_unavailable(session, raw_id, &error);
             Ok(None)
         }
-        Err(error) => Err(session_capture_reject(session, error)),
+        Err(error) => Err(settle_session_capture_error(session, error)),
     }
 }
 
@@ -196,18 +196,18 @@ async fn confirm_high_usage(
         return Ok(());
     }
     let pricing = pricing.ok_or_else(|| {
-        capture_reject(CaptureError::RequirementMissing(
+        settle_capture_error(CaptureError::RequirementMissing(
             "provider pricing is not wired for the required high-usage estimate".into(),
         ))
     })?;
-    let estimated =
-        estimate_playlist_selection_cost(entries, selected, pricing).map_err(capture_reject)?;
+    let estimated = estimate_playlist_selection_cost(entries, selected, pricing)
+        .map_err(settle_capture_error)?;
     let confirmation = high_usage_confirmation(call_id, selected.len(), &estimated);
     match elicit_user(user_prompt, sink, confirmation).await {
         ElicitationOutcome::Answered { chosen_ids } if chosen_ids.as_slice() == ["continue"] => {
             Ok(())
         }
-        ElicitationOutcome::Answered { .. } => Err(capture_reject(CaptureError::Cancelled(
+        ElicitationOutcome::Answered { .. } => Err(settle_capture_error(CaptureError::Cancelled(
             "playlist distillation was cancelled at the high-usage warning".into(),
         ))),
         ElicitationOutcome::Rejected { error } => {

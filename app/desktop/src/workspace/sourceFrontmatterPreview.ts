@@ -1,4 +1,11 @@
-import { StateEffect, StateField, type EditorState, type Extension } from "@codemirror/state";
+import {
+  StateEffect,
+  StateField,
+  type EditorState,
+  type Extension,
+  type StateEffectType,
+  type Transaction,
+} from "@codemirror/state";
 import { Decoration, type DecorationSet, EditorView, WidgetType } from "@codemirror/view";
 
 import { createFrontmatterPropertiesDom } from "./FrontmatterProperties";
@@ -195,10 +202,68 @@ function build(
   ], true);
 }
 
-interface FrontmatterPreviewState {
-  readonly decorations: DecorationSet;
+/** The saved note's frontmatter as the editor last parsed it. The document is
+ *  compared against this to decide whether the rendered preview has gone
+ *  stale — both halves are reads of the same saved state, so they travel
+ *  together. */
+interface SavedFrontmatter {
+  readonly isValid: () => boolean;
+  readonly raw: () => string | null;
+}
+
+interface PreviewMode {
   readonly mode: FrontmatterMode;
   readonly foldBlocked: boolean;
+}
+
+interface FrontmatterPreviewState extends PreviewMode {
+  readonly decorations: DecorationSet;
+}
+
+/** Does the document's YAML still match the frontmatter the editor parsed? */
+function isSynchronized(state: EditorState, saved: SavedFrontmatter): boolean {
+  return saved.isValid() && sourceFrontmatterRaw(state) === saved.raw();
+}
+
+/** The mode a settled document implies. A note with no frontmatter block has
+ *  nothing to preview; one whose YAML has drifted from the parsed copy shows
+ *  the stale notice instead. */
+function settledMode(state: EditorState, saved: SavedFrontmatter): FrontmatterMode {
+  if (sourceFrontmatterRange(state) === null) return "preview";
+  return isSynchronized(state, saved) ? "preview" : "stale";
+}
+
+/** A refresh lands after a save, once the parsed frontmatter has caught up with
+ *  the document. An open raw-editing session stays open — it only learns
+ *  whether the delimiters are back and it may fold. */
+function refreshedState(
+  current: PreviewMode,
+  state: EditorState,
+  saved: SavedFrontmatter,
+): PreviewMode {
+  if (current.mode === "editing") {
+    return { mode: "editing", foldBlocked: sourceFrontmatterRange(state) === null };
+  }
+  if (isSynchronized(state, saved)) return { mode: "preview", foldBlocked: false };
+  const previewable = saved.isValid() && sourceFrontmatterRange(state) !== null;
+  return { mode: previewable ? "stale" : "preview", foldBlocked: false };
+}
+
+/** Leaving the raw editor. With the delimiters gone there is nothing to fold
+ *  back into, so the session is held open and the blocking notice shown. */
+function finishedState(state: EditorState, saved: SavedFrontmatter): PreviewMode {
+  if (sourceFrontmatterRange(state) === null) {
+    return { mode: "editing", foldBlocked: true };
+  }
+  return {
+    mode: sourceFrontmatterRaw(state) === saved.raw() ? "preview" : "stale",
+    foldBlocked: false,
+  };
+}
+
+/** Does this transaction carry `effect`? */
+function carries<T>(transaction: Transaction, effect: StateEffectType<T>): boolean {
+  return transaction.effects.some((candidate) => candidate.is(effect));
 }
 
 export function sourceFrontmatterPreview(
@@ -207,14 +272,10 @@ export function sourceFrontmatterPreview(
   frontmatterRaw: () => string | null,
   onSearchTag: () => SearchTag | undefined,
 ): Extension {
+  const saved: SavedFrontmatter = { isValid: hasValidFrontmatter, raw: frontmatterRaw };
   return StateField.define<FrontmatterPreviewState>({
     create(state) {
-      const range = sourceFrontmatterRange(state);
-      const valid = hasValidFrontmatter();
-      const currentRaw = sourceFrontmatterRaw(state);
-      const savedRaw = frontmatterRaw();
-      const synchronized = valid && currentRaw === savedRaw;
-      const mode: FrontmatterMode = synchronized || !range ? "preview" : "stale";
+      const mode = settledMode(state, saved);
       return {
         decorations: build(
           state,
@@ -229,55 +290,28 @@ export function sourceFrontmatterPreview(
       };
     },
     update(value, transaction) {
-      let { mode, foldBlocked } = value;
-      if (transaction.effects.some((effect) => effect.is(refreshSourceFrontmatterPreview))) {
-        const range = sourceFrontmatterRange(transaction.state);
-        const valid = hasValidFrontmatter();
-        const synchronized = valid
-          && sourceFrontmatterRaw(transaction.state) === frontmatterRaw();
-        if (mode === "editing") {
-          foldBlocked = !range;
-        } else if (synchronized) {
-          mode = "preview";
-          foldBlocked = false;
-        } else {
-          mode = valid && range ? "stale" : "preview";
-          foldBlocked = false;
-        }
+      let next: PreviewMode = value;
+      if (carries(transaction, refreshSourceFrontmatterPreview)) {
+        next = refreshedState(next, transaction.state, saved);
       }
-      if (transaction.effects.some((effect) => effect.is(revealSourceFrontmatter))) {
-        mode = "editing";
-        foldBlocked = false;
+      if (carries(transaction, revealSourceFrontmatter)) {
+        next = { mode: "editing", foldBlocked: false };
       }
-      if (transaction.effects.some((effect) => effect.is(finishSourceFrontmatter))) {
-        const range = sourceFrontmatterRange(transaction.state);
-        if (!range) {
-          mode = "editing";
-          foldBlocked = true;
-        } else {
-          mode = sourceFrontmatterRaw(transaction.state) === frontmatterRaw()
-            ? "preview"
-            : "stale";
-          foldBlocked = false;
-        }
+      if (carries(transaction, finishSourceFrontmatter)) {
+        next = finishedState(transaction.state, saved);
       }
-      if (transaction.docChanged && mode !== "editing") {
-        const range = sourceFrontmatterRange(transaction.state);
-        const valid = hasValidFrontmatter();
-        const synchronized = valid
-          && sourceFrontmatterRaw(transaction.state) === frontmatterRaw();
-        mode = synchronized || !range ? "preview" : "stale";
-        foldBlocked = false;
+      if (transaction.docChanged && next.mode !== "editing") {
+        next = { mode: settledMode(transaction.state, saved), foldBlocked: false };
       }
       return {
-        mode,
-        foldBlocked,
+        mode: next.mode,
+        foldBlocked: next.foldBlocked,
         decorations: build(
           transaction.state,
           frontmatter(),
           hasValidFrontmatter(),
-          mode,
-          foldBlocked,
+          next.mode,
+          next.foldBlocked,
           onSearchTag,
         ),
       };

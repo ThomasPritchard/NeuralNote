@@ -25,6 +25,7 @@ vi.mock("../lib/api", () => ({
   onMenu: vi.fn(() => Promise.resolve(() => {})),
 }));
 
+import { withPublishedParse } from "../test/publishedParse";
 import { SourceNoteEditor } from "./SourceNoteEditor";
 import { cellPaintPlan, type CellPaintPlan } from "./sourceEditorCellPaintPlan";
 import { clearSourceEditorSessions } from "./sourceEditorSession";
@@ -60,12 +61,20 @@ const settle = async (): Promise<void> => {
   }
 };
 
+// The plan reads `syntaxTree(state)`, so the state it is given has to be holding
+// the finished parse rather than whatever `LanguageState.init` managed inside its
+// 20 ms wall-clock budget — see `src/test/publishedParse.ts`. This is the probe
+// oracle for "primes the probe from the editor it mounts", and a plan built from
+// a truncated tree measures a different string from the one the editor paints.
 function planFor(cell: string): CellPaintPlan {
   const doc = `| ${cell} |`;
-  const state = EditorState.create({
+  const state = withPublishedParse(
+    EditorState.create({
+      doc,
+      extensions: [markdown({ base: markdownLanguage })],
+    }),
     doc,
-    extensions: [markdown({ base: markdownLanguage })],
-  });
+  );
   const from = doc.indexOf(cell);
   return cellPaintPlan(state, { from, to: from + cell.length }, {
     context: "body",

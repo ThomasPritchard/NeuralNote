@@ -77,6 +77,43 @@ impl RetrievalProvider for FailingRetrieval {
     }
 }
 
+/// A retriever whose every call fails with a CHOSEN `CoreError`, so one error can
+/// be pushed through two different dispatchers and the two accounts compared.
+///
+/// `FailingRetrieval` above is fixed to `CoreError::Io`, which is the one bucket
+/// where both seams happen to agree — which is exactly why it could not see the
+/// disagreement.
+pub struct ChosenVaultError(pub CoreError);
+
+impl RetrievalProvider for ChosenVaultError {
+    fn list_notes(&self, _folder: Option<&str>) -> CoreResult<ListOutcome> {
+        Err(self.0.clone())
+    }
+
+    fn list_folders(&self) -> CoreResult<Vec<FolderMeta>> {
+        Err(self.0.clone())
+    }
+
+    fn search_notes(
+        &self,
+        _query: &str,
+        _max_results: usize,
+        _folder: Option<&str>,
+    ) -> CoreResult<SearchOutcome> {
+        Err(self.0.clone())
+    }
+
+    fn read_note_span(
+        &self,
+        _rel_path: &str,
+        _start_line: u32,
+        _end_line: u32,
+        _max_bytes: usize,
+    ) -> CoreResult<EvidenceSpan> {
+        Err(self.0.clone())
+    }
+}
+
 pub fn write_note(vault: &std::path::Path, rel_path: &str) {
     let path = vault.join(rel_path);
     if let Some(parent) = path.parent() {

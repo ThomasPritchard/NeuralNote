@@ -111,6 +111,16 @@ fn normalized<T: Serialize>(value: T, root: &Path) -> Value {
     value
 }
 
+/// One `read_link_graph` exchange over the vault as it stands right now — so a
+/// journey that reads the graph twice asserts against two REAL core graphs.
+fn graph_exchange(root: &Path) -> Exchange {
+    ok(
+        "read_link_graph",
+        json!({}),
+        normalized(links::read_link_graph(root).expect("contract graph"), root),
+    )
+}
+
 fn search_exchange(query: &'static str, files: &[(&str, &[u8])]) -> Exchange {
     let vault = write_vault(files);
     ok(
@@ -181,24 +191,42 @@ fn build_contract() -> Contract {
         vec![search_exchange("hello", &[("Note.md", b"hello")])],
     );
 
-    let graph_vault = write_vault(&[
+    let graph_notes: [(&str, &[u8]); 3] = [
         ("notes/Alpha.md", b"Linked to [[Beta]].\n\nAlpha body."),
         ("notes/Beta.md", b"Beta body."),
         (
             "essays/Gamma.md",
             b"See [alpha note](../notes/Alpha.md).\n\nGamma body.",
         ),
-    ]);
+    ];
+    let graph_vault = write_vault(&graph_notes);
+    scenarios.insert("graph-linked", vec![graph_exchange(graph_vault.path())]);
+
+    // Live graph refresh (issue #34): the graph stays mounted while the vault
+    // changes underneath it, so each journey reads the SAME vault twice — once
+    // at mount, once after the change. Both halves are real core output, so a
+    // journey can never assert a refreshed graph the core would not produce.
+    let external_vault = write_vault(&graph_notes);
+    let external_at_mount = graph_exchange(external_vault.path());
+    // Another editor (Obsidian, a git pull) adds a cross-folder wikilink.
+    fs::write(
+        external_vault.path().join("notes/Beta.md"),
+        b"Beta body.\n\nSee also [[Gamma]].",
+    )
+    .expect("apply external contract edit");
     scenarios.insert(
-        "graph-linked",
-        vec![ok(
-            "read_link_graph",
-            json!({}),
-            normalized(
-                links::read_link_graph(graph_vault.path()).expect("contract graph"),
-                graph_vault.path(),
-            ),
-        )],
+        "graph-live-external-edit",
+        vec![external_at_mount, graph_exchange(external_vault.path())],
+    );
+
+    let in_app_vault = write_vault(&graph_notes);
+    let in_app_at_mount = graph_exchange(in_app_vault.path());
+    // The user deletes a note in-app; the shell's watcher pings the frontend.
+    fs::remove_file(in_app_vault.path().join("essays/Gamma.md"))
+        .expect("apply in-app contract delete");
+    scenarios.insert(
+        "graph-live-in-app-delete",
+        vec![in_app_at_mount, graph_exchange(in_app_vault.path())],
     );
 
     let feature_vault = write_vault(&[

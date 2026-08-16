@@ -122,6 +122,35 @@ jobs:
             echo "::error::Release tag must point at the current main commit"
             exit 1
           fi
+          # The manifest publisher must exist AT THE RELEASE COMMIT, and that has
+          # to be settled here rather than where it is used.
+          #
+          # The publish step fetches the script from the repository at
+          # $RELEASE_SHA, deliberately, so a compromised dependency cannot choose
+          # the code that later runs with repository write scope. The cost of
+          # that pinning is that a tag predating the script fails the fetch — and
+          # that step is
+          # LAST, after the GitHub prerelease is public and immutable. Its own
+          # `test -s` guard catches this far too late to matter.
+          #
+          # Not hypothetical: the `release_tag` input's own default is the current
+          # release tag, which is also the documented recovery path, and that tag
+          # predates the extraction of this script from inline YAML. Re-dispatching
+          # it would publish, then 404, then leave exactly the manual manifest
+          # recovery that two earlier releases each cost and that the extraction
+          # exists to end.
+          #
+          # Deliberately naming no version here. RUNBOOK.md's bump checklist counts
+          # the lines in this file carrying the version, and a narrative mention
+          # would inflate that count and then go stale at the next release.
+          #
+          # Checking the working tree is equivalent to checking $RELEASE_SHA: the
+          # two comparisons above have just proven the checkout IS that commit.
+          if [ ! -s scripts/publish-release-manifest.mjs ]; then
+            echo "::error::scripts/publish-release-manifest.mjs is missing at $RELEASE_TAG ($RELEASE_SHA)."
+            echo "::error::The publish step reads it from that commit, so this release would go public and then fail to publish its manifest. Re-tag from a commit that carries the script."
+            exit 1
+          fi
           printf 'RELEASE_SHA=%s\n' "$RELEASE_SHA" >> "$GITHUB_OUTPUT"
 
       - name: Configure temporary release paths
@@ -645,44 +674,46 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          MANIFEST_WORKTREE="$RUNNER_TEMP/release-manifests"
-          git init "$MANIFEST_WORKTREE"
-          git -C "$MANIFEST_WORKTREE" remote add origin "https://github.com/$GITHUB_REPOSITORY.git"
-          gh auth setup-git
-          # Probe INSIDE the manifest worktree. This job performs no checkout by
-          # design, so the job's own working directory is not a git repository and
-          # knows no `origin` - a bare `git ls-remote origin ...` there fails for
-          # that reason alone. Both 0.2.1 and 0.3.0 published their release and
-          # then failed this push: the probe errored, `2>/dev/null` hid why, and
-          # `if` read "cannot reach the remote" as "branch does not exist", so a
-          # rootless history was pushed at a branch that already existed. #83
-          # changed `--heads <ref>` to an exact ref and asserted the new string;
-          # the ref syntax was never the problem, and asserting a command's SHAPE
-          # does not run it.
+          # The publication itself lives in scripts/publish-release-manifest.mjs,
+          # not inline here, because this step runs ONLY during a real release
+          # dispatch - so a regression in it is discovered by shipping, and it
+          # has twice cost a manual manifest recovery. The file fetched below is
+          # the same file its unit tests import.
           #
-          # `--exit-code` returns 2 for "no matching refs" and other non-zero
-          # values for real failures, so the two are kept apart here. Anything
-          # that is not a clean yes or a clean no stops the release rather than
-          # guessing, because guessing wrong destroys the branch clients poll.
-          probe_status=0
-          git -C "$MANIFEST_WORKTREE" ls-remote --exit-code origin \
-            refs/heads/release-manifests >/dev/null || probe_status=$?
-          if [ "$probe_status" -eq 0 ]; then
-            git -C "$MANIFEST_WORKTREE" fetch --depth=1 origin refs/heads/release-manifests
-            git -C "$MANIFEST_WORKTREE" checkout -b release-manifests FETCH_HEAD
-          elif [ "$probe_status" -eq 2 ]; then
-            git -C "$MANIFEST_WORKTREE" checkout --orphan release-manifests
-          else
-            echo "::error::Could not determine whether release-manifests exists (git ls-remote exit $probe_status)"
-            exit 1
-          fi
-          cp "$RELEASE_MANIFEST" "$MANIFEST_WORKTREE/latest-alpha.json"
-          git -C "$MANIFEST_WORKTREE" config user.name "github-actions[bot]"
-          git -C "$MANIFEST_WORKTREE" config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git -C "$MANIFEST_WORKTREE" add latest-alpha.json
-          if git -C "$MANIFEST_WORKTREE" diff --cached --quiet; then
-            echo "release-manifests already contains this manifest; nothing to publish"
-            exit 0
-          fi
-          git -C "$MANIFEST_WORKTREE" commit -m "release: publish NeuralNote 0.4.0 alpha manifest"
-          git -C "$MANIFEST_WORKTREE" push origin HEAD:refs/heads/release-manifests
+          # It is read from the repository at $RELEASE_SHA - the commit the
+          # build proved equal to the trusted main dispatch, and which this job
+          # has already revalidated against the remote tag twice - rather than
+          # carried in with the build artifacts. The build job executes the
+          # package manager, the Rust toolchain, and the entire third-party
+          # dependency tree over the same checkout before it assembles those
+          # artifacts, so anything it hands on proves only that the transfer was
+          # intact, not that the bytes are the reviewed source. Pinning to the
+          # commit is what stops a compromised dependency choosing the code that
+          # runs here under `contents: write`. This job still checks nothing out
+          # and still runs no build tooling.
+          #
+          # What went wrong on 0.2.1 and again on 0.3.0: both published their
+          # release and then failed this push, because the branch-existence
+          # probe ran outside the manifest worktree, where this job has no
+          # `origin` to ask. It failed for that reason alone, `2>/dev/null` hid
+          # why, and `if` read "cannot reach the remote" as "branch does not
+          # exist", so a rootless history was pushed at a branch that already
+          # existed. #83 changed `--heads <ref>` to an exact ref and asserted
+          # the new string; the ref syntax was never the problem, and asserting
+          # a command's SHAPE does not run it.
+          #
+          # `git ls-remote --exit-code` returns 2 for "no matching refs" and
+          # other non-zero values for real failures, so the publisher keeps the
+          # two apart. Anything that is not a clean yes or a clean no stops the
+          # release rather than guessing, because guessing wrong destroys the
+          # branch every installed client polls. Those three outcomes are pure
+          # functions with tests, and the fetch/orphan/no-op paths are exercised
+          # against a real git remote, so neither needs a release to run.
+          gh auth setup-git
+          MANIFEST_PUBLISHER="$RUNNER_TEMP/publish-release-manifest.mjs"
+          gh api \
+            -H "Accept: application/vnd.github.raw+json" \
+            "repos/$GITHUB_REPOSITORY/contents/scripts/publish-release-manifest.mjs?ref=$RELEASE_SHA" \
+            > "$MANIFEST_PUBLISHER"
+          test -s "$MANIFEST_PUBLISHER"
+          node "$MANIFEST_PUBLISHER"

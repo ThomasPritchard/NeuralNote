@@ -73,8 +73,28 @@ export function ToastProvider({ children }: Readonly<{ children: ReactNode }>) {
 
   return (
     <ToastContext.Provider value={controller}>
-      {children}
-      <ToastViewport toasts={visibleToasts} onDismiss={dismiss} />
+      {/* The app and the notification dock share ONE column, as siblings.
+       *
+       *  The stack used to be `position: fixed` in the window's top-right
+       *  corner — which is the chat pane's corner. Every notification therefore
+       *  landed on the pane's header, and because an error never expires
+       *  (`getToastDuration`), one unacknowledged error covered the pane's
+       *  "Neural Assistant" title and the top of the conversation for the life
+       *  of the session (issue #117).
+       *
+       *  Stacking the two in one column makes clearing the panes STRUCTURAL
+       *  rather than an inset that happens to miss: the dock cannot reach a
+       *  pane header, or the composer at the other end of that pane, because it
+       *  is not inside the same box as either. Any offset — top, bottom, or
+       *  corner — only chooses which pane the stack covers instead.
+       *
+       *  What the column costs is that the two now compete for the same pixels:
+       *  the content row has no floor and the dock does not shrink, so the well
+       *  below carries a ceiling of its own. */}
+      <div className="flex h-full w-full flex-col">
+        <div className="min-h-0 flex-1 overflow-hidden">{children}</div>
+        <ToastViewport toasts={visibleToasts} onDismiss={dismiss} />
+      </div>
     </ToastContext.Provider>
   );
 }
@@ -109,24 +129,58 @@ function ToastViewport({
   }, [toasts]);
 
   return (
-    <div
-      aria-label="Notifications"
-      className="pointer-events-none fixed right-4 top-[calc(var(--titlebar-height,2rem)+1rem)] z-50 w-[min(24rem,calc(100vw-2rem))]"
-    >
+    // Zero height until something is raised, so an idle window looks exactly as
+    // it did: the live region is `sr-only` (out of flow) and the well below it
+    // is not rendered at all while the stack is empty. The region itself stays
+    // MOUNTED across that — a live region recreated with its message already
+    // inside it is not reliably announced. Moving it inside the branch below
+    // reds the empty-stack case in `ToastViewport.browser.test.tsx`, which is
+    // the only test that looks before a notification has been raised.
+    //
+    // A `section` rather than a labelled `div`, because a bare `div` is
+    // `role="generic"` and browsers drop an `aria-label` on one. In flow rather
+    // than floating over the app, the dock is a real landmark, so the label has
+    // to survive to name it.
+    //
+    // `section` carries the `region` role implicitly ONCE IT HAS AN ACCESSIBLE
+    // NAME, which is why the label here is load-bearing rather than decorative:
+    // strip `aria-label` and this silently stops being a landmark at all. The
+    // earlier `<div role="region">` named the same landmark and said so twice;
+    // Sonar `typescript:S6819` prefers the native element, and so does anything
+    // that maps HTML to platform accessibility APIs without consulting ARIA.
+    <section aria-label="Notifications" className="shrink-0">
       <div role="status" aria-live="polite" aria-atomic="true" className="sr-only">
         {politeAnnouncement}
       </div>
-      <ol className="flex flex-col gap-2">
-        {toasts.map((toast) => (
-          <ToastItem
-            key={toast.id}
-            toast={toast}
-            documentHidden={documentHidden}
-            onDismiss={onDismiss}
-          />
-        ))}
-      </ol>
-    </div>
+      {toasts.length > 0 && (
+        // A sunken well at the window's bottom edge. `bg-surface-sunken` is the
+        // app's recessed ground — everywhere else it lines a rounded box inside
+        // a panel, and this is its one full-bleed use — so the notifications
+        // stay the raised cards they already were, standing in it, and the
+        // hairline separates the well from the status bar it opens beneath.
+        //
+        // The ceiling is what keeps the borrowed space a loan. The dock does not
+        // shrink and the content row above has no floor, so an uncapped well
+        // simply keeps taking: three real save failures, each carrying the
+        // backend's whole error chain and its absolute paths, measure 859px —
+        // more than the entire 600px window `tauri.conf.json` allows as its
+        // minimum, leaving the workspace nothing. Two fifths of the window is
+        // the most the dock may hold; past that it scrolls, so no notification
+        // is lost to the cap.
+        <div className="max-h-[40vh] overflow-y-auto border-t border-border bg-surface-sunken px-4 py-3">
+          <ol className="ml-auto flex w-full max-w-96 flex-col gap-2">
+            {toasts.map((toast) => (
+              <ToastItem
+                key={toast.id}
+                toast={toast}
+                documentHidden={documentHidden}
+                onDismiss={onDismiss}
+              />
+            ))}
+          </ol>
+        </div>
+      )}
+    </section>
   );
 }
 
@@ -152,7 +206,7 @@ function ToastItem({
       aria-label={`${toast.message} notification`}
       data-testid="toast"
       data-toast-kind={toast.kind}
-      className={`pointer-events-auto rounded-lg border p-3 text-sm text-foreground shadow-lg ${TOAST_KIND_STYLES[toast.kind]}`}
+      className={`rounded-lg border p-3 text-sm text-foreground shadow-lg ${TOAST_KIND_STYLES[toast.kind]}`}
       onMouseEnter={() => setHovered(true)}
       onMouseLeave={() => setHovered(false)}
       onFocus={() => setFocusWithin(true)}

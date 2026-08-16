@@ -1,3 +1,16 @@
 # Historical false positive: an old documentation example passed the Sonar token
 # from the environment as an HTTP basic-auth username. No credential was committed.
 3fd608e7296bdb7115ef582988d275e6384e2bac:docs/definition-of-done.md:curl-auth-user:138
+
+# Historical false positive: a COMMENT in the native artifact redactor illustrated
+# the two shapes that used to defeat it, and wrote them out as a realistic-looking
+# key. Invented for the comment, never a real credential, and the comment has since
+# been rewritten to describe the shapes instead of printing one — but the Gitleaks
+# job scans `--log-opts=--all`, so the example survives in the commit that
+# introduced it whatever later commits say.
+#
+# Two entries, not a rule- or file-level allowlist: an entry pinned to a commit
+# stops covering anything the moment that file changes again, which is what keeps
+# this from quietly pre-authorising a real key in the same file later.
+4552faffc5b79cb8ede65816b77c4cccfb5445a4:app/desktop/e2e-native/native-artifacts.ts:generic-api-key:21
+4552faffc5b79cb8ede65816b77c4cccfb5445a4:app/desktop/e2e-native/native-artifacts.ts:generic-api-key:23

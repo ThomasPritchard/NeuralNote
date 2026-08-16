@@ -79,6 +79,16 @@ export interface CreateMockVaultOptions {
   /** Expected fake provider key for the secret-safe save probe. The backend
    * records only whether the submitted key matched, never the key itself. */
   expectedApiKey?: string;
+  /** What `save_api_key` / `clear_api_key` report for the cross-process key
+   *  revision. Defaults to `true` — the ordinary case, where every other running
+   *  instance was told to drop the key it had cached.
+   *
+   *  Pass `false` to exercise the partial outcome: the keychain change committed,
+   *  but a second window keeps using the previous key until it restarts. That
+   *  path had no coverage at all while `api.ts` typed both commands as
+   *  `invoke<void>`, because a mock returning `undefined` agreed with a frontend
+   *  that read nothing. */
+  keyRevisionPublished?: boolean;
   /** The AI key status `api_key_status`/`ai_status` report. Defaults to a key
    *  present so a test lands straight in the chat view; pass `{ hasKey: false }`
    *  to exercise the first-run provider picker (and, through it, guided key

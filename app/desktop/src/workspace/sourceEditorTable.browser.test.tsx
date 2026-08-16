@@ -37,6 +37,23 @@ import { SourceNoteEditor } from "./SourceNoteEditor";
 import { REQUIRED_STYLESHEET_RULES } from "./sourceEditorTableContractFixture";
 import "../styles.css";
 
+// The last row is the CJK and emoji one issue #86 asked for, and it is
+// deliberately the WIDEST cell in both of its columns — 18 monospace columns of
+// CJK against `Commitment`'s 10, and 20 of emoji against `soundcheck at six`'s
+// 17 — so the geometry below is measured on non-ASCII text rather than beside
+// it. Its emoji span the classes that decide a width: a supplementary-plane
+// pictograph, a regional-indicator PAIR painted as one flag, two symbols that
+// need `U+FE0F` before they are emoji at all, and two that ask for emoji
+// presentation on their own.
+//
+// What this row does NOT test is `monospaceWidth`, and the issue was wrong to
+// expect it would. Once CT-4's probe has primed, `trackTemplate` stamps MEASURED
+// pixels and the character count only feeds the unprimed first frame — so this
+// file was measured green against the pre-fix width table, with the same
+// alignment it reports now. The width table is pinned in
+// `sourceEditorTableModel.test.ts`, where the assertions are exact; what this
+// row adds here is that the measured path, the row's line box and the track it
+// stamps all survive text the fixture had never contained.
 const SOURCE = [
   "# Commitments",
   "",
@@ -46,6 +63,7 @@ const SOURCE = [
   "| --- | --- | --- |",
   "| 2026-04-03 | DJ gig | soundcheck at six |",
   "| 2026-11-30 | Rehearsal |  |",
+  "| 2026-12-24 | 東京公演リハーサル | 🚀🇬🇧☀️❤️⭐⌚✅👍🎉🌡️ |",
 ].join("\n");
 
 const PANE_WIDTH_PX = 640;
@@ -116,7 +134,7 @@ describe("a drawn table as a grid", () => {
     await expect.element(page.getByRole("table", { name: "Markdown table" })).not.toBeInTheDocument();
 
     const rows = rowLines(host);
-    expect(rows).toHaveLength(4);
+    expect(rows).toHaveLength(5);
 
     const shipped = getComputedStyle(rows[0]!).display === "grid";
     const injected = shipped ? null : styleSheet(contractRules());
@@ -127,7 +145,7 @@ describe("a drawn table as a grid", () => {
 
     // 1. One grid row per line. Nine stacked tracks is what the buffers do
     //    unparked, and it is invisible to every hit-testing probe.
-    expect(rows.map(trackCount)).toEqual([1, 1, 1, 1]);
+    expect(rows.map(trackCount)).toEqual([1, 1, 1, 1, 1]);
     const heights = rows.map(heightOf);
 
     // 1b. The same measurement with the parking removed, so the assertion above
@@ -136,13 +154,15 @@ describe("a drawn table as a grid", () => {
     expect(rows.map(trackCount).every((count) => count > 1)).toBe(true);
     expect(heightOf(rows[0]!)).toBeGreaterThan(heights[0]! * 2);
     unparked.remove();
-    expect(rows.map(trackCount)).toEqual([1, 1, 1, 1]);
+    expect(rows.map(trackCount)).toEqual([1, 1, 1, 1, 1]);
     expect(rows.map(heightOf)).toEqual(heights);
 
     // 2. Rows do not shear: every content row is the same height. (The
-    //    alignment row is deliberately a slim band and is excluded.)
+    //    alignment row is deliberately a slim band and is excluded.) The CJK and
+    //    emoji row is the one that can fail this for a reason of its own — a
+    //    fallback face with a taller line box would grow that line alone.
     const contentRows = rows.filter((row) => cellsOf(row).length > 0);
-    expect(contentRows).toHaveLength(3);
+    expect(contentRows).toHaveLength(4);
     expect(new Set(contentRows.map(heightOf)).size).toBe(1);
 
     // 3. Columns. Every row's cell for a column starts at the same x, and the

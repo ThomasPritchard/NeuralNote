@@ -3,7 +3,7 @@
 // the active note. State lives in the useOpenNote hook passed down from
 // Workspace; the active-note tab itself lives in the window titlebar.
 
-import { lazy, Suspense, useEffect, useRef, useState } from "react";
+import { lazy, Suspense, useEffect, useRef, useState, type ReactNode } from "react";
 import {
   AlertTriangle,
   FileText,
@@ -210,16 +210,18 @@ function TextNoteBody({
         </div>
       )}
       {previewError && (
-        <div role="status" className="mb-4 text-[0.75rem] text-muted-foreground">
+        // `<output>` carries the status role and polite live region natively.
+        // `block` keeps the box the `<div>` it replaced was, so `mb-4` applies.
+        <output className="mb-4 block text-[0.75rem] text-muted-foreground">
           Live preview is temporarily unavailable: {previewError}
-        </div>
+        </output>
       )}
       <div className="flex min-h-[50vh] flex-col">
         <Suspense
           fallback={
-            <p role="status" className="text-sm text-muted-foreground">
+            <output className="block text-sm text-muted-foreground">
               Loading source editor…
-            </p>
+            </output>
           }
         >
           <SourceNoteEditor
@@ -296,6 +298,34 @@ export function NotePane({
   }
 
   const note = open.note;
+
+  // Which body view the note gets. A binary note is read-only; an oversized one
+  // never mounts a heavy view at all (see `OversizedNoteNotice`); everything
+  // else is editable.
+  let body: ReactNode;
+  if (note.binary) {
+    body = (
+      <Reader
+        note={note}
+        noteIndex={noteIndex}
+        onOpenLink={onOpenLink}
+        onSearchTag={onSearchTag}
+      />
+    );
+  } else if (note.exceedsEditableSize) {
+    body = <OversizedNoteNotice note={note} onReload={open.reload} />;
+  } else {
+    body = (
+      <TextNoteBody
+        open={open}
+        noteIndex={noteIndex}
+        onOpenLink={onOpenLink}
+        onSearchTag={onSearchTag}
+        reportError={reportError}
+      />
+    );
+  }
+
   return (
     <main className="flex min-w-0 flex-1 flex-col bg-background">
       <SaveAnnouncements
@@ -350,24 +380,7 @@ export function NotePane({
         </div>
       )}
 
-      {note.binary ? (
-        <Reader
-          note={note}
-          noteIndex={noteIndex}
-          onOpenLink={onOpenLink}
-          onSearchTag={onSearchTag}
-        />
-      ) : note.exceedsEditableSize ? (
-        <OversizedNoteNotice note={note} onReload={open.reload} />
-      ) : (
-        <TextNoteBody
-          open={open}
-          noteIndex={noteIndex}
-          onOpenLink={onOpenLink}
-          onSearchTag={onSearchTag}
-          reportError={reportError}
-        />
-      )}
+      {body}
     </main>
   );
 }

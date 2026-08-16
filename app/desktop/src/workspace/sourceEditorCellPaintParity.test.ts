@@ -14,18 +14,28 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorSelection, EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
+import { withPublishedParse } from "../test/publishedParse";
 import { cellPaintPlan } from "./sourceEditorCellPaintPlan";
 import { collectMarkdownPreview, type PreviewDecoration } from "./sourceEditorDecorations";
 import { tableModelAt } from "./sourceEditorTableModel";
 
+// Every reader below — `tableModelAt`, `cellPaintPlan`, `collectMarkdownPreview`
+// — walks `syntaxTree(state)`, so the finished parse has to be PUBLISHED into
+// the state before any of them runs. See `src/test/publishedParse.ts` for why
+// building the state is not enough. Measured: `Error: No table at 43` from
+// "paints exactly the text its own paint plan projects", once in 8 full-suite
+// runs under 20 CPU burners.
 function state(doc: string, anchor: number) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.cursor(anchor),
+      extensions: [
+        markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+      ],
+    }),
     doc,
-    selection: EditorSelection.cursor(anchor),
-    extensions: [
-      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
-    ],
-  });
+  );
 }
 
 /**

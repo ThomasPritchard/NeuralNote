@@ -1,13 +1,15 @@
 import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
+import { forceParsing } from "@codemirror/language";
 import {
   EditorSelection,
   EditorState,
   type Transaction,
   type TransactionSpec,
 } from "@codemirror/state";
-import { EditorView } from "@codemirror/view";
+import { EditorView, keymap } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
+import { withPublishedParse } from "../test/publishedParse";
 import { MAX_TABLE_PREVIEW_ROWS } from "./sourceEditorDecorationsPreview";
 import {
   formatTable,
@@ -16,12 +18,14 @@ import {
   guardTableDelimiterBackward,
   nextTableRow,
   tableCellStep,
+  tableKeymap,
   tableRowStep,
 } from "./sourceEditorTableCommands";
 import {
   tableDelimiterGuard,
   tableStructuralEdit,
 } from "./sourceEditorTableDelimiterGuard";
+import { revealedTableSource } from "./sourceEditorTableReveal";
 
 const TABLE = [
   "# Notes",
@@ -37,21 +41,34 @@ const MARKDOWN = markdown({
   pasteURLAsLink: false,
 });
 
+// Every builder in this file publishes the finished parse before a command
+// reads it. All of these commands find their table by walking
+// `syntaxTree(state)`, and a state that lost the 20 ms `Work.Apply` race holds
+// no table at all — so the command declines, and a `not.toBeNull()` here goes
+// red for a reason that has nothing to do with the command. See
+// `src/test/publishedParse.ts`; the negative assertions are as exposed as the
+// positive ones, since an unparsed table also makes a command decline.
 function state(doc: string, anchor: number) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.cursor(anchor),
+      extensions: [MARKDOWN],
+    }),
     doc,
-    selection: EditorSelection.cursor(anchor),
-    extensions: [MARKDOWN],
-  });
+  );
 }
 
 /** The editor as the app configures it, where several cursors are allowed. */
 function multiCursorState(doc: string, anchors: readonly number[]) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.create(anchors.map((anchor) => EditorSelection.cursor(anchor))),
+      extensions: [EditorState.allowMultipleSelections.of(true), MARKDOWN],
+    }),
     doc,
-    selection: EditorSelection.create(anchors.map((anchor) => EditorSelection.cursor(anchor))),
-    extensions: [EditorState.allowMultipleSelections.of(true), MARKDOWN],
-  });
+  );
 }
 
 /** Apply a spec and return the resulting document plus the selected text. */
@@ -417,15 +434,18 @@ describe("guardTableDelimiter", () => {
 });
 
 function guardedState(doc: string, anchors: readonly number[]) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.create(anchors.map((anchor) => EditorSelection.cursor(anchor))),
+      extensions: [
+        EditorState.allowMultipleSelections.of(true),
+        MARKDOWN,
+        tableDelimiterGuard,
+      ],
+    }),
     doc,
-    selection: EditorSelection.create(anchors.map((anchor) => EditorSelection.cursor(anchor))),
-    extensions: [
-      EditorState.allowMultipleSelections.of(true),
-      MARKDOWN,
-      tableDelimiterGuard,
-    ],
-  });
+  );
 }
 
 /** A command target that applies what it is given and keeps the transactions. */
@@ -498,5 +518,87 @@ describe("the keymap layer leaves multicursor editing to the filter", () => {
     expect(applied).toEqual([]);
     expect(document()).toBe(TABLE);
     expect(view.state.selection.ranges).toHaveLength(2);
+  });
+});
+
+/** Dispatch a keydown and hand back the event, so callers can read the verdict. */
+function press(view: EditorView, init: KeyboardEventInit): KeyboardEvent {
+  const event = new KeyboardEvent("keydown", { bubbles: true, cancelable: true, ...init });
+  view.contentDOM.dispatchEvent(event);
+  return event;
+}
+
+// The Windows/Linux half of #97. It cannot live beside its macOS twin in
+// `sourceEditorTableKeymap.test.ts`, because that file pins `navigator.platform`
+// to Mac before CodeMirror loads and the platform is then fixed for the whole
+// module graph. This file runs on jsdom's own platform, so it is the non-mac
+// side of the same fix: the macOS alternates must not have cost these anything.
+describe("the table chords on Windows and Linux", () => {
+  const RAGGED = ["| a | b |", "| --- | --- |", "| xxxx | yyyy |"].join("\n");
+  const ALIGNED = ["| A | B |", "| --- | --- |", "| 1 | 2 |"].join("\n");
+
+  /**
+   * A real view — `target` above is a fake one, and cannot receive key events.
+   *
+   * `forceParsing` is the view-shaped form of the same precondition the state
+   * builders above meet: it finishes the parse and dispatches the transaction
+   * that publishes it (`@codemirror/language/dist/index.js:225-230`). Without
+   * it the chord resolves, the command finds no table, and the press looks
+   * unhandled for a reason that is not about the keymap.
+   */
+  function mounted(doc: string, anchor: number) {
+    const view = new EditorView({
+      state: EditorState.create({
+        doc,
+        selection: EditorSelection.cursor(anchor),
+        extensions: [MARKDOWN, revealedTableSource, tableDelimiterGuard, keymap.of([...tableKeymap])],
+      }),
+      parent: document.body,
+    });
+    if (!forceParsing(view, view.state.doc.length, 30_000)) {
+      throw new Error("the table did not parse in full; the chord would have nothing to act on");
+    }
+    return view;
+  }
+
+  it("still formats through the base-layout fallback macOS opts out of", () => {
+    // Shift-Alt-F arrives as `key: "F"` — the SHIFTED character, never "f" — so
+    // only `base[keyCode]` gets CodeMirror back to the name the binding uses
+    // (`@codemirror/view/dist/index.js:9190-9191`). That fallback is exactly what
+    // macOS skips, which is why #97 needed a second binding rather than an edit
+    // to this one.
+    //
+    // Measured, not inferred: a Playwright press of `Shift+Alt+KeyF` reports
+    // `key: "F"`, `keyCode: 70` on both WebKit and Chromium.
+    const byCommand = mounted(RAGGED, RAGGED.indexOf("xxxx"));
+    expect(formatTable(byCommand)).toBe(true);
+    const formatted = byCommand.state.doc.toString();
+    byCommand.destroy();
+
+    const view = mounted(RAGGED, RAGGED.indexOf("xxxx"));
+    const event = press(view, { key: "F", altKey: true, shiftKey: true, keyCode: 70 });
+
+    // Compared against what the command itself produces, so the column widths
+    // stay `sourceEditorTableModel`'s contract to change, not this test's.
+    expect(view.state.doc.toString()).toBe(formatted);
+    expect(formatted).not.toBe(RAGGED);
+    expect(event.defaultPrevented).toBe(true);
+    view.destroy();
+  });
+
+  it("still reveals through that same fallback", () => {
+    // Shift-Alt-\ arrives as "|", the shifted backslash, on keyCode 220 —
+    // measured the same way, on both engines.
+    const view = mounted(ALIGNED, ALIGNED.indexOf("| --- |") + 2);
+    // Nothing was revealed before the press, so the assertion after it is about
+    // the keystroke rather than about the field's initial value.
+    expect(view.state.field(revealedTableSource)).toBeNull();
+
+    const event = press(view, { key: "|", altKey: true, shiftKey: true, keyCode: 220 });
+
+    expect(view.state.field(revealedTableSource)).not.toBeNull();
+    expect(view.state.doc.toString()).toBe(ALIGNED);
+    expect(event.defaultPrevented).toBe(true);
+    view.destroy();
   });
 });

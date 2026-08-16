@@ -15,6 +15,7 @@ import { EditorSelection, EditorState, type Transaction } from "@codemirror/stat
 import { EditorView } from "@codemirror/view";
 import { describe, expect, it } from "vitest";
 
+import { withPublishedParse } from "../test/publishedParse";
 import {
   revealTableSourceAt,
   revealTableSource,
@@ -45,16 +46,24 @@ const ALIGNMENT_ROW = TABLE.indexOf("| --- |");
 const ALIGNMENT_CELL = ALIGNMENT_ROW + 2;
 const OUTSIDE = TABLE.indexOf("Outside");
 
+// The published parse is not optional here: `revealTableSourceAt` and
+// `hiddenTableDelimiters` both walk `syntaxTree(state)`, so a state that lost the
+// 20ms `Work.Apply` race holds no table, the command returns null, and the test
+// reads `expected null not to be null`. Measured at 3 failures in 8 full-suite
+// runs under 20 CPU burners. See `src/test/publishedParse.ts`.
 function editor(anchor: number, doc = TABLE) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      selection: EditorSelection.cursor(anchor),
+      extensions: [
+        markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+        revealedTableSource,
+        tableDelimiterGuard,
+      ],
+    }),
     doc,
-    selection: EditorSelection.cursor(anchor),
-    extensions: [
-      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
-      revealedTableSource,
-      tableDelimiterGuard,
-    ],
-  });
+  );
 }
 
 /** Apply the reveal command's spec, as the keymap would. */

@@ -86,6 +86,17 @@ describe("GalaxyNotePreview", () => {
     expect(screen.getByText("1 connected note")).toBeInTheDocument();
   });
 
+  it("announces the pending read through a polite status live region", () => {
+    // The loading notice is a native <output>; "status" is its implicit role and
+    // the only reason a screen reader hears the wait at all. Pin the role, not
+    // the copy — an implicit mapping can go quiet without changing any text.
+    mocks.readNote.mockReturnValue(new Promise<NoteDoc>(() => {}));
+
+    renderPreview();
+
+    expect(screen.getByRole("status")).toHaveTextContent("Loading note…");
+  });
+
   it("drops a late read when the selected node changes", async () => {
     let resolveAlpha!: (value: NoteDoc) => void;
     mocks.readNote

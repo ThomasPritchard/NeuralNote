@@ -4,12 +4,12 @@ use crate::ai::elicitation::{elicit_user, ElicitationOutcome};
 use crate::ai::events::{ChatEvent, ElicitOption, Elicitation};
 use crate::ai::llm::UserPrompt;
 use crate::ai::skills::{Eligibility, YOUTUBE_DISTIL_SKILL_ID};
-use crate::ai::tools::{action, reject, ToolContext, ToolResult};
+use crate::ai::tools::{action, fail, reject, ToolContext, ToolResult};
 use crate::ai::youtube::{
     CaptionPayload, CaptionRequest, MetadataPayload, PotMode, YoutubeAnnotation, YoutubeIo,
     YoutubeToolSession, YoutubeUrl,
 };
-use crate::ai::youtube_tool_errors::{capture_reject, session_capture_reject};
+use crate::ai::youtube_tool_errors::{settle_capture_error, settle_session_capture_error};
 use crate::capture::{
     estimate_transcript_cost, parse_video_metadata, parse_vtt, render_youtube_transcript,
     CaptionSource, CaptureAction, CaptureError, CostEstimate, PricingInput, RenderedTranscript,
@@ -46,29 +46,29 @@ pub(super) async fn dispatch_fetch_video_info(
     };
     let url = match validate_youtube_url(&args.url) {
         Ok(url) => url,
-        Err(error) => return capture_reject(error),
+        Err(error) => return settle_capture_error(error),
     };
     let (io, session) = match youtube_services(context) {
         Ok(services) => services,
-        Err(error) => return capture_reject(error),
+        Err(error) => return settle_capture_error(error),
     };
     if let Err(error) = session.validate_playlist_capture_url(&url) {
-        return session_capture_reject(session, error);
+        return settle_session_capture_error(session, error);
     }
     let payload = match inspect_with_retry(io, session, &url).await {
         Ok(payload) => payload,
-        Err(error) => return session_capture_reject(session, error),
+        Err(error) => return settle_session_capture_error(session, error),
     };
     let metadata = match parse_video_metadata(&payload.json) {
         Ok(metadata) => metadata,
-        Err(error) => return session_capture_reject(session, error),
+        Err(error) => return settle_session_capture_error(session, error),
     };
     let metadata_video_id = match crate::capture::VideoId::new(&metadata.video_id) {
         Ok(video_id) => video_id,
-        Err(error) => return session_capture_reject(session, error),
+        Err(error) => return settle_session_capture_error(session, error),
     };
     if let Err(error) = session.validate_playlist_video_id(&metadata_video_id) {
-        return session_capture_reject(session, error);
+        return settle_session_capture_error(session, error);
     }
     let genuinely_absent = metadata.captions.is_genuinely_absent()
         && !payload
@@ -88,25 +88,30 @@ pub(super) async fn dispatch_fetch_captions(
     };
     let url = match validate_youtube_url(&args.url) {
         Ok(url) => url,
-        Err(error) => return capture_reject(error),
+        Err(error) => return settle_capture_error(error),
     };
     let language = args.lang.trim();
     if language.is_empty() || language.len() > 64 {
-        return capture_reject(CaptureError::InvalidMetadata(
+        // `InvalidSource`, not `InvalidMetadata`: nothing has been fetched yet,
+        // so there is no metadata to be invalid. This is the caller's own
+        // argument check, and it has to read as a refusal (#116) — telling the
+        // user something broke when the model sent `lang: ""` is the same wrong
+        // story this split exists to remove, pointed the other way.
+        return settle_capture_error(CaptureError::InvalidSource(
             "requested caption language must contain 1 to 64 bytes".into(),
         ));
     }
     let pricing = context.pricing.cloned();
     let (io, session) = match youtube_services(context) {
         Ok(services) => services,
-        Err(error) => return capture_reject(error),
+        Err(error) => return settle_capture_error(error),
     };
     if let Err(error) = session.validate_playlist_capture_url(&url) {
-        return session_capture_reject(session, error);
+        return settle_session_capture_error(session, error);
     }
     let (payload, metadata, video_id) = match inspect_validated_metadata(io, session, &url).await {
         Ok(value) => value,
-        Err(error) => return session_capture_reject(session, error),
+        Err(error) => return settle_session_capture_error(session, error),
     };
     let selection = match prepare_caption_selection(
         session,
@@ -117,7 +122,7 @@ pub(super) async fn dispatch_fetch_captions(
         language,
     ) {
         Ok(selection) => selection,
-        Err(error) => return session_capture_reject(session, error),
+        Err(error) => return settle_session_capture_error(session, error),
     };
     let request = CaptionRequest {
         url,
@@ -127,12 +132,12 @@ pub(super) async fn dispatch_fetch_captions(
     };
     let payload = match captions_with_retry(io, session, &request).await {
         Ok(payload) => payload,
-        Err(error) => return session_capture_reject(session, error),
+        Err(error) => return settle_session_capture_error(session, error),
     };
     let rendered =
         match render_caption_payload(&payload, selection.source, &selection.language, &video_id) {
             Ok(rendered) => rendered,
-            Err(error) => return session_capture_reject(session, error),
+            Err(error) => return settle_session_capture_error(session, error),
         };
     let mut annotations = combined_annotations(session, payload.annotations);
     let cost_estimate =
@@ -226,16 +231,19 @@ pub(super) async fn dispatch_transcribe_audio(
     };
     let url = match validate_youtube_url(&args.url) {
         Ok(url) => url,
-        Err(error) => return capture_reject(error),
+        Err(error) => return settle_capture_error(error),
     };
     let (cancellation, video_id) = match transcription_authority(context, &url) {
         Ok(authority) => authority,
-        Err(error) => return capture_reject(error),
+        Err(error) => return settle_capture_error(error),
     };
     let pricing = context.pricing.cloned();
     let optional_requirements = match context.skills.lookup(YOUTUBE_DISTIL_SKILL_ID) {
         Ok(manifest) => manifest.optional_requirements.clone(),
-        Err(error) => return reject(error.to_string()),
+        // The skill granted this tool, so its manifest must be in the registry.
+        // A miss here is the catalogue coming apart underneath a running call,
+        // not the model asking for something it may not have.
+        Err(error) => return fail(error.to_string()),
     };
     if let Err(result) = ensure_whisper_available(
         call_id,
@@ -250,21 +258,21 @@ pub(super) async fn dispatch_transcribe_audio(
     }
     let (io, session) = match youtube_services(context) {
         Ok(services) => services,
-        Err(error) => return capture_reject(error),
+        Err(error) => return settle_capture_error(error),
     };
     let model = session.whisper_model();
     let payload = match transcription_with_retry(io, session, &url, model).await {
         Ok(payload) => payload,
-        Err(error) => return session_capture_reject(session, error),
+        Err(error) => return settle_session_capture_error(session, error),
     };
     if session.cancellation().is_cancelled() {
-        return capture_reject(CaptureError::Cancelled(
+        return settle_capture_error(CaptureError::Cancelled(
             "transcription was cancelled".into(),
         ));
     }
     let cues = match parse_vtt(&payload.vtt) {
         Ok(cues) => cues,
-        Err(error) => return session_capture_reject(session, error),
+        Err(error) => return settle_session_capture_error(session, error),
     };
     let rendered = match render_youtube_transcript(
         &cues,
@@ -274,7 +282,7 @@ pub(super) async fn dispatch_transcribe_audio(
         &video_id,
     ) {
         Ok(rendered) => rendered,
-        Err(error) => return session_capture_reject(session, error),
+        Err(error) => return settle_session_capture_error(session, error),
     };
     let mut annotations = combined_annotations(session, payload.annotations);
     let cost_estimate =
@@ -338,7 +346,7 @@ async fn ensure_whisper_available(
     context: &mut ToolContext<'_>,
     cancellation: &crate::ai::youtube::CaptureCancellation,
 ) -> Result<(), ToolResult> {
-    validate_whisper_disk(requirements, context).map_err(capture_reject)?;
+    validate_whisper_disk(requirements, context).map_err(settle_capture_error)?;
     let eligibility = Eligibility::evaluate(requirements, context.environment);
     if eligibility.is_eligible() {
         return Ok(());
@@ -347,7 +355,7 @@ async fn ensure_whisper_available(
     match elicit_user(user_prompt, context.sink, question).await {
         ElicitationOutcome::Answered { chosen_ids } if chosen_ids.as_slice() == ["install"] => {}
         ElicitationOutcome::Answered { .. } => {
-            return Err(capture_reject(CaptureError::Cancelled(
+            return Err(settle_capture_error(CaptureError::Cancelled(
                 "Whisper installation was declined".into(),
             )))
         }
@@ -361,7 +369,7 @@ async fn ensure_whisper_available(
         .youtube_requirements
         .install_whisper_bundle(context.sink, cancellation)
         .await
-        .map_err(capture_reject)
+        .map_err(settle_capture_error)
 }
 
 fn validate_whisper_disk(
@@ -553,15 +561,17 @@ async fn transcription_with_retry(
         .transcribe_audio(url, model, session.cancellation())
         .await
     {
-        Err(_error) if session.cancellation().is_cancelled() => Err(CaptureError::Cancelled(
-            "transcription was cancelled before a fallback retry".into(),
+        Err(error) if session.cancellation().is_cancelled() => Err(cancelled_after(
+            "transcription was cancelled before a fallback retry",
+            &error,
         )),
         Err(error) => match session.decide(&error) {
             CaptureAction::UpdateExtractorAndRetry => {
                 update_extractor(io, session).await;
                 if session.cancellation().is_cancelled() {
-                    Err(CaptureError::Cancelled(
-                        "transcription was cancelled during extractor update".into(),
+                    Err(cancelled_after(
+                        "transcription was cancelled during extractor update",
+                        &error,
                     ))
                 } else {
                     io.transcribe_audio(url, model, session.cancellation())
@@ -572,6 +582,25 @@ async fn transcription_with_retry(
         },
         success => success,
     }
+}
+
+/// A cancellation that interrupted an attempt which had ALREADY failed.
+///
+/// Both call sites above key on the cancellation *flag*, never on the cause — so
+/// they fire identically whether the run was healthy when the user pressed Stop
+/// or `whisper-cli` had just died. The flag cannot carry that difference and the
+/// original error is the only thing that can, so it travels in the detail rather
+/// than being dropped on the floor. `settle_capture_error` projects `detail()` to
+/// both the model and the timeline, so this is where a crash that raced a Stop
+/// stays visible.
+///
+/// It stays a `Cancelled`, not a `TranscriptionFailed`: the run is over either
+/// way and the user asked for that, so the headline is still "the run ended".
+/// What changes is that the headline is no longer the whole story.
+fn cancelled_after(what_happened: &str, cause: &CaptureError) -> CaptureError {
+    CaptureError::Cancelled(format!(
+        "{what_happened}; the attempt in flight had already failed ({cause})"
+    ))
 }
 
 pub(super) async fn update_extractor(io: &dyn YoutubeIo, session: &mut YoutubeToolSession) {

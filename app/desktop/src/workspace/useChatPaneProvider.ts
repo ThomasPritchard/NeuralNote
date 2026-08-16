@@ -89,6 +89,11 @@ export interface ChatPaneProvider {
   reasoningOn: boolean;
   effectiveReasoning: boolean;
   reasoningReasonId: string;
+  /** The last key save landed in the keychain but could not be announced to the
+   *  app's other windows — see `KeyChangeCaveat`. The pane renders the notice;
+   *  this flag is the only thing that decides whether it is up. */
+  keyChangeCaveat: boolean;
+  dismissKeyChangeCaveat: () => void;
   applyStatus: (next: AiStatus) => void;
   handleSave: (key: string, chosenModel: string) => Promise<void>;
   toggleReasoning: () => Promise<void>;
@@ -120,6 +125,11 @@ export function useChatPaneProvider({
   const [saving, setSaving] = useState(false);
   const [savingReasoning, setSavingReasoning] = useState(false);
   const [reasoningError, setReasoningError] = useState<string | null>(null);
+  // Set when a save committed to the keychain but the app's other windows could
+  // not be told to drop the key they cached. Deliberately NOT on `reportError`:
+  // that channel raises a red toast and would tell the user the save failed,
+  // which is the opposite false report to the one this exists to fix.
+  const [keyChangeCaveat, setKeyChangeCaveat] = useState(false);
   const reasoningReasonId = useId();
 
   // Latest view, readable from the status effect below without re-running it
@@ -263,11 +273,19 @@ export function useChatPaneProvider({
     }
   }, [savingReasoning, capability.disabled, reasoningOn, applyStatus]);
 
+  const dismissKeyChangeCaveat = useCallback(() => setKeyChangeCaveat(false), []);
+
   const handleSave = useCallback(
     async (key: string, chosenModel: string) => {
       setSaving(true);
       try {
-        await api.saveApiKey(key, chosenModel);
+        const outcome = await api.saveApiKey(key, chosenModel);
+        // Read the outcome before anything downstream can fail. The keychain
+        // write is committed by the time this resolves, so a partial publish is
+        // true regardless of what the status re-read below does — and the pane
+        // is about to swap this panel out for the transcript, which is why the
+        // notice has to outlive the view it was raised from.
+        setKeyChangeCaveat(!outcome.revisionPublished);
         // Re-read the effective provider: a fresh key with no explicit choice
         // reads as "openRouter", which lands the pane in the chat view.
         const generation = statusGenerationRef.current + 1;
@@ -299,6 +317,8 @@ export function useChatPaneProvider({
     reasoningOn,
     effectiveReasoning,
     reasoningReasonId,
+    keyChangeCaveat,
+    dismissKeyChangeCaveat,
     applyStatus,
     handleSave,
     toggleReasoning,

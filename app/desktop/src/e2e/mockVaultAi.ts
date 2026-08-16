@@ -279,11 +279,17 @@ export const createAiBackend = (
       });
       keyState.hasKey = true;
       keyState.model = model;
-      return undefined;
+      // Shaped like the real command, which returns `KeyChangeOutcome` rather
+      // than nothing (`commands/ai.rs:55`, `:117`). A mock answering `undefined`
+      // agreed both with a frontend that read the outcome and with one that
+      // discarded it, so the journey tier stayed green through the whole period
+      // `api.ts` typed these as `invoke<void>` and dropped a failed revocation
+      // notice on the floor.
+      return { revisionPublished: opts.keyRevisionPublished ?? true };
     },
     clear_api_key: () => {
       keyState.hasKey = false;
-      return undefined;
+      return { revisionPublished: opts.keyRevisionPublished ?? true };
     },
     list_skills: () =>
       // Fresh objects per call, exactly as serde would deserialise them —

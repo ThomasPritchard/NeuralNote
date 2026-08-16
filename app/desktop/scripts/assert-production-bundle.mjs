@@ -13,13 +13,27 @@ const AUTOMATION_MARKERS = [
 const SCANNED_EXTENSIONS = new Set([".cjs", ".html", ".js", ".mjs"]);
 const MAX_SCANNED_FILE_BYTES = 64 * 1024 * 1024;
 
-async function findNativeAutomationMarkers(bundleRoot) {
+// A package manifest imported for one field and left whole by the bundler ships
+// every dependency and its exact version range to users. The build is minified,
+// so the leak reads `,devDependencies:{"@tauri-apps/cli":`^2`,...}` - the key
+// unquoted, its value an object literal. Matching the pretty-printed
+// `"devDependencies":` instead would never fire on a real bundle.
+//
+// The preceding `{` or `,` is what separates a manifest from an app string that
+// merely names one of these sections, which release notes legitimately do.
+const MINIFIED_MANIFEST_SECTION =
+  /[{,](dependencies|devDependencies|optionalDependencies|peerDependencies|scripts):\{/g;
+// One section alone is not proof: an app could own an object called `scripts`.
+// A manifest always arrives with several, so requiring two keeps the rule
+// specific without letting a real leak through.
+const EMBEDDED_MANIFEST_SECTION_THRESHOLD = 2;
+
+async function* bundleAssets(bundleRoot) {
   const rootStat = await lstat(bundleRoot);
   if (!rootStat.isDirectory() || rootStat.isSymbolicLink()) {
     throw new Error("production bundle root must be a real directory");
   }
 
-  const found = new Map();
   const pending = [bundleRoot];
   while (pending.length > 0) {
     const directory = pending.pop();
@@ -39,15 +53,32 @@ async function findNativeAutomationMarkers(bundleRoot) {
       if (fileStat.size > MAX_SCANNED_FILE_BYTES) {
         throw new Error(`production bundle chunk is too large to inspect: ${path.relative(bundleRoot, pathname)}`);
       }
-      const source = await readFile(pathname, "utf8");
-      for (const marker of AUTOMATION_MARKERS) {
-        if (source.includes(marker) && !found.has(marker)) {
-          found.set(marker, path.relative(bundleRoot, pathname));
-        }
+      yield {
+        assetPath: path.relative(bundleRoot, pathname),
+        source: await readFile(pathname, "utf8"),
+      };
+    }
+  }
+}
+
+async function findNativeAutomationMarkers(bundleRoot) {
+  const found = new Map();
+  for await (const { assetPath, source } of bundleAssets(bundleRoot)) {
+    for (const marker of AUTOMATION_MARKERS) {
+      if (source.includes(marker) && !found.has(marker)) {
+        found.set(marker, assetPath);
       }
     }
   }
   return found;
+}
+
+function minifiedManifestSections(source) {
+  const sections = new Set();
+  for (const [, section] of source.matchAll(MINIFIED_MANIFEST_SECTION)) {
+    sections.add(section);
+  }
+  return [...sections].sort();
 }
 
 export async function assertNoNativeAutomation(bundleRoot) {
@@ -71,6 +102,17 @@ export async function assertNativeAutomationIncluded(bundleRoot) {
   }
 }
 
+export async function assertNoEmbeddedPackageManifest(bundleRoot) {
+  for await (const { assetPath, source } of bundleAssets(bundleRoot)) {
+    const sections = minifiedManifestSections(source);
+    if (sections.length >= EMBEDDED_MANIFEST_SECTION_THRESHOLD) {
+      throw new Error(
+        `production bundle embeds package manifest sections (${sections.join(", ")}) in ${assetPath}`,
+      );
+    }
+  }
+}
+
 export function bundleExpectation(args) {
   if (args.length === 0) return "production";
   if (args.length === 1 && args[0] === "--expect-native-automation") {
@@ -81,7 +123,15 @@ export function bundleExpectation(args) {
 
 if (process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const bundleRoot = path.resolve(process.argv[2] ?? "dist");
-  if (bundleExpectation(process.argv.slice(3)) === "native-e2e") {
+  const expectation = bundleExpectation(process.argv.slice(3));
+
+  // Both bundles are built from the same sources, so a manifest that leaks into
+  // one leaks into the other. Checking both means whichever build a developer
+  // runs is the one that catches it.
+  await assertNoEmbeddedPackageManifest(bundleRoot);
+  console.log("Bundle embeds no package manifest.");
+
+  if (expectation === "native-e2e") {
     await assertNativeAutomationIncluded(bundleRoot);
     console.log("Native E2E bundle includes the WebdriverIO frontend bootstrap.");
   } else {

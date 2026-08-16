@@ -66,7 +66,10 @@ ${indent(6)}},`,
     )
     .join("\n");
 
-  return `import packageJson from "../../package.json";
+  // A named import, never a default one: Rolldown does not tree-shake the unused
+  // properties off a whole-manifest default import, so `import packageJson` ships
+  // every dependency and version range in package.json to users.
+  return `import { version } from "../../package.json";
 
 export interface ReleaseNotesGroup {
   readonly title: string;
@@ -104,15 +107,15 @@ ${body}
   },
 };
 
-function releaseNotesFor(version: string): ReleaseNotes {
-  const notes = RELEASE_NOTES[version];
+function releaseNotesFor(releaseVersion: string): ReleaseNotes {
+  const notes = RELEASE_NOTES[releaseVersion];
   if (!notes) {
-    throw new Error(\`No bundled release notes exist for NeuralNote \${version}.\`);
+    throw new Error(\`No bundled release notes exist for NeuralNote \${releaseVersion}.\`);
   }
   return notes;
 }
 
-export const CURRENT_RELEASE_NOTES = releaseNotesFor(packageJson.version);
+export const CURRENT_RELEASE_NOTES = releaseNotesFor(version);
 `;
 }
 

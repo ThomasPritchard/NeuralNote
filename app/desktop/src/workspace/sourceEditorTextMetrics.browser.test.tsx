@@ -345,9 +345,23 @@ describe("sourceEditorTextMetrics in a real browser", () => {
     // empty until CodeMirror's first measure cycle — so a freshly mounted editor
     // paints the raw source for a frame, markers and all. Wait for the
     // projection itself rather than for a timeout.
+    //
+    // Wait for EVERY cell, not for one of them. Waiting on a single line and
+    // then reading all of them assumes the whole document paints in one cycle;
+    // it does not, and the loop below `continue`s past whatever is still
+    // missing, so a slow cell leaves the sweep quietly comparing less than it
+    // claims. That is not hypothetical: the WebKit CI leg failed exactly here
+    // with `` `soundcheck` `` — an inline-code cell — absent from `compared`,
+    // caught only by the guard at the end of this test. Naming the stragglers in
+    // the error keeps that diagnosis in the failure message rather than in a
+    // deep-equal diff of two long arrays.
+    const projections = CELL_SOURCES.map((cell) => ({ cell, text: planFor(cell).visibleText }));
     await vi.waitFor(() => {
-      if (!paintedLine(host, "DJ gig at the Bell")) {
-        throw new Error("the preview decorations have not painted yet");
+      const unpainted = projections.filter(({ text }) => !paintedLine(host, text));
+      if (unpainted.length > 0) {
+        throw new Error(
+          `the preview decorations have not painted yet: ${unpainted.map(({ cell }) => cell).join(", ")}`,
+        );
       }
     });
     primeTextMetrics(host.querySelector(".cm-content")!);

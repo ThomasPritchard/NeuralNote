@@ -57,6 +57,18 @@ export function FlatTreeRow({
         // Wrapper carries this row's "Move to" shortcut; keydowns bubble up from
         // the row's focused button. TreeRow itself is untouched, so its
         // React.memo boundary (issue #25) is preserved exactly.
+        //
+        // Two Sonar findings are knowingly left OPEN here, unsuppressed: S6847
+        // (keyboard handler on a non-interactive element) and S6819 (prefer a
+        // tag over `role="presentation"`). `presentation` is the honest label
+        // for scaffolding sitting between the tree and its treeitem, and it is
+        // what exempts this wrapper from S6848 — dropping it only trades S6819
+        // for "static HTML elements with event handlers require a role". The
+        // one change that silences both — re-registering this handler with
+        // `addEventListener` on a ref — merely hides it from the analyser, and
+        // it fires ahead of React's synthetic dispatch, which would blind the
+        // `defaultPrevented` guard in `handleMoveShortcut` to a descendant's
+        // React preventDefault.
         <div
           role="presentation"
           onKeyDown={(event) => handleMoveShortcut(event, row.node, onMove)}

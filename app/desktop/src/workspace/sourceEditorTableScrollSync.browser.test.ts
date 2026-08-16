@@ -28,6 +28,7 @@ import {
   type DecorationSet,
 } from "@codemirror/view";
 import { afterEach, describe, expect, it } from "vitest";
+import { userEvent } from "vitest/browser";
 
 import {
   CARET_OFFSCREEN_CLASS,
@@ -58,6 +59,29 @@ const DEEP_SOURCE = SOURCE.replace(
   "Between the tables.",
   Array.from({ length: 30 }, (_, index) => `Filler paragraph ${index}.`).join("\n\n"),
 );
+
+/**
+ * `SOURCE` with a long tail. `SOURCE` is a prefix of it, so every offset below
+ * still points where it did; the filler goes after the tables rather than
+ * between them, so both tables stay on screen while the note gains somewhere to
+ * scroll to.
+ *
+ * The length is the point: past ~3,000 characters a Markdown document is no
+ * longer parsed up front, and a fixture under that budget can only ever exercise
+ * the easy case. This harness carries no Markdown parser — its row marks come
+ * from the `StateField` above — so the budget is not what makes the tests here
+ * pass or fail. The wheel specs use it anyway, because a real gesture is worth
+ * measuring against a document the size of a real note — and they assert the
+ * length rather than trusting the arithmetic here.
+ */
+const LONG_SOURCE = [
+  SOURCE,
+  ...Array.from(
+    { length: 40 },
+    (_, index) =>
+      `Trailing filler paragraph ${index}, carrying the document past the budget.`,
+  ),
+].join("\n\n");
 
 const HARNESS_STYLE = `
 .nn-scroll-harness { width: 400px; height: 260px; }
@@ -159,8 +183,24 @@ function unmount(harness: Harness): void {
   mounted = mounted.filter((entry) => entry !== harness);
 }
 
+/**
+ * A bare element in the page, cleaned up with the harnesses. The wheel specs
+ * need one that owes nothing to this module: a control the provider can be
+ * measured against.
+ */
+let strays: HTMLElement[] = [];
+
+function strayElement(): HTMLElement {
+  const element = document.createElement("div");
+  document.body.append(element);
+  strays.push(element);
+  return element;
+}
+
 afterEach(() => {
   while (mounted.length > 0) unmount(mounted[0]!);
+  for (const stray of strays) stray.remove();
+  strays = [];
 });
 
 const frame = (): Promise<void> =>
@@ -275,6 +315,127 @@ const FIRST_CELL_END = FIRST_CELL + "alpha one two three".length;
 const LAST_CELL_END = at("charlie one two thr") + "charlie one two thr".length;
 const SECOND_TABLE_CELL = at("delta body");
 const OUTSIDE = at("Between the tables.");
+
+/**
+ * Issue #98 reported a wide table in the native macOS build sitting at
+ * `scrollLeft = 0` under horizontal-wheel input while genuinely overflowed
+ * (`scrollWidth 1099`, `clientWidth 631`), and caveated its own finding: the
+ * gesture came from Computer Use's *generated* horizontal wheel, and vertical
+ * scrolling through the same automation worked.
+ *
+ * These drive `userEvent.wheel`, which reaches `page.mouse.wheel` in the
+ * Playwright provider — engine wheel dispatch with the engine's own default
+ * scrolling behind it. A hand-dispatched `new WheelEvent(...)` will not do: it
+ * exercises listeners and never default scrolling, so it can only ever confirm
+ * what this module already believes. Nothing here constructs one.
+ *
+ * The measurement they were written from: at `deltaX: 180` the row went 0 to
+ * 180 and all five siblings with it, identically on WebKit and Chromium, the
+ * event arriving `deltaMode: 0` with `defaultPrevented: false`. Nothing in this
+ * module registers a `wheel` handler at all — the engine and the stylesheet
+ * originate the scroll and the `scroll` listener only propagates it — so no
+ * wheel handler was written for #98. What no tier here can reach is recorded on
+ * the issue: a physical trackpad, AppKit-to-WKWebView delivery, and momentum.
+ *
+ * The control is the first test rather than a comment, and it earns the place:
+ * the same run had Shift-plus-vertical-delta leave a plain overflowed div at
+ * `scrollLeft = 0`, because `page.mouse.wheel` emits `deltaX: 0` and the
+ * Shift-to-horizontal translation happens above the engine. An automation layer
+ * that cannot originate horizontal motion makes a provably scrollable container
+ * look frozen — the reported symptom, with no defect present. Without a control,
+ * the day the provider regresses that way it reads as this module's fault.
+ */
+describe("a real horizontal wheel over a table row", () => {
+  /** Comfortably inside every fixture row's extent, so nothing clamps. */
+  const WHEEL_DELTA_PX = 180;
+
+  it("moves a plain overflowed element, so a still row below is not the provider", async () => {
+    const probe = strayElement();
+    probe.style.cssText = "width:400px;height:60px;overflow:auto;white-space:pre";
+    probe.textContent = "x".repeat(400);
+    expect(maxOffset(probe)).toBeGreaterThan(WHEEL_DELTA_PX);
+
+    await userEvent.wheel(probe, { delta: { x: WHEEL_DELTA_PX } });
+    await settle();
+
+    expect(probe.scrollLeft).toBeGreaterThan(WHEEL_DELTA_PX / 2);
+  });
+
+  it("scrolls the row it lands on, and every sibling with it", async () => {
+    // The fixture is the size the doc comment claims, checked rather than
+    // trusted — a shrunken tail would quietly stop exercising a real note.
+    expect(LONG_SOURCE.length).toBeGreaterThan(3000);
+    const { view } = mount(LONG_SOURCE);
+    const rows = tableRowsFor(view, FIRST_CELL);
+    // A body row, which is where the issue's reproduction put the gesture.
+    const row = rows[2]!;
+    // The report's premise restated as the fixture's: genuinely overflowed, and
+    // genuinely at zero. Without both, everything below passes on nothing.
+    expect(maxOffset(row)).toBeGreaterThan(WHEEL_DELTA_PX);
+    expect(row.scrollLeft).toBe(0);
+
+    await userEvent.wheel(row, { delta: { x: WHEEL_DELTA_PX } });
+    await settle();
+
+    // Moved meaningfully rather than by exactly the delta: an engine is free to
+    // scale a wheel, and pinning the number would measure the engine instead.
+    expect(row.scrollLeft).toBeGreaterThan(WHEEL_DELTA_PX / 2);
+    for (const other of rows) expect(other.scrollLeft).toBeCloseTo(row.scrollLeft, 0);
+
+    // The rest of the note stays fixed, asked of something that could actually
+    // have moved. `view.scrollDOM.scrollLeft` cannot: the harness clamps
+    // `.cm-content` to the band (`:98`), so `scrollWidth === clientWidth` and
+    // the browser rejects any write. Measured, because that zero used to be
+    // asserted here as though it meant something — writing 500 to it and then
+    // asserting it is 0 PASSES. The second table's rows are the real control:
+    // they move independently, as "leaves a second table where it was" below
+    // shows, and aiming this loop at the wheeled table fails on 180 against 0.
+    for (const other of tableRowsFor(view, SECOND_TABLE_CELL)) {
+      expect(maxOffset(other)).toBeGreaterThan(WHEEL_DELTA_PX);
+      expect(other.scrollLeft).toBe(0);
+    }
+  });
+
+  it("leaves a vertical wheel over a row to the note", async () => {
+    // The other half, and the one a speculative wheel handler would break: the
+    // block axis is still CodeMirror's, and a row must not swallow it.
+    const { view } = mount(LONG_SOURCE);
+    const row = tableRowsFor(view, FIRST_CELL)[2]!;
+    expect(view.scrollDOM.scrollTop).toBe(0);
+    // The row has somewhere to go on the inline axis, so the last assertion is
+    // about the gesture staying on the block axis rather than about a container
+    // that could not have moved anyway.
+    expect(maxOffset(row)).toBeGreaterThan(WHEEL_DELTA_PX);
+
+    await userEvent.wheel(row, { delta: { y: 120 } });
+    await settle();
+
+    expect(view.scrollDOM.scrollTop).toBeGreaterThan(0);
+    expect(row.scrollLeft).toBe(0);
+  });
+
+  it("suppresses a caret a real gesture has scrolled out of band", async () => {
+    // The issue's remaining acceptance criterion, over the gesture rather than
+    // over a scripted `scrollLeft` write. The same `scroll` event underneath —
+    // but the two are only one path until someone changes one of them.
+    const { view } = mount(LONG_SOURCE);
+    view.dispatch({ selection: EditorSelection.cursor(FIRST_CELL) });
+    await settle();
+    const row = tableRowsFor(view, FIRST_CELL)[2]!;
+    expect(caretFlagged(view)).toBe(false);
+
+    // Several ticks rather than one enormous delta, which is both what a real
+    // gesture looks like and what a row can be sure of consuming: the total
+    // comfortably outruns the extent, so the row ends against its far edge.
+    await userEvent.wheel(row, { delta: { x: 400 }, times: 3 });
+    await settle();
+
+    // The caret's column really did leave the band, rather than the flag having
+    // been raised by something else.
+    expect(row.scrollLeft).toBeGreaterThan(contentX(view, FIRST_CELL));
+    expect(caretFlagged(view)).toBe(true);
+  });
+});
 
 describe("table row scroll synchronisation", () => {
   it("puts every row of a table on the offset one row was scrolled to", async () => {

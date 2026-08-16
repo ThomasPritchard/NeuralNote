@@ -2,10 +2,12 @@ import { markdown, markdownLanguage } from "@codemirror/lang-markdown";
 import { EditorState } from "@codemirror/state";
 import { describe, expect, it } from "vitest";
 
+import { withPublishedParse } from "../test/publishedParse";
 import type { CellPaintPlan } from "./sourceEditorCellPaintPlan";
 import {
   CELL_TRACK_GUTTER_CH,
   CELL_TRACK_GUTTER_PX,
+  monospaceWidth,
   tableColumnWidths,
   tableDelimiterRanges,
   tableModelAt,
@@ -14,13 +16,32 @@ import {
   type TableRenderPlan,
 } from "./sourceEditorTableModel";
 
+/**
+ * A state whose syntax tree covers the WHOLE document.
+ *
+ * `tableModelAt` finds its table by walking `syntaxTree(state)`, and a bare
+ * `EditorState.create` publishes only what `LanguageState.init` reached inside
+ * `Work.InitViewport` (3,000 characters) and `Work.Apply` (20 ms of WALL CLOCK)
+ * — `@codemirror/language/dist/index.js:539-545`. Either bound leaves the model
+ * measuring a document with no table in it, so every fixture here goes through
+ * the shared publisher; `src/test/publishedParse.ts` carries the full argument,
+ * including why `ensureSyntaxTree` alone does not close it.
+ *
+ * The long-fixture case at "sizes a wide column past the 3,000 characters the
+ * parser reads up front" used to have a builder of its own for this. It does not
+ * need one: the bound it is written against applies to every fixture in the
+ * file, short ones included, whenever the machine is busy enough.
+ */
 function state(doc: string) {
-  return EditorState.create({
+  return withPublishedParse(
+    EditorState.create({
+      doc,
+      extensions: [
+        markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
+      ],
+    }),
     doc,
-    extensions: [
-      markdown({ base: markdownLanguage, completeHTMLTags: false, pasteURLAsLink: false }),
-    ],
-  });
+  );
 }
 
 function slotText(doc: string, model: TableModel, row: number, column: number): string {
@@ -102,6 +123,72 @@ describe("tableModelAt", () => {
   });
 });
 
+/**
+ * The contract issue #86 settles, case by case. Two rules decide a cluster:
+ * emoji presentation makes it two columns, and East Asian Wide/Fullwidth does
+ * too. Everything else is one, including a pictograph that defaults to TEXT
+ * presentation and was not given `U+FE0F` — `☀` is a narrow dingbat and `☀️` is
+ * a wide emoji, and the only thing that separates them is the selector.
+ */
+describe("monospaceWidth", () => {
+  it.each([
+    ["🚀", "U+1F680, transport and map symbols"],
+    ["✅", "U+2705, a dingbat that defaults to emoji presentation"],
+    ["⭐", "U+2B50, a misc symbol that defaults to emoji presentation"],
+    ["⌚", "U+231A, misc technical"],
+    ["🇬🇧", "U+1F1EC U+1F1E7, a regional-indicator pair painted as one flag"],
+    ["☀️", "U+2600 U+FE0F, a text-presentation symbol asking for emoji"],
+    ["❤️", "U+2764 U+FE0F, the same, and the commonest one in prose"],
+    ["1️⃣", "U+0031 U+FE0F U+20E3, a keycap sequence"],
+    ["👍", "U+1F44D, already covered — the case issue #86 opened on"],
+    ["🫠", "U+1FAE0, astral and outside every hard-coded range"],
+    ["🩹", "U+1FA79, the same, in a different post-2019 block"],
+    ["中", "U+4E2D, East Asian Wide"],
+    ["Ａ", "U+FF21, Fullwidth"],
+  ])("counts %s as two columns (%s)", (text) => {
+    expect(monospaceWidth(text)).toBe(2);
+  });
+
+  it("has the two astral rows written as the code points they name", () => {
+    // Why those two: the emoji blocks `DOUBLE_WIDTH_RANGES` lists stop at
+    // U+1F9FF, and both of these sit above it, so a reader who assumes the
+    // pictograph ranges cover every astral emoji is wrong about exactly these.
+    // Only `\p{Emoji_Presentation}` can answer them, and a look-alike glyph
+    // would take that guard away without turning anything red — which is
+    // precisely how the combining-mark row below went unexercised. So the bytes
+    // are checked rather than read off the screen.
+    expect("🫠".codePointAt(0)).toBe(0x1fae0);
+    expect("🩹".codePointAt(0)).toBe(0x1fa79);
+  });
+
+  it.each([
+    ["☀", "U+2600 alone: text presentation, so a narrow dingbat"],
+    ["❤", "U+2764 alone: the same"],
+    ["★", "U+2605, a symbol with no emoji presentation at all"],
+    ["☐", "U+2610, ditto — and common in a checklist column"],
+    ["→", "U+2192, an arrow"],
+    // An escape, not a glyph. This row used to hold a precomposed é (U+00E9),
+    // which looks identical, is a single non-combining code point, and so
+    // duplicated the ★ case above while claiming to cover the decomposed one —
+    // the file contained no code point in U+0300-U+036F at all, and
+    // `isZeroWidth`'s combining-mark branch was never entered.
+    ["e\u0301", "U+0065 U+0301, a base plus a zero-width combining mark"],
+  ])("counts %s as one column (%s)", (text) => {
+    expect(monospaceWidth(text)).toBe(1);
+  });
+
+  it("counts a cluster that is nothing but a combining mark as no columns", () => {
+    // `clusterWidth`'s documented `return 0`, which nothing else here reaches:
+    // the mark is zero-width and there is no base behind it to carry a width.
+    expect(monospaceWidth("\u0301")).toBe(0);
+  });
+
+  it("adds cluster widths across a mixed string", () => {
+    // 2 + 1 + 4 + 1 + 2 + 2: rocket, space, two ideographs, space, ASCII, flag.
+    expect(monospaceWidth("🚀 中文 ok🇬🇧")).toBe(12);
+  });
+});
+
 describe("tableColumnWidths", () => {
   it("sizes each column to its widest content row", () => {
     const editor = state(SIMPLE);
@@ -132,6 +219,27 @@ describe("tableColumnWidths", () => {
 
     // "中文字" is 3 characters but 6 monospace columns.
     expect(tableColumnWidths(editor, tableModelAt(editor, 0)!)[0]).toBe(6);
+  });
+
+  it("sizes a flag column by the two columns each flag paints, not by its code points", () => {
+    // Three flags: 3 grapheme clusters, 6 code points, 12 UTF-16 code units,
+    // and 6 monospace columns. A regional-indicator PAIR is one wide glyph.
+    const doc = "| a | b |\n| --- | --- |\n| 🇬🇧🇫🇷🇯🇵 | y |";
+    const editor = state(doc);
+
+    expect(tableColumnWidths(editor, tableModelAt(editor, 0)!)[0]).toBe(6);
+  });
+
+  it("sizes a wide column past the 3,000 characters the parser reads up front", () => {
+    // A width bug below the initial parse window is invisible to every short
+    // fixture in this file, because there is no `Table` node there to measure.
+    // "日本語です🚀" is 6 clusters and 12 monospace columns.
+    const doc = `${"Filler paragraph line.\n\n".repeat(200)}| a | b |\n| --- | --- |\n| 日本語です🚀 | y |`;
+    expect(doc.length).toBeGreaterThan(3_000);
+    const editor = state(doc);
+
+    const model = tableModelAt(editor, doc.indexOf("日本語"))!;
+    expect(tableColumnWidths(editor, model)[0]).toBe(12);
   });
 });
 

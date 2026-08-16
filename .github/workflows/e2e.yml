@@ -1,6 +1,9 @@
 # Native end-to-end tests drive the real application through WebdriverIO's
-# embedded Tauri provider. Ubuntu and macOS are required pull-request gates;
-# Windows remains an informational main/manual lane until issue #78 is resolved.
+# embedded Tauri provider. Ubuntu is the required pull-request gate; macOS runs
+# informationally until #100 lands, and runs strictly more journeys than the
+# required lane does - see `required-native` for which ones only it covers.
+# Windows is a main/manual informational lane - see the `windows-informational`
+# job for what is currently known, and not known, about it.
 
 name: e2e-native
 
@@ -36,10 +39,20 @@ jobs:
     # macOS is informational until #100 lands. The suite passes locally, and the
     # runner's 1024x768 display clamps the app's 1280x820 window until the note
     # column is too narrow to render the lines the journeys reach for. Three
-    # fixes narrowed it - budgets, first-run picker, document-level scrolling -
-    # and the harness records only `errorType`, never the message, so every cause
-    # so far has produced byte-identical metadata. Ubuntu stays required and runs
-    # the same journeys.
+    # fixes narrowed it - budgets, first-run picker, document-level scrolling.
+    # Diagnosis was slow because the artifact recorded only `errorType`, so every
+    # cause produced byte-identical metadata; it now also carries a redacted
+    # first message line plus the assertion code and operator, which tells the
+    # suite's assertion failures apart. See `native-artifacts.ts`.
+    #
+    # Ubuntu does NOT run the same journeys - macOS runs strictly more, so this
+    # demotion is a real coverage gap, not a duplicate lane. The real macOS save
+    # accelerator in `specs/50-workspace-ui.spec.ts` is gated behind `macOsIt`,
+    # and the native fullscreen journey in `specs/40-window.spec.ts` returns
+    # early off darwin. Nothing required covers either, so a regression in one
+    # can merge green. The environments also differ in the dimension blamed
+    # above: Ubuntu runs under xvfb at 1440x900, macOS bare on the runner's
+    # smaller display.
     continue-on-error: ${{ matrix.informational || false }}
     strategy:
       fail-fast: false
@@ -112,6 +125,25 @@ jobs:
 
   windows-informational:
     name: Native Tauri (Windows informational)
+    # Issue #78 calls this lane "~50% flaky" and blames a WebdriverIO startup
+    # race. That framing is stale. The job failed 6/6 of the last runs in about
+    # a minute each - far too early to have reached WebdriverIO at all - dying
+    # in `npm run test:config`, where two assertions located job headers with
+    # `indexOf("  frontend:\n")`. No `.gitattributes` covers `.github/workflows`
+    # - the repository's only one sits under `fixtures/note-test-vault/` and
+    # applies there alone, so `git check-attr text -- .github/workflows/ci.yml`
+    # reports `unspecified` - and Windows therefore checks the workflows out
+    # with CRLF, so those lookups returned -1. Fixed by normalising line endings
+    # at read time in `app/desktop/e2e-native/ci-workflow.test.ts`.
+    #
+    # What #78 originally asked is deferred, not answered: `npm test` runs
+    # `test:config` before `run-native.ts`, so the native suite has not executed
+    # on Windows since this job was restructured, and there is no current
+    # evidence either way about its stability here. The lane stays informational
+    # until it produces some. Once several consecutive `main` runs get past
+    # `test:config` and actually drive the app, that pass rate settles #78 on
+    # data - stabilise the lane, or drop it because Windows is not a release
+    # target for this macOS-only alpha.
     if: github.event_name != 'pull_request'
     continue-on-error: true
     runs-on: windows-latest

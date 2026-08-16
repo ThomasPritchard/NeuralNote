@@ -38,6 +38,26 @@ type SyntaxNode = ReturnType<typeof syntaxTree>["topNode"];
  * itself (a `text` run), replaced by drawn chrome (a `widget` run), or hidden
  * outright (a {@link CellPaintPlan.hiddenRanges} entry). The three tile the
  * cell's span exactly.
+ *
+ * **Kept whole, deliberately — the decision behind #105.** The guardrail is
+ * `eslint/max-lines` in `.oxlintrc.json`, and it counts code with blank lines
+ * and comments skipped. Measured 2026-08-12: 513 physical lines but 327 lines
+ * of code against a budget of 500, with oxlint on this file exiting 0. The gap
+ * between the two numbers is documentation, which is the rule working as
+ * designed rather than an overage to pay down.
+ *
+ * What the file holds is one pipeline — scan the Markdown tree, merge
+ * Obsidian's spans over it, derive the painted runs, take their hidden
+ * complement, sign the result — and every seam in it is internal to that.
+ * Splitting the projection is the failure this module exists to prevent: the
+ * escaped-pipe and image alt text bugs fixed in #96 were that divergence
+ * returning, from the escape rule living at a single call site instead of here.
+ * Six production modules import from this one, so reshaping its export surface
+ * costs real churn for no behavioural change.
+ *
+ * Revisit when a genuinely independent responsibility appears here — something
+ * with its own reason to change that does not need the projection's own state —
+ * and not because the line count moved again.
  */
 
 /** Which half of a table a cell sits in. Header cells paint at their own weight. */
@@ -202,22 +222,72 @@ function wikilinkLabel(rawTarget: string): string {
   return base || rawTarget;
 }
 
+/** What ends a wikilink target: its own closer, a line break, or the text. */
+function endsTarget(character: string | undefined): boolean {
+  return character === undefined
+    || character === "]"
+    || character === "\r"
+    || character === "\n";
+}
+
 /**
  * Every `[[wikilink]]` in `source`, at document offsets. THE scanner —
  * `obsidianLivePreview.ts` uses it too, so the span the paint layer replaces and
  * the span this plan projects can never be two different answers.
  *
+ * A single forward pass, not `/(!)?\[\[([^\]\r\n]+)\]\]/g` (issue #143,
+ * `typescript:S5852`). That pattern is quadratic in the length of a LINE: the
+ * target run excludes `]`, so it reaches the next `]` or line break, and on a
+ * line of unclosed `[[` — no `]` anywhere — every opener rescans the whole line.
+ * A captured source with one enormous line took 3.7 s at 64 KiB, and
+ * `collectObsidianPreview` defaults its scan range to the WHOLE document.
+ *
+ * Every character is visited a bounded number of times, because both ways out of
+ * a candidate move `cursor` past everything the candidate examined:
+ *
+ * - **It closes.** Emit it and resume after the `]]`.
+ * - **It does not.** Resume at the terminator — nothing between an opener and
+ *   the terminator that defeated it can open a link either, since every later
+ *   `[[` runs to that same terminator and fails on it for the same reason.
+ *
+ * That second rule is what the regex could not express, and skipping it is safe
+ * rather than approximate: a shortened target run ends on a character the run
+ * had already accepted, which is by construction not the `]` a closer needs.
+ *
  * @param source - the text to scan
  * @param base - the document offset `source` starts at
  */
 export function inlineWikilinks(source: string, base = 0): InlineWikilink[] {
-  return [...source.matchAll(/(!)?\[\[([^\]\r\n]+)\]\]/g)].map((match) => ({
-    from: base + match.index,
-    to: base + match.index + match[0].length,
-    embed: match[1] === "!",
-    rawTarget: match[2],
-    label: wikilinkLabel(match[2]),
-  }));
+  const links: InlineWikilink[] = [];
+  let cursor = 0;
+
+  while (cursor < source.length) {
+    if (source[cursor] !== "[" || source[cursor + 1] !== "[") {
+      cursor += 1;
+      continue;
+    }
+    let end = cursor + 2;
+    while (!endsTarget(source[end])) end += 1;
+    if (end === cursor + 2 || source[end] !== "]" || source[end + 1] !== "]") {
+      cursor = end;
+      continue;
+    }
+
+    // `![[…]]` matches from the `!`. No need to check that the `!` is outside
+    // the previous match, the way the regex's `lastIndex` would have: a match
+    // ends in `]]`, so the character before a resume point is never a `!`.
+    const embed = cursor > 0 && source[cursor - 1] === "!";
+    const rawTarget = source.slice(cursor + 2, end);
+    links.push({
+      from: base + cursor - (embed ? 1 : 0),
+      to: base + end + 2,
+      embed,
+      rawTarget,
+      label: wikilinkLabel(rawTarget),
+    });
+    cursor = end + 2;
+  }
+  return links;
 }
 
 /**
