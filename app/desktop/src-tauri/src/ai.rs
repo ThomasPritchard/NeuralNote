@@ -42,12 +42,56 @@ const KEY_ACCOUNT: &str = "openrouter-api-key";
 const E2E_KEYCHAIN_SERVICE: &str = "com.neuralnote.desktop.e2e";
 const E2E_KEY_ACCOUNT: &str = "openrouter-api-key-e2e";
 
-const fn keychain_service() -> &'static str {
-    if cfg!(feature = "native-e2e") {
-        E2E_KEYCHAIN_SERVICE
-    } else {
-        KEYCHAIN_SERVICE
+/// The bundle identifier this build is actually running as, bound once by the
+/// shell's `setup()` hook (see [`init_keychain_service`]). It is what keeps a
+/// separately-identified build — the `com.neuralnote.desktop.dev` smoke bundle —
+/// out of the shipped app's credential namespace.
+static KEYCHAIN_SERVICE_OVERRIDE: OnceLock<String> = OnceLock::new();
+
+/// Bind `slot` to a bundle identifier. The slot is injected rather than read from
+/// the static so the rules below are testable without a process-global race.
+///
+/// A blank identifier is refused: an empty namespace is not a safer default than
+/// the historical one, it is just a different, wrong one. Only the first non-blank
+/// value is kept, so nothing can move the namespace out from under a session that
+/// has already read a key.
+fn bind_identifier(slot: &OnceLock<String>, identifier: &str) {
+    let identifier = identifier.trim();
+    if identifier.is_empty() {
+        log::warn!("blank bundle identifier ignored; keychain stays on {KEYCHAIN_SERVICE}");
+        return;
     }
+    if let Err(rejected) = slot.set(identifier.to_string()) {
+        let bound = slot.get().map_or(KEYCHAIN_SERVICE, String::as_str);
+        if rejected != bound {
+            log::warn!("keychain namespace already bound to {bound}; ignoring {rejected}");
+        }
+    }
+}
+
+/// Bind the credential namespace to the running app's bundle identifier. Called
+/// once from the shell's Tauri `setup()` hook, before any command can read a key.
+pub(crate) fn init_keychain_service(identifier: &str) {
+    bind_identifier(&KEYCHAIN_SERVICE_OVERRIDE, identifier);
+}
+
+/// Which keychain service this build uses, given whatever identifier was bound.
+/// Pure, so the resolution order is provable without a running Tauri app.
+///
+/// The `native-e2e` feature wins outright: an automation build must be unable to
+/// reach a real user's keychain item whatever identifier its configuration
+/// carries. Otherwise the bound bundle identifier wins, so a build with its own
+/// app identity gets its own namespace. With nothing bound — unit tests, or any
+/// call before `setup()` — the historical constant keeps behaviour deterministic.
+fn resolve_keychain_service(bound_identifier: Option<&str>) -> &str {
+    if cfg!(feature = "native-e2e") {
+        return E2E_KEYCHAIN_SERVICE;
+    }
+    bound_identifier.unwrap_or(KEYCHAIN_SERVICE)
+}
+
+fn keychain_service() -> &'static str {
+    resolve_keychain_service(KEYCHAIN_SERVICE_OVERRIDE.get().map(String::as_str))
 }
 
 const fn compiled_keychain_account() -> &'static str {
@@ -1234,6 +1278,152 @@ mod tests {
             assert_eq!(keychain_service(), KEYCHAIN_SERVICE);
             assert_eq!(keychain_account(), KEY_ACCOUNT);
         }
+        // The E2E namespace outranks the bundle identifier. An automation build
+        // must be unable to reach a real user's keychain item whatever identifier
+        // its configuration happens to carry.
+        if cfg!(feature = "native-e2e") {
+            assert_eq!(
+                resolve_keychain_service(Some("com.neuralnote.desktop")),
+                E2E_KEYCHAIN_SERVICE,
+                "the native-e2e namespace must not be overridable by an identifier"
+            );
+        }
+    }
+
+    /// The bundle identifier a shipped configuration actually carries, read from
+    /// the real file so an edit to it trips the pins below instead of silently
+    /// moving the keychain namespace.
+    fn configured_identifier(config_file_name: &str) -> String {
+        let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(config_file_name);
+        let raw = fs::read_to_string(&path)
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()));
+        let config: serde_json::Value = serde_json::from_str(&raw)
+            .unwrap_or_else(|e| panic!("{} is not valid JSON: {e}", path.display()));
+        config
+            .get("identifier")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_else(|| panic!("{} has no string `identifier`", path.display()))
+            .to_string()
+    }
+
+    /// The no-migration pin. Deriving the keychain namespace from the bundle
+    /// identifier is only a no-op for existing users while the production
+    /// identifier is byte-identical to the constant their key was stored under.
+    ///
+    /// What goes red: change `identifier` in `tauri.conf.json`. That must fail
+    /// here — loudly, at build time — rather than orphaning every stored API key
+    /// in a namespace the app no longer looks in.
+    #[test]
+    fn the_production_identifier_is_the_legacy_keychain_service() {
+        assert_eq!(
+            configured_identifier("tauri.conf.json"),
+            KEYCHAIN_SERVICE,
+            "the production bundle identifier moved: existing keys live under \
+             '{KEYCHAIN_SERVICE}' and would be orphaned — ship a keychain migration \
+             before changing it"
+        );
+    }
+
+    /// The defect this seam exists for: the debug/smoke bundle has its own app
+    /// identity precisely so it stays separate from the shipped app, so it must
+    /// get its own credential namespace rather than reaching for the user's real
+    /// production key (and tripping that item's macOS ACL prompt on every launch).
+    #[test]
+    fn a_separate_bundle_identity_gets_a_separate_keychain_namespace() {
+        let dev_identifier = configured_identifier("tauri.dev-build.conf.json");
+        assert_ne!(
+            dev_identifier, KEYCHAIN_SERVICE,
+            "the dev build's whole purpose is a separate identity"
+        );
+
+        let resolved = resolve_keychain_service(Some(&dev_identifier));
+        if cfg!(feature = "native-e2e") {
+            assert_eq!(resolved, E2E_KEYCHAIN_SERVICE);
+        } else {
+            assert_eq!(
+                resolved, dev_identifier,
+                "a build running as '{dev_identifier}' must not read the production keychain item"
+            );
+            assert_ne!(resolved, KEYCHAIN_SERVICE);
+        }
+    }
+
+    /// Nothing bound — unit tests, and any call before the shell's `setup()` hook
+    /// runs — keeps the historical namespace, so behaviour is deterministic
+    /// without a running Tauri app. A blank identifier is not a namespace: it
+    /// falls back rather than inventing an empty one.
+    #[test]
+    fn an_unbound_identifier_falls_back_to_the_legacy_namespace() {
+        let expected = if cfg!(feature = "native-e2e") {
+            E2E_KEYCHAIN_SERVICE
+        } else {
+            KEYCHAIN_SERVICE
+        };
+        assert_eq!(resolve_keychain_service(None), expected);
+    }
+
+    /// The binding rules, exercised against a *local* slot. `OnceLock` is
+    /// process-wide and cargo runs this binary's tests in parallel, so binding
+    /// some other identifier into the real static would race every test that
+    /// reads `keychain_service()`. Injecting the slot makes these assertions
+    /// deterministic and repeatable.
+    #[test]
+    fn binding_takes_the_first_non_blank_identifier_and_nothing_later() {
+        let slot = OnceLock::new();
+
+        for blank in ["", "   ", "\t\n"] {
+            bind_identifier(&slot, blank);
+            assert_eq!(
+                slot.get(),
+                None,
+                "a blank identifier must never become a keychain namespace"
+            );
+        }
+
+        bind_identifier(&slot, "  com.neuralnote.desktop.dev  ");
+        assert_eq!(
+            slot.get().map(String::as_str),
+            Some("com.neuralnote.desktop.dev"),
+            "the bound identifier is what the keychain namespace follows"
+        );
+
+        // First write wins: nothing may move the namespace out from under a
+        // session that has already read a key.
+        bind_identifier(&slot, "com.neuralnote.desktop");
+        assert_eq!(
+            slot.get().map(String::as_str),
+            Some("com.neuralnote.desktop.dev")
+        );
+    }
+
+    /// The real process-wide static, end to end: `init_keychain_service` and
+    /// `keychain_service()` must be wired to the same slot.
+    ///
+    /// Binding the *production* identifier here is safe in a parallel suite
+    /// precisely because `the_production_identifier_is_the_legacy_keychain_service`
+    /// pins it byte-identical to `KEYCHAIN_SERVICE` — whatever order the suite
+    /// runs in, no other test can observe a different value. The dev-identifier
+    /// case is covered through the pure resolver and the local slot above.
+    #[test]
+    fn the_shell_binds_the_process_wide_namespace() {
+        let identifier = configured_identifier("tauri.conf.json");
+        init_keychain_service(&identifier);
+
+        // Reading the real static is what distinguishes "bound" from "silently
+        // ignored" — the resolved service alone cannot, while the production
+        // identifier and the legacy constant are deliberately the same string.
+        assert_eq!(
+            KEYCHAIN_SERVICE_OVERRIDE.get().map(String::as_str),
+            Some(identifier.as_str()),
+            "init_keychain_service must write the slot keychain_service() reads"
+        );
+
+        let expected = if cfg!(feature = "native-e2e") {
+            E2E_KEYCHAIN_SERVICE
+        } else {
+            identifier.as_str()
+        };
+        assert_eq!(keychain_service(), expected);
     }
 
     #[test]

@@ -75,6 +75,10 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
   it to `target/dev-builds/NeuralNote-Dev.app`, and exercise that exact bundle. This keeps the
   test build visibly separate from the main NeuralNote app and prevents both builds sharing an
   application identity by accident. The repeatable commands are listed below.
+- **Expect the dev build to have its own API key.** The keychain namespace follows the running
+  bundle identifier, so `com.neuralnote.desktop.dev` reads and writes its own credential item and
+  never the shipped app's. Save a provider key into the dev build once; that isolation is the
+  point — a test build must not spend, or clear, the key the real app is using.
 - **Sign dev builds with a stable identity, once per machine.** Run
   `bash scripts/ensure-dev-signing-identity.sh`. Keychain ACLs bind to the *Designated
   Requirement* of the writing process, and an ad-hoc signature derives that from the code hash —

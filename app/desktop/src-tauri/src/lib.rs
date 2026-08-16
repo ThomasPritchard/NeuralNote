@@ -255,6 +255,13 @@ pub fn run() {
         // default. A failure here would leave the app menu-less — surface it in
         // the log rather than dropping it silently (PA-007 discipline).
         .setup(|app| {
+            // Bind the credential namespace to THIS build's identity before any
+            // command can read a key. A separately-identified build (the
+            // `com.neuralnote.desktop.dev` smoke bundle) must not reach into the
+            // shipped app's keychain item — that is the whole point of giving it
+            // its own identity, and it is also what avoids an ACL prompt against
+            // an item the dev binary was never on the trusted-application list for.
+            ai::init_keychain_service(&app.config().identifier);
             #[cfg(desktop)]
             {
                 if updater_public_key_is_configured(app.config()) {
