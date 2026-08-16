@@ -3,6 +3,10 @@
 > Status: design draft. The **Vault-Slate foundation is built and verified** (open/create a
 > vault, browse, read/edit markdown, file/folder CRUD — see `specs/app-vault-slate-plan.md`).
 > The AI loop in this spec (capture → distil → embed → cited chat) is **not yet implemented**.
+>
+> Research-led feature priorities and post-v1 candidates are recorded in
+> [`research-led-product-priorities.md`](research-led-product-priorities.md). That companion does
+> not widen the v1 scope defined here.
 
 ---
 
