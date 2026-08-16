@@ -13,7 +13,7 @@ export interface ReleaseNotes {
 }
 
 // GENERATED FILE — do not edit by hand.
-// Source: docs/releases/v0.4.0.md. Regenerate with `npm run gen:release-notes`.
+// Source: docs/releases/v0.4.1.md. Regenerate with `npm run gen:release-notes`.
 //
 // One release only. The workflow contract greps this WHOLE file for `items:` and
 // compares the result with the single-version `.md`, so a superseded entry left
@@ -25,77 +25,63 @@ export interface ReleaseNotes {
 // CURRENT_RELEASE_NOTES, so a stale entry is never rendered and the query passes
 // whether or not the entry is there.
 export const RELEASE_NOTES: Readonly<Record<string, ReleaseNotes>> = {
-  "0.4.0": {
-    version: "0.4.0",
-    title: "What's new in NeuralNote 0.4.0",
+  "0.4.1": {
+    version: "0.4.1",
+    title: "What's new in NeuralNote 0.4.1",
     introduction:
-      "NeuralNote 0.4.0 opens up the assistant. Every turn now carries an ordered account of what it did — the actions it ran, its reasoning, the plan it followed, and what the run cost — instead of a closed box and a list of filenames. NeuralNote also asks your permission before it writes to your vault, reaches the internet, or runs a program, with three levels of trust in Settings. The graph gains note previews worked out on your own machine. Your vault format and saved settings are unchanged, and NeuralNote starts by asking you every time.",
+      "NeuralNote 0.4.1 is a corrections release. It fixes a two-minute freeze when a note could not be deleted, and a run of places where NeuralNote told you something different from what actually happened — an approval you granted reported as a timeout, an action NeuralNote attempted and failed reported as one it refused, and a stopped response announced for a run that finished. Tables, the editor and the notification dock get a set of fixes too. Your vault format and saved settings are unchanged.",
     groups: [
       {
-        title: "What the assistant is doing",
+        title: "Deleting a note",
         items: [
-          "Each assistant turn now shows an ordered account of everything it did — the actions it ran, its reasoning, and the citation check at the end — in the order it happened.",
-          "Actions that previously left no trace at all, including listing notes, listing folders, looking up a video and fetching captions, now appear alongside every other action.",
-          "Every action is named in plain English and reports how it ended, so an action NeuralNote refused, one you declined, and one nobody answered in time no longer all read the same.",
-          "An action that did not succeed opens its own detail on sight, rather than hiding it behind a click.",
-          "The assistant's reasoning keeps its headings, lists and code instead of rendering as one unbroken block of text.",
-          "The assistant can state the steps it intends to take before it takes them, with each action grouped under the step it was run for.",
-          "Once a turn settles, the account folds down to a one-line summary that can be reopened to read the whole run back.",
-          "A note the assistant is writing is previewed as the model composes it, with a running count of the lines added so far.",
-          "Stopping a run part-way through a write now clears the half-composed note, instead of leaving it on screen looking committed.",
-          "A finished turn reports how long it took, how many tokens it used and which model ran it, and a figure the provider does not report is left out rather than shown as zero.",
-          "A turn that ends in an error now reports what it cost, instead of dropping that line at the point it matters most.",
-          "A turn's summary no longer says nothing was found when the searches did return passages the assistant chose not to open; it now reports how many were found and that none were read.",
+          "Deleting a note the system refuses to move to the Trash now fails immediately instead of leaving the app unresponsive for two minutes.",
+          "The refusal explains itself: it reports the reason the system gave, rather than arriving as a timeout after the wait.",
+          "A note that could not be deleted stays where it is, and stays visible in the file tree.",
+          "On macOS a deleted note goes to the Trash as before, but is restored by dragging it out rather than by Finder's Put Back.",
+          "Deleting also no longer depends on NeuralNote having permission to control Finder, so it works on machines where that permission was declined.",
         ],
       },
       {
-        title: "Approving what the assistant does",
+        title: "What NeuralNote tells you it did",
         items: [
-          "NeuralNote now asks your permission before it writes to your vault, reaches the internet, or runs a program on your machine.",
-          "The request appears in the conversation at the point it happened, shows the exact file path involved, and offers Allow or Don't allow.",
-          "Settings gains a section for how often NeuralNote checks with you, offering three choices: ask every time, let a model approve routine actions on your behalf, or never ask.",
-          "Upgrading keeps your existing settings and starts you on asking every time.",
-          "An individual kind of action can be set to ask more often than the overall setting, and a setting that cannot loosen it is shown as inactive with the reason rather than hidden.",
-          "Letting a model approve routine actions is unavailable while a local model is in use, with the reason stated in place, and your stored choice is kept for when you switch back to a cloud provider.",
-          "Turning off asking altogether requires a confirmation that names, in plain language, the actions that cannot be undone.",
-          "Every action covered by these settings leaves a record in the conversation showing whether you allowed it or it was approved on your behalf, and on what grounds.",
-          "The Stop button stays usable while an approval is waiting, so a run can always be ended.",
-          "An approval request that expired, or whose run ended before it was answered, says so and confirms that nothing ran.",
+          "An approval you granted is no longer reported as a timeout when your answer arrives at the same moment the request expires.",
+          "A decision that never reached the run is now reported as an error rather than confirmed as accepted.",
+          "An action that ran and failed is now told apart from one NeuralNote refused, instead of both reading as a refusal.",
+          "A response that was stopped is announced only when the run actually stopped, so a run that went on to finish is no longer announced as stopped.",
+          "The assistant keeps its final answer and the context it needs to continue, instead of losing them between steps.",
+          "A vault error now reads the same whichever part of the assistant hit it.",
+          "If a change to your API key does not reach your other open windows, NeuralNote now says so instead of leaving them disagreeing until a restart.",
+          "Two open windows no longer disagree about your API key until one of them is restarted.",
+          "A model list that arrives after you have moved on is discarded rather than replacing the current one.",
         ],
       },
       {
-        title: "Note previews in the graph",
+        title: "Writing and tables",
         items: [
-          "Selecting a note in the graph now opens a preview of that note beside it, instead of a panel that listed only the note's connections.",
-          "The preview shows the note's opening sentence along with its word count, estimated reading time and number of sections.",
-          "That summary is worked out on your own machine from the note itself, and the preview says so; no AI provider is contacted when you select a note in the graph.",
-          "The graph keeps its full size while a preview is open, so the selected note and the notes around it stay where they were.",
-          "The preview stays joined to its note by a short line, follows it as the camera moves, and can be dragged or moved with the arrow keys.",
-          "Connected notes appear as dots below the summary and can be selected to preview each of them in turn.",
-          "A note that cannot be previewed says why, whether the vault was closed, the file could not be read, it holds no text, it has no body yet, or it is past the editing size limit, and a failed read offers a retry.",
-          "A note whose text decoded imperfectly, or whose frontmatter could not be parsed, still shows its preview with the problem noted alongside it.",
-          "Selecting a second note while the first is still loading shows the note you actually picked, rather than a late answer for the one before it.",
+          "The macOS table shortcuts now respond to the characters the Option key actually produces.",
+          "A table shortcut works whenever the cursor is inside a table, rather than only in some positions.",
+          "Emoji are measured as two columns when a table's widths are worked out, so a table containing them lines up.",
+          "A wide table scrolls sideways as expected.",
+          "Revealing a table's source and returning now repaints the table rather than leaving the previous rendering.",
+          "Pressing Enter inside an unfinished code fence no longer leaks a tag into the note.",
+          "A heading written with closing hashes is read correctly.",
+          "Notes with very large numbers of links open faster.",
         ],
       },
       {
-        title: "Moving around the panes",
+        title: "Notifications and the window",
         items: [
-          "The chat transcript now follows an answer as it streams, instead of leaving it to grow out of view.",
-          "Scrolling up pauses the follow so you can read, and a Latest button appears to jump back to the newest content.",
-          "Expanding a folded section keeps the row you clicked where it was, rather than jumping the view.",
-          "A button in the chat pane header widens the pane, and the choice is remembered between sessions.",
-          "Widening the chat pane collapses the navigation labels to make room at every window size, and the widened pane is narrowed at smaller windows so the editor keeps a usable width.",
-          "At the wider size, an action's arguments and its result are laid out side by side.",
-          "After you answer a question from the assistant, the pane keeps showing that the run is still working instead of rendering it as finished.",
-          "Pressing Escape closes a graph note preview and returns the view to where it was before you selected the note.",
-          "Switching the map between 2D and 3D closes the preview rather than leaving it pointing at the wrong place.",
+          "Notifications now sit in the layout rather than floating over the chat pane, so they can no longer cover what you are reading.",
+          "The notification area is named for screen readers.",
+          "Launching straight into full screen on macOS no longer paints the window controls in the wrong place for the first frame before snapping into position.",
+          "A development or unsigned build no longer raises a permanent error about updates being unavailable, which is expected for those builds rather than a fault.",
         ],
       },
       {
         title: "Upgrading",
         items: [
           "Your vault, its notes and your saved settings are carried over unchanged.",
-          "Application packages, updater checks, and the upgrade journey are aligned on version 0.4.0.",
+          "Application packages, updater checks, and the upgrade journey are aligned on version 0.4.1.",
         ],
       },
     ],

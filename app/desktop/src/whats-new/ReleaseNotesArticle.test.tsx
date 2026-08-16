@@ -4,37 +4,44 @@ import packageJson from "../../package.json";
 import { ReleaseNotesArticle } from "./ReleaseNotesArticle";
 import { CURRENT_RELEASE_NOTES, RELEASE_NOTES } from "./releaseNotes";
 
-describe("v0.4.0 release notes", () => {
+describe("v0.4.1 release notes", () => {
   it("matches the build version and renders the full shared changelog", () => {
     expect(CURRENT_RELEASE_NOTES.version).toBe(packageJson.version);
     render(<ReleaseNotesArticle />);
 
     const article = screen.getByRole("article", {
-      name: "What's new in NeuralNote 0.4.0",
+      name: "What's new in NeuralNote 0.4.1",
     });
     expect(within(article).getByRole("heading", { level: 1 })).toHaveTextContent(
-      "What's new in NeuralNote 0.4.0",
+      "What's new in NeuralNote 0.4.1",
     );
+    // Headings and phrases are THIS release's and must be re-pointed at each bump,
+    // here and in scripts/check-release-workflow.mjs. Neither is a version string,
+    // so the runbook's version sweep cannot catch them going stale.
     for (const heading of [
-      "What the assistant is doing",
-      "Approving what the assistant does",
-      "Note previews in the graph",
-      "Moving around the panes",
+      "Deleting a note",
+      "What NeuralNote tells you it did",
+      "Writing and tables",
+      "Notifications and the window",
       "Upgrading",
     ]) {
       expect(within(article).getByRole("heading", { name: heading })).toBeInTheDocument();
     }
     // Each phrase below must be unique to its bullet: the introduction paraphrases
     // all four sections, so a substring it shares with a bullet matches twice and
-    // `getByText` throws on the ambiguity rather than the absence.
+    // `getByText` throws on the ambiguity rather than the absence. "reported as a
+    // timeout" is exactly such a phrase this release — it appears in the
+    // introduction too, so the second assertion reaches for the expiry wording.
     expect(
-      within(article).getByText(/ordered account of everything it did/i),
+      within(article).getByText(/leaving the app unresponsive for two minutes/i),
     ).toBeInTheDocument();
-    expect(within(article).getByText(/or runs a program on your machine/i)).toBeInTheDocument();
     expect(
-      within(article).getByText(/worked out on your own machine from the note itself/i),
+      within(article).getByText(/at the same moment the request expires/i),
     ).toBeInTheDocument();
-    expect(within(article).getByText(/follows an answer as it streams/i)).toBeInTheDocument();
+    expect(within(article).getByText(/measured as two columns/i)).toBeInTheDocument();
+    expect(
+      within(article).getByText(/sit in the layout rather than floating over the chat pane/i),
+    ).toBeInTheDocument();
   });
 
   it("bundles the current release only", () => {

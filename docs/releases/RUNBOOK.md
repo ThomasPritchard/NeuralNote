@@ -26,8 +26,18 @@ Plus:
 
 - `Cargo.lock` — refresh the workspace-crate versions with `cargo update --workspace`. It should report exactly three packages moved (`desktop`, `neuralnote-core`, `neuralnote-release`) and touch nothing else; anything more means a dependency drifted and belongs in its own commit.
 - `app/desktop/package-lock.json` and `app/desktop/e2e-native/package-lock.json` — the root `"version"` on **lines 3 and 9 only** (two slots each: the top-level field and the `""` self-entry). Do not replace globally: `e2e-native/package-lock.json` also pins unrelated dependencies that happen to sit at the old version number.
-- `app/desktop/src/updater/release-config.test.ts` — the validator test that pins the app-local versions; update its expected string to `X.Y.Z`.
-- `scripts/check-release-workflow.mjs` — the contract test hard-codes the release version itself: `releaseVersion`, the `release_tag` default assertion, the changelog path (twice), the `# NeuralNote X.Y.Z ALPHA` heading assertion, and the test's own name. Bumping the workflow without bumping its checker leaves the gate asserting the previous release.
+- `app/desktop/src/updater/release-config.test.ts` — the validator test that pins the app-local versions; update its expected strings to `X.Y.Z`. **One of them is a regex** (`/^version = "X\.Y\.Z"$/m`) — see the escaping warning below.
+- `app/desktop/src/whats-new/ReleaseNotesArticle.test.tsx` and `app/desktop/src/App.test.tsx` — both name the version in test titles and in the "What's new" modal heading they assert (three occurrences each).
+- `scripts/check-release-workflow.mjs` — the contract test hard-codes the release version itself: `releaseVersion`, the `release_tag` default assertion, the changelog path (twice), the `# NeuralNote X.Y.Z ALPHA` heading assertion, and the test's own name. Bumping the workflow without bumping its checker leaves the gate asserting the previous release. **Four of these are regexes.**
+
+  It also pins **content, not just the version**: the five `## ` section headings of the changelog and one distinctive phrase from each section (`assert.match(releaseNotes, /…/)`). Those exist so the published GitHub body cannot silently become a stub or the wrong file, and since every release invents its own section titles they must be re-pointed at the new changelog by hand. Choose phrases specific to this release — a generic one that would match any release retires the check while appearing to keep it.
+
+**Version literals hide inside regexes.** Five of the slots above store the version *escaped* — `0\.4\.0`, not `0.4.0`. A find-and-replace for the plain string does not touch them, and neither does the `grep -c 'X\.Y\.Z'` verification below, because `\.` in that pattern matches a literal dot and not a backslash. Following this checklist exactly and verifying exactly as instructed still leaves the release red. Sweep **both spellings**, then confirm neither remains:
+
+```bash
+grep -rn 'A\.B\.C\|A\\\.B\\\.C' scripts/ .github/workflows/ app/desktop/src/updater/ \
+  app/desktop/src/whats-new/ app/desktop/src/App.test.tsx    # A.B.C = the OLD version; expect no output
+```
 - `.github/workflows/release-alpha.yml` — **13 lines** carrying 17 occurrences (four of the lines name the version twice): the `release_tag` description and default, the two `preflight`/`build` tag allow-lists (two lines each), the two `RELEASE_VERSION` env values, the two updater-manifest `notes` strings, the changelog copy path `docs/releases/vX.Y.Z.md`, and the two `RELEASE_TITLE` strings. The line count is what the `grep -c` below reports; the occurrence count is not.
 
   **This was 14 until the manifest publisher was extracted.** The fourteenth line was the manifest commit message, which now lives in `scripts/publish-release-manifest.mjs` and does not name the version at all. Nothing else moved. If the count drifts again, find out which line left before changing the number — the count exists to catch a missed bump, and quietly re-fitting it to whatever `grep` currently reports would retire the check while appearing to maintain it.

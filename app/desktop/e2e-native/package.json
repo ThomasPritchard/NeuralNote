@@ -1,7 +1,7 @@
 {
   "name": "neuralnote-e2e-native",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.4.1",
   "license": "AGPL-3.0-or-later",
   "type": "module",
   "description": "Tier-2 native WebDriver tests using WebdriverIO's embedded Tauri provider on Linux, macOS, and Windows.",
