@@ -194,9 +194,17 @@ describe("TitleBar — native fullscreen geometry", () => {
     });
     renderTitleBar();
 
-    expect(screen.getByRole("button", {
+    const cluster = screen.getByRole("button", {
       name: "Toggle navigation sidebar",
-    }).parentElement).toHaveClass("pl-[74px]");
+    }).parentElement;
+    expect(cluster).toHaveClass("pl-[74px]");
+    // `pl-[74px]` is emitted identically for "unknown" and "windowed", so that
+    // assertion alone cannot tell the two apart. Only "unknown" adds `invisible`, and
+    // off macOS the effect bails before anything could ever resolve it — so
+    // initialising the state to "unknown" would leave the navigation toggle
+    // permanently invisible on Windows and Linux with every other assertion here
+    // still green. This is the line that catches that.
+    expect(cluster).not.toHaveClass("invisible");
     await act(async () => Promise.resolve());
     expect(nativeWindow.isFullscreen).not.toHaveBeenCalled();
     expect(nativeWindow.onResized).not.toHaveBeenCalled();
@@ -209,6 +217,137 @@ describe("TitleBar — native fullscreen geometry", () => {
     view.unmount();
 
     expect(nativeWindow.unlisten).toHaveBeenCalledOnce();
+  });
+});
+
+// Issue #135: a boolean `useState(false)` cannot represent "not yet known",
+// so an already-fullscreen launch used to paint the 74px windowed offset on
+// its very first frame and then snap to 12px once the native query answered.
+// Every test above resolves the query (via waitFor/mockResolvedValueOnce)
+// before asserting, so none of them can see frame one — that's the only
+// moment this defect exists. These tests hold the native query open with a
+// manually-controlled promise and assert on the DOM synchronously, right
+// after render(), before anything is awaited.
+//
+// The fix does not guess an offset for "unknown" — macOS restores a
+// window's fullscreen state across launches, so guessing either offset
+// makes the original bug total for whichever population's launch state
+// doesn't match the guess, rather than rare. Instead "unknown" holds: the
+// left cluster renders `invisible` (visibility: hidden, box still present)
+// until the native query answers, so nothing wrong is ever painted for
+// either launch state.
+//
+// Note: this jsdom tier runs with `css: false` (vitest.config.ts) — no
+// Tailwind stylesheet is loaded, so `toBeVisible()`/`getComputedStyle`
+// cannot see what the `invisible` utility actually does. Assert on the
+// class itself, exactly like every other offset assertion in this file.
+describe("TitleBar — native fullscreen launch state (first paint)", () => {
+  it("holds the toggle invisible, reserving its layout space, while the native query is in flight", async () => {
+    let resolveQuery!: (value: boolean) => void;
+    nativeWindow.isFullscreen.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        resolveQuery = resolve;
+      }),
+    );
+    renderTitleBar();
+    const leftCluster = screen.getByRole("button", {
+      name: "Toggle navigation sidebar",
+    }).parentElement;
+
+    // The query is still in flight — this is frame one. Neither offset has
+    // been committed to where it can be seen.
+    expect(leftCluster).toHaveClass("invisible");
+    expect(leftCluster).toHaveClass("pl-[74px]");
+    expect(leftCluster?.closest(".nn-titlebar")).toHaveClass(
+      "nn-titlebar-toggle-clearance-windowed",
+    );
+
+    await act(async () => {
+      resolveQuery(true);
+      await Promise.resolve();
+    });
+  });
+
+  it("reveals the windowed offset once an ordinary launch resolves, with nothing shown before that", async () => {
+    let resolveQuery!: (value: boolean) => void;
+    nativeWindow.isFullscreen.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        resolveQuery = resolve;
+      }),
+    );
+    renderTitleBar();
+    const leftCluster = screen.getByRole("button", {
+      name: "Toggle navigation sidebar",
+    }).parentElement;
+
+    expect(leftCluster).toHaveClass("invisible");
+
+    await act(async () => {
+      resolveQuery(false);
+      await Promise.resolve();
+    });
+
+    expect(leftCluster).not.toHaveClass("invisible");
+    expect(leftCluster).toHaveClass("pl-[74px]");
+    expect(leftCluster?.closest(".nn-titlebar")).toHaveClass(
+      "nn-titlebar-toggle-clearance-windowed",
+    );
+  });
+
+  it("reveals the fullscreen offset once an already-fullscreen launch resolves, with nothing shown before that", async () => {
+    let resolveQuery!: (value: boolean) => void;
+    nativeWindow.isFullscreen.mockReturnValueOnce(
+      new Promise<boolean>((resolve) => {
+        resolveQuery = resolve;
+      }),
+    );
+    renderTitleBar();
+    const leftCluster = screen.getByRole("button", {
+      name: "Toggle navigation sidebar",
+    }).parentElement;
+
+    expect(leftCluster).toHaveClass("invisible");
+
+    await act(async () => {
+      resolveQuery(true);
+      await Promise.resolve();
+    });
+
+    expect(leftCluster).not.toHaveClass("invisible");
+    expect(leftCluster).toHaveClass("pl-[12px]");
+    expect(leftCluster?.closest(".nn-titlebar")).toHaveClass(
+      "nn-titlebar-toggle-clearance-fullscreen",
+    );
+  });
+
+  it("falls back to windowed and reveals the toggle if the initial native query fails, instead of staying stuck invisible", async () => {
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    let rejectQuery!: (error: unknown) => void;
+    nativeWindow.isFullscreen.mockReturnValueOnce(
+      new Promise<boolean>((_resolve, reject) => {
+        rejectQuery = reject;
+      }),
+    );
+    renderTitleBar();
+    const leftCluster = screen.getByRole("button", {
+      name: "Toggle navigation sidebar",
+    }).parentElement;
+
+    expect(leftCluster).toHaveClass("invisible");
+
+    await act(async () => {
+      rejectQuery(new Error("native query failed"));
+      await Promise.resolve();
+      await Promise.resolve();
+    });
+
+    expect(leftCluster).not.toHaveClass("invisible");
+    expect(leftCluster).toHaveClass("pl-[74px]");
+    expect(consoleError).toHaveBeenCalledWith(
+      "failed to read native fullscreen state:",
+      expect.any(Error),
+    );
+    consoleError.mockRestore();
   });
 });
 

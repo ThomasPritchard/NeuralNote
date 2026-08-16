@@ -84,11 +84,16 @@ export function TitleBar({
   onCloseTab,
   onCloseGraph,
 }: Readonly<TitleBarProps>) {
-  const macOSFullscreen = useMacOSFullscreen();
+  const macOSFullscreenState = useMacOSFullscreenState();
+  // Named for what they select, not for what they know: `useTightOffset` is true
+  // only when fullscreen is *confirmed*, so "unknown" falls to the windowed
+  // offset and is hidden by `holdOffsetDecision` rather than painted.
+  const useTightOffset = macOSFullscreenState === "fullscreen";
+  const holdOffsetDecision = macOSFullscreenState === "unknown";
 
   return (
     <header
-      className={`nn-titlebar ${macOSFullscreen ? "nn-titlebar-toggle-clearance-fullscreen" : "nn-titlebar-toggle-clearance-windowed"} relative grid h-(--titlebar-height) shrink-0 border-b border-border bg-titlebar`}
+      className={`nn-titlebar ${useTightOffset ? "nn-titlebar-toggle-clearance-fullscreen" : "nn-titlebar-toggle-clearance-windowed"} relative grid h-(--titlebar-height) shrink-0 border-b border-border bg-titlebar`}
       data-navigation-expanded={navigationExpanded}
       data-chat-open={chatOpen}
     >
@@ -96,9 +101,11 @@ export function TitleBar({
           the window instead of firing, this layering is what broke. */}
       <div data-tauri-drag-region aria-hidden className="absolute inset-0" />
 
-      {/* Left: traffic-light spacer (pl), then navigation toggle. */}
+      {/* Left: traffic-light spacer (pl), then navigation toggle. While macOS
+          fullscreen is still "unknown", this cluster is held `invisible`
+          (not `display: none`) — see useMacOSFullscreenState for why. */}
       <div
-        className={`relative z-10 flex min-w-0 items-center gap-1 self-stretch pr-2 ${macOSFullscreen ? "pl-[12px]" : "pl-[74px]"}`}
+        className={`relative z-10 flex min-w-0 items-center gap-1 self-stretch pr-2 ${useTightOffset ? "pl-[12px]" : "pl-[74px]"} ${holdOffsetDecision ? "invisible" : ""}`}
       >
         <TitleBarButton
           icon={PanelLeft}
@@ -138,11 +145,54 @@ function isMacOSRuntime(): boolean {
   );
 }
 
-function useMacOSFullscreen(): boolean {
-  // TODO(fullscreen-first-paint): represent macOS fullscreen as unknown until
-  // the initial native query resolves so an already-fullscreen launch never
-  // paints the 74 px traffic-light offset first; cover that launch state.
-  const [fullscreen, setFullscreen] = useState(false);
+type MacOSFullscreenState = "unknown" | "windowed" | "fullscreen";
+
+function useMacOSFullscreenState(): MacOSFullscreenState {
+  // Fullscreen is genuinely UNKNOWN until the async native query answers —
+  // isFullscreen() is IPC-only, so there is no synchronous signal to read
+  // before the first paint. Modelling that gap as a boolean (the old
+  // `useState(false)`) silently means "windowed" for the whole gap: an app
+  // launched already in native fullscreen painted the 74px traffic-light
+  // offset on frame one — an empty gap with no traffic lights under it,
+  // since macOS hides them in fullscreen — and then visibly snapped shut to
+  // 12px once the query answered.
+  //
+  // Picking the opposite default (guess fullscreen) doesn't fix this: macOS
+  // restores a window's fullscreen state across launches, so this is not a
+  // rare-vs-common split. A user who works fullscreen quits fullscreen and
+  // relaunches fullscreen — the original bug hits *every* launch for them.
+  // A user who works windowed hits it on *none*. Defaulting "unknown" to
+  // either offset just moves the total-failure population from one type of
+  // user to the other; there is no guess that is "usually right".
+  //
+  // So don't guess — hold. While `state === "unknown"`, the offset-dependent
+  // left cluster renders `invisible` (visibility: hidden, not display:
+  // none) so its box still reserves its own layout space, but nothing
+  // wrong is ever painted there: no control sits at an offset that turns
+  // out to be false. The header's traffic-light-clearance class (which also
+  // sizes the grid column carrying this cluster — see .nn-titlebar's
+  // `max(nav+sidebar+splitter, clearance)` in styles.css) stays pinned to
+  // "windowed" throughout "unknown", matching non-macOS's synchronous
+  // default below, so a windowed launch never moves at all: the cluster is
+  // simply invisible-then-visible at the position it already occupies. A
+  // fullscreen launch still corrects once the query answers — the toggle
+  // appears and the tab strip snaps to its tighter position in that one
+  // update (neither `--titlebar-toggle-clearance` nor `.nn-titlebar` is
+  // transitioned, so it is a snap, not an ease) — but nothing incorrect was
+  // ever shown first, which is the part that read as broken. Non-macOS
+  // resolves straight to "windowed" synchronously (isMacOSRuntime() is a
+  // plain UA check, no IPC needed) and paints the cluster visible
+  // immediately — no held/invisible frame there at all.
+  //
+  // The catch block resolves a *rejected* initial query to "windowed". That
+  // is rejection, not a query that never settles: there is no deadline here,
+  // so a hung IPC would hold "unknown" and leave the toggle `visibility:
+  // hidden` — out of hit-testing and out of the tab order. No path is known
+  // that produces a hang, and the native app menu still reaches the sidebar
+  // if one ever did, so this is recorded rather than defended against.
+  const [state, setState] = useState<MacOSFullscreenState>(() =>
+    isMacOSRuntime() ? "unknown" : "windowed",
+  );
 
   useEffect(() => {
     if (!isMacOSRuntime()) return;
@@ -156,9 +206,18 @@ function useMacOSFullscreen(): boolean {
       const request = ++requestVersion;
       try {
         const next = await appWindow.isFullscreen();
-        if (!cancelled && request === requestVersion) setFullscreen(next);
+        if (!cancelled && request === requestVersion) {
+          setState(next ? "fullscreen" : "windowed");
+        }
       } catch (error) {
         console.error("failed to read native fullscreen state:", error);
+        if (!cancelled && request === requestVersion) {
+          // Resolve an unconfirmed "unknown" to the safe windowed fallback.
+          // A failure on a later resync (state already definite) is left
+          // alone — keep the last confirmed geometry rather than discarding
+          // it over a transient IPC hiccup.
+          setState((prev) => (prev === "unknown" ? "windowed" : prev));
+        }
       }
     };
 
@@ -180,7 +239,7 @@ function useMacOSFullscreen(): boolean {
     };
   }, []);
 
-  return fullscreen;
+  return state;
 }
 
 interface TabStripProps {
