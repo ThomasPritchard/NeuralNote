@@ -75,6 +75,13 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
   it to `target/dev-builds/NeuralNote-Dev.app`, and exercise that exact bundle. This keeps the
   test build visibly separate from the main NeuralNote app and prevents both builds sharing an
   application identity by accident. The repeatable commands are listed below.
+- **Sign dev builds with a stable identity, once per machine.** Run
+  `bash scripts/ensure-dev-signing-identity.sh`. Keychain ACLs bind to the *Designated
+  Requirement* of the writing process, and an ad-hoc signature derives that from the code hash —
+  so every rebuild reads as a different application and macOS re-prompts for the login keychain
+  every single time, with "Always Allow" never sticking. A stable identity pins the requirement to
+  the certificate instead, so one authorisation holds. `scripts/dev-build.sh` uses the identity
+  automatically and falls back to ad-hoc when it is absent.
 
 ### Review
 - Every non-trivial change receives a focused review for correctness, silent failures, security,
@@ -186,13 +193,19 @@ npm run coverage          # all tests + 90% line gate; writes coverage/lcov.info
 npm run build
 
 # macOS maintainer handoff (from the repository root; requires the pinned sidecars)
+# Run ONCE per machine, so the keychain stops re-prompting on every rebuild:
+bash scripts/ensure-dev-signing-identity.sh
+
 npm --prefix app/desktop run tauri build -- --debug --bundles app \
   --config '{"productName":"NeuralNote-Dev","identifier":"com.neuralnote.desktop.dev","bundle":{"createUpdaterArtifacts":false}}'
 mkdir -p target/dev-builds
 rm -rf target/dev-builds/NeuralNote-Dev.app # generated local handoff only
 ditto --rsrc --extattr --acl target/debug/bundle/macos/NeuralNote-Dev.app target/dev-builds/NeuralNote-Dev.app
-codesign --force --deep --sign - target/dev-builds/NeuralNote-Dev.app
-codesign --verify --deep --strict target/dev-builds/NeuralNote-Dev.app
+# `--deep` is deprecated by Apple (it re-signs nested code with the outer identity
+# and drops entitlements); sign the bundle itself and let Tauri's own signing of
+# nested helpers stand.
+codesign --force --sign "NeuralNote Dev Signing" target/dev-builds/NeuralNote-Dev.app
+codesign --verify --strict target/dev-builds/NeuralNote-Dev.app
 
 # Rust (from repo root)
 cargo test --workspace --locked
