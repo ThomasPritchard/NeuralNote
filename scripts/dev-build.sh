@@ -57,13 +57,31 @@ fi
 # No `-v` on find-identity: that filters to *trusted* identities and a
 # self-signed root never passes it, though codesign signs with it fine.
 signing_identity="${NEURALNOTE_DEV_SIGNING_IDENTITY:-NeuralNote Dev Signing}"
+signing_note=""
 if [[ "$(uname -s)" == "Darwin" ]]; then
-  if security find-identity -p codesigning 2>/dev/null | grep -qF "$signing_identity"; then
+  # stderr is captured rather than discarded, and the listing is materialised
+  # before grepping: a locked or unreadable keychain must not be reported as
+  # "identity absent", and `grep -q` exiting early must not SIGPIPE the producer
+  # into a `pipefail` false negative.
+  identity_listing=""
+  identity_query_ok=0
+  if ! identity_listing="$(security find-identity -p codesigning 2>&1)"; then
+    identity_query_ok=1
+  fi
+
+  if [[ "$identity_query_ok" -eq 0 ]] && printf '%s' "$identity_listing" | grep -qF "$signing_identity"; then
     echo "Signing with stable identity: ${signing_identity}"
     codesign --force --sign "$signing_identity" "$app_path"
   else
-    echo "No stable signing identity found; falling back to ad-hoc." >&2
-    echo "The keychain will re-prompt on every rebuild until you run:" >&2
+    if [[ "$identity_query_ok" -ne 0 ]]; then
+      signing_note="AD-HOC: could not query code-signing identities (keychain locked or unreadable)"
+      echo "Could not query code-signing identities:" >&2
+      printf '%s\n' "$identity_listing" >&2
+    else
+      signing_note="AD-HOC: no stable signing identity '${signing_identity}' found"
+    fi
+    echo "${signing_note}. Falling back to ad-hoc signing." >&2
+    echo "The keychain will re-prompt on EVERY rebuild until you run:" >&2
     echo "  bash scripts/ensure-dev-signing-identity.sh" >&2
     codesign --force --sign - "$app_path"
   fi
@@ -73,3 +91,15 @@ fi
 echo
 echo "Built: ${app_path}"
 echo "Open with: open '${app_path}'"
+# Repeated on stdout on purpose. The warning above goes to stderr, and a build
+# this slow is routinely run as `> build.log` or with stderr dropped — which
+# would leave a success banner visible and the degradation invisible. An ad-hoc
+# signature re-prompts the keychain on every rebuild, so it must not be separable
+# from the success message that qualifies it.
+if [[ -n "$signing_note" ]]; then
+  echo
+  echo "WARNING — ${signing_note}."
+  echo "          Signed ad-hoc, so macOS will re-prompt for the login keychain"
+  echo "          on every rebuild. Fix with:"
+  echo "            bash scripts/ensure-dev-signing-identity.sh"
+fi

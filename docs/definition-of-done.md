@@ -75,10 +75,17 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
   it to `target/dev-builds/NeuralNote-Dev.app`, and exercise that exact bundle. This keeps the
   test build visibly separate from the main NeuralNote app and prevents both builds sharing an
   application identity by accident. The repeatable commands are listed below.
-- **Expect the dev build to have its own API key.** The keychain namespace follows the running
-  bundle identifier, so `com.neuralnote.desktop.dev` reads and writes its own credential item and
-  never the shipped app's. Save a provider key into the dev build once; that isolation is the
-  point — a test build must not spend, or clear, the key the real app is using.
+- **Expect the packaged dev build to have its own API key.** The keychain namespace follows the
+  running bundle identifier, so a bundle built as `com.neuralnote.desktop.dev` (via
+  `scripts/dev-build.sh` or the handoff recipe below) reads and writes its own credential item
+  rather than the shipped app's. Save a provider key into it once; that isolation is the point — a
+  test build must not spend, or clear, the key the real app is using.
+
+  **`npm run tauri dev` is NOT isolated.** It applies no config overlay, so it runs as
+  `com.neuralnote.desktop` and binds the **shipped app's** credential namespace. Clearing the API
+  key from a `tauri dev` session deletes the real one, and reading it can raise a keychain
+  authorisation prompt. Use the packaged dev bundle for anything that touches provider
+  credentials. Giving `tauri dev` its own identity is tracked separately.
 - **Sign dev builds with a stable identity, once per machine.** Run
   `bash scripts/ensure-dev-signing-identity.sh`. Keychain ACLs bind to the *Designated
   Requirement* of the writing process, and an ad-hoc signature derives that from the code hash —
@@ -205,9 +212,17 @@ npm --prefix app/desktop run tauri build -- --debug --bundles app \
 mkdir -p target/dev-builds
 rm -rf target/dev-builds/NeuralNote-Dev.app # generated local handoff only
 ditto --rsrc --extattr --acl target/debug/bundle/macos/NeuralNote-Dev.app target/dev-builds/NeuralNote-Dev.app
-# `--deep` is deprecated by Apple (it re-signs nested code with the outer identity
-# and drops entitlements); sign the bundle itself and let Tauri's own signing of
-# nested helpers stand.
+# `--deep` is deprecated by Apple, and here it was actively destructive: the two
+# Ollama sidecars ship pre-signed by their vendor (Identifier ai.ollama.ollama,
+# TeamIdentifier 3MU9H2V9Y9, hardened runtime flag 0x10000), and --deep re-signed
+# over those Developer ID signatures with this local identity, dropping the
+# hardened-runtime flag with them. Sign the bundle itself and leave the VENDOR's
+# nested signatures intact.
+#
+# Note nothing in this repo signs nested code: neither config sets a
+# signingIdentity. If you ever add an in-repo nested helper it will ship UNSIGNED,
+# and `codesign --verify --strict` without --deep does not recurse, so the verify
+# step below will not catch it.
 codesign --force --sign "NeuralNote Dev Signing" target/dev-builds/NeuralNote-Dev.app
 codesign --verify --strict target/dev-builds/NeuralNote-Dev.app
 
