@@ -133,11 +133,16 @@ jobs:
           # LAST, after the GitHub prerelease is public and immutable. Its own
           # `test -s` guard catches this far too late to matter.
           #
-          # Not hypothetical: `release_tag` defaults to v0.4.0, which is also the
-          # documented recovery path, and v0.4.0 predates the extraction of this
-          # script from inline YAML. Re-dispatching it would publish, then 404,
-          # then leave exactly the manual manifest recovery that 0.2.1 and 0.3.0
-          # each cost and that the extraction exists to end.
+          # Not hypothetical: the `release_tag` input's own default is the current
+          # release tag, which is also the documented recovery path, and that tag
+          # predates the extraction of this script from inline YAML. Re-dispatching
+          # it would publish, then 404, then leave exactly the manual manifest
+          # recovery that two earlier releases each cost and that the extraction
+          # exists to end.
+          #
+          # Deliberately naming no version here. RUNBOOK.md's bump checklist counts
+          # the lines in this file carrying the version, and a narrative mention
+          # would inflate that count and then go stale at the next release.
           #
           # Checking the working tree is equivalent to checking $RELEASE_SHA: the
           # two comparisons above have just proven the checkout IS that commit.

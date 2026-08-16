@@ -28,7 +28,9 @@ Plus:
 - `app/desktop/package-lock.json` and `app/desktop/e2e-native/package-lock.json` — the root `"version"` on **lines 3 and 9 only** (two slots each: the top-level field and the `""` self-entry). Do not replace globally: `e2e-native/package-lock.json` also pins unrelated dependencies that happen to sit at the old version number.
 - `app/desktop/src/updater/release-config.test.ts` — the validator test that pins the app-local versions; update its expected string to `X.Y.Z`.
 - `scripts/check-release-workflow.mjs` — the contract test hard-codes the release version itself: `releaseVersion`, the `release_tag` default assertion, the changelog path (twice), the `# NeuralNote X.Y.Z ALPHA` heading assertion, and the test's own name. Bumping the workflow without bumping its checker leaves the gate asserting the previous release.
-- `.github/workflows/release-alpha.yml` — **14 lines** carrying 18 occurrences (four of the lines name the version twice): the `release_tag` description and default, the two `preflight`/`build` tag allow-lists (two lines each), the two `RELEASE_VERSION` env values, the two updater-manifest `notes` strings, the changelog copy path `docs/releases/vX.Y.Z.md`, the two `RELEASE_TITLE` strings, and the manifest commit message. The line count is what the `grep -c` below reports; the occurrence count is not.
+- `.github/workflows/release-alpha.yml` — **13 lines** carrying 17 occurrences (four of the lines name the version twice): the `release_tag` description and default, the two `preflight`/`build` tag allow-lists (two lines each), the two `RELEASE_VERSION` env values, the two updater-manifest `notes` strings, the changelog copy path `docs/releases/vX.Y.Z.md`, and the two `RELEASE_TITLE` strings. The line count is what the `grep -c` below reports; the occurrence count is not.
+
+  **This was 14 until the manifest publisher was extracted.** The fourteenth line was the manifest commit message, which now lives in `scripts/publish-release-manifest.mjs` and does not name the version at all. Nothing else moved. If the count drifts again, find out which line left before changing the number — the count exists to catch a missed bump, and quietly re-fitting it to whatever `grep` currently reports would retire the check while appearing to maintain it.
 
   Five of these are guarded by nothing — the two `RELEASE_TITLE` strings and the two manifest `notes` strings reach immutable published output, and a missed bump there publishes a correct build under the *previous* version's title or update note with every gate still green. Tracked in #145; until it is fixed, check those four lines by eye.
 
@@ -37,7 +39,7 @@ Plus:
 - `.github/workflows/release-alpha.yml` and `scripts/check-release-workflow.mjs` each carry a comment recording that the 0.2.1 and 0.3.0 releases both published and then failed their manifest push. That is the evidence for the `git -C` fix; rewriting it destroys the record.
 - `docs/security/dependency-advisories.md` names `urlpattern 0.3.0`, a third-party crate version.
 
-So verify by counting the *new* string rather than searching for leftovers of the old one: `grep -c 'X\.Y\.Z' .github/workflows/release-alpha.yml` should report **14**, and a single `0.3.0` hit remaining in that file is correct.
+So verify by counting the *new* string rather than searching for leftovers of the old one: `grep -c 'X\.Y\.Z' .github/workflows/release-alpha.yml` should report **13**, and a single `0.3.0` hit remaining in that file is correct.
 
 ## 2. Write the dual changelog
 
