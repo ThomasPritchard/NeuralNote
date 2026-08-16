@@ -43,3 +43,6 @@ lcov-rust.info
 # leaving these tracked would seed a fresh manual vault with another machine's state.
 .neuralnote/
 .obsidian/
+
+# Marketing/social assets: large generated PNG masters and backgrounds, kept local.
+output/marketing/
