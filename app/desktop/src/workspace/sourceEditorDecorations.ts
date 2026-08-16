@@ -37,7 +37,7 @@ import {
   tableRenderPlan,
   type TableRenderCell,
 } from "./sourceEditorTableModel";
-import { revealedTableSource } from "./sourceEditorTableReveal";
+import { revealedTableSource, setRevealedTableSource } from "./sourceEditorTableReveal";
 import type { VisibleRange } from "./sourceEditorDecorationsTypes";
 
 export type {
@@ -349,6 +349,17 @@ const sourceEditorTableDecorations = StateField.define<TableDecorationState>({
     const viewport = transaction.effects.find((effect) => effect.is(updateSourceEditorTableViewport));
     const remeasure = transaction.effects.some((effect) =>
       effect.is(refreshSourceEditorTableMetrics));
+    // A reveal toggles whether this table is drawn as chrome or left as literal
+    // pipes, and it arrives as an effect and NOTHING else: no document change, no
+    // selection, no viewport, no remeasure, no reparse. Without it in this list
+    // the guard below returned the previous decorations, so `Shift-Option-\` in
+    // the shipped app updated `revealedTableSource`, was correctly claimed as a
+    // command (no `»` typed — the half issue #97 reported), and then repainted
+    // nothing at all. `drawsCellChrome` reads that field, so the recompute below
+    // is what turns the flipped state into the drawn/literal swap the user asked
+    // for. Found by hand in a real WKWebView build.
+    const revealToggled = transaction.effects.some((effect) =>
+      effect.is(setRevealedTableSource));
     let visibleRanges = viewport?.value ?? value.visibleRanges;
     if (transaction.docChanged && !viewport) {
       visibleRanges = visibleRanges.map(({ from, to }) => ({
@@ -366,6 +377,7 @@ const sourceEditorTableDecorations = StateField.define<TableDecorationState>({
       && !transaction.reconfigured
       && !viewport
       && !remeasure
+      && !revealToggled
       && !reparsed(transaction.startState, transaction.state)
     ) return value;
     return { ...tableDecorationResult(transaction.state, visibleRanges), visibleRanges };
@@ -480,6 +492,13 @@ export function sourceEditorDecorations(
         const linksChanged = update.transactions.some((transaction) =>
           transaction.effects.some((effect) => effect.is(refreshSourceEditorDecorations))
         );
+        // Deliberately NOT watching `setRevealedTableSource` here. A reveal changes
+        // what the TABLE field paints (`sourceEditorTableDecorations`, above), and
+        // nothing this preview pass produces reads the reveal state — no path from
+        // `sourceEditorDecorationsPreview` reaches `drawsCellChrome`. Adding it was
+        // tried and removed: with the table field fixed, taking the clause back out
+        // reds nothing, so it would have been a recompute on every toggle bought
+        // for no observable difference.
         if (
           update.docChanged
           || update.viewportChanged
