@@ -166,14 +166,39 @@ pub fn move_entry(root: &Path, path: &Path, new_parent: &Path) -> CoreResult<Tre
 }
 
 /// Delete a file or folder by moving it to the OS trash — recoverable, never a
-/// permanent `remove`. A wrong delete should always be undoable.
+/// permanent `remove`. A wrong delete is always recoverable from the system
+/// Trash.
+///
+/// On macOS "recoverable" means dragging the note out of the Trash, not Finder's
+/// one-click "Put Back": the delete method chosen below does not record the
+/// origin path. That cost is accepted deliberately — see the comment on the
+/// macOS branch.
 pub fn delete_entry(root: &Path, path: &Path) -> CoreResult<()> {
     let path = ensure_within(root, path)?;
     if !path.exists() {
         return Err(CoreError::NotFound(path.display().to_string()));
     }
+    // Do NOT collapse this branch back to `trash::delete` (issue #159).
+    //
+    // `trash`'s macOS default is `DeleteMethod::Finder`, which shells out to
+    // `osascript` and asks Finder to do the delete. When Finder refuses — a
+    // read-only parent directory, say — `osascript` does not fail; it returns
+    // when the Apple Event times out. Measured on Darwin 24.6.0: 120.1 s, during
+    // which the whole app is unresponsive because this call runs synchronously
+    // under the vault mutation mutex.
+    //
+    // `NsFileManager` uses `trashItemAtURL` and fails immediately instead:
+    // 21.8 ms for the same refusal, and a successful delete still lands in
+    // ~/.Trash. Two costs come with it, both accepted:
+    //   - no Finder "Put Back" entry, so restoring is a drag out of the Trash;
+    //   - a different `trash::Error` variant (`Unknown` rather than `Os`), which
+    //     `CoreError::from` maps identically, so no caller sees the change.
+    // It also removes a failure class: the Finder path needs macOS Automation
+    // permission, so a user who denied that prompt had every delete fail.
     #[cfg(target_os = "macos")]
     {
+        // The `use` must stay inside this block: `trash::macos` is itself gated
+        // on macOS, so a top-of-file import breaks the Linux and Windows builds.
         use trash::macos::{DeleteMethod, TrashContextExtMacos};
         let mut ctx = trash::TrashContext::new();
         ctx.set_delete_method(DeleteMethod::NsFileManager);
