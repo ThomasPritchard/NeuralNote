@@ -278,16 +278,37 @@ decodable AAC-LC m4a rendition** (no-m4a + HE-AAC + Opus combined), **OR any sin
 `UNDECODABLE_COMBINED_THRESHOLD`, `SINGLE_CLASS_THRESHOLD`, and `MIN_REPRESENTATIVE_SAMPLE`, and
 `CoverageTally::fallback_triggered` is the single source of truth the harness prints.
 
-**The decision.** The product direction is to **implement the consented ffmpeg fallback.** But the
-actual binary integration — pinning, downloading, and executing a third-party LGPL ffmpeg build on
-untrusted media — is **deferred to a dedicated follow-up (#59)** so it lands with real sample data
-and a focused security review rather than blind. #38 delivers the measurement harness, the
-threshold, this decision record, and an **actionable interim limitation**: until #59, a video with
-no decodable AAC-LC m4a fails with `unsupported_audio_codec` whose message explains the video's
-audio isn't in the supported format, suggests trying a captioned video or a different source, and
-notes ffmpeg support is planned. The trigger is recorded at the code site
-(`capture/audio.rs::unsupported_codec`, `TODO(ffmpeg-fallback, #59)`), pointing back at the harness
-and this threshold.
+**The measurement (16 July 2026).** The harness was run over **79 videos across 10 content
+categories**, sampled with `yt-dlp ytsearch` and classified by the core classifier using the
+repo's SHA-256-pinned `yt-dlp_macos`. The result:
+
+| Class | Count | Rate |
+| --- | --- | --- |
+| `aac_lc_m4a` (decodable) | 79 | 100.0 % |
+| `he_aac` | 0 | 0.0 % |
+| `opus` | 0 | 0.0 % |
+| `no_m4a` | 0 | 0.0 % |
+| `other` | 0 | 0.0 % |
+
+Combined undecodable rate: **0.0 %**, against a 10 % threshold. Sample size 79, against a
+minimum of 50, so the run counts as representative. `fallback_triggered` printed **false**.
+
+**The decision.** The threshold is **not met**, so the consented ffmpeg fallback is **not
+warranted on current evidence** and stays deferred to **#59**. That is the decision the
+measurement produced — not a foregone one; had the rate exceeded the bound, #59 would have been
+scheduled rather than parked. Re-run the harness before assuming this still holds: the sample is
+one point in time, and YouTube's default renditions change.
+
+#38 delivers the measurement harness, the threshold, this decision record, and an **actionable
+interim limitation**: until #59, a video with no decodable AAC-LC m4a fails with
+`unsupported_audio_codec` whose message explains the video's audio isn't in the supported format,
+suggests trying a captioned video or a different source, and notes ffmpeg support is planned. The
+trigger is recorded at the code site (`capture/audio.rs::unsupported_codec`,
+`TODO(ffmpeg-fallback, #59)`), pointing back at the harness and this threshold.
+
+Note that the integration risk stands regardless of the rate: pinning, downloading, and executing
+a third-party LGPL ffmpeg build on untrusted media wants a focused security review, so #59 should
+land with real sample data rather than blind.
 
 ## 5. Timestamped citation comes for free — the argument that justifies the rewrite
 
