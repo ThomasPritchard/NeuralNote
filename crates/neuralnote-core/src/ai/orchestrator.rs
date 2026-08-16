@@ -17,7 +17,8 @@ use crate::ai::evidence::EvidenceRegistry;
 use crate::ai::llm::{Completion, LlmClient, LlmMessage, LlmRequest, Role, ToolCall, UserPrompt};
 use crate::ai::plan::RunPlan;
 use crate::ai::retrieval::RetrievalProvider;
-use crate::ai::skills::{missing_required_binary, ActiveSkills, SkillEnvironment, SkillRegistry};
+use crate::ai::skill_activation::{activation_failure_message, skill_activation_failed};
+use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
 use crate::ai::tool_registry;
 use crate::ai::tools::{self, dispatch, ToolOutcome};
 use crate::ai::verify::CitationVerifier;
@@ -38,13 +39,7 @@ const MAX_PLAYLIST_TURNS_PER_ITEM: usize = 8;
 /// shell. Kept here as the client-agnostic default the host can override.
 pub const DEFAULT_MODEL: &str = "anthropic/claude-sonnet-4.5";
 
-/// Marker substring the frontend keys activation-failure rendering on.
-/// TS mirror: app/desktop/src/workspace/ChatMessages.tsx `ACTIVATION_FAILURE_MARK`.
-/// A wording change is a two-site edit; the tripwire is
-/// `disabled_fixture_preload_surfaces_a_recoverable_error_without_activation`
-/// in `tests/skill_orchestrator.rs`, which asserts the emitted `SkillStep`
-/// message contains this constant.
-pub const SKILL_ACTIVATION_FAILURE_MARK: &str = "could not be activated";
+pub use crate::ai::skill_activation::SKILL_ACTIVATION_FAILURE_MARK;
 
 /// Why a run ended short. Both are the orchestrator's own knowledge — a guard it
 /// tripped, or a stop it honoured — so neither is ever inferred from model prose.
@@ -1632,31 +1627,6 @@ fn truncate_chars(text: &str, max: usize) -> String {
     }
     let kept: String = text.chars().take(max).collect();
     format!("{kept}…")
-}
-
-/// The structured report for a skill that could not be activated. `missing_binary`
-/// is the only remedy the UI can offer, and it is derived from the requirement set
-/// — never from `message`, so re-wording the sentence cannot disable the remedy.
-pub(super) fn skill_activation_failed(
-    id: &str,
-    error: &str,
-    registry: &SkillRegistry,
-    environment: &SkillEnvironment,
-) -> ChatEvent {
-    let manifest = registry.lookup(id).ok();
-    ChatEvent::SkillActivationFailed {
-        id: id.to_string(),
-        // An id nobody recognises has no name of its own; the id the caller asked
-        // for is the only identity there is.
-        name: manifest.map_or_else(|| id.to_string(), |manifest| manifest.name.clone()),
-        message: activation_failure_message(id, error),
-        missing_binary: manifest
-            .and_then(|manifest| missing_required_binary(&manifest.requirements, environment)),
-    }
-}
-
-pub(super) fn activation_failure_message(id: &str, error: &str) -> String {
-    format!("Skill '{id}' {SKILL_ACTIVATION_FAILURE_MARK}: {error} — continuing without it")
 }
 
 fn emit_coverage(coverage: CoverageAcc, guard_tripped: bool, sink: &mut dyn EventSink) {

@@ -29,6 +29,7 @@ pub mod plan;
 pub mod provider_config;
 pub mod requirement_binaries;
 pub mod retrieval;
+mod skill_activation;
 mod skill_tools;
 pub mod skills;
 pub mod tool_registry;
