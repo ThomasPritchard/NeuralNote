@@ -172,7 +172,17 @@ pub fn delete_entry(root: &Path, path: &Path) -> CoreResult<()> {
     if !path.exists() {
         return Err(CoreError::NotFound(path.display().to_string()));
     }
-    trash::delete(&path)?;
+    #[cfg(target_os = "macos")]
+    {
+        use trash::macos::{DeleteMethod, TrashContextExtMacos};
+        let mut ctx = trash::TrashContext::new();
+        ctx.set_delete_method(DeleteMethod::NsFileManager);
+        ctx.delete(&path)?;
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        trash::delete(&path)?;
+    }
     Ok(())
 }
 
