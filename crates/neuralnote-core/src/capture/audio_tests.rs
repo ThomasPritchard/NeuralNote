@@ -217,6 +217,37 @@ fn downmix_rejects_misaligned_or_non_finite_samples() {
 }
 
 #[test]
+fn downmix_of_extreme_finite_samples_stays_finite_and_matches_the_reference() {
+    // Every input sample is finite, so the per-sample guard passes. Summing in f32
+    // would then saturate to +inf, and `inf / 2.0` is still inf — a non-finite sample
+    // that escapes the downmix and panics inside `rubato` rather than surfacing as a
+    // decode failure. Accumulating in f64 makes that impossible: two operands (the most
+    // `validate_audio_spec` permits) sum to 6.81e38 and halve to exactly f32::MAX.
+    let mono = downmix_packet(&[f32::MAX, f32::MAX], 2, 44_100, 0)
+        .expect("an extreme but finite packet must downmix, not fail");
+
+    assert!(
+        mono.iter().all(|sample| sample.is_finite()),
+        "downmixing finite samples must not produce a non-finite result, got {mono:?}"
+    );
+    assert_eq!(mono, [f32::MAX], "the average of two f32::MAX is f32::MAX");
+
+    // The f32 and f64 paths used to diverge here, which would break any property test
+    // written against this oracle. Pin that they now agree at the extreme too.
+    let mut reference = Vec::new();
+    reference_append_downmixed(&[f32::MAX, f32::MAX], 2, 44_100, &mut reference)
+        .expect("the reference must accept the same packet");
+    assert_eq!(
+        mono,
+        reference
+            .into_iter()
+            .map(|sample| sample as f32)
+            .collect::<Vec<_>>(),
+        "production and reference downmix must agree at the extreme"
+    );
+}
+
+#[test]
 fn unsupported_codec_message_is_actionable_and_keeps_technical_detail() {
     let error = validate_aac_codec(CODEC_ID_PCM_S16LE).unwrap_err();
     let detail = error.detail();
