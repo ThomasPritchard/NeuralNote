@@ -7,27 +7,19 @@
 //! `Done`. Any error is surfaced as a [`ChatEvent::Error`] and stops the run — never
 //! a panic, never silent.
 
-use crate::ai::approval::{
-    self, ApprovalClassifier, ApprovalContext, ApprovalDecision, ApprovalGate, ApprovalPolicy,
-    ApprovalPrompt, ApprovedCall, DenyingApprovalPrompt, UnavailableApprovalClassifier,
-};
+use crate::ai::approval::{self, ApprovalContext, ApprovalDecision, ApprovalGate, ApprovedCall};
 use crate::ai::events::{ChatEvent, EventSink};
 use crate::ai::evidence::EvidenceRegistry;
-use crate::ai::llm::{Completion, LlmClient, LlmMessage, LlmRequest, Role, ToolCall, UserPrompt};
+use crate::ai::llm::{Completion, LlmClient, LlmMessage, LlmRequest, ToolCall};
 use crate::ai::plan::RunPlan;
 use crate::ai::retrieval::RetrievalProvider;
 use crate::ai::skill_activation::{activation_failure_message, skill_activation_failed};
-use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
+use crate::ai::skills::ActiveSkills;
 use crate::ai::tools::{self, dispatch, ToolOutcome};
 use crate::ai::verify::CitationVerifier;
-use crate::ai::write_policy::{NoteWriteBackend, UndoLedger, WriteSession};
-use crate::ai::youtube::{
-    CaptureCancellation, ExtractorUpdateSession, YoutubeIo, YoutubeToolSession,
-    UNAVAILABLE_YOUTUBE_IO,
-};
-use crate::capture::{PricingInput, UnavailableVaultProfileIo, VaultProfileIo};
+use crate::ai::write_policy::{UndoLedger, WriteSession};
+use crate::ai::youtube::YoutubeToolSession;
 use crate::error::CoreResult;
-use async_trait::async_trait;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -46,6 +38,12 @@ mod usage;
 use usage::{EmissionGuard, ThinkingCounter, UsageMeter};
 mod playlist;
 use playlist::{handle_empty_tool_turn, playlist_preflight, LoopControl, PlaylistLoopState};
+mod prompt;
+use prompt::system_prompt;
+mod services;
+pub use services::{NoRetryDelay, RetryDelay, SkillServices};
+mod coverage;
+use coverage::{emit_coverage, push_unique, CoverageAcc};
 
 /// The default OpenRouter model — BYO-key, OpenAI-compatible, user-editable in the
 /// shell. Kept here as the client-agnostic default the host can override.
@@ -82,185 +80,6 @@ impl Default for Guards {
             max_context_chars: 60_000,
         }
     }
-}
-
-const SYSTEM_PROMPT: &str = r#"You are NeuralNote's assistant. You help the user think with, and about, their own notes.
-
-Choose a mode for each message.
-
-CONVERSE — answer directly, call no tools:
-- greetings, thanks, small talk
-- questions about you, your abilities, or something you just said
-- follow-ups that need only your own previous answer
-
-RESEARCH — you MUST search before answering:
-- any question about facts, or about anything in the user's notes or material
-- Issue 3 to 8 varied searches: try synonyms, tags, note titles, and the user's own
-  wording. Keyword search is literal, so rephrase generously.
-- The vault is organised into folders. Call `list_folders` to see them (each with its
-  note count). When the user asks about a specific folder — e.g. "what's in my Recipes
-  folder" — pass that folder's path as the `folder` argument to `search_notes` or
-  `list_notes` to scope to it and its subfolders; omit `folder` to cover the whole vault.
-- Cite every claim with the evidence id in square brackets, e.g. [e1] or [e2]. Cite ids
-  only — never a file path, and never a quote you did not retrieve.
-- If the work genuinely needs three or more distinct steps, call `update_plan` once
-  before you start, then keep it current as you go. Skip it for a direct answer or a
-  single search — a plan for one step is noise.
-
-These hold in both modes:
-- Never answer a factual question from your own knowledge. Your knowledge is for
-  conversation, not for facts.
-- If your searches find nothing relevant, say so plainly: name what you searched for,
-  and invite the user to add a note on the topic so you can answer it next time. Never
-  invent a citation or an answer.
-- Keep answers concise and grounded in the cited evidence."#;
-
-/// Host seam for the retry backoff pause. The core owns *how long* to wait (its retry
-/// policy) but never owns a clock — every timer in the app lives in the host — so it
-/// hands the duration to this seam and awaits it. The shell backs it with its async
-/// runtime timer; tests supply a deterministic double so backoff is exercised without
-/// real time passing.
-#[async_trait]
-pub trait RetryDelay: Send + Sync {
-    /// Await `duration` before the caller retries. Must not block the executor thread.
-    async fn delay(&self, duration: Duration);
-}
-
-/// The no-op default: retry immediately. Used by non-host callers and any run that does
-/// not wire a real timer; the desktop shell overrides it with a runtime-backed delay.
-pub struct NoRetryDelay;
-
-#[async_trait]
-impl RetryDelay for NoRetryDelay {
-    async fn delay(&self, _duration: Duration) {}
-}
-
-static NO_RETRY_DELAY: NoRetryDelay = NoRetryDelay;
-
-/// Shell-supplied seams and pure skill policy for one chat run.
-pub struct SkillServices<'a> {
-    registry: &'a SkillRegistry,
-    environment: &'a SkillEnvironment,
-    user_prompt: &'a dyn UserPrompt,
-    note_writer: &'a dyn NoteWriteBackend,
-    work_items: usize,
-    youtube_io: &'a dyn YoutubeIo,
-    youtube_requirements: &'a dyn crate::ai::youtube::YoutubeRequirementInstaller,
-    vault_profile_io: &'a dyn VaultProfileIo,
-    capture_cancellation: CaptureCancellation,
-    pricing: Option<&'a PricingInput>,
-    extractor_updates: ExtractorUpdateSession,
-    retry_delay: &'a dyn RetryDelay,
-    approval_policy: ApprovalPolicy,
-    approval_prompt: &'a dyn ApprovalPrompt,
-    approval_classifier: &'a dyn ApprovalClassifier,
-}
-
-static DENYING_APPROVAL_PROMPT: DenyingApprovalPrompt = DenyingApprovalPrompt;
-static UNAVAILABLE_APPROVAL_CLASSIFIER: UnavailableApprovalClassifier =
-    UnavailableApprovalClassifier;
-
-static UNAVAILABLE_VAULT_PROFILE_IO: UnavailableVaultProfileIo = UnavailableVaultProfileIo;
-
-impl<'a> SkillServices<'a> {
-    pub fn new(
-        registry: &'a SkillRegistry,
-        environment: &'a SkillEnvironment,
-        user_prompt: &'a dyn UserPrompt,
-        note_writer: &'a dyn NoteWriteBackend,
-        work_items: usize,
-    ) -> Self {
-        Self {
-            registry,
-            environment,
-            user_prompt,
-            note_writer,
-            work_items,
-            youtube_io: &UNAVAILABLE_YOUTUBE_IO,
-            youtube_requirements: &crate::ai::youtube::UNAVAILABLE_YOUTUBE_REQUIREMENT_INSTALLER,
-            vault_profile_io: &UNAVAILABLE_VAULT_PROFILE_IO,
-            capture_cancellation: CaptureCancellation::default(),
-            pricing: None,
-            // Non-host callers get an isolated allowance; the desktop shell overrides
-            // this with its app-session-owned update state through the builder below.
-            extractor_updates: ExtractorUpdateSession::default(),
-            // No-op backoff by default; the desktop shell wires its runtime timer.
-            retry_delay: &NO_RETRY_DELAY,
-            // Fail-closed defaults: ask about everything, deny when nobody is
-            // listening, and have no judge. A client that forgets to wire the
-            // approval seams therefore cannot run gated tools unattended — the
-            // opposite default would turn a missed wiring step into silent
-            // unattended vault writes.
-            approval_policy: ApprovalPolicy::default(),
-            approval_prompt: &DENYING_APPROVAL_PROMPT,
-            approval_classifier: &UNAVAILABLE_APPROVAL_CLASSIFIER,
-        }
-    }
-
-    /// Wire the tool-approval gate: the persisted policy, the host's approval
-    /// sheet, and the judge.
-    pub fn with_approval(
-        mut self,
-        policy: ApprovalPolicy,
-        prompt: &'a dyn ApprovalPrompt,
-        classifier: &'a dyn ApprovalClassifier,
-    ) -> Self {
-        self.approval_policy = policy;
-        self.approval_prompt = prompt;
-        self.approval_classifier = classifier;
-        self
-    }
-
-    pub fn with_youtube_io(mut self, youtube_io: &'a dyn YoutubeIo) -> Self {
-        self.youtube_io = youtube_io;
-        self
-    }
-
-    pub fn with_youtube_requirements(
-        mut self,
-        installer: &'a dyn crate::ai::youtube::YoutubeRequirementInstaller,
-    ) -> Self {
-        self.youtube_requirements = installer;
-        self
-    }
-
-    pub fn with_vault_profile_io(mut self, profile_io: &'a dyn VaultProfileIo) -> Self {
-        self.vault_profile_io = profile_io;
-        self
-    }
-
-    pub fn with_capture_cancellation(mut self, cancellation: CaptureCancellation) -> Self {
-        self.capture_cancellation = cancellation;
-        self
-    }
-
-    pub fn with_pricing(mut self, pricing: &'a PricingInput) -> Self {
-        self.pricing = Some(pricing);
-        self
-    }
-
-    /// Override the current per-run default with update state retained by a host.
-    pub fn with_extractor_update_session(mut self, updates: ExtractorUpdateSession) -> Self {
-        self.extractor_updates = updates;
-        self
-    }
-
-    /// Wire the host's runtime-backed retry backoff. Without this, retries fire
-    /// immediately (the [`NoRetryDelay`] default).
-    pub fn with_retry_delay(mut self, retry_delay: &'a dyn RetryDelay) -> Self {
-        self.retry_delay = retry_delay;
-        self
-    }
-}
-
-fn system_prompt(registry: &SkillRegistry) -> String {
-    let catalogue = registry.catalogue();
-    let catalogue = if catalogue.is_empty() {
-        "(none)"
-    } else {
-        &catalogue
-    };
-    format!("{SYSTEM_PROMPT}\n\nAVAILABLE SKILLS\n{catalogue}")
 }
 
 /// Run one chat turn end-to-end, streaming [`ChatEvent`]s to `sink`.
@@ -341,15 +160,6 @@ struct ChatSession<'a> {
     llm: &'a dyn LlmClient,
     skill_services: &'a SkillServices<'a>,
     guards: &'a Guards,
-}
-
-/// The coverage footer accumulated across the run (so partial coverage is visible).
-#[derive(Default)]
-struct CoverageAcc {
-    searched_terms: Vec<String>,
-    notes_read: Vec<String>,
-    truncated: bool,
-    skipped_files: u32,
 }
 
 enum EvidenceCollection {
@@ -1051,40 +861,6 @@ fn collection_after_tool_batch(
     None
 }
 
-fn emit_coverage(coverage: CoverageAcc, guard_tripped: bool, sink: &mut dyn EventSink) {
-    let truncated = coverage.truncated || guard_tripped;
-
-    // A conversational turn searched and read nothing, so an empty footer would be a
-    // lie of precision — say nothing instead. But suppress only when the footer would
-    // carry *no* information: a run can trip a guard (or skip files) having called
-    // only `list_notes`/`list_folders`, which populate neither vector, and dropping
-    // the footer there would hide the truncation. Partial coverage is visible, never
-    // hidden (see `ChatEvent::Coverage`).
-    if coverage.searched_terms.is_empty()
-        && coverage.notes_read.is_empty()
-        && !truncated
-        && coverage.skipped_files == 0
-    {
-        return;
-    }
-
-    sink.send(ChatEvent::Coverage {
-        searched_terms: coverage.searched_terms,
-        notes_read: coverage.notes_read,
-        // "Partial coverage" = the sweep was genuinely cut short: a loop guard
-        // stopped it, OR the vault search hit its own global cap (`coverage.truncated`
-        // now carries only that, not a routine per-search `max_results` clip).
-        truncated,
-        skipped_files: coverage.skipped_files,
-    });
-}
-
-fn push_unique(list: &mut Vec<String>, value: &str) {
-    if !list.iter().any(|v| v == value) {
-        list.push(value.to_string());
-    }
-}
-
 /// Extract the `query` field from a search tool call's raw JSON arguments, if present.
 fn peek_query(args_json: &str) -> Option<String> {
     serde_json::from_str::<serde_json::Value>(args_json)
@@ -1122,10 +898,13 @@ mod tests {
         LOCAL_CONTEXT_WINDOW_TOKENS, PROMPT_OVERHEAD_TOKENS,
     };
     use super::history::MAX_HISTORY_CHARS;
+    use super::prompt::SYSTEM_PROMPT;
     use super::*;
-    use crate::ai::approval::ApprovalMode;
+    use crate::ai::approval::{
+        ApprovalMode, ApprovalPolicy, DenyingApprovalPrompt, UnavailableApprovalClassifier,
+    };
     use crate::ai::events::{TokenUsage, ToolStatus, VecSink};
-    use crate::ai::llm::{Completion, NoUserPrompt};
+    use crate::ai::llm::{Completion, NoUserPrompt, Role, UserPrompt};
     use crate::ai::local::HardwareSpec;
     use crate::ai::plan::{PlanStep, StepStatus};
     use crate::ai::retrieval::{FolderMeta, KeywordRetriever, ListOutcome, SearchOutcome};
