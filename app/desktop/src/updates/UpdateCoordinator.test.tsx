@@ -208,4 +208,36 @@ describe("UpdateCoordinator", () => {
     );
     expect(screen.getByText("Manifest unavailable.")).toBeInTheDocument();
   });
+
+  it("treats a missing updater plugin as expected dev/unsigned-build configuration, not an error", () => {
+    render(
+      <UpdateCoordinator>
+        <AutomaticErrorStatus />
+      </UpdateCoordinator>,
+    );
+
+    act(() => mocks.publishAutomaticError("plugin updater not found"));
+
+    expect(mocks.toast.error).not.toHaveBeenCalled();
+    expect(screen.getByText("plugin updater not found")).toBeInTheDocument();
+  });
+
+  it('keeps a genuine failure at error severity even when its message contains "not found"', () => {
+    render(
+      <UpdateCoordinator>
+        <AutomaticErrorStatus />
+      </UpdateCoordinator>,
+    );
+
+    act(() =>
+      mocks.publishAutomaticError(
+        "the platform `darwin-aarch64` was not found in the response `platforms` object",
+      ),
+    );
+
+    expect(mocks.toast.error).toHaveBeenCalledWith(
+      "Automatic update check failed. the platform `darwin-aarch64` was not found in the response `platforms` object",
+      { dedupKey: "automatic-update-error" },
+    );
+  });
 });
