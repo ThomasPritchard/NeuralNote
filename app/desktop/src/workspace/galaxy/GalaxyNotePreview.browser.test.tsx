@@ -28,6 +28,23 @@ vi.mock("../../lib/api", async (importOriginal) => ({
 }));
 vi.mock("../../lib/store", () => ({ useVault: mocks.useVault }));
 
+/** WCAG 2.5.8's minimum target size, in CSS pixels. */
+const MIN_TARGET_PX = 24;
+
+/** Chromium stores layout in `LayoutUnit`, a 1/64th-pixel fixed-point type, so a
+ *  box laid out to exactly 24px can measure back as 23.9999… — observed here at
+ *  both 23.996749877929688 and 23.999935150146484 on the same assertion, under
+ *  full-suite load only and never in isolation. Comparing against a bare 24
+ *  therefore fails on the representation rather than on the geometry.
+ *
+ *  One quantum is the whole allowance on purpose. The repo's other browser specs
+ *  use `TOLERANCE_PX = 1` for "did this move?" questions, but this is a
+ *  compliance floor: a tolerance of a whole pixel would let a genuinely
+ *  undersized 23px target pass, which is the one thing this assertion exists to
+ *  catch. A real shortfall is whole pixels wide; representation error cannot
+ *  exceed 1/64. */
+const LAYOUT_UNIT_PX = 1 / 64;
+
 const baseTitle = "A deliberately descriptive constellation note";
 const baseBody =
   "This deliberately detailed opening sentence demonstrates that the complete bounded local digest remains readable even in the tightest supported graph pane.\n\n## Detail\n\nMore context follows.";
@@ -238,8 +255,8 @@ describe("GalaxyNotePreview responsive geometry", () => {
     await expect.element(page.getByText("+2", { exact: true })).toBeVisible();
     for (const target of targets) {
       const rect = target.getBoundingClientRect();
-      expect(rect.width).toBeGreaterThanOrEqual(24);
-      expect(rect.height).toBeGreaterThanOrEqual(24);
+      expect(rect.width).toBeGreaterThanOrEqual(MIN_TARGET_PX - LAYOUT_UNIT_PX);
+      expect(rect.height).toBeGreaterThanOrEqual(MIN_TARGET_PX - LAYOUT_UNIT_PX);
     }
 
     await renderAt({
@@ -255,8 +272,8 @@ describe("GalaxyNotePreview responsive geometry", () => {
     expect(smallTargets).toHaveLength(6);
     for (const target of smallTargets) {
       const rect = target.getBoundingClientRect();
-      expect(rect.width).toBeGreaterThanOrEqual(24);
-      expect(rect.height).toBeGreaterThanOrEqual(24);
+      expect(rect.width).toBeGreaterThanOrEqual(MIN_TARGET_PX - LAYOUT_UNIT_PX);
+      expect(rect.height).toBeGreaterThanOrEqual(MIN_TARGET_PX - LAYOUT_UNIT_PX);
     }
   });
 });

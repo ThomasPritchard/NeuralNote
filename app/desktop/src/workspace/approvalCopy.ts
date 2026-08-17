@@ -26,6 +26,7 @@ import {
   UserX,
   type LucideIcon,
 } from "lucide-react";
+import { GATED_TOOL_WIRE_NAMES } from "../lib/gatedToolWireNames";
 import type {
   ApprovalDegradedReason,
   ApprovalMode,
@@ -55,7 +56,9 @@ export const APPROVAL_GROUPS: ReadonlyArray<{ id: ApprovalGroupId; title: string
 
 export interface GatedToolCopy {
   /** The persisted key: the `TOOL_*` constant `toolOverrides` /
-   *  `effectiveModes` are keyed by. Never shown to the user. */
+   *  `effectiveModes` are keyed by. Never shown to the user, and never written
+   *  here by hand — it comes from `GATED_TOOL_WIRE_NAMES`, the one place the
+   *  frontend states the tool→wire-name correspondence (issues #120, #146). */
   key: string;
   tool: GatedTool;
   /** The settings row's name — a gerund, because the row is about a habit. */
@@ -65,57 +68,65 @@ export interface GatedToolCopy {
   group: ApprovalGroupId;
 }
 
-const GATED_TOOLS: readonly GatedToolCopy[] = [
-  {
-    key: "write_note",
-    tool: "writeNote",
+/** What each gated tool is called, keyed by its `GatedTool` variant.
+ *
+ *  **A `Record<GatedTool, …>` on purpose, and the wire name is NOT in here.**
+ *  Both halves of that are the fix for issue #146. This table used to be a flat
+ *  array carrying a hand-written snake_case `key` beside each `tool`, which made
+ *  it a second, unchecked copy of the correspondence `GATED_TOOL_WIRE_NAMES`
+ *  already states — and the unchecked copy was the one production read. A key
+ *  mistyped here did not fail anything: `gatedToolCopyForKey` simply missed, and
+ *  the settings page rendered the raw `resolve_distil_route` at a user with the
+ *  whole suite green. Keying by `GatedTool` makes a missing or misspelled tool a
+ *  compile error, and deriving the key below means there is no second spelling
+ *  of the wire name left to get wrong. */
+const GATED_TOOL_COPY: Record<GatedTool, Omit<GatedToolCopy, "key" | "tool">> = {
+  writeNote: {
     title: "Creating and changing notes",
     action: "create or change a note in your vault",
     group: "vault",
   },
-  {
-    key: "use_skill",
-    tool: "useSkill",
+  useSkill: {
     title: "Turning on a skill",
     action: "turn on a skill, which widens what it is allowed to do",
     group: "grant",
   },
-  {
-    key: "select_playlist_videos",
-    tool: "selectPlaylistVideos",
+  selectPlaylistVideos: {
     title: "Choosing videos from a playlist",
     action: "choose which videos from a playlist to work through",
     group: "grant",
   },
-  {
-    key: "resolve_distil_route",
-    tool: "resolveDistilRoute",
+  resolveDistilRoute: {
     title: "Saving how it files your notes",
     action: "save how it files your notes, which steers future runs too",
     group: "grant",
   },
-  {
-    key: "fetch_video_info",
-    tool: "fetchVideoInfo",
+  fetchVideoInfo: {
     title: "Looking up a video",
     action: "look up a video over the internet",
     group: "network",
   },
-  {
-    key: "fetch_captions",
-    tool: "fetchCaptions",
+  fetchCaptions: {
     title: "Fetching captions",
     action: "fetch captions for a video over the internet",
     group: "network",
   },
-  {
-    key: "transcribe_audio",
-    tool: "transcribeAudio",
+  transcribeAudio: {
     title: "Transcribing audio",
     action: "transcribe audio here, which runs a program on your machine",
     group: "process",
   },
-];
+};
+
+/** The same copy as a list, each entry wearing the wire name the registry gives
+ *  it. `Object.keys` preserves insertion order for string keys, so this holds
+ *  the declaration order above — kept stable because it is how the table reads,
+ *  not because anything renders from it. The settings page orders rows by
+ *  `APPROVAL_GROUPS` and then by the backend's own `effectiveModes` key order,
+ *  so it never sees this sequence. */
+const GATED_TOOLS: readonly GatedToolCopy[] = (
+  Object.keys(GATED_TOOL_COPY) as GatedTool[]
+).map((tool) => ({ ...GATED_TOOL_COPY[tool], tool, key: GATED_TOOL_WIRE_NAMES[tool] }));
 
 const BY_TOOL = new Map(GATED_TOOLS.map((entry) => [entry.tool, entry]));
 const BY_KEY = new Map(GATED_TOOLS.map((entry) => [entry.key, entry]));

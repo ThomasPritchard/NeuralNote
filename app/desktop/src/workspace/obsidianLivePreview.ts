@@ -1,4 +1,4 @@
-import { syntaxTree } from "@codemirror/language";
+import { ensureSyntaxTree, syntaxTree } from "@codemirror/language";
 import { Prec, StateEffect, type EditorState, type Extension } from "@codemirror/state";
 import {
   Decoration,
@@ -27,6 +27,13 @@ export interface ObsidianPreviewDecoration extends PreviewDecoration {
 }
 
 export const refreshObsidianPreview = StateEffect.define<null>();
+
+/**
+ * Lezer's `Tree`, named without importing `@lezer/common` — it is a transitive
+ * dependency of `@codemirror/language` rather than one this package declares,
+ * and a type alias needs no entry in `package.json` to stay honest.
+ */
+type SyntaxTree = ReturnType<typeof syntaxTree>;
 
 const SCAN_MARGIN = 2_048;
 
@@ -76,9 +83,9 @@ function syntaxMaskedRanges(
   state: EditorState,
   scanRanges: readonly VisibleRange[],
   nodeNames: ReadonlySet<string>,
+  tree: SyntaxTree,
 ): Array<{ from: number; to: number }> {
   const ranges: Array<{ from: number; to: number }> = [];
-  const tree = syntaxTree(state);
   for (const scan of scanRanges) {
     tree.iterate({
       from: scan.from,
@@ -94,7 +101,7 @@ function syntaxMaskedRanges(
 }
 
 /**
- * The tail of the document nothing has parsed yet, masked for the render path.
+ * The tail of the document `tree` has not parsed yet, masked.
  *
  * Past the end of the tree every masking node is missing simply because nothing
  * has parsed there: `LanguageState.init` covers only the first 3,000 characters,
@@ -104,16 +111,16 @@ function syntaxMaskedRanges(
  * The decorations here are found by scanning TEXT and suppressed by finding a
  * node over them, so an absent node reads as "not masked" — the one direction in
  * which a late tree paints something wrong rather than nothing at all, and it
- * put a `#tag` inside an unparsed fenced block (issue #129). What has not been
- * parsed is therefore masked until it has been; `reparsed` above repaints as
- * soon as the tree catches up.
+ * put a `#tag` inside an unparsed fenced block (issues #129 and #168). What has
+ * not been parsed is therefore masked until it has been; `reparsed` above
+ * repaints as soon as the tree catches up.
  *
- * {@link decorationAtCaret} declines this mask deliberately — see the reasoning
- * there.
+ * Derived from the tree the caller decided on rather than from the state, so a
+ * caller that parsed further ({@link decorationAtCaret}) masks less by having
+ * genuinely parsed more, and never by overriding this.
  */
-function unparsedTail(state: EditorState): VisibleRange[] {
-  const parsedTo = syntaxTree(state).length;
-  return parsedTo < state.doc.length ? [{ from: parsedTo, to: state.doc.length }] : [];
+function unparsedTail(state: EditorState, tree: SyntaxTree): VisibleRange[] {
+  return tree.length < state.doc.length ? [{ from: tree.length, to: state.doc.length }] : [];
 }
 
 function overlapsMasked(from: number, to: number, ranges: readonly { from: number; to: number }[]): boolean {
@@ -140,22 +147,32 @@ interface PreviewScanOptions {
   readonly visibleRanges: readonly VisibleRange[];
   readonly selectionActive: boolean;
   /**
-   * Ranges masked only because the parser has not reached them yet. Kept out of
-   * the exported signature on purpose: a render path that forgot it repaints
-   * issue #129, and a command path that took it edits the note (see
-   * {@link decorationAtCaret}). Neither caller should be choosing.
+   * The tree to read nodes from, defaulting to the state's own. A caller wanting
+   * more of the document masked cannot ask for it — it has to hand over a tree
+   * that really covers less. That is the whole safety property here: the two
+   * callers below fail closed in opposite directions, and letting either name
+   * its mask directly is what let the command path answer with no tree at all
+   * (issue #168).
+   *
+   * Optional, so the default below fills in on `undefined` and ONLY `undefined`.
+   * `ensureSyntaxTree` returns `null` on a spent budget, which would sail past
+   * that default and throw in `unparsedTail` from inside the Enter keymap
+   * handler — so the `?? syntaxTree(state)` at the call site is load-bearing,
+   * not belt-and-braces. Dropping it reddens "declines a final-line tag while
+   * the whole-document parse is behind" and nothing else.
    */
-  readonly unparsedMask: readonly VisibleRange[];
+  readonly tree?: SyntaxTree;
 }
 
 function collectPreview(
   state: EditorState,
   index: readonly NoteIndexEntry[],
-  { visibleRanges, selectionActive, unparsedMask }: PreviewScanOptions,
+  { visibleRanges, selectionActive, tree = syntaxTree(state) }: PreviewScanOptions,
 ): ObsidianPreviewDecoration[] {
   const scanRanges = boundedScanRanges(state.doc.length, visibleRanges);
+  const unparsedMask = unparsedTail(state, tree);
   const masked = (nodeNames: ReadonlySet<string>) =>
-    [...syntaxMaskedRanges(state, scanRanges, nodeNames), ...unparsedMask];
+    [...syntaxMaskedRanges(state, scanRanges, nodeNames, tree), ...unparsedMask];
   const codeMasked = masked(CODE_MASKED_NODES);
   const wikilinkContainers = masked(WIKILINK_CONTAINER_NODES);
   const tagMasked = masked(TAG_MASKED_NODES);
@@ -246,25 +263,69 @@ export function collectObsidianPreview(
   visibleRanges: readonly VisibleRange[] = [{ from: 0, to: state.doc.length }],
   selectionActive = true,
 ): ObsidianPreviewDecoration[] {
-  return collectPreview(state, index, {
-    visibleRanges,
-    selectionActive,
-    unparsedMask: unparsedTail(state),
-  });
+  return collectPreview(state, index, { visibleRanges, selectionActive });
 }
+
+/**
+ * How long {@link decorationAtCaret} may spend parsing, synchronously, inside a
+ * keystroke handler.
+ *
+ * 20 ms is the budget CodeMirror already spends parsing inside every state
+ * update it applies (`Work.Apply`,
+ * `@codemirror/language/dist/index.js:536,543`), so this adds no pause the
+ * editor does not already take on an ordinary keypress, and in practice costs
+ * nothing at all: the idle worker has usually parsed the caret's line long
+ * before the user reaches it, and `ParseContext.work` returns immediately when
+ * it has (`:346-349`). Overrunning the budget is a correctness question rather
+ * than a latency one, and the fail-closed branch below answers it.
+ */
+const CARET_PARSE_BUDGET_MS = 20;
 
 /**
  * The matching decoration under the caret, scanning the caret's line only.
  *
- * Declines {@link unparsedTail} on purpose, and that is the whole reason this
- * exists apart from {@link collectObsidianPreview}. The two paths fail closed in
+ * Parses the caret's own line first, and that is the whole reason this exists
+ * apart from {@link collectObsidianPreview}. The two paths fail closed in
  * opposite directions: suppressing a decoration draws nothing and is safe, but a
  * command that finds nothing returns `false`, and CodeMirror then runs the next
  * binding for that key. Bare Enter is bound to {@link openTagSearchAtCaret}
- * ahead of `insertNewlineAndIndent` (`SourceNoteEditor.tsx`), so masking the
- * caret's own line would not decline the action — it would insert a newline into
- * the user's note. Text alone answers for one line the user is already pointing
- * at.
+ * ahead of `insertNewlineAndIndent` (`SourceNoteEditor.tsx:224-227` vs `:260`),
+ * so masking the caret's line does not decline the action — it inserts a newline
+ * into the user's note.
+ *
+ * Answering from text alone was the previous reading of that, and it was wrong
+ * in the other direction: past the frontier the tree holds no nodes at all, so a
+ * `#tag` inside a fenced block had no `FencedCode` over it, opened tag search,
+ * and swallowed the newline (issue #168). Neither "trust the stale tree" nor
+ * "ignore it" is right — the fix is to stop deciding without one.
+ *
+ * `ensureSyntaxTree` returns a DIFFERENT tree rather than updating the state's:
+ * `LanguageState.tree` is snapshotted at construction (`:525`) and `syntaxTree`
+ * reads that snapshot (`:188`), while `ensureSyntaxTree` advances the shared
+ * `ParseContext` and hands back `parse.tree` (`:195-205`). Threading it through
+ * is therefore load-bearing — reading `syntaxTree(state)` here again would
+ * compile, run, and change nothing.
+ *
+ * When the budget runs out, `ensureSyntaxTree` returns `null` and the state's
+ * short tree stands, masking the tail so this DECLINES and Enter types a
+ * newline. That is the direction to fail in: a shortcut that misses once is
+ * invisible, a swallowed keystroke edits the note.
+ *
+ * On the LAST line that budget has to cover the whole document rather than the
+ * line, so the boundary is the note's size and not the caret's distance past the
+ * parse frontier. `line.to` is `doc.length` there, and a limit at or past the
+ * end is DISCARDED rather than applied
+ * (`@codemirror/language/dist/index.js:344-345`), leaving `stopAt` unreached
+ * (`:358-360`) and nothing bounding the parse but the 20 ms. A 200 KB note — the
+ * size full-source capture produces — therefore declines a final-line `#tag` for
+ * as long as the background parse is behind it, and starts firing once `isDone`
+ * can answer for the whole document without working (`:202`, `:505-508`).
+ * Accepted rather than unnoticed: it fails in the same safe direction, and the
+ * alternative is parsing an arbitrary document inside a keystroke. Every other
+ * line keeps its limit and is unaffected; the two `obsidianLivePreview.test.ts`
+ * cases "declines a final-line tag while the whole-document parse is behind" and
+ * "still opens tag search on an already-parsed line under the same spent budget"
+ * pin both sides of that split.
  */
 function decorationAtCaret(
   state: EditorState,
@@ -273,10 +334,11 @@ function decorationAtCaret(
 ): ObsidianPreviewDecoration | undefined {
   const caret = state.selection.main.head;
   const line = state.doc.lineAt(caret);
+  const tree = ensureSyntaxTree(state, line.to, CARET_PARSE_BUDGET_MS) ?? syntaxTree(state);
   return collectPreview(state, index, {
     visibleRanges: [{ from: line.from, to: line.to }],
     selectionActive: true,
-    unparsedMask: [],
+    tree,
   }).find((candidate) => caret >= candidate.from && caret <= candidate.to && matches(candidate));
 }
 

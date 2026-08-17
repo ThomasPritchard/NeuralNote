@@ -7,7 +7,22 @@ interface RecentListProps {
   onOpen: (path: string) => void;
 }
 
-/** The list of recently-opened vaults, with a tasteful empty state. */
+/** The list of recently-opened vaults, with a tasteful empty state.
+ *
+ *  The list is a bounded, scrolling well rather than one that grows the welcome
+ *  card (#164). The backend already caps the history at twelve entries
+ *  (`crates/neuralnote-core/src/recents.rs:11`), and twelve rows measure 668px —
+ *  on their own taller than the 600px minimum window, before the brand block,
+ *  the actions and the footer are counted. So the ceiling here is the fix, not a
+ *  second cap on the data: every remembered vault still renders, and the ones
+ *  past the fold stay reachable — by scrolling, and by focus, which the well
+ *  scrolls into view. (Whether Tab itself reaches a button is the platform's
+ *  call, not this list's: WebKit follows the macOS "Keyboard navigation"
+ *  setting and skips buttons while it is off.)
+ *
+ *  Proved in `Welcome.browser.test.tsx`, which has to be browser-tier — jsdom
+ *  reports every rect as zeros, so "the card overflows the window" and "the card
+ *  fits" read identically there. */
 export function RecentList({ recents, onOpen }: Readonly<RecentListProps>) {
   return (
     <section className="w-full text-left">
@@ -19,7 +34,21 @@ export function RecentList({ recents, onOpen }: Readonly<RecentListProps>) {
           No recent vaults yet — open or create one to begin.
         </p>
       ) : (
-        <ul className="space-y-1">
+        // Two deliberate numbers, in the shape the skill picker's popup already
+        // uses (`../workspace/SkillPicker.tsx:64`).
+        //
+        // `max-h-52` (208px) is picked to cut a row IN HALF rather than land on
+        // a boundary. A row is 52px on a 56px pitch, so 200px of content shows
+        // three whole rows and most of a fourth. Both engines here draw overlay
+        // scrollbars — invisible at rest — so the half-row is the only thing
+        // telling the reader there are more vaults below; a ceiling that ended
+        // flush after four would read as "four vaults, that is all".
+        //
+        // `p-1` is not decoration: the rows draw their focus indicator with
+        // `focus-visible:ring-2`, painted OUTSIDE the button's border box, so a
+        // well flush against its own rows would clip that ring on the first and
+        // last one.
+        <ul className="max-h-52 space-y-1 overflow-y-auto p-1">
           {recents.map((recent) => (
             <li key={recent.path}>
               <button
