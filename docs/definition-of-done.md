@@ -75,17 +75,31 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
   it to `target/dev-builds/NeuralNote-Dev.app`, and exercise that exact bundle. This keeps the
   test build visibly separate from the main NeuralNote app and prevents both builds sharing an
   application identity by accident. The repeatable commands are listed below.
-- **Expect the packaged dev build to have its own API key.** The keychain namespace follows the
-  running bundle identifier, so a bundle built as `com.neuralnote.desktop.dev` (via
-  `scripts/dev-build.sh` or the handoff recipe below) reads and writes its own credential item
-  rather than the shipped app's. Save a provider key into it once; that isolation is the point — a
-  test build must not spend, or clear, the key the real app is using.
+- **Expect development builds to have their own API key.** Development never shares the shipped
+  app's credential, by two different routes that land in the same place:
 
-  **`npm run tauri dev` is NOT isolated.** It applies no config overlay, so it runs as
-  `com.neuralnote.desktop` and binds the **shipped app's** credential namespace. Clearing the API
-  key from a `tauri dev` session deletes the real one, and reading it can raise a keychain
-  authorisation prompt. Use the packaged dev bundle for anything that touches provider
-  credentials. Giving `tauri dev` its own identity is tracked separately.
+  - A bundle built as `com.neuralnote.desktop.dev` (via `scripts/dev-build.sh` or the handoff
+    recipe below) gets its own namespace because the keychain service follows the running bundle
+    identifier.
+  - `npm run tauri dev` applies no config overlay, so it *runs* as `com.neuralnote.desktop` — but
+    it is a debug build, and a debug build is sent to `com.neuralnote.desktop.dev` in code
+    regardless of the identifier it was handed (`resolve_keychain_service` in
+    `app/desktop/src-tauri/src/ai.rs`). The guard is in code rather than in a `--config` flag
+    because `package.json`'s `tauri` script backs `tauri build` as well, so a dev overlay added
+    there would stamp the dev identifier onto production releases — and a flag someone can forget
+    to pass is not a security boundary (`AGENTS.md`).
+
+  Both therefore read and write the same development credential, so save a provider key into it
+  once and `tauri dev` and the packaged dev bundle share it. That isolation is the point: a
+  development session must not spend, or clear, the key the real app is using. Clearing the API
+  key from Settings in a `tauri dev` session now clears the *development* key.
+
+  **Still shared with the shipped app in a `tauri dev` run:** only the credential namespace is
+  isolated. The app data directory, window state, and anything else Tauri keys on the bundle
+  identifier still resolve to `com.neuralnote.desktop`, because `tauri dev` still runs under that
+  identifier. Moving those too would change where a developer's existing vault config lives, so it
+  is a deliberate decision rather than a side effect of the keychain fix, and is tracked
+  separately. Use the packaged dev bundle when you need a fully separate app identity.
 - **Sign dev builds with a stable identity, once per machine.** Run
   `bash scripts/ensure-dev-signing-identity.sh`. Keychain ACLs bind to the *Designated
   Requirement* of the writing process, and an ad-hoc signature derives that from the code hash —

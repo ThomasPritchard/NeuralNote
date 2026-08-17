@@ -41,6 +41,11 @@ const KEYCHAIN_SERVICE: &str = "com.neuralnote.desktop";
 const KEY_ACCOUNT: &str = "openrouter-api-key";
 const E2E_KEYCHAIN_SERVICE: &str = "com.neuralnote.desktop.e2e";
 const E2E_KEY_ACCOUNT: &str = "openrouter-api-key-e2e";
+/// Where a debug build keeps its credential. Byte-identical to the identifier in
+/// `tauri.dev-build.conf.json` so `npm run tauri dev` and a bundle from
+/// `scripts/dev-build.sh` share one development key instead of each needing its
+/// own — pinned by `the_debug_keychain_namespace_is_the_packaged_dev_bundles`.
+const DEV_KEYCHAIN_SERVICE: &str = "com.neuralnote.desktop.dev";
 
 /// The bundle identifier this build is actually running as, bound once by the
 /// shell's `setup()` hook (see [`init_keychain_service`]). It is what keeps a
@@ -105,23 +110,60 @@ pub(crate) fn init_keychain_service(identifier: &str) -> Result<(), BlankBundleI
     Ok(())
 }
 
+/// Whether this binary was compiled as a debug build.
+///
+/// Injected into [`resolve_keychain_service`] rather than read from `cfg!` inside
+/// it, for the same reason the bound identifier is injected: `cargo test` is
+/// itself a debug build, so a `cfg!` read there would leave the release rule
+/// permanently unobservable and only one of the two branches ever proven.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BuildProfile {
+    Debug,
+    Release,
+}
+
+impl BuildProfile {
+    /// What this binary actually is, as opposed to what a caller wants to prove.
+    const fn current() -> Self {
+        if cfg!(debug_assertions) {
+            Self::Debug
+        } else {
+            Self::Release
+        }
+    }
+}
+
 /// Which keychain service this build uses, given whatever identifier was bound.
 /// Pure, so the resolution order is provable without a running Tauri app.
 ///
 /// The `native-e2e` feature wins outright: an automation build must be unable to
 /// reach a real user's keychain item whatever identifier its configuration
-/// carries. Otherwise the bound bundle identifier wins, so a build with its own
-/// app identity gets its own namespace. With nothing bound — unit tests, or any
-/// call before `setup()` — the historical constant keeps behaviour deterministic.
-fn resolve_keychain_service(bound_identifier: Option<&str>) -> &str {
+/// carries. A debug build is the same argument (issue #169): `npm run tauri dev`
+/// applies no config overlay, so it runs under the *production* identifier and a
+/// development session would otherwise read, overwrite and — from Settings'
+/// "Clear API key" — delete the shipped app's credential. Configuration cannot be
+/// the control here, because the command a developer is told to run carries none;
+/// so a debug build is sent to the development namespace in code, whatever
+/// identifier it was handed. Otherwise the bound bundle identifier wins, so a
+/// build with its own app identity gets its own namespace. With nothing bound —
+/// unit tests, or any call before `setup()` — the historical constant keeps
+/// release behaviour deterministic.
+fn resolve_keychain_service(bound_identifier: Option<&str>, profile: BuildProfile) -> &str {
     if cfg!(feature = "native-e2e") {
         return E2E_KEYCHAIN_SERVICE;
     }
-    bound_identifier.unwrap_or(KEYCHAIN_SERVICE)
+    let resolved = bound_identifier.unwrap_or(KEYCHAIN_SERVICE);
+    if profile == BuildProfile::Debug && resolved == KEYCHAIN_SERVICE {
+        return DEV_KEYCHAIN_SERVICE;
+    }
+    resolved
 }
 
 fn keychain_service() -> &'static str {
-    resolve_keychain_service(KEYCHAIN_SERVICE_OVERRIDE.get().map(String::as_str))
+    resolve_keychain_service(
+        KEYCHAIN_SERVICE_OVERRIDE.get().map(String::as_str),
+        BuildProfile::current(),
+    )
 }
 
 const fn compiled_keychain_account() -> &'static str {
@@ -1305,7 +1347,10 @@ mod tests {
             assert_ne!(keychain_service(), KEYCHAIN_SERVICE);
             assert_ne!(keychain_account(), KEY_ACCOUNT);
         } else {
-            assert_eq!(keychain_service(), KEYCHAIN_SERVICE);
+            // `cargo test` is a debug build, so the issue-#169 guard applies to the
+            // suite too: no build that is not the shipped one resolves to the
+            // shipped namespace. The account is unaffected — only the service moves.
+            assert_eq!(keychain_service(), expected_service_for_this_build());
             assert_eq!(keychain_account(), KEY_ACCOUNT);
         }
         // The E2E namespace outranks the bundle identifier. An automation build
@@ -1313,7 +1358,7 @@ mod tests {
         // its configuration happens to carry.
         if cfg!(feature = "native-e2e") {
             assert_eq!(
-                resolve_keychain_service(Some("com.neuralnote.desktop")),
+                resolve_keychain_service(Some("com.neuralnote.desktop"), BuildProfile::Release),
                 E2E_KEYCHAIN_SERVICE,
                 "the native-e2e namespace must not be overridable by an identifier"
             );
@@ -1347,6 +1392,21 @@ mod tests {
         let path = Path::new(env!("CARGO_MANIFEST_DIR")).join(config_file_name);
         declared_identifier(&path)
             .unwrap_or_else(|| panic!("{} has no string `identifier`", path.display()))
+    }
+
+    /// The namespace *this* test binary resolves to while the production
+    /// identifier is in force, which is what the two process-wide pins observe.
+    /// Neither constant nor obvious: the automation feature outranks everything,
+    /// and `cargo test` is a debug build, so the issue-#169 guard applies to the
+    /// suite as much as to a `tauri dev` session.
+    fn expected_service_for_this_build() -> &'static str {
+        if cfg!(feature = "native-e2e") {
+            E2E_KEYCHAIN_SERVICE
+        } else if cfg!(debug_assertions) {
+            DEV_KEYCHAIN_SERVICE
+        } else {
+            KEYCHAIN_SERVICE
+        }
     }
 
     /// Config files that may legitimately carry an identifier other than the
@@ -1496,6 +1556,11 @@ mod tests {
     /// identity precisely so it stays separate from the shipped app, so it must
     /// get its own credential namespace rather than reaching for the user's real
     /// production key (and tripping that item's macOS ACL prompt on every launch).
+    ///
+    /// Asserted for both build profiles: an identifier that already names its own
+    /// namespace is passed through untouched, so the issue-#169 debug guard adds a
+    /// floor rather than overriding a build that had already been given an
+    /// identity of its own.
     #[test]
     fn a_separate_bundle_identity_gets_a_separate_keychain_namespace() {
         let dev_identifier = configured_identifier("tauri.dev-build.conf.json");
@@ -1504,22 +1569,92 @@ mod tests {
             "the dev build's whole purpose is a separate identity"
         );
 
-        let resolved = resolve_keychain_service(Some(&dev_identifier));
-        if cfg!(feature = "native-e2e") {
-            assert_eq!(resolved, E2E_KEYCHAIN_SERVICE);
-        } else {
-            assert_eq!(
-                resolved, dev_identifier,
-                "a build running as '{dev_identifier}' must not read the production keychain item"
-            );
-            assert_ne!(resolved, KEYCHAIN_SERVICE);
+        for profile in [BuildProfile::Debug, BuildProfile::Release] {
+            let resolved = resolve_keychain_service(Some(&dev_identifier), profile);
+            if cfg!(feature = "native-e2e") {
+                assert_eq!(resolved, E2E_KEYCHAIN_SERVICE);
+            } else {
+                assert_eq!(
+                    resolved, dev_identifier,
+                    "a {profile:?} build running as '{dev_identifier}' must not read the \
+                     production keychain item"
+                );
+                assert_ne!(resolved, KEYCHAIN_SERVICE);
+            }
         }
+    }
+
+    /// The defect in issue #169: `npm run tauri dev` applies no config overlay, so
+    /// it runs as the *production* identifier and a development session reaches
+    /// the shipped app's credential — clearing the key from Settings deletes the
+    /// real one. A debug build must therefore never resolve to the shipped
+    /// namespace, whatever identifier it was handed and whether it was handed one
+    /// at all.
+    ///
+    /// The `assert_ne!` is the invariant and holds in every feature
+    /// configuration; which namespace it lands in instead depends on whether the
+    /// automation feature is on, because that one outranks everything.
+    #[test]
+    fn a_debug_build_never_resolves_to_the_shipped_keychain_namespace() {
+        let instead = if cfg!(feature = "native-e2e") {
+            E2E_KEYCHAIN_SERVICE
+        } else {
+            DEV_KEYCHAIN_SERVICE
+        };
+
+        for bound in [Some(KEYCHAIN_SERVICE), None] {
+            let resolved = resolve_keychain_service(bound, BuildProfile::Debug);
+            assert_ne!(
+                resolved, KEYCHAIN_SERVICE,
+                "a debug build bound to {bound:?} reached the shipped app's credential namespace"
+            );
+            assert_eq!(resolved, instead);
+        }
+    }
+
+    /// The other half of the guard, and the reason the build profile is a
+    /// parameter rather than a `cfg!` read inside the resolver: `cargo test` is
+    /// itself a debug build, so nothing else in this suite could observe the
+    /// release rule. Existing users' keys live under the shipped namespace and a
+    /// release build must still find them.
+    #[test]
+    fn a_release_build_still_resolves_to_the_shipped_keychain_namespace() {
+        let expected = if cfg!(feature = "native-e2e") {
+            E2E_KEYCHAIN_SERVICE
+        } else {
+            KEYCHAIN_SERVICE
+        };
+        assert_eq!(
+            resolve_keychain_service(Some(KEYCHAIN_SERVICE), BuildProfile::Release),
+            expected,
+            "a release build must keep reading the credential existing users already have"
+        );
+    }
+
+    /// The debug namespace is the packaged dev bundle's, not a third one. A
+    /// developer who saves a key in `npm run tauri dev` finds it again in a build
+    /// from `scripts/dev-build.sh`, and neither can see the shipped app's.
+    ///
+    /// What goes red: change `identifier` in `tauri.dev-build.conf.json` without
+    /// moving the constant, which would silently split development across two
+    /// credentials.
+    #[test]
+    fn the_debug_keychain_namespace_is_the_packaged_dev_bundles() {
+        assert_eq!(
+            DEV_KEYCHAIN_SERVICE,
+            configured_identifier("tauri.dev-build.conf.json"),
+            "the debug fallback and the packaged dev bundle must share one namespace"
+        );
+        assert_ne!(DEV_KEYCHAIN_SERVICE, KEYCHAIN_SERVICE);
     }
 
     /// Nothing bound — unit tests, and any call before the shell's `setup()` hook
     /// runs — keeps the historical namespace, so behaviour is deterministic
     /// without a running Tauri app. A blank identifier is not a namespace: it
     /// falls back rather than inventing an empty one.
+    ///
+    /// Stated for a release build: a debug build has a guard of its own, pinned by
+    /// [`a_debug_build_never_resolves_to_the_shipped_keychain_namespace`].
     #[test]
     fn an_unbound_identifier_falls_back_to_the_legacy_namespace() {
         let expected = if cfg!(feature = "native-e2e") {
@@ -1527,7 +1662,10 @@ mod tests {
         } else {
             KEYCHAIN_SERVICE
         };
-        assert_eq!(resolve_keychain_service(None), expected);
+        assert_eq!(
+            resolve_keychain_service(None, BuildProfile::Release),
+            expected
+        );
     }
 
     /// The binding rules, exercised against a *local* slot. `OnceLock` is
@@ -1599,11 +1737,11 @@ mod tests {
             "the refusal must explain itself, got: {refusal}"
         );
 
-        // The stakes, made explicit: this is the namespace the process would have
-        // gone on to use had the refusal above been a fallback instead.
+        // The stakes, made explicit: this is the namespace a shipped process would
+        // have gone on to use had the refusal above been a fallback instead.
         if !cfg!(feature = "native-e2e") {
             assert_eq!(
-                resolve_keychain_service(slot.get().map(String::as_str)),
+                resolve_keychain_service(slot.get().map(String::as_str), BuildProfile::Release),
                 KEYCHAIN_SERVICE
             );
         }
@@ -1631,12 +1769,9 @@ mod tests {
             "init_keychain_service must write the slot keychain_service() reads"
         );
 
-        let expected = if cfg!(feature = "native-e2e") {
-            E2E_KEYCHAIN_SERVICE
-        } else {
-            identifier.as_str()
-        };
-        assert_eq!(keychain_service(), expected);
+        // Not `identifier` itself: this is a debug build, so the issue-#169 guard
+        // moves the production identifier off the shipped namespace.
+        assert_eq!(keychain_service(), expected_service_for_this_build());
     }
 
     #[test]
