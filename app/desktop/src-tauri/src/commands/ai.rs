@@ -1089,7 +1089,6 @@ pub(crate) async fn chat(
         std::sync::Arc::clone(&close_signal),
         std::sync::Arc::clone(&cancellation_observed),
     );
-    let vault_profile_io = crate::vault_profile::FsVaultProfileIo::new(root.clone());
     let mut run = ChatRun {
         prompt: &prompt,
         history: &history,
@@ -1105,7 +1104,6 @@ pub(crate) async fn chat(
         guards: &guards,
         youtube_io,
         youtube_requirements,
-        vault_profile_io: &vault_profile_io,
         capture_cancellation,
         extractor_updates: youtube_host.extractor_updates(),
         sink: &mut causal_sink,
@@ -1373,7 +1371,6 @@ struct ChatRun<'a> {
     guards: &'a neuralnote_core::ai::Guards,
     youtube_io: &'a dyn neuralnote_core::ai::YoutubeIo,
     youtube_requirements: &'a dyn neuralnote_core::ai::YoutubeRequirementInstaller,
-    vault_profile_io: &'a dyn neuralnote_core::capture::VaultProfileIo,
     capture_cancellation: neuralnote_core::ai::CaptureCancellation,
     extractor_updates: neuralnote_core::ai::ExtractorUpdateSession,
     sink: &'a mut dyn neuralnote_core::ai::EventSink,

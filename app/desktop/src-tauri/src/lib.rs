@@ -40,7 +40,6 @@ mod requirement_installer;
 mod requirement_source_build;
 mod skills;
 mod vault_mutation;
-mod vault_profile;
 mod youtube;
 
 // Re-exported solely for the network-gated behavioural eval integration test
