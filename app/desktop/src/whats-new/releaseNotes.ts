@@ -13,7 +13,7 @@ export interface ReleaseNotes {
 }
 
 // GENERATED FILE — do not edit by hand.
-// Source: docs/releases/v0.4.1.md. Regenerate with `npm run gen:release-notes`.
+// Source: docs/releases/v0.4.2.md. Regenerate with `npm run gen:release-notes`.
 //
 // One release only. The workflow contract greps this WHOLE file for `items:` and
 // compares the result with the single-version `.md`, so a superseded entry left
@@ -25,63 +25,56 @@ export interface ReleaseNotes {
 // CURRENT_RELEASE_NOTES, so a stale entry is never rendered and the query passes
 // whether or not the entry is there.
 export const RELEASE_NOTES: Readonly<Record<string, ReleaseNotes>> = {
-  "0.4.1": {
-    version: "0.4.1",
-    title: "What's new in NeuralNote 0.4.1",
+  "0.4.2": {
+    version: "0.4.2",
+    title: "What's new in NeuralNote 0.4.2",
     introduction:
-      "NeuralNote 0.4.1 is a corrections release. It fixes a two-minute freeze when a note could not be deleted, and a run of places where NeuralNote told you something different from what actually happened — an approval you granted reported as a timeout, an action NeuralNote attempted and failed reported as one it refused, and a stopped response announced for a run that finished. Tables, the editor and the notification dock get a set of fixes too. Your vault format and saved settings are unchanged.",
+      "NeuralNote 0.4.2 is a corrections release. A YouTube video with a very large caption list now gets through metadata inspection instead of stalling, and the choice you make about where its notes are filed is remembered in your vault. Pressing Enter inside a code fence types a newline again, the welcome screen stops growing as you collect vaults, and a notification can no longer hide part of the note you are editing. Your vault format and saved settings are unchanged.",
     groups: [
       {
-        title: "Deleting a note",
+        title: "Capturing from YouTube",
         items: [
-          "Deleting a note the system refuses to move to the Trash now fails immediately instead of leaving the app unresponsive for two minutes.",
-          "The refusal explains itself: it reports the reason the system gave, rather than arriving as a timeout after the wait.",
-          "A note that could not be deleted stays where it is, and stays visible in the file tree.",
-          "On macOS a deleted note goes to the Trash as before, but is restored by dragging it out rather than by Finder's Put Back.",
-          "Deleting also no longer depends on NeuralNote having permission to control Finder, so it works on machines where that permission was declined.",
+          "A video whose automatic captions run to thousands of entries now completes metadata inspection instead of stopping at an output limit.",
+          "Only the handful of details NeuralNote actually uses are read from a video, so signed caption links are no longer carried any further.",
+          "The choice you make about where a video's notes are filed is now remembered in your vault, so capture continues on to fetching captions and writing the note.",
+          "Stopping a YouTube capture now reads as the run ending before the step, rather than as NeuralNote refusing to do it.",
+          "A playlist whose entries have no title is handled by falling back to the video id instead of failing outright.",
+          "Work that arrives just after you press Stop is still recorded, so the timeline does not lose the last thing that happened.",
         ],
       },
       {
-        title: "What NeuralNote tells you it did",
+        title: "Writing",
         items: [
-          "An approval you granted is no longer reported as a timeout when your answer arrives at the same moment the request expires.",
-          "A decision that never reached the run is now reported as an error rather than confirmed as accepted.",
-          "An action that ran and failed is now told apart from one NeuralNote refused, instead of both reading as a refusal.",
-          "A response that was stopped is announced only when the run actually stopped, so a run that went on to finish is no longer announced as stopped.",
-          "The assistant keeps its final answer and the context it needs to continue, instead of losing them between steps.",
-          "A vault error now reads the same whichever part of the assistant hit it.",
-          "If a change to your API key does not reach your other open windows, NeuralNote now says so instead of leaving them disagreeing until a restart.",
-          "Two open windows no longer disagree about your API key until one of them is restarted.",
-          "A model list that arrives after you have moved on is discarded rather than replacing the current one.",
+          "Pressing Enter on a tag inside a fenced code block now types a new line instead of opening tag search and discarding the keystroke.",
+          "Pressing Enter on an ordinary tag still opens tag search, as before.",
         ],
       },
       {
-        title: "Writing and tables",
+        title: "The window",
         items: [
-          "The macOS table shortcuts now respond to the characters the Option key actually produces.",
-          "A table shortcut works whenever the cursor is inside a table, rather than only in some positions.",
-          "Emoji are measured as two columns when a table's widths are worked out, so a table containing them lines up.",
-          "A wide table scrolls sideways as expected.",
-          "Revealing a table's source and returning now repaints the table rather than leaving the previous rendering.",
-          "Pressing Enter inside an unfinished code fence no longer leaks a tag into the note.",
-          "A heading written with closing hashes is read correctly.",
-          "Notes with very large numbers of links open faster.",
+          "A notification can no longer clip the note editor: at small window sizes the note stays reachable by scrolling instead of being cut off with no way to see the rest.",
+          "The welcome screen's list of recent vaults now scrolls inside its own panel, so the card keeps a steady size and the Open vault and New vault buttons stop moving as vaults accumulate.",
+          "A part-visible row at the bottom of that list shows there are more vaults below it.",
+          "The running cost of a turn is now shown beneath an error rather than above it.",
         ],
       },
       {
-        title: "Notifications and the window",
+        title: "Settings",
         items: [
-          "Notifications now sit in the layout rather than floating over the chat pane, so they can no longer cover what you are reading.",
-          "The notification area is named for screen readers.",
-          "Launching straight into full screen on macOS no longer paints the window controls in the wrong place for the first frame before snapping into position.",
-          "A development or unsigned build no longer raises a permanent error about updates being unavailable, which is expected for those builds rather than a fault.",
+          "Every action listed under what the assistant may do is named in plain English, so a newly added one can no longer appear as a raw internal identifier.",
+        ],
+      },
+      {
+        title: "For anyone running NeuralNote from source",
+        items: [
+          "A development build now keeps its own API key rather than sharing the installed app's, so clearing the key while developing no longer deletes the real one.",
         ],
       },
       {
         title: "Upgrading",
         items: [
           "Your vault, its notes and your saved settings are carried over unchanged.",
-          "Application packages, updater checks, and the upgrade journey are aligned on version 0.4.1.",
+          "Application packages, updater checks, and the upgrade journey are aligned on version 0.4.2.",
         ],
       },
     ],
