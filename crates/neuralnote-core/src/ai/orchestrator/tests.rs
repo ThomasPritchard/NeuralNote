@@ -26,8 +26,7 @@ use crate::ai::youtube::YoutubeToolSession;
 use crate::ai::{
     CaptionPayload, CaptionRequest, CaptureCancellation, Elicitation, MetadataPayload,
     NotePathState, NoteWriteBackend, NoteWriteParent, OpenedNoteParent, PlaylistPayload,
-    ThumbnailPayload, VideoId, YoutubeIo, YoutubeUrl, FIXTURE_SKILL_ID,
-    YOUTUBE_DISTIL_SKILL_ID,
+    ThumbnailPayload, VideoId, YoutubeIo, YoutubeUrl, FIXTURE_SKILL_ID, YOUTUBE_DISTIL_SKILL_ID,
 };
 use crate::capture::{CaptureError, PricingInput};
 use crate::error::CoreError;
@@ -385,10 +384,7 @@ struct PlaylistIo(usize);
 
 #[async_trait]
 impl YoutubeIo for PlaylistIo {
-    async fn inspect_metadata(
-        &self,
-        _url: &YoutubeUrl,
-    ) -> Result<MetadataPayload, CaptureError> {
+    async fn inspect_metadata(&self, _url: &YoutubeUrl) -> Result<MetadataPayload, CaptureError> {
         Err(CaptureError::MetadataUnavailable(
             "unused in this script".into(),
         ))
@@ -401,10 +397,7 @@ impl YoutubeIo for PlaylistIo {
         Err(CaptureError::CaptionsAbsent("unused in this script".into()))
     }
 
-    async fn enumerate_playlist(
-        &self,
-        _url: &YoutubeUrl,
-    ) -> Result<PlaylistPayload, CaptureError> {
+    async fn enumerate_playlist(&self, _url: &YoutubeUrl) -> Result<PlaylistPayload, CaptureError> {
         let entries = (0..self.0)
             .map(|index| {
                 serde_json::json!({
@@ -425,10 +418,7 @@ impl YoutubeIo for PlaylistIo {
         })
     }
 
-    async fn fetch_thumbnail(
-        &self,
-        _video_id: &VideoId,
-    ) -> Result<ThumbnailPayload, CaptureError> {
+    async fn fetch_thumbnail(&self, _video_id: &VideoId) -> Result<ThumbnailPayload, CaptureError> {
         Err(CaptureError::ThumbnailRejected(
             "fixture has no image".into(),
         ))
@@ -458,10 +448,7 @@ struct GuardedPlaylistIo {
 
 #[async_trait]
 impl YoutubeIo for GuardedPlaylistIo {
-    async fn inspect_metadata(
-        &self,
-        _url: &YoutubeUrl,
-    ) -> Result<MetadataPayload, CaptureError> {
+    async fn inspect_metadata(&self, _url: &YoutubeUrl) -> Result<MetadataPayload, CaptureError> {
         self.capture_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Err(CaptureError::MetadataUnavailable(
@@ -480,10 +467,7 @@ impl YoutubeIo for GuardedPlaylistIo {
         ))
     }
 
-    async fn enumerate_playlist(
-        &self,
-        _url: &YoutubeUrl,
-    ) -> Result<PlaylistPayload, CaptureError> {
+    async fn enumerate_playlist(&self, _url: &YoutubeUrl) -> Result<PlaylistPayload, CaptureError> {
         self.enumerations
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         Ok(PlaylistPayload {
@@ -500,10 +484,7 @@ impl YoutubeIo for GuardedPlaylistIo {
         })
     }
 
-    async fn fetch_thumbnail(
-        &self,
-        _video_id: &VideoId,
-    ) -> Result<ThumbnailPayload, CaptureError> {
+    async fn fetch_thumbnail(&self, _video_id: &VideoId) -> Result<ThumbnailPayload, CaptureError> {
         Err(CaptureError::ThumbnailRejected(
             "fixture has no image".into(),
         ))
@@ -566,8 +547,8 @@ impl NoteWriteBackend for FsWriter {
         canonical_root: &Path,
         canonical_parent: &Path,
     ) -> CoreResult<OpenedNoteParent> {
-        let opened = fs::canonicalize(canonical_parent)
-            .map_err(|error| CoreError::Io(error.to_string()))?;
+        let opened =
+            fs::canonicalize(canonical_parent).map_err(|error| CoreError::Io(error.to_string()))?;
         if !opened.starts_with(canonical_root) {
             return Err(CoreError::OutsideVault(opened.display().to_string()));
         }
@@ -607,8 +588,8 @@ impl NoteWriteBackend for CancellingWriter {
         canonical_root: &Path,
         canonical_parent: &Path,
     ) -> CoreResult<OpenedNoteParent> {
-        let opened = fs::canonicalize(canonical_parent)
-            .map_err(|error| CoreError::Io(error.to_string()))?;
+        let opened =
+            fs::canonicalize(canonical_parent).map_err(|error| CoreError::Io(error.to_string()))?;
         if !opened.starts_with(canonical_root) {
             return Err(CoreError::OutsideVault(opened.display().to_string()));
         }
@@ -654,8 +635,7 @@ fn youtube_test_environment() -> SkillEnvironment {
 }
 
 #[test]
-fn playlist_orchestrator_processes_21_transcripts_with_bounded_context_and_full_partial_ledger()
-{
+fn playlist_orchestrator_processes_21_transcripts_with_bounded_context_and_full_partial_ledger() {
     let vault = tempfile::tempdir().unwrap();
     let selected = (0..21)
         .map(|index| format!("V{index:010}"))
@@ -1522,13 +1502,7 @@ fn run_with_provider(
     mock: &MockLlmClient,
     guards: &Guards,
 ) -> Vec<ChatEvent> {
-    run_with_provider_and_cancellation(
-        root,
-        provider,
-        mock,
-        guards,
-        CaptureCancellation::default(),
-    )
+    run_with_provider_and_cancellation(root, provider, mock, guards, CaptureCancellation::default())
 }
 
 /// The same run with the host's cancellation token supplied, for the cases
@@ -2398,8 +2372,7 @@ fn eval_plumbs_the_five_section_7_cases_through_the_mock() {
                 tool_call("c1", "search_notes", r#"{"query":"components"}"#),
                 final_turn(),
             ],
-            answer:
-                "Nothing in your notes covers this yet — add a note and I'll answer next time.",
+            answer: "Nothing in your notes covers this yet — add a note and I'll answer next time.",
             search_bounds: 1..=usize::MAX,
             citation_bounds: 0..=0,
             coverage_bounds: 1..=usize::MAX,
@@ -3672,8 +3645,7 @@ fn tool_turn_retries_a_dropped_connection() {
     );
     let llm = MockLlmClient::new(vec![final_turn()], "answer").with_complete_failures(vec![
         CoreError::Llm(
-            "request to openrouter failed: error sending request: connection reset by peer"
-                .into(),
+            "request to openrouter failed: error sending request: connection reset by peer".into(),
         ),
     ]);
     let session = ChatSession {
