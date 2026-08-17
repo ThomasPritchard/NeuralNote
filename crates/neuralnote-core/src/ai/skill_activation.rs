@@ -7,7 +7,6 @@ use crate::ai::events::ChatEvent;
 use crate::ai::skills::{missing_required_binary, SkillEnvironment, SkillRegistry};
 
 /// Marker substring the frontend keys activation-failure rendering on.
-/// TS mirror: app/desktop/src/workspace/ChatMessages.tsx `ACTIVATION_FAILURE_MARK`.
 /// A wording change is a two-site edit; the tripwire is
 /// `disabled_fixture_preload_surfaces_a_recoverable_error_without_activation`
 /// in `tests/skill_orchestrator.rs`, which asserts the emitted `SkillStep`
