@@ -190,6 +190,43 @@ describe("turn-specific event and stop routing", () => {
     expect(markAssistantStopped(settled, "turn-1")).toBe(settled);
     expect(markAssistantStopped(settled, "turn-2")).toBe(settled);
   });
+
+  it("settles an in-flight tool after stop and still hides late answer or error", () => {
+    // Stop marks the turn done so the composer re-opens. A later toolResult
+    // used to be dropped, leaving the playlist-enumeration node spinning.
+    const live = reduceAssistant(emptyAssistant(false, "turn-1"), {
+      type: "toolCall",
+      id: "c1",
+      name: "select_playlist_videos",
+      title: "Choose playlist videos",
+      arguments: "{}",
+      stepId: null,
+    });
+    const stopped = markAssistantStopped([live], "turn-1");
+    const settled = reduceAssistantForTurn(stopped, "turn-1", {
+      type: "toolResult",
+      id: "c1",
+      status: "cancelled",
+      summary: null,
+      detail: "YouTube capture was cancelled",
+    });
+    const withPartial = reduceAssistantForTurn(settled, "turn-1", {
+      type: "partialRun",
+      reason: "the run was stopped before it finished every item",
+    });
+    const afterLate = reduceAssistantForTurn(withPartial, "turn-1", {
+      type: "answer",
+      delta: "late answer must stay hidden",
+    });
+    const turn = afterLate[0] as AssistantMessage;
+
+    expect(turn.toolCalls[0]?.status).toBe("cancelled");
+    expect(turn.partialRun).toBe(
+      "the run was stopped before it finished every item",
+    );
+    expect(turn.answer).toBe("");
+    expect(turn.error).toBeNull();
+  });
 });
 
 describe("reduceAssistant — grounded progress", () => {

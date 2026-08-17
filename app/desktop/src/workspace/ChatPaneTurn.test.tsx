@@ -235,6 +235,58 @@ describe("ChatPane — chat view", () => {
     await waitFor(() => expect(composer()).toBeEnabled());
   });
 
+  it("settles an in-flight playlist call after stop instead of leaving it spinning", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const run = deferred<string>();
+    let emit!: (event: ChatEvent) => void;
+    mockChat.mockImplementation((_turnId, _prompt, _history, onEvent) => {
+      emit = onEvent;
+      onEvent({
+        type: "toolCall",
+        id: "c1",
+        name: "select_playlist_videos",
+        title: "Choose playlist videos",
+        arguments: "{}",
+        stepId: null,
+      });
+      return run.promise;
+    });
+    const { user } = setup();
+    await screen.findByLabelText("Ask across your vault");
+
+    await user.type(composer(), "distil this playlist");
+    await user.click(sendButton());
+    await user.click(await screen.findByRole("button", { name: "Stop response" }));
+    expect(await screen.findByText("Stopped")).toBeInTheDocument();
+
+    act(() => {
+      emit({
+        type: "toolResult",
+        id: "c1",
+        status: "cancelled",
+        summary: null,
+        detail: "YouTube capture was cancelled",
+      });
+      emit({
+        type: "partialRun",
+        reason: "the run was stopped before it finished every item",
+      });
+      emit({ type: "answer", delta: "late answer must stay hidden" });
+      emit({ type: "error", message: "late cancellation error must stay hidden" });
+    });
+    await act(async () => {
+      run.resolve(TURN_ID);
+      await run.promise;
+    });
+
+    expect(screen.getByText("Choose playlist videos").closest("p")).toHaveTextContent(
+      "run ended first",
+    );
+    expect(screen.getByText("Stopped")).toBeInTheDocument();
+    expect(screen.queryByText("late answer must stay hidden")).not.toBeInTheDocument();
+    expect(screen.queryByText("late cancellation error must stay hidden")).not.toBeInTheDocument();
+  });
+
   it("keeps a queued committed-note ledger after stop without reviving terminal chat events", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive());
     const run = deferred<string>();
