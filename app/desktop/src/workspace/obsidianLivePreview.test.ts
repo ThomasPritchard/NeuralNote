@@ -415,6 +415,49 @@ describe("obsidianLivePreview over an unfinished parse", () => {
     }
   });
 
+  it("types a newline on Enter inside a fenced block past the frontier", async () => {
+    const doc = `${PARSE_WINDOW_FILLER}\n\n\`\`\`md\n#fenced\n\`\`\``;
+    const caret = doc.indexOf("#fenced") + 1;
+    const searched: string[] = [];
+    const host = document.body.appendChild(document.createElement("div"));
+    const view = new EditorView({
+      state: partiallyParsedState(
+        doc,
+        [
+          EXTENSIONS,
+          // Same ordering as its sibling above, because this pins the opposite
+          // direction of the same decision: there the command has to fire, here
+          // it has to decline and let `insertNewlineAndIndent` have the key.
+          keymap.of([
+            { key: "Enter", run: openTagSearchAtCaret((tag) => searched.push(tag)) },
+            ...defaultKeymap,
+          ]),
+        ],
+        caret,
+      ),
+      parent: host,
+    });
+
+    try {
+      // The fence has to open past where the tree stops, or `FencedCode` is
+      // present and the command was never deciding without a tree at all.
+      expect(syntaxTree(view.state).length).toBeLessThan(doc.indexOf("```md"));
+
+      view.contentDOM.dispatchEvent(new KeyboardEvent("keydown", {
+        key: "Enter",
+        bubbles: true,
+        cancelable: true,
+      }));
+      await Promise.resolve();
+
+      expect(searched).toEqual([]);
+      expect(view.state.doc.toString()).toBe(`${doc.slice(0, caret)}\n${doc.slice(caret)}`);
+    } finally {
+      view.destroy();
+      host.remove();
+    }
+  });
+
   it("masks a fenced block sitting past the initial parse window", () => {
     const doc = `${PARSE_WINDOW_FILLER}\n\n\`\`\`md\n#fenced\n\`\`\`\n\nA real #body tag`;
     const complete = state(doc);
