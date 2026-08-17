@@ -6,6 +6,7 @@ mod elicitation;
 mod note_writer;
 #[cfg(not(unix))]
 mod note_writer_unsupported;
+mod profile_io;
 #[cfg(unix)]
 mod quarantine_recovery;
 mod undo;
@@ -24,6 +25,7 @@ pub(crate) use note_writer::FsNoteWriteBackend;
 pub(crate) use note_writer::RunNoteWriteBackend;
 #[cfg(not(unix))]
 pub(crate) use note_writer_unsupported::RunNoteWriteBackend;
+pub(crate) use profile_io::RunVaultProfileIo;
 #[cfg(unix)]
 pub(crate) use quarantine_recovery::{reconcile_quarantine_recovery, QuarantineRecoveryReport};
 pub(crate) use undo::{undo_ledger, UndoReport, UndoRunStore};

@@ -25,7 +25,7 @@ fn assert_sanitized_path(spec: &super::process::ProcessSpec) {
 }
 
 #[test]
-fn metadata_argv_is_static_bounded_and_keeps_the_full_url_last() {
+fn metadata_argv_projects_only_consumed_fields_and_keeps_the_full_url_last() {
     let url = YoutubeUrl::new("https://youtu.be/-abcdefghij").unwrap();
 
     let spec = command_builder().metadata(&url);
@@ -35,7 +35,20 @@ fn metadata_argv_is_static_bounded_and_keeps_the_full_url_last() {
         [
             "--ignore-config",
             "--no-plugin-dirs",
-            "--dump-single-json",
+            "--output-na-placeholder",
+            "!nn-missing!",
+            "--print",
+            "nn-metadata-v1:%(.{id,title,uploader,channel,duration,upload_date})j",
+            "--print",
+            "nn-fields:%()l",
+            "--print",
+            "nn-human-languages:%(subtitles)l",
+            "--print",
+            "nn-human-first-exts:%(subtitles.:.0.ext)j",
+            "--print",
+            "nn-auto-languages:%(automatic_captions)l",
+            "--print",
+            "nn-auto-first-exts:%(automatic_captions.:.0.ext)j",
             "--skip-download",
             "--no-playlist",
             "https://youtu.be/-abcdefghij",

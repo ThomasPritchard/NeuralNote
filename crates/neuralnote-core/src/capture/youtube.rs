@@ -20,9 +20,11 @@ const MAX_THUMBNAIL_PIXELS: u64 = 1_024 * 1_024;
 const MAX_CLASSIFIER_BYTES: usize = 64 * 1024;
 const MAX_TITLE_BYTES: usize = 500;
 const MAX_CHANNEL_BYTES: usize = 300;
+const MAX_PROJECTION_FIELD_COUNT: usize = 512;
 const MAX_LANGUAGE_COUNT: usize = 512;
 const MAX_TRACKS_PER_LANGUAGE: usize = 32;
 const MAX_DURATION_SECONDS: f64 = 31.0 * 24.0 * 60.0 * 60.0;
+const MISSING_PROJECTION_VALUE: &str = "!nn-missing!";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -214,6 +216,20 @@ struct RawVideoMetadata {
 }
 
 #[derive(Deserialize)]
+struct RawProjectedVideoMetadata {
+    id: String,
+    title: String,
+    #[serde(default)]
+    uploader: Option<String>,
+    #[serde(default)]
+    channel: Option<String>,
+    #[serde(default)]
+    duration: Option<f64>,
+    #[serde(default)]
+    upload_date: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct RawCaptionTrack {
     ext: String,
 }
@@ -239,37 +255,169 @@ pub fn parse_video_metadata(bytes: &[u8]) -> Result<VideoMetadata, CaptureError>
     if bytes.len() > MAX_METADATA_JSON_BYTES {
         return Err(invalid_metadata("metadata exceeds the byte limit"));
     }
+    if bytes.starts_with(b"nn-metadata-v1:") {
+        return parse_projected_video_metadata(bytes);
+    }
     let raw: RawVideoMetadata = serde_json::from_slice(bytes)
         .map_err(|error| invalid_metadata(format!("metadata JSON is invalid: {error}")))?;
-    if !valid_video_id(&raw.id) {
-        return Err(invalid_metadata("video id must be 11 URL-safe characters"));
-    }
     let subtitles = raw
         .subtitles
         .ok_or_else(|| invalid_metadata("caption inventories missing; absence not proven"))?;
     let automatic_captions = raw
         .automatic_captions
         .ok_or_else(|| invalid_metadata("caption inventories missing; absence not proven"))?;
-    let title = bounded_text(raw.title, "title", MAX_TITLE_BYTES).map_err(invalid_metadata)?;
-    let channel = raw
-        .uploader
-        .or(raw.channel)
-        .map(|value| bounded_text(value, "channel", MAX_CHANNEL_BYTES))
-        .transpose()
-        .map_err(invalid_metadata)?;
-    let duration_seconds = checked_duration(raw.duration).map_err(invalid_metadata)?;
-    let upload_date = raw
-        .upload_date
-        .map(validate_upload_date)
-        .transpose()
-        .map_err(invalid_metadata)?;
     let captions = CaptionInventory {
         human: inventory_languages(subtitles).map_err(invalid_metadata)?,
         automatic: inventory_languages(automatic_captions).map_err(invalid_metadata)?,
     };
+    validated_video_metadata(
+        raw.id,
+        raw.title,
+        raw.uploader,
+        raw.channel,
+        raw.duration,
+        raw.upload_date,
+        captions,
+    )
+}
+
+fn parse_projected_video_metadata(bytes: &[u8]) -> Result<VideoMetadata, CaptureError> {
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| invalid_metadata("metadata projection is not valid UTF-8"))?;
+    let mut lines = text.lines();
+    let metadata = projection_record(&mut lines, "nn-metadata-v1:")?;
+    let fields = projection_record(&mut lines, "nn-fields:")?;
+    let human_languages = projection_record(&mut lines, "nn-human-languages:")?;
+    let human_extensions = projection_record(&mut lines, "nn-human-first-exts:")?;
+    let automatic_languages = projection_record(&mut lines, "nn-auto-languages:")?;
+    let automatic_extensions = projection_record(&mut lines, "nn-auto-first-exts:")?;
+    if lines.next().is_some() {
+        return Err(invalid_metadata(
+            "metadata projection contains unexpected records",
+        ));
+    }
+    let present_fields = projected_fields(fields).map_err(invalid_metadata)?;
+    if !present_fields.contains("subtitles") || !present_fields.contains("automatic_captions") {
+        return Err(invalid_metadata(
+            "caption inventories missing; absence not proven",
+        ));
+    }
+
+    let raw: RawProjectedVideoMetadata = serde_json::from_str(metadata).map_err(|error| {
+        invalid_metadata(format!("metadata projection JSON is invalid: {error}"))
+    })?;
+    let captions = CaptionInventory {
+        human: projected_inventory(human_languages, human_extensions).map_err(invalid_metadata)?,
+        automatic: projected_inventory(automatic_languages, automatic_extensions)
+            .map_err(invalid_metadata)?,
+    };
+    validated_video_metadata(
+        raw.id,
+        raw.title,
+        raw.uploader,
+        raw.channel,
+        raw.duration,
+        raw.upload_date,
+        captions,
+    )
+}
+
+fn projection_record<'a>(
+    lines: &mut impl Iterator<Item = &'a str>,
+    prefix: &str,
+) -> Result<&'a str, CaptureError> {
+    lines
+        .next()
+        .and_then(|line| line.strip_prefix(prefix))
+        .ok_or_else(|| invalid_metadata(format!("metadata projection is missing {prefix}")))
+}
+
+fn projected_inventory(languages: &str, extensions: &str) -> Result<Vec<String>, String> {
+    if extensions == MISSING_PROJECTION_VALUE {
+        return Err("caption format projection is missing".into());
+    }
+    let extension_values: Vec<String> = serde_json::from_str(extensions)
+        .map_err(|error| format!("caption format projection is invalid: {error}"))?;
+    if languages == MISSING_PROJECTION_VALUE {
+        return if extension_values.is_empty() {
+            Ok(Vec::new())
+        } else {
+            Err("empty caption languages have projected formats".into())
+        };
+    }
+    if languages.is_empty() {
+        return Err("caption language projection is empty without the missing sentinel".into());
+    }
+    let language_values = languages.split(", ").collect::<Vec<_>>();
+    if language_values.len() > MAX_LANGUAGE_COUNT {
+        return Err("caption inventory exceeds the language limit".into());
+    }
+    if language_values.len() != extension_values.len() {
+        return Err("caption language and format projections have different lengths".into());
+    }
+
+    let mut unique = BTreeSet::new();
+    for (language, extension) in language_values.into_iter().zip(extension_values) {
+        validate_language(language)?;
+        validate_track_extension(&extension)?;
+        if !unique.insert(language.to_string()) {
+            return Err("caption inventory contains a duplicate language key".into());
+        }
+    }
+    Ok(unique.into_iter().collect())
+}
+
+fn projected_fields(fields: &str) -> Result<BTreeSet<String>, String> {
+    if fields.is_empty() || fields == MISSING_PROJECTION_VALUE {
+        return Err("metadata field projection is empty".into());
+    }
+    let values = fields.split(", ").collect::<Vec<_>>();
+    if values.len() > MAX_PROJECTION_FIELD_COUNT {
+        return Err("metadata field projection exceeds the field limit".into());
+    }
+    let mut unique = BTreeSet::new();
+    for field in values {
+        if field.is_empty()
+            || field.len() > 64
+            || !field
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        {
+            return Err("metadata field projection contains an invalid field".into());
+        }
+        if !unique.insert(field.to_string()) {
+            return Err("metadata field projection contains a duplicate field".into());
+        }
+    }
+    Ok(unique)
+}
+
+fn validated_video_metadata(
+    id: String,
+    raw_title: String,
+    uploader: Option<String>,
+    channel: Option<String>,
+    duration: Option<f64>,
+    upload_date: Option<String>,
+    captions: CaptionInventory,
+) -> Result<VideoMetadata, CaptureError> {
+    if !valid_video_id(&id) {
+        return Err(invalid_metadata("video id must be 11 URL-safe characters"));
+    }
+    let title = bounded_text(raw_title, "title", MAX_TITLE_BYTES).map_err(invalid_metadata)?;
+    let channel = uploader
+        .or(channel)
+        .map(|value| bounded_text(value, "channel", MAX_CHANNEL_BYTES))
+        .transpose()
+        .map_err(invalid_metadata)?;
+    let duration_seconds = checked_duration(duration).map_err(invalid_metadata)?;
+    let upload_date = upload_date
+        .map(validate_upload_date)
+        .transpose()
+        .map_err(invalid_metadata)?;
     Ok(VideoMetadata {
-        canonical_url: canonical_video_url(&raw.id),
-        video_id: raw.id,
+        canonical_url: canonical_video_url(&id),
+        video_id: id,
         title,
         channel,
         duration_seconds,
@@ -407,29 +555,40 @@ fn inventory_languages(
     }
     let mut languages = Vec::new();
     for (language, tracks) in inventory {
-        if language.is_empty()
-            || language.len() > 64
-            || !language
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
-        {
-            return Err("caption inventory contains an invalid language key".into());
-        }
+        validate_language(&language)?;
         if tracks.len() > MAX_TRACKS_PER_LANGUAGE {
             return Err("caption language exceeds the track limit".into());
         }
-        if tracks.iter().any(|track| {
-            track.ext.is_empty()
-                || track.ext.len() > 16
-                || !track.ext.bytes().all(|byte| byte.is_ascii_alphanumeric())
-        }) {
-            return Err("caption inventory contains an invalid track format".into());
+        for track in &tracks {
+            validate_track_extension(&track.ext)?;
         }
         if !tracks.is_empty() {
             languages.push(language);
         }
     }
     Ok(languages)
+}
+
+fn validate_language(language: &str) -> Result<(), String> {
+    if language.is_empty()
+        || language.len() > 64
+        || !language
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+    {
+        return Err("caption inventory contains an invalid language key".into());
+    }
+    Ok(())
+}
+
+fn validate_track_extension(extension: &str) -> Result<(), String> {
+    if extension.is_empty()
+        || extension.len() > 16
+        || !extension.bytes().all(|byte| byte.is_ascii_alphanumeric())
+    {
+        return Err("caption inventory contains an invalid track format".into());
+    }
+    Ok(())
 }
 
 fn select_language(languages: &[String], requested: &str) -> Option<String> {
