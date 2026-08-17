@@ -82,12 +82,14 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
     recipe below) gets its own namespace because the keychain service follows the running bundle
     identifier.
   - `npm run tauri dev` applies no config overlay, so it *runs* as `com.neuralnote.desktop` — but
-    it is a debug build, and a debug build is sent to `com.neuralnote.desktop.dev` in code
-    regardless of the identifier it was handed (`resolve_keychain_service` in
-    `app/desktop/src-tauri/src/ai.rs`). The guard is in code rather than in a `--config` flag
-    because `package.json`'s `tauri` script backs `tauri build` as well, so a dev overlay added
-    there would stamp the dev identifier onto production releases — and a flag someone can forget
-    to pass is not a security boundary (`AGENTS.md`).
+    it is a debug build, and no debug build resolves to the shipped namespace: one running under
+    the production identifier is sent to `com.neuralnote.desktop.dev` in code
+    (`resolve_keychain_service` in `app/desktop/src-tauri/src/ai.rs`). That is a floor, not a
+    redirect of everything — a debug build handed some *other* identifier keeps that identifier's
+    own namespace, which is separate from the shipped one too. The guard is in code rather than in
+    a `--config` flag because `package.json`'s `tauri` script backs `tauri build` as well, so a dev
+    overlay added there would stamp the dev identifier onto production releases — and a flag
+    someone can forget to pass is not a security boundary (`AGENTS.md`).
 
   Both therefore read and write the same development credential, so save a provider key into it
   once and `tauri dev` and the packaged dev bundle share it. That isolation is the point: a

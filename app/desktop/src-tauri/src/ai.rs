@@ -110,11 +110,11 @@ pub(crate) fn init_keychain_service(identifier: &str) -> Result<(), BlankBundleI
     Ok(())
 }
 
-/// Whether this binary was compiled as a debug build.
+/// Which cargo profile this binary was built in.
 ///
 /// Injected into [`resolve_keychain_service`] rather than read from `cfg!` inside
-/// it, for the same reason the bound identifier is injected: `cargo test` is
-/// itself a debug build, so a `cfg!` read there would leave the release rule
+/// it, for the same reason the bound identifier is injected: `cargo test` runs in
+/// a non-release profile, so a `cfg!` read there would leave the release rule
 /// permanently unobservable and only one of the two branches ever proven.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BuildProfile {
@@ -124,11 +124,21 @@ enum BuildProfile {
 
 impl BuildProfile {
     /// What this binary actually is, as opposed to what a caller wants to prove.
+    ///
+    /// Read from cargo's own `PROFILE`, which `build.rs` surfaces as
+    /// `cfg(release_profile)`, and deliberately not from `debug_assertions`. That
+    /// flag reports whether assertions were compiled in, never whether this
+    /// artifact ships, and the two come apart: a release build with
+    /// `debug-assertions = true` — a `[profile.release]` override, or
+    /// `RUSTFLAGS="-C debug-assertions=on"` — would call itself `Debug`, so the
+    /// *shipped* app would resolve to [`DEV_KEYCHAIN_SERVICE`] and every user's
+    /// saved key would read as absent. Pinned by
+    /// `no_source_derives_the_build_profile_from_the_assertion_setting`.
     const fn current() -> Self {
-        if cfg!(debug_assertions) {
-            Self::Debug
-        } else {
+        if cfg!(release_profile) {
             Self::Release
+        } else {
+            Self::Debug
         }
     }
 }
@@ -143,11 +153,15 @@ impl BuildProfile {
 /// development session would otherwise read, overwrite and — from Settings'
 /// "Clear API key" — delete the shipped app's credential. Configuration cannot be
 /// the control here, because the command a developer is told to run carries none;
-/// so a debug build is sent to the development namespace in code, whatever
-/// identifier it was handed. Otherwise the bound bundle identifier wins, so a
-/// build with its own app identity gets its own namespace. With nothing bound —
-/// unit tests, or any call before `setup()` — the historical constant keeps
-/// release behaviour deterministic.
+/// so the floor is enforced in code: no debug build resolves to the shipped
+/// namespace, and one running under the production identifier is sent to the
+/// development namespace instead. Otherwise the bound bundle identifier wins, so a
+/// build with its own app identity gets its own namespace — a debug build handed
+/// some other identifier keeps that identifier's namespace rather than being
+/// collected into the development one, which is what
+/// `a_separate_bundle_identity_gets_a_separate_keychain_namespace` pins. With
+/// nothing bound — unit tests, or any call before `setup()` — the historical
+/// constant keeps release behaviour deterministic.
 fn resolve_keychain_service(bound_identifier: Option<&str>, profile: BuildProfile) -> &str {
     if cfg!(feature = "native-e2e") {
         return E2E_KEYCHAIN_SERVICE;
@@ -1394,19 +1408,87 @@ mod tests {
             .unwrap_or_else(|| panic!("{} has no string `identifier`", path.display()))
     }
 
+    /// The cargo profile this test binary was compiled in, read from the build
+    /// script's own output directory — `…/target/<profile>/build/desktop-<hash>/out`.
+    ///
+    /// Deliberately a *different* channel from the one the implementation uses:
+    /// [`BuildProfile::current`] reads a `cfg` that `build.rs` emits, this reads a
+    /// path that cargo itself emits. An expectation derived from the same flag as
+    /// the implementation could only restate it, and the defect these assertions
+    /// exist to catch is precisely a build profile that misidentifies itself.
+    ///
+    /// Panics on a profile it does not recognise rather than guessing. A wrong
+    /// guess here would silently move what every keychain assertion below expects.
+    fn cargo_profile_of_this_build() -> BuildProfile {
+        let out_dir = Path::new(env!("OUT_DIR"));
+        let profile_directory = out_dir
+            .ancestors()
+            .find(|ancestor| ancestor.file_name().is_some_and(|name| name == "build"))
+            .and_then(Path::parent)
+            .and_then(Path::file_name)
+            .unwrap_or_else(|| {
+                panic!(
+                    "no `build` component in OUT_DIR ({}), so the cargo profile cannot be read \
+                     from it",
+                    out_dir.display()
+                )
+            });
+        match profile_directory.to_str() {
+            Some("release") => BuildProfile::Release,
+            Some("debug") => BuildProfile::Debug,
+            other => panic!(
+                "unrecognised cargo profile directory {other:?} in OUT_DIR ({}); this helper \
+                 identifies the build profile by path and has to be taught a new profile before \
+                 the keychain-namespace assertions can be trusted",
+                out_dir.display()
+            ),
+        }
+    }
+
     /// The namespace *this* test binary resolves to while the production
     /// identifier is in force, which is what the two process-wide pins observe.
     /// Neither constant nor obvious: the automation feature outranks everything,
-    /// and `cargo test` is a debug build, so the issue-#169 guard applies to the
-    /// suite as much as to a `tauri dev` session.
+    /// and `cargo test` runs in a non-release profile, so the issue-#169 guard
+    /// applies to the suite as much as to a `tauri dev` session.
     fn expected_service_for_this_build() -> &'static str {
         if cfg!(feature = "native-e2e") {
             E2E_KEYCHAIN_SERVICE
-        } else if cfg!(debug_assertions) {
+        } else if cargo_profile_of_this_build() == BuildProfile::Debug {
             DEV_KEYCHAIN_SERVICE
         } else {
             KEYCHAIN_SERVICE
         }
+    }
+
+    fn read_source(path: &Path) -> String {
+        fs::read_to_string(path)
+            .unwrap_or_else(|e| panic!("could not read {}: {e}", path.display()))
+    }
+
+    /// The body of `BuildProfile::current()`, cut out of `ai.rs` by brace
+    /// matching. Panics rather than returning nothing when the function cannot be
+    /// found: a silent miss would make "does not mention `debug_assertions`" pass
+    /// vacuously, which is the one way this check could fail open.
+    fn build_profile_current_body(source: &str) -> &str {
+        const SIGNATURE: &str = "const fn current() -> Self {";
+        let opening = source
+            .find(SIGNATURE)
+            .unwrap_or_else(|| panic!("ai.rs no longer declares `{SIGNATURE}`"))
+            + SIGNATURE.len();
+        let mut depth = 1usize;
+        for (offset, character) in source[opening..].char_indices() {
+            match character {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        return &source[opening..opening + offset];
+                    }
+                }
+                _ => {}
+            }
+        }
+        panic!("`{SIGNATURE}` is never closed in ai.rs");
     }
 
     /// Config files that may legitimately carry an identifier other than the
@@ -1628,6 +1710,94 @@ mod tests {
             resolve_keychain_service(Some(KEYCHAIN_SERVICE), BuildProfile::Release),
             expected,
             "a release build must keep reading the credential existing users already have"
+        );
+    }
+
+    /// Which profile a build *is*, cross-checked against a channel the resolver
+    /// does not use: cargo's own output-directory layout.
+    ///
+    /// Discriminating only where the two signals disagree, and `cargo test` alone
+    /// cannot produce that — it is a non-release profile with assertions on, so
+    /// `debug_assertions` and the cargo profile agree and either derivation passes.
+    /// Force the disagreement with
+    /// `RUSTFLAGS="-C debug-assertions=off" cargo test -p desktop the_resolved_build_profile`:
+    /// a resolver reading `debug_assertions` then calls this debug build `Release`
+    /// and points `npm run tauri dev` straight at the shipped app's credential,
+    /// which is the issue-#169 defect restored. The mirror-image configuration,
+    /// `RUSTFLAGS="-C debug-assertions=on" cargo test -p desktop --release`, is a
+    /// release build that would call itself `Debug` and leave every shipped user's
+    /// saved key unreadable.
+    #[test]
+    fn the_resolved_build_profile_matches_the_cargo_profile_this_binary_was_built_in() {
+        assert_eq!(
+            BuildProfile::current(),
+            cargo_profile_of_this_build(),
+            "the keychain namespace is turning on a build profile that is not the one cargo \
+             actually built"
+        );
+    }
+
+    /// Where the build-profile signal comes from, pinned because in this binary it
+    /// cannot be observed. Same shape as the config-drift walk above: the answer is
+    /// unobservable, the source of the answer is not.
+    ///
+    /// What goes red: derive `BuildProfile::current()` from `debug_assertions`
+    /// again. That flag says whether assertions were compiled in, never whether
+    /// this artifact ships. A release build with `debug-assertions = true` — a
+    /// `[profile.release]` override, or `RUSTFLAGS="-C debug-assertions=on"` —
+    /// classifies itself as `Debug`, so the *shipped* app resolves to
+    /// `DEV_KEYCHAIN_SERVICE` and every user's saved key reads as absent. Nothing
+    /// else here would notice: every other keychain test passes a `BuildProfile`
+    /// literal, so they prove the resolution rules and say nothing about which
+    /// profile a real build reports.
+    #[test]
+    fn no_source_derives_the_build_profile_from_the_assertion_setting() {
+        let crate_root = Path::new(env!("CARGO_MANIFEST_DIR"));
+
+        let build_script = read_source(&crate_root.join("build.rs"));
+        // The read proves itself before it is trusted: a file that is not the build
+        // script could not carry these emissions either, and its silence would mean
+        // nothing.
+        assert!(
+            build_script.contains("tauri_build::build()"),
+            "build.rs does not look like this crate's build script, so the assertions below \
+             would be passing judgement on the wrong file"
+        );
+        assert!(
+            build_script.contains(r#"env::var("PROFILE")"#)
+                && build_script.contains(r#"== "release""#),
+            "build.rs must take the profile from cargo's own PROFILE, which is what says \
+             whether this artifact ships"
+        );
+        for emission in [
+            "cargo:rustc-check-cfg=cfg(release_profile)",
+            "cargo:rustc-cfg=release_profile",
+        ] {
+            assert!(
+                build_script.contains(emission),
+                "build.rs must print `{emission}`; without it the resolver has no profile \
+                 signal to read"
+            );
+        }
+
+        let resolver_source = read_source(&crate_root.join("src/ai.rs"));
+        let current = build_profile_current_body(&resolver_source);
+        // The same vacuity guard on the other half: an extraction that missed would
+        // satisfy the `!contains` assertion below while proving nothing at all.
+        assert!(
+            current.contains("Self::Debug") && current.contains("Self::Release"),
+            "the extracted body is not BuildProfile::current(): {current}"
+        );
+        assert!(
+            current.contains("release_profile"),
+            "BuildProfile::current() must read the cargo-profile cfg that build.rs emits, \
+             got: {current}"
+        );
+        assert!(
+            !current.contains("debug_assertions"),
+            "BuildProfile::current() decides a shipped app's keychain namespace from \
+             `debug_assertions`, which reports whether assertions are compiled in rather than \
+             whether this build ships: {current}"
         );
     }
 
