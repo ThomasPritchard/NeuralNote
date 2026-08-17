@@ -228,6 +228,87 @@ impl StableDirectory {
         })
     }
 
+    /// Open one direct child directory through this already-confined directory
+    /// capability. The child is never followed when it is a symlink, and its
+    /// post-open identity must be the exact expected child inside the vault.
+    pub(crate) fn open_child_directory(&self, leaf: &str) -> CoreResult<Option<Self>> {
+        self.ensure_active()?;
+        let leaf_c = leaf_cstring(leaf)?;
+        let raw = unsafe {
+            // SAFETY: `self.fd` is live and `leaf_c` is one NUL-terminated
+            // component. O_NOFOLLOW refuses a symlink at the final component.
+            libc::openat(
+                self.fd.as_raw_fd(),
+                leaf_c.as_ptr(),
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )
+        };
+        if raw < 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ENOENT) => Ok(None),
+                Some(libc::ELOOP) | Some(libc::ENOTDIR) => Err(CoreError::OutsideVault(format!(
+                    "refused symlink or non-directory vault state child '{leaf}'"
+                ))),
+                _ => Err(CoreError::Io(format!(
+                    "could not open vault state directory '{leaf}': {error}"
+                ))),
+            };
+        }
+        let fd = unsafe {
+            // SAFETY: openat returned a fresh descriptor owned by this scope.
+            OwnedFd::from_raw_fd(raw)
+        };
+        let canonical_path = verify_opened_directory(&self.canonical_root, &fd)?;
+        let expected = self.canonical_path.join(leaf);
+        if canonical_path != expected {
+            return Err(CoreError::OutsideVault(format!(
+                "opened vault state directory '{}' did not match expected child '{}'",
+                canonical_path.display(),
+                expected.display()
+            )));
+        }
+        self.ensure_active()?;
+        Ok(Some(Self {
+            fd,
+            canonical_path,
+            canonical_root: self.canonical_root.clone(),
+            close_signal: self.close_signal.clone(),
+        }))
+    }
+
+    /// Create one direct child directory if absent, then open it through the
+    /// same no-follow capability path as [`Self::open_child_directory`].
+    pub(crate) fn open_or_create_child_directory(&self, leaf: &str) -> CoreResult<Self> {
+        if let Some(directory) = self.open_child_directory(leaf)? {
+            return Ok(directory);
+        }
+        self.ensure_active()?;
+        let leaf_c = leaf_cstring(leaf)?;
+        let result = unsafe {
+            // SAFETY: `self.fd` is live and `leaf_c` is one NUL-terminated
+            // component. mkdirat creates only that direct child.
+            libc::mkdirat(self.fd.as_raw_fd(), leaf_c.as_ptr(), 0o755)
+        };
+        if result < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::EEXIST) {
+                return Err(CoreError::Io(format!(
+                    "could not create vault state directory '{leaf}': {error}"
+                )));
+            }
+        }
+        self.open_child_directory(leaf)?.ok_or_else(|| {
+            CoreError::Conflict(format!(
+                "vault state directory '{leaf}' disappeared while opening it"
+            ))
+        })
+    }
+
+    pub(crate) fn raw_fd(&self) -> RawFd {
+        self.fd.as_raw_fd()
+    }
+
     /// The note's parent directory as a vault-relative, `/`-joined path. An empty
     /// string means the confined directory *is* the vault root. Fails closed
     /// rather than lossily encoding a non-round-trippable path, because a recovery
