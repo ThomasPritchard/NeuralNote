@@ -54,7 +54,7 @@ const A_FEW_RECENTS = 2;
  *  all ten rows and lands near 1.0 here. */
 const MAX_SHARE_OF_ADDED_ROWS = 0.5;
 
-/** `RecentList.tsx:29` draws the row's focus indicator with
+/** `RecentList.tsx:58` draws the row's focus indicator with
  *  `focus-visible:ring-2`, and a Tailwind ring is painted OUTSIDE the button's
  *  border box. A scroll container flush against its own rows therefore clips
  *  that ring on the first and last row — which is a WCAG 2.4.11 failure that
@@ -63,7 +63,7 @@ const MAX_SHARE_OF_ADDED_ROWS = 0.5;
  *  (padding on the well, a padded wrapper) satisfies it. */
 const FOCUS_RING_PX = 2;
 
-/** `styles.css:1262` opens a `@media (max-height: 700px)` branch that reshapes
+/** `styles.css:1289` opens a `@media (max-height: 700px)` branch that reshapes
  *  the card's padding and gaps. Every measurement below is taken in the TALL
  *  branch on purpose; if the configured viewport ever drops under this, the
  *  numbers stop describing the window the bug was reported against. */
@@ -173,7 +173,7 @@ function recentListRect(): DOMRect {
 }
 
 /** Every row, in DOM order. `aria-label="Open <name>"` is the row's own
- *  contract (`RecentList.tsx:28`) and what the jsdom suite already selects on. */
+ *  contract (`RecentList.tsx:57`) and what the jsdom suite already selects on. */
 function recentRows(): HTMLElement[] {
   return [...(recentListElement()?.querySelectorAll<HTMLElement>('li > button[aria-label^="Open "]') ?? [])];
 }

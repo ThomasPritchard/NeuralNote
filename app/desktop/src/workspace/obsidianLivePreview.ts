@@ -153,6 +153,13 @@ interface PreviewScanOptions {
    * callers below fail closed in opposite directions, and letting either name
    * its mask directly is what let the command path answer with no tree at all
    * (issue #168).
+   *
+   * Optional, so the default below fills in on `undefined` and ONLY `undefined`.
+   * `ensureSyntaxTree` returns `null` on a spent budget, which would sail past
+   * that default and throw in `unparsedTail` from inside the Enter keymap
+   * handler — so the `?? syntaxTree(state)` at the call site is load-bearing,
+   * not belt-and-braces. Dropping it reddens "declines a final-line tag while
+   * the whole-document parse is behind" and nothing else.
    */
   readonly tree?: SyntaxTree;
 }
@@ -299,10 +306,26 @@ const CARET_PARSE_BUDGET_MS = 20;
  * is therefore load-bearing — reading `syntaxTree(state)` here again would
  * compile, run, and change nothing.
  *
- * When the budget runs out before the line, `ensureSyntaxTree` returns `null`
- * and the state's short tree stands, masking the tail so this DECLINES and Enter
- * types a newline. That is the direction to fail in: a shortcut that misses once
- * is invisible, a swallowed keystroke edits the note.
+ * When the budget runs out, `ensureSyntaxTree` returns `null` and the state's
+ * short tree stands, masking the tail so this DECLINES and Enter types a
+ * newline. That is the direction to fail in: a shortcut that misses once is
+ * invisible, a swallowed keystroke edits the note.
+ *
+ * On the LAST line that budget has to cover the whole document rather than the
+ * line, so the boundary is the note's size and not the caret's distance past the
+ * parse frontier. `line.to` is `doc.length` there, and a limit at or past the
+ * end is DISCARDED rather than applied
+ * (`@codemirror/language/dist/index.js:344-345`), leaving `stopAt` unreached
+ * (`:358-360`) and nothing bounding the parse but the 20 ms. A 200 KB note — the
+ * size full-source capture produces — therefore declines a final-line `#tag` for
+ * as long as the background parse is behind it, and starts firing once `isDone`
+ * can answer for the whole document without working (`:202`, `:505-508`).
+ * Accepted rather than unnoticed: it fails in the same safe direction, and the
+ * alternative is parsing an arbitrary document inside a keystroke. Every other
+ * line keeps its limit and is unaffected; the two `obsidianLivePreview.test.ts`
+ * cases "declines a final-line tag while the whole-document parse is behind" and
+ * "still opens tag search on an already-parsed line under the same spent budget"
+ * pin both sides of that split.
  */
 function decorationAtCaret(
   state: EditorState,

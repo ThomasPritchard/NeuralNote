@@ -78,10 +78,23 @@ const BUDGET_OVERRUN_MS = 50;
  * reached. A clock that outruns the budget reproduces that every run.
  */
 function budgetExhaustedState(doc: string, extensions: Extension = EXTENSIONS): EditorState {
+  return withExhaustedParseBudget(() => partiallyParsedState(doc, extensions));
+}
+
+/**
+ * Runs `body` with the parse budget already spent, by the same means: a clock
+ * that outruns any deadline measured against it.
+ *
+ * `budgetExhaustedState` needs that only while the state field is built.
+ * `decorationAtCaret` spends its budget inside the keystroke instead, so a note
+ * too large to parse in 20 ms is reproduced by holding the clock across the
+ * event rather than across construction.
+ */
+function withExhaustedParseBudget<T>(body: () => T): T {
   let clock = Date.now();
   const now = vi.spyOn(Date, "now").mockImplementation(() => (clock += BUDGET_OVERRUN_MS));
   try {
-    return partiallyParsedState(doc, extensions);
+    return body();
   } finally {
     now.mockRestore();
   }
@@ -305,7 +318,7 @@ describe("obsidianLivePreview tag masking", () => {
    * consulted, and their cases cover the boundary rule instead. Named here so
    * the difference is asserted rather than mistaken for an oversight.
    *
-   * `sourceEditorCellPaintPlan.ts:388` applies the same boundary rule, so its
+   * `sourceEditorCellPaintPlan.ts:458` applies the same boundary rule, so its
    * `Autolink` and `Escape` entries are unreachable there too.
    */
   const BOUNDARY_REJECTED: ReadonlySet<string> = new Set(["Autolink", "Escape"]);
@@ -352,6 +365,63 @@ const PARSE_WINDOW_FILLER = Array.from(
   (_, index) => `Filler paragraph ${index} carrying enough words to advance the offset.`,
 ).join("\n\n");
 
+/**
+ * One `#tag` in front of the initial parse frontier and one on the final line
+ * behind it, so a single document exercises both sides of the caret path's
+ * budget with the two cases differing in nothing but caret position.
+ */
+const FRONTIER_STRADDLING_DOC =
+  `An early #early tag\n\n${PARSE_WINDOW_FILLER}\n\nA trailing #inbox tag`;
+
+/**
+ * An editor wired the way `SourceNoteEditor` wires one: the tag binding ahead of
+ * CodeMirror's defaults (`SourceNoteEditor.tsx:224-227` vs `:260`).
+ *
+ * That ordering is what every keyboard case below turns on. A command returning
+ * `false` hands bare Enter to `insertNewlineAndIndent`, so declining is not a
+ * no-op — masking the caret's line edits the note.
+ */
+function tagSearchView(
+  doc: string,
+  caret: number,
+  searched: string[],
+): { readonly view: EditorView; readonly cleanup: () => void } {
+  const host = document.body.appendChild(document.createElement("div"));
+  const view = new EditorView({
+    state: partiallyParsedState(
+      doc,
+      [
+        EXTENSIONS,
+        keymap.of([
+          { key: "Enter", run: openTagSearchAtCaret((tag) => searched.push(tag)) },
+          ...defaultKeymap,
+        ]),
+      ],
+      caret,
+    ),
+    parent: host,
+  });
+  return { view, cleanup: () => { view.destroy(); host.remove(); } };
+}
+
+/** Bare Enter, as the browser delivers it. */
+function dispatchEnter(view: EditorView): void {
+  view.contentDOM.dispatchEvent(new KeyboardEvent("keydown", {
+    key: "Enter",
+    bubbles: true,
+    cancelable: true,
+  }));
+}
+
+/**
+ * Enter with the parse budget already spent, held across the event rather than
+ * across construction: this is the budget `decorationAtCaret` spends INSIDE the
+ * keystroke, and the whole question is what it does when that runs out.
+ */
+function dispatchEnterOnSpentBudget(view: EditorView): void {
+  withExhaustedParseBudget(() => dispatchEnter(view));
+}
+
 describe("obsidianLivePreview over an unfinished parse", () => {
   /** Tags the partial parse paints that the complete parse does not: always none. */
   const leaked = (partial: EditorState, complete: EditorState): (string | undefined)[] => {
@@ -377,41 +447,18 @@ describe("obsidianLivePreview over an unfinished parse", () => {
     const doc = `${PARSE_WINDOW_FILLER}\n\nA real #inbox tag`;
     const tagFrom = doc.indexOf("#inbox");
     const searched: string[] = [];
-    const host = document.body.appendChild(document.createElement("div"));
-    const view = new EditorView({
-      state: partiallyParsedState(
-        doc,
-        [
-          EXTENSIONS,
-          // The real editor's ordering: the tag binding first, CodeMirror's
-          // defaults behind it. A command that returns `false` hands bare Enter
-          // to `insertNewlineAndIndent`, so masking the caret's line as unparsed
-          // does not decline the action — it edits the note.
-          keymap.of([
-            { key: "Enter", run: openTagSearchAtCaret((tag) => searched.push(tag)) },
-            ...defaultKeymap,
-          ]),
-        ],
-        tagFrom + 1,
-      ),
-      parent: host,
-    });
+    const { view, cleanup } = tagSearchView(doc, tagFrom + 1, searched);
 
     try {
       expect(syntaxTree(view.state).length).toBeLessThan(tagFrom);
 
-      view.contentDOM.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "Enter",
-        bubbles: true,
-        cancelable: true,
-      }));
+      dispatchEnter(view);
       await Promise.resolve();
 
       expect(view.state.doc.toString()).toBe(doc);
       expect(searched).toEqual(["#inbox"]);
     } finally {
-      view.destroy();
-      host.remove();
+      cleanup();
     }
   });
 
@@ -419,42 +466,77 @@ describe("obsidianLivePreview over an unfinished parse", () => {
     const doc = `${PARSE_WINDOW_FILLER}\n\n\`\`\`md\n#fenced\n\`\`\``;
     const caret = doc.indexOf("#fenced") + 1;
     const searched: string[] = [];
-    const host = document.body.appendChild(document.createElement("div"));
-    const view = new EditorView({
-      state: partiallyParsedState(
-        doc,
-        [
-          EXTENSIONS,
-          // Same ordering as its sibling above, because this pins the opposite
-          // direction of the same decision: there the command has to fire, here
-          // it has to decline and let `insertNewlineAndIndent` have the key.
-          keymap.of([
-            { key: "Enter", run: openTagSearchAtCaret((tag) => searched.push(tag)) },
-            ...defaultKeymap,
-          ]),
-        ],
-        caret,
-      ),
-      parent: host,
-    });
+    // The opposite direction of the same decision as its sibling above: there
+    // the command has to fire, here it has to decline and let
+    // `insertNewlineAndIndent` have the key.
+    const { view, cleanup } = tagSearchView(doc, caret, searched);
 
     try {
       // The fence has to open past where the tree stops, or `FencedCode` is
       // present and the command was never deciding without a tree at all.
       expect(syntaxTree(view.state).length).toBeLessThan(doc.indexOf("```md"));
 
-      view.contentDOM.dispatchEvent(new KeyboardEvent("keydown", {
-        key: "Enter",
-        bubbles: true,
-        cancelable: true,
-      }));
+      dispatchEnter(view);
       await Promise.resolve();
 
       expect(searched).toEqual([]);
       expect(view.state.doc.toString()).toBe(`${doc.slice(0, caret)}\n${doc.slice(caret)}`);
     } finally {
-      view.destroy();
-      host.remove();
+      cleanup();
+    }
+  });
+
+  it("declines a final-line tag while the whole-document parse is behind", async () => {
+    const caret = FRONTIER_STRADDLING_DOC.indexOf("#inbox") + 1;
+    const searched: string[] = [];
+    const { view, cleanup } = tagSearchView(FRONTIER_STRADDLING_DOC, caret, searched);
+
+    try {
+      // The boundary itself, and the only thing separating this case from its
+      // sibling below. On the last line `line.to` IS `doc.length`, and a limit
+      // at or past the end is discarded rather than applied
+      // (`@codemirror/language/dist/index.js:344-345`), so the 20 ms has to
+      // cover the whole document. Asserted because a line appended to the
+      // fixture would silently stop testing that and leave this passing.
+      expect(view.state.doc.lineAt(caret).to).toBe(FRONTIER_STRADDLING_DOC.length);
+      // And the tag has to sit past the frontier, or the parse had no work left
+      // to run out of and this would pass having exercised nothing.
+      expect(syntaxTree(view.state).length).toBeLessThan(caret);
+
+      dispatchEnterOnSpentBudget(view);
+      await Promise.resolve();
+
+      expect(searched).toEqual([]);
+      expect(view.state.doc.toString()).toBe(
+        `${FRONTIER_STRADDLING_DOC.slice(0, caret)}\n${FRONTIER_STRADDLING_DOC.slice(caret)}`,
+      );
+    } finally {
+      cleanup();
+    }
+  });
+
+  it("still opens tag search on an already-parsed line under the same spent budget", async () => {
+    const caret = FRONTIER_STRADDLING_DOC.indexOf("#early") + 1;
+    const searched: string[] = [];
+    const { view, cleanup } = tagSearchView(FRONTIER_STRADDLING_DOC, caret, searched);
+
+    try {
+      // Not the last line, so the limit survives — and the line is already
+      // parsed, so `ensureSyntaxTree` answers from `isDone` without doing any
+      // work at all (`@codemirror/language/dist/index.js:202,505-508`) and never
+      // reads the spent clock. Same document and same spent budget as above, so
+      // this is what makes that decline specific to the FINAL line rather than
+      // to an exhausted budget in general.
+      expect(view.state.doc.lineAt(caret).to).toBeLessThan(FRONTIER_STRADDLING_DOC.length);
+      expect(syntaxTree(view.state).length).toBeGreaterThanOrEqual(caret + "#early".length);
+
+      dispatchEnterOnSpentBudget(view);
+      await Promise.resolve();
+
+      expect(searched).toEqual(["#early"]);
+      expect(view.state.doc.toString()).toBe(FRONTIER_STRADDLING_DOC);
+    } finally {
+      cleanup();
     }
   });
 
