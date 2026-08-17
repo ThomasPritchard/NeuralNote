@@ -144,6 +144,113 @@ fn metadata_parser_returns_bounded_sanitized_fields() {
 }
 
 #[test]
+fn metadata_parser_accepts_the_bounded_ytdlp_projection() {
+    let projected = br#"nn-metadata-v1:{"id":"iG9CE55wbtY","title":"Do schools kill creativity?","uploader":"TED","channel":"TED Talks","duration":123.0,"upload_date":"20070107"}
+nn-fields:id, title, subtitles, automatic_captions, duration
+nn-human-languages:en, en-GB
+nn-human-first-exts:["vtt","vtt"]
+nn-auto-languages:fr, en-orig
+nn-auto-first-exts:["vtt","vtt"]
+"#;
+
+    let parsed = parse_video_metadata(projected).unwrap();
+
+    assert_eq!(parsed.video_id, VIDEO_ID);
+    assert_eq!(parsed.title, "Do schools kill creativity?");
+    assert_eq!(parsed.channel.as_deref(), Some("TED"));
+    assert_eq!(parsed.duration_seconds, Some(123));
+    assert_eq!(parsed.upload_date.as_deref(), Some("20070107"));
+    assert_eq!(parsed.captions.human_languages(), ["en", "en-GB"]);
+    assert_eq!(parsed.captions.automatic_languages(), ["en-orig", "fr"]);
+}
+
+#[test]
+fn metadata_projection_requires_both_present_inventories_to_prove_absence() {
+    let projected = br#"nn-metadata-v1:{"id":"iG9CE55wbtY","title":"A talk"}
+nn-fields:id, title, subtitles, automatic_captions
+nn-human-languages:!nn-missing!
+nn-human-first-exts:[]
+nn-auto-languages:!nn-missing!
+nn-auto-first-exts:[]
+"#;
+
+    let parsed = parse_video_metadata(projected).unwrap();
+
+    assert!(parsed.captions.is_genuinely_absent());
+}
+
+#[test]
+fn metadata_projection_rejects_untrusted_or_ambiguous_language_lists() {
+    let metadata = r#"nn-metadata-v1:{"id":"iG9CE55wbtY","title":"A talk"}"#;
+    for raw in [
+        format!("{metadata}\nnn-human-languages:en\n"),
+        format!("{metadata}\nnn-fields:id, subtitles, automatic_captions\nnn-human-languages:en\nnn-human-first-exts:[\"vtt\"]\nnn-auto-languages:!nn-missing!\nnn-auto-first-exts:[]\nextra\n"),
+        format!("{metadata}\nnn-fields:id, subtitles, automatic_captions\nnn-human-languages:en, en\nnn-human-first-exts:[\"vtt\",\"vtt\"]\nnn-auto-languages:!nn-missing!\nnn-auto-first-exts:[]\n"),
+        format!("{metadata}\nnn-fields:id, subtitles, automatic_captions\nnn-human-languages:en, bad language\nnn-human-first-exts:[\"vtt\",\"vtt\"]\nnn-auto-languages:!nn-missing!\nnn-auto-first-exts:[]\n"),
+        format!("{metadata}\nnn-fields:id, subtitles, automatic_captions\nnn-human-languages:en, fr\nnn-human-first-exts:[\"vtt\"]\nnn-auto-languages:!nn-missing!\nnn-auto-first-exts:[]\n"),
+        format!("{metadata}\nnn-fields:id, subtitles, automatic_captions\nnn-human-languages:en\nnn-human-first-exts:[\"v tt\"]\nnn-auto-languages:!nn-missing!\nnn-auto-first-exts:[]\n"),
+        format!("{metadata}\nnn-fields:id, subtitles, automatic_captions\nnn-human-languages:!nn-missing!\nnn-human-first-exts:!nn-missing!\nnn-auto-languages:!nn-missing!\nnn-auto-first-exts:[]\n"),
+        format!("{metadata}\nnn-fields:id, subtitles\nnn-human-languages:!nn-missing!\nnn-human-first-exts:[]\nnn-auto-languages:!nn-missing!\nnn-auto-first-exts:[]\n"),
+        format!("{metadata}\nnn-fields:id, automatic_captions\nnn-human-languages:!nn-missing!\nnn-human-first-exts:[]\nnn-auto-languages:!nn-missing!\nnn-auto-first-exts:[]\n"),
+        format!("{metadata}\nnn-fields:id, bad field, subtitles, automatic_captions\nnn-human-languages:!nn-missing!\nnn-human-first-exts:[]\nnn-auto-languages:!nn-missing!\nnn-auto-first-exts:[]\n"),
+        format!("{metadata}\nnn-fields:id, subtitles, subtitles, automatic_captions\nnn-human-languages:!nn-missing!\nnn-human-first-exts:[]\nnn-auto-languages:!nn-missing!\nnn-auto-first-exts:[]\n"),
+        format!("{metadata}\nnn-fields:!nn-missing!\nnn-human-languages:!nn-missing!\nnn-human-first-exts:[]\nnn-auto-languages:!nn-missing!\nnn-auto-first-exts:[]\n"),
+    ] {
+        assert!(
+            matches!(
+                parse_video_metadata(raw.as_bytes()),
+                Err(CaptureError::InvalidMetadata(_))
+            ),
+            "projection must be rejected: {raw:?}"
+        );
+    }
+}
+
+#[test]
+fn metadata_projection_rejects_more_than_the_bounded_field_count() {
+    let fields = (0..513)
+        .map(|index| format!("field{index}"))
+        .chain(["subtitles".into(), "automatic_captions".into()])
+        .collect::<Vec<_>>()
+        .join(", ");
+    let projected = format!(
+        "nn-metadata-v1:{{\"id\":\"{VIDEO_ID}\",\"title\":\"A talk\"}}\n\
+         nn-fields:{fields}\n\
+         nn-human-languages:!nn-missing!\n\
+         nn-human-first-exts:[]\n\
+         nn-auto-languages:!nn-missing!\n\
+         nn-auto-first-exts:[]\n"
+    );
+
+    assert!(matches!(
+        parse_video_metadata(projected.as_bytes()),
+        Err(CaptureError::InvalidMetadata(message)) if message.contains("field limit")
+    ));
+}
+
+#[test]
+fn metadata_projection_rejects_more_than_the_bounded_language_count() {
+    let languages = (0..513)
+        .map(|index| format!("lang{index}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let extensions = serde_json::to_string(&vec!["vtt"; 513]).unwrap();
+    let projected = format!(
+        "nn-metadata-v1:{{\"id\":\"{VIDEO_ID}\",\"title\":\"A talk\"}}\n\
+         nn-fields:id, subtitles, automatic_captions\n\
+         nn-human-languages:{languages}\n\
+         nn-human-first-exts:{extensions}\n\
+         nn-auto-languages:\n\
+         nn-auto-first-exts:[]\n"
+    );
+
+    assert!(matches!(
+        parse_video_metadata(projected.as_bytes()),
+        Err(CaptureError::InvalidMetadata(message)) if message.contains("language limit")
+    ));
+}
+
+#[test]
 fn caption_selection_prefers_human_then_exact_then_base_variant() {
     let parsed = parse_video_metadata(&metadata_json(
         r#"{"en":[{"ext":"vtt"}],"en-GB":[{"ext":"vtt"}]}"#,
@@ -244,6 +351,11 @@ fn metadata_parser_rejects_malformed_invalid_and_oversized_input() {
     assert!(matches!(
         parse_video_metadata(&oversized),
         Err(CaptureError::InvalidMetadata(message)) if message.contains("byte limit")
+    ));
+
+    assert!(matches!(
+        parse_video_metadata(b"nn-metadata-v1:\xff"),
+        Err(CaptureError::InvalidMetadata(message)) if message.contains("UTF-8")
     ));
 }
 

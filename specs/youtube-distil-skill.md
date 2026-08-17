@@ -195,11 +195,22 @@ BYO-key commercial API in Settings (§10).
 
 ### 4.2 Metadata and strategy — ported from the script
 
-One `yt-dlp --dump-single-json --skip-download --no-playlist` call yields metadata + the caption
-inventory. Prefer human `subtitles`; fall back to `automatic_captions`; only a genuinely empty
-inventory reaches the Whisper offer (§3.3). Language pick ports the script's logic (exact match →
-base-language variant). The `--no-playlist` flag means playlist support is an **explicit new
-branch keyed on the URL shape** (§7), not an accident of the existing call.
+One `yt-dlp --print ... --skip-download --no-playlist` call yields a bounded, versioned metadata
+projection: the consumed scalar fields, the top-level field names, each caption inventory's
+language keys, and the first track extension for every non-empty language. It deliberately omits
+caption URLs because YouTube can expose thousands of signed auto-translation URLs and make the
+full info JSON exceed the process-output limit. The field-name record proves that both
+`subtitles` and `automatic_captions` were present even when yt-dlp renders an empty mapping with
+its missing-value placeholder; an omitted inventory remains an explicit failure rather than
+being mistaken for genuine absence. Prefer human `subtitles`; fall back to
+`automatic_captions`; only two present and genuinely empty inventories reach the Whisper offer
+(§3.3). Language pick ports the script's logic (exact match → base-language variant). The
+`--no-playlist` flag means playlist support is an **explicit new branch keyed on the URL shape**
+(§7), not an accident of the existing call. Residual schema assumption: yt-dlp documents both
+caption inventories as dictionaries, but its output formatter collapses an empty dictionary and
+other falsey values to the same placeholder. The projection proves key presence, bounds shape and
+cardinality, and rejects malformed records; it cannot independently prove the upstream value's
+dictionary type without serialising the signed URLs it intentionally excludes.
 
 ### 4.3 `capture/vtt.rs` — the cue model (the TDD heart of the slice)
 
@@ -352,7 +363,10 @@ is PARA-shaped, so the skill infers the vault's actual organising scheme and con
   `<vault>/.neuralnote/profile.json` — vault-scoped facts do not belong in the app-scoped
   `ai-config.json`, the dotfolder is invisible to Obsidian, and the product spec already
   anticipates `.neuralnote/sources/`. This does not violate the "data format is sacred" rule: no
-  markdown, no frontmatter, nothing Obsidian reads is touched.
+  markdown, no frontmatter, nothing Obsidian reads is touched. The desktop supplies the core's
+  `VaultProfileIo` for every chat run, bound to that run's canonical vault and lifecycle; reads are
+  bounded and no-follow, and saves use a descriptor-confined temporary file plus atomic rename so
+  a symlinked or swapped state path cannot redirect the write outside the vault.
 - Within a detected PARA vault, the ported tree applies unchanged and total:
   `Areas/<topic>/` → `Resources/<topic>/` → `Projects/<project>/` → `Inbox/` as the honest
   fallback. Wrong-but-announced beats wrong-and-silent.

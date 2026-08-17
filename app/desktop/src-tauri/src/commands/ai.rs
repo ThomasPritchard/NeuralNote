@@ -968,6 +968,17 @@ pub(crate) async fn chat(
             return Ok(run_id);
         }
     };
+    let vault_profile_io =
+        match skills::RunVaultProfileIo::new(&canonical_root, std::sync::Arc::clone(&close_signal))
+        {
+            Ok(profile_io) => profile_io,
+            Err(error) => {
+                sink.send(ChatEvent::Error {
+                    message: format!("Couldn't prepare this vault's skill profile: {error}"),
+                });
+                return Ok(run_id);
+            }
+        };
 
     // The active provider is a pure config read; a read failure is surfaced, not
     // guessed (guessing the provider could bill the user on the wrong one or fail
@@ -1089,6 +1100,7 @@ pub(crate) async fn chat(
         skill_environment: &skill_environment,
         user_prompt: &user_prompt,
         note_writer: &note_writer,
+        vault_profile_io: &vault_profile_io,
         guards: &guards,
         youtube_io,
         youtube_requirements,
@@ -1355,6 +1367,7 @@ struct ChatRun<'a> {
     skill_environment: &'a neuralnote_core::ai::SkillEnvironment,
     user_prompt: &'a dyn neuralnote_core::ai::UserPrompt,
     note_writer: &'a dyn neuralnote_core::ai::NoteWriteBackend,
+    vault_profile_io: &'a dyn neuralnote_core::capture::VaultProfileIo,
     guards: &'a neuralnote_core::ai::Guards,
     youtube_io: &'a dyn neuralnote_core::ai::YoutubeIo,
     youtube_requirements: &'a dyn neuralnote_core::ai::YoutubeRequirementInstaller,
@@ -1440,6 +1453,7 @@ async fn chat_via_openrouter(
     .with_approval(run.approval_policy.clone(), run.approval_prompt, &judge)
     .with_youtube_io(run.youtube_io)
     .with_youtube_requirements(run.youtube_requirements)
+    .with_vault_profile_io(run.vault_profile_io)
     .with_capture_cancellation(run.capture_cancellation.clone())
     .with_extractor_update_session(run.extractor_updates.clone())
     .with_retry_delay(&ai::TokioRetryDelay);
@@ -1575,6 +1589,7 @@ async fn chat_via_local(
     .with_approval(run.approval_policy.clone(), run.approval_prompt, &NO_JUDGE)
     .with_youtube_io(run.youtube_io)
     .with_youtube_requirements(run.youtube_requirements)
+    .with_vault_profile_io(run.vault_profile_io)
     .with_pricing(&pricing)
     .with_capture_cancellation(run.capture_cancellation.clone())
     .with_extractor_update_session(run.extractor_updates.clone())

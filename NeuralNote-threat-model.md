@@ -46,7 +46,7 @@ responses, downloaded requirement bytes, helper output, and webview IPC argument
 
 | Entry point | Principal threats | Primary controls |
 |---|---|---|
-| Vault open/read/write | traversal, symlink escape, overwrite, parser DoS | user-selected roots, canonical parent checks, no-follow/regular-file checks, bounded parsing, create-new semantics, hash-guarded undo |
+| Vault open/read/write and skill profile state | traversal, symlink escape, overwrite, parser DoS, durable route poisoning | user-selected roots, canonical parent checks, descriptor-relative no-follow/regular-file checks, bounded parsing, create-new note semantics, atomic profile replacement, lifecycle cancellation, hash-guarded undo |
 | Markdown/frontmatter render | XSS, remote beacons, broken content hiding | no raw HTML, safe URL transform, inert links, CSP, failed-image fallback, explicit lossy/parse notices |
 | Source-native editor | source normalization, widget injection, unsafe navigation, remote fetches, parser or allocation DoS | exact separator map, text-node labels, viewport-bounded decorations, inert images/embeds, guarded vault resolver, safe external schemes, 8 MiB full-document write limit, optimistic concurrency, atomic write |
 | Window-state IPC | unintended native window authority | `core:window:allow-is-fullscreen` exposes only the current main-window fullscreen boolean; it grants no window mutation authority |
@@ -54,7 +54,7 @@ responses, downloaded requirement bytes, helper output, and webview IPC argument
 | Elicitation | model-provided active media, choice forgery | model images rejected, implementation images fully decoded and bounded, offered IDs and arity validated |
 | Provider IPC/network and settings | key disclosure, arbitrary requests, ranking-data poisoning, hangs, concurrent preference loss | OS keychain, redaction, fixed HTTPS origins, no redirects, authenticated daily rankings, bounded reads, connect/total timeouts, defensive join/filter validation, exact last-offered model selection, in-process mutation sequencing, cross-process advisory lock, atomic config replacement |
 | Ollama sidecar | port hijack, arbitrary model operation | loopback binding, child ownership/health checks, app-owned model store, curated pull/select/chat/delete tags |
-| YouTube helpers | command injection, ambient config/plugin execution, output DoS | typed YouTube URLs, fixed argv, no shell, absolute binaries, cleared environment, no config/default plugins, explicit pinned POT directory, time/output/cancel bounds |
+| YouTube helpers | command injection, ambient config/plugin execution, output DoS, malformed caption inventory | typed YouTube URLs, fixed argv, no shell, absolute binaries, cleared environment, no config/default plugins, explicit pinned POT directory, time/output/cancel bounds, bounded versioned metadata projection with field/key grammar and cardinality checks |
 | Requirement installer | malicious archive/binary, race, partial install | compiled HTTPS URL and digest, streamed SHA-256, archive entry/type/size limits, install locks, atomic publication |
 | Application updater | manifest spoofing, malicious or downgraded archive, signing-key loss/theft | HTTPS production endpoint, mandatory Tauri artifact signature, embedded public key, strictly newer version comparison, explicit review/install consent, minimal updater/process capabilities |
 | Local updater harness | replacement of the real app, private-key leak, exposed local files, insecure transport escaping to production | distinct bundle identity, unique ignored target, owner-only key path, allowlisted build environment, exact loopback binding/routes, generated-only HTTP override, valid and one-byte-tampered archive journeys |
@@ -84,6 +84,14 @@ Vault path and symlink swaps are the highest-impact local tampering path. Writes
 the actual parent, create without overwrite, retain the filesystem's stored spelling, and record
 content hashes for undo. Downloaded helpers are verified before atomic publication. Citation spans
 are rechecked against note hashes before emission.
+
+Vault-scoped skill routing is stored at `.neuralnote/profile.json` only after the normal durable-tool
+approval. The desktop binds one raw-byte profile backend to the chat run's canonical vault and close
+signal. On Unix it opens the vault and state directory as stable descriptors, refuses directory and
+leaf symlinks or non-regular profile files, stages bytes with exclusive no-follow creation, syncs,
+and atomically renames before syncing the directory. Missing state is a genuine absence and does not
+create `.neuralnote` during ordinary chat. Non-Unix builds fail this seam closed alongside their
+already-unavailable descriptor-confined note writer rather than substituting weaker path operations.
 
 The source-native editor keeps complete Markdown source authoritative. Its line-ending map follows
 CodeMirror transactions and blocks saving if that map becomes inconsistent. Decorations and
@@ -133,6 +141,17 @@ sessions are bounded. Other parsers cap bytes, lines, entries, dimensions, alias
 spans, write budgets, and playlist work. Network and process operations have deadlines, bounded pipes,
 and cancellation. The Sonar-reported backtracking expression was replaced by a linear scan.
 
+Vault profile reads take at most 64 KiB plus one detection byte and use non-blocking no-follow opens,
+so a FIFO, device, oversized file, or symlink is rejected rather than read or waited on. Profile saves
+enforce the same byte limit before creating the state directory and bound temporary-name collisions.
+
+The yt-dlp metadata projection excludes signed caption URLs and validates record order, top-level
+field presence, key grammar, extension grammar, uniqueness, and cardinality. Its formatter renders
+an empty caption dictionary and other falsey values identically, so dictionary type still relies on
+the pinned yt-dlp schema. A stale helper that violates that documented schema could misclassify a
+malformed inventory as empty and reach the user-approved Whisper fallback; this is a retained
+residual risk, not authority to write or execute without the normal approval gates.
+
 ### Elevation of privilege
 
 The webview has minimal Tauri capabilities and no shell/filesystem plugin access. Rust commands are
@@ -170,7 +189,10 @@ reversed.
 - Oversized, malformed, duplicate, wrong-day, redirected, or unauthenticated OpenRouter ranking
   responses; catalogue/ranking slug mismatches; and model IDs not in the last validated offer set.
 - YouTube URLs with option-like video IDs, shell suffixes, block/rate-limit responses, oversized
-  metadata, captions, playlists, thumbnails, stderr, and process output.
+  metadata, falsey non-dictionary caption inventories, captions, playlists, thumbnails, stderr,
+  and process output.
+- Missing, oversized, non-UTF-8, symlinked, non-regular, path-swapped, and cancellation-raced vault
+  profiles, including predictable temporary-file collisions.
 - Portable/system yt-dlp configuration and default plugin locations.
 - Archive traversal, symlink entries, oversized extraction, checksum mismatch, and concurrent install.
 - Spoofed, malformed, equal-version, downgraded, empty-signature, and wrong-signature updater manifests.

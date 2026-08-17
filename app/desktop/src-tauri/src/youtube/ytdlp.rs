@@ -54,7 +54,22 @@ impl YtDlpCommands {
     pub(super) fn metadata(&self, url: &YoutubeUrl) -> ProcessSpec {
         self.spec(
             [
-                OsString::from("--dump-single-json"),
+                OsString::from("--output-na-placeholder"),
+                OsString::from("!nn-missing!"),
+                OsString::from("--print"),
+                OsString::from(
+                    "nn-metadata-v1:%(.{id,title,uploader,channel,duration,upload_date})j",
+                ),
+                OsString::from("--print"),
+                OsString::from("nn-fields:%()l"),
+                OsString::from("--print"),
+                OsString::from("nn-human-languages:%(subtitles)l"),
+                OsString::from("--print"),
+                OsString::from("nn-human-first-exts:%(subtitles.:.0.ext)j"),
+                OsString::from("--print"),
+                OsString::from("nn-auto-languages:%(automatic_captions)l"),
+                OsString::from("--print"),
+                OsString::from("nn-auto-first-exts:%(automatic_captions.:.0.ext)j"),
                 OsString::from("--skip-download"),
                 OsString::from("--no-playlist"),
                 OsString::from(url.as_ref()),
