@@ -47,8 +47,11 @@ fn capture_outcome(error: &CaptureError, message: String) -> ToolOutcome {
         // and nothing is broken.
         CaptureError::InvalidSource(_)
         | CaptureError::PlaylistInvalid(_)
-        | CaptureError::RequirementMissing(_)
-        | CaptureError::Cancelled(_) => ToolOutcome::Rejected,
+        | CaptureError::RequirementMissing(_) => ToolOutcome::Rejected,
+        // A Stop is not a confinement refusal. The timeline already has
+        // `Cancelled` / "run ended first" for this case; mapping it to
+        // `Rejected` paints "refused by NeuralNote" on a call the user ended.
+        CaptureError::Cancelled(_) => ToolOutcome::Cancelled,
         // Capture was attempted and came apart: the network, the extractor, the
         // audio pipeline, the vault profile, or data we fetched and could not
         // use. "Refused by NeuralNote" would be false for every one of these.
@@ -162,7 +165,6 @@ mod tests {
             CaptureError::InvalidSource("not a YouTube URL".into()),
             CaptureError::PlaylistInvalid("targets a video outside the selection".into()),
             CaptureError::RequirementMissing("call fetch_captions first".into()),
-            CaptureError::Cancelled("the user stopped the run".into()),
         ] {
             assert_eq!(
                 settle_capture_error(error.clone()).outcome,
@@ -170,6 +172,21 @@ mod tests {
                 "{error} must read as a refusal"
             );
         }
+    }
+
+    #[test]
+    fn a_user_stop_is_cancelled_not_a_refusal() {
+        // A Stop is the user ending the run. Grouping it with InvalidSource /
+        // PlaylistInvalid / RequirementMissing painted the timeline
+        // "refused by NeuralNote" for a call nobody declined — the walk
+        // failure on an in-flight playlist-enumeration cancel.
+        let result =
+            settle_capture_error(CaptureError::Cancelled("the user stopped the run".into()));
+        assert_eq!(
+            result.outcome,
+            ToolOutcome::Cancelled,
+            "a user's Stop must settle as Cancelled, never Rejected"
+        );
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use crate::ai::elicitation::{elicit_user, ElicitationOutcome};
 use crate::ai::events::{ChatEvent, ElicitOption, Elicitation};
 use crate::ai::llm::UserPrompt;
-use crate::ai::orchestrator::{activation_failure_message, skill_activation_failed};
+use crate::ai::skill_activation::{activation_failure_message, skill_activation_failed};
 use crate::ai::skills::YOUTUBE_DISTIL_SKILL_ID;
 use crate::ai::tools::{
     action, function_tool, reject, reject_and_complete, settle_vault_error, ToolContext,

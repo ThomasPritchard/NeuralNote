@@ -433,6 +433,8 @@ impl YoutubeToolSession {
     }
 
     pub(crate) fn fail_playlist_item(&mut self, reason: impl Into<String>) {
+        // TODO(playlist-handoff, #187): advancing `current` here leaves a follow-up
+        // capture of the failed video looking like a URL/id mismatch.
         let Some(run) = self.playlist.as_mut() else {
             return;
         };

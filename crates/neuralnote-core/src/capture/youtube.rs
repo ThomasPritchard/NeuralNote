@@ -239,14 +239,16 @@ struct RawPlaylist {
     #[serde(rename = "_type")]
     kind: String,
     id: String,
-    title: String,
+    #[serde(default)]
+    title: Option<String>,
     entries: Vec<Option<RawPlaylistEntry>>,
 }
 
 #[derive(Deserialize)]
 struct RawPlaylistEntry {
     id: String,
-    title: String,
+    #[serde(default)]
+    title: Option<String>,
     #[serde(default)]
     duration: Option<f64>,
 }
@@ -442,8 +444,12 @@ pub fn parse_playlist(bytes: &[u8]) -> Result<Playlist, CaptureError> {
         return Err(playlist_invalid("playlist exceeds the entry limit"));
     }
     let playlist_id = bounded_identifier(raw.id, "playlist id", 128).map_err(playlist_invalid)?;
-    let title =
-        bounded_text(raw.title, "playlist title", MAX_TITLE_BYTES).map_err(playlist_invalid)?;
+    let title = match raw.title {
+        Some(title) => {
+            bounded_text(title, "playlist title", MAX_TITLE_BYTES).map_err(playlist_invalid)?
+        }
+        None => playlist_id.clone(),
+    };
     let mut seen = BTreeSet::new();
     let mut entries = Vec::with_capacity(raw.entries.len());
     let mut unavailable_entries_skipped = 0;
@@ -455,8 +461,11 @@ pub fn parse_playlist(bytes: &[u8]) -> Result<Playlist, CaptureError> {
         if !valid_video_id(&raw_entry.id) {
             return Err(playlist_invalid("playlist entry has an invalid video id"));
         }
-        let entry_title = bounded_text(raw_entry.title, "playlist entry title", MAX_TITLE_BYTES)
-            .map_err(playlist_invalid)?;
+        let entry_title = match raw_entry.title {
+            Some(title) => bounded_text(title, "playlist entry title", MAX_TITLE_BYTES)
+                .map_err(playlist_invalid)?,
+            None => raw_entry.id.clone(),
+        };
         let duration_seconds = checked_duration(raw_entry.duration).map_err(playlist_invalid)?;
         if seen.insert(raw_entry.id.clone()) {
             entries.push(PlaylistEntry {

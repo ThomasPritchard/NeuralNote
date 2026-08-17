@@ -361,12 +361,28 @@ export function reduceAssistantForTurn(
   );
   if (index < 0) return messages;
   const turn = messages[index] as AssistantMessage;
-  if (turn.done && (!turn.stopped || event.type !== "noteWritten")) {
+  if (turn.done && (!turn.stopped || !isPostStopSettlement(event))) {
     return messages;
   }
   const next = messages.slice();
   next[index] = reduceAssistant(turn, event);
   return next;
+}
+
+/** Events that may still arrive after the user presses Stop.
+ *
+ *  Stop marks the turn `done` so the composer re-opens. In-flight tools,
+ *  partial-run notices, and notes already committed must still land —
+ *  otherwise a playlist-enumeration node spins forever. Answer, error, and
+ *  Done must not: those would revive a turn the user already ended. */
+function isPostStopSettlement(event: ChatEvent): boolean {
+  return (
+    event.type === "noteWritten" ||
+    event.type === "toolResult" ||
+    event.type === "partialRun" ||
+    event.type === "usage" ||
+    event.type === "coverage"
+  );
 }
 
 /** Set the neutral stopped terminal state only on the matching active turn. */
