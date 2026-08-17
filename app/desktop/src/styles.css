@@ -490,6 +490,26 @@ html[data-font-family="sourceSerif4"] {
   background: var(--ring);
 }
 
+/*
+ * The note pane is the editor's container of record (#166).
+ *
+ * The editor used to size itself against the WINDOW — `100vh` less the two
+ * bars, and floors and ceilings in `vh`. That held only while the app owned the
+ * whole window. Since #117 the notification dock is a SIBLING of the app in one
+ * column rather than an overlay above it, so the app column shrinks by whatever
+ * the dock takes (up to `max-h-[40vh]`) and a viewport-relative editor keeps the
+ * height it had before, hanging past the bottom of the pane showing it.
+ *
+ * `container-type: size` makes `cqh` below measure THIS box instead. The pane's
+ * height is definite either way — it is a stretched flex item of the panes row —
+ * so nothing here depends on its own contents. Note the identity that keeps the
+ * everyday window pixel-for-pixel as it was: with no dock raised, `100cqh` IS
+ * `100vh` less the title bar and the status bar.
+ */
+.nn-note-pane {
+  container-type: size;
+}
+
 .nn-chat-pane {
   flex: 0 0 var(--chat-width);
   width: var(--chat-width);
@@ -557,13 +577,6 @@ html[data-font-family="sourceSerif4"] {
   text-wrap: pretty;
 }
 
-/* The CodeMirror document is the source and the preview. Keep its chrome
-   invisible so it shares the reader's typography without hiding editability. */
-.nn-source-editor,
-.nn-source-editor .cm-editor {
-  min-height: 50vh;
-}
-
 /*
  * CodeMirror's base theme declares `line-height: 1.4` directly on
  * `.cm-scroller`, a descendant of `.cm-editor`. A descendant's own declaration
@@ -575,14 +588,28 @@ html[data-font-family="sourceSerif4"] {
   line-height: 1.8;
 }
 
+/* The CodeMirror document is the source and the preview. Keep its chrome
+   invisible so it shares the reader's typography without hiding editability. */
 .nn-source-editor .cm-editor {
   background: transparent;
   color: color-mix(in oklab, var(--foreground) 90%, transparent);
   font-family: var(--font-sans);
   font-size: 1rem;
   caret-color: var(--primary);
-  height: calc(100vh - var(--titlebar-height) - var(--note-toolbar-height) - var(--statusbar-height) - 8rem);
-  max-height: 72vh;
+  /*
+   * The pane (`.nn-note-pane`, `container-type: size`) less the toolbar it sits
+   * under and the reader's own frame around it — `py-10` plus the `mt-7` above
+   * the editor, with a little slack. `.cm-scroller` carries `overflow: auto`, so
+   * this is the window CodeMirror reads the document through and the box it
+   * judges a caret to be "in view" inside; measured against anything larger than
+   * the pane, that judgement is about pixels the user cannot see. Held to the
+   * container rather than the viewport, it shrinks with the pane when the
+   * notification dock takes its share (#166).
+   *
+   * No ceiling: `100cqh` already is one, and the old `max-height: 72vh` was a
+   * second viewport measure that could only ever disagree with this.
+   */
+  height: calc(100cqh - var(--note-toolbar-height) - 8rem);
 }
 
 .nn-source-editor .cm-editor.cm-focused {

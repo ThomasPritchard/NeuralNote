@@ -216,7 +216,13 @@ function TextNoteBody({
           Live preview is temporarily unavailable: {previewError}
         </output>
       )}
-      <div className="flex min-h-[50vh] flex-col">
+      {/* No floor of its own. A `min-h-[50vh]` here was a third opinion about
+          the editor's height, held against the WINDOW, and it outranked both
+          the editor's own sizing and the pane it had to fit inside — at the
+          minimum window with the dock full it alone was taller than the pane
+          (#166). The editor sizes itself from `.nn-note-pane`; this wrapper
+          just stacks it. */}
+      <div className="flex flex-col">
         <Suspense
           fallback={
             <output className="block text-sm text-muted-foreground">
@@ -327,7 +333,9 @@ export function NotePane({
   }
 
   return (
-    <main className="flex min-w-0 flex-1 flex-col bg-background">
+    // `nn-note-pane` makes this the size container the editor measures against,
+    // so the editor tracks the pane rather than the window (#166).
+    <main className="nn-note-pane flex min-w-0 flex-1 flex-col bg-background">
       <SaveAnnouncements
         notePath={note.path}
         dirty={open.dirty}
