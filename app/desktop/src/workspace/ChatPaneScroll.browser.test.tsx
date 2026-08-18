@@ -152,7 +152,7 @@ function writeEdit(lines: number, complete: boolean): NoteEditView {
 function writeTurn(lines: number, settled: boolean, answerSentences: number): AssistantMessage {
   return {
     ...emptyAssistant(false, "turn-write"),
-    phase: "thinking",
+    phase: "planning",
     noteEdits: [writeEdit(lines, settled)],
     toolCalls: settled
       ? [
@@ -578,7 +578,7 @@ function approvalTurn(pending: boolean, answerSentences: number): AssistantMessa
   const approval = approvalView(pending);
   return {
     ...emptyAssistant(false, "turn-approval"),
-    phase: "thinking",
+    phase: "planning",
     toolCalls: [
       {
         id: APPROVAL_CALL_ID,

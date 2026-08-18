@@ -43,13 +43,6 @@ const MISSING_YTDLP_FAILURE = {
   missingBinary: "yt-dlp",
 };
 
-const PLAYFUL_PROGRESS_PAIRS = [
-  ["Sending message", "Thinking"],
-  ["Dispatching a tiny messenger", "Connecting the dots"],
-  ["Knocking on the model's door", "Rummaging through the mental drawers"],
-  ["Launching a thought balloon", "Consulting the inner librarian"],
-] as const;
-
 function renderMessages(turn: AssistantMessage, runIds: Record<number, string> = {}) {
   const onOpenCitation = vi.fn();
   const onOpenNote = vi.fn();
@@ -441,59 +434,11 @@ describe("ChatMessages — skill turns", () => {
     expect(screen.queryByText("Searching your vault")).not.toBeInTheDocument();
   });
 
-  it("varies the playful copy across prompts while keeping one voice per prompt", () => {
-    const labels = [
-      "Summarise my project notes",
-      "What did I decide about search?",
-      "Find the meeting follow-ups",
-      "Explain the citation strategy",
-      "Draft a short release note",
-      "Connect the ideas in this folder",
-    ].map((prompt) => {
-      const view = render(
-        <ChatMessages
-          messages={[{ role: "user", content: prompt }, emptyAssistant()]}
-          onOpenCitation={vi.fn()}
-          onOpenNote={vi.fn()}
-          onSendFollowUp={vi.fn()}
-          busy
-          runIds={{}}
-        />,
-      );
-      const first = view.container.querySelector("output")?.textContent;
-      view.rerender(
-        <ChatMessages
-          messages={[
-            { role: "user", content: prompt },
-            reduceAssistant(emptyAssistant(), { type: "processing" }),
-          ]}
-          onOpenCitation={vi.fn()}
-          onOpenNote={vi.fn()}
-          onSendFollowUp={vi.fn()}
-          busy
-          runIds={{}}
-        />,
-      );
-      const thinking = view.container.querySelector("output")?.textContent;
-      expect(
-        PLAYFUL_PROGRESS_PAIRS.some(
-          ([sending, matchingThinking]) =>
-            sending === first && matchingThinking === thinking,
-        ),
-      ).toBe(true);
-      view.unmount();
-      return first;
-    });
-
-    expect(new Set(labels).size).toBeGreaterThan(1);
-    expect(
-      labels.every((label) =>
-        PLAYFUL_PROGRESS_PAIRS.some(([sending]) => sending === label),
-      ),
-    ).toBe(true);
-  });
-
-  it("shows thinking only after Processing and search only after Searching", () => {
+  it("names each phase only once the event that grounds it has arrived", () => {
+    // The head used to say "Thinking" on `processing` — an event emitted before
+    // a single token had been asked for. Every label below is now backed by the
+    // event that makes it true, and "Thinking" belongs to the one event that
+    // proves reasoning is arriving.
     const accepted = reduceAssistant(emptyAssistant(), { type: "processing" });
     const { rerender } = render(
       <ChatMessages
@@ -505,13 +450,42 @@ describe("ChatMessages — skill turns", () => {
         runIds={{}}
       />,
     );
-    const thinkingLabel = document.querySelector("output")?.textContent;
-    expect(PLAYFUL_PROGRESS_PAIRS.map(([, thinking]) => thinking)).toContain(
-      thinkingLabel,
-    );
+    expect(screen.getByText("Sending message")).toBeInTheDocument();
+    expect(screen.queryByText("Thinking")).not.toBeInTheDocument();
     expect(screen.queryByText("Searching your vault")).not.toBeInTheDocument();
 
-    const searching = reduceAssistant(accepted, { type: "searching", query: "notes", callId: null });
+    const planning = reduceAssistant(accepted, {
+      type: "planningRound",
+      round: 1,
+      maxRounds: 8,
+      playlist: null,
+    });
+    rerender(
+      <ChatMessages
+        messages={[{ role: "user", content: "question" }, planning]}
+        onOpenCitation={vi.fn()}
+        onOpenNote={vi.fn()}
+        onSendFollowUp={vi.fn()}
+        busy
+        runIds={{}}
+      />,
+    );
+    expect(screen.getByText("Planning")).toBeInTheDocument();
+
+    const reasoning = reduceAssistant(planning, { type: "thinking", delta: "weighing" });
+    rerender(
+      <ChatMessages
+        messages={[{ role: "user", content: "question" }, reasoning]}
+        onOpenCitation={vi.fn()}
+        onOpenNote={vi.fn()}
+        onSendFollowUp={vi.fn()}
+        busy
+        runIds={{}}
+      />,
+    );
+    expect(screen.getByText("Thinking")).toBeInTheDocument();
+
+    const searching = reduceAssistant(reasoning, { type: "searching", query: "notes", callId: null });
     rerender(
       <ChatMessages
         messages={[{ role: "user", content: "question" }, searching]}

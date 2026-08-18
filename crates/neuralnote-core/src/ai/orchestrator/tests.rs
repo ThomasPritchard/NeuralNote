@@ -784,6 +784,127 @@ fn playlist_orchestrator_processes_21_transcripts_with_bounded_context_and_full_
     assert_eq!(completion_requests.len(), 22);
 }
 
+/// A playlist run whose beacons can be read: three videos, two writes each.
+fn run_three_video_playlist() -> Vec<ChatEvent> {
+    let vault = tempfile::tempdir().unwrap();
+    let selected = (0..3)
+        .map(|index| format!("V{index:010}"))
+        .collect::<Vec<_>>();
+    let prompt = PlaylistPrompt(Mutex::new(VecDeque::from([
+        Some(selected.clone()),
+        Some(vec!["continue".into()]),
+    ])));
+    let mut script = vec![tool_call(
+        "select",
+        "select_playlist_videos",
+        r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-orchestrator_3"}"#,
+    )];
+    for (work_item, video_id) in selected.iter().enumerate() {
+        script.push(Completion {
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: format!("literature-{work_item}"),
+                    name: "write_note".into(),
+                    arguments: serde_json::json!({
+                        "rel_path": format!("literature-{work_item}.md"),
+                        "content": format!("# Lecture {work_item}\n\nDistilled from {video_id}."),
+                        "kind": "literature",
+                        "work_item": work_item,
+                    })
+                    .to_string(),
+                },
+                ToolCall {
+                    id: format!("transcript-{work_item}"),
+                    name: "write_note".into(),
+                    arguments: serde_json::json!({
+                        "rel_path": format!("transcript-{work_item}.md"),
+                        "content": realistic_transcript(video_id),
+                        "kind": "transcript",
+                        "work_item": work_item,
+                    })
+                    .to_string(),
+                },
+            ],
+        });
+    }
+    let llm = MockLlmClient::new(script, "Playlist complete.");
+    let retriever = KeywordRetriever::new(vault.path());
+    let skills = SkillRegistry::built_in(&[]).unwrap();
+    let environment = youtube_test_environment();
+    let pricing = PricingInput::Local;
+    let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+        .with_approval(
+            unattended_policy(),
+            &TEST_APPROVAL_PROMPT,
+            &TEST_APPROVAL_CLASSIFIER,
+        )
+        .with_youtube_io(&PlaylistIo(3))
+        .with_pricing(&pricing);
+    let mut sink = VecSink::default();
+    block_on(run_chat(
+        "Distil this playlist",
+        &[],
+        vec![YOUTUBE_DISTIL_SKILL_ID.into()],
+        vault.path(),
+        "test-model",
+        &retriever,
+        &llm,
+        &services,
+        &mut sink,
+        &Guards::default(),
+    ))
+    .unwrap();
+    sink.events
+}
+
+#[test]
+fn a_playlist_round_beacon_names_the_video_it_is_working_on() {
+    // A playlist bypasses the iteration guard by design, so `round N of
+    // max_rounds` runs past its ceiling and the clamp pins the pair at "one
+    // round from done" for the rest of the run. The playlist's own length is
+    // the denominator that cannot move — it was fixed when the user chose the
+    // videos — so during a playlist the beacon says which video is in flight
+    // and the head counts videos instead of rounds.
+    let events = run_three_video_playlist();
+
+    let positions = events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::PlanningRound { playlist, .. } => Some(*playlist),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert!(positions.len() > 3, "one beacon per round: {positions:?}");
+    // The first round is the one that DECIDES the selection, so no playlist
+    // exists yet and the beacon says so rather than guessing "video 1 of ?".
+    assert_eq!(positions[0], None);
+    let during = &positions[1..];
+    assert!(
+        during.iter().all(|position| position.is_some()),
+        "every round after the selection names its video: {positions:?}"
+    );
+    let numbered = during.iter().flatten().collect::<Vec<_>>();
+    assert!(
+        numbered
+            .iter()
+            .all(|position| position.total == 3 && (1..=3).contains(&position.position)),
+        "1-based and never past a denominator that cannot move: {numbered:?}"
+    );
+    assert!(
+        numbered
+            .windows(2)
+            .all(|pair| pair[0].position <= pair[1].position),
+        "a playlist only ever moves forward: {numbered:?}"
+    );
+    assert_eq!(
+        numbered.last().map(|position| position.position),
+        Some(3),
+        "the run reaches the last video: {numbered:?}"
+    );
+}
+
 #[test]
 fn playlist_cancellation_inside_a_batched_turn_skips_later_calls_and_keeps_partial_ledger() {
     let vault = tempfile::tempdir().unwrap();
@@ -3815,7 +3936,7 @@ impl LlmClient for StreamingToolLlm {
     }
 }
 
-fn run_streamed_tool_turn(llm: &StreamingToolLlm) -> (CoreResult<Completion>, VecSink) {
+fn run_streamed_tool_turn(llm: &dyn LlmClient) -> (CoreResult<Completion>, VecSink) {
     let env = retry_env();
     let services = SkillServices::new(
         &env.skills,
@@ -3856,6 +3977,13 @@ fn a_run_past_its_ceiling_still_never_announces_a_round_above_it() {
     // "Round 17 of 16" is arithmetically impossible and reads as a bug; worse,
     // the denominator would then chase the numerator forever, telling the user
     // the run is permanently one round from finishing.
+    //
+    // A playlist now travels its own honest pair beside these two
+    // (`a_playlist_round_beacon_names_the_video_it_is_working_on`), so the
+    // clamp is no longer what a playlist user reads. It stays as the backstop
+    // for every other way `consumed` can reach the ceiling — measured here with
+    // no playlist position at all, which is precisely the case with nothing
+    // else to fall back on.
     let base_ceiling = Guards::default().max_iterations;
     let skill_ceiling = 16;
     for consumed in 0..(base_ceiling + skill_ceiling + 8) {
@@ -3863,7 +3991,7 @@ fn a_run_past_its_ceiling_still_never_announces_a_round_above_it() {
         let max_iterations = base_ceiling.max(skill_ceiling).max(consumed);
         let ChatEvent::PlanningRound {
             round, max_rounds, ..
-        } = round_beacon(consumed, max_iterations)
+        } = round_beacon(consumed, max_iterations, None)
         else {
             panic!("round_beacon announces a round");
         };
@@ -3917,6 +4045,65 @@ fn a_streamed_tool_turn_that_failed_before_emitting_is_still_retried_once() {
         sink.events.is_empty(),
         "the turn published nothing across BOTH attempts, got {:?}",
         sink.events
+    );
+}
+
+#[test]
+fn a_keepalive_does_not_count_as_something_the_user_has_seen() {
+    // The tool turn forwards keepalives now, because it is the turn whose
+    // silence the live head has to explain. That must not quietly cost the turn
+    // its one bounded retry: a keepalive carries no content, renders nothing on
+    // its own, and a second one says exactly what the first did — so a replay
+    // has nothing to rewind. This is the same exemption `record_usage` already
+    // has, measured on the retry rather than on the guard's private field.
+    struct KeepaliveThenFailingToolTurn {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for KeepaliveThenFailingToolTurn {
+        async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+            panic!("a client that streams tool turns must not fall back to the buffered one")
+        }
+
+        async fn complete_tool_streaming(
+            &self,
+            _req: &LlmRequest,
+            sink: &mut dyn EventSink,
+        ) -> CoreResult<Completion> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            sink.send(ChatEvent::Keepalive);
+            Err(CoreError::Llm(
+                "openrouter returned 429 Too Many Requests".into(),
+            ))
+        }
+
+        async fn complete_streaming(
+            &self,
+            _req: &LlmRequest,
+            _sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            panic!("the answer turn is not reached")
+        }
+    }
+
+    let llm = KeepaliveThenFailingToolTurn {
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+    };
+
+    let (result, sink) = run_streamed_tool_turn(&llm);
+
+    assert!(result.is_err(), "both attempts failed");
+    assert_eq!(
+        llm.attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "retried exactly once despite the keepalive"
+    );
+    assert_eq!(
+        sink.events,
+        vec![ChatEvent::Keepalive, ChatEvent::Keepalive],
+        "each attempt's liveness signal still reaches the user"
     );
 }
 

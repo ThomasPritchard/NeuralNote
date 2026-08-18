@@ -9,12 +9,17 @@ pub(super) struct ThinkingCounter<'a> {
     pub(super) count: usize,
 }
 
-/// A pass-through sink that remembers whether anything went out through it.
+/// A pass-through sink that remembers whether anything a replay could rewind
+/// went out through it.
 ///
 /// The one fact `complete_tool_turn` needs before it may retry: nothing the user
 /// can already see was published. Watching the sink means the answer holds for
 /// any client, including one whose streaming implementation this crate has never
 /// seen — rather than trusting each implementation to report it honestly.
+///
+/// Two things pass through without latching it, and both are listed at their
+/// method: a usage report (not visible) and a keepalive (visible, but idempotent
+/// — a second one says exactly what the first did).
 pub(super) struct EmissionGuard<'a> {
     pub(super) inner: &'a mut dyn EventSink,
     pub(super) emitted: bool,
@@ -22,7 +27,14 @@ pub(super) struct EmissionGuard<'a> {
 
 impl EventSink for EmissionGuard<'_> {
     fn send(&mut self, event: ChatEvent) {
-        self.emitted = true;
+        // A keepalive is exempt, for the same reason `record_usage` below is: it
+        // is not something a replay could rewind. It carries no content, renders
+        // nothing on its own, and a second one says exactly what the first did.
+        // Latching on it would let a provider that sent one comment line before
+        // a transient failure silently disable the turn's one bounded retry —
+        // and the tool-deciding turn, the one that forwards these, is exactly
+        // the turn long enough to receive one.
+        self.emitted |= !matches!(event, ChatEvent::Keepalive);
         self.inner.send(event);
     }
 

@@ -2,7 +2,9 @@
 
 use super::context_budget::fit_prompt_to_window;
 use super::coverage::{push_unique, CoverageAcc};
-use super::playlist::{handle_empty_tool_turn, playlist_preflight, LoopControl, PlaylistLoopState};
+use super::playlist::{
+    handle_empty_tool_turn, playlist_position, playlist_preflight, LoopControl, PlaylistLoopState,
+};
 use super::session::ChatSession;
 use super::settlement::{
     emit_tool_call, emit_tool_result, playlist_failure_reason, settle_skipped, settlement_for,
@@ -11,7 +13,7 @@ use super::settlement::{
 use super::usage::EmissionGuard;
 use super::PARTIAL_RUN_CANCELLED;
 use crate::ai::approval::{self, ApprovalContext, ApprovalDecision, ApprovalGate, ApprovedCall};
-use crate::ai::events::{ChatEvent, EventSink};
+use crate::ai::events::{ChatEvent, EventSink, PlaylistPosition};
 use crate::ai::evidence::EvidenceRegistry;
 use crate::ai::llm::{Completion, LlmMessage, LlmRequest, ToolCall};
 use crate::ai::plan::RunPlan;
@@ -88,6 +90,7 @@ impl ChatSession<'_> {
             sink.send(round_beacon(
                 consumed,
                 active_skills.max_iterations(consumed),
+                playlist_position(youtube_session),
             ));
             // This tool-DECIDING turn is idempotent (no tool has run yet), so a single
             // transient transport failure is retried once rather than aborting the run.
@@ -535,25 +538,28 @@ impl ChatSession<'_> {
 /// and it would then have the denominator chase the numerator for the rest of
 /// the run, telling the user they are permanently one round from finished.
 ///
-/// What the clamp says instead is "at the ceiling", every round, which is true
-/// but thin. The richer answer — a playlist run has no applicable round ceiling
-/// and should show a bare round number — needs `max_rounds` to become optional,
-/// which is a change to the frozen wire shape rather than a fix, so it is a
-/// ruling for whoever renders these numbers rather than something to decide here.
+/// The clamp stays as the backstop for the ordinary path, where what it says —
+/// "at the ceiling" — is true, if thin. What it could never do is give a
+/// playlist an honest denominator, because there isn't one to be had in rounds.
+/// So the beacon carries `playlist` beside the pair: the number of videos the
+/// user picked is fixed for the run and cannot be overtaken, which dissolves the
+/// moving ceiling rather than clamping around it. Whoever renders these numbers
+/// counts videos while `playlist` is present and rounds when it is not.
 ///
 /// Both numbers saturate rather than wrap: a wrapped round would read as a run
 /// starting over, the exact confusion `PlanningRound` replaced `Processing` to end.
-pub(super) fn round_beacon(consumed: usize, max_iterations: usize) -> ChatEvent {
+pub(super) fn round_beacon(
+    consumed: usize,
+    max_iterations: usize,
+    playlist: Option<PlaylistPosition>,
+) -> ChatEvent {
     let round = u32::try_from(consumed)
         .unwrap_or(u32::MAX)
         .saturating_add(1);
     ChatEvent::PlanningRound {
         round,
         max_rounds: u32::try_from(max_iterations).unwrap_or(u32::MAX).max(round),
-        // The wire can carry the playlist item in flight; nothing reads the
-        // session here yet, so this beacon says "no playlist" until the phase
-        // that teaches the head to count videos wires it up.
-        playlist: None,
+        playlist,
     }
 }
 

@@ -14,6 +14,7 @@ import type {
   ElicitOption,
   GatedTool,
   NoteKind,
+  PlaylistPosition,
   StepStatus,
   ToolStatus,
 } from "../lib/types";
@@ -145,6 +146,30 @@ export interface TranscriptSourceView {
   relPath: string | null;
 }
 
+/** Which tool-deciding round the run is on, as the last beacon said.
+ *
+ *  `max` is never cached: activating a skill raises the ceiling mid-run, so the
+ *  backend re-reads it every round and this holds whatever the latest beacon
+ *  carried. During a playlist it is not the number to show at all — the
+ *  playlist's own length is (see `AssistantMessage.playlist`). */
+export interface PlanningRoundView {
+  current: number;
+  max: number;
+}
+
+/** The video the run is working on, for the card beside the live head.
+ *
+ *  Every field is host-read metadata, never model prose. A `null` thumbnail is
+ *  the *degraded path, not an error*: the fetch is capped and timed out, and a
+ *  card with no image is the one that has to look deliberate. */
+export interface VideoPreviewView {
+  videoId: string;
+  title: string;
+  durationSecs: number | null;
+  channel: string | null;
+  thumbnailDataUri: string | null;
+}
+
 /** One step of the plan the model declared, and where it has got to.
  *
  *  `label` is model prose — unavoidably, since only the model knows what it
@@ -175,8 +200,34 @@ export interface AssistantMessage {
   role: "assistant";
   /** Caller-generated identity used to route events and cancellation outcomes. */
   turnId: string | null;
-  /** The last progress phase backed by an actual transport/backend event. */
-  phase: "sending" | "thinking" | "searching" | "reading" | "verifying";
+  /** The last progress phase backed by an actual transport/backend event.
+   *
+   *  There is deliberately no `"thinking"` member. "Thinking" is a claim that
+   *  reasoning tokens are arriving *right now*, which no phase can hold on to —
+   *  it used to be set by `processing`, an event emitted before a single token
+   *  had been asked for. `reasoningStreaming` carries that claim instead, and
+   *  the absence of the member is what stops it coming back. */
+  phase: "sending" | "planning" | "searching" | "reading" | "verifying";
+  /** Reasoning deltas are arriving right now: true on a `thinking` delta and
+   *  false again on the next event that reports anything else. */
+  reasoningStreaming: boolean;
+  /** The tool-deciding round the run is on, or `null` before the first beacon. */
+  round: PlanningRoundView | null;
+  /** Which video of a selected playlist is in flight, or `null` when no
+   *  playlist is running. Re-read from every beacon, so the end of a playlist
+   *  clears it rather than leaving "video 3 of 3" over the answer turn. */
+  playlist: PlaylistPosition | null;
+  /** The card for the video being processed, or `null`. */
+  videoPreview: VideoPreviewView | null;
+  /** When the turn's first event landed, as the client's clock read it — the
+   *  origin for the live elapsed readout. `0` means nothing has arrived yet,
+   *  and renders as no clock rather than as `0s`. */
+  startedAt: number;
+  /** The last event that reported PROGRESS. What the stall notice watches. */
+  lastEventAt: number;
+  /** The last event of any kind, keepalives included. What tells "still
+   *  working" apart from "the provider has gone away". */
+  lastAliveAt: number;
   skillActivations: Array<{ id: string; name: string }>;
   /** Skills that could not be activated, reported structurally by the backend —
    *  never inferred from the wording of a progress message. */
@@ -259,6 +310,15 @@ export function emptyAssistant(
     role: "assistant",
     turnId,
     phase: "sending",
+    reasoningStreaming: false,
+    round: null,
+    playlist: null,
+    videoPreview: null,
+    // Stamped by the first event rather than by this factory, so a turn built
+    // for a test is a fixed value and two of them are still comparable.
+    startedAt: 0,
+    lastEventAt: 0,
+    lastAliveAt: 0,
     skillActivations: [],
     skillActivationFailures: [],
     skillSteps: [],
@@ -348,11 +408,45 @@ export function showsNothingFoundCard(turn: AssistantMessage): boolean {
   );
 }
 
+/** Fold one event in, and date the turn by it.
+ *
+ *  This is where a `keepalive` finally means something. It refreshes
+ *  `lastAliveAt` and deliberately leaves `lastEventAt` alone, which is the whole
+ *  distinction: the socket being alive is not the work progressing, so a
+ *  provider emitting comment lines forever can never clear a stall notice about
+ *  a run that has stopped producing anything.
+ *
+ *  The clock lives here rather than in the pure fold so `reduceAssistant` stays
+ *  a function of the event alone — and so a caller folding a fixture with
+ *  `Array.reduce` cannot accidentally pass the array index in as the time.
+ *
+ *  `startedAt` is set by the first event to arrive, not by the send: the
+ *  backend emits `processing` at the top of the run, before any provider call,
+ *  so this is within an IPC hop of the moment `usage.elapsedMs` measures from. */
+function foldWithLiveness(
+  turn: AssistantMessage,
+  event: ChatEvent,
+  now: number,
+): AssistantMessage {
+  if (event.type === "keepalive") return { ...turn, lastAliveAt: now };
+  const folded = reduceAssistant(turn, event);
+  // An event that changed nothing has nothing to date either — and dating it
+  // would cost the identity check below the render it exists to prevent.
+  if (folded === turn) return turn;
+  return {
+    ...folded,
+    startedAt: turn.startedAt === 0 ? now : turn.startedAt,
+    lastEventAt: now,
+    lastAliveAt: now,
+  };
+}
+
 /** Fold one transport event into the assistant turn that owns its caller ID. */
 export function reduceAssistantForTurn(
   messages: ChatMessage[],
   turnId: string,
   event: ChatEvent,
+  now: number = Date.now(),
 ): ChatMessage[] {
   const index = messages.findIndex(
     (message) =>
@@ -364,11 +458,13 @@ export function reduceAssistantForTurn(
   if (turn.done && (!turn.stopped || !isPostStopSettlement(event))) {
     return messages;
   }
-  const reduced = reduceAssistant(turn, event);
-  // An event that changed nothing returns the SAME list, not a copy of it.
-  // `keepalive` says the socket is alive rather than that anything happened, and
-  // a fresh array would still commit a render — the transcript's scroll-follow
-  // re-asserts its pin on every commit, so an inert event must not produce one.
+  const reduced = foldWithLiveness(turn, event, now);
+  // An event that changed nothing returns the SAME list, not a copy of it: a
+  // fresh array would still commit a render, and the transcript's scroll-follow
+  // re-asserts its pin on every commit. `toolProgress` is the variant that has
+  // nothing to say yet and so must not reach the DOM at all. A `keepalive` no
+  // longer qualifies — it now refreshes the liveness the head reads, which is a
+  // real change to real state.
   if (reduced === turn) return messages;
   const next = messages.slice();
   next[index] = reduced;

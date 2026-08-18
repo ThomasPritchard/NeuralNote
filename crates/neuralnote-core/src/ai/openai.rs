@@ -527,15 +527,20 @@ pub fn consume_tool_sse_line(
             accumulator.abandon(tool_stream::ABANDONED_TURN_FAILED, sink);
             Err(CoreError::Llm(message))
         }
-        // Both turns CLASSIFY a comment line the same way; for now only the
-        // answer turn FORWARDS one. Not because this turn lacks a sink — it has
-        // `sink` right there and emits through it elsewhere in this function —
-        // but because nothing consumes a keepalive yet. The stall detector that
-        // gives it meaning arrives with the live head, and forwarding from the
-        // tool path is that change's job, made cheap by the classification
-        // already being here. Until then the asymmetry is deliberate and this is
-        // the one place that says so.
-        ToolSseEvent::Keepalive | ToolSseEvent::Other => Ok(false),
+        // Both turns classify a comment line the same way and both forward it.
+        // This is the turn that matters most: it can spend fifteen seconds
+        // deciding tool calls and emit nothing else, so it is the silence the
+        // live head has to explain — and a keepalive is what tells "still
+        // working" apart from "the provider has gone away".
+        //
+        // It is deliberately exempt from `EmissionGuard`'s retry latch (see
+        // `orchestrator::usage`): a replay cannot rewind a contentless signal,
+        // so forwarding here does not cost this turn its one bounded retry.
+        ToolSseEvent::Keepalive => {
+            sink.send(ChatEvent::Keepalive);
+            Ok(false)
+        }
+        ToolSseEvent::Other => Ok(false),
     }
 }
 
@@ -1172,9 +1177,12 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_turn_classifies_a_keepalive_without_emitting_one() {
-        // Both turns agree on what a comment line means; only the answer turn
-        // forwards it. A tool turn that emitted too would double every keepalive.
+    fn the_tool_turn_forwards_a_keepalive_exactly_as_the_answer_turn_does() {
+        // Both turns read the same stream, so a comment line swallowed on one
+        // path and surfaced on the other is precisely the drift the shared
+        // classifier exists to prevent. It also matters most HERE: the
+        // tool-deciding turn is the one that can spend fifteen seconds emitting
+        // nothing else, which is the silence the live head has to explain.
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
 
@@ -1182,7 +1190,7 @@ mod tests {
             consume_tool_sse_line(b": OPENROUTER PROCESSING", &mut accumulator, &mut sink).unwrap();
 
         assert!(!stop, "a keepalive never terminates the tool turn either");
-        assert!(sink.0.is_empty(), "{:?}", sink.0);
+        assert_eq!(sink.0, vec![ChatEvent::Keepalive]);
     }
 
     #[test]

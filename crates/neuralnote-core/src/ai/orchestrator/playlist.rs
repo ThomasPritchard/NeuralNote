@@ -1,11 +1,30 @@
 //! Per-video playlist control: bounded turns, announcements, and context eviction.
 
 use super::PARTIAL_RUN_CANCELLED;
-use crate::ai::events::{ChatEvent, EventSink};
+use crate::ai::events::{ChatEvent, EventSink, PlaylistPosition};
 use crate::ai::llm::{LlmMessage, Role};
 use crate::ai::youtube::YoutubeToolSession;
 
 const MAX_PLAYLIST_TURNS_PER_ITEM: usize = 8;
+
+/// Which video the run is working on, for the round beacon to carry.
+///
+/// `None` covers both "no playlist was ever selected" and "the playlist is
+/// finished", because in each case there is no item in flight to count — and a
+/// finished playlist reporting "video 3 of 3" for the answer turn would claim
+/// work that is over.
+///
+/// The 1-based position is composed here rather than at the reader: the session
+/// counts items from zero, and the wire is what a human reads.
+pub(super) fn playlist_position(session: &YoutubeToolSession) -> Option<PlaylistPosition> {
+    let (index, total, _video_id) = session.playlist_current()?;
+    Some(PlaylistPosition {
+        // Saturating like the round number beside it: a wrapped position would
+        // read as the playlist starting over.
+        position: u32::try_from(index.saturating_add(1)).unwrap_or(u32::MAX),
+        total: u32::try_from(total).unwrap_or(u32::MAX),
+    })
+}
 
 #[derive(Default)]
 pub(super) struct PlaylistLoopState {

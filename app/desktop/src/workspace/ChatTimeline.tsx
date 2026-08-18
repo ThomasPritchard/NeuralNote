@@ -22,7 +22,6 @@
 import { ChevronRight, Loader2 } from "lucide-react";
 import { searchOutcome, summarizeActivity } from "./chatMessage";
 import type { AssistantMessage, ToolCallView } from "./chatMessage";
-import { playfulProgressCopy } from "./playfulProgressCopy";
 import { approvalNodeState } from "./approvalCopy";
 import { ApprovalDegradedNode, ToolApprovalNode } from "./ChatApprovalNode";
 import { PlanStepNode } from "./ChatPlanNode";
@@ -48,14 +47,19 @@ function count(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
-/** A phase is visible only after the event that grounds it arrives. */
-function livePhase(phase: AssistantMessage["phase"], prompt: string): string {
-  const playful = playfulProgressCopy(prompt);
-  switch (phase) {
+/** What the run is actually doing, named plainly.
+ *
+ *  A phase is visible only after the event that grounds it arrives, and
+ *  "Thinking" is not one of them: it is a claim that reasoning tokens are
+ *  arriving right now, so it is read off `reasoningStreaming` and disappears
+ *  with the deltas. */
+function livePhase(turn: AssistantMessage): string {
+  if (turn.reasoningStreaming) return "Thinking";
+  switch (turn.phase) {
     case "sending":
-      return playful.sending;
-    case "thinking":
-      return playful.thinking;
+      return "Sending message";
+    case "planning":
+      return "Planning";
     case "searching":
       return "Searching your vault";
     case "reading":
@@ -191,17 +195,16 @@ function SummaryLine({
  *  aria-hidden because its per-node churn would otherwise announce 15–20 times.
  *  (`<output>` carries an implicit status role and renders inline.) */
 function LiveHead({
-  phase,
-  prompt,
+  turn,
   nodeCount,
-}: Readonly<{ phase: AssistantMessage["phase"]; prompt: string; nodeCount: number }>) {
+}: Readonly<{ turn: AssistantMessage; nodeCount: number }>) {
   return (
     <>
       <Loader2
         className="size-3.5 shrink-0 animate-spin text-primary motion-reduce:animate-none"
         aria-hidden
       />
-      <output>{livePhase(phase, prompt)}</output>
+      <output>{livePhase(turn)}</output>
       {nodeCount > 0 && (
         <span aria-hidden className="font-normal text-muted-foreground/60">
           · {count(nodeCount, "step", "steps")}
@@ -255,12 +258,10 @@ function needsAttention(turn: AssistantMessage, calls: ToolCallView[]): boolean 
  *  a user who re-opens it afterwards keeps it open. */
 export function ChatTimeline({
   turn,
-  prompt,
   answering,
   suppressLive,
 }: Readonly<{
   turn: AssistantMessage;
-  prompt: string;
   /** Answer tokens have started arriving — the answer is the live focus now. */
   answering: boolean;
   /** A skill narrative (header/steps/question) is already carrying the live
@@ -304,7 +305,7 @@ export function ChatTimeline({
             aria-hidden
           />
           {live ? (
-            <LiveHead phase={turn.phase} prompt={prompt} nodeCount={nodeCount} />
+            <LiveHead turn={turn} nodeCount={nodeCount} />
           ) : (
             <SummaryLine
               turn={turn}

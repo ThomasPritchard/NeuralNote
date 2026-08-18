@@ -1,17 +1,18 @@
 // The pure `ChatEvent` → `AssistantMessage` fold, split out of `chatMessage.ts`
 // when the approval-gate events pushed that file past the 500-line guardrail.
 //
-// **The `: AssistantMessage` return annotation on `reduceAssistant` is the whole
-// totality guarantee, and it travelled here with the function on purpose.** That
-// annotation plus `strict` is what makes an unhandled `ChatEvent` variant a
-// compile error (TS2366, "function lacks ending return statement"). There is no
-// `assertNever` behind it; lose the annotation in a later move and the safety net
-// disappears silently.
+// **The `: AssistantMessage` return annotation on `foldEvent` — the function
+// holding the switch — is the whole totality guarantee.** That annotation plus
+// `strict` is what makes an unhandled `ChatEvent` variant a compile error
+// (TS2366, "function lacks ending return statement"). There is no `assertNever`
+// behind it; lose the annotation in a later move and the safety net disappears
+// silently. It sits on `foldEvent` rather than on `reduceAssistant` because the
+// switch is what has to be exhaustive; `reduceAssistant` wraps it.
 //
 // The import of `AssistantMessage` is type-only, so the apparent cycle with
 // `chatMessage.ts` is erased at compile time and there is no runtime cycle.
 
-import type { ChatEvent } from "../lib/types";
+import type { ChatEvent, PlaylistPosition } from "../lib/types";
 import type {
   ActivityStep,
   AssistantMessage,
@@ -150,32 +151,89 @@ function approvalAfter(
   return updated[updated.findIndex((approval) => approval.id === id)];
 }
 
+/** Whether two beacons are talking about the same playlist item.
+ *
+ *  Both `null` counts as the same: a run with no playlist in flight does not
+ *  change item from one round to the next, so a preview outside a playlist
+ *  survives its rounds exactly as one inside a playlist does. */
+function sameVideo(
+  before: PlaylistPosition | null,
+  after: PlaylistPosition | null,
+): boolean {
+  return before?.position === after?.position;
+}
+
 /** Immutably fold one streamed `ChatEvent` into the assistant turn's view
  *  state. Total over the `ChatEvent` union — a new variant is a compile error
- *  here, so the UI can never silently ignore a backend event. */
+ *  here, so the UI can never silently ignore a backend event.
+ *
+ *  Pure, and deliberately clock-free: the timestamps the live head runs on are
+ *  stamped by `reduceAssistantForTurn`, which is the one caller that owns the
+ *  outside world. */
 export function reduceAssistant(
   turn: AssistantMessage,
   event: ChatEvent,
 ): AssistantMessage {
+  const folded = foldEvent(turn, event);
+  // "Thinking" is a claim about right now, so it is derived from the event that
+  // just landed rather than latched by one and cleared by hand somewhere else.
+  // An event that changed nothing cannot unsay it — nothing happened.
+  if (folded === turn) return turn;
+  const reasoningStreaming = event.type === "thinking";
+  return folded.reasoningStreaming === reasoningStreaming
+    ? folded
+    : { ...folded, reasoningStreaming };
+}
+
+/** The event-by-event fold. **The `: AssistantMessage` return annotation is the
+ *  totality guarantee** — with `strict`, an unhandled variant is a compile
+ *  error (TS2366) rather than a silently ignored event. */
+function foldEvent(turn: AssistantMessage, event: ChatEvent): AssistantMessage {
   switch (event.type) {
     case "processing":
-      return { ...turn, phase: "thinking" };
+      // The run was accepted and is preparing its first request. That is all it
+      // says: it is emitted before a single token has been asked for, so it is
+      // no evidence at all that the model is reasoning.
+      return { ...turn, phase: "sending" };
     case "planningRound":
-      // The backend split one repeated `processing` into an accepted-the-run
-      // beacon and a per-round one. Both still mean the same thing to the head
-      // today, so this deliberately reproduces what the per-round `processing`
-      // did — the round numbers it now carries are read by a later phase, and
-      // reading them here would change what the user sees.
-      return { ...turn, phase: "thinking" };
-    case "keepalive":
-    case "toolProgress":
+      return {
+        ...turn,
+        phase: "planning",
+        round: { current: event.round, max: event.maxRounds },
+        // Re-read, never merged: the beacon re-states the item every round, so
+        // a finished playlist clears itself here instead of leaving "video 3 of
+        // 3" standing over the answer turn.
+        playlist: event.playlist,
+        // The preview belongs to the item that was in flight when it arrived.
+        // A beacon naming a different item retires it, so a video whose preview
+        // never arrives shows no card rather than the previous video's.
+        videoPreview: sameVideo(turn.playlist, event.playlist)
+          ? turn.videoPreview
+          : null,
+      };
     case "videoPreview":
-      // Wire plumbing only. `keepalive` says the socket is alive rather than
-      // that progress happened, and nothing emits `toolProgress` or
-      // `videoPreview` yet; folding any of them into state now would move the
-      // UI ahead of the contract. Never collapse these into a `default:` arm —
-      // the exhaustive switch is what makes a new backend event a compile
-      // error here.
+      return {
+        ...turn,
+        videoPreview: {
+          videoId: event.videoId,
+          title: event.title,
+          durationSecs: event.durationSecs,
+          channel: event.channel,
+          // Carried through as absent, never coerced to "": the card's
+          // text-only form is the degraded path, not a broken image.
+          thumbnailDataUri: event.thumbnailDataUri,
+        },
+      };
+    case "keepalive":
+      // No view state: a keepalive says the socket is alive, not that anything
+      // happened. It is consumed by the liveness stamp in
+      // `reduceAssistantForTurn`, which is where "alive" and "progressed" are
+      // deliberately kept apart.
+      return turn;
+    case "toolProgress":
+      // Nothing emits it yet; folding it now would move the UI ahead of the
+      // contract. Never collapse this into a `default:` arm — the exhaustive
+      // switch is what makes a new backend event a compile error here.
       return turn;
     case "skillActivated":
       return {

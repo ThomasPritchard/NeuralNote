@@ -64,7 +64,6 @@ function renderTimeline(
   render(
     <ChatTimeline
       turn={turn}
-      prompt="what is active recall?"
       answering={opts.answering ?? turn.answer.trim() !== ""}
       suppressLive={opts.suppressLive ?? false}
     />,

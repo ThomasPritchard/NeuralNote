@@ -169,12 +169,11 @@ describe("turn-specific event and stop routing", () => {
 
   it("returns the same list for an event that changed nothing", () => {
     // Identity, not deep equality: a fresh array would commit a React render,
-    // and the transcript's scroll-follow re-asserts its pin on every commit. A
-    // keepalive means the socket is alive, not that anything happened, so it
-    // must not reach the DOM at all.
-    expect(reduceAssistantForTurn(messages, "turn-1", { type: "keepalive" })).toBe(
-      messages,
-    );
+    // and the transcript's scroll-follow re-asserts its pin on every commit.
+    // `toolProgress` is the variant with nothing to say yet, so it must not
+    // reach the DOM at all. A keepalive no longer qualifies — it refreshes the
+    // liveness the live head reads (see `chatMessageLive.test.ts`), which is a
+    // real change to real state and has to commit.
     expect(
       reduceAssistantForTurn(messages, "turn-1", {
         type: "toolProgress",
@@ -252,7 +251,7 @@ describe("reduceAssistant — grounded progress", () => {
     let turn = emptyAssistant();
 
     turn = reduceAssistant(turn, { type: "processing" });
-    expect(turn.phase).toBe("thinking");
+    expect(turn.phase).toBe("sending");
 
     turn = reduceAssistant(turn, { type: "searching", query: "active recall", callId: null });
     expect(turn.phase).toBe("searching");
@@ -270,73 +269,23 @@ describe("reduceAssistant — grounded progress", () => {
     expect(turn.phase).toBe("verifying");
   });
 
-  it("treats a planning round exactly as the round beacon it replaced", () => {
-    // The backend split one repeated `processing` into an accepted-the-run
-    // beacon and a per-round `planningRound`. Until a later phase teaches the
-    // head to say "round N of M", the two must be indistinguishable to the user
-    // — a contract freeze that changed what the pane shows would have done a
-    // later phase's work.
-    const viaProcessing = reduceAssistant(emptyAssistant(), { type: "processing" });
-    const viaRound = reduceAssistant(emptyAssistant(), {
-      type: "planningRound",
-      round: 3,
-      maxRounds: 12,
-      playlist: null,
-    });
-
-    expect(viaRound).toEqual(viaProcessing);
-    expect(viaRound.phase).toBe("thinking");
-  });
-
-  it("reads a playlist position on the round beacon as nothing yet", () => {
-    // The amendment widened the beacon so the head can count videos instead of
-    // rounds. Widening the wire is not the same as changing the pane, and this
-    // commit is only the former: a beacon carrying a playlist position must
-    // still reduce exactly as one without it.
-    const withPlaylist = reduceAssistant(emptyAssistant(), {
-      type: "planningRound",
-      round: 9,
-      maxRounds: 16,
-      playlist: { position: 2, total: 3 },
-    });
-    const withoutPlaylist = reduceAssistant(emptyAssistant(), {
-      type: "planningRound",
-      round: 9,
-      maxRounds: 16,
-      playlist: null,
-    });
-
-    expect(withPlaylist).toEqual(withoutPlaylist);
-  });
-
-  it("leaves the turn untouched for keepalive, tool progress and a video preview", () => {
-    // All three are wire plumbing this phase only carries. A keepalive says the
-    // socket is alive, not that anything happened, so it must not move the
-    // phase, the activity log, or anything else the user can see; nothing emits
-    // the other two yet, and folding them now would put the pane ahead of the
-    // contract.
+  it("leaves the CONTENT fold untouched for keepalive and tool progress", () => {
+    // Neither says anything about the conversation. A keepalive says the socket
+    // is alive, which the fold has no view state for — it is dated by
+    // `reduceAssistantForTurn` instead, where "alive" and "progressed" are kept
+    // apart. Nothing emits `toolProgress` yet at all.
     const searched = run([
       { type: "searching", query: "active recall", callId: "c1" },
     ]);
 
-    expect(reduceAssistant(searched, { type: "keepalive" })).toEqual(searched);
+    expect(reduceAssistant(searched, { type: "keepalive" })).toBe(searched);
     expect(
       reduceAssistant(searched, {
         type: "toolProgress",
         id: "c1",
         message: "3 of 8 videos",
       }),
-    ).toEqual(searched);
-    expect(
-      reduceAssistant(searched, {
-        type: "videoPreview",
-        videoId: "iG9CE55wbtY",
-        title: "Spaced repetition, explained",
-        durationSecs: 742,
-        channel: "Study Lab",
-        thumbnailDataUri: "data:image/jpeg;base64,AAAA",
-      }),
-    ).toEqual(searched);
+    ).toBe(searched);
   });
 
   it("ignores the retrieval correlation key rather than rendering it", () => {
