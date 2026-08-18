@@ -585,4 +585,40 @@ describe("ChatMessages — skill turns", () => {
     expect(screen.getByText("1 note written")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Undo" })).toBeEnabled();
   });
+
+  it("keeps a narrating tool's progress line out of every live region on the turn", () => {
+    // The deliberate decision this guards is at `ChatMessages.tsx:95`: the
+    // per-row churn of a run (15-20 mutations) stays silent, and liveness is
+    // scoped to the phase line, the answer, and the error box. A long tool now
+    // narrates itself every few seconds on its node, which under a turn-wide
+    // live region would be a screen reader interrupted through a four-minute
+    // transcription.
+    //
+    // Asserted HERE, through the whole turn, and not in `ChatTimeline.test.tsx`:
+    // the rail rendered on its own cannot see a live region added to the turn
+    // wrapper ABOVE it, which is exactly where one would be added.
+    renderMessages(
+      skillTurn({
+        toolCalls: [
+          {
+            id: "c1",
+            name: "transcribe_audio",
+            title: "Transcribe audio",
+            arguments: '{"url":"https://youtu.be/abc"}',
+            status: null,
+            summary: null,
+            detail: null,
+            stepId: null,
+            progress: "Transcribing the audio locally with Whisper",
+          },
+        ],
+      }),
+    );
+
+    const line = screen.getByText("Transcribing the audio locally with Whisper");
+    expect(line.closest("[aria-live], [role='status'], output")).toBeNull();
+    // Nor is it hidden: for a long call this is the only account of what is
+    // happening, so it stays readable to anyone who navigates to the node.
+    expect(line.closest("[aria-hidden='true']")).toBeNull();
+  });
 });

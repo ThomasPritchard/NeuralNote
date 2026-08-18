@@ -444,18 +444,31 @@ async function mountTranscript(expanded: boolean): Promise<void> {
   });
 }
 
-/** The two column blocks of the open disclosure, by their headings. Both are
- *  always in the DOM; below the threshold they are `display: none`, which is a
- *  rect of zeros — so these are measured, never merely found. */
+/** The two column blocks of the open disclosure, by their headings. Being in the
+ *  DOM proves nothing here — a `display: none` block is still queryable and
+ *  hands back a rect of zeros — so these are measured, never merely found.
+ *
+ *  The Arguments heading carries the call's wire name after it, so it is matched
+ *  on its leading text rather than on equality. */
 function columnRects(): { args: DOMRect; result: DOMRect } {
   const found = (text: string): DOMRect => {
-    const el = [...host!.querySelectorAll<HTMLElement>("p")].find(
-      (candidate) => candidate.textContent === text,
+    const el = [...host!.querySelectorAll<HTMLElement>("p")].find((candidate) =>
+      candidate.textContent?.startsWith(text),
     );
     if (el === undefined) throw new Error(`the ${text} column did not render`);
     return el.getBoundingClientRect();
   };
   return { args: found("Arguments"), result: found("Result") };
+}
+
+/** The raw argument PAYLOAD, not its heading. A heading that occupies space
+ *  above a collapsed payload would still be a payload nobody can read. */
+function argumentPayloadRect(): DOMRect {
+  const el = [...host!.querySelectorAll<HTMLElement>("p")].find((candidate) =>
+    candidate.textContent?.includes('"spaced repetition"'),
+  );
+  if (el === undefined) throw new Error("the argument payload did not render");
+  return el.getBoundingClientRect();
 }
 
 /** The turn card, which is the container the disclosure queries against. */
@@ -494,16 +507,30 @@ describe("the tool disclosure at the widened width", () => {
     expectNoHorizontalOverflow();
   });
 
-  it("stays exactly as it was at the shipped width", async () => {
+  it("stacks the arguments above the result at the shipped width, not out of reach", async () => {
+    // The bug this replaces: the arguments block was `hidden` until the turn
+    // reached 30rem, and the turn is ~388px at the shipped pane width — so the
+    // raw payload was unreachable at the width almost everyone runs, not merely
+    // deprioritised. jsdom cannot see this at all; `display: none` and a laid-out
+    // block are the same all-zero rect there, so this tier is the only one that
+    // can tell the fix from the bug.
     await mountTranscript(false);
 
     expect(turnContainer().getBoundingClientRect().width).toBeLessThan(TWO_COLUMN_PX);
 
-    // Neither heading occupies any space, so what is on screen is the single
-    // detail block this disclosure has always been.
     const { args, result } = columnRects();
-    expect(args.width).toBe(0);
-    expect(result.width).toBe(0);
+    // Both blocks are on screen, and — the assertion that matters — so is the
+    // payload itself, not just a heading above a collapsed one.
+    const payload = argumentPayloadRect();
+    expect(payload.width).toBeGreaterThan(0);
+    expect(payload.height).toBeGreaterThan(0);
+    expect(args.width).toBeGreaterThan(0);
+    expect(result.width).toBeGreaterThan(0);
+    // Stacked in reading order — what was asked, then what came back — and in
+    // one column, which is what the two-column layout above the threshold is
+    // measured against.
+    expect(result.top).toBeGreaterThan(args.bottom - 1);
+    expect(Math.abs(result.left - args.left)).toBeLessThan(2);
     expectNoHorizontalOverflow();
   });
 });

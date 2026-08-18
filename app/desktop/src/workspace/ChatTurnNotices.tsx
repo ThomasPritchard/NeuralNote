@@ -124,6 +124,18 @@ export function UsageFooter({ usage }: Readonly<{ usage: UsageView | null }>) {
 // this no longer repeats "Searched X · read Y" — two independently-computed
 // provenance lines in one card would eventually disagree. Nothing to warn about →
 // nothing rendered.
+//
+// `coverage.notesRead` is deliberately not listed here, having been considered
+// for exactly this footer and declined. Three reasons, in order of weight:
+// the rail already names every note the run opened, with its line range, on the
+// node that opened it, and the ruling this phase implements is that provenance
+// belongs in place on the call that raised it rather than in a second aggregate
+// surface; `Sources` already names, clickably, every note the answer cites; and
+// this footer is a WARNING surface that renders nothing when nothing is wrong,
+// so a paragraph of paths under every turn would change what it is for. The gap
+// between those two lists — notes whose spans came back from a search and were
+// never opened or cited — is real but carries no action, and the footer is not
+// where an inventory belongs.
 export function CoverageFooter({ coverage }: Readonly<{ coverage: CoverageView }>) {
   const { truncated, skippedFiles } = coverage;
   if (!truncated && skippedFiles === 0) return null;

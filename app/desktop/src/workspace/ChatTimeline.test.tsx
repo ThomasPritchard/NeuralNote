@@ -214,6 +214,112 @@ describe("ChatTimeline — tool node statuses", () => {
   });
 });
 
+/** The longest line the shipped tools actually send (`youtube_tools.rs`), which
+ *  is also the one that matters most: it is what a four-minute transcription
+ *  says for itself. */
+const WHISPER_PROGRESS =
+  "Transcribing the audio locally with Whisper (base.en); this can take several minutes";
+
+describe("ChatTimeline — what a running tool says about itself", () => {
+  it("shows the line the running tool sent, beneath what it was asked to do", () => {
+    // Before this, `toolProgress` folded to identity and rendered nowhere, so a
+    // four-minute transcription was a spinner and nothing else — and the stall
+    // notice called a perfectly healthy run quiet at 45 seconds.
+    renderTimeline({
+      toolCalls: [
+        call("c1", null, {
+          name: "transcribe_audio",
+          title: "Transcribe audio",
+          arguments: '{"url":"https://youtu.be/abc"}',
+          progress: WHISPER_PROGRESS,
+        }),
+      ],
+    });
+
+    const node = within(rail()).getByRole("listitem");
+    expect(within(node).getByText(WHISPER_PROGRESS)).toBeInTheDocument();
+    // The title line still says what the call IS; progress says what it is up to.
+    expect(within(node).getByText("Transcribe audio")).toBeInTheDocument();
+  });
+
+  it("never announces the line, however often the tool re-sends it", () => {
+    // A tool narrating its stages every few seconds must not interrupt a screen
+    // reader: the per-row churn stays silent by design (`ChatMessages.tsx:95`),
+    // and Phase 2 set the precedent that the ticking half of a run is for the
+    // eye while the stall notice is the thing that speaks.
+    //
+    // What goes red: wrap the line in an `aria-live` region, a `role=status`, or
+    // an `<output>` and this fails — including if an ancestor gains one.
+    renderTimeline({
+      toolCalls: [call("c1", null, { progress: "Looking up the video on YouTube" })],
+    });
+
+    const line = screen.getByText("Looking up the video on YouTube");
+    expect(line.closest("[aria-live], [role='status'], output")).toBeNull();
+    // …and it is not hidden from assistive tech either. For a long call this is
+    // the only account of what is happening, so it stays readable on the node.
+    expect(line.closest("[aria-hidden='true']")).toBeNull();
+  });
+
+  it("keeps the whole sentence even though the line is clipped to one", () => {
+    // The row is one line so the node's footprint cannot move; the tail is still
+    // recoverable rather than discarded.
+    renderTimeline({ toolCalls: [call("c1", null, { progress: WHISPER_PROGRESS })] });
+
+    expect(screen.getByText(WHISPER_PROGRESS)).toHaveAttribute("title", WHISPER_PROGRESS);
+  });
+
+  it("hands the slot back to the settled account once the call settles", () => {
+    // Progress is what a call is doing; the moment it has done it, the
+    // Rust-composed summary and the disclosure are the authoritative record.
+    // Nothing may keep claiming a stage that has finished.
+    renderTimeline({
+      toolCalls: [
+        call("c1", "ok", {
+          summary: "12 spans",
+          detail: "12 spans across 3 notes",
+          progress: WHISPER_PROGRESS,
+        }),
+      ],
+      done: true,
+      answer: "Here you go.",
+    });
+
+    expect(screen.queryByText(WHISPER_PROGRESS)).not.toBeInTheDocument();
+    expect(screen.getByText("· 12 spans")).toBeInTheDocument();
+  });
+});
+
+describe("ChatTimeline — the disclosure names the call the model made", () => {
+  it("puts the wire name beside the raw payload, not on the rail", () => {
+    // `Search notes` and `search_notes` on one glance line is the same fact
+    // twice. The machine name belongs with the machine payload — and that fold
+    // is the ONLY place an unregistered name can appear, because a name the
+    // model invented is titled "Unrecognised tool" and titles are Rust-authored.
+    renderTimeline({
+      toolCalls: [
+        call("c1", "rejected", {
+          name: "definitely_not_a_tool",
+          title: "Unrecognised tool",
+          detail: "unknown tool: definitely_not_a_tool",
+        }),
+      ],
+      done: true,
+      answer: "I couldn't do that.",
+    });
+
+    const node = within(rail()).getByRole("listitem");
+    // A rejected call opens its own fold, so the invented name is on screen.
+    expect(within(node).getByText("Details").closest("details")).toHaveAttribute("open");
+    const name = within(node).getByText("definitely_not_a_tool");
+    expect(name.closest("details")).not.toBeNull();
+    // Not on the title line: the row above the fold stays the human account.
+    expect(within(node).getByText("Unrecognised tool").textContent).toBe(
+      "Unrecognised tool",
+    );
+  });
+});
+
 describe("ChatTimeline — the fold head", () => {
   it("reads live while the run streams, and the fold is open", () => {
     renderTimeline({ phase: "searching", toolCalls: [call("c1", null)] });
@@ -356,6 +462,56 @@ describe("ChatTimeline — reasoning", () => {
     });
 
     expect(screen.queryByText("Reasoning", { selector: "summary" })).not.toBeInTheDocument();
+  });
+
+  it("says which turn of the run each train of thought came from", async () => {
+    // A run reasons once per tool-deciding round and again before it answers.
+    // Rendered as three identical `Reasoning` folds, the rail says the model
+    // thought three times and nothing about when — which is the whole reason the
+    // boundaries exist. Round 2's thinking has to be tellable from round 3's.
+    const first = "which notes cover this";
+    const second = "the second one looked closer";
+    const third = "now to answer it";
+    const { user } = renderTimeline({
+      thinking: first + second + third,
+      reasoningBoundaries: [
+        { source: { kind: "round", round: 1 }, at: 0 },
+        { source: { kind: "round", round: 2 }, at: first.length },
+        { source: { kind: "answer" }, at: first.length + second.length },
+      ],
+      answer: "Here you go.",
+      done: true,
+    });
+
+    await user.click(fold().querySelector("summary")!);
+    const labels = screen
+      .getAllByRole("listitem")
+      .map((node) => node.querySelector("summary")?.textContent)
+      .filter((text) => text?.startsWith("Reasoning"));
+    // The round numbers are the beacon's own, so they survive a ceiling that a
+    // mid-run skill activation raises; the answer turn is named by WHEN it
+    // happened, matching the rounds beside it.
+    expect(labels).toEqual([
+      "Reasoning· round 1",
+      "Reasoning· round 2",
+      "Reasoning· before answering",
+    ]);
+  });
+
+  it("leaves reasoning that no boundary claimed unlabelled, rather than guessing", async () => {
+    // Nothing on the wire produces an unattributed segment — the planning beacon
+    // precedes the first model request — so this is a turn assembled by hand,
+    // and it must read exactly as it did before boundaries existed.
+    const { user } = renderTimeline({
+      thinking: "a single train of thought",
+      answer: "Here you go.",
+      done: true,
+    });
+
+    await user.click(fold().querySelector("summary")!);
+    expect(
+      screen.getByText("Reasoning", { selector: "summary" }).textContent,
+    ).toBe("Reasoning");
   });
 });
 

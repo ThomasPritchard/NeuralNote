@@ -21,7 +21,11 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import "../styles.css";
 import { ChatTimeline } from "./ChatTimeline";
-import { emptyAssistant, type AssistantMessage } from "./chatMessage";
+import {
+  emptyAssistant,
+  type AssistantMessage,
+  type ToolCallView,
+} from "./chatMessage";
 import { STALL_AFTER_MS } from "./turnLiveness";
 
 /** 26.25rem − 2×16 (transcript) − 2×12 (turn) − 2×1 (border) − 2×10 (fold). */
@@ -78,6 +82,8 @@ function mount(overrides: Partial<AssistantMessage>) {
     card: section.querySelector("details > div") as HTMLElement | null,
     /** The reserved stall line: the section's trailing element. */
     slot: section.lastElementChild as HTMLElement,
+    /** The rail's own nodes, top-level only (a plan step nests its own). */
+    nodes: [...section.querySelectorAll<HTMLElement>("ol > li")],
   };
 }
 
@@ -200,6 +206,87 @@ describe("the video preview card reserves the thumbnail's footprint", () => {
     );
 
     expect(clamped).toBe(short);
+  });
+});
+
+/** One tool node, with just enough of a call to lay out. `arguments` carries no
+ *  hint field on purpose: the title line then reads the same in flight as it
+ *  does settled, which is what leaves the SECOND row as the only variable in
+ *  the measurements below. */
+function toolCall(overrides: Partial<ToolCallView> = {}): ToolCallView {
+  return {
+    id: "c1",
+    name: "transcribe_audio",
+    title: "Transcribe audio",
+    arguments: "{}",
+    status: null,
+    summary: null,
+    detail: null,
+    stepId: null,
+    ...overrides,
+  };
+}
+
+/** The longest line the shipped tools send (`youtube_tools.rs`) — 84 characters
+ *  against a ~300px column, so it is also the one that would wrap if the row
+ *  were not clipped to a single line. */
+const WHISPER_PROGRESS =
+  "Transcribing the audio locally with Whisper (base.en); this can take several minutes";
+
+describe("a running tool's progress line holds the footprint it hands over", () => {
+  it("does not move the node when a long tool finally says something", () => {
+    // Amendment C1's whole point is that a four-minute transcription stops
+    // being a silent spinner. The line arriving mid-run must cost nothing: this
+    // is the class of bug Phase 2 hit twice, and jsdom cannot see it — every
+    // rect there is zero, so "the node did not move" is trivially true against
+    // the fix AND against a node that grew by fifteen pixels.
+    const silent = mount({ phase: "planning", toolCalls: [toolCall()] });
+    const quietNode = height(silent.nodes[0]);
+    const quietSection = height(silent.section);
+
+    const narrating = mount({
+      phase: "planning",
+      toolCalls: [toolCall({ progress: WHISPER_PROGRESS })],
+    });
+
+    expect(narrating.nodes[0].textContent).toContain("Whisper");
+    expect(height(narrating.nodes[0])).toBe(quietNode);
+    expect(height(narrating.section)).toBe(quietSection);
+    // And the reservation is a real line rather than a collapsed nothing: an
+    // empty block has no line box, so this would be the whole fix failing.
+    expect(quietNode).toBeGreaterThan(24);
+  });
+
+  it("clips the longest line to one rather than wrapping the rail", () => {
+    const { nodes } = mount({
+      phase: "planning",
+      toolCalls: [toolCall({ progress: WHISPER_PROGRESS })],
+    });
+    const line = [...nodes[0].querySelectorAll<HTMLElement>("p")].find((p) =>
+      p.textContent?.startsWith("Transcribing"),
+    )!;
+
+    // One line of its own type. Two lines would read better and would cost the
+    // footprint guarantee above, which is the trade this makes deliberately.
+    expect(height(line)).toBeLessThan(20);
+    // The tail is clipped, not discarded — the whole sentence is still there.
+    expect(line.title).toBe(WHISPER_PROGRESS);
+    expect(line.scrollWidth).toBeGreaterThan(line.clientWidth);
+  });
+
+  it("is the same height running as it is once the call has settled", () => {
+    // The two states share one slot, so a node holds its footprint from
+    // dispatch through settlement. Before this the in-flight node was one row
+    // and the settled one was two, which grew the rail a line at EVERY
+    // settlement under a live run.
+    const running = mount({ phase: "planning", toolCalls: [toolCall()] });
+    const settled = mount({
+      phase: "planning",
+      toolCalls: [toolCall({ status: "ok", detail: "12 spans across 3 notes" })],
+    });
+
+    expect(settled.nodes[0].textContent).toContain("Details");
+    expect(height(settled.nodes[0])).toBe(height(running.nodes[0]));
   });
 });
 

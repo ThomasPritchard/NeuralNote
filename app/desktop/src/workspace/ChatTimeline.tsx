@@ -80,7 +80,7 @@ function TimelineEntryNode({
     case "failure":
       return <ActivationFailureNode failure={entry.failure} last={last} />;
     case "thinking":
-      return <ThinkingNode text={entry.text} last={last} />;
+      return <ThinkingNode text={entry.text} source={entry.source} last={last} />;
     case "degraded":
       return <ApprovalDegradedNode reason={entry.reason} last={last} />;
     case "approval":

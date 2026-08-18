@@ -7,6 +7,12 @@
 // hairline spine that joins it to the node below — so run state reads from the
 // glyph column alone, before any text. Presentational only: nothing here folds
 // events, and no string here is matched against backend prose.
+//
+// A tool node adds one more row to that anatomy, and the two things that can
+// occupy it SHARE it rather than stacking: while the call runs it holds what the
+// tool is saying about itself, and once the call settles it holds the disclosure
+// of what it said. Neither can move the node, because the row is there either
+// way — see `ProgressLine`.
 
 import type { ReactNode } from "react";
 import {
@@ -27,7 +33,11 @@ import { cn } from "../lib/cn";
 import type { ToolStatus } from "../lib/types";
 import { Markdown } from "./Markdown";
 import { YoutubeRequirementCard } from "./ChatSkillChrome";
-import type { SkillActivationFailure, ToolCallView } from "./chatMessage";
+import type {
+  ReasoningSource,
+  SkillActivationFailure,
+  ToolCallView,
+} from "./chatMessage";
 
 /** The disclosure summary idiom shared by every node that folds (matches the
  *  reasoning/activity disclosures the pane already uses). */
@@ -69,13 +79,43 @@ export function TimelineNode({
   );
 }
 
-/** The streamed reasoning tokens, folded. Markdown, not a flat string: models
- *  emit headings, lists and code in their reasoning, and rendering that as one
- *  pre-wrapped blob made the most structured part of a turn the least legible. */
+/** Which turn of the run one train of thought came from, in the vocabulary the
+ *  live head already uses for the same fact ("round 2 of 8").
+ *
+ *  This label is the entire reason a turn now contributes one node per train of
+ *  thought instead of one blob: three identical `Reasoning` folds in a row say
+ *  the model thought three times and nothing about *when*, which is the one
+ *  thing that tells round 2's reasoning from round 3's and from the reasoning it
+ *  did just before answering.
+ *
+ *  `unattributed` is deliberately unlabelled rather than guessed at. Nothing on
+ *  the wire produces it — the planning beacon precedes the first model request —
+ *  so in practice it is a turn assembled by hand, and an unlabelled fold is
+ *  exactly how this node read before boundaries existed. */
+function reasoningLabel(source: ReasoningSource): string | null {
+  switch (source.kind) {
+    case "round":
+      return `round ${source.round}`;
+    // Named by when it happened, like the round beside it, rather than by what
+    // it is: "final" would be a claim about the run's shape that a stopped or
+    // failed turn breaks.
+    case "answer":
+      return "before answering";
+    case "unattributed":
+      return null;
+  }
+}
+
+/** One train of thought, folded, labelled with the turn that produced it.
+ *  Markdown, not a flat string: models emit headings, lists and code in their
+ *  reasoning, and rendering that as one pre-wrapped blob made the most
+ *  structured part of a turn the least legible. */
 export function ThinkingNode({
   text,
+  source,
   last,
-}: Readonly<{ text: string; last: boolean }>) {
+}: Readonly<{ text: string; source: ReasoningSource; last: boolean }>) {
+  const label = reasoningLabel(source);
   return (
     <TimelineNode
       glyph={<Brain className="size-3.5 text-muted-foreground/70" aria-hidden />}
@@ -88,6 +128,12 @@ export function ThinkingNode({
             aria-hidden
           />
           Reasoning
+          {/* A qualifier, not a second heading: quieter and lighter than the
+              word it qualifies, so a rail of folds still reads as one thing
+              said several times rather than as several different things. */}
+          {label !== null && (
+            <span className="font-normal text-muted-foreground/60">· {label}</span>
+          )}
         </summary>
         <div className={NODE_MARKDOWN}>
           <Markdown body={text} />
@@ -202,6 +248,44 @@ export function formatArguments(argumentsJson: string): string {
   }
 }
 
+/** The node's second row, in both of the states a node has.
+ *
+ *  A node is one line plus one: the title line, and beneath it either what the
+ *  running tool is saying about itself or the disclosure holding what it
+ *  eventually said. The two never coexist — `progress` only arrives while
+ *  `status` is null, and `detail` only exists once it is not — so they share one
+ *  slot of one declared line, and the node therefore holds its footprint from
+ *  dispatch through settlement.
+ *
+ *  That is not a nicety. Before this, an in-flight node was one row and a
+ *  settled one was two, so every single settlement grew the rail a line under a
+ *  live run. Sharing the slot removes that, and it is what makes a progress line
+ *  arriving four minutes into a transcription cost nothing at all. */
+function ProgressLine({ text }: Readonly<{ text: string | undefined }>) {
+  return (
+    // `min-h` because an empty block has no line box and would reserve nothing.
+    // `1.375em` is `leading-snug`'s own ratio against this element's font size —
+    // the same reservation the stall notice makes, and no pixel value to drift.
+    //
+    // One line, clipped, with the whole sentence kept in the DOM (so assistive
+    // tech and a hover both get it). Two lines would read better for the longest
+    // string a tool sends and would cost the footprint guarantee above; the run
+    // clock in the head is the better answer to "how much longer" anyway.
+    //
+    // NOT a live region and NOT `aria-hidden`. Nothing here announces, because
+    // nothing wraps it in one — a tool narrating itself every few seconds must
+    // not interrupt a screen reader (`ChatMessages.tsx:95`). It stays readable
+    // on the node for anyone who navigates to it, which for a four-minute call
+    // is the only account of what is happening.
+    <p
+      className="mt-1 min-h-[1.375em] truncate text-[0.625rem] leading-snug text-muted-foreground/80"
+      title={text}
+    >
+      {text}
+    </p>
+  );
+}
+
 export function argumentHint(argumentsJson: string): string | null {
   let parsed: unknown;
   try {
@@ -228,7 +312,21 @@ export function argumentHint(argumentsJson: string): string | null {
 /** One dispatched tool call. The title comes from the Rust-side registry and the
  *  summary from the structured outcome — the UI composes neither and matches
  *  neither. While the call is in flight there is no summary yet, so the hint
- *  parsed out of its arguments is what says *what* is being done. */
+ *  parsed out of its arguments is what says *what* is being done, and
+ *  `progress` — when the tool sends any — says what it is doing about it.
+ *
+ *  **`call.searches` and `call.reads` are deliberately not rendered here**, and
+ *  that is a decision rather than an omission. The orchestrator raises at most
+ *  one `Searching`/`Retrieved` pair per `search_notes` call and at most one
+ *  `Reading` per `read_note_span` call (`orchestrator/collect.rs`), so each list
+ *  holds one entry — and both of that entry's facts are already on this line:
+ *  the query IS the argument hint (`HINT_FIELDS` leads with `query`), and the
+ *  hit count and the note's line range ARE the Rust-composed summary ("12
+ *  spans", "A.md:12–28"). Rendering them again would put one act on one node
+ *  twice, which is the rule `showHint` and `railCalls` already enforce
+ *  elsewhere. What that leaves genuinely out of reach is a query longer than
+ *  `MAX_HINT_CHARS`, and the answer to that is the disclosure below — which is
+ *  why the arguments column no longer hides itself at the shipped pane width. */
 export function ToolNode({
   call,
   last,
@@ -272,6 +370,7 @@ export function ToolNode({
           <span className={settled.tone}> · {settled.label}</span>
         )}
       </p>
+      {settled === null && <ProgressLine text={call.progress} />}
       {call.detail !== null && call.detail !== "" && (
         // A call that did not simply succeed opens itself: the reason has to be
         // on screen the moment it happens, not one click away. Passing a derived
@@ -288,19 +387,34 @@ export function ToolNode({
             />
             Details
           </summary>
-          {/* What was asked, beside what came back — but only where there is
-              room for two readable columns. The threshold is a container query
-              on the turn, so it answers to the pane's ACTUAL width: it opens at
-              the widened width on a normal window and stays shut at the narrow
-              breakpoints, where the expanded pane is still only ~24rem. Below
-              it, this is exactly the single detail block it has always been. */}
+          {/* What was asked, then what came back. The container query decides
+              only whether the two sit SIDE BY SIDE, never whether the first one
+              exists: it used to hide the arguments outright below 30rem, and
+              since the turn is ~388px at the shipped pane width, the raw
+              payload was unreachable at the width almost everyone runs — not
+              deprioritised, gone. Stacked below the threshold, two columns
+              above; both headed either way, because two unlabelled blobs in a
+              column are worse than none. */}
           <div className="mt-1 grid gap-1.5 @[30rem]:grid-cols-2">
-            <div className="hidden min-w-0 flex-col gap-1 @[30rem]:flex">
-              <p className={COLUMN_LABEL}>Arguments</p>
+            <div className="flex min-w-0 flex-col gap-1">
+              <p className={COLUMN_LABEL}>
+                Arguments
+                {/* The wire name of the call the model actually made, kept in
+                    the machine register beside the machine payload rather than
+                    on the rail — `Search notes` and `search_notes` on one glance
+                    line is the same fact twice. It earns its place here because
+                    of the one node where the title cannot identify the call: an
+                    unregistered name renders under a Rust-authored "Unrecognised
+                    tool", and this fold — which opens itself for a rejected
+                    call — is then the only place the invented name appears. */}
+                <span className="nn-mono ml-1.5 font-normal normal-case tracking-normal text-muted-foreground/50">
+                  {call.name}
+                </span>
+              </p>
               <p className={DETAIL_BODY}>{formatArguments(call.arguments)}</p>
             </div>
             <div className="flex min-w-0 flex-col gap-1">
-              <p className={`hidden ${COLUMN_LABEL} @[30rem]:block`}>Result</p>
+              <p className={COLUMN_LABEL}>Result</p>
               <p className={DETAIL_BODY}>{call.detail}</p>
             </div>
           </div>
