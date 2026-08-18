@@ -83,23 +83,87 @@ pub enum ReasoningControl {
     },
 }
 
+/// The value a model uses inside its own effort menu to mean "do not reason".
+/// It is a sentinel, not an effort, so it never reaches the user as a menu item.
+const OFF_SENTINEL: &str = "none";
+
 /// Decide which reasoning control a model's capability record calls for.
 ///
-/// `None` means the probe has not answered — offline, a hand-typed model id, a
-/// 5xx — which is NOT the same as a model that published nothing.
+/// `None` means the model published no reasoning block. It is NOT "the probe has
+/// not answered" — that is [`ReasoningControl::Pending`], which only the caller
+/// can know and which this function therefore never returns.
 ///
-/// **Open question, to settle before this is implemented:** what precedence do
-/// `mandatory`, `default_enabled`, `supported_efforts` and `supports_max_tokens`
-/// take when a record carries several of them? The captured catalogue has real
-/// records with `mandatory: true` AND a full effort menu (`x-ai/grok-4.6`), and
-/// records with `supports_max_tokens` AND a menu
-/// (`nvidia/nemotron-3-ultra-550b-a55b`) — so `Locked` versus `Efforts` versus
-/// `Efforts { can_disable: false }` is a real ordering decision, not a
-/// hypothetical one. See the fixture at
+/// The precedence, in order, and why (amendment D1):
+///
+/// 1. **A published menu wins.** `supported_efforts` is the only field that
+///    offers the user a choice, so a record carrying one renders [`Efforts`]
+///    even when it also carries `mandatory` or `supports_max_tokens`.
+///    `mandatory: true` alongside a menu is not a contradiction — the user picks
+///    how hard the model thinks without being able to stop it thinking — and a
+///    `max_tokens` budget is a different knob that OpenRouter documents as
+///    mutually exclusive with `effort`.
+/// 2. **Off gets exactly one representation.** The catalogue spells "reasoning
+///    can be turned off" two ways: `none` inside the menu, and `mandatory:
+///    false` beside it. Both fold into `can_disable`, so two models that behave
+///    identically render an identical control. Only `mandatory: true` takes the
+///    off switch away.
+/// 3. **No menu, `mandatory: true` → [`Locked`].** On is the only state.
+/// 4. **No menu otherwise → [`Toggle`]**, following `default_enabled` where the
+///    record publishes one and starting **off** where it does not. Absent means
+///    the server never told us, reasoning tokens bill as output, and the
+///    existing opt-in already starts false.
+///
+/// The effort VALUES are never touched: not lower-cased, not reordered, not
+/// checked against a compiled-in list. The live catalogue carries 21 distinct
+/// menus, so any list compiled in here would be wrong for some model and would
+/// silently downgrade its reasoning. Stripping [`OFF_SENTINEL`] is the single
+/// permitted normalisation, and it removes a state — not a value.
+///
+/// See the captured fixture at
 /// `crates/neuralnote-core/src/ai/fixtures/openrouter_models_reasoning.json`.
 pub fn reasoning_control(capability: Option<&RawReasoningCapability>) -> ReasoningControl {
-    let _ = capability;
-    todo!("precedence between mandatory / default_enabled / supported_efforts is unsettled")
+    let Some(capability) = capability else {
+        return ReasoningControl::Hidden;
+    };
+    let mandatory = capability.mandatory == Some(true);
+    let options = offerable_efforts(capability);
+
+    if options.is_empty() {
+        return menuless_control(capability, mandatory);
+    }
+    ReasoningControl::Efforts {
+        options,
+        default_effort: capability.default_effort.clone(),
+        can_disable: !mandatory,
+    }
+}
+
+/// The efforts a user may actually pick, with the off sentinel removed.
+///
+/// Empty for a record that published no menu, and equally empty for one whose
+/// menu held nothing but the sentinel — neither leaves anything to choose
+/// between, so both take the menu-less path.
+fn offerable_efforts(capability: &RawReasoningCapability) -> Vec<String> {
+    capability
+        .supported_efforts
+        .iter()
+        .flatten()
+        .filter(|effort| effort.as_str() != OFF_SENTINEL)
+        .cloned()
+        .collect()
+}
+
+/// The control for a record with no effort to offer: on-only when reasoning is
+/// mandatory, otherwise an on/off switch starting where the record says (and off
+/// where it says nothing).
+fn menuless_control(capability: &RawReasoningCapability, mandatory: bool) -> ReasoningControl {
+    if mandatory {
+        ReasoningControl::Locked
+    } else {
+        ReasoningControl::Toggle {
+            default_on: capability.default_enabled.unwrap_or(false),
+        }
+    }
 }
 
 /// The selected model's `reasoning` block from the raw OpenRouter `/models` body.
@@ -370,6 +434,180 @@ mod tests {
                 mandatory: Some(false),
                 ..RawReasoningCapability::default()
             }
+        );
+    }
+
+    /// The capability record `id` publishes, from the captured catalogue.
+    fn captured(id: &str) -> RawReasoningCapability {
+        openrouter_reasoning_capability(CAPTURED_MODELS, id)
+            .unwrap_or_else(|| panic!("{id} publishes a reasoning block"))
+    }
+
+    #[test]
+    fn a_published_menu_becomes_efforts_verbatim_with_the_off_sentinel_stripped() {
+        // The captured record lists `none` INSIDE its menu. `none` is not an
+        // effort the user picks — it is how this model spells "off" — so it
+        // leaves the menu and becomes `can_disable`. Every other value survives
+        // in the model's own words and its own order.
+        assert_eq!(
+            reasoning_control(Some(&captured("openai/gpt-5.6-luna-pro"))),
+            ReasoningControl::Efforts {
+                options: vec![
+                    "max".into(),
+                    "xhigh".into(),
+                    "high".into(),
+                    "medium".into(),
+                    "low".into(),
+                ],
+                default_effort: Some("medium".into()),
+                can_disable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_mandatory_model_with_a_menu_offers_the_menu_but_no_way_off() {
+        // `x-ai/grok-4.6` carries `mandatory: true` AND a full menu. Both facts
+        // are real and they do not conflict: the user picks how hard it thinks,
+        // but cannot stop it thinking.
+        assert_eq!(
+            reasoning_control(Some(&captured("x-ai/grok-4.6"))),
+            ReasoningControl::Efforts {
+                options: vec!["xhigh".into(), "high".into(), "medium".into(), "low".into()],
+                default_effort: Some("high".into()),
+                can_disable: false,
+            }
+        );
+    }
+
+    #[test]
+    fn a_menu_without_the_off_sentinel_can_still_be_disabled_when_it_is_not_mandatory() {
+        // `nvidia/nemotron-3-ultra-550b-a55b` spells off the OTHER way the
+        // catalogue spells it — `mandatory: false`, no `none` in the array. It
+        // must render the same control as a model that lists `none`, or two
+        // models that behave identically look different (amendment D1).
+        assert_eq!(
+            reasoning_control(Some(&captured("nvidia/nemotron-3-ultra-550b-a55b"))),
+            ReasoningControl::Efforts {
+                options: vec!["high".into(), "medium".into()],
+                default_effort: Some("high".into()),
+                can_disable: true,
+            }
+        );
+        // `supports_max_tokens: true` on this record must not divert it: a token
+        // budget is a different knob, and OpenRouter documents effort and
+        // max_tokens as mutually exclusive. The published menu wins.
+        assert_eq!(
+            captured("nvidia/nemotron-3-ultra-550b-a55b").supports_max_tokens,
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn no_menu_falls_back_to_a_toggle_that_follows_the_published_default() {
+        assert_eq!(
+            reasoning_control(Some(&captured("inclusionai/ling-3.0-flash"))),
+            ReasoningControl::Toggle { default_on: true }
+        );
+    }
+
+    #[test]
+    fn no_menu_and_no_published_default_starts_the_toggle_off() {
+        // The commonest shape in the catalogue is a bare `{"mandatory": false}`.
+        // Absent `default_enabled` means the server never told us, and the safe
+        // reading of that is OFF: reasoning tokens bill as output, and today's
+        // opt-in already starts false.
+        assert_eq!(
+            reasoning_control(Some(&captured("dots-studio/dots-3-note-preview:free"))),
+            ReasoningControl::Toggle { default_on: false }
+        );
+    }
+
+    #[test]
+    fn mandatory_without_a_menu_is_locked_on() {
+        // Constructed rather than captured: none of the six captured records is a
+        // menu-less mandatory model, and hand-writing one in JSON would test our
+        // spelling of the wire rather than the precedence. The wire spelling is
+        // already pinned by the two parse tests above.
+        assert_eq!(
+            reasoning_control(Some(&RawReasoningCapability {
+                mandatory: Some(true),
+                ..RawReasoningCapability::default()
+            })),
+            ReasoningControl::Locked
+        );
+        // `default_enabled` is not a second opinion on a locked model — it
+        // cannot be turned off either way.
+        assert_eq!(
+            reasoning_control(Some(&RawReasoningCapability {
+                mandatory: Some(true),
+                default_enabled: Some(false),
+                ..RawReasoningCapability::default()
+            })),
+            ReasoningControl::Locked
+        );
+    }
+
+    #[test]
+    fn a_published_but_empty_block_is_a_toggle_that_starts_off() {
+        // `{}` IS an answer: the model published a reasoning block and named
+        // nothing in it. Not `Hidden` — that is reserved for no block at all.
+        assert_eq!(
+            reasoning_control(Some(&RawReasoningCapability::default())),
+            ReasoningControl::Toggle { default_on: false }
+        );
+    }
+
+    #[test]
+    fn a_model_publishing_no_block_at_all_shows_no_control() {
+        // `openrouter/auto-beta` is in the captured catalogue with `reasoning:
+        // null`, which `openrouter_reasoning_capability` reports as `None`.
+        // Whether an UNPROBED model shows `Pending` is the caller's decision,
+        // not this function's — it is handed only what was published.
+        assert_eq!(
+            openrouter_reasoning_capability(CAPTURED_MODELS, "openrouter/auto-beta"),
+            None
+        );
+        assert_eq!(reasoning_control(None), ReasoningControl::Hidden);
+    }
+
+    #[test]
+    fn an_effort_menu_is_never_reordered_lowercased_or_filtered_beyond_the_sentinel() {
+        // 21 distinct menus exist in the live catalogue, so any compiled-in list
+        // would be wrong for some model and would silently downgrade it. The
+        // ONLY value this function may remove is the off sentinel.
+        let control = reasoning_control(Some(&RawReasoningCapability {
+            supported_efforts: Some(vec![
+                "Ultra".into(),
+                "none".into(),
+                "ludicrous-speed".into(),
+                "MINIMAL".into(),
+            ]),
+            ..RawReasoningCapability::default()
+        }));
+
+        assert_eq!(
+            control,
+            ReasoningControl::Efforts {
+                options: vec!["Ultra".into(), "ludicrous-speed".into(), "MINIMAL".into()],
+                default_effort: None,
+                can_disable: true,
+            }
+        );
+    }
+
+    #[test]
+    fn a_menu_of_nothing_but_the_off_sentinel_leaves_a_toggle_not_an_empty_menu() {
+        // Stripping the sentinel can empty the list, and a menu with no options
+        // is a control with nothing to pick. What the record actually says is
+        // "reasoning can be on or off", which is a toggle.
+        assert_eq!(
+            reasoning_control(Some(&RawReasoningCapability {
+                supported_efforts: Some(vec!["none".into()]),
+                default_enabled: Some(true),
+                ..RawReasoningCapability::default()
+            })),
+            ReasoningControl::Toggle { default_on: true }
         );
     }
 
