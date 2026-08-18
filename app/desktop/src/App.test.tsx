@@ -2,7 +2,7 @@ import { render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ReactNode } from "react";
-import type { AppPreferencesLoad } from "./lib/types";
+import type { PreferencesBootstrap } from "./preferences/preferences";
 
 const { mockUseVault } = vi.hoisted(() => ({ mockUseVault: vi.fn() }));
 
@@ -28,7 +28,7 @@ vi.mock("./updates/UpdateCoordinator", () => ({
 import * as api from "./lib/api";
 import App from "./App";
 
-const SEEN_CURRENT: AppPreferencesLoad = {
+const SEEN_CURRENT: PreferencesBootstrap = {
   preferences: {
     automaticUpdateChecks: true,
     theme: "neuralVioletDark",
@@ -37,6 +37,7 @@ const SEEN_CURRENT: AppPreferencesLoad = {
     lastSeenWhatsNewVersion: "0.4.2",
   },
   recoveredFromCorrupt: false,
+  readFailed: false,
   recoveryMessage: null,
 };
 
