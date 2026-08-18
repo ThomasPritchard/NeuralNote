@@ -33,47 +33,13 @@ permissions:
 
 jobs:
   required-native:
-    name: Native Tauri (${{ matrix.label }})
-    runs-on: ${{ matrix.platform }}
-    # Matches the widened per-wait budget in `nativeWait`: this suite passes
-    # locally and expired on the hosted macOS runner, and a per-wait budget the
-    # job cap outlives is no budget at all.
+    name: Native Tauri (Ubuntu)
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    # macOS is informational until #100 lands, and runs only on the weekly
-    # schedule or manual dispatch. The suite passes locally, and the
-    # runner's 1024x768 display clamps the app's 1280x820 window until the note
-    # column is too narrow to render the lines the journeys reach for. Three
-    # fixes narrowed it - budgets, first-run picker, document-level scrolling.
-    # Diagnosis was slow because the artifact recorded only `errorType`, so every
-    # cause produced byte-identical metadata; it now also carries a redacted
-    # first message line plus the assertion code and operator, which tells the
-    # suite's assertion failures apart. See `native-artifacts.ts`.
-    #
-    # Ubuntu does NOT run the same journeys - macOS runs strictly more, so this
-    # demotion is a real coverage gap, not a duplicate lane. The real macOS save
-    # accelerator in `specs/50-workspace-ui.spec.ts` is gated behind `macOsIt`,
-    # and the native fullscreen journey in `specs/40-window.spec.ts` returns
-    # early off darwin. Nothing required covers either, so a regression in one
-    # can merge green. The environments also differ in the dimension blamed
-    # above: Ubuntu runs under xvfb at 1440x900, macOS bare on the runner's
-    # smaller display.
-    continue-on-error: ${{ matrix.informational || false }}
-    if: ${{ !matrix.informational || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: ubuntu-latest
-            label: Ubuntu
-          - platform: macos-latest
-            label: macOS (informational)
-            informational: true
-
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
 
       - name: Tauri system dependencies (Ubuntu)
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -110,12 +76,59 @@ jobs:
         run: npm ci
 
       - name: Native Tauri E2E (Ubuntu)
-        if: runner.os == 'Linux'
         working-directory: app/desktop/e2e-native
         run: xvfb-run --auto-servernum --server-args="-screen 0 1440x900x24" npm test
 
+      - name: Upload redacted failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-e2e-${{ runner.os }}-${{ github.run_attempt }}
+          path: app/desktop/e2e-native/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  macos-informational:
+    name: Native Tauri (macOS informational)
+    # Parked until #100/#101 land. The suite passes locally; the hosted runner's
+    # 1024x768 display clamps the app's 1280x820 window. Ubuntu does not run the
+    # same journeys (macOS save accelerator, fullscreen), so this is a real
+    # coverage gap, not a duplicate lane.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+
+      - name: Setup Rust 1.96
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.96.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+        with:
+          workspaces: "."
+
+      - name: Setup Node 24 LTS
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            app/desktop/package-lock.json
+            app/desktop/e2e-native/package-lock.json
+
+      - name: Install desktop dependencies
+        working-directory: app/desktop
+        run: npm ci
+
+      - name: Install native E2E dependencies
+        working-directory: app/desktop/e2e-native
+        run: npm ci
+
       - name: Native Tauri E2E (macOS)
-        if: runner.os == 'macOS'
         working-directory: app/desktop/e2e-native
         run: npm test
 

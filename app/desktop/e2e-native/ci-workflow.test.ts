@@ -71,8 +71,8 @@ test("resolves job bodies from a CRLF checkout", (t) => {
   assert.doesNotMatch(frontend, /runs-on: macos-latest/u);
 });
 
-const informationalOnly =
-  /if: \$\{\{ !matrix\.informational \|\| github\.event_name == 'schedule' \|\| github\.event_name == 'workflow_dispatch' \}\}/u;
+const weeklyOrManual =
+  /if: github\.event_name == 'schedule' \|\| github\.event_name == 'workflow_dispatch'/u;
 
 test("schedules a weekly informational pass and keeps manual dispatch", () => {
   for (const source of [ciWorkflow, workflow]) {
@@ -82,23 +82,26 @@ test("schedules a weekly informational pass and keeps manual dispatch", () => {
 });
 
 test("gates pull requests on the required Ubuntu native lane only", () => {
-  const required = jobBody(workflow, "  required-native:\n", "  windows-informational:\n");
+  const required = jobBody(workflow, "  required-native:\n", "  macos-informational:\n");
   assert.match(workflow, /pull_request:/u);
   assert.match(required, /timeout-minutes: 30/u);
-  assert.match(required, /platform: ubuntu-latest/u);
-  assert.match(required, /platform: macos-latest/u);
-  assert.match(required, /informational: true/u);
-  assert.match(required, informationalOnly);
-  assert.match(required, /name: Native Tauri \(\$\{\{ matrix\.label \}\}\)/u);
+  assert.match(required, /ubuntu-latest/u);
   assert.match(required, /xvfb-run --auto-servernum/u);
+  assert.doesNotMatch(required, /macos-latest/u);
+  assert.doesNotMatch(required, weeklyOrManual);
+});
+
+test("parks native macOS on the weekly and manual informational lane", () => {
+  const macos = jobBody(workflow, "  macos-informational:\n", "  windows-informational:\n");
+  assert.match(macos, weeklyOrManual);
+  assert.match(macos, /macos-latest/u);
+  assert.match(macos, /continue-on-error: true/u);
+  assert.match(macos, /path: app\/desktop\/e2e-native\/artifacts\//u);
 });
 
 test("parks Windows native on the weekly and manual informational lane", () => {
   const windows = jobBody(workflow, "  windows-informational:\n");
-  assert.match(
-    windows,
-    /if: github\.event_name == 'schedule' \|\| github\.event_name == 'workflow_dispatch'/u,
-  );
+  assert.match(windows, weeklyOrManual);
   assert.match(windows, /timeout-minutes: 15/u);
   assert.match(windows, /continue-on-error: true/u);
   assert.match(windows, /path: app\/desktop\/e2e-native\/artifacts\//u);
@@ -106,10 +109,14 @@ test("parks Windows native on the weekly and manual informational lane", () => {
 });
 
 test("parks WebKit on the weekly and manual informational lane", () => {
-  const browser = jobBody(ciWorkflow, "  browser:\n", "  rust:\n");
-  assert.match(browser, /browser: chromium/u);
-  assert.match(browser, /browser: webkit/u);
-  assert.match(browser, informationalOnly);
+  const browser = jobBody(ciWorkflow, "  browser:\n", "  browser-webkit:\n");
+  const webkit = jobBody(ciWorkflow, "  browser-webkit:\n", "  rust:\n");
+  assert.match(browser, /name: Browser \/ chromium \/ ubuntu-latest/u);
+  assert.match(browser, /test:browser:chromium/u);
+  assert.doesNotMatch(browser, /webkit/u);
+  assert.match(webkit, weeklyOrManual);
+  assert.match(webkit, /test:browser:webkit/u);
+  assert.match(webkit, /continue-on-error: true/u);
 });
 
 test("prints verbose Gitleaks findings", () => {
