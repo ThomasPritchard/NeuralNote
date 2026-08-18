@@ -234,7 +234,8 @@ pub struct Backlink {
     pub source_rel: String,
     pub source_title: String,
     pub snippet: String,
-    /// 1-based line number in the source note body.
+    /// 1-based line number in the source note's raw file (frontmatter included),
+    /// so it matches the line search reports for the same text.
     pub line: u32,
 }
 
@@ -246,7 +247,8 @@ pub struct UnlinkedMention {
     pub source_rel: String,
     pub source_title: String,
     pub snippet: String,
-    /// 1-based line number in the source note body.
+    /// 1-based line number in the source note's raw file (frontmatter included),
+    /// so it matches the line search reports for the same text.
     pub line: u32,
 }
 

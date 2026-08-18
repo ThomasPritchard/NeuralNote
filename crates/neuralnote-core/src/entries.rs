@@ -3,7 +3,7 @@
 
 use crate::error::{CoreError, CoreResult};
 use crate::model::TreeNode;
-use crate::paths::{ensure_within, validate_name};
+use crate::paths::{ensure_descendant, ensure_within, validate_name};
 use crate::tree::node_for;
 use std::path::{Path, PathBuf};
 
@@ -40,17 +40,33 @@ pub fn create_note(root: &Path, parent: &Path, name: &str) -> CoreResult<TreeNod
     let parent = ensure_within(root, parent)?;
     let file_name = ensure_md_extension(name.trim());
     let target = ensure_within(root, &parent.join(&file_name))?;
-    if target.exists() {
-        return Err(CoreError::AlreadyExists(file_name));
+    // `create_new` is `O_CREAT|O_EXCL`, which POSIX requires to fail `EEXIST` on a
+    // symlink — dangling or not — so the note can never be created THROUGH a link
+    // planted at this name (issue #193). It is also the clobber refusal itself:
+    // a separate `exists()` pre-check would only widen a check-then-create window,
+    // and `exists()` follows symlinks, so it reports `false` for the dangling link
+    // that is exactly the case being defended against.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(CoreError::AlreadyExists(file_name));
+        }
+        Err(error) => return Err(error.into()),
     }
-    std::fs::write(&target, "")?;
     node_for(&canon_root(root)?, &target)
 }
 
 /// Rename a file or folder in place (keeps it in the same parent).
 pub fn rename_entry(root: &Path, path: &Path, new_name: &str) -> CoreResult<TreeNode> {
     validate_name(new_name)?;
-    let path = ensure_within(root, path)?;
+    // `ensure_descendant`, not `ensure_within`: the vault root is contained in
+    // itself, and renaming it moves the vault inside the user's filesystem —
+    // the case-only branch below would do it *outside* the boundary entirely.
+    let path = ensure_descendant(root, path)?;
     if !path.exists() {
         return Err(CoreError::NotFound(path.display().to_string()));
     }
@@ -106,6 +122,18 @@ fn apply_case_only_rename(
     parent: &Path,
     final_name: &str,
 ) -> CoreResult<TreeNode> {
+    // Both renames below run in `parent`, which is derived from the target rather
+    // than from the vault. Prove *the parent* is contained, then join onto that —
+    // these are the only writes in this module no `ensure_within` stands in front
+    // of, and for a vault-root target `parent` is outside the vault entirely.
+    //
+    // The check has to land on the parent rather than on the joined path: leaf
+    // names here differ from what is on disk only by case, and `ensure_within`
+    // canonicalises, which on a case-insensitive filesystem normalises the new
+    // casing straight back to the old one and collapses the rename to a no-op.
+    // `final_name` is separator-free (`validate_name`), so a contained parent
+    // makes the join contained too.
+    let parent = ensure_within(root, parent)?;
     let final_target = parent.join(final_name);
     if final_target.exists() && !is_same_entry(path, &final_target) {
         // A genuinely different file already holds that name (case-sensitive FS).
@@ -133,9 +161,16 @@ fn apply_case_only_rename(
 }
 
 /// Move a file or folder to `new_parent`, keeping its name. Refuses to move a
-/// folder into its own descendant.
+/// folder into its own descendant, and refuses to move the vault root at all.
 pub fn move_entry(root: &Path, path: &Path, new_parent: &Path) -> CoreResult<TreeNode> {
-    let path = ensure_within(root, path)?;
+    // `ensure_descendant` on what is being moved, `ensure_within` on where it is
+    // going: the vault root is a legitimate *destination* but never a legitimate
+    // thing to relocate. Containment alone admits the root (it is contained in
+    // itself), and the self-move branch below only catches a root `path` by
+    // coincidence — `new_parent` is already proven inside the root, so
+    // `starts_with` is trivially true there. Naming the boundary here keeps the
+    // refusal when that branch is narrowed (issue #194).
+    let path = ensure_descendant(root, path)?;
     let new_parent = ensure_within(root, new_parent)?;
     if !path.exists() {
         return Err(CoreError::NotFound(path.display().to_string()));
@@ -174,7 +209,9 @@ pub fn move_entry(root: &Path, path: &Path, new_parent: &Path) -> CoreResult<Tre
 /// origin path. That cost is accepted deliberately — see the comment on the
 /// macOS branch.
 pub fn delete_entry(root: &Path, path: &Path) -> CoreResult<()> {
-    let path = ensure_within(root, path)?;
+    // `ensure_descendant`, not `ensure_within`: the root passes containment, and
+    // deleting it would move the user's entire vault to the Trash on one IPC call.
+    let path = ensure_descendant(root, path)?;
     if !path.exists() {
         return Err(CoreError::NotFound(path.display().to_string()));
     }

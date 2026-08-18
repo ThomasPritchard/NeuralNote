@@ -72,6 +72,45 @@ mod tests {
         assert!(paths::ensure_within(v.path(), &inside).is_ok());
     }
 
+    /// A symlink whose target does not exist fails `canonicalize` with the very
+    /// same `ENOENT` a genuinely missing file gives, so the "target doesn't exist
+    /// yet" branch used to rejoin the leaf onto the canonical parent and hand back
+    /// an in-vault path for a link pointing straight out of the vault (issue #193).
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_dangling_symlink_leaf_pointing_outside_the_vault() {
+        use std::os::unix::fs::symlink;
+
+        let v = vault();
+        let outside = tempfile::tempdir().unwrap();
+        let link = v.path().join("Research/dangling.md");
+        symlink(outside.path().join("planted.md"), &link).unwrap();
+
+        assert!(matches!(
+            paths::ensure_within(v.path(), &link),
+            Err(CoreError::OutsideVault(_))
+        ));
+    }
+
+    /// The live-symlink case is already refused through the `canonicalize` success
+    /// branch. Pinned so a future change to the non-existent-target branch cannot
+    /// regress the one that already works.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_live_symlink_leaf_pointing_outside_the_vault() {
+        use std::os::unix::fs::symlink;
+
+        let v = vault();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let link = v.path().join("Research/live.md");
+        symlink(outside.path(), &link).unwrap();
+
+        assert!(matches!(
+            paths::ensure_within(v.path(), &link),
+            Err(CoreError::OutsideVault(_))
+        ));
+    }
+
     #[test]
     fn validate_name_rejects_separators_and_navigation() {
         assert!(paths::validate_name("a/b").is_err());
@@ -2660,6 +2699,63 @@ mod tests {
         assert_eq!(b.unlinked.len(), 1);
         assert_eq!(b.unlinked[0].line, 5);
         assert_eq!(b.unlinked[0].snippet, "plain Rust survives");
+    }
+
+    #[test]
+    fn backlinks_number_linked_mentions_from_the_start_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("target.md"), "# Rust\n").unwrap();
+        // 4 frontmatter lines, so the link on body line 1 is file line 5.
+        fs::write(
+            dir.path().join("alpha.md"),
+            "---\ntitle: Alpha\ntags: [rust]\n---\nThis line links [[target]] now.\n",
+        )
+        .unwrap();
+        // 6 frontmatter lines, so the link on body line 2 is file line 8 — a
+        // different offset, so no single constant satisfies both notes.
+        fs::write(
+            dir.path().join("beta.md"),
+            "---\ntitle: Beta\ntags:\n  - rust\n  - notes\n---\nIntro paragraph.\nAnother line links [target](target.md).\n",
+        )
+        .unwrap();
+
+        let b = backlinks::read_backlinks(dir.path(), "target.md").unwrap();
+
+        assert_eq!(b.linked.len(), 2);
+        assert_eq!(b.linked[0].source_rel, "alpha.md");
+        assert_eq!(b.linked[0].source_title, "Alpha");
+        assert_eq!(b.linked[0].line, 5);
+        assert_eq!(b.linked[0].snippet, "This line links [[target]] now.");
+        assert_eq!(b.linked[1].source_rel, "beta.md");
+        assert_eq!(b.linked[1].source_title, "Beta");
+        assert_eq!(b.linked[1].line, 8);
+        assert_eq!(
+            b.linked[1].snippet,
+            "Another line links [target](target.md)."
+        );
+    }
+
+    #[test]
+    fn backlinks_number_unlinked_mentions_from_the_start_of_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("target.md"), "# Rust\n").unwrap();
+        // 3 frontmatter lines, so body lines 2 and 4 are file lines 5 and 7.
+        fs::write(
+            dir.path().join("plain.md"),
+            "---\ntitle: Plain\n---\nIntro line.\nRust starts here.\nNo match here.\nAnother rust mention here.\n",
+        )
+        .unwrap();
+
+        let b = backlinks::read_backlinks(dir.path(), "target.md").unwrap();
+
+        assert!(b.linked.is_empty());
+        assert_eq!(b.unlinked.len(), 2);
+        assert!(b.unlinked.iter().all(|m| m.source_rel == "plain.md"));
+        assert_eq!(b.unlinked[0].source_title, "Plain");
+        assert_eq!(b.unlinked[0].line, 5);
+        assert_eq!(b.unlinked[0].snippet, "Rust starts here.");
+        assert_eq!(b.unlinked[1].line, 7);
+        assert_eq!(b.unlinked[1].snippet, "Another rust mention here.");
     }
 
     #[test]
