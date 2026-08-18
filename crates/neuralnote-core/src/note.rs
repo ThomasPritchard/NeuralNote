@@ -295,6 +295,21 @@ pub(crate) struct Parsed {
     pub(crate) body: String,
 }
 
+/// How many file lines precede the body [`parse_frontmatter`] extracted from
+/// `raw`. Add it to a body-relative line number to get the line the user sees in
+/// the file, so every surface (search, backlinks) cites the same line for the same
+/// text — a citation that points at the wrong line is worse than no citation.
+///
+/// `body` must be the [`Parsed::body`] produced from this same `raw`. When there
+/// is no frontmatter — including the unterminated-block case, where the body falls
+/// back to the whole file — the offset is 0 and body lines are already file lines.
+pub(crate) fn body_line_offset(raw: &str, body: &str) -> usize {
+    raw.len()
+        .checked_sub(body.len())
+        .map(|body_start| raw[..body_start].lines().count())
+        .unwrap_or(0)
+}
+
 /// Extract a leading `---` … `---` YAML block (Obsidian/Jekyll style) and parse
 /// it. On a malformed or unterminated block we never lose content: the error is
 /// surfaced and the body falls back to the whole file.
