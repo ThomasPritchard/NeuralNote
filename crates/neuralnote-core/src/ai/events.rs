@@ -42,6 +42,25 @@ pub struct Elicitation {
     pub multi_select: bool,
 }
 
+/// Which item of a selected playlist is in flight.
+///
+/// The denominator is the playlist's own length — fixed when the user picked the
+/// videos and unable to move afterwards, unlike
+/// [`ChatEvent::PlanningRound::max_rounds`], which a mid-run skill activation can
+/// raise. That is the whole reason this exists: during a playlist the run's
+/// progress is measured in videos, which is both the honest unit of work and the
+/// only one with a stable ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PlaylistPosition {
+    /// 1-based: the first selected video is 1, so it pairs directly with
+    /// `total` as "video 2 of 3".
+    pub position: u32,
+    /// How many videos the user selected. Constant for the run.
+    pub total: u32,
+}
+
 /// How a dispatched tool call settled. Mirrors [`crate::ai::tools::ToolOutcome`]'s
 /// discriminant but is the UI-facing vocabulary: `Rejected` (bad args/path — the
 /// orchestrator refused) and `Denied` (the user refused) are different stories and
@@ -139,6 +158,16 @@ pub enum ChatEvent {
         /// folds each active skill's declared cap over the base). The UI must
         /// render the latest pair and never cache the denominator.
         max_rounds: u32,
+        /// Which video of a selected playlist this round is working on, or
+        /// `None` when no playlist is in flight.
+        ///
+        /// Re-stated on every beacon rather than announced once, so the pair the
+        /// head renders is always this round's pair and the end of a playlist
+        /// clears itself. During a playlist this is the honest progress reading:
+        /// `max_rounds` above is a ceiling the iteration guard deliberately does
+        /// not enforce while a playlist runs (each item may spend its own
+        /// bounded allowance), whereas the playlist length cannot move.
+        playlist: Option<PlaylistPosition>,
     },
     /// The provider is alive and has sent nothing else. Forwarded from an SSE
     /// comment line (OpenRouter sends `: OPENROUTER PROCESSING`), which the
@@ -159,6 +188,37 @@ pub enum ChatEvent {
         /// The [`ChatEvent::ToolCall`] id.
         id: String,
         message: String,
+    },
+    /// The video the run is about to work on, for a preview card beside the
+    /// live head.
+    ///
+    /// **It carries no playlist position.** The position is owned by the
+    /// [`ChatEvent::PlanningRound`] beacon alone, so the card and the head read
+    /// one number from one emitter and can never disagree about which video is
+    /// in flight. That places an ordering requirement on whoever emits this:
+    /// **it follows the beacon that first announces its item**, so a preview
+    /// belonging to the previous video is cleared by the beacon rather than left
+    /// standing beside the new one.
+    ///
+    /// Everything here is host-read metadata, never model prose.
+    VideoPreview {
+        /// The YouTube video id, so a card can be told apart from its successor
+        /// even when two videos share a title.
+        video_id: String,
+        title: String,
+        /// Absent when the extractor reported no duration — which it does — and
+        /// an absent duration must render as absent rather than as `0`.
+        duration_secs: Option<u64>,
+        channel: Option<String>,
+        /// The thumbnail, bounded and validated host-side and carried as a data
+        /// URI exactly as [`ElicitOption::image_data_uri`] already is, so the
+        /// webview needs no third-party network allowlist.
+        ///
+        /// A **nice-to-have**: the fetch is capped and timed out, and a
+        /// thumbnail that fails, exceeds its cap, or is rejected arrives as
+        /// `None` rather than delaying or failing the run. `None` is the
+        /// degraded path the card must render usefully, not an error.
+        thumbnail_data_uri: Option<String>,
     },
     /// A skill became active and granted its declared tools.
     SkillActivated { id: String, name: String },
@@ -504,11 +564,95 @@ mod tests {
         let event = ChatEvent::PlanningRound {
             round: 2,
             max_rounds: 12,
+            playlist: None,
         };
         assert_eq!(
             json(&event),
-            serde_json::json!({ "type": "planningRound", "round": 2, "maxRounds": 12 })
+            serde_json::json!({
+                "type": "planningRound",
+                "round": 2,
+                "maxRounds": 12,
+                "playlist": null,
+            })
         );
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn a_planning_round_inside_a_playlist_names_the_item_in_flight() {
+        // The playlist length is the one denominator that cannot move: it was
+        // fixed when the user picked the videos. `max_rounds` still travels
+        // beside it, unchanged, because a run is still spending rounds.
+        let event = ChatEvent::PlanningRound {
+            round: 9,
+            max_rounds: 16,
+            playlist: Some(PlaylistPosition {
+                position: 2,
+                total: 3,
+            }),
+        };
+        assert_eq!(
+            json(&event),
+            serde_json::json!({
+                "type": "planningRound",
+                "round": 9,
+                "maxRounds": 16,
+                "playlist": { "position": 2, "total": 3 },
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn a_video_preview_carries_its_thumbnail_as_a_data_uri() {
+        // Same transport as `ElicitOption::image_data_uri`: the image crosses as
+        // a bounded data URI, so the webview never talks to a third party.
+        let event = ChatEvent::VideoPreview {
+            video_id: "iG9CE55wbtY".into(),
+            title: "Spaced repetition, explained".into(),
+            duration_secs: Some(742),
+            channel: Some("Study Lab".into()),
+            thumbnail_data_uri: Some("data:image/jpeg;base64,AAAA".into()),
+        };
+        assert_eq!(
+            json(&event),
+            serde_json::json!({
+                "type": "videoPreview",
+                "videoId": "iG9CE55wbtY",
+                "title": "Spaced repetition, explained",
+                "durationSecs": 742,
+                "channel": "Study Lab",
+                "thumbnailDataUri": "data:image/jpeg;base64,AAAA",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn a_video_preview_without_a_thumbnail_is_null_rather_than_an_empty_string() {
+        // The degraded path, and the likely one: the thumbnail is a
+        // nice-to-have whose fetch may be capped, timed out, or rejected. An
+        // empty string would render as a broken image; `null` says there is no
+        // image and the card draws its text-only self.
+        let event = ChatEvent::VideoPreview {
+            video_id: "iG9CE55wbtY".into(),
+            title: "Spaced repetition, explained".into(),
+            duration_secs: None,
+            channel: None,
+            thumbnail_data_uri: None,
+        };
+        assert_eq!(json(&event)["thumbnailDataUri"], serde_json::Value::Null);
+        assert_eq!(json(&event)["durationSecs"], serde_json::Value::Null);
+        assert_eq!(json(&event)["channel"], serde_json::Value::Null);
         assert_eq!(
             serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
             event

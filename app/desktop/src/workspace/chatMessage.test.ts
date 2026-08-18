@@ -281,16 +281,40 @@ describe("reduceAssistant — grounded progress", () => {
       type: "planningRound",
       round: 3,
       maxRounds: 12,
+      playlist: null,
     });
 
     expect(viaRound).toEqual(viaProcessing);
     expect(viaRound.phase).toBe("thinking");
   });
 
-  it("leaves the turn untouched for keepalive and tool progress", () => {
-    // Both are wire plumbing this phase only carries. A keepalive says the
+  it("reads a playlist position on the round beacon as nothing yet", () => {
+    // The amendment widened the beacon so the head can count videos instead of
+    // rounds. Widening the wire is not the same as changing the pane, and this
+    // commit is only the former: a beacon carrying a playlist position must
+    // still reduce exactly as one without it.
+    const withPlaylist = reduceAssistant(emptyAssistant(), {
+      type: "planningRound",
+      round: 9,
+      maxRounds: 16,
+      playlist: { position: 2, total: 3 },
+    });
+    const withoutPlaylist = reduceAssistant(emptyAssistant(), {
+      type: "planningRound",
+      round: 9,
+      maxRounds: 16,
+      playlist: null,
+    });
+
+    expect(withPlaylist).toEqual(withoutPlaylist);
+  });
+
+  it("leaves the turn untouched for keepalive, tool progress and a video preview", () => {
+    // All three are wire plumbing this phase only carries. A keepalive says the
     // socket is alive, not that anything happened, so it must not move the
-    // phase, the activity log, or anything else the user can see.
+    // phase, the activity log, or anything else the user can see; nothing emits
+    // the other two yet, and folding them now would put the pane ahead of the
+    // contract.
     const searched = run([
       { type: "searching", query: "active recall", callId: "c1" },
     ]);
@@ -301,6 +325,16 @@ describe("reduceAssistant — grounded progress", () => {
         type: "toolProgress",
         id: "c1",
         message: "3 of 8 videos",
+      }),
+    ).toEqual(searched);
+    expect(
+      reduceAssistant(searched, {
+        type: "videoPreview",
+        videoId: "iG9CE55wbtY",
+        title: "Spaced repetition, explained",
+        durationSecs: 742,
+        channel: "Study Lab",
+        thumbnailDataUri: "data:image/jpeg;base64,AAAA",
       }),
     ).toEqual(searched);
   });

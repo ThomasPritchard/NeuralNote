@@ -550,6 +550,10 @@ pub(super) fn round_beacon(consumed: usize, max_iterations: usize) -> ChatEvent 
     ChatEvent::PlanningRound {
         round,
         max_rounds: u32::try_from(max_iterations).unwrap_or(u32::MAX).max(round),
+        // The wire can carry the playlist item in flight; nothing reads the
+        // session here yet, so this beacon says "no playlist" until the phase
+        // that teaches the head to count videos wires it up.
+        playlist: None,
     }
 }
 

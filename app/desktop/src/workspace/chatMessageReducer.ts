@@ -169,11 +169,13 @@ export function reduceAssistant(
       return { ...turn, phase: "thinking" };
     case "keepalive":
     case "toolProgress":
+    case "videoPreview":
       // Wire plumbing only. `keepalive` says the socket is alive rather than
-      // that progress happened, and nothing emits `toolProgress` yet; folding
-      // either into state now would move the UI ahead of the contract. Never
-      // collapse these into a `default:` arm — the exhaustive switch is what
-      // makes a new backend event a compile error here.
+      // that progress happened, and nothing emits `toolProgress` or
+      // `videoPreview` yet; folding any of them into state now would move the
+      // UI ahead of the contract. Never collapse these into a `default:` arm —
+      // the exhaustive switch is what makes a new backend event a compile
+      // error here.
       return turn;
     case "skillActivated":
       return {

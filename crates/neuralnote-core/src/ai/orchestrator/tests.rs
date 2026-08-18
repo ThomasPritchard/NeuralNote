@@ -2476,7 +2476,9 @@ fn happy_path_searches_reads_and_emits_a_verified_citation() {
     let rounds: Vec<(u32, u32)> = events
         .iter()
         .filter_map(|event| match event {
-            ChatEvent::PlanningRound { round, max_rounds } => Some((*round, *max_rounds)),
+            ChatEvent::PlanningRound {
+                round, max_rounds, ..
+            } => Some((*round, *max_rounds)),
             _ => None,
         })
         .collect();
@@ -3859,7 +3861,9 @@ fn a_run_past_its_ceiling_still_never_announces_a_round_above_it() {
     for consumed in 0..(base_ceiling + skill_ceiling + 8) {
         // Exactly what `collect_evidence` passes, floor included.
         let max_iterations = base_ceiling.max(skill_ceiling).max(consumed);
-        let ChatEvent::PlanningRound { round, max_rounds } = round_beacon(consumed, max_iterations)
+        let ChatEvent::PlanningRound {
+            round, max_rounds, ..
+        } = round_beacon(consumed, max_iterations)
         else {
             panic!("round_beacon announces a round");
         };

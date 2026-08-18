@@ -7,6 +7,7 @@ import type { ElicitOption } from "./ElicitOption";
 import type { GatedTool } from "./GatedTool";
 import type { NoteKind } from "./NoteKind";
 import type { PlanStep } from "./PlanStep";
+import type { PlaylistPosition } from "./PlaylistPosition";
 import type { StepStatus } from "./StepStatus";
 import type { ToolStatus } from "./ToolStatus";
 
@@ -28,11 +29,44 @@ round: number,
  * folds each active skill's declared cap over the base). The UI must
  * render the latest pair and never cache the denominator.
  */
-maxRounds: number, } | { "type": "keepalive" } | { "type": "toolProgress", 
+maxRounds: number, 
+/**
+ * Which video of a selected playlist this round is working on, or
+ * `None` when no playlist is in flight.
+ *
+ * Re-stated on every beacon rather than announced once, so the pair the
+ * head renders is always this round's pair and the end of a playlist
+ * clears itself. During a playlist this is the honest progress reading:
+ * `max_rounds` above is a ceiling the iteration guard deliberately does
+ * not enforce while a playlist runs (each item may spend its own
+ * bounded allowance), whereas the playlist length cannot move.
+ */
+playlist: PlaylistPosition | null, } | { "type": "keepalive" } | { "type": "toolProgress", 
 /**
  * The [`ChatEvent::ToolCall`] id.
  */
-id: string, message: string, } | { "type": "skillActivated", id: string, name: string, } | { "type": "skillStep", message: string, } | { "type": "elicit", id: string, question: string, options: Array<ElicitOption>, multiSelect: boolean, } | { "type": "skillActivationFailed", id: string, name: string, 
+id: string, message: string, } | { "type": "videoPreview", 
+/**
+ * The YouTube video id, so a card can be told apart from its successor
+ * even when two videos share a title.
+ */
+videoId: string, title: string, 
+/**
+ * Absent when the extractor reported no duration — which it does — and
+ * an absent duration must render as absent rather than as `0`.
+ */
+durationSecs: number | null, channel: string | null, 
+/**
+ * The thumbnail, bounded and validated host-side and carried as a data
+ * URI exactly as [`ElicitOption::image_data_uri`] already is, so the
+ * webview needs no third-party network allowlist.
+ *
+ * A **nice-to-have**: the fetch is capped and timed out, and a
+ * thumbnail that fails, exceeds its cap, or is rejected arrives as
+ * `None` rather than delaying or failing the run. `None` is the
+ * degraded path the card must render usefully, not an error.
+ */
+thumbnailDataUri: string | null, } | { "type": "skillActivated", id: string, name: string, } | { "type": "skillStep", message: string, } | { "type": "elicit", id: string, question: string, options: Array<ElicitOption>, multiSelect: boolean, } | { "type": "skillActivationFailed", id: string, name: string, 
 /**
  * The human sentence, for display only — no longer load-bearing.
  */
