@@ -816,7 +816,8 @@ pub struct OpenAiChatClient {
     /// budgets the assembled prompt against the real window (issue #22); `None`
     /// means unknown and budgeting stays inert.
     context_window_tokens: Option<usize>,
-    /// Whether to request streamed reasoning tokens on the answer turn. The caller
+    /// Whether to request streamed reasoning tokens — on the tool-deciding turns
+    /// as well as the answer turn, which is one ask rather than two. The caller
     /// combines the user's opt-in with the selected model's capability before client
     /// construction, for both OpenRouter and Ollama.
     reasoning: bool,
@@ -891,6 +892,8 @@ impl OpenAiChatClient {
     }
 
     /// What this client asks the provider for on a turn that carries reasoning.
+    /// Every such turn asks the same thing — planning and answer alike — so a
+    /// second, hidden reasoning setting cannot appear by drift.
     ///
     /// `Enabled` rather than an effort: the client is built from a boolean
     /// opt-in, so no effort has been chosen. Naming one here would substitute our
@@ -899,18 +902,29 @@ impl OpenAiChatClient {
         self.reasoning.then_some(openai::ReasoningAsk::Enabled)
     }
 
-    /// The tool-deciding turn's wire body. Streamed, but otherwise identical to
-    /// what [`LlmClient::complete`] sends: **uncapped**, so long tool-call JSON is
-    /// never truncated mid-note, and with **no reasoning** — the tool turn drops
-    /// reasoning frames on the floor, so requesting them here is pure cost. Split
-    /// out so a test can inspect exactly what would be sent, without an endpoint.
+    /// The tool-deciding turn's wire body. Streamed, **uncapped** so long
+    /// tool-call JSON is never truncated mid-note, and carrying **the same
+    /// reasoning ask the answer turn sends**. Split out so a test can inspect
+    /// exactly what would be sent, without an endpoint.
+    ///
+    /// The tool turn used to ask for no reasoning, on the grounds that it threw
+    /// the frames away. It no longer does: `consume_tool_sse_line` streams them
+    /// as `ChatEvent::Thinking`, and this is the turn a run spends most of its
+    /// wall clock on — the silence this fills is the planning phase itself.
+    ///
+    /// One ask, not two: the reasoning the user opted into applies to planning
+    /// and to the answer alike, so there is a single knob and no hidden second
+    /// setting. The cost is real and deliberate — reasoning tokens now bill once
+    /// per planning round as well as once for the answer, on a turn with no
+    /// `max_tokens` ceiling — and it lands in `UsageMeter`, so the footer shows
+    /// it rather than hiding it.
     fn tool_wire_body(&self, req: &LlmRequest, stream: bool) -> serde_json::Value {
         openai::to_wire_request(
             req,
             stream,
             self.num_ctx,
             /* max_tokens */ None,
-            /* reasoning */ None,
+            self.reasoning_ask(),
         )
     }
 
@@ -2434,25 +2448,57 @@ mod tests {
     }
 
     #[test]
-    fn the_tool_turn_is_streamed_uncapped_and_without_reasoning() {
-        // Uncapped because a ceiling hit mid tool-call truncates the note JSON;
-        // no reasoning because the tool turn discards reasoning frames, so asking
-        // for them would be billed and thrown away. True even for a client whose
-        // user opted into reasoning — that opt-in belongs to the answer turn.
+    fn the_tool_turn_is_streamed_uncapped_and_asks_for_reasoning_like_the_answer_turn() {
+        // Uncapped because a ceiling hit mid tool-call truncates the note JSON.
+        // Reasoning because the tool-deciding turn is where a run spends most of
+        // its wall clock, and the rail renders those frames now instead of
+        // dropping them — so asking for them buys the planning phase a voice.
         let client = OpenAiChatClient::new("sk-test".into(), true);
+        let req = tool_request();
 
-        let streamed = client.tool_wire_body(&tool_request(), true);
+        let streamed = client.tool_wire_body(&req, true);
 
         assert_eq!(streamed["stream"], true);
         assert!(
             streamed.get("max_tokens").is_none(),
             "a ceiling here would truncate the note the model is composing"
         );
-        assert!(
-            streamed.get("reasoning").is_none(),
-            "the tool turn drops reasoning frames, so requesting them is pure cost"
+        assert_eq!(streamed["reasoning"]["enabled"], true);
+        // ONE knob, not two: whatever the answer turn asks for, the planning
+        // turns ask for. A second, quietly different reasoning setting is the
+        // failure this equality exists to prevent.
+        assert_eq!(
+            streamed["reasoning"],
+            client.answer_wire_body(&req)["reasoning"],
+            "planning and answer must carry the same reasoning ask"
+        );
+        assert_eq!(
+            client.tool_wire_body(&req, false)["reasoning"],
+            streamed["reasoning"],
+            "and the buffered fallback must ask for the same thing"
         );
         assert!(streamed.get("tools").is_some(), "it is still a tool turn");
+    }
+
+    #[test]
+    fn a_user_who_did_not_opt_into_reasoning_is_never_billed_for_it_on_a_tool_turn() {
+        // The opt-in is the only thing that turns reasoning on, and it now gates
+        // up to 16 planning turns rather than one answer turn — so a client built
+        // without it must send no `reasoning` object anywhere.
+        let client = OpenAiChatClient::new("sk-test".into(), false);
+        let req = tool_request();
+
+        assert!(
+            client.tool_wire_body(&req, true).get("reasoning").is_none(),
+            "the streamed tool turn must not ask for reasoning the user declined"
+        );
+        assert!(
+            client
+                .tool_wire_body(&req, false)
+                .get("reasoning")
+                .is_none(),
+            "nor must the buffered fallback"
+        );
     }
 
     #[test]

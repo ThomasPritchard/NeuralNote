@@ -20,6 +20,12 @@ pub(super) struct ThinkingCounter<'a> {
 /// Two things pass through without latching it, and both are listed at their
 /// method: a usage report (not visible) and a keepalive (visible, but idempotent
 /// — a second one says exactly what the first did).
+///
+/// **Reasoning is not one of them.** The tool turn streams `Thinking` now, and a
+/// replay would append a second monologue to the same round with nothing marking
+/// the boundary — content, not a repeated signal. It latches, and that costs a
+/// reasoning-enabled turn its retry once the first reasoning token is out
+/// (`reasoning_does_count_as_something_the_user_has_seen_and_costs_the_turn_its_retry`).
 pub(super) struct EmissionGuard<'a> {
     pub(super) inner: &'a mut dyn EventSink,
     pub(super) emitted: bool,

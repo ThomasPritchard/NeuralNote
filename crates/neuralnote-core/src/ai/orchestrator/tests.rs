@@ -4049,6 +4049,78 @@ fn a_streamed_tool_turn_that_failed_before_emitting_is_still_retried_once() {
 }
 
 #[test]
+fn reasoning_does_count_as_something_the_user_has_seen_and_costs_the_turn_its_retry() {
+    // The deliberate counterpart to the keepalive exemption below, and the
+    // reason it is a separate exemption rather than a general one.
+    //
+    // The tool turn now streams reasoning, and reasoning is NOT contentless: a
+    // replay does not repeat what the user already read, it appends a second
+    // monologue to the same round's buffer with nothing on screen marking the
+    // boundary — one train of thought the model never had. So it latches the
+    // guard, like every other visible event, and this turn spends its retry.
+    //
+    // The cost is real and is stated here rather than discovered later: a
+    // mid-stream socket drop on a reasoning-enabled run is no longer retried.
+    // What survives is every failure that happens BEFORE the first frame — the
+    // whole 429/5xx/408 and connect-timeout class the retry was written for
+    // (see `a_streamed_tool_turn_that_failed_before_emitting_is_still_retried_once`),
+    // and the full turn for a user who did not opt into reasoning.
+    struct ReasoningThenFailingToolTurn {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for ReasoningThenFailingToolTurn {
+        async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+            panic!("a client that streams tool turns must not fall back to the buffered one")
+        }
+
+        async fn complete_tool_streaming(
+            &self,
+            _req: &LlmRequest,
+            sink: &mut dyn EventSink,
+        ) -> CoreResult<Completion> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            sink.send(ChatEvent::Thinking {
+                delta: "The user wants".into(),
+            });
+            Err(CoreError::Llm(
+                "openrouter returned 429 Too Many Requests".into(),
+            ))
+        }
+
+        async fn complete_streaming(
+            &self,
+            _req: &LlmRequest,
+            _sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            panic!("the answer turn is not reached")
+        }
+    }
+
+    let llm = ReasoningThenFailingToolTurn {
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+    };
+
+    let (result, sink) = run_streamed_tool_turn(&llm);
+
+    assert!(result.is_err(), "the failure is surfaced, not swallowed");
+    assert_eq!(
+        llm.attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "reasoning was on screen, so there is no replay"
+    );
+    assert_eq!(
+        sink.events,
+        vec![ChatEvent::Thinking {
+            delta: "The user wants".into()
+        }],
+        "the one attempt's reasoning reached the user exactly once"
+    );
+}
+
+#[test]
 fn a_keepalive_does_not_count_as_something_the_user_has_seen() {
     // The tool turn forwards keepalives now, because it is the turn whose
     // silence the live head has to explain. That must not quietly cost the turn

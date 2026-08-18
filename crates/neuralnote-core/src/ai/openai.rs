@@ -399,10 +399,16 @@ fn answer_event(chunk: StreamChunk) -> SseEvent {
 
 /// One parsed SSE line's meaning on a tool-deciding turn.
 pub enum ToolSseEvent {
-    /// What the frame carried for this turn. Both parts, because the wire does
-    /// not promise prose and tool-call fragments arrive in separate frames, and
-    /// returning early on either would drop the other.
+    /// What the frame carried for this turn. All three parts in ONE variant,
+    /// because the wire does not promise reasoning, prose and tool-call
+    /// fragments arrive in separate frames, and returning early on any of them
+    /// would drop the others.
     Delta {
+        /// Model reasoning tokens, surfaced live and never folded into the
+        /// turn's content — see [`consume_tool_sse_line`]. A separate variant
+        /// would have to choose between reasoning and the fragments riding
+        /// beside it, and dropping a fragment corrupts a note body.
+        reasoning: Option<String>,
         content: Option<String>,
         fragments: Vec<ToolCallDelta>,
     },
@@ -416,7 +422,10 @@ pub enum ToolSseEvent {
     /// drifting apart on the shared parts of the stream. Forwarding is a separate
     /// question, answered in [`consume_tool_sse_line`].
     Keepalive,
-    /// Reasoning, an empty delta, or malformed noise.
+    /// An empty delta or malformed noise. Reasoning is deliberately NOT here:
+    /// the tool-deciding turn is where a run spends most of its wall clock, and
+    /// classifying its reasoning as noise is what made the whole planning phase
+    /// silent by construction.
     Other,
 }
 
@@ -450,6 +459,11 @@ fn tool_event(chunk: StreamChunk) -> ToolSseEvent {
     if let Some(message) = tool_turn_failure(choice.finish_reason.as_deref()) {
         return ToolSseEvent::Failed(message);
     }
+    // Read reasoning BEFORE anything filters the frame, exactly as the answer
+    // turn does: a reasoning-only chunk carries an empty `delta.content` and no
+    // fragments, so the empty-delta filter below would drop every reasoning
+    // token on this turn — the mechanism that kept the planning phase silent.
+    let reasoning = extract_reasoning(&choice.delta);
     let mut fragments = Vec::with_capacity(choice.delta.tool_calls.len());
     for entry in choice.delta.tool_calls {
         let Some(index) = entry.index else {
@@ -467,10 +481,14 @@ fn tool_event(chunk: StreamChunk) -> ToolSseEvent {
         });
     }
     let content = choice.delta.content.filter(|s| !s.is_empty());
-    if content.is_none() && fragments.is_empty() {
+    if reasoning.is_none() && content.is_none() && fragments.is_empty() {
         return ToolSseEvent::Other;
     }
-    ToolSseEvent::Delta { content, fragments }
+    ToolSseEvent::Delta {
+        reasoning,
+        content,
+        fragments,
+    }
 }
 
 /// A finish reason that means the model never finished deciding.
@@ -513,7 +531,24 @@ pub fn consume_tool_sse_line(
         );
     }
     match tool_sse_event(classified) {
-        ToolSseEvent::Delta { content, fragments } => {
+        ToolSseEvent::Delta {
+            reasoning,
+            content,
+            fragments,
+        } => {
+            // Reasoning first: within a frame it precedes the tokens beside it,
+            // and the answer turn orders it the same way.
+            //
+            // **The live-only mechanism on this path is the line that ISN'T
+            // here.** Reasoning goes to the sink and NOWHERE else — it is never
+            // pushed to the accumulator, so it cannot reach the turn's content,
+            // the messages replayed to the model on the next round, or anything
+            // the citation verifier reads. The answer turn keeps the same
+            // invariant by keeping reasoning out of `full` (see
+            // [`consume_sse_line`]).
+            if let Some(reasoning) = reasoning {
+                sink.send(ChatEvent::Thinking { delta: reasoning });
+            }
             if let Some(content) = content {
                 accumulator.push_content(&content);
             }
@@ -1369,6 +1404,11 @@ mod tests {
     fn reasoning_only_stream_then_done_still_fails_the_empty_answer_guard() {
         // A stream that reasons at length and then produces no answer is still a
         // failure: reasoning never satisfies finish_answer's empty-answer guard.
+        //
+        // This is the ANSWER turn's half of the live-only invariant. Its twin on
+        // the tool turn is
+        // `a_tool_turn_streams_its_reasoning_and_keeps_it_out_of_the_settled_turn`,
+        // and the third check lives in TypeScript, over `toHistory`.
         let mut sink = VecSink::default();
         let mut full = AnswerStream::new();
         for text in ["Let me ", "think about ", "this"] {
@@ -1810,9 +1850,179 @@ mod tests {
     }
 
     #[test]
-    fn a_reasoning_frame_on_the_tool_turn_is_not_mistaken_for_a_tool_call() {
+    fn a_reasoning_frame_on_the_tool_turn_surfaces_as_reasoning_not_as_noise() {
+        // The capture opens with four reasoning frames, which is the wire saying
+        // the tool-deciding turn reasons out loud. Classifying them as noise is
+        // what made the planning phase — where the wall clock actually goes —
+        // silent by construction.
         let frame = captured_frame(|line| line.contains("reasoning.text"));
-        assert!(matches!(parse_tool_sse_line(frame), ToolSseEvent::Other));
+        match parse_tool_sse_line(frame) {
+            ToolSseEvent::Delta {
+                reasoning,
+                content,
+                fragments,
+            } => {
+                assert_eq!(
+                    reasoning.as_deref(),
+                    Some("The"),
+                    "the capture's first reasoning token"
+                );
+                assert!(
+                    content.is_none(),
+                    "a reasoning frame's content is the empty string, not a token"
+                );
+                assert!(fragments.is_empty(), "reasoning is not a tool call");
+            }
+            _ => panic!("a captured reasoning frame must surface its reasoning"),
+        }
+    }
+
+    /// The capture's leading reasoning frames, in the order the provider sent them.
+    fn captured_reasoning_frames() -> Vec<&'static str> {
+        CAPTURE
+            .lines()
+            .filter(|line| line.starts_with("data:") && line.contains("reasoning.text"))
+            .collect()
+    }
+
+    /// What one captured frame reasoned, as the parser reads it.
+    fn reasoning_of(line: &str) -> String {
+        match parse_tool_sse_line(line) {
+            ToolSseEvent::Delta {
+                reasoning: Some(reasoning),
+                ..
+            } => reasoning,
+            _ => panic!("expected a reasoning frame, got {line}"),
+        }
+    }
+
+    /// The first captured frame matching `predicate`, as JSON to derive from.
+    fn captured_frame_json(predicate: impl Fn(&str) -> bool) -> serde_json::Value {
+        serde_json::from_str(
+            captured_frame(predicate)
+                .strip_prefix("data:")
+                .expect("a captured data frame")
+                .trim(),
+        )
+        .expect("the captured frame is JSON")
+    }
+
+    /// The capture's frames carrying fragments for the small `search_notes` call.
+    fn captured_search_frames() -> Vec<&'static str> {
+        CAPTURE
+            .lines()
+            .filter(|line| match parse_tool_sse_line(line) {
+                ToolSseEvent::Delta { fragments, .. } => {
+                    !fragments.is_empty() && fragments.iter().all(|f| f.index == 0)
+                }
+                _ => false,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_tool_turn_streams_its_reasoning_and_keeps_it_out_of_the_settled_turn() {
+        // The live-only invariant on the tool path, BOTH halves in one test so it
+        // cannot pass by neither happening: every reasoning token reaches the sink
+        // as `Thinking`, and none of it reaches the `Completion` — which is what
+        // the orchestrator replays to the model as context and what the citation
+        // verifier's evidence is drawn from. Reasoning is shown, never remembered.
+        let reasoning_frames = captured_reasoning_frames();
+        assert_eq!(
+            reasoning_frames.len(),
+            4,
+            "the capture still opens with its four reasoning frames"
+        );
+        let mut sink = VecSink::default();
+        let mut accumulator = ToolTurnAccumulator::new();
+        for line in reasoning_frames
+            .iter()
+            .chain(captured_search_frames().iter())
+        {
+            assert!(
+                !consume_tool_sse_line(line.as_bytes(), &mut accumulator, &mut sink).unwrap(),
+                "no terminator in these frames"
+            );
+        }
+
+        let streamed: String = sink
+            .0
+            .iter()
+            .filter_map(|event| match event {
+                ChatEvent::Thinking { delta } => Some(delta.as_str()),
+                _ => None,
+            })
+            .collect();
+        let expected: String = reasoning_frames
+            .iter()
+            .map(|line| reasoning_of(line))
+            .collect();
+        assert_eq!(
+            streamed, expected,
+            "every captured reasoning token must reach the user live"
+        );
+        assert!(
+            expected.len() > 20,
+            "the capture reasoned {} chars; a near-empty expectation would let \
+             this test pass without comparing anything",
+            expected.len()
+        );
+
+        let completion = accumulator.finish(&mut sink).unwrap();
+        assert!(
+            completion.content.is_none(),
+            "reasoning is not the turn's prose, got {:?}",
+            completion.content
+        );
+        let call = completion
+            .tool_calls
+            .first()
+            .expect("the captured search_notes call still settles");
+        assert_eq!(call.name, "search_notes");
+        // Byte-for-byte: the reasoning must be absent from everything that
+        // outlives the stream, not merely absent from `content`.
+        let remembered = format!("{}{}", call.name, call.arguments);
+        for frame in &reasoning_frames {
+            let reasoned = reasoning_of(frame);
+            assert!(
+                !remembered.contains(&reasoned),
+                "reasoning {reasoned:?} leaked into the settled turn: {remembered}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_frame_carrying_reasoning_and_a_tool_call_fragment_keeps_both() {
+        // The ordering trap: the empty-delta filter used to return early on a
+        // frame with no content, and a reasoning check placed after it would
+        // swallow the reasoning. Placed before, it must still not swallow the
+        // FRAGMENT riding beside it — a dropped fragment is a corrupted note body.
+        //
+        // The capture never sent both in one frame, so the frame is derived: a
+        // real `reasoning_details` array spliced into a real tool-call frame.
+        // Both halves are the provider's bytes; only the combination is ours.
+        let mut call_frame = captured_frame_json(|line| line.contains(r#""name":"search_notes""#));
+        let reasoning_frame = captured_frame_json(|line| line.contains("reasoning.text"));
+        let reasoning_delta = &reasoning_frame["choices"][0]["delta"];
+        let delta = &mut call_frame["choices"][0]["delta"];
+        delta["reasoning"] = reasoning_delta["reasoning"].clone();
+        delta["reasoning_details"] = reasoning_delta["reasoning_details"].clone();
+        let frame = format!("data: {call_frame}");
+
+        let mut sink = VecSink::default();
+        let mut accumulator = ToolTurnAccumulator::new();
+        consume_tool_sse_line(frame.as_bytes(), &mut accumulator, &mut sink).unwrap();
+
+        match sink.0.as_slice() {
+            [ChatEvent::Thinking { delta }] => assert_eq!(delta, "The"),
+            other => panic!("expected the frame's reasoning to reach the sink, got {other:?}"),
+        }
+        let completion = accumulator.finish(&mut sink).unwrap();
+        let call = completion
+            .tool_calls
+            .first()
+            .expect("the fragment beside the reasoning must still become a call");
+        assert_eq!(call.name, "search_notes");
     }
 
     #[test]

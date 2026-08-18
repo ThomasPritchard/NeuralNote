@@ -1103,6 +1103,41 @@ describe("toHistory", () => {
     expect(content).toContain("- [running] Keep context ");
     expect(content).toContain("…\nThe final answer failed after the recorded work.");
   });
+
+  // Reasoning is LIVE-ONLY. Planning rounds reason out loud now, so a turn can
+  // hold thousands of reasoning characters — none of which the model may ever be
+  // shown again. Today `assistantHistoryContent` holds that by never reading
+  // `thinking`, which nothing would notice if it stopped being true. These two
+  // are what notices.
+  it("never returns a turn's reasoning to the model, even when nothing else was said", () => {
+    const reasoning = "The user wants two things; let me search the vault first.";
+    const history = toHistory([
+      userMessage("what is spacing?"),
+      { ...emptyAssistant(), thinking: reasoning, answer: "", done: true },
+    ]);
+
+    expect(history).toEqual([{ role: "user", content: "what is spacing?" }]);
+  });
+
+  it("sends the answer and the continuation record, never the reasoning beside them", () => {
+    const reasoning = "Round 3: the transcript note is already written, so skip it.";
+    const history = toHistory([
+      userMessage("distil this"),
+      {
+        ...emptyAssistant(),
+        thinking: reasoning,
+        answer: "Done — the note is in Literature.",
+        done: true,
+        writtenNotes: [{ relPath: "Literature/One.md", kind: "literature" as const }],
+      },
+    ]);
+
+    expect(history[1].content).toContain("Done — the note is in Literature.");
+    expect(history[1].content).toContain("Completed note writes:");
+    // Both branches of the history content, one assertion: whatever it built,
+    // the reasoning is not in it.
+    expect(history.map((turn) => turn.content).join("\n")).not.toContain(reasoning);
+  });
 });
 
 describe("stripCitationMarkers", () => {
