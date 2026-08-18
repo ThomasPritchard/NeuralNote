@@ -930,3 +930,54 @@ retry at the first reasoning token. A replayed retry would append a second, diff
 into the same round's buffer with nothing marking the boundary, showing a train of thought the
 model never had. Failures before any frame (429/5xx/408, connect drops) still retry, and those are
 the failures the retry was written for. No change.
+
+---
+
+# Amendment E — ratifications Phase 6 correctly refused to make alone
+
+## E1. The effort applies to planning turns. RATIFIED — this closes §4.3 and §6 open question 2.
+
+Phase 6 flagged that its brief cited a "locked decision 7" the spec does not contain, and it was
+right to stop: §4.3 reserved this choice and §6 left it open.
+
+**It was ratified by Tom, in the affirmative, on 2026-08-18** — mitigation **(a)**, chosen over
+"low on planning, chosen effort on the answer" and "uncapped, report the cost". One knob, no hidden
+second setting. The failure was documentation: the ratification was recorded outside this file, so
+this spec still read as open. Fixed here.
+
+The price §4.3 named stands and is accepted: reasoning moves from once per run to once per planning
+round plus the answer, on a turn deliberately left uncapped (`max_tokens: None`, so long tool-call
+JSON is never truncated mid-note). Typical 3-5 rounds; worst case ~17x the reasoning-token volume.
+It bills as output and lands in `UsageMeter`, so the cost surfaces in the footer rather than hiding.
+
+## E2. Sending a stored effort during a cold-launch probe window. RATIFIED as shipped.
+
+Phase 6 observed that the send path gates on the persisted verdict while the menu cache is not
+persisted, so for the ~8s probe window after launch a stored effort is sent while the control still
+reads `Pending` — which §4.2's sentence, read literally, forbids.
+
+**The shipped behaviour is correct and stands.** Locked decision 2 forbids *guessing a menu*; a
+stored effort is not a guess, it was read off this model's own probed menu and a model change
+clears it. Discarding it would silently ignore the user's explicit setting on every turn in the
+window. §4.2's wording is hereby read as governing the MENU, not a known-good stored value.
+
+## E3. A menu that shrinks under a stable model — DECIDED: fall back, never fail the turn.
+
+Phase 6 flagged, and declined to invent a policy for, the case where a model keeps its id but drops
+an effort the user had already stored. Sending a no-longer-offered effort would have the provider
+reject the turn outright.
+
+**Ruling:** when a refreshed menu no longer offers the stored effort, fall back to that model's
+`default_effort`, or to `ReasoningAsk::Enabled` if it publishes none — and log it. Never send an
+effort the current menu does not list, and never fail a turn over a preference. This matches the
+fail-open posture §4.2 already sets for the send path.
+
+## E4. Not a defect in this workstream — three load-sensitive tests
+
+`youtube::process`'s `stdout_overflow_is_bounded`, `stderr_overflow_is_bounded` and
+`timeout_kills_and_reaps_the_child` are wall-clock `timeout(2s)` assertions around busy-loop
+subprocesses. Phase 6 did not assume they were unrelated: it built a throwaway worktree at the
+untouched baseline `4013bdd` and ran them six times, going **4-of-6 red with none of its code
+present**. Pre-existing and load-sensitive. The file already carries a dated note about going red
+then green on identical code. Deserves its own issue; it is not this branch's to fix, and tuning
+the tolerance to make it pass would be the wrong repair.
