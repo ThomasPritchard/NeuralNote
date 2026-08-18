@@ -85,6 +85,51 @@ pub enum ReasoningControl {
     },
 }
 
+impl ReasoningControl {
+    /// Whether the menu this control is showing lists `effort` **right now**.
+    ///
+    /// The single answer to "may this effort be used", asked by the send path
+    /// before it puts a stored preference on the wire and by the effort-setting
+    /// command before it persists one. Both ask it of the same control value, so
+    /// a menu that moved underneath the user cannot be refused by one and
+    /// accepted by the other — which is the drift a second copy of this rule
+    /// would let in.
+    ///
+    /// Only [`Efforts`](ReasoningControl::Efforts) publishes a menu, so every
+    /// other control answers `false`: they have nothing to pick from. That is
+    /// membership alone, and deliberately not policy — [`Pending`] means the
+    /// catalogue has not answered rather than that the menu shrank, and what to
+    /// do about that difference belongs to the callers, which read it in
+    /// opposite directions (amendment E2 keeps a stored value on the send path;
+    /// the write path refuses a new one).
+    ///
+    /// The variants are named one by one rather than caught by a `_`, so a
+    /// control variant added later — a `max_tokens` budget is already parsed and
+    /// documented as the other half of this knob — has to answer this question
+    /// explicitly instead of silently answering "offers nothing".
+    ///
+    /// [`Pending`]: ReasoningControl::Pending
+    pub fn offers(&self, effort: &str) -> bool {
+        match self {
+            Self::Efforts { options, .. } => menu_lists(options, effort),
+            Self::Hidden | Self::Pending | Self::Toggle { .. } | Self::Locked => false,
+        }
+    }
+}
+
+/// Membership of a raw effort menu, for the one caller that has no control to
+/// ask: [`reasoning_control`] checks a record's published `default_effort`
+/// against the menu it is still assembling. Everything else goes through
+/// [`ReasoningControl::offers`], which is this rule with the variants in front
+/// of it.
+///
+/// Compared verbatim — never case-folded, never trimmed. The values are the
+/// model's own words (21 distinct menus in the live catalogue), so normalising
+/// one here would quietly accept an effort the provider will reject.
+fn menu_lists(options: &[String], effort: &str) -> bool {
+    options.iter().any(|option| option == effort)
+}
+
 /// The value a model uses inside its own effort menu to mean "do not reason".
 /// It is a sentinel, not an effort, so it never reaches the user as a menu item.
 const OFF_SENTINEL: &str = "none";
@@ -143,7 +188,7 @@ pub fn reasoning_control(capability: Option<&RawReasoningCapability>) -> Reasoni
         default_effort: capability
             .default_effort
             .clone()
-            .filter(|effort| options.contains(effort)),
+            .filter(|effort| menu_lists(&options, effort)),
         options,
         can_disable: !mandatory,
     }
@@ -532,12 +577,8 @@ fn sendable_effort<'a>(control: &'a ReasoningControl, stored: Option<&'a str>) -
     let stored = stored?;
     match control {
         ReasoningControl::Pending => Some(stored),
-        ReasoningControl::Efforts {
-            options,
-            default_effort,
-            ..
-        } => {
-            if options.iter().any(|option| option == stored) {
+        ReasoningControl::Efforts { default_effort, .. } => {
+            if control.offers(stored) {
                 return Some(stored);
             }
             let fallback = default_effort.as_deref();
@@ -1244,6 +1285,46 @@ mod tests {
             options: options.iter().map(|o| (*o).to_string()).collect(),
             default_effort: default_effort.map(str::to_string),
             can_disable: true,
+        }
+    }
+
+    #[test]
+    fn offers_answers_membership_of_the_menu_this_control_is_showing() {
+        // The one rule, asked directly. Both the send path and the write path
+        // ask it of the same value, so a model whose menu moved cannot be
+        // refused by one and accepted by the other.
+        let control = menu(&["high", "low"], Some("high"));
+
+        assert!(control.offers("high"), "a listed effort is offered");
+        assert!(control.offers("low"), "and so is the rest of the list");
+        assert!(!control.offers("xhigh"), "an unlisted effort is not");
+        assert!(
+            !control.offers("HIGH"),
+            "the values are the model's own words, never case-folded"
+        );
+    }
+
+    #[test]
+    fn a_control_with_no_menu_offers_no_effort_at_all() {
+        // Including `Pending`: "the catalogue has not answered" is not a menu,
+        // and the question here is only ever what THIS control lists. What to do
+        // about an unanswered probe is a separate rule, and it lives with the
+        // caller that has to make that call (amendment E2).
+        for control in [
+            ReasoningControl::Pending,
+            ReasoningControl::Hidden,
+            ReasoningControl::Locked,
+            ReasoningControl::Toggle { default_on: true },
+            ReasoningControl::Efforts {
+                options: Vec::new(),
+                default_effort: None,
+                can_disable: true,
+            },
+        ] {
+            assert!(
+                !control.offers("high"),
+                "{control:?} publishes no effort to pick"
+            );
         }
     }
 

@@ -620,16 +620,18 @@ fn set_reasoning_effort_in(
 /// and that is a real condition worth seeing rather than coercing to something
 /// nearby. Coercion would send an effort the user did not choose, silently, and
 /// bill them for it.
+///
+/// Membership itself is [`ReasoningControl::offers`](neuralnote_core::ai::ReasoningControl::offers),
+/// the core's one answer to that question — the same one the send path asks
+/// before a stored effort goes on the wire. What is left here is this site's own
+/// half: which refusal to give, since "not on the menu", "not answered yet" and
+/// "no menu at all" are three different things to tell the user.
 fn ensure_effort_is_offered(
     control: &neuralnote_core::ai::ReasoningControl,
     effort: &str,
 ) -> Result<(), CoreError> {
     match control {
-        neuralnote_core::ai::ReasoningControl::Efforts { options, .. }
-            if options.iter().any(|option| option == effort) =>
-        {
-            Ok(())
-        }
+        neuralnote_core::ai::ReasoningControl::Efforts { .. } if control.offers(effort) => Ok(()),
         neuralnote_core::ai::ReasoningControl::Efforts { options, .. } => {
             Err(CoreError::InvalidContent(format!(
                 "\"{effort}\" is no longer one of this model's reasoning efforts ({}). Reopen Settings to pick from the current list.",
