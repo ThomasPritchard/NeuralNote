@@ -1,6 +1,6 @@
 use super::thumbnail::{
-    collect_thumbnail_stream, collect_thumbnail_stream_with_raw, mqdefault_url,
-    thumbnail_status_error, MAX_THUMBNAIL_DOWNLOAD_BYTES,
+    collect_thumbnail_stream, collect_thumbnail_stream_with_raw, mqdefault_url, thumbnail_request,
+    thumbnail_status_error, MAX_THUMBNAIL_DOWNLOAD_BYTES, THUMBNAIL_REQUEST_TIMEOUT,
 };
 use futures_util::stream;
 use image::{DynamicImage, ImageFormat};
@@ -24,6 +24,26 @@ fn mqdefault_url_uses_the_validated_id_even_when_it_begins_with_a_hyphen() {
         mqdefault_url(&id),
         "https://i.ytimg.com/vi/-abcdefghij/mqdefault.jpg"
     );
+}
+
+#[tokio::test]
+async fn the_thumbnail_request_carries_a_deadline_of_its_own() {
+    // A nice-to-have must never delay the run, and the shared client's 30-second
+    // ceiling is the wrong bound for one: a black-holed CDN spent it in full,
+    // once per video, and up to fifty times on a page of playlist thumbnails.
+    // Asserted against the request reqwest actually built, so deleting the
+    // `.timeout(..)` fails here rather than only in front of a hostile host.
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap();
+    let id = VideoId::new("abcdefghijk").unwrap();
+
+    let request = thumbnail_request(&client, &id).build().unwrap();
+
+    assert_eq!(request.timeout(), Some(&THUMBNAIL_REQUEST_TIMEOUT));
+    assert_eq!(THUMBNAIL_REQUEST_TIMEOUT, std::time::Duration::from_secs(3));
+    assert_eq!(request.url().as_str(), mqdefault_url(&id));
 }
 
 #[test]

@@ -14,8 +14,36 @@ pub(super) struct ThumbnailFetchFailure {
     pub(super) raw: Vec<u8>,
 }
 
+/// How long the whole thumbnail exchange may take — connect, headers and body.
+///
+/// The shared capture client is built for yt-dlp-shaped work and allows 30
+/// seconds a request (`service.rs`). That is the wrong ceiling for a
+/// **nice-to-have**: a thumbnail must never delay a distil run, and a
+/// black-holed CDN spent the full 30 seconds per video before degrading to the
+/// text-only card. It is worse on the shipped playlist-selection path, which
+/// fetches up to fifty thumbnails for one page of choices.
+///
+/// Three seconds is a judgement, not arithmetic: an `mqdefault.jpg` is a few
+/// tens of kilobytes, so a host that has not finished in three seconds is one
+/// worth giving up on — the degraded card is a designed state, and the run
+/// carries on regardless.
+pub(super) const THUMBNAIL_REQUEST_TIMEOUT: Duration = Duration::from_secs(3);
+
 pub(super) fn mqdefault_url(video_id: &VideoId) -> String {
     format!("https://i.ytimg.com/vi/{}/mqdefault.jpg", video_id.as_ref())
+}
+
+/// The one place a thumbnail request is built, so its deadline cannot be left
+/// off one call site. `RequestBuilder::timeout` overrides the client's own
+/// total timeout for this request alone, which is what keeps the deadline local
+/// to the nice-to-have instead of retuning every capture request.
+pub(super) fn thumbnail_request(
+    client: &reqwest::Client,
+    video_id: &VideoId,
+) -> reqwest::RequestBuilder {
+    client
+        .get(mqdefault_url(video_id))
+        .timeout(THUMBNAIL_REQUEST_TIMEOUT)
 }
 
 pub(super) async fn fetch_thumbnail(
@@ -26,7 +54,7 @@ pub(super) async fn fetch_thumbnail(
     if cancellation.is_cancelled() {
         return Err(failure(cancelled(), Vec::new()));
     }
-    let request = client.get(mqdefault_url(video_id)).send();
+    let request = thumbnail_request(client, video_id).send();
     tokio::pin!(request);
     let response = tokio::select! {
         biased;
