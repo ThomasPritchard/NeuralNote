@@ -12,10 +12,11 @@
 //   • the install affordance is reached through the structured `missingBinary`,
 //     never by matching a sentence composed in Rust.
 
-import { render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { StepStatus, ToolStatus } from "../lib/types";
+import { STALL_AFTER_MS } from "./turnLiveness";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -218,8 +219,11 @@ describe("ChatTimeline — the fold head", () => {
     renderTimeline({ phase: "searching", toolCalls: [call("c1", null)] });
 
     // Only the phase word is a live region; the tally would otherwise announce
-    // on every node.
-    const phase = screen.getByRole("status");
+    // on every node. Scoped to the fold rather than taken off the page: the
+    // stall notice is a second, deliberate `role=status` sitting outside the
+    // fold, so an unscoped query would collide with it and read as ambiguity in
+    // the head.
+    const phase = within(fold()).getByRole("status");
     expect(phase).toHaveTextContent("Searching your vault");
     expect(screen.getByText(/1 step/)).toHaveAttribute("aria-hidden", "true");
     expect(fold()).toHaveAttribute("open");
@@ -524,5 +528,369 @@ describe("formatArguments — the widened disclosure's left column", () => {
     // Raw model output. Anything unparseable is displayed verbatim rather than
     // repaired into something the model never sent.
     expect(formatArguments(raw)).toBe(raw);
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────────────
+// The honest live head: how far through, how long, and what it is working on.
+//
+// Every case here is a state transition at an explicit clock reading. Nothing
+// waits on wall time and nothing asserts a duration — the properties under test
+// are which sentence is on screen, and who is allowed to hear it.
+// ─────────────────────────────────────────────────────────────────────────────
+
+const RUN_START = 1_000_000;
+
+/** A live turn whose first event landed at `RUN_START`, rendered straight (no
+ *  `userEvent`, which needs its own fake-timer arrangement and is not the
+ *  subject of anything below). */
+function renderLiveHead(overrides: Partial<AssistantMessage> = {}) {
+  const turn: AssistantMessage = {
+    ...emptyAssistant(),
+    startedAt: RUN_START,
+    lastEventAt: RUN_START,
+    lastAliveAt: RUN_START,
+    ...overrides,
+  };
+  const view = render(
+    <ChatTimeline turn={turn} answering={false} suppressLive={false} />,
+  );
+  const rerenderWith = (next: Partial<AssistantMessage>) =>
+    view.rerender(
+      <ChatTimeline
+        turn={{ ...turn, ...next }}
+        answering={false}
+        suppressLive={false}
+      />,
+    );
+  return { rerenderWith };
+}
+
+/** The always-mounted stall slot: the section's trailing element. */
+const stallSlot = () => rail().lastElementChild as HTMLElement;
+
+describe("ChatTimeline — how far through the run is", () => {
+  it("pairs the round with the ceiling it is actually measured against", () => {
+    renderLiveHead({ phase: "planning", round: { current: 3, max: 8 } });
+
+    // The round churns as often as the node tally does, and for the same reason
+    // it must not announce: the head would otherwise read itself out eight times
+    // over a run nobody asked to have narrated.
+    expect(screen.getByText("· round 3 of 8")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("measures a playlist in videos, and drops the round's ceiling while it runs", () => {
+    // The whole point of the playlist denominator. `max` is the iteration
+    // ceiling, which a playlist deliberately runs past — three videos reach ~24
+    // rounds under a cap of 16 — so a head that used to be able to say
+    // `round 17 of 16` now shows the one denominator that cannot move.
+    renderLiveHead({
+      phase: "planning",
+      round: { current: 17, max: 16 },
+      playlist: { position: 2, total: 3 },
+    });
+
+    expect(within(fold()).getByRole("status")).toHaveTextContent(
+      "Planning · Video 2 of 3",
+    );
+    expect(screen.getByText("· round 17")).toBeInTheDocument();
+    expect(screen.queryByText(/of 16/)).not.toBeInTheDocument();
+  });
+
+  it("announces the video but never the round", () => {
+    // The item changes once per video against a fixed total, so it is worth
+    // hearing. Everything in the counter cluster is churn and stays silent.
+    renderLiveHead({
+      phase: "planning",
+      round: { current: 4, max: 16 },
+      playlist: { position: 2, total: 3 },
+    });
+
+    const head = within(fold()).getByRole("status");
+    expect(within(head).getByText("· Video 2 of 3")).toBeInTheDocument();
+    expect(screen.getByText("· round 4")).toHaveAttribute("aria-hidden", "true");
+  });
+
+  it("keeps one work counter, not two: the round replaces the node tally", () => {
+    // Both answer "how much has this run got through". The round wins wherever
+    // it exists because it arrives with a denominator, and showing both would
+    // put two churning numbers in a head that has to stay one line.
+    renderLiveHead({
+      phase: "planning",
+      round: { current: 2, max: 8 },
+      toolCalls: [call("c1", null), call("c2", null)],
+    });
+
+    expect(screen.getByText("· round 2 of 8")).toBeInTheDocument();
+    expect(screen.queryByText(/steps/)).not.toBeInTheDocument();
+  });
+
+  it("falls back to the node tally before the first planning beacon", () => {
+    renderLiveHead({ phase: "sending", toolCalls: [call("c1", null)] });
+
+    expect(screen.getByText(/· 1 step/)).toBeInTheDocument();
+  });
+});
+
+describe("ChatTimeline — the run clock", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("ticks once a second and stays out of the live region beside it", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(RUN_START);
+    renderLiveHead({ phase: "planning", round: { current: 1, max: 8 } });
+
+    expect(screen.getByText("· 0s")).toHaveAttribute("aria-hidden", "true");
+
+    act(() => {
+      vi.advanceTimersByTime(3_000);
+    });
+
+    // A per-second readout inside a focusable summary would rewrite that
+    // control's accessible name every tick. The clock is for the eye; the stall
+    // notice is the thing that speaks.
+    expect(screen.getByText("· 3s")).toHaveAttribute("aria-hidden", "true");
+    const head = within(fold()).getByRole("status");
+    expect(head).toHaveTextContent("Planning");
+    expect(head).not.toHaveTextContent("3s");
+  });
+
+  it("takes the settled shape once there is a minute to report", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(RUN_START);
+    renderLiveHead({ phase: "planning" });
+
+    act(() => {
+      vi.advanceTimersByTime(125_000);
+    });
+
+    // The same `2m 05s` shape `formatElapsed` gives the settled figure, so the
+    // live readout and the record it hands over read as one thing.
+    expect(screen.getByText("· 2m 05s")).toBeInTheDocument();
+  });
+
+  it("shows no clock at all before the run's first event", () => {
+    // Zero would report a measurement of a run that has taken no time. Nothing
+    // has been measured yet, which is a different statement.
+    render(
+      <ChatTimeline turn={emptyAssistant()} answering={false} suppressLive={false} />,
+    );
+
+    expect(screen.queryByText(/^· \d+s$/)).not.toBeInTheDocument();
+  });
+});
+
+describe("ChatTimeline — the stall notice", () => {
+  afterEach(() => {
+    vi.useRealTimers();
+  });
+
+  it("reserves its line from the start of the run and says nothing", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(RUN_START);
+    renderLiveHead({ phase: "planning" });
+
+    const slot = stallSlot();
+    expect(slot.tagName).toBe("OUTPUT");
+    expect(slot).toBeEmptyDOMElement();
+    // Mounted empty rather than inserted with its text: a live region that
+    // arrives together with its content is often skipped, and the reserved line
+    // means the notice appearing moves nothing under it.
+    expect(screen.getAllByRole("status")).toContain(slot);
+    expect(slot).toHaveClass("min-h-[1.375em]");
+  });
+
+  it("says the provider has gone quiet once nothing at all has arrived", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(RUN_START);
+    renderLiveHead({ phase: "planning" });
+
+    act(() => {
+      vi.advanceTimersByTime(STALL_AFTER_MS);
+    });
+
+    // Not a countdown and not a failure. The approval sheet renders its expiry
+    // once and never ticks it, because a counting-down prompt manufactures
+    // urgency; this is the same ruling applied to a slow run.
+    expect(stallSlot()).toHaveTextContent(
+      "The model has been quiet for a while.",
+    );
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+  });
+
+  it("tells a slow model apart from a silent provider", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(RUN_START);
+    // Keepalives are still arriving: the connection is fine and the model is
+    // taking its time. A keepalive is not progress, so it cannot clear the
+    // notice — but it does change which sentence the notice makes.
+    renderLiveHead({ phase: "planning", lastAliveAt: RUN_START + STALL_AFTER_MS });
+
+    act(() => {
+      vi.advanceTimersByTime(STALL_AFTER_MS);
+    });
+
+    expect(stallSlot()).toHaveTextContent(
+      "Still working. Nothing new for a while.",
+    );
+    expect(stallSlot()).not.toHaveTextContent("The run is still open.");
+  });
+
+  it("clears itself on the next real event", () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(RUN_START);
+    const { rerenderWith } = renderLiveHead({ phase: "planning" });
+
+    act(() => {
+      vi.advanceTimersByTime(STALL_AFTER_MS);
+    });
+    expect(stallSlot()).not.toBeEmptyDOMElement();
+
+    rerenderWith({
+      phase: "searching",
+      lastEventAt: Date.now(),
+      lastAliveAt: Date.now(),
+    });
+
+    expect(stallSlot()).toBeEmptyDOMElement();
+  });
+
+  it("keeps no slot at all once the run has settled", () => {
+    render(
+      <ChatTimeline
+        turn={{
+          ...emptyAssistant(),
+          done: true,
+          startedAt: RUN_START,
+          lastEventAt: RUN_START,
+          toolCalls: [call("c1", "ok")],
+        }}
+        answering
+        suppressLive={false}
+      />,
+    );
+
+    expect(screen.queryAllByRole("status")).toHaveLength(0);
+  });
+});
+
+describe("ChatTimeline — the video preview card", () => {
+  const preview = {
+    videoId: "dQw4w9WgXcQ",
+    title: "Deep work and the shape of an afternoon",
+    durationSecs: 742,
+    channel: "Sarah Chen",
+    thumbnailDataUri: null,
+  };
+
+  it("reads as a finished card with no image, because that is the path that ships", () => {
+    // The thumbnail fetch lands in a later phase and is capped and timed out
+    // even then, so `null` is both the only state reachable today and the
+    // permanent degraded one. Nothing here is phrased as a missing picture.
+    renderLiveHead({
+      phase: "planning",
+      playlist: { position: 2, total: 3 },
+      videoPreview: preview,
+    });
+
+    expect(
+      screen.getByText("Deep work and the shape of an afternoon"),
+    ).toBeInTheDocument();
+    expect(screen.getByText("Video 2 of 3 · Sarah Chen · 12:22")).toBeInTheDocument();
+    expect(screen.queryByRole("img")).not.toBeInTheDocument();
+    expect(screen.queryByText(/thumbnail|unavailable|failed/i)).not.toBeInTheDocument();
+  });
+
+  it("holds its place between playlist items rather than blinking out", () => {
+    // The reducer retires a preview the moment a beacon names a different item,
+    // so there is a real gap before the next one arrives. A card bound to the
+    // preview would unmount and remount across it; this one changes its contents
+    // and keeps its footprint.
+    renderLiveHead({
+      phase: "planning",
+      playlist: { position: 3, total: 3 },
+      videoPreview: null,
+    });
+
+    expect(screen.getByText("Waiting for the video details")).toBeInTheDocument();
+    expect(screen.getByText("Video 3 of 3")).toBeInTheDocument();
+  });
+
+  it("shows the thumbnail as decoration, never as the card's meaning", () => {
+    renderLiveHead({
+      phase: "planning",
+      playlist: { position: 1, total: 2 },
+      videoPreview: { ...preview, thumbnailDataUri: "data:image/webp;base64,AAAA" },
+    });
+
+    // `alt=""` on purpose: the title beside it is the accessible content, and a
+    // described thumbnail would add nothing a reader can use.
+    expect(screen.getByAltText("")).toHaveAttribute(
+      "src",
+      "data:image/webp;base64,AAAA",
+    );
+    expect(
+      screen.getByText("Deep work and the shape of an afternoon"),
+    ).toBeInTheDocument();
+  });
+
+  it("drops a fact the extractor did not report rather than inventing a zero", () => {
+    renderLiveHead({
+      phase: "planning",
+      playlist: { position: 1, total: 2 },
+      videoPreview: { ...preview, durationSecs: null, channel: null },
+    });
+
+    expect(screen.getByText("Video 1 of 2")).toBeInTheDocument();
+    expect(screen.queryByText(/0:00/)).not.toBeInTheDocument();
+  });
+
+  it("reports a zero-length extraction as absent, not as a measured 0:00", () => {
+    renderLiveHead({
+      phase: "planning",
+      playlist: { position: 1, total: 2 },
+      videoPreview: { ...preview, durationSecs: 0 },
+    });
+
+    expect(screen.getByText("Video 1 of 2 · Sarah Chen")).toBeInTheDocument();
+  });
+
+  it("writes an hour-long video the way a player does", () => {
+    renderLiveHead({
+      phase: "planning",
+      playlist: { position: 1, total: 2 },
+      videoPreview: { ...preview, durationSecs: 3_735 },
+    });
+
+    expect(screen.getByText("Video 1 of 2 · Sarah Chen · 1:02:15")).toBeInTheDocument();
+  });
+
+  it("stays out of the way when no video is in flight", () => {
+    renderLiveHead({ phase: "searching", toolCalls: [call("c1", null)] });
+
+    expect(screen.queryByText("Waiting for the video details")).not.toBeInTheDocument();
+  });
+
+  it("makes way for the answer once it starts streaming", () => {
+    render(
+      <ChatTimeline
+        turn={{
+          ...emptyAssistant(),
+          startedAt: RUN_START,
+          lastEventAt: RUN_START,
+          playlist: { position: 2, total: 3 },
+          videoPreview: preview,
+          answer: "Here is what the videos said.",
+        }}
+        answering
+        suppressLive={false}
+      />,
+    );
+
+    expect(
+      screen.queryByText("Deep work and the shape of an afternoon"),
+    ).not.toBeInTheDocument();
   });
 });
