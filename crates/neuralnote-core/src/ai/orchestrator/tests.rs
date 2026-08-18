@@ -12,7 +12,7 @@ use super::*;
 use crate::ai::approval::{
     ApprovalMode, ApprovalPolicy, DenyingApprovalPrompt, UnavailableApprovalClassifier,
 };
-use crate::ai::events::{TokenUsage, ToolStatus, VecSink};
+use crate::ai::events::{PlaylistPosition, TokenUsage, ToolStatus, VecSink};
 use crate::ai::evidence::EvidenceRegistry;
 use crate::ai::llm::{Completion, LlmRequest, NoUserPrompt, Role, ToolCall, UserPrompt};
 use crate::ai::local::HardwareSpec;
@@ -856,6 +856,228 @@ fn run_three_video_playlist() -> Vec<ChatEvent> {
     ))
     .unwrap();
     sink.events
+}
+
+/// A playlist whose videos can actually be looked up, so `fetch_video_info`
+/// reaches metadata and emits a preview. The thumbnail is deliberately absent:
+/// the degraded card is the path a playlist run most often takes and it must not
+/// change the ordering being asserted.
+struct PreviewPlaylistIo;
+
+#[async_trait]
+impl YoutubeIo for PreviewPlaylistIo {
+    async fn inspect_metadata(&self, url: &YoutubeUrl) -> Result<MetadataPayload, CaptureError> {
+        let video_id = url.video_id().expect("the script only sends watch URLs");
+        Ok(MetadataPayload {
+            json: serde_json::to_vec(&serde_json::json!({
+                "id": video_id.as_ref(),
+                "title": format!("Realistic lecture {}", video_id.as_ref()),
+                "uploader": "Test channel",
+                "duration": 3600,
+                "subtitles": {"en": [{"ext": "vtt"}]},
+                "automatic_captions": {},
+            }))
+            .unwrap(),
+            annotations: Vec::new(),
+        })
+    }
+
+    async fn fetch_caption_vtt(
+        &self,
+        _request: &CaptionRequest,
+    ) -> Result<CaptionPayload, CaptureError> {
+        Err(CaptureError::CaptionsAbsent("unused in this script".into()))
+    }
+
+    async fn enumerate_playlist(&self, _url: &YoutubeUrl) -> Result<PlaylistPayload, CaptureError> {
+        let entries = (0..3)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("V{index:010}"),
+                    "title": format!("Realistic lecture {index}"),
+                    "duration": 3600,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(PlaylistPayload {
+            json: serde_json::to_vec(&serde_json::json!({
+                "_type": "playlist",
+                "id": "PL-preview_3",
+                "title": "Three lectures",
+                "entries": entries,
+            }))
+            .unwrap(),
+        })
+    }
+
+    async fn fetch_thumbnail(&self, _video_id: &VideoId) -> Result<ThumbnailPayload, CaptureError> {
+        Err(CaptureError::ThumbnailRejected(
+            "fixture has no image".into(),
+        ))
+    }
+
+    async fn transcribe_audio(
+        &self,
+        _url: &YoutubeUrl,
+        _model: &str,
+        _cancellation: &CaptureCancellation,
+    ) -> Result<CaptionPayload, CaptureError> {
+        Err(CaptureError::TranscriptionFailed(
+            "unused in this script".into(),
+        ))
+    }
+
+    async fn update_extractor(&self) -> Result<(), CaptureError> {
+        Err(CaptureError::ExtractorStale("unused in this script".into()))
+    }
+}
+
+/// Three videos, looked up and written the way a greedy model actually behaves:
+/// the round that finishes one video's notes ALSO reaches for the next video's
+/// details in the same batch. That is the shape that can carry a lookup past the
+/// item its beacon named, so it is the shape the ordering has to survive — the
+/// batch guard turns the greedy trailing call into a stale skip, and the honest
+/// re-issue in the next round is where the preview actually comes from.
+fn run_three_video_playlist_with_lookups() -> Vec<ChatEvent> {
+    let vault = tempfile::tempdir().unwrap();
+    let selected = (0..3)
+        .map(|index| format!("V{index:010}"))
+        .collect::<Vec<_>>();
+    let prompt = PlaylistPrompt(Mutex::new(VecDeque::from([Some(selected.clone())])));
+    let lookup = |work_item: usize, video_id: &str, suffix: &str| {
+        tool_call(
+            &format!("info-{work_item}{suffix}"),
+            "fetch_video_info",
+            &serde_json::json!({
+                "url": format!("https://www.youtube.com/watch?v={video_id}"),
+            })
+            .to_string(),
+        )
+    };
+    let mut script = vec![tool_call(
+        "select",
+        "select_playlist_videos",
+        r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-preview_3"}"#,
+    )];
+    script.push(lookup(0, &selected[0], ""));
+    for (work_item, video_id) in selected.iter().enumerate() {
+        let mut calls = vec![
+            ToolCall {
+                id: format!("literature-{work_item}"),
+                name: "write_note".into(),
+                arguments: serde_json::json!({
+                    "rel_path": format!("literature-{work_item}.md"),
+                    "content": format!("# Lecture {work_item}\n\nDistilled from {video_id}."),
+                    "kind": "literature",
+                    "work_item": work_item,
+                })
+                .to_string(),
+            },
+            ToolCall {
+                id: format!("transcript-{work_item}"),
+                name: "write_note".into(),
+                arguments: serde_json::json!({
+                    "rel_path": format!("transcript-{work_item}.md"),
+                    "content": realistic_transcript(video_id),
+                    "kind": "transcript",
+                    "work_item": work_item,
+                })
+                .to_string(),
+            },
+        ];
+        // The greedy trailing lookup, and then the re-issue the model makes after
+        // being told the batch went stale.
+        if let Some(next) = selected.get(work_item + 1) {
+            calls.push(lookup(work_item + 1, next, "-greedy").tool_calls.remove(0));
+        }
+        script.push(Completion {
+            content: None,
+            tool_calls: calls,
+        });
+        if let Some(next) = selected.get(work_item + 1) {
+            script.push(lookup(work_item + 1, next, ""));
+        }
+    }
+    let llm = MockLlmClient::new(script, "Playlist complete.");
+    let retriever = KeywordRetriever::new(vault.path());
+    let skills = SkillRegistry::built_in(&[]).unwrap();
+    let environment = youtube_test_environment();
+    let pricing = PricingInput::Local;
+    let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+        .with_approval(
+            unattended_policy(),
+            &TEST_APPROVAL_PROMPT,
+            &TEST_APPROVAL_CLASSIFIER,
+        )
+        .with_youtube_io(&PreviewPlaylistIo)
+        .with_pricing(&pricing);
+    let mut sink = VecSink::default();
+    block_on(run_chat(
+        "Distil this playlist",
+        &[],
+        vec![YOUTUBE_DISTIL_SKILL_ID.into()],
+        vault.path(),
+        "test-model",
+        &retriever,
+        &llm,
+        &services,
+        &mut sink,
+        &Guards::default(),
+    ))
+    .unwrap();
+    sink.events
+}
+
+#[test]
+fn a_playlist_preview_is_never_retired_by_the_beacon_that_follows_it() {
+    // `VideoPreview` carries no playlist position: the consumer reads that number
+    // off `PlanningRound` and retires a preview the moment a beacon names a
+    // DIFFERENT item. So a preview emitted for a video the next beacon has
+    // already moved past would blink out immediately — a card that appears and
+    // vanishes rather than one that never appeared, which is the worse bug.
+    //
+    // The guarantee is not held here. It is held by `handle_tool_calls` closing
+    // a batch the instant the playlist item advances, so no `fetch_video_info`
+    // can ever run for an item the round's beacon did not name. This test is what
+    // goes red if that guard is loosened.
+    let events = run_three_video_playlist_with_lookups();
+
+    let mut in_flight: Option<PlaylistPosition> = None;
+    let mut checked = 0usize;
+    let mut previewed: Option<PlaylistPosition> = None;
+    for event in &events {
+        match event {
+            ChatEvent::PlanningRound { playlist, .. } => {
+                if let Some(at_preview) = previewed.take() {
+                    // A finished playlist clearing the card is correct — the item
+                    // really is over. Naming a different item is not.
+                    assert!(
+                        playlist.is_none() || *playlist == Some(at_preview),
+                        "a preview raised at {at_preview:?} was retired by a beacon naming {playlist:?}"
+                    );
+                    checked += 1;
+                }
+                in_flight = *playlist;
+            }
+            ChatEvent::VideoPreview { .. } => {
+                previewed = in_flight;
+                assert!(
+                    in_flight.is_some(),
+                    "a preview during a playlist must follow a beacon that names its item"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::VideoPreview { .. }))
+            .count(),
+        3,
+        "one preview per video, or this test proved nothing: {events:?}"
+    );
+    assert_eq!(checked, 3, "every preview must be followed by a beacon");
 }
 
 #[test]
