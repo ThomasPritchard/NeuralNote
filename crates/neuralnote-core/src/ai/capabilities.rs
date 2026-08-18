@@ -57,7 +57,11 @@ pub struct RawReasoningCapability {
 /// probe can produce needs exactly one: an unanswered probe is not the same as a
 /// model that cannot reason, and neither is a model whose reasoning is forced on.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
-#[serde(rename_all = "camelCase", tag = "kind")]
+#[serde(
+    tag = "kind",
+    rename_all = "camelCase",
+    rename_all_fields = "camelCase"
+)]
 #[ts(export)]
 pub enum ReasoningControl {
     /// The model cannot reason. Show nothing.
@@ -367,6 +371,47 @@ mod tests {
                 ..RawReasoningCapability::default()
             }
         );
+    }
+
+    #[test]
+    fn reasoning_control_crosses_the_ipc_boundary_entirely_in_camel_case() {
+        // The wire INTO this module is snake_case (OpenRouter); the wire OUT of it
+        // is the repo's camelCase IPC contract. Both the tag values and the
+        // struct-variant fields are renamed — `rename_all` alone leaves the fields
+        // snake_case, which is the half-conversion this pins.
+        assert_eq!(
+            serde_json::to_value(ReasoningControl::Efforts {
+                options: vec!["xhigh".into(), "low".into()],
+                default_effort: Some("xhigh".into()),
+                can_disable: true,
+            })
+            .unwrap(),
+            serde_json::json!({
+                "kind": "efforts",
+                "options": ["xhigh", "low"],
+                "defaultEffort": "xhigh",
+                "canDisable": true,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ReasoningControl::Toggle { default_on: false }).unwrap(),
+            serde_json::json!({ "kind": "toggle", "defaultOn": false })
+        );
+        for (control, kind) in [
+            (ReasoningControl::Hidden, "hidden"),
+            (ReasoningControl::Pending, "pending"),
+            (ReasoningControl::Locked, "locked"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(&control).unwrap(),
+                serde_json::json!({ "kind": kind })
+            );
+            assert_eq!(
+                serde_json::from_value::<ReasoningControl>(serde_json::json!({ "kind": kind }))
+                    .unwrap(),
+                control
+            );
+        }
     }
 
     #[test]

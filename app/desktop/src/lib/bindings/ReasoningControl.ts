@@ -7,4 +7,4 @@
  * probe can produce needs exactly one: an unanswered probe is not the same as a
  * model that cannot reason, and neither is a model whose reasoning is forced on.
  */
-export type ReasoningControl = { "kind": "hidden" } | { "kind": "pending" } | { "kind": "toggle", default_on: boolean, } | { "kind": "locked" } | { "kind": "efforts", options: Array<string>, default_effort: string | null, can_disable: boolean, };
+export type ReasoningControl = { "kind": "hidden" } | { "kind": "pending" } | { "kind": "toggle", defaultOn: boolean, } | { "kind": "locked" } | { "kind": "efforts", options: Array<string>, defaultEffort: string | null, canDisable: boolean, };
