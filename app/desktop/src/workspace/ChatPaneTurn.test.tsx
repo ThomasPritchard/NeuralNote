@@ -537,8 +537,8 @@ describe("ChatPane — chat view", () => {
         arguments: '{"query":"spacing"}',
         stepId: null,
       },
-      { type: "searching", query: "spacing", callId: null },
-      { type: "retrieved", query: "spacing", hitCount: 1, callId: null },
+      { type: "searching", query: "spacing", callId: "c1" },
+      { type: "retrieved", query: "spacing", hitCount: 1, callId: "c1" },
       { type: "toolResult", id: "c1", status: "ok", summary: "1 span", detail: null, durationMs: 0 },
       { type: "answer", delta: "Spacing is spreading review over time." },
       { type: "done" },
@@ -567,7 +567,7 @@ describe("ChatPane — chat view", () => {
         arguments: JSON.stringify({ rel_path: relPath, start_line: 123, end_line: 456 }),
         stepId: null,
       },
-      { type: "reading", relPath, startLine: 123, endLine: 456, callId: null },
+      { type: "reading", relPath, startLine: 123, endLine: 456, callId: "c1" },
       {
         type: "toolResult",
         id: "c1",
@@ -657,7 +657,7 @@ describe("ChatPane — chat view", () => {
         arguments: '{"query":"focus"}',
         stepId: null,
       },
-      { type: "searching", query: "focus", callId: null },
+      { type: "searching", query: "focus", callId: "c1" },
       { type: "answer", delta: "Let me pull that together." },
     ]);
 

@@ -1,5 +1,5 @@
 use super::citations::{extract_cited_ids, strip_cited_markers};
-use super::collect::{EvidenceCollection, RETRY_BACKOFF};
+use super::collect::{round_beacon, EvidenceCollection, RETRY_BACKOFF};
 use super::context_budget::{
     context_window_tokens, estimate_tokens, fit_prompt_to_window, total_tokens,
     ANSWER_RESERVE_TOKENS, LOCAL_CONTEXT_WINDOW_TOKENS, PROMPT_OVERHEAD_TOKENS,
@@ -3833,6 +3833,41 @@ fn run_streamed_tool_turn(llm: &StreamingToolLlm) -> (CoreResult<Completion>, Ve
     let mut sink = VecSink::default();
     let result = block_on(session.complete_tool_turn(&tool_decision_request(), &mut sink));
     (result, sink)
+}
+
+#[test]
+fn a_run_past_its_ceiling_still_never_announces_a_round_above_it() {
+    // The invariant measured at the configuration that can actually break it.
+    // The happy-path assertion runs a script with no playlist and no skill
+    // activation, so `consumed` never approaches the ceiling there and that
+    // assertion only ever sees the passing case.
+    //
+    // The playlist path bypasses the iteration guard entirely
+    // (`iteration_guard_reached` is false while a playlist is active), and each
+    // item may spend up to MAX_PLAYLIST_TURNS_PER_ITEM turns, so a multi-video
+    // playlist runs well past the ceiling by design.
+    //
+    // `ActiveSkills::max_iterations` cannot be the raw denominator there: it
+    // seeds its fold at `base.max(consumed)` — a FLOOR protecting history from a
+    // late activation, not a ceiling — so once `consumed` passes every declared
+    // cap it returns `consumed` itself, one BELOW the round being announced.
+    // "Round 17 of 16" is arithmetically impossible and reads as a bug; worse,
+    // the denominator would then chase the numerator forever, telling the user
+    // the run is permanently one round from finishing.
+    let base_ceiling = Guards::default().max_iterations;
+    let skill_ceiling = 16;
+    for consumed in 0..(base_ceiling + skill_ceiling + 8) {
+        // Exactly what `collect_evidence` passes, floor included.
+        let max_iterations = base_ceiling.max(skill_ceiling).max(consumed);
+        let ChatEvent::PlanningRound { round, max_rounds } = round_beacon(consumed, max_iterations)
+        else {
+            panic!("round_beacon announces a round");
+        };
+        assert!(
+            round <= max_rounds,
+            "round {round} of {max_rounds} at consumed={consumed}"
+        );
+    }
 }
 
 #[test]

@@ -113,10 +113,12 @@ pub enum ToolStatus {
 pub enum ChatEvent {
     /// The run has been accepted and is preparing its first model request.
     ///
-    /// Emitted EXACTLY ONCE per run, at the top of the orchestrator. The
-    /// per-round beacon is [`ChatEvent::PlanningRound`], which carries a round
-    /// number and therefore cannot reset the phase backwards the way a repeated
-    /// `Processing` did.
+    /// Emitted AT MOST ONCE per run, at the top of the orchestrator — never
+    /// twice, and not at all when setting up the write session fails, which
+    /// surfaces [`ChatEvent::Error`] and returns before this point. The per-round
+    /// beacon is [`ChatEvent::PlanningRound`], which carries a round number and
+    /// therefore cannot reset the phase backwards the way a repeated `Processing`
+    /// did.
     Processing,
     /// A tool-deciding round-trip is starting. Emitted once per round, before the
     /// model request goes out, through the raw sink and before the retry guard in
@@ -229,6 +231,12 @@ pub enum ChatEvent {
         /// Never optional: the orchestrator always knows how long it waited, and
         /// a call that never ran waited approximately nothing rather than an
         /// unknown amount.
+        ///
+        /// **It is time-to-settle, not time-in-the-tool.** The approval gate sits
+        /// between dispatch and settlement, so a gated call the user leaves
+        /// sitting reports the human's thinking time too — up to the gate's
+        /// 120-second budget. Anything rendering this beside a tool name has to
+        /// say "took", never "spent working".
         duration_ms: u64,
     },
     /// How a transcript was actually obtained, reported by the tool that obtained
@@ -320,10 +328,12 @@ pub enum ChatEvent {
     /// `query` finished, yielding `hit_count` evidence spans.
     ///
     /// `call_id` is the correlation key for all three retrieval cues. These cues
-    /// are emitted BY the tool calls above them on the rail, so the UI enriches
-    /// the tool node in place rather than rendering the same act twice — and
-    /// tool calls can run in parallel, so arrival order is not a correlation key
-    /// and guessing from it would put the wrong query on the wrong node.
+    /// are emitted BY the tool calls above them on the rail, so the timeline can
+    /// enrich the tool node in place rather than render the same act twice. It
+    /// does not do so yet — today the rail drops these cues — and this key is
+    /// what makes that possible without guessing: tool calls run in parallel, so
+    /// arrival order is not a correlation key, and inferring one from it would
+    /// put the wrong query on the wrong node.
     ///
     /// `Option`, not `String`: the cues come from the retrieval layer and a path
     /// may have no dispatched call behind it. `None` means "no node to attach

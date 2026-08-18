@@ -106,8 +106,8 @@ pub fn reasoning_control(capability: Option<&RawReasoningCapability>) -> Reasoni
 ///
 /// `None` covers all three ways the answer can be absent — an unparseable body,
 /// an unlisted id, or a listed model that publishes no reasoning block — and it
-/// is the `None` [`reasoning_control`] reads as "the probe has not answered".
-/// Fail-open, like the sibling probes on this page.
+/// is the `None` [`reasoning_control`] is specified to read as "the probe has not
+/// answered" once its body is written. Fail-open, like the sibling probes here.
 pub fn openrouter_reasoning_capability(
     models_json: &str,
     model_id: &str,

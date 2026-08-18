@@ -85,10 +85,10 @@ impl ChatSession<'_> {
             //
             // The ceiling is re-read every round on purpose — activating a skill
             // raises it — so the pair the UI renders is always this round's pair.
-            sink.send(ChatEvent::PlanningRound {
-                round: round_number(consumed),
-                max_rounds: round_ceiling(active_skills.max_iterations(consumed)),
-            });
+            sink.send(round_beacon(
+                consumed,
+                active_skills.max_iterations(consumed),
+            ));
             // This tool-DECIDING turn is idempotent (no tool has run yet), so a single
             // transient transport failure is retried once rather than aborting the run.
             let completion = self
@@ -515,23 +515,42 @@ impl ChatSession<'_> {
     }
 }
 
-/// The 1-based round about to run, from the count of rounds already consumed.
+/// The beacon for the round about to run: its 1-based number, and the ceiling to
+/// show beside it.
 ///
-/// Saturating rather than wrapping: the iteration guard stops the loop long
-/// before `u32` runs out, and a wrapped round number would read as a run
-/// starting over — the exact confusion `PlanningRound` replaced `Processing` to
-/// end.
-fn round_number(consumed: usize) -> u32 {
-    u32::try_from(consumed)
+/// **The ceiling is clamped to never sit below the round it accompanies**, and
+/// that is not defensive padding — it is the difference between two things
+/// [`ActiveSkills::max_iterations`](crate::ai::skills::ActiveSkills::max_iterations)
+/// deliberately conflates. That function seeds its fold at
+/// `base.max(consumed)`: a FLOOR, there so a late skill activation cannot
+/// retroactively lower the ceiling below turns already spent. Read as a display
+/// denominator it is wrong, because once `consumed` passes every declared cap it
+/// returns `consumed` itself — one below the round being announced.
+///
+/// An ordinary run never gets there, because the iteration guard stops it first.
+/// A playlist does: `iteration_guard_reached` is false while a playlist is
+/// active, so the loop runs past the ceiling by design (each item may spend up
+/// to `MAX_PLAYLIST_TURNS_PER_ITEM` turns, and a playlist has many items).
+/// Unclamped, that puts "round 17 of 16" on the wire — arithmetically impossible,
+/// and it would then have the denominator chase the numerator for the rest of
+/// the run, telling the user they are permanently one round from finished.
+///
+/// What the clamp says instead is "at the ceiling", every round, which is true
+/// but thin. The richer answer — a playlist run has no applicable round ceiling
+/// and should show a bare round number — needs `max_rounds` to become optional,
+/// which is a change to the frozen wire shape rather than a fix, so it is a
+/// ruling for whoever renders these numbers rather than something to decide here.
+///
+/// Both numbers saturate rather than wrap: a wrapped round would read as a run
+/// starting over, the exact confusion `PlanningRound` replaced `Processing` to end.
+pub(super) fn round_beacon(consumed: usize, max_iterations: usize) -> ChatEvent {
+    let round = u32::try_from(consumed)
         .unwrap_or(u32::MAX)
-        .saturating_add(1)
-}
-
-/// This round's ceiling, narrowed for the wire. Saturating for the same reason
-/// as [`round_number`]: a wrapped ceiling would render a round above its own
-/// maximum.
-fn round_ceiling(max_iterations: usize) -> u32 {
-    u32::try_from(max_iterations).unwrap_or(u32::MAX)
+        .saturating_add(1);
+    ChatEvent::PlanningRound {
+        round,
+        max_rounds: u32::try_from(max_iterations).unwrap_or(u32::MAX).max(round),
+    }
 }
 
 fn iteration_guard_reached(

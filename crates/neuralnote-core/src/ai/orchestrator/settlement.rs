@@ -225,7 +225,10 @@ pub(super) fn emit_tool_call<'a>(
 ///
 /// Reading a monotonic clock is a measurement, not a timer: the core still owns
 /// no waiting.
-#[must_use = "a dispatched call must be settled, and its settlement needs this"]
+// `must_use` catches an outright discard, which is the accident worth catching
+// cheaply. It cannot catch a bind-and-never-settle — "exactly one ToolResult per
+// ToolCall" is held by the per-call loop settling on every branch, not by this.
+#[must_use = "the settlement helpers need this, so discarding it strands the call"]
 pub(super) struct Dispatched<'a> {
     call: &'a ToolCall,
     at: Instant,

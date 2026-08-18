@@ -205,7 +205,8 @@ pub enum ReasoningAsk {
 /// `reasoning` asks the provider to stream reasoning tokens; `None` sends no
 /// `reasoning` object at all. Both providers speak it — OpenRouter natively, and
 /// Ollama's OpenAI-compatible endpoint by mapping thinking onto the same field
-/// (see `local::ollama_chat_client`) — so the caller decides, not the transport.
+/// (`ollama_chat_client` in the shell crate, `app/desktop/src-tauri/src/local.rs`)
+/// — so the caller decides, not the transport.
 pub fn to_wire_request(
     req: &LlmRequest,
     stream: bool,
@@ -410,9 +411,10 @@ pub enum ToolSseEvent {
     /// The turn cannot be trusted or completed: an in-band error frame, a
     /// provider-declared failure, or a fragment there is no way to place.
     Failed(String),
-    /// An SSE comment line — see [`SseEvent::Keepalive`]. Classified on this turn
-    /// too so the two paths agree about what a comment line means; the tool turn
-    /// has no sink of its own to forward it through.
+    /// An SSE comment line — see [`SseEvent::Keepalive`]. Classified here so both
+    /// turns agree on what a comment line MEANS, which is what stops them
+    /// drifting apart on the shared parts of the stream. Forwarding is a separate
+    /// question, answered in [`consume_tool_sse_line`].
     Keepalive,
     /// Reasoning, an empty delta, or malformed noise.
     Other,
@@ -525,10 +527,14 @@ pub fn consume_tool_sse_line(
             accumulator.abandon(tool_stream::ABANDONED_TURN_FAILED, sink);
             Err(CoreError::Llm(message))
         }
-        // Classified so both turns agree on what a comment line means, but not
-        // forwarded here: the answer turn's `consume_sse_line` is the one that
-        // emits, and a keepalive surfaced from one path and swallowed on the other
-        // is exactly the drift `classify_sse_line` exists to prevent.
+        // Both turns CLASSIFY a comment line the same way; for now only the
+        // answer turn FORWARDS one. Not because this turn lacks a sink — it has
+        // `sink` right there and emits through it elsewhere in this function —
+        // but because nothing consumes a keepalive yet. The stall detector that
+        // gives it meaning arrives with the live head, and forwarding from the
+        // tool path is that change's job, made cheap by the classification
+        // already being here. Until then the asymmetry is deliberate and this is
+        // the one place that says so.
         ToolSseEvent::Keepalive | ToolSseEvent::Other => Ok(false),
     }
 }

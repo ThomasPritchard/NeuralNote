@@ -90,6 +90,12 @@ detail: string | null,
  * Never optional: the orchestrator always knows how long it waited, and
  * a call that never ran waited approximately nothing rather than an
  * unknown amount.
+ *
+ * **It is time-to-settle, not time-in-the-tool.** The approval gate sits
+ * between dispatch and settlement, so a gated call the user leaves
+ * sitting reports the human's thinking time too — up to the gate's
+ * 120-second budget. Anything rendering this beside a tool name has to
+ * say "took", never "spent working".
  */
 durationMs: number, } | { "type": "transcriptSource", label: string, relPath: string | null, } | { "type": "partialRun", reason: string, } | { "type": "noteWritten", relPath: string, kind: NoteKind, } | { "type": "noteExists", relPath: string, kind: NoteKind, } | { "type": "noteEditPreview", 
 /**

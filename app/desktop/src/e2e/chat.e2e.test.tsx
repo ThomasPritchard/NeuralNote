@@ -360,8 +360,8 @@ describe("Journey 7: cited chat — the timeline rail", () => {
         arguments: '{"query":"photosynthesis"}',
         stepId: null,
       },
-      { type: "searching", query: "photosynthesis", callId: null },
-      { type: "retrieved", query: "photosynthesis", hitCount: 3, callId: null },
+      { type: "searching", query: "photosynthesis", callId: "ok-1" },
+      { type: "retrieved", query: "photosynthesis", hitCount: 3, callId: "ok-1" },
       { type: "toolResult", id: "ok-1", status: "ok", summary: "3 spans", detail: null, durationMs: 0 },
       {
         type: "toolCall",
