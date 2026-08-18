@@ -22,6 +22,100 @@ pub struct ModelCapabilities {
     pub supported_parameters: Vec<String>,
 }
 
+/// One model's `reasoning` block from the OpenRouter `/models` payload, verbatim.
+///
+/// **The wire is snake_case and this struct must stay snake_case.** Do NOT add
+/// `#[serde(rename_all = "camelCase")]` — the sibling [`RawOpenRouterModel`] has
+/// none for the same reason, and `openai.rs` states the rule outright. Every
+/// field here is `Option`, so a rename would not error: a record carrying a full
+/// effort menu would deserialize to all-`None`, indistinguishable from a genuine
+/// `{}`. That is a silent failure, which this project forbids, and
+/// `reasoning_capability_parses_a_captured_full_effort_menu` is the check that
+/// catches it.
+///
+/// Absent fields stay absent for the same reason the sibling's do: "the server
+/// never told us" and "the server told us nothing is available" are different
+/// facts, and only the caller may decide what to do about the first.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+pub struct RawReasoningCapability {
+    /// The model always reasons; reasoning cannot be turned off.
+    pub mandatory: Option<bool>,
+    /// Reasoning is on unless the caller says otherwise.
+    pub default_enabled: Option<bool>,
+    /// The model's own effort menu, in its own words. Never normalised — the
+    /// catalogue carries 21 distinct menus.
+    pub supported_efforts: Option<Vec<String>>,
+    /// The effort the model uses when the caller names none.
+    pub default_effort: Option<String>,
+    /// The model accepts a `reasoning.max_tokens` budget instead of an effort.
+    pub supports_max_tokens: Option<bool>,
+}
+
+/// What the reasoning control should offer for the selected model.
+///
+/// A closed set, because the control is a rendering decision and every state the
+/// probe can produce needs exactly one: an unanswered probe is not the same as a
+/// model that cannot reason, and neither is a model whose reasoning is forced on.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase", tag = "kind")]
+#[ts(export)]
+pub enum ReasoningControl {
+    /// The model cannot reason. Show nothing.
+    Hidden,
+    /// The probe has not answered yet. Show the control disabled rather than
+    /// guessing at a shape it may not have.
+    Pending,
+    /// Reasoning is on or off, with no effort menu behind it.
+    Toggle { default_on: bool },
+    /// The model always reasons. Show that it is on, and that it cannot be
+    /// turned off.
+    Locked,
+    /// The model publishes an effort menu. `options` is that menu VERBATIM, in
+    /// the model's own words and its own order.
+    Efforts {
+        options: Vec<String>,
+        default_effort: Option<String>,
+        can_disable: bool,
+    },
+}
+
+/// Decide which reasoning control a model's capability record calls for.
+///
+/// `None` means the probe has not answered — offline, a hand-typed model id, a
+/// 5xx — which is NOT the same as a model that published nothing.
+///
+/// **Open question, to settle before this is implemented:** what precedence do
+/// `mandatory`, `default_enabled`, `supported_efforts` and `supports_max_tokens`
+/// take when a record carries several of them? The captured catalogue has real
+/// records with `mandatory: true` AND a full effort menu (`x-ai/grok-4.6`), and
+/// records with `supports_max_tokens` AND a menu
+/// (`nvidia/nemotron-3-ultra-550b-a55b`) — so `Locked` versus `Efforts` versus
+/// `Efforts { can_disable: false }` is a real ordering decision, not a
+/// hypothetical one. See the fixture at
+/// `crates/neuralnote-core/src/ai/fixtures/openrouter_models_reasoning.json`.
+pub fn reasoning_control(capability: Option<&RawReasoningCapability>) -> ReasoningControl {
+    let _ = capability;
+    todo!("precedence between mandatory / default_enabled / supported_efforts is unsettled")
+}
+
+/// The selected model's `reasoning` block from the raw OpenRouter `/models` body.
+///
+/// `None` covers all three ways the answer can be absent — an unparseable body,
+/// an unlisted id, or a listed model that publishes no reasoning block — and it
+/// is the `None` [`reasoning_control`] reads as "the probe has not answered".
+/// Fail-open, like the sibling probes on this page.
+pub fn openrouter_reasoning_capability(
+    models_json: &str,
+    model_id: &str,
+) -> Option<RawReasoningCapability> {
+    serde_json::from_str::<RawOpenRouterModels>(models_json)
+        .ok()?
+        .data
+        .into_iter()
+        .find(|model| model.id == model_id)?
+        .reasoning
+}
+
 #[derive(Deserialize)]
 struct RawOpenRouterModels {
     #[serde(default)]
@@ -40,6 +134,10 @@ struct RawOpenRouterModel {
     // Absent (or zero) means the server never told us the window — skipped by
     // `parse_openrouter_context_windows`, so budgeting stays inert rather than guessed.
     context_length: Option<u64>,
+    // Absent for a model that publishes no reasoning block at all — see
+    // `openrouter_reasoning_capability`, which keeps that apart from a published
+    // but empty one.
+    reasoning: Option<RawReasoningCapability>,
 }
 
 #[derive(Deserialize)]
@@ -199,6 +297,93 @@ pub fn effective_reasoning(opt_in: bool, support: ReasoningSupport) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Six whole records captured verbatim from OpenRouter's public `/models`
+    /// endpoint on 2026-08-18. Captured rather than hand-written on purpose: a
+    /// hand-written literal tests our model of the payload, not the payload, and
+    /// the failure this fixture exists to catch is precisely a mismatch between
+    /// the two.
+    const CAPTURED_MODELS: &str = include_str!("fixtures/openrouter_models_reasoning.json");
+
+    #[test]
+    fn reasoning_capability_parses_a_captured_full_effort_menu() {
+        // The wire is snake_case. Every field on `RawReasoningCapability` is
+        // `Option`, so a `rename_all = "camelCase"` would not error — it would
+        // quietly yield all-`None`, indistinguishable from a model that published
+        // nothing. This test is what makes that failure loud.
+        let capability =
+            openrouter_reasoning_capability(CAPTURED_MODELS, "openai/gpt-5.6-luna-pro")
+                .expect("the captured record publishes a reasoning block");
+
+        assert_eq!(
+            capability.supported_efforts.as_deref(),
+            Some(
+                [
+                    "max".to_string(),
+                    "xhigh".to_string(),
+                    "high".to_string(),
+                    "medium".to_string(),
+                    "low".to_string(),
+                    "none".to_string(),
+                ]
+                .as_slice()
+            ),
+            "the menu round-trips verbatim, in the model's own order"
+        );
+        assert_eq!(capability.default_effort.as_deref(), Some("medium"));
+        assert_eq!(capability.default_enabled, Some(true));
+        assert_eq!(capability.mandatory, Some(false));
+        // Absent on this record, and absent must stay absent rather than become
+        // `Some(false)` — "not offered" and "offered and off" are different facts.
+        assert_eq!(capability.supports_max_tokens, None);
+    }
+
+    #[test]
+    fn every_reasoning_field_survives_the_wire_on_some_captured_record() {
+        // One record per field is not enough: a rename that broke only
+        // `supports_max_tokens` would slip past a test that reads one model. Each
+        // field is asserted where the catalogue actually publishes it.
+        let capability = |id| {
+            openrouter_reasoning_capability(CAPTURED_MODELS, id)
+                .unwrap_or_else(|| panic!("{id} publishes a reasoning block"))
+        };
+
+        assert_eq!(capability("x-ai/grok-4.6").mandatory, Some(true));
+        assert_eq!(
+            capability("nvidia/nemotron-3-ultra-550b-a55b").supports_max_tokens,
+            Some(true)
+        );
+        assert_eq!(
+            capability("inclusionai/ling-3.0-flash").default_enabled,
+            Some(true)
+        );
+        // A block carrying only `mandatory` is a real, common shape — and the one
+        // that survives a wrong `rename_all` by luck, because the word has no case
+        // boundary in it. It must not be the only evidence the parse works.
+        assert_eq!(
+            capability("dots-studio/dots-3-note-preview:free"),
+            RawReasoningCapability {
+                mandatory: Some(false),
+                ..RawReasoningCapability::default()
+            }
+        );
+    }
+
+    #[test]
+    fn a_model_publishing_no_reasoning_block_is_absent_not_empty() {
+        // "The server told us nothing about reasoning" must stay distinguishable
+        // from "the server told us reasoning exists and said nothing else" — the
+        // first is what `reasoning_control` reads as an unanswered probe.
+        assert_eq!(
+            openrouter_reasoning_capability(CAPTURED_MODELS, "openrouter/auto-beta"),
+            None
+        );
+        assert_eq!(
+            openrouter_reasoning_capability(CAPTURED_MODELS, "vendor/not-in-the-catalogue"),
+            None
+        );
+        assert_eq!(openrouter_reasoning_capability(r#"{"data":"#, "any"), None);
+    }
 
     #[test]
     fn openrouter_context_windows_parse_positive_lengths_for_every_listed_model() {

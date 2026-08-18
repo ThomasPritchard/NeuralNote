@@ -187,7 +187,7 @@ describe("the approval gate's view state", () => {
       },
       requested,
       { type: "toolApprovalResolved", id: "call-1", decision: "denied" },
-      { type: "toolResult", id: "call-1", status: "denied", summary: null, detail: "Denied. Nothing was written." },
+      { type: "toolResult", id: "call-1", status: "denied", summary: null, detail: "Denied. Nothing was written.", durationMs: 0 },
     ]);
     expect(turn.toolCalls[0].status).toBe("denied");
     expect(turn.toolApprovals[0].resolution).toBe("denied");

@@ -102,7 +102,7 @@ describe("the declared plan", () => {
     const turn = fold([
       declared,
       status("s1", "done"),
-      { type: "searching", query: "spaced repetition" },
+      { type: "searching", query: "spaced repetition", callId: null },
       { type: "answer", delta: "..." },
       { type: "done" },
     ]);

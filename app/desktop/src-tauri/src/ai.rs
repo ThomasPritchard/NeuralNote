@@ -886,8 +886,17 @@ impl OpenAiChatClient {
             true,
             self.num_ctx,
             Some(openai::ANSWER_MAX_TOKENS),
-            self.reasoning,
+            self.reasoning_ask(),
         )
+    }
+
+    /// What this client asks the provider for on a turn that carries reasoning.
+    ///
+    /// `Enabled` rather than an effort: the client is built from a boolean
+    /// opt-in, so no effort has been chosen. Naming one here would substitute our
+    /// guess for the model's own default.
+    fn reasoning_ask(&self) -> Option<openai::ReasoningAsk> {
+        self.reasoning.then_some(openai::ReasoningAsk::Enabled)
     }
 
     /// The tool-deciding turn's wire body. Streamed, but otherwise identical to
@@ -901,7 +910,7 @@ impl OpenAiChatClient {
             stream,
             self.num_ctx,
             /* max_tokens */ None,
-            /* reasoning */ false,
+            /* reasoning */ None,
         )
     }
 
@@ -1184,8 +1193,9 @@ impl LlmClient for OpenAiChatClient {
         sink: &mut dyn EventSink,
     ) -> Result<String, CoreError> {
         // The answer turn carries the output ceiling; tool-deciding turns do not. It
-        // also carries the reasoning request (OpenRouter only, when opted in) — this is
-        // the one turn whose reasoning tokens surface as live `Thinking` events.
+        // also carries the reasoning request, on either provider, when opted in —
+        // this is the one turn whose reasoning tokens surface as live `Thinking`
+        // events.
         let mut answer = openai::AnswerStream::new();
         let text = self.read_answer_stream(req, sink, &mut answer).await?;
         if !answer.usage_reported() {
@@ -2194,9 +2204,9 @@ mod tests {
 
     #[test]
     fn openai_client_requests_reasoning_only_when_enabled() {
-        // The answer turn is the one that can carry OpenRouter's billed reasoning
-        // request. `new(key, false)` must omit it entirely; `new(key, true)` must ask
-        // for it — proving the opt-in flag threads through to the wire body.
+        // The answer turn is the one that can carry the billed reasoning request.
+        // `new(key, false)` must omit it entirely; `new(key, true)` must ask for it
+        // — proving the opt-in flag threads through to the wire body.
         let req = LlmRequest {
             model: "anthropic/claude-sonnet-4.5".into(),
             messages: vec![LlmMessage::user("q")],

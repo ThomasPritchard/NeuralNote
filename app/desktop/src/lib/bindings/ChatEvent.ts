@@ -15,7 +15,24 @@ import type { ToolStatus } from "./ToolStatus";
  * either [`ChatEvent::Done`] (success) or [`ChatEvent::Error`] (surfaced failure)
  * — never silently.
  */
-export type ChatEvent = { "type": "processing" } | { "type": "skillActivated", id: string, name: string, } | { "type": "skillStep", message: string, } | { "type": "elicit", id: string, question: string, options: Array<ElicitOption>, multiSelect: boolean, } | { "type": "skillActivationFailed", id: string, name: string, 
+export type ChatEvent = { "type": "processing" } | { "type": "planningRound", 
+/**
+ * 1-based. The first tool-deciding turn is round 1.
+ */
+round: number, 
+/**
+ * The ceiling as computed for THIS round.
+ *
+ * Re-read every emission and it CAN GROW mid-run: activating a skill
+ * raises the ceiling ([`ActiveSkills::max_iterations`](crate::ai::skills::ActiveSkills::max_iterations)
+ * folds each active skill's declared cap over the base). The UI must
+ * render the latest pair and never cache the denominator.
+ */
+maxRounds: number, } | { "type": "keepalive" } | { "type": "toolProgress", 
+/**
+ * The [`ChatEvent::ToolCall`] id.
+ */
+id: string, message: string, } | { "type": "skillActivated", id: string, name: string, } | { "type": "skillStep", message: string, } | { "type": "elicit", id: string, question: string, options: Array<ElicitOption>, multiSelect: boolean, } | { "type": "skillActivationFailed", id: string, name: string, 
 /**
  * The human sentence, for display only — no longer load-bearing.
  */
@@ -66,7 +83,15 @@ summary: string | null,
 /**
  * Bounded result or error text for the disclosure. Truncated Rust-side.
  */
-detail: string | null, } | { "type": "transcriptSource", label: string, relPath: string | null, } | { "type": "partialRun", reason: string, } | { "type": "noteWritten", relPath: string, kind: NoteKind, } | { "type": "noteExists", relPath: string, kind: NoteKind, } | { "type": "noteEditPreview", 
+detail: string | null, 
+/**
+ * Wall-clock time from dispatch to settlement. Measured with `Instant`,
+ * which the core already treats as a measurement rather than a timer.
+ * Never optional: the orchestrator always knows how long it waited, and
+ * a call that never ran waited approximately nothing rather than an
+ * unknown amount.
+ */
+durationMs: number, } | { "type": "transcriptSource", label: string, relPath: string | null, } | { "type": "partialRun", reason: string, } | { "type": "noteWritten", relPath: string, kind: NoteKind, } | { "type": "noteExists", relPath: string, kind: NoteKind, } | { "type": "noteEditPreview", 
 /**
  * The [`ChatEvent::ToolCall`] id, so the card upgrades in place into
  * [`ChatEvent::NoteWritten`] rather than becoming a second node.
@@ -99,4 +124,12 @@ relPath: string | null,
 /**
  * A compiled-in reason, never free text and never model prose.
  */
-reason: ApprovalReason, expiresInSecs: number, } | { "type": "toolAutoApproved", id: string, tool: GatedTool, rule: ApprovalRule, } | { "type": "toolApprovalResolved", id: string, decision: ApprovalResolution, } | { "type": "toolApprovalDegraded", reason: ApprovalDegradedReason, } | { "type": "searching", query: string, } | { "type": "retrieved", query: string, hitCount: number, } | { "type": "reading", relPath: string, startLine: number, endLine: number, } | { "type": "thinking", delta: string, } | { "type": "verifying" } | { "type": "citationDropped", reason: string, } | { "type": "answer", delta: string, } | { "type": "answerTruncated" } | { "type": "citation", id: string, relPath: string, startLine: number, endLine: number, text: string, } | { "type": "coverage", searchedTerms: Array<string>, notesRead: Array<string>, truncated: boolean, skippedFiles: number, } | { "type": "plan", steps: Array<PlanStep>, } | { "type": "planStepStatus", id: string, status: StepStatus, } | { "type": "usage", elapsedMs: number, tokensIn: number | null, tokensOut: number | null, model: string, } | { "type": "error", message: string, } | { "type": "done" };
+reason: ApprovalReason, expiresInSecs: number, } | { "type": "toolAutoApproved", id: string, tool: GatedTool, rule: ApprovalRule, } | { "type": "toolApprovalResolved", id: string, decision: ApprovalResolution, } | { "type": "toolApprovalDegraded", reason: ApprovalDegradedReason, } | { "type": "searching", query: string, 
+/**
+ * The [`ChatEvent::ToolCall`] that ran it — see [`ChatEvent::Retrieved`].
+ */
+callId: string | null, } | { "type": "retrieved", query: string, hitCount: number, callId: string | null, } | { "type": "reading", relPath: string, startLine: number, endLine: number, 
+/**
+ * The [`ChatEvent::ToolCall`] that read it — see [`ChatEvent::Retrieved`].
+ */
+callId: string | null, } | { "type": "thinking", delta: string, } | { "type": "verifying" } | { "type": "citationDropped", reason: string, } | { "type": "answer", delta: string, } | { "type": "answerTruncated" } | { "type": "citation", id: string, relPath: string, startLine: number, endLine: number, text: string, } | { "type": "coverage", searchedTerms: Array<string>, notesRead: Array<string>, truncated: boolean, skippedFiles: number, } | { "type": "plan", steps: Array<PlanStep>, } | { "type": "planStepStatus", id: string, status: StepStatus, } | { "type": "usage", elapsedMs: number, tokensIn: number | null, tokensOut: number | null, model: string, } | { "type": "error", message: string, } | { "type": "done" };

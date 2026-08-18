@@ -511,7 +511,7 @@ describe("ChatMessages — skill turns", () => {
     );
     expect(screen.queryByText("Searching your vault")).not.toBeInTheDocument();
 
-    const searching = reduceAssistant(accepted, { type: "searching", query: "notes" });
+    const searching = reduceAssistant(accepted, { type: "searching", query: "notes", callId: null });
     rerender(
       <ChatMessages
         messages={[{ role: "user", content: "question" }, searching]}
@@ -529,6 +529,7 @@ describe("ChatMessages — skill turns", () => {
       relPath: "Notes/Example.md",
       startLine: 1,
       endLine: 2,
+      callId: null,
     });
     rerender(
       <ChatMessages

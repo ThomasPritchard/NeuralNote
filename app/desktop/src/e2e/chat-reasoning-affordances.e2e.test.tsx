@@ -90,8 +90,8 @@ describe("Journey 10: chat-pane reasoning affordances", () => {
 
   it("shows the nothing-found card when a search reads and cites nothing", async () => {
     const nothingFound: ChatEvent[] = [
-      { type: "searching", query: "fibonacci trading" },
-      { type: "retrieved", query: "fibonacci trading", hitCount: 0 },
+      { type: "searching", query: "fibonacci trading", callId: null },
+      { type: "retrieved", query: "fibonacci trading", hitCount: 0, callId: null },
       { type: "answer", delta: "Your notes don't cover that. Try adding one." },
       {
         type: "coverage",

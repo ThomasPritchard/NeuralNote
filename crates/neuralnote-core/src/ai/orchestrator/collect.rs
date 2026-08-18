@@ -77,6 +77,18 @@ impl ChatSession<'_> {
             let budgeted =
                 fit_prompt_to_window(messages, self.model, self.llm.context_window_tokens());
             coverage.truncated |= budgeted.lost;
+            // Announced here, through the raw sink, so it is structurally outside the
+            // retry `EmissionGuard` that `complete_tool_turn` builds around the turn:
+            // that guard bars a retry on anything the user can already SEE, and this
+            // beacon is neither the provider's output nor something a replay could
+            // rewind, so counting it would silently disable the one bounded retry.
+            //
+            // The ceiling is re-read every round on purpose — activating a skill
+            // raises it — so the pair the UI renders is always this round's pair.
+            sink.send(ChatEvent::PlanningRound {
+                round: round_number(consumed),
+                max_rounds: round_ceiling(active_skills.max_iterations(consumed)),
+            });
             // This tool-DECIDING turn is idempotent (no tool has run yet), so a single
             // transient transport failure is retried once rather than aborting the run.
             let completion = self
@@ -149,9 +161,9 @@ impl ChatSession<'_> {
             // instead of vanishing. Every branch below settles it exactly once.
             // This is also where the step affiliation is stamped — the plan as it
             // stands at THIS call's dispatch, not as it ends up.
-            emit_tool_call(sink, call, plan);
+            let dispatched = emit_tool_call(sink, call, plan);
             if playlist_batch_closed {
-                settle_skipped(messages, sink, call, SkippedCall::StalePlaylistBatch);
+                settle_skipped(messages, sink, &dispatched, SkippedCall::StalePlaylistBatch);
                 continue;
             }
             if !playlist_cancelled
@@ -168,11 +180,16 @@ impl ChatSession<'_> {
                 }
             }
             if playlist_cancelled {
-                settle_skipped(messages, sink, call, SkippedCall::PlaylistCancelled);
+                settle_skipped(messages, sink, &dispatched, SkippedCall::PlaylistCancelled);
                 continue;
             }
             if control.budget_hit {
-                settle_skipped(messages, sink, call, SkippedCall::EvidenceBudgetSpent);
+                settle_skipped(
+                    messages,
+                    sink,
+                    &dispatched,
+                    SkippedCall::EvidenceBudgetSpent,
+                );
                 continue;
             }
             let (tool_control, settlement) = self
@@ -199,7 +216,7 @@ impl ChatSession<'_> {
                     reason: PARTIAL_RUN_CANCELLED.to_string(),
                 });
             }
-            emit_tool_result(sink, &call.id, settlement);
+            emit_tool_result(sink, &dispatched, settlement);
             let current_playlist_item = youtube_session
                 .playlist_current()
                 .map(|(index, _, _)| index);
@@ -345,26 +362,19 @@ impl ChatSession<'_> {
     ///
     /// A non-transient failure or a user-stopped run is never retried either.
     ///
-    /// **It opens by saying the run is working** (#126). Nothing else can reach the
-    /// user during this turn — only a `write_note` preview can, and only on a
-    /// provider that streams tool calls — so an answered question was followed by a
-    /// whole round-trip of silence, and by TWO on a provider that does not stream
-    /// tool turns and re-runs the turn buffered. The pane went on showing whichever
-    /// phase word it last had ("searching", while the model was composing). One
-    /// [`ChatEvent::Processing`] before the turn is the honest correction: it is the
-    /// variant that already means "working", which the run genuinely is.
+    /// **The caller announces the round before calling this** (#126). Nothing else
+    /// can reach the user during this turn — only a `write_note` preview can, and
+    /// only on a provider that streams tool calls — so an answered question was
+    /// followed by a whole round-trip of silence, and by TWO on a provider that
+    /// does not stream tool turns and re-runs the turn buffered. The pane went on
+    /// showing whichever phase word it last had ("searching", while the model was
+    /// composing). [`ChatEvent::PlanningRound`], emitted by `collect_evidence`
+    /// outside the guard below, is the honest correction.
     pub(super) async fn complete_tool_turn(
         &self,
         request: &LlmRequest,
         sink: &mut dyn EventSink,
     ) -> CoreResult<Completion> {
-        // Sent through the raw sink, BEFORE the guard below wraps it, and once for
-        // the whole call rather than once per attempt. Both matter. The guard bars a
-        // retry on anything the user can already SEE — a half-composed note — and
-        // this beacon is neither the provider's output nor something a replay could
-        // rewind, so counting it would silently disable the one bounded retry. Once
-        // per call also keeps the turn to a single event no matter how it goes.
-        sink.send(ChatEvent::Processing);
         let mut retries = MAX_COMPLETE_RETRIES;
         let mut sink = EmissionGuard {
             inner: sink,
@@ -415,10 +425,16 @@ impl ChatSession<'_> {
         coverage: &mut CoverageAcc,
         sink: &mut dyn EventSink,
     ) -> tools::ToolResult {
-        // The "searching…" cue precedes the search so the UI shows it live.
+        // The "searching…" cue precedes the search so the UI shows it live. It
+        // names the call that runs it so the timeline can enrich that node rather
+        // than render the same act a second time — parallel calls make arrival
+        // order useless as a correlation key.
         if call.name() == tools::TOOL_SEARCH_NOTES {
             if let Some(query) = peek_query(call.arguments()) {
-                sink.send(ChatEvent::Searching { query });
+                sink.send(ChatEvent::Searching {
+                    query,
+                    call_id: Some(call.call_id().to_string()),
+                });
             }
         }
         let result = {
@@ -462,6 +478,7 @@ impl ChatSession<'_> {
                 sink.send(ChatEvent::Retrieved {
                     query: query.clone(),
                     hit_count: *hit_count,
+                    call_id: Some(call.call_id().to_string()),
                 });
                 push_unique(&mut coverage.searched_terms, query);
                 for rel in notes_read {
@@ -481,6 +498,7 @@ impl ChatSession<'_> {
                     rel_path: rel_path.clone(),
                     start_line: *start_line,
                     end_line: *end_line,
+                    call_id: Some(call.call_id().to_string()),
                 });
                 push_unique(&mut coverage.notes_read, rel_path);
             }
@@ -495,6 +513,25 @@ impl ChatSession<'_> {
         }
         result
     }
+}
+
+/// The 1-based round about to run, from the count of rounds already consumed.
+///
+/// Saturating rather than wrapping: the iteration guard stops the loop long
+/// before `u32` runs out, and a wrapped round number would read as a run
+/// starting over — the exact confusion `PlanningRound` replaced `Processing` to
+/// end.
+fn round_number(consumed: usize) -> u32 {
+    u32::try_from(consumed)
+        .unwrap_or(u32::MAX)
+        .saturating_add(1)
+}
+
+/// This round's ceiling, narrowed for the wire. Saturating for the same reason
+/// as [`round_number`]: a wrapped ceiling would render a round above its own
+/// maximum.
+fn round_ceiling(max_iterations: usize) -> u32 {
+    u32::try_from(max_iterations).unwrap_or(u32::MAX)
 }
 
 fn iteration_guard_reached(

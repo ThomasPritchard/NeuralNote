@@ -209,6 +209,7 @@ describe("turn-specific event and stop routing", () => {
       status: "cancelled",
       summary: null,
       detail: "YouTube capture was cancelled",
+      durationMs: 0,
     });
     const withPartial = reduceAssistantForTurn(settled, "turn-1", {
       type: "partialRun",
@@ -236,7 +237,7 @@ describe("reduceAssistant — grounded progress", () => {
     turn = reduceAssistant(turn, { type: "processing" });
     expect(turn.phase).toBe("thinking");
 
-    turn = reduceAssistant(turn, { type: "searching", query: "active recall" });
+    turn = reduceAssistant(turn, { type: "searching", query: "active recall", callId: null });
     expect(turn.phase).toBe("searching");
 
     turn = reduceAssistant(turn, {
@@ -244,11 +245,65 @@ describe("reduceAssistant — grounded progress", () => {
       relPath: "Learning.md",
       startLine: 3,
       endLine: 8,
+      callId: null,
     });
     expect(turn.phase).toBe("reading");
 
     turn = reduceAssistant(turn, { type: "verifying" });
     expect(turn.phase).toBe("verifying");
+  });
+
+  it("treats a planning round exactly as the round beacon it replaced", () => {
+    // The backend split one repeated `processing` into an accepted-the-run
+    // beacon and a per-round `planningRound`. Until a later phase teaches the
+    // head to say "round N of M", the two must be indistinguishable to the user
+    // — a contract freeze that changed what the pane shows would have done a
+    // later phase's work.
+    const viaProcessing = reduceAssistant(emptyAssistant(), { type: "processing" });
+    const viaRound = reduceAssistant(emptyAssistant(), {
+      type: "planningRound",
+      round: 3,
+      maxRounds: 12,
+    });
+
+    expect(viaRound).toEqual(viaProcessing);
+    expect(viaRound.phase).toBe("thinking");
+  });
+
+  it("leaves the turn untouched for keepalive and tool progress", () => {
+    // Both are wire plumbing this phase only carries. A keepalive says the
+    // socket is alive, not that anything happened, so it must not move the
+    // phase, the activity log, or anything else the user can see.
+    const searched = run([
+      { type: "searching", query: "active recall", callId: "c1" },
+    ]);
+
+    expect(reduceAssistant(searched, { type: "keepalive" })).toEqual(searched);
+    expect(
+      reduceAssistant(searched, {
+        type: "toolProgress",
+        id: "c1",
+        message: "3 of 8 videos",
+      }),
+    ).toEqual(searched);
+  });
+
+  it("ignores the retrieval correlation key rather than rendering it", () => {
+    // The key exists so a later phase can attach a cue to the node that raised
+    // it. Until then a correlated cue and an uncorrelated one must produce the
+    // same turn — that is the degradation guarantee, checked rather than stated.
+    const correlated = run([
+      { type: "searching", query: "spacing", callId: "call-7" },
+      { type: "retrieved", query: "spacing", hitCount: 2, callId: "call-7" },
+      { type: "reading", relPath: "n.md", startLine: 1, endLine: 2, callId: "call-8" },
+    ]);
+    const uncorrelated = run([
+      { type: "searching", query: "spacing", callId: null },
+      { type: "retrieved", query: "spacing", hitCount: 2, callId: null },
+      { type: "reading", relPath: "n.md", startLine: 1, endLine: 2, callId: null },
+    ]);
+
+    expect(correlated).toEqual(uncorrelated);
   });
 });
 
@@ -398,6 +453,7 @@ describe("reduceAssistant — the tool timeline", () => {
         status: "ok",
         summary: "12 spans",
         detail: null,
+        durationMs: 0,
       },
     ]);
 
@@ -437,7 +493,7 @@ describe("reduceAssistant — the tool timeline", () => {
         stepId: null, },
       { type: "toolCall", id: "c2", name: "list_folders", title: "List folders", arguments: "{}",
         stepId: null, },
-      { type: "toolResult", id: "c2", status: "rejected", summary: null, detail: "nope" },
+      { type: "toolResult", id: "c2", status: "rejected", summary: null, detail: "nope", durationMs: 0 },
     ]);
 
     expect(turn.toolCalls.map((call) => call.status)).toEqual([null, "rejected"]);
@@ -448,7 +504,7 @@ describe("reduceAssistant — the tool timeline", () => {
     // Mirrors `withHitCount`: a backend that breaks its own pairing contract
     // must produce a visible anomaly, never a silently discarded event.
     const turn = run([
-      { type: "toolResult", id: "ghost", status: "error", summary: null, detail: "boom" },
+      { type: "toolResult", id: "ghost", status: "error", summary: null, detail: "boom", durationMs: 0 },
     ]);
 
     expect(turn.toolCalls).toEqual([
@@ -494,7 +550,7 @@ describe("reduceAssistant — the tool timeline", () => {
         arguments: '{"query":"widgets"}',
         stepId: null,
       },
-      { type: "toolResult", id: "c1", status: "ok", summary: "3 spans", detail: null },
+      { type: "toolResult", id: "c1", status: "ok", summary: "3 spans", detail: null, durationMs: 0 },
     ]);
 
     expect(turn.planSteps).toEqual([]);
@@ -532,8 +588,8 @@ describe("reduceAssistant — the tool timeline", () => {
         arguments: "{}",
         stepId: null,
       },
-      { type: "toolResult", id: "c2", status: "ok", summary: null, detail: null },
-      { type: "toolResult", id: "c1", status: "rejected", summary: null, detail: "nope" },
+      { type: "toolResult", id: "c2", status: "ok", summary: null, detail: null, durationMs: 0 },
+      { type: "toolResult", id: "c1", status: "rejected", summary: null, detail: "nope", durationMs: 0 },
     ]);
 
     expect(turn.toolCalls.map((call) => [call.id, call.status, call.stepId])).toEqual([
@@ -573,8 +629,8 @@ describe("reduceAssistant — the tool timeline", () => {
     const turn = run([
       { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}",
         stepId: null, },
-      { type: "toolResult", id: "c1", status: "ok", summary: null, detail: null },
-      { type: "toolResult", id: "c1", status: "rejected", summary: null, detail: "late" },
+      { type: "toolResult", id: "c1", status: "ok", summary: null, detail: null, durationMs: 0 },
+      { type: "toolResult", id: "c1", status: "rejected", summary: null, detail: "late", durationMs: 0 },
     ]);
 
     expect(turn.toolCalls).toHaveLength(2);
@@ -585,7 +641,7 @@ describe("reduceAssistant — the tool timeline", () => {
     // A tool node is not a phase. Announcing a call must not overwrite the
     // phase a `searching`/`reading` event established.
     const turn = run([
-      { type: "reading", relPath: "n.md", startLine: 1, endLine: 2 },
+      { type: "reading", relPath: "n.md", startLine: 1, endLine: 2, callId: null },
       { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}",
         stepId: null, },
     ]);
@@ -690,8 +746,8 @@ describe("reduceAssistant — the live note preview", () => {
  *  count undefined — the in-flight shape, which is not zero. */
 const settledSearch = (query: string, hitCount: number | null): ChatEvent[] =>
   hitCount === null
-    ? [{ type: "searching", query }]
-    : [{ type: "searching", query }, { type: "retrieved", query, hitCount }];
+    ? [{ type: "searching", query, callId: null }]
+    : [{ type: "searching", query, callId: null }, { type: "retrieved", query, hitCount, callId: null }];
 
 /** Close a run with a coverage footer that read no note — the state the empty-
  *  retrieval card is eligible in. */
@@ -807,8 +863,8 @@ describe("showsNothingFoundCard", () => {
 describe("reduceAssistant — activity log", () => {
   it("appends a search row, then merges the retrieved count into it", () => {
     const turn = run([
-      { type: "searching", query: "active recall" },
-      { type: "retrieved", query: "active recall", hitCount: 3 },
+      { type: "searching", query: "active recall", callId: null },
+      { type: "retrieved", query: "active recall", hitCount: 3, callId: null },
     ]);
     expect(turn.activity).toEqual([
       { kind: "search", query: "active recall", hitCount: 3 },
@@ -817,9 +873,9 @@ describe("reduceAssistant — activity log", () => {
 
   it("keeps two same-query searches distinct, filling each pending count once", () => {
     const turn = run([
-      { type: "searching", query: "spacing" },
-      { type: "searching", query: "spacing" },
-      { type: "retrieved", query: "spacing", hitCount: 2 },
+      { type: "searching", query: "spacing", callId: null },
+      { type: "searching", query: "spacing", callId: null },
+      { type: "retrieved", query: "spacing", hitCount: 2, callId: null },
     ]);
     // The most recent pending search takes the count; the first stays pending.
     expect(turn.activity).toEqual([
@@ -829,13 +885,13 @@ describe("reduceAssistant — activity log", () => {
   });
 
   it("keeps a retrieved count even if its search row never arrived", () => {
-    const turn = run([{ type: "retrieved", query: "orphan", hitCount: 5 }]);
+    const turn = run([{ type: "retrieved", query: "orphan", hitCount: 5, callId: null }]);
     expect(turn.activity).toEqual([{ kind: "search", query: "orphan", hitCount: 5 }]);
   });
 
   it("records reading, verifying and dropped-citation rows in order", () => {
     const turn = run([
-      { type: "reading", relPath: "Spaced-Repetition.md", startLine: 12, endLine: 28 },
+      { type: "reading", relPath: "Spaced-Repetition.md", startLine: 12, endLine: 28, callId: null },
       { type: "verifying" },
       { type: "citationDropped", reason: "quote not found" },
     ]);

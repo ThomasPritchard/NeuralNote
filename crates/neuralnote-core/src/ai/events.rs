@@ -111,13 +111,53 @@ pub enum ToolStatus {
 )]
 #[ts(export)]
 pub enum ChatEvent {
-    /// The run is working and nothing more specific is true yet: the backend has
-    /// accepted it and is preparing a model request. Emitted once when the run is
-    /// accepted, and again before each tool-deciding round-trip — that turn can
-    /// take fifteen seconds and emits nothing else, so without it the last phase
-    /// word simply goes stale on screen (#126). Deliberately repeatable and
-    /// idempotent: it re-states the phase, it does not announce a new thing.
+    /// The run has been accepted and is preparing its first model request.
+    ///
+    /// Emitted EXACTLY ONCE per run, at the top of the orchestrator. The
+    /// per-round beacon is [`ChatEvent::PlanningRound`], which carries a round
+    /// number and therefore cannot reset the phase backwards the way a repeated
+    /// `Processing` did.
     Processing,
+    /// A tool-deciding round-trip is starting. Emitted once per round, before the
+    /// model request goes out, through the raw sink and before the retry guard in
+    /// `orchestrator::collect` wraps it — counting it would disable the one
+    /// bounded retry that turn is allowed.
+    ///
+    /// It replaces the per-round `Processing` that used to keep the phase word
+    /// from going stale during a turn that can take fifteen seconds and emits
+    /// nothing else (#126); unlike `Processing` it says *which* round, so a
+    /// repeat cannot read as a fresh start.
+    PlanningRound {
+        /// 1-based. The first tool-deciding turn is round 1.
+        round: u32,
+        /// The ceiling as computed for THIS round.
+        ///
+        /// Re-read every emission and it CAN GROW mid-run: activating a skill
+        /// raises the ceiling ([`ActiveSkills::max_iterations`](crate::ai::skills::ActiveSkills::max_iterations)
+        /// folds each active skill's declared cap over the base). The UI must
+        /// render the latest pair and never cache the denominator.
+        max_rounds: u32,
+    },
+    /// The provider is alive and has sent nothing else. Forwarded from an SSE
+    /// comment line (OpenRouter sends `: OPENROUTER PROCESSING`), which the
+    /// stream classifier used to resolve to "ignorable" and drop.
+    ///
+    /// Carries no payload on purpose: it says "the socket is alive", not
+    /// "progress happened". It refreshes the transport-liveness signal and must
+    /// NOT reset a stall detector, which watches for progress.
+    Keepalive,
+    /// A long-running tool reporting from inside itself, keyed to the
+    /// [`ChatEvent::ToolCall`] it belongs to so it renders on that node rather
+    /// than on a separate surface.
+    ///
+    /// `message` is Rust-composed, never model prose — the same rule
+    /// [`ChatEvent::ToolCall`]'s `title` follows. Repeatable; the UI shows the
+    /// latest.
+    ToolProgress {
+        /// The [`ChatEvent::ToolCall`] id.
+        id: String,
+        message: String,
+    },
     /// A skill became active and granted its declared tools.
     SkillActivated { id: String, name: String },
     /// A user-facing progress update emitted by an active skill.
@@ -184,6 +224,12 @@ pub enum ChatEvent {
         summary: Option<String>,
         /// Bounded result or error text for the disclosure. Truncated Rust-side.
         detail: Option<String>,
+        /// Wall-clock time from dispatch to settlement. Measured with `Instant`,
+        /// which the core already treats as a measurement rather than a timer.
+        /// Never optional: the orchestrator always knows how long it waited, and
+        /// a call that never ran waited approximately nothing rather than an
+        /// unknown amount.
+        duration_ms: u64,
     },
     /// How a transcript was actually obtained, reported by the tool that obtained
     /// it — so provenance is read off the wire, never scraped out of model prose.
@@ -266,14 +312,34 @@ pub enum ChatEvent {
     /// not once per call.
     ToolApprovalDegraded { reason: ApprovalDegradedReason },
     /// A search is about to run for `query` (the live "searching…" cue).
-    Searching { query: String },
+    Searching {
+        query: String,
+        /// The [`ChatEvent::ToolCall`] that ran it — see [`ChatEvent::Retrieved`].
+        call_id: Option<String>,
+    },
     /// `query` finished, yielding `hit_count` evidence spans.
-    Retrieved { query: String, hit_count: u32 },
+    ///
+    /// `call_id` is the correlation key for all three retrieval cues. These cues
+    /// are emitted BY the tool calls above them on the rail, so the UI enriches
+    /// the tool node in place rather than rendering the same act twice — and
+    /// tool calls can run in parallel, so arrival order is not a correlation key
+    /// and guessing from it would put the wrong query on the wrong node.
+    ///
+    /// `Option`, not `String`: the cues come from the retrieval layer and a path
+    /// may have no dispatched call behind it. `None` means "no node to attach
+    /// to" and renders exactly as it did before the key existed.
+    Retrieved {
+        query: String,
+        hit_count: u32,
+        call_id: Option<String>,
+    },
     /// A bounded line range of a note is being read into evidence.
     Reading {
         rel_path: String,
         start_line: u32,
         end_line: u32,
+        /// The [`ChatEvent::ToolCall`] that read it — see [`ChatEvent::Retrieved`].
+        call_id: Option<String>,
     },
     /// Optional model reasoning tokens (surfaced only if the client streams them).
     Thinking { delta: String },
@@ -414,10 +480,97 @@ mod tests {
         assert_eq!(json(&ChatEvent::Verifying)["type"], "verifying");
         assert_eq!(
             json(&ChatEvent::Searching {
-                query: "widgets".into()
+                query: "widgets".into(),
+                call_id: None,
             })["type"],
             "searching"
         );
+    }
+
+    #[test]
+    fn planning_round_carries_both_numbers_in_camel_case() {
+        // The denominator travels with every emission precisely because it can
+        // grow mid-run, so the UI never has to remember one.
+        let event = ChatEvent::PlanningRound {
+            round: 2,
+            max_rounds: 12,
+        };
+        assert_eq!(
+            json(&event),
+            serde_json::json!({ "type": "planningRound", "round": 2, "maxRounds": 12 })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn keepalive_is_a_payload_free_camel_case_event() {
+        // No payload on purpose: it says the socket is alive, not that progress
+        // happened.
+        assert_eq!(
+            json(&ChatEvent::Keepalive),
+            serde_json::json!({ "type": "keepalive" })
+        );
+    }
+
+    #[test]
+    fn tool_progress_is_keyed_to_the_call_it_reports_on() {
+        assert_eq!(
+            json(&ChatEvent::ToolProgress {
+                id: "call-1".into(),
+                message: "3 of 8 videos".into(),
+            }),
+            serde_json::json!({
+                "type": "toolProgress",
+                "id": "call-1",
+                "message": "3 of 8 videos",
+            })
+        );
+    }
+
+    #[test]
+    fn a_correlated_retrieval_cue_names_the_call_that_ran_it() {
+        let event = ChatEvent::Retrieved {
+            query: "widgets".into(),
+            hit_count: 3,
+            call_id: Some("call-7".into()),
+        };
+        assert_eq!(json(&event)["callId"], "call-7");
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn an_uncorrelated_retrieval_cue_carries_a_null_call_id_not_an_empty_string() {
+        // The degradation guarantee: a cue with no dispatched call behind it says
+        // "no node to attach to" explicitly. An empty string would look like a
+        // real id and attach the cue to nothing at all.
+        for event in [
+            ChatEvent::Searching {
+                query: "widgets".into(),
+                call_id: None,
+            },
+            ChatEvent::Retrieved {
+                query: "widgets".into(),
+                hit_count: 0,
+                call_id: None,
+            },
+            ChatEvent::Reading {
+                rel_path: "a/b.md".into(),
+                start_line: 1,
+                end_line: 2,
+                call_id: None,
+            },
+        ] {
+            let value = json(&event);
+            assert_eq!(value["callId"], serde_json::Value::Null);
+            assert_ne!(value["callId"], "");
+            assert_eq!(serde_json::from_value::<ChatEvent>(value).unwrap(), event);
+        }
     }
 
     #[test]
@@ -433,6 +586,7 @@ mod tests {
             rel_path: "a/b.md".into(),
             start_line: 3,
             end_line: 5,
+            call_id: None,
         });
         assert_eq!(v["relPath"], "a/b.md");
         assert_eq!(v["startLine"], 3);
@@ -609,6 +763,7 @@ mod tests {
                 status: ToolStatus::Rejected,
                 summary: None,
                 detail: Some("unknown tool 'nope'".into()),
+                duration_ms: 4,
             }),
             serde_json::json!({
                 "type": "toolResult",
@@ -616,6 +771,7 @@ mod tests {
                 "status": "rejected",
                 "summary": null,
                 "detail": "unknown tool 'nope'",
+                "durationMs": 4,
             })
         );
     }

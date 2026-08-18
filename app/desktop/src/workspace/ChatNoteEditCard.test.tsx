@@ -67,7 +67,7 @@ const settle = (
   status: "ok" | "rejected" | "error" | "denied",
   detail: string | null = null,
   id = CALL_ID,
-): ChatEvent => ({ type: "toolResult", id, status, summary: null, detail });
+): ChatEvent => ({ type: "toolResult", id, status, summary: null, detail, durationMs: 0 });
 
 const abandon = (reason: string, id = CALL_ID): ChatEvent => ({
   type: "noteEditAbandoned",

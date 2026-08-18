@@ -140,6 +140,14 @@ pub fn consume_sse_line(
             sink.send(ChatEvent::AnswerTruncated);
             Ok(None)
         }
+        SseEvent::Keepalive => {
+            // Forwarded rather than dropped: the UI needs to tell "the provider is
+            // thinking" apart from "the provider has gone away". It carries no
+            // content, so `full` is untouched and the returned string stays
+            // byte-equal to the Answer deltas.
+            sink.send(ChatEvent::Keepalive);
+            Ok(None)
+        }
         SseEvent::Done => Ok(Some(full.clone())),
         SseEvent::Error(msg) => Err(CoreError::Llm(msg)),
         SseEvent::Other => Ok(None),
@@ -169,17 +177,41 @@ pub fn finish_answer(full: String) -> CoreResult<String> {
 /// parses) — never mis-cited.
 pub const ANSWER_MAX_TOKENS: u32 = 4096;
 
+/// What to ask the provider for on this turn. `None` = send no `reasoning`
+/// object at all.
+///
+/// Not on the wire as a type — it is the internal ask that
+/// [`to_wire_request`] renders into OpenRouter's `reasoning` object.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReasoningAsk {
+    /// `{"enabled": true}` and nothing else — reasoning at the model's own
+    /// default effort. This is the fail-OPEN send, used when no effort has been
+    /// chosen or the capability probe has not answered.
+    Enabled,
+    /// `{"effort": "<verbatim>"}`. The string is passed through EXACTLY as the
+    /// model's own menu named it: never normalised, never lower-cased, and never
+    /// validated against a compiled-in list — the catalogue carries 21 distinct
+    /// menus, so any list we compiled in would be wrong for some model and would
+    /// silently downgrade its reasoning.
+    ///
+    /// `enabled` is omitted alongside it, because OpenRouter infers `enabled`
+    /// from `effort` (verified 2026-08-18 against OpenRouter's *Reasoning
+    /// tokens* guide).
+    Effort(String),
+}
+
 /// Build the OpenAI-compatible request body. `num_ctx` is set only by the local
 /// (Ollama) client, where it becomes `options.num_ctx`; OpenRouter passes `None`.
-/// `reasoning` asks the provider to stream reasoning tokens — set only by the
-/// OpenRouter client, which speaks it, and only when the user has opted in; the
-/// local (Ollama) endpoint would ignore or reject the field.
+/// `reasoning` asks the provider to stream reasoning tokens; `None` sends no
+/// `reasoning` object at all. Both providers speak it — OpenRouter natively, and
+/// Ollama's OpenAI-compatible endpoint by mapping thinking onto the same field
+/// (see `local::ollama_chat_client`) — so the caller decides, not the transport.
 pub fn to_wire_request(
     req: &LlmRequest,
     stream: bool,
     num_ctx: Option<u32>,
     max_tokens: Option<u32>,
-    reasoning: bool,
+    reasoning: Option<ReasoningAsk>,
 ) -> serde_json::Value {
     serde_json::to_value(WireRequest::from_core(
         req, stream, num_ctx, max_tokens, reasoning,
@@ -233,8 +265,12 @@ pub enum SseEvent {
     /// A mid-stream OpenRouter `error` frame (HTTP was already 200) — fatal, must
     /// surface as a `ChatEvent::Error`, never be swallowed into an empty answer.
     Error(String),
-    /// A heartbeat comment, blank line, non-`data:` field, empty delta, or a
-    /// malformed chunk — all skipped, none fatal.
+    /// An SSE comment line: the provider is alive and has sent nothing else.
+    /// Non-fatal and payload-free — it says the socket is healthy, not that
+    /// progress happened.
+    Keepalive,
+    /// A blank line, non-`data:` field, empty delta, or a malformed chunk — all
+    /// skipped, none fatal.
     Other,
 }
 
@@ -252,6 +288,7 @@ pub fn parse_sse_line(line: &str) -> SseEvent {
 fn sse_event(classified: SseLine) -> SseEvent {
     match classified {
         SseLine::Ignorable => SseEvent::Other,
+        SseLine::Keepalive => SseEvent::Keepalive,
         SseLine::Done => SseEvent::Done,
         SseLine::Failed(message) => SseEvent::Error(message),
         SseLine::Chunk(chunk) => answer_event(chunk),
@@ -267,6 +304,10 @@ fn sse_event(classified: SseLine) -> SseEvent {
 /// worst of both.
 enum SseLine {
     Ignorable,
+    /// An SSE comment line. The provider is alive and has sent nothing else, which
+    /// is a fact worth forwarding rather than discarding — a stream that goes
+    /// quiet while the socket is healthy is a different story from a dead one.
+    Keepalive,
     Done,
     Failed(String),
     Chunk(StreamChunk),
@@ -274,9 +315,12 @@ enum SseLine {
 
 fn classify_sse_line(line: &str) -> SseLine {
     let line = line.trim_end_matches(['\r', '\n']).trim();
-    // `:`-prefixed lines are SSE comments (OpenRouter sends `: OPENROUTER PROCESSING`).
-    if line.is_empty() || line.starts_with(':') {
+    if line.is_empty() {
         return SseLine::Ignorable;
+    }
+    // `:`-prefixed lines are SSE comments (OpenRouter sends `: OPENROUTER PROCESSING`).
+    if line.starts_with(':') {
+        return SseLine::Keepalive;
     }
     let Some(data) = line.strip_prefix("data:") else {
         return SseLine::Ignorable;
@@ -366,7 +410,11 @@ pub enum ToolSseEvent {
     /// The turn cannot be trusted or completed: an in-band error frame, a
     /// provider-declared failure, or a fragment there is no way to place.
     Failed(String),
-    /// A heartbeat, reasoning, an empty delta, or malformed noise.
+    /// An SSE comment line — see [`SseEvent::Keepalive`]. Classified on this turn
+    /// too so the two paths agree about what a comment line means; the tool turn
+    /// has no sink of its own to forward it through.
+    Keepalive,
+    /// Reasoning, an empty delta, or malformed noise.
     Other,
 }
 
@@ -386,6 +434,7 @@ pub fn parse_tool_sse_line(line: &str) -> ToolSseEvent {
 fn tool_sse_event(classified: SseLine) -> ToolSseEvent {
     match classified {
         SseLine::Ignorable => ToolSseEvent::Other,
+        SseLine::Keepalive => ToolSseEvent::Keepalive,
         SseLine::Done => ToolSseEvent::Done,
         SseLine::Failed(message) => ToolSseEvent::Failed(message),
         SseLine::Chunk(chunk) => tool_event(chunk),
@@ -476,7 +525,11 @@ pub fn consume_tool_sse_line(
             accumulator.abandon(tool_stream::ABANDONED_TURN_FAILED, sink);
             Err(CoreError::Llm(message))
         }
-        ToolSseEvent::Other => Ok(false),
+        // Classified so both turns agree on what a comment line means, but not
+        // forwarded here: the answer turn's `consume_sse_line` is the one that
+        // emits, and a keepalive surfaced from one path and swallowed on the other
+        // is exactly the drift `classify_sse_line` exists to prevent.
+        ToolSseEvent::Keepalive | ToolSseEvent::Other => Ok(false),
     }
 }
 
@@ -503,13 +556,41 @@ fn extract_reasoning(delta: &StreamDelta) -> Option<String> {
 // The core's LlmMessage serialises camelCase (the IPC/UI contract). The OpenRouter
 // wire is snake_case, so we map explicitly here rather than reuse the core's serde.
 
-/// OpenRouter's unified reasoning request object. We only ever enable it — no
-/// `effort` / `max_tokens` knobs (YAGNI); its presence is what tells OpenRouter to
-/// stream reasoning tokens as `delta.reasoning_details`. Omitted entirely for
-/// providers that don't speak it (Ollama's OpenAI-compatible endpoint).
+/// OpenRouter's unified reasoning request object. Its presence is what tells the
+/// provider to stream reasoning tokens as `delta.reasoning_details`; omitted
+/// entirely when the caller asks for none.
+///
+/// Exactly one of the two fields is ever set, which is why both are `Option` and
+/// both are skipped when absent — `{"enabled": true}` asks for the model's
+/// default effort, `{"effort": "…"}` names one and lets OpenRouter infer
+/// `enabled` from it.
+///
+/// `max_tokens` is deliberately absent: OpenRouter documents `effort` and
+/// `max_tokens` as mutually exclusive ("One of the following (not both)"), and
+/// so is `exclude` — a run that suppressed its own reasoning stream would have
+/// nothing to show for the tokens it paid for.
 #[derive(Serialize)]
 struct ReasoningRequest {
-    enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    enabled: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    effort: Option<String>,
+}
+
+impl From<ReasoningAsk> for ReasoningRequest {
+    fn from(ask: ReasoningAsk) -> Self {
+        match ask {
+            ReasoningAsk::Enabled => Self {
+                enabled: Some(true),
+                effort: None,
+            },
+            // Verbatim. Whatever the model's own menu named, that is what goes out.
+            ReasoningAsk::Effort(effort) => Self {
+                enabled: None,
+                effort: Some(effort),
+            },
+        }
+    }
 }
 
 /// Ollama request options. OpenRouter has a large context and its own defaults, so
@@ -596,8 +677,9 @@ struct WireRequest<'a> {
     /// Optional output cap for streamed answer turns; omitted for tool-deciding turns.
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
-    /// Set only by the OpenRouter client to request streamed reasoning tokens; omitted
-    /// for the local (Ollama) provider, which doesn't speak it.
+    /// Requests streamed reasoning tokens; omitted when the caller asks for none.
+    /// Both providers speak it — Ollama's OpenAI-compatible endpoint maps
+    /// thinking onto the same field.
     #[serde(skip_serializing_if = "Option::is_none")]
     reasoning: Option<ReasoningRequest>,
 }
@@ -608,7 +690,7 @@ impl<'a> WireRequest<'a> {
         stream: bool,
         num_ctx: Option<u32>,
         max_tokens: Option<u32>,
-        reasoning: bool,
+        reasoning: Option<ReasoningAsk>,
     ) -> Self {
         Self {
             model: &req.model,
@@ -620,7 +702,7 @@ impl<'a> WireRequest<'a> {
             }),
             options: num_ctx.map(|num_ctx| WireOptions { num_ctx }),
             max_tokens,
-            reasoning: reasoning.then_some(ReasoningRequest { enabled: true }),
+            reasoning: reasoning.map(ReasoningRequest::from),
         }
     }
 }
@@ -818,10 +900,12 @@ mod tests {
     }
 
     #[test]
-    fn sse_heartbeat_and_blank_are_ignored() {
+    fn sse_heartbeat_survives_classification_and_a_blank_line_does_not() {
+        // A comment line is the provider saying it is still there, so it is
+        // classified rather than discarded. A blank line says nothing at all.
         assert!(matches!(
             parse_sse_line(": OPENROUTER PROCESSING"),
-            SseEvent::Other
+            SseEvent::Keepalive
         ));
         assert!(matches!(parse_sse_line(""), SseEvent::Other));
     }
@@ -852,7 +936,7 @@ mod tests {
             messages: vec![LlmMessage::user("q")],
             tools: Vec::new(),
         };
-        let v = to_wire_request(&req, true, None, None, false);
+        let v = to_wire_request(&req, true, None, None, None);
         assert_eq!(v["model"], "anthropic/claude-sonnet-4.5");
         assert_eq!(v["stream"], true);
         assert!(
@@ -882,10 +966,10 @@ mod tests {
             messages: vec![LlmMessage::user("q")],
             tools: Vec::new(),
         };
-        let streamed = to_wire_request(&req, true, None, None, false);
+        let streamed = to_wire_request(&req, true, None, None, None);
         assert_eq!(streamed["stream_options"]["include_usage"], true);
 
-        let buffered = to_wire_request(&req, false, None, None, false);
+        let buffered = to_wire_request(&req, false, None, None, None);
         assert!(
             buffered.get("stream_options").is_none(),
             "stream_options must never ride on a non-streamed request"
@@ -901,10 +985,10 @@ mod tests {
         };
         // Local (Ollama) path: options.num_ctx present so Ollama sizes its window
         // instead of front-truncating the grounding rules + evidence.
-        let local = to_wire_request(&req, false, Some(32768), None, false);
+        let local = to_wire_request(&req, false, Some(32768), None, None);
         assert_eq!(local["options"]["num_ctx"], 32768);
         // OpenRouter path: no options object at all.
-        let cloud = to_wire_request(&req, false, None, None, false);
+        let cloud = to_wire_request(&req, false, None, None, None);
         assert!(cloud.get("options").is_none());
     }
 
@@ -915,9 +999,9 @@ mod tests {
             messages: vec![LlmMessage::user("q")],
             tools: Vec::new(),
         };
-        let capped = to_wire_request(&req, true, None, Some(ANSWER_MAX_TOKENS), false);
+        let capped = to_wire_request(&req, true, None, Some(ANSWER_MAX_TOKENS), None);
         assert_eq!(capped["max_tokens"], 4096);
-        let uncapped = to_wire_request(&req, true, None, None, false);
+        let uncapped = to_wire_request(&req, true, None, None, None);
         assert!(uncapped.get("max_tokens").is_none());
     }
 
@@ -928,14 +1012,51 @@ mod tests {
             messages: vec![LlmMessage::user("q")],
             tools: Vec::new(),
         };
-        // OpenRouter answer turn: the unified reasoning object asks for streamed
-        // reasoning tokens.
-        let on = to_wire_request(&req, true, None, Some(ANSWER_MAX_TOKENS), true);
-        assert_eq!(on["reasoning"]["enabled"], true);
-        // Any turn that doesn't request it (all tool turns, and the whole Local path)
-        // must omit the field entirely — Ollama would ignore or reject it.
-        let off = to_wire_request(&req, true, None, Some(ANSWER_MAX_TOKENS), false);
+        // The unified reasoning object asks for streamed reasoning tokens. Both
+        // providers read it: OpenRouter natively, Ollama by mapping thinking onto
+        // the same field.
+        let on = to_wire_request(
+            &req,
+            true,
+            None,
+            Some(ANSWER_MAX_TOKENS),
+            Some(ReasoningAsk::Enabled),
+        );
+        assert_eq!(on["reasoning"], serde_json::json!({ "enabled": true }));
+        // A turn that asks for none must omit the field entirely, rather than send
+        // `{"enabled": false}` — absent is the only shape every provider agrees on.
+        let off = to_wire_request(&req, true, None, Some(ANSWER_MAX_TOKENS), None);
         assert!(off.get("reasoning").is_none());
+    }
+
+    #[test]
+    fn an_effort_ask_travels_verbatim_and_alone() {
+        let req = LlmRequest {
+            model: "vendor/model".into(),
+            messages: vec![LlmMessage::user("q")],
+            tools: Vec::new(),
+        };
+        // The catalogue carries 21 distinct effort menus, so the string is never
+        // normalised, case-folded, or checked against a compiled-in list. `enabled`
+        // is omitted beside it because OpenRouter infers it from `effort`, and
+        // `max_tokens`/`exclude` never appear: the first is mutually exclusive with
+        // `effort`, the second would suppress the stream we asked for.
+        for effort in [
+            "xhigh",
+            "MEDIUM",
+            "minimal",
+            "none",
+            "a-menu-we-have-never-seen",
+        ] {
+            let wire = to_wire_request(
+                &req,
+                true,
+                None,
+                None,
+                Some(ReasoningAsk::Effort(effort.to_string())),
+            );
+            assert_eq!(wire["reasoning"], serde_json::json!({ "effort": effort }));
+        }
     }
 
     #[test]
@@ -1026,6 +1147,36 @@ mod tests {
             ChatEvent::Answer { delta } => assert_eq!(delta.as_str(), "Hi"),
             _ => panic!("expected an Answer event"),
         }
+    }
+
+    #[test]
+    fn a_comment_line_reaches_the_sink_as_a_keepalive_and_adds_no_answer_text() {
+        // The answer turn is the one with a sink, so it is the one that forwards.
+        // A keepalive must never touch the accumulated answer: the returned string
+        // has to stay byte-equal to the Answer deltas the orchestrator verifies
+        // citations against.
+        let mut sink = VecSink::default();
+        let mut full = AnswerStream::new();
+
+        let stop = consume_sse_line(b": OPENROUTER PROCESSING", &mut sink, &mut full).unwrap();
+
+        assert!(stop.is_none(), "a keepalive never terminates the stream");
+        assert_eq!(full.text(), "");
+        assert_eq!(sink.0, vec![ChatEvent::Keepalive]);
+    }
+
+    #[test]
+    fn the_tool_turn_classifies_a_keepalive_without_emitting_one() {
+        // Both turns agree on what a comment line means; only the answer turn
+        // forwards it. A tool turn that emitted too would double every keepalive.
+        let mut sink = VecSink::default();
+        let mut accumulator = ToolTurnAccumulator::new();
+
+        let stop =
+            consume_tool_sse_line(b": OPENROUTER PROCESSING", &mut accumulator, &mut sink).unwrap();
+
+        assert!(!stop, "a keepalive never terminates the tool turn either");
+        assert!(sink.0.is_empty(), "{:?}", sink.0);
     }
 
     #[test]
@@ -1626,7 +1777,7 @@ mod tests {
         // resolved once — this is the test that says so.
         assert!(matches!(
             parse_tool_sse_line(": OPENROUTER PROCESSING"),
-            ToolSseEvent::Other
+            ToolSseEvent::Keepalive
         ));
         assert!(matches!(parse_tool_sse_line(""), ToolSseEvent::Other));
         assert!(matches!(

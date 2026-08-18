@@ -2445,10 +2445,17 @@ fn happy_path_searches_reads_and_emits_a_verified_citation() {
     let events = run(v.path(), &mock, &Guards::default());
 
     assert!(matches!(events.first(), Some(ChatEvent::Processing)));
-    // One beacon for the accepted run, then one more before each tool-deciding
-    // turn (#126) — never one per row of anything. Counted from the turns the
-    // mock was actually asked for rather than written as a number, so the
-    // bound is on the RATE rather than on this script's length.
+    // `Processing` means "the run was accepted" and says it exactly once. The
+    // per-round beacon is `PlanningRound`, which carries a round number and so
+    // cannot read as a fresh start when it repeats.
+    assert_eq!(
+        count(&events, |event| matches!(event, ChatEvent::Processing)),
+        1
+    );
+    // One round beacon before each tool-deciding turn (#126) — never one per row
+    // of anything. Counted from the turns the mock was actually asked for rather
+    // than written as a number, so the bound is on the RATE rather than on this
+    // script's length.
     //
     // What it does NOT bound is beacons per ATTEMPT. Nothing in this run
     // fails, so one `complete` call is one turn is one round-trip, and a
@@ -2458,17 +2465,37 @@ fn happy_path_searches_reads_and_emits_a_verified_citation() {
     // `a_streamed_tool_turn_that_failed_before_emitting_is_still_retried_once`,
     // which retries once and still admits exactly one.
     assert_eq!(
-        count(&events, |event| matches!(event, ChatEvent::Processing)),
-        1 + mock.completion_requests().len()
+        count(&events, |event| matches!(
+            event,
+            ChatEvent::PlanningRound { .. }
+        )),
+        mock.completion_requests().len()
     );
+    // The rounds count up from 1 and never restart, and no round ever exceeds
+    // the ceiling it was measured against.
+    let rounds: Vec<(u32, u32)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::PlanningRound { round, max_rounds } => Some((*round, *max_rounds)),
+            _ => None,
+        })
+        .collect();
+    for (index, (round, max_rounds)) in rounds.iter().enumerate() {
+        assert_eq!(
+            *round,
+            u32::try_from(index).unwrap() + 1,
+            "rounds are 1-based and strictly increasing: {rounds:?}"
+        );
+        assert!(round <= max_rounds, "round {round} of {max_rounds}");
+    }
     assert!(events
         .iter()
-        .any(|e| matches!(e, ChatEvent::Searching { query } if query == "components")));
+        .any(|e| matches!(e, ChatEvent::Searching { query, .. } if query == "components")));
     assert!(events
         .iter()
         .any(|e| matches!(e, ChatEvent::Retrieved { hit_count, .. } if *hit_count == 1)));
     assert!(events.iter().any(
-        |e| matches!(e, ChatEvent::Reading { rel_path, start_line, end_line }
+        |e| matches!(e, ChatEvent::Reading { rel_path, start_line, end_line, .. }
         if rel_path == "Research/widgets.md" && *start_line == 1 && *end_line == 2)
     ));
     assert!(events.iter().any(|e| matches!(e, ChatEvent::Verifying)));
@@ -2487,7 +2514,7 @@ fn happy_path_searches_reads_and_emits_a_verified_citation() {
     // Event ordering: search cue precedes retrieval; verify precedes citation.
     let pos = |pred: fn(&ChatEvent) -> bool| events.iter().position(pred).unwrap();
     assert!(
-        pos(|e| matches!(e, ChatEvent::Processing))
+        pos(|e| matches!(e, ChatEvent::PlanningRound { .. }))
             < pos(|e| matches!(e, ChatEvent::Searching { .. }))
     );
     assert!(
@@ -3001,7 +3028,7 @@ fn folder_scoped_search_flows_through_the_loop() {
     let events = run(v.path(), &mock, &Guards::default());
     assert!(events
         .iter()
-        .any(|e| matches!(e, ChatEvent::Searching { query } if query == "components")));
+        .any(|e| matches!(e, ChatEvent::Searching { query, .. } if query == "components")));
     assert!(events.iter().any(|e| matches!(
         e,
         ChatEvent::Citation { rel_path, .. } if rel_path == "Research/widgets.md"
@@ -3841,16 +3868,16 @@ fn a_streamed_tool_turn_that_failed_before_emitting_is_still_retried_once() {
 
     assert!(result.is_err(), "both attempts failed");
     assert_eq!(llm.attempts(), 2, "retried exactly once");
-    // This used to read `sink.events.is_empty()`. The turn now opens by saying
-    // the run is working (#126), and that beacon must NOT be mistaken for
-    // something a replay could rewind — if it were counted as an emission, the
-    // retry above would silently stop happening. So the claim is stated
-    // precisely instead of loosened: the provider published nothing across BOTH
-    // attempts, and the beacon went out once for the call rather than per try.
-    assert_eq!(
-        sink.events,
-        vec![ChatEvent::Processing],
-        "only the beacon, and only one of it"
+    // The round beacon (`PlanningRound`) is emitted by `collect_evidence` BEFORE
+    // this call, so it is outside the retry guard by construction rather than by
+    // statement order — the turn itself publishes nothing at all. That pairing is
+    // what keeps the retry alive: put any emission back inside the loop and
+    // `sink.emitted` latches, the retry above silently stops happening, and the
+    // `attempts == 2` assertion goes red.
+    assert!(
+        sink.events.is_empty(),
+        "the turn published nothing across BOTH attempts, got {:?}",
+        sink.events
     );
 }
 
@@ -3948,12 +3975,15 @@ fn an_answered_question_is_followed_by_a_beacon_rather_than_silence() {
                 if id == "prompt" && *status == ToolStatus::Ok)
         })
         .expect("the answered question settles");
-    assert_eq!(
-        events.get(settled + 1),
-        Some(&ChatEvent::Processing),
+    assert!(
+        matches!(
+            events.get(settled + 1),
+            Some(ChatEvent::PlanningRound { round: 2, .. })
+        ),
         "a full provider round-trip starts here, and nothing else can be \
          emitted during it — so without a beacon the pane keeps showing \
-         whichever phase word it last had. Got: {:?}",
+         whichever phase word it last had. It names its round, so the second \
+         one cannot read as the run starting over. Got: {:?}",
         &events[settled..],
     );
     assert!(
@@ -4030,7 +4060,7 @@ impl LlmClient for UnstreamableToolLlm {
 }
 
 #[test]
-fn a_turn_the_provider_reruns_buffered_still_gets_one_beacon_before_both_round_trips() {
+fn a_turn_the_provider_reruns_buffered_publishes_nothing_between_its_round_trips() {
     let env = retry_env();
     let services = SkillServices::new(
         &env.skills,
@@ -4057,10 +4087,10 @@ fn a_turn_the_provider_reruns_buffered_still_gets_one_beacon_before_both_round_t
         2,
         "the worse case the issue names: this turn really did run twice"
     );
-    assert_eq!(
-        sink.events,
-        vec![ChatEvent::Processing],
-        "the beacon precedes the pair, so ONE covers both — and the two \
-         round-trips publish nothing else between them"
+    assert!(
+        sink.events.is_empty(),
+        "the caller's single `PlanningRound` covers both round-trips precisely \
+         because the pair publishes nothing of its own, got {:?}",
+        sink.events
     );
 }

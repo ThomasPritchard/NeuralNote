@@ -160,6 +160,21 @@ export function reduceAssistant(
   switch (event.type) {
     case "processing":
       return { ...turn, phase: "thinking" };
+    case "planningRound":
+      // The backend split one repeated `processing` into an accepted-the-run
+      // beacon and a per-round one. Both still mean the same thing to the head
+      // today, so this deliberately reproduces what the per-round `processing`
+      // did — the round numbers it now carries are read by a later phase, and
+      // reading them here would change what the user sees.
+      return { ...turn, phase: "thinking" };
+    case "keepalive":
+    case "toolProgress":
+      // Wire plumbing only. `keepalive` says the socket is alive rather than
+      // that progress happened, and nothing emits `toolProgress` yet; folding
+      // either into state now would move the UI ahead of the contract. Never
+      // collapse these into a `default:` arm — the exhaustive switch is what
+      // makes a new backend event a compile error here.
+      return turn;
     case "skillActivated":
       return {
         ...turn,
