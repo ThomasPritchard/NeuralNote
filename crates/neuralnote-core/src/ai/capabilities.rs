@@ -498,7 +498,7 @@ pub fn effective_reasoning(opt_in: bool, support: ReasoningSupport) -> bool {
 ///
 /// `effort` must already be one the model's **current** menu offers — nothing
 /// here checks it, and a `Supported` verdict sends whatever is named verbatim.
-/// [`sendable_effort`] is what reconciles a stored preference against a menu
+/// [`resolve_effort`] is what reconciles a stored preference against a menu
 /// that moved underneath it (amendment E3), so callers resolving an ask from
 /// persisted config go through it first.
 pub fn effective_reasoning_ask(
@@ -524,10 +524,11 @@ pub fn effective_reasoning_ask(
 /// This is the whole decision, in one place, deliberately. The two halves it
 /// composes read different facts that arrive at different times — the verdict is
 /// persisted, the menu cache is not — and resolving an ask without consulting
-/// the menu is exactly the bug amendment E3 rules out. [`sendable_effort`] is
-/// therefore private and reachable only from here, after the opt-in gate: a
-/// preference the user switched off is not overridden by anything, so a turn
-/// that sends no `reasoning` object at all must not report one.
+/// the menu is exactly the bug amendment E3 rules out. [`resolve_effort`] is
+/// therefore private and reachable only from here and from
+/// [`reasoning_effort_override`], both after the opt-in gate: a preference the
+/// user switched off is not overridden by anything, so a turn that sends no
+/// `reasoning` object at all must neither report nor log one.
 pub fn reasoning_ask(
     preference: &ReasoningPreference,
     support: ReasoningSupport,
@@ -536,22 +537,143 @@ pub fn reasoning_ask(
     if !effective_reasoning(preference.enabled, support) {
         return None;
     }
-    effective_reasoning_ask(
-        preference.enabled,
-        sendable_effort(control, preference.effort.as_deref()),
-        support,
-    )
+    let resolved = resolve_effort(control, preference.effort.as_deref());
+    resolved.warn_if_overridden();
+    effective_reasoning_ask(preference.enabled, resolved.sending(), support)
 }
 
-/// The stored effort this turn may actually send, reconciled against the menu
-/// the catalogue offers *right now* (amendment E3).
+/// The substitution the send path is applying to the stored effort right now, or
+/// `None` when what the user chose is what goes out.
+///
+/// The same three facts, the same gate and the same resolution as
+/// [`reasoning_ask`] — this is that decision *reported* rather than acted on, so
+/// the status and the request are one rule read twice rather than two rules that
+/// happen to agree today. What can still move between a status read and a turn
+/// is the menu itself, and the next read reports that.
+///
+/// It exists because amendment E3's fallback is otherwise invisible to the
+/// person paying for it: a stored `xhigh` against a menu that shrank to
+/// `["high", "low"]` leaves Settings rendering a blank effort dropdown while
+/// every turn quietly sends `high`, and the only witness is a log line no
+/// desktop user opens. What is rendered from this is a UI decision; that the
+/// truth is available to render is this function's job.
+///
+/// Deliberately silent, unlike its sibling: this is a status read the UI polls,
+/// and a warning per poll is how the real one at the send path becomes
+/// ignorable.
+pub fn reasoning_effort_override(
+    preference: &ReasoningPreference,
+    support: ReasoningSupport,
+    control: &ReasoningControl,
+) -> Option<ReasoningEffortOverride> {
+    if !effective_reasoning(preference.enabled, support) {
+        return None;
+    }
+    resolve_effort(control, preference.effort.as_deref()).reported()
+}
+
+/// A stored reasoning effort this model's current menu will not accept, and the
+/// value going out in its place (amendment E3).
+///
+/// Both halves travel together because the sentence a reader needs is one
+/// sentence — "you chose X; this model no longer offers it, so turns are asking
+/// for Y" — and a consumer diffing two separate fields to work that out would be
+/// re-deriving a decision the core already made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct ReasoningEffortOverride {
+    /// The effort the user picked, still persisted and still theirs. It comes
+    /// back on its own if the menu does.
+    pub stored: String,
+    /// The effort actually being sent instead. Null for "name no effort and take
+    /// the provider's own default", which is what null means on the stored
+    /// preference beside it too.
+    pub sending: Option<String>,
+}
+
+/// What the send path does with a stored effort, decided once so that the
+/// request, the log line and the status read cannot drift apart.
+enum ResolvedEffort<'a> {
+    /// Send exactly what is stored — including nothing, when nothing was chosen.
+    AsStored(Option<&'a str>),
+    /// The stored effort is not one this control offers, so `sending` goes in
+    /// its place (`None` meaning no effort at all).
+    Overridden {
+        stored: &'a str,
+        sending: Option<&'a str>,
+        cause: OverrideCause,
+    },
+}
+
+/// Why a stored effort could not be sent. The two read differently to whoever
+/// finds the log line — one sends them to the model's menu, the other to a model
+/// that no longer has one — so they are not collapsed into a single message.
+enum OverrideCause {
+    /// The model still publishes a menu; this effort is no longer on it.
+    DroppedFromMenu,
+    /// The model publishes no effort menu at all any more.
+    NoMenuAtAll,
+}
+
+impl<'a> ResolvedEffort<'a> {
+    /// The effort this turn names, if any. `None` is sent by
+    /// [`effective_reasoning_ask`] as plain [`ReasoningAsk::Enabled`].
+    fn sending(&self) -> Option<&'a str> {
+        match self {
+            Self::AsStored(effort) => *effort,
+            Self::Overridden { sending, .. } => *sending,
+        }
+    }
+
+    /// The override as something a caller outside this module can hold on to.
+    fn reported(self) -> Option<ReasoningEffortOverride> {
+        match self {
+            Self::AsStored(_) => None,
+            Self::Overridden {
+                stored, sending, ..
+            } => Some(ReasoningEffortOverride {
+                stored: stored.to_string(),
+                sending: sending.map(str::to_string),
+            }),
+        }
+    }
+
+    /// **Tolerated, not silent**, same shape as [`lenient_reasoning`] above: a
+    /// billed preference being overridden is exactly the quiet degradation this
+    /// project forbids, so the send path says so where it decides it.
+    fn warn_if_overridden(&self) {
+        let Self::Overridden {
+            stored,
+            sending,
+            cause,
+        } = self
+        else {
+            return;
+        };
+        match cause {
+            OverrideCause::DroppedFromMenu => log::warn!(
+                "capabilities: this model's menu no longer offers the stored reasoning effort \
+                 {stored:?}; asking for {} instead",
+                sending.unwrap_or("the provider's own default")
+            ),
+            OverrideCause::NoMenuAtAll => log::warn!(
+                "capabilities: this model publishes no effort menu any more, so the stored \
+                 reasoning effort {stored:?} cannot be sent; asking for the provider's own \
+                 default instead"
+            ),
+        }
+    }
+}
+
+/// Reconcile the stored effort against the menu the catalogue offers *right now*
+/// (amendment E3).
 ///
 /// A model can keep its id while its published `supported_efforts` shrinks,
 /// leaving a stored effort the provider would reject outright — failing a whole
 /// run over a preference. So an effort survives only while the current control
-/// still lists it. Otherwise it falls back to the menu's own `default_effort`,
-/// and to `None` — which [`effective_reasoning_ask`] sends as plain
-/// `ReasoningAsk::Enabled` — when the model publishes no default.
+/// still offers it. Otherwise it falls back to the menu's own `default_effort`,
+/// and to `None` when the model publishes no default.
 ///
 /// Nothing is invented and §4.2 still holds: [`reasoning_control`] has already
 /// filtered `default_effort` down to a value the menu carries, so every effort
@@ -563,39 +685,36 @@ pub fn reasoning_ask(
 /// probed menu would silently ignore the user's setting for every turn of the
 /// cold-launch probe window.
 ///
-/// The remaining three controls are menu-less rather than shrunken, and they say
-/// so in their own words: pointing whoever reads the log at a menu that never
-/// existed would send them looking for the wrong thing. They are named one by
-/// one rather than caught by a `_`, so the day a control variant is added — a
-/// `max_tokens` budget is already parsed and documented as the other half of
-/// this knob — this function fails to compile instead of silently absorbing it.
-///
-/// **Tolerated, not silent**, same shape as [`lenient_reasoning`] above: a
-/// billed preference being overridden is exactly the quiet degradation this
-/// project forbids, so the override is logged where it is decided.
-fn sendable_effort<'a>(control: &'a ReasoningControl, stored: Option<&'a str>) -> Option<&'a str> {
-    let stored = stored?;
+/// The remaining three controls are menu-less rather than shrunken, and they are
+/// named one by one rather than caught by a `_`, so the day a control variant is
+/// added — a `max_tokens` budget is already parsed and documented as the other
+/// half of this knob — this function fails to compile instead of silently
+/// absorbing it.
+fn resolve_effort<'a>(
+    control: &'a ReasoningControl,
+    stored: Option<&'a str>,
+) -> ResolvedEffort<'a> {
+    let Some(stored) = stored else {
+        return ResolvedEffort::AsStored(None);
+    };
     match control {
-        ReasoningControl::Pending => Some(stored),
+        ReasoningControl::Pending => ResolvedEffort::AsStored(Some(stored)),
         ReasoningControl::Efforts { default_effort, .. } => {
             if control.offers(stored) {
-                return Some(stored);
+                return ResolvedEffort::AsStored(Some(stored));
             }
-            let fallback = default_effort.as_deref();
-            log::warn!(
-                "capabilities: this model's menu no longer offers the stored reasoning effort \
-                 {stored:?}; asking for {} instead",
-                fallback.unwrap_or("the provider's own default")
-            );
-            fallback
+            ResolvedEffort::Overridden {
+                stored,
+                sending: default_effort.as_deref(),
+                cause: OverrideCause::DroppedFromMenu,
+            }
         }
         ReasoningControl::Toggle { .. } | ReasoningControl::Locked | ReasoningControl::Hidden => {
-            log::warn!(
-                "capabilities: this model publishes no effort menu any more, so the stored \
-                 reasoning effort {stored:?} cannot be sent; asking for the provider's own \
-                 default instead"
-            );
-            None
+            ResolvedEffort::Overridden {
+                stored,
+                sending: None,
+                cause: OverrideCause::NoMenuAtAll,
+            }
         }
     }
 }
@@ -1331,7 +1450,7 @@ mod tests {
     #[test]
     fn an_effort_the_current_menu_still_offers_survives_untouched() {
         assert_eq!(
-            sendable_effort(&menu(&["high", "low"], Some("high")), Some("low")),
+            resolve_effort(&menu(&["high", "low"], Some("high")), Some("low")).sending(),
             Some("low")
         );
     }
@@ -1343,11 +1462,14 @@ mod tests {
         // a preference. Fall back to the default the menu itself publishes.
         let control = menu(&["high", "low"], Some("high"));
 
-        assert_eq!(sendable_effort(&control, Some("xhigh")), Some("high"));
+        assert_eq!(
+            resolve_effort(&control, Some("xhigh")).sending(),
+            Some("high")
+        );
         assert_eq!(
             effective_reasoning_ask(
                 true,
-                sendable_effort(&control, Some("xhigh")),
+                resolve_effort(&control, Some("xhigh")).sending(),
                 ReasoningSupport::Supported
             ),
             Some(ReasoningAsk::Effort("high".into()))
@@ -1360,11 +1482,11 @@ mod tests {
         // effort at all and take the provider's own, rather than guessing one.
         let control = menu(&["high", "low"], None);
 
-        assert_eq!(sendable_effort(&control, Some("xhigh")), None);
+        assert_eq!(resolve_effort(&control, Some("xhigh")).sending(), None);
         assert_eq!(
             effective_reasoning_ask(
                 true,
-                sendable_effort(&control, Some("xhigh")),
+                resolve_effort(&control, Some("xhigh")).sending(),
                 ReasoningSupport::Supported
             ),
             Some(ReasoningAsk::Enabled)
@@ -1378,7 +1500,7 @@ mod tests {
         // already means, and preselecting one here would start naming a value on
         // the wire that the user never picked.
         assert_eq!(
-            sendable_effort(&menu(&["high", "low"], Some("high")), None),
+            resolve_effort(&menu(&["high", "low"], Some("high")), None).sending(),
             None
         );
     }
@@ -1393,7 +1515,7 @@ mod tests {
             ReasoningControl::Hidden,
         ] {
             assert_eq!(
-                sendable_effort(&control, Some("xhigh")),
+                resolve_effort(&control, Some("xhigh")).sending(),
                 None,
                 "{control:?} offers no effort menu"
             );
@@ -1425,12 +1547,21 @@ mod tests {
         // The other half of the E3 ruling. Without this the warning could be
         // deleted and the suite would stay green, leaving a billed preference
         // overridden with nothing anywhere saying why.
+        //
+        // Asked of `reasoning_ask` rather than of the resolution beneath it,
+        // because the send path is where the line has to appear: the sibling
+        // status read shares that resolution and must stay silent, so a check
+        // aimed at the shared helper would no longer be able to tell them apart.
         let mark = warning_capture::capture();
         let control = menu(&["high", "low"], Some("high"));
 
         assert_eq!(
-            sendable_effort(&control, Some("e3-dropped-effort")),
-            Some("high")
+            reasoning_ask(
+                &preference(Some("e3-dropped-effort")),
+                ReasoningSupport::Supported,
+                &control,
+            ),
+            Some(ReasoningAsk::Effort("high".into()))
         );
 
         assert!(
@@ -1493,9 +1624,216 @@ mod tests {
         // model's probed menu, so discarding it here would silently ignore the
         // user's setting for every turn of the cold-launch probe window.
         assert_eq!(
-            sendable_effort(&ReasoningControl::Pending, Some("xhigh")),
+            resolve_effort(&ReasoningControl::Pending, Some("xhigh")).sending(),
             Some("xhigh")
         );
+    }
+
+    /* ───────  Reporting the override to whoever is paying for it  ─────── */
+
+    #[test]
+    fn a_dropped_effort_is_reported_as_both_halves_of_the_substitution() {
+        // A log line is not a surface a desktop user opens. The pair — what they
+        // chose, what is actually going out — is what makes the sentence the UI
+        // renders an honest one, so both halves travel together rather than the
+        // UI diffing two fields and inferring the rest.
+        assert_eq!(
+            reasoning_effort_override(
+                &preference(Some("xhigh")),
+                ReasoningSupport::Supported,
+                &menu(&["high", "low"], Some("high")),
+            ),
+            Some(ReasoningEffortOverride {
+                stored: "xhigh".into(),
+                sending: Some("high".into()),
+            })
+        );
+    }
+
+    #[test]
+    fn an_override_with_no_published_default_reports_the_providers_own() {
+        // `sending: None` reads exactly as the stored preference's own `None`
+        // does: name no effort and take whatever the provider uses.
+        assert_eq!(
+            reasoning_effort_override(
+                &preference(Some("xhigh")),
+                ReasoningSupport::Supported,
+                &menu(&["high", "low"], None),
+            ),
+            Some(ReasoningEffortOverride {
+                stored: "xhigh".into(),
+                sending: None,
+            })
+        );
+        assert_eq!(
+            reasoning_effort_override(
+                &preference(Some("xhigh")),
+                ReasoningSupport::Supported,
+                &ReasoningControl::Toggle { default_on: true },
+            ),
+            Some(ReasoningEffortOverride {
+                stored: "xhigh".into(),
+                sending: None,
+            }),
+            "a model that dropped its menu entirely overrides the stored effort too"
+        );
+    }
+
+    #[test]
+    fn nothing_is_reported_while_the_stored_effort_is_the_one_being_sent() {
+        // Reporting an override on a turn that is honouring the preference would
+        // make the surface cry wolf exactly as the log line would.
+        for (label, preference, support, control) in [
+            (
+                "the menu still offers it",
+                preference(Some("low")),
+                ReasoningSupport::Supported,
+                menu(&["high", "low"], Some("high")),
+            ),
+            (
+                "no effort was ever chosen",
+                preference(None),
+                ReasoningSupport::Supported,
+                menu(&["high", "low"], Some("high")),
+            ),
+            (
+                "the catalogue has not answered (amendment E2)",
+                preference(Some("xhigh")),
+                ReasoningSupport::Supported,
+                ReasoningControl::Pending,
+            ),
+            (
+                "reasoning is switched off",
+                ReasoningPreference {
+                    enabled: false,
+                    effort: Some("xhigh".into()),
+                },
+                ReasoningSupport::Supported,
+                menu(&["high", "low"], Some("high")),
+            ),
+            (
+                "the model cannot reason at all",
+                preference(Some("xhigh")),
+                ReasoningSupport::Unsupported,
+                ReasoningControl::Hidden,
+            ),
+        ] {
+            assert_eq!(
+                reasoning_effort_override(&preference, support, &control),
+                None,
+                "{label}: nothing is being overridden"
+            );
+        }
+    }
+
+    #[test]
+    fn reporting_the_substitution_does_not_also_log_it() {
+        // The status read is polled. If it warned on every poll it would bury the
+        // one line the send path emits per run, which is the same cry-wolf
+        // failure `a_turn_that_sends_no_reasoning_object_reports_no_override`
+        // exists to prevent — reached from the other side.
+        let mark = warning_capture::capture();
+
+        assert!(reasoning_effort_override(
+            &preference(Some("e3-polled-effort")),
+            ReasoningSupport::Supported,
+            &menu(&["high", "low"], Some("high")),
+        )
+        .is_some());
+
+        assert!(
+            !warning_capture::recorded(mark, "e3-polled-effort"),
+            "a status read must not log: {:?}",
+            warning_capture::since(mark)
+        );
+    }
+
+    #[test]
+    fn an_unanswered_verdict_is_not_reported_as_the_menu_substituting_anything() {
+        // With the verdict still `Unknown` the effort fails closed (§4.2), so the
+        // turn sends plain `Enabled` and the stored `xhigh` is not on the wire —
+        // and yet nothing has substituted for the user's choice. The probe has
+        // not answered, the control renders `Pending`, the stored value is
+        // untouched, and it goes out the moment the menu confirms it (amendment
+        // E2). Reporting a substitution here would fire on every cold launch,
+        // which is precisely how the real one becomes ignorable.
+        assert_eq!(
+            reasoning_effort_override(
+                &preference(Some("xhigh")),
+                ReasoningSupport::Unknown,
+                &ReasoningControl::Pending,
+            ),
+            None
+        );
+        assert_eq!(
+            reasoning_ask(
+                &preference(Some("xhigh")),
+                ReasoningSupport::Unknown,
+                &ReasoningControl::Pending,
+            ),
+            Some(ReasoningAsk::Enabled)
+        );
+    }
+
+    #[test]
+    fn what_is_reported_is_what_the_turn_actually_sends() {
+        // The whole point of the field: a status read that disagreed with the
+        // wire would be a more convincing lie than the silence it replaces. Both
+        // answers come off one resolution, and this is the check that says so.
+        for (preference, support, control) in [
+            (
+                preference(Some("xhigh")),
+                ReasoningSupport::Supported,
+                menu(&["high", "low"], Some("high")),
+            ),
+            (
+                preference(Some("xhigh")),
+                ReasoningSupport::Supported,
+                menu(&["high", "low"], None),
+            ),
+            (
+                preference(Some("low")),
+                ReasoningSupport::Supported,
+                menu(&["high", "low"], Some("high")),
+            ),
+            (
+                preference(Some("xhigh")),
+                ReasoningSupport::Supported,
+                ReasoningControl::Locked,
+            ),
+            (
+                preference(Some("xhigh")),
+                ReasoningSupport::Unknown,
+                ReasoningControl::Pending,
+            ),
+        ] {
+            let ask = reasoning_ask(&preference, support, &control);
+            let expected = match (
+                reasoning_effort_override(&preference, support, &control),
+                support,
+            ) {
+                // A reported substitution names what goes out in its place. This
+                // is the load-bearing half: a status saying `high` while the wire
+                // carries something else is worse than the silence it replaced.
+                (Some(reported), _) => reported.sending,
+                // Nothing reported and a probed menu behind it: the stored
+                // preference goes out verbatim.
+                (None, ReasoningSupport::Supported) => preference.effort.clone(),
+                // Nothing reported and no answered verdict: the effort fails
+                // closed (§4.2) without the menu substituting anything — see
+                // `an_unanswered_verdict_is_not_reported_as_the_menu_substituting_anything`.
+                (None, _) => None,
+            };
+            let sent = match ask {
+                Some(ReasoningAsk::Effort(effort)) => Some(effort),
+                Some(ReasoningAsk::Enabled) => None,
+                None => None,
+            };
+            assert_eq!(
+                sent, expected,
+                "{control:?} with {preference:?} must report the effort it sends"
+            );
+        }
     }
 
     #[test]

@@ -80,6 +80,7 @@ export type { OpenRouterStatus } from "./bindings/OpenRouterStatus";
 export type { OpenRouterModelChoice } from "./bindings/OpenRouterModelChoice";
 export type { OpenRouterModelMenu } from "./bindings/OpenRouterModelMenu";
 export type { ReasoningControl } from "./bindings/ReasoningControl";
+export type { ReasoningEffortOverride } from "./bindings/ReasoningEffortOverride";
 export type { ReasoningSupport } from "./bindings/ReasoningSupport";
 export type { LocalStatus } from "./bindings/LocalStatus";
 export type { HardwareSpec } from "./bindings/HardwareSpec";

@@ -51,8 +51,8 @@ pub use capabilities::{
     effective_reasoning, effective_reasoning_ask, ollama_reasoning_support,
     openrouter_reasoning_support, parse_ollama_capabilities, parse_openrouter_context_windows,
     parse_openrouter_input_pricing, parse_openrouter_models, parse_openrouter_reasoning_controls,
-    reasoning_ask, supports_reasoning, supports_thinking, ModelCapabilities, ReasoningControl,
-    ReasoningSupport,
+    reasoning_ask, reasoning_effort_override, supports_reasoning, supports_thinking,
+    ModelCapabilities, ReasoningControl, ReasoningEffortOverride, ReasoningSupport,
 };
 pub use elicitation::{elicit_user, ElicitationOutcome};
 pub use events::{ChatEvent, ElicitOption, Elicitation, EventSink, TokenUsage, ToolStatus};

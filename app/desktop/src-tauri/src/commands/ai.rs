@@ -220,8 +220,31 @@ pub(crate) struct OpenRouterStatus {
     /// It is the STORED value, which since amendment E3 is not always the one on
     /// the wire: a menu that shrinks under a model leaves the preference intact
     /// and substitutes for the request alone (`reasoning_ask`). This field is
-    /// what the user chose, not what the last turn sent.
+    /// what the user chose, not what the last turn sent — `reasoning_effort_override`
+    /// beside it is where the two part company.
     reasoning_effort: Option<String>,
+    /// Present only while this model's current menu will not accept the stored
+    /// effort, and then carrying both halves: what the user chose, and what turns
+    /// are asking for instead (amendment E3).
+    ///
+    /// It exists because without it the substitution is invisible to the person
+    /// paying for it. A stored `xhigh` against a menu that shrank to
+    /// `["high", "low"]` renders the effort control blank — the value is not on
+    /// the list it draws from — while every turn quietly bills for `high`, and
+    /// the only witness is a log line no desktop user opens.
+    ///
+    /// Resolved by the same core call the send path uses, against the same
+    /// control this status hands the UI — one rule read twice, not two rules that
+    /// happen to agree. (What can still move between a poll and a turn is the
+    /// menu itself; the next poll reports that.) Absent is the ordinary case,
+    /// which is why it is an optional key rather than a null: nothing is being
+    /// substituted, and `reasoning_effort` above is the whole truth.
+    ///
+    /// Rendering it is a UI decision and deliberately not made here. What is
+    /// settled here is that the truth is available to render.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[ts(optional)]
+    reasoning_effort_override: Option<neuralnote_core::ai::ReasoningEffortOverride>,
 }
 
 #[derive(serde::Serialize, TS)]
@@ -425,6 +448,15 @@ fn openrouter_reasoning_ask(
 fn build_ai_status(cfg: neuralnote_core::ai::ProviderConfig, key_present: bool) -> AiStatus {
     let reasoning_supported = cfg.cached_reasoning_support(key_present);
     let reasoning_control = selected_reasoning_control(&cfg, key_present);
+    // Read off the same three facts, and the same control, that
+    // `openrouter_reasoning_ask` resolves the request from — so what this status
+    // says about the substitution and what the next turn actually sends are one
+    // decision reported twice, never two decisions that agree today.
+    let reasoning_effort_override = neuralnote_core::ai::reasoning_effort_override(
+        &cfg.reasoning_preference,
+        reasoning_supported,
+        &reasoning_control,
+    );
     let approval_policy = cfg.approval_policy(key_present);
     let effective_modes: std::collections::BTreeMap<String, _> =
         neuralnote_core::ai::approval::ALL_GATED_TOOLS
@@ -440,6 +472,7 @@ fn build_ai_status(cfg: neuralnote_core::ai::ProviderConfig, key_present: bool) 
             model: cfg.model,
             reasoning: cfg.reasoning_preference.enabled,
             reasoning_effort: cfg.reasoning_preference.effort,
+            reasoning_effort_override,
         },
         local: LocalStatus {
             active_model_tag: cfg.local_model_tag,
@@ -3528,6 +3561,106 @@ mod tests {
             openrouter_reasoning_ask(&openrouter_config_with_effort(model, "xhigh"), true),
             Some(neuralnote_core::ai::openai::ReasoningAsk::Enabled)
         );
+    }
+
+    #[test]
+    fn the_status_reports_the_substitution_the_send_path_is_making() {
+        // The E3 fallback used to be invisible to the person paying for it: the
+        // effort dropdown renders blank against a stored value the menu no longer
+        // lists, while every turn quietly asks for something else, and the only
+        // witness is a log line no desktop user opens. The status now carries
+        // both halves, and carries them from the same resolution the wire uses.
+        let model = "test/status-shrunken-menu";
+        warm_catalogue_menu(
+            model,
+            serde_json::json!({ "supported_efforts": ["high", "low"], "default_effort": "high" }),
+        );
+        let cfg = openrouter_config_with_effort(model, "xhigh");
+
+        let status = build_ai_status(cfg.clone(), true);
+
+        assert_eq!(
+            status.openrouter.reasoning_effort.as_deref(),
+            Some("xhigh"),
+            "the stored preference is theirs and is left alone"
+        );
+        assert_eq!(
+            status.openrouter.reasoning_effort_override,
+            Some(neuralnote_core::ai::ReasoningEffortOverride {
+                stored: "xhigh".into(),
+                sending: Some("high".into()),
+            }),
+            "and the status says what is going out in its place"
+        );
+        // Checked against the wire rather than against a second literal: two
+        // literals agree because they were typed to, while this fails the moment
+        // the status stops reading the resolution the request is built from.
+        assert_eq!(
+            openrouter_reasoning_ask(&cfg, true),
+            Some(neuralnote_core::ai::openai::ReasoningAsk::Effort(
+                "high".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn the_substitution_crosses_the_ipc_boundary_as_an_optional_camel_case_key() {
+        // The generated binding types this as `reasoningEffortOverride?:`, with no
+        // null in it, so the wire must genuinely omit the key when there is
+        // nothing to report. A serialized `null` would typecheck nowhere and
+        // would make the generated type a lie about its own payload.
+        let model = "test/status-wire-shape";
+        warm_catalogue_menu(
+            model,
+            serde_json::json!({ "supported_efforts": ["high", "low"], "default_effort": "high" }),
+        );
+
+        let overridden = serde_json::to_value(
+            build_ai_status(openrouter_config_with_effort(model, "xhigh"), true).openrouter,
+        )
+        .unwrap();
+        let honoured = serde_json::to_value(
+            build_ai_status(openrouter_config_with_effort(model, "low"), true).openrouter,
+        )
+        .unwrap();
+
+        assert_eq!(
+            overridden.get("reasoningEffortOverride"),
+            Some(&serde_json::json!({ "stored": "xhigh", "sending": "high" })),
+        );
+        assert!(
+            honoured.get("reasoningEffortOverride").is_none(),
+            "nothing to report must omit the key, not send null: {honoured}"
+        );
+    }
+
+    #[test]
+    fn the_status_reports_no_substitution_while_the_menu_still_offers_the_choice() {
+        let model = "test/status-menu-unchanged";
+        warm_catalogue_menu(
+            model,
+            serde_json::json!({ "supported_efforts": ["high", "low"], "default_effort": "high" }),
+        );
+
+        let status = build_ai_status(openrouter_config_with_effort(model, "low"), true);
+
+        assert_eq!(status.openrouter.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(status.openrouter.reasoning_effort_override, None);
+    }
+
+    #[test]
+    fn a_cold_catalogue_reports_no_substitution() {
+        // Amendment E2 again, from the status side: for the ~8s probe window the
+        // control reads `Pending` and the stored effort still goes out untouched.
+        // A substitution banner on every cold launch is how the real one would
+        // become something users learn to ignore.
+        let status = build_ai_status(
+            openrouter_config_with_effort("test/status-cold-catalogue", "xhigh"),
+            true,
+        );
+
+        assert_eq!(status.reasoning_control, ReasoningControl::Pending);
+        assert_eq!(status.openrouter.reasoning_effort_override, None);
     }
 
     #[test]
