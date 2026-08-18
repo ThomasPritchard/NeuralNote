@@ -20,7 +20,6 @@ import type {
   ReasoningBoundary,
   ToolApprovalView,
   ToolCallView,
-  ToolSearchView,
 } from "./chatMessage";
 
 /** Fold a `retrieved` event into the matching `searching` row (→ "searching X →
@@ -108,27 +107,6 @@ function withLiveCall(
     }
   }
   return calls;
-}
-
-/** Fold a `retrieved` count into the query it answers, on one call's own list.
- *
- *  Mirrors `withHitCount` over the node instead of the activity trace: the
- *  newest still-unreported entry for that query takes the count, and a count
- *  whose query is missing is appended rather than dropped. */
-function withCallHitCount(
-  searches: ToolSearchView[],
-  query: string,
-  hitCount: number,
-): ToolSearchView[] {
-  for (let i = searches.length - 1; i >= 0; i--) {
-    const search = searches[i];
-    if (search.query === query && search.hitCount === null) {
-      const next = searches.slice();
-      next[i] = { ...search, hitCount };
-      return next;
-    }
-  }
-  return [...searches, { query, hitCount }];
 }
 
 /** Fold a live note preview into the edit that owns its id, or start one.
@@ -495,27 +473,20 @@ function foldEvent(turn: AssistantMessage, event: ChatEvent): AssistantMessage {
         approvalDegraded: turn.approvalDegraded ?? event.reason,
       };
     case "searching":
-      // Two destinations, one ledger: `activity` stays the trace the settled
-      // summary counts, and the node gains a VIEW of the query it ran. The
-      // summary is not recomputed from the nodes — two independently-computed
-      // provenance lines in one turn eventually disagree.
+      // One ledger, not two. A retrieval cue drives `activity` and nothing else:
+      // the query is already the tool node's argument hint and the hit count is
+      // already its Rust-composed summary, so a per-call copy would put one act
+      // on one node twice — and two independently-maintained provenance lines in
+      // one turn eventually disagree.
       return {
         ...turn,
         phase: "searching",
         activity: [...turn.activity, { kind: "search", query: event.query }],
-        toolCalls: withLiveCall(turn.toolCalls, event.callId, (call) => ({
-          ...call,
-          searches: [...(call.searches ?? []), { query: event.query, hitCount: null }],
-        })),
       };
     case "retrieved":
       return {
         ...turn,
         activity: withHitCount(turn.activity, event.query, event.hitCount),
-        toolCalls: withLiveCall(turn.toolCalls, event.callId, (call) => ({
-          ...call,
-          searches: withCallHitCount(call.searches ?? [], event.query, event.hitCount),
-        })),
       };
     case "reading":
       return {
@@ -525,13 +496,6 @@ function foldEvent(turn: AssistantMessage, event: ChatEvent): AssistantMessage {
           ...turn.activity,
           { kind: "reading", relPath: event.relPath, startLine: event.startLine, endLine: event.endLine },
         ],
-        toolCalls: withLiveCall(turn.toolCalls, event.callId, (call) => ({
-          ...call,
-          reads: [
-            ...(call.reads ?? []),
-            { relPath: event.relPath, startLine: event.startLine, endLine: event.endLine },
-          ],
-        })),
       };
     case "verifying":
       return {

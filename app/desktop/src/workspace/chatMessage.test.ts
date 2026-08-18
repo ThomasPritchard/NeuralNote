@@ -284,8 +284,8 @@ describe("reduceAssistant — grounded progress", () => {
   it("renders a cue with no call behind it exactly as it always did", () => {
     // The degradation guarantee, checked rather than stated: `callId` is
     // optional because at least one retrieval path has no dispatched call to
-    // name, and a cue arriving without one must attach to nothing and leave the
-    // trace it has always driven untouched.
+    // name, and a cue arriving without one must leave the trace it has always
+    // driven untouched.
     const uncorrelated = run([
       { type: "toolCall", id: "call-7", name: "search_notes", title: "Search notes",
         arguments: "{}", stepId: null, },
@@ -294,8 +294,6 @@ describe("reduceAssistant — grounded progress", () => {
       { type: "reading", relPath: "n.md", startLine: 1, endLine: 2, callId: null },
     ]);
 
-    expect(uncorrelated.toolCalls[0].searches).toBeUndefined();
-    expect(uncorrelated.toolCalls[0].reads).toBeUndefined();
     expect(uncorrelated.activity).toEqual([
       { kind: "search", query: "spacing", hitCount: 2 },
       { kind: "reading", relPath: "n.md", startLine: 1, endLine: 2 },
@@ -667,56 +665,12 @@ describe("reduceAssistant — the tool timeline", () => {
     expect(turn.toolCalls[0].progress).toBeUndefined();
   });
 
-  it("puts each query and its own hit count on the call that ran it", () => {
-    // Two searches in flight at once. Correlation is on the call id the cue
-    // carries, never arrival order: parallel calls are supported, so ordering
-    // would put one call's query on the other call's node — a provenance lie in
-    // the one surface whose whole job is provenance. The counts stay per query
-    // rather than summed, because "12 spans" and "0 spans" are two facts.
-    const turn = run([
-      { type: "toolCall", id: "c1", name: "search_notes", title: "Search notes",
-        arguments: '{"query":"spacing"}', stepId: null, },
-      { type: "toolCall", id: "c2", name: "search_notes", title: "Search notes",
-        arguments: '{"query":"chloroplasts"}', stepId: null, },
-      { type: "searching", query: "spacing", callId: "c1" },
-      { type: "searching", query: "chloroplasts", callId: "c2" },
-      { type: "retrieved", query: "chloroplasts", hitCount: 0, callId: "c2" },
-      { type: "retrieved", query: "spacing", hitCount: 12, callId: "c1" },
-    ]);
-
-    expect(turn.toolCalls[0].searches).toEqual([{ query: "spacing", hitCount: 12 }]);
-    expect(turn.toolCalls[1].searches).toEqual([{ query: "chloroplasts", hitCount: 0 }]);
-  });
-
-  it("holds a query's count as unknown until its own retrieval reports", () => {
-    // Between `searching` and `retrieved` the count has not been said yet, and
-    // "hasn't said yet" must never render as zero — that is the #122 failure,
-    // telling a user their vault holds nothing on a subject it covers.
-    const turn = run([
-      { type: "toolCall", id: "c1", name: "search_notes", title: "Search notes",
-        arguments: "{}", stepId: null, },
-      { type: "searching", query: "spacing", callId: "c1" },
-    ]);
-
-    expect(turn.toolCalls[0].searches).toEqual([{ query: "spacing", hitCount: null }]);
-  });
-
-  it("puts the note and the lines it opened on the call that read them", () => {
-    const turn = run([
-      { type: "toolCall", id: "c1", name: "read_note", title: "Read note",
-        arguments: '{"rel_path":"Spaced.md"}', stepId: null, },
-      { type: "reading", relPath: "Spaced.md", startLine: 12, endLine: 28, callId: "c1" },
-    ]);
-
-    expect(turn.toolCalls[0].reads).toEqual([
-      { relPath: "Spaced.md", startLine: 12, endLine: 28 },
-    ]);
-  });
-
   it("keeps the activity trace as the one ledger the settled summary counts", () => {
-    // The enrichment is a view onto the node, not a second ledger:
-    // `summarizeActivity` and `searchOutcome` still read `activity`, and two
-    // independently-computed provenance lines in one turn eventually disagree.
+    // A retrieval cue has one destination. `summarizeActivity` and
+    // `searchOutcome` read `activity`, and nothing copies the query or the count
+    // onto the call's own node — two independently-maintained provenance lines
+    // in one turn eventually disagree, and the node already carries both facts
+    // (the query as its argument hint, the count in its settled summary).
     const turn = run([
       { type: "toolCall", id: "c1", name: "search_notes", title: "Search notes",
         arguments: "{}", stepId: null, },

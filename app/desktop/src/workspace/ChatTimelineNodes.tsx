@@ -315,18 +315,19 @@ export function argumentHint(argumentsJson: string): string | null {
  *  parsed out of its arguments is what says *what* is being done, and
  *  `progress` — when the tool sends any — says what it is doing about it.
  *
- *  **`call.searches` and `call.reads` are deliberately not rendered here**, and
- *  that is a decision rather than an omission. The orchestrator raises at most
+ *  **A call's own retrieval cues are deliberately not shown here**, and that is
+ *  a decision rather than an omission — the reducer no longer even keeps them
+ *  per call, only on the turn's activity trace. The orchestrator raises at most
  *  one `Searching`/`Retrieved` pair per `search_notes` call and at most one
- *  `Reading` per `read_note_span` call (`orchestrator/collect.rs`), so each list
- *  holds one entry — and both of that entry's facts are already on this line:
- *  the query IS the argument hint (`HINT_FIELDS` leads with `query`), and the
- *  hit count and the note's line range ARE the Rust-composed summary ("12
- *  spans", "A.md:12–28"). Rendering them again would put one act on one node
- *  twice, which is the rule `showHint` and `railCalls` already enforce
- *  elsewhere. What that leaves genuinely out of reach is a query longer than
- *  `MAX_HINT_CHARS`, and the answer to that is the disclosure below — which is
- *  why the arguments column no longer hides itself at the shipped pane width. */
+ *  `Reading` per `read_note_span` call (`orchestrator/collect.rs`), and both of
+ *  that cue's facts are already on this line: the query IS the argument hint
+ *  (`HINT_FIELDS` leads with `query`), and the hit count and the note's line
+ *  range ARE the Rust-composed summary ("12 spans", "A.md:12–28"). Showing them
+ *  again would put one act on one node twice, which is the rule `showHint` and
+ *  `railCalls` already enforce elsewhere. What that leaves genuinely out of
+ *  reach is a query longer than `MAX_HINT_CHARS`, and the answer to that is the
+ *  disclosure below — which is why the arguments column no longer hides itself
+ *  at the shipped pane width. */
 export function ToolNode({
   call,
   last,

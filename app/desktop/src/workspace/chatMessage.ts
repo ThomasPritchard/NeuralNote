@@ -57,27 +57,6 @@ export interface PendingElicitation {
   multiSelect: boolean;
 }
 
-/** One query a call ran, and what the vault returned for it.
- *
- *  The count stays per query and is never summed into the node: "12 spans" and
- *  "nothing" are two different facts about two different questions, and a total
- *  hides the second inside the first. */
-export interface ToolSearchView {
-  query: string;
-  /** Spans the search returned, or `null` while its `retrieved` cue has yet to
-   *  report. `null` is "hasn't said yet" and must never render as zero —
-   *  telling a user their vault covers nothing it demonstrably covers is the
-   *  same class of failure as a wrong citation (#122). */
-  hitCount: number | null;
-}
-
-/** One span of one note a call opened. */
-export interface ToolReadView {
-  relPath: string;
-  startLine: number;
-  endLine: number;
-}
-
 /** One tool call the model made, and how it settled. `status === null` means the
  *  call is still in flight: the backend emits exactly one settlement per call on
  *  every path, so a node that stays null after the turn ends is a backend bug,
@@ -108,16 +87,6 @@ export interface ToolCallView {
    *  Optional because a node only carries what actually arrived — a call that
    *  never narrated itself has no line, which is different from an empty one. */
   progress?: string;
-  /** What this call searched for, attached by the `callId` the cue carries —
-   *  never by arrival order, which parallel calls make meaningless and which
-   *  would put one call's query on another call's node.
-   *
-   *  Absent on a call that searched nothing, and on one whose cue named no call
-   *  at all: that cue still drives `activity` exactly as it always has. */
-  searches?: ToolSearchView[];
-  /** Which notes this call opened, and the lines it read, correlated the same
-   *  way and absent under the same conditions as `searches`. */
-  reads?: ToolReadView[];
 }
 
 /** A note the model is composing, as the backend's partial parse of the streamed
