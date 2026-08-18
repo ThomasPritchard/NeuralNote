@@ -18,7 +18,8 @@ vi.mock("../lib/api", async (importOriginal) => {
 const openRouterStatus = (model = "openai/gpt-5"): AiStatus => ({
   activeProvider: "openRouter",
   reasoningSupported: "supported",
-  openrouter: { hasKey: true, model, reasoning: false },
+  reasoningControl: { kind: "pending" },
+  openrouter: { hasKey: true, model, reasoning: false, reasoningEffort: null },
   local: { activeModelTag: null },
   approval: ALWAYS_ASK_APPROVAL_STATUS,
 });
@@ -26,7 +27,8 @@ const openRouterStatus = (model = "openai/gpt-5"): AiStatus => ({
 const localStatus: AiStatus = {
   activeProvider: "local",
   reasoningSupported: "unknown",
-  openrouter: { hasKey: false, model: "openai/gpt-5", reasoning: false },
+  reasoningControl: { kind: "pending" },
+  openrouter: { hasKey: false, model: "openai/gpt-5", reasoning: false, reasoningEffort: null },
   local: { activeModelTag: "qwen3:8b" },
   approval: ALWAYS_ASK_APPROVAL_STATUS,
 };

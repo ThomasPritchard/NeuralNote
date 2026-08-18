@@ -62,21 +62,26 @@ const GIB = 1024 ** 3;
 const UNCONFIGURED: AiStatus = {
   activeProvider: null,
   reasoningSupported: "unknown",
-  openrouter: { hasKey: false, model: "anthropic/claude-sonnet-4.5", reasoning: false },
+  // No provider means nothing to control, which the shell reports as "hidden"
+  // before it ever looks at the verdict.
+  reasoningControl: { kind: "hidden" },
+  openrouter: { hasKey: false, model: "anthropic/claude-sonnet-4.5", reasoning: false, reasoningEffort: null },
   local: { activeModelTag: null },
   approval: ALWAYS_ASK_APPROVAL_STATUS,
 };
 const OR_ACTIVE: AiStatus = {
   activeProvider: "openRouter",
   reasoningSupported: "unknown",
-  openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5", reasoning: false },
+  reasoningControl: { kind: "pending" },
+  openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5", reasoning: false, reasoningEffort: null },
   local: { activeModelTag: null },
   approval: ALWAYS_ASK_APPROVAL_STATUS,
 };
 const LOCAL_ACTIVE: AiStatus = {
   activeProvider: "local",
   reasoningSupported: "unknown",
-  openrouter: { hasKey: false, model: "anthropic/claude-sonnet-4.5", reasoning: false },
+  reasoningControl: { kind: "pending" },
+  openrouter: { hasKey: false, model: "anthropic/claude-sonnet-4.5", reasoning: false, reasoningEffort: null },
   local: { activeModelTag: "qwen2.5:7b" },
   approval: ALWAYS_ASK_APPROVAL_STATUS,
 };
@@ -591,7 +596,7 @@ describe("AiSettingsPage — OpenRouter", () => {
   it("surfaces a failed provider switch inline", async () => {
     mockAiStatus.mockResolvedValue({
       ...UNCONFIGURED,
-      openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5", reasoning: false },
+      openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5", reasoning: false, reasoningEffort: null },
     });
     mockSetActive.mockRejectedValue({ kind: "io", message: "config write failed" });
     const { user } = setup();
@@ -708,7 +713,8 @@ describe("AiSettingsPage — OpenRouter reasoning toggle", () => {
     mockAiStatus.mockResolvedValue({
       activeProvider: "local",
       reasoningSupported: "unsupported", // the LOCAL model's verdict
-      openrouter: { hasKey: true, model: "openai/gpt-4.1", reasoning: false },
+      reasoningControl: { kind: "hidden" },
+      openrouter: { hasKey: true, model: "openai/gpt-4.1", reasoning: false, reasoningEffort: null },
       local: { activeModelTag: "qwen3.5:9b" },
       approval: ALWAYS_ASK_APPROVAL_STATUS,
     });

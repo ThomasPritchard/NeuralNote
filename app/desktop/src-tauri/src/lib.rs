@@ -335,6 +335,7 @@ pub fn run() {
             commands::ai::open_openrouter_rankings,
             commands::ai::set_active_provider,
             commands::ai::set_reasoning,
+            commands::ai::set_reasoning_effort,
             commands::ai::set_approval_mode,
             commands::ai::set_tool_approval_override,
             commands::ai::refresh_reasoning_support,

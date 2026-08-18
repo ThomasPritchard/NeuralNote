@@ -1,8 +1,9 @@
 //! Pure model-capability parsing shared by hosted and local AI providers.
 
+use crate::ai::openai::ReasoningAsk;
 use crate::capture::ModelPricing;
 use crate::error::{CoreError, CoreResult};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use ts_rs::TS;
 
 /// Whether the selected model can emit reasoning tokens. `Unknown` when the
@@ -204,8 +205,32 @@ struct RawOpenRouterModel {
     context_length: Option<u64>,
     // Absent for a model that publishes no reasoning block at all — see
     // `openrouter_reasoning_capability`, which keeps that apart from a published
-    // but empty one.
+    // but empty one. Read leniently, because this field shares its record with
+    // the rest of the catalogue — see `lenient_reasoning`.
+    #[serde(default, deserialize_with = "lenient_reasoning")]
     reasoning: Option<RawReasoningCapability>,
+}
+
+/// Read a model's `reasoning` block without letting an unreadable one take the
+/// rest of the catalogue down with it.
+///
+/// This field shares [`RawOpenRouterModel`] with `pricing`, `context_length` and
+/// the id list, and serde fails a whole body on one bad field. So a single
+/// record whose reasoning block arrives in a shape this build cannot read would
+/// otherwise break prompt budgeting (issue #22), model listing and pricing at
+/// the same time — for a field none of them use.
+///
+/// An unreadable block is reported as absent, which is the same fail-open answer
+/// this module already gives for an unparseable body: the control shows nothing
+/// rather than a guess. (`pricing` still carries the un-narrowed version of this
+/// exposure; narrowing it is a separate change, since its own parser is
+/// deliberately fallible.)
+fn lenient_reasoning<'de, D>(deserializer: D) -> Result<Option<RawReasoningCapability>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok().flatten())
 }
 
 #[derive(Deserialize)]
@@ -311,6 +336,29 @@ pub fn parse_openrouter_input_pricing(
     })
 }
 
+/// The reasoning control every model in the raw OpenRouter `/models` body calls
+/// for, as `(id, control)` pairs.
+///
+/// One body answers for the whole catalogue, so a caller warms one cache from
+/// one fetch rather than asking per model. A listed model that publishes no
+/// reasoning block is present here as [`ReasoningControl::Hidden`] — "listed and
+/// silent" is an answer, and it is not the same as "not in this body", which is
+/// the absence a caller reads as an unanswered probe.
+///
+/// Fail-open like its sibling probes: a malformed body yields `None` and the
+/// caller's cache simply stays unwarmed.
+pub fn parse_openrouter_reasoning_controls(
+    models_json: &str,
+) -> Option<Vec<(String, ReasoningControl)>> {
+    let raw: RawOpenRouterModels = serde_json::from_str(models_json).ok()?;
+    Some(
+        raw.data
+            .into_iter()
+            .map(|model| (model.id, reasoning_control(model.reasoning.as_ref())))
+            .collect(),
+    )
+}
+
 /// The context window (`context_length`) of every model in the raw OpenRouter
 /// `/models` body, as `(id, tokens)` pairs. Fail-open like the reasoning probe: a
 /// malformed body yields `None` (the caller's cache just stays unwarmed), and a
@@ -360,6 +408,39 @@ pub fn ollama_reasoning_support(show_json: &str) -> ReasoningSupport {
 /// normal turn. `Unknown` still sends (fail open).
 pub fn effective_reasoning(opt_in: bool, support: ReasoningSupport) -> bool {
     opt_in && support != ReasoningSupport::Unsupported
+}
+
+/// What to ask the provider for on every turn of this run, from the user's
+/// stored preference and the selected model's probed verdict. `None` sends no
+/// `reasoning` object at all.
+///
+/// The two halves fail in opposite directions, deliberately (§4.2):
+///
+/// * **Whether to reason at all fails OPEN.** [`effective_reasoning`] decides it
+///   and is unchanged: an `Unknown` verdict still reasons, because the probe not
+///   having answered is not evidence the model cannot.
+/// * **The effort fails CLOSED.** A value is named only when the verdict is
+///   `Supported`, which is the only state in which the menu it came from was
+///   actually read. There is no fallback effort, no remembered effort from a
+///   previous model, and no compiled-in default — omitting one simply takes the
+///   provider's own.
+///
+/// The asymmetry is the point: guessing a menu invents user-facing options that
+/// may not exist, while omitting an effort costs nothing but a default.
+pub fn effective_reasoning_ask(
+    opt_in: bool,
+    effort: Option<&str>,
+    support: ReasoningSupport,
+) -> Option<ReasoningAsk> {
+    if !effective_reasoning(opt_in, support) {
+        return None;
+    }
+    match (support, effort) {
+        (ReasoningSupport::Supported, Some(effort)) => {
+            Some(ReasoningAsk::Effort(effort.to_string()))
+        }
+        _ => Some(ReasoningAsk::Enabled),
+    }
 }
 
 #[cfg(test)]
@@ -986,5 +1067,137 @@ mod tests {
     #[test]
     fn effective_reasoning_respects_opt_out_for_unsupported_model() {
         assert!(!effective_reasoning(false, ReasoningSupport::Unsupported));
+    }
+
+    #[test]
+    fn an_opted_in_turn_with_no_chosen_effort_asks_for_the_models_own_default() {
+        assert_eq!(
+            effective_reasoning_ask(true, None, ReasoningSupport::Supported),
+            Some(ReasoningAsk::Enabled)
+        );
+    }
+
+    #[test]
+    fn a_chosen_effort_goes_out_verbatim() {
+        assert_eq!(
+            effective_reasoning_ask(true, Some("xHigh"), ReasoningSupport::Supported),
+            Some(ReasoningAsk::Effort("xHigh".into()))
+        );
+    }
+
+    #[test]
+    fn an_unprobed_model_sends_the_opt_in_but_never_an_effort() {
+        // §4.2's asymmetry: the SEND path stays fail open (an `Unknown` verdict
+        // still reasons), while an effort is only ever sent when it was read off
+        // a probed menu. Guessing a menu invents user-facing options that may not
+        // exist; omitting an effort just takes the provider's own default.
+        assert_eq!(
+            effective_reasoning_ask(true, None, ReasoningSupport::Unknown),
+            Some(ReasoningAsk::Enabled)
+        );
+        assert_eq!(
+            effective_reasoning_ask(true, Some("xhigh"), ReasoningSupport::Unknown),
+            Some(ReasoningAsk::Enabled)
+        );
+    }
+
+    #[test]
+    fn a_model_known_not_to_reason_is_asked_for_nothing_however_it_was_configured() {
+        assert_eq!(
+            effective_reasoning_ask(true, Some("xhigh"), ReasoningSupport::Unsupported),
+            None
+        );
+    }
+
+    #[test]
+    fn opting_out_sends_no_reasoning_object_even_with_an_effort_stored() {
+        for support in [
+            ReasoningSupport::Supported,
+            ReasoningSupport::Unknown,
+            ReasoningSupport::Unsupported,
+        ] {
+            assert_eq!(effective_reasoning_ask(false, Some("xhigh"), support), None);
+        }
+    }
+
+    #[test]
+    fn every_listed_model_gets_a_control_from_one_catalogue_body() {
+        // One fetch warms the whole cache, so the parse answers for every id the
+        // body carries — including the one that publishes no reasoning block,
+        // which is `Hidden` rather than missing. "Listed and silent" and "not in
+        // this body at all" are different facts, and only the second is `Pending`.
+        let controls = parse_openrouter_reasoning_controls(CAPTURED_MODELS).unwrap();
+
+        assert_eq!(
+            controls,
+            vec![
+                (
+                    "openai/gpt-5.6-luna-pro".to_string(),
+                    reasoning_control(Some(&captured("openai/gpt-5.6-luna-pro")))
+                ),
+                (
+                    "x-ai/grok-4.6".to_string(),
+                    reasoning_control(Some(&captured("x-ai/grok-4.6")))
+                ),
+                (
+                    "nvidia/nemotron-3-ultra-550b-a55b".to_string(),
+                    reasoning_control(Some(&captured("nvidia/nemotron-3-ultra-550b-a55b")))
+                ),
+                (
+                    "inclusionai/ling-3.0-flash".to_string(),
+                    ReasoningControl::Toggle { default_on: true }
+                ),
+                (
+                    "dots-studio/dots-3-note-preview:free".to_string(),
+                    ReasoningControl::Toggle { default_on: false }
+                ),
+                ("openrouter/auto-beta".to_string(), ReasoningControl::Hidden),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_malformed_catalogue_body_warms_no_controls_rather_than_erroring() {
+        assert!(parse_openrouter_reasoning_controls(r#"{"data":"#).is_none());
+        assert_eq!(parse_openrouter_reasoning_controls("{}"), Some(vec![]));
+    }
+
+    #[test]
+    fn one_unreadable_reasoning_block_does_not_take_the_rest_of_the_body_with_it() {
+        // `reasoning` shares one raw record with pricing, `context_length` and the
+        // id list. A strict parse would fail the WHOLE body on a single odd
+        // record, so a model whose reasoning block arrived in a shape we cannot
+        // read would silently break prompt budgeting (issue #22) and the model
+        // menu as well.
+        let json = r#"{"data":[
+            {"id":"vendor/odd","reasoning":"high","pricing":{"prompt":"0.000002"},"context_length":65536,
+             "supported_parameters":["reasoning"]},
+            {"id":"vendor/ordinary","reasoning":{"mandatory":true},"pricing":{"prompt":"0.000004"},"context_length":32768}
+        ]}"#;
+
+        assert_eq!(
+            parse_openrouter_reasoning_controls(json),
+            Some(vec![
+                ("vendor/odd".to_string(), ReasoningControl::Hidden),
+                ("vendor/ordinary".to_string(), ReasoningControl::Locked),
+            ])
+        );
+        assert_eq!(
+            parse_openrouter_context_windows(json),
+            Some(vec![
+                ("vendor/odd".to_string(), 65_536),
+                ("vendor/ordinary".to_string(), 32_768),
+            ])
+        );
+        assert_eq!(
+            parse_openrouter_input_pricing(json, "vendor/odd")
+                .unwrap()
+                .input_usd_per_token,
+            0.000002
+        );
+        assert_eq!(
+            openrouter_reasoning_support(json, "vendor/odd"),
+            ReasoningSupport::Supported
+        );
     }
 }

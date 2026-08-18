@@ -159,6 +159,14 @@ pub(crate) fn clear_api_key_in(
 pub(crate) struct AiStatus {
     active_provider: Option<neuralnote_core::ai::ProviderKind>,
     reasoning_supported: neuralnote_core::ai::ReasoningSupport,
+    /// What reasoning control the UI should render for the selected model, and
+    /// nothing more. `reasoning_supported` stays because it answers a different
+    /// question — *can* this model reason, which is what the send path fails open
+    /// on — while this answers *what may the user choose*, which fails closed.
+    ///
+    /// Everything the control renders is in this value; the frontend derives no
+    /// part of it, and in particular never invents a menu.
+    reasoning_control: neuralnote_core::ai::ReasoningControl,
     openrouter: OpenRouterStatus,
     local: LocalStatus,
     approval: ApprovalStatus,
@@ -201,6 +209,14 @@ pub(crate) struct OpenRouterStatus {
     /// OpenRouter status DTO for compatibility, while both providers use the same
     /// persisted opt-in.
     reasoning: bool,
+    /// The effort the user picked off this model's own menu, or `null` for the
+    /// model's own default. Sits beside `reasoning` for the same reason it does:
+    /// one persisted preference, surfaced where the existing control reads it.
+    ///
+    /// Never a value we chose. It is only ever set by `set_reasoning_effort`,
+    /// which refuses anything the probed menu does not offer, and it is cleared
+    /// whenever the selected model changes.
+    reasoning_effort: Option<String>,
 }
 
 #[derive(serde::Serialize, TS)]
@@ -302,12 +318,62 @@ pub(crate) fn open_openrouter_rankings(app: AppHandle) -> Result<(), CoreError> 
         .map_err(|_| CoreError::Io("Could not open the OpenRouter rankings page.".into()))
 }
 
+/// Decide which reasoning control the selected model calls for, from the two
+/// things that are known about it: the persisted capability verdict, and what
+/// the catalogue published (`None` = it has not answered for this id).
+///
+/// The verdict leads, because it is the only authority on whether the model can
+/// reason at all. Then:
+///
+/// * **`Unknown` → `Pending`.** The probe has not answered, so any menu shown now
+///   would be a guess — the one thing locked decision 2 forbids outright. This is
+///   the deliberate opposite of the SEND path, which fails open on `Unknown`
+///   (§4.2): guessing a menu invents options that may not exist, while sending
+///   without an effort just takes the provider's own default.
+/// * **`Unsupported`, or no provider at all → `Hidden`.** Nothing to control.
+/// * **`Supported` on the local lane → a switch.** Ollama publishes a `thinking`
+///   capability and no effort menu, so on/off is the whole of the choice.
+/// * **`Supported` on the hosted lane → whatever the catalogue published**, with
+///   two named exceptions: no answer yet is still `Pending` (the verdict is
+///   persisted, the menu cache is not, so this is every fresh launch), and a
+///   listed model whose reasoning block is `null` gets a switch rather than
+///   nothing — it reasons, it just published no menu and no default.
+fn reasoning_control_for(
+    provider: Option<neuralnote_core::ai::ProviderKind>,
+    support: ReasoningSupport,
+    catalogue: Option<neuralnote_core::ai::ReasoningControl>,
+) -> neuralnote_core::ai::ReasoningControl {
+    use neuralnote_core::ai::ReasoningControl;
+
+    let Some(provider) = provider else {
+        return ReasoningControl::Hidden;
+    };
+    match support {
+        ReasoningSupport::Unsupported => ReasoningControl::Hidden,
+        ReasoningSupport::Unknown => ReasoningControl::Pending,
+        ReasoningSupport::Supported => match provider {
+            ProviderKind::Local => ReasoningControl::Toggle { default_on: false },
+            ProviderKind::OpenRouter => match catalogue {
+                None => ReasoningControl::Pending,
+                Some(ReasoningControl::Hidden) => ReasoningControl::Toggle { default_on: false },
+                Some(control) => control,
+            },
+        },
+    }
+}
+
 /// Map the persisted config onto the provider-aware status DTO. Split from the
 /// command (which owns only the config read) so the config → status mapping — notably
 /// that `reasoning` surfaces on the OpenRouter status — is unit-testable without an
 /// `AppHandle`.
 fn build_ai_status(cfg: neuralnote_core::ai::ProviderConfig, key_present: bool) -> AiStatus {
     let reasoning_supported = cfg.cached_reasoning_support(key_present);
+    let reasoning_control = reasoning_control_for(
+        cfg.effective_provider(key_present),
+        reasoning_supported,
+        cfg.selected_model(key_present)
+            .and_then(ai::cached_openrouter_reasoning_control),
+    );
     let approval_policy = cfg.approval_policy(key_present);
     let effective_modes: std::collections::BTreeMap<String, _> =
         neuralnote_core::ai::approval::ALL_GATED_TOOLS
@@ -317,10 +383,12 @@ fn build_ai_status(cfg: neuralnote_core::ai::ProviderConfig, key_present: bool) 
     AiStatus {
         active_provider: cfg.effective_provider(key_present),
         reasoning_supported,
+        reasoning_control,
         openrouter: OpenRouterStatus {
             has_key: key_present,
             model: cfg.model,
-            reasoning: cfg.reasoning,
+            reasoning: cfg.reasoning_preference.enabled,
+            reasoning_effort: cfg.reasoning_preference.effort,
         },
         local: LocalStatus {
             active_model_tag: cfg.local_model_tag,
@@ -438,10 +506,97 @@ fn set_reasoning_in(
     enabled: bool,
 ) -> Result<AiStatus, CoreError> {
     let cfg = mutation_gate.update(config_dir, key_present, |cfg| {
-        cfg.reasoning = enabled;
+        cfg.reasoning_preference.enabled = enabled;
         Ok(())
     })?;
     Ok(build_ai_status(cfg, key_present))
+}
+
+/// Choose the effort this model reasons at, or clear it with `null` to take the
+/// model's own default. `set_reasoning`'s effort-setting sibling.
+///
+/// Naming an effort also opts the user in, because that is what picking one off
+/// the menu means: the `Efforts` control carries its own separate off affordance
+/// (`can_disable`), which is `set_reasoning(false)`. Clearing does NOT opt them
+/// out for the mirror-image reason — "take the model's default effort" and "stop
+/// reasoning" are two different requests.
+///
+/// Returns the freshly persisted `AiStatus` for the same reason `set_reasoning`
+/// does: a follow-up read that failed after the write landed would leave the
+/// control showing an effort the config no longer holds.
+#[tauri::command]
+pub(crate) fn set_reasoning_effort(
+    app: AppHandle,
+    state: SharedState<'_>,
+    effort: Option<String>,
+) -> Result<AiStatus, CoreError> {
+    let dir = config_dir(&app)?;
+    let key_present = ai::read_api_key(&dir)?.is_some();
+    set_reasoning_effort_in(
+        &dir,
+        &provider_config_mutation_gate(&state),
+        key_present,
+        effort,
+    )
+}
+
+fn set_reasoning_effort_in(
+    config_dir: &Path,
+    mutation_gate: &ProviderConfigMutationGate,
+    key_present: bool,
+    effort: Option<String>,
+) -> Result<AiStatus, CoreError> {
+    let cfg = mutation_gate.update(config_dir, key_present, |cfg| {
+        let Some(effort) = effort else {
+            cfg.reasoning_preference.effort = None;
+            return Ok(());
+        };
+        ensure_effort_is_offered(
+            &reasoning_control_for(
+                cfg.effective_provider(key_present),
+                cfg.cached_reasoning_support(key_present),
+                cfg.selected_model(key_present)
+                    .and_then(ai::cached_openrouter_reasoning_control),
+            ),
+            &effort,
+        )?;
+        cfg.reasoning_preference = neuralnote_core::ai::ReasoningPreference {
+            enabled: true,
+            effort: Some(effort),
+        };
+        Ok(())
+    })?;
+    Ok(build_ai_status(cfg, key_present))
+}
+
+/// Refuse an effort the model's *current* menu does not offer.
+///
+/// The user never types an effort — every value they can pick came from the menu
+/// this same status read handed the UI. So a value that is not on it means the
+/// menu moved underneath the control (the model changed, or the catalogue did),
+/// and that is a real condition worth seeing rather than coercing to something
+/// nearby. Coercion would send an effort the user did not choose, silently, and
+/// bill them for it.
+fn ensure_effort_is_offered(
+    control: &neuralnote_core::ai::ReasoningControl,
+    effort: &str,
+) -> Result<(), CoreError> {
+    match control {
+        neuralnote_core::ai::ReasoningControl::Efforts { options, .. }
+            if options.iter().any(|option| option == effort) =>
+        {
+            Ok(())
+        }
+        neuralnote_core::ai::ReasoningControl::Efforts { options, .. } => {
+            Err(CoreError::InvalidContent(format!(
+                "\"{effort}\" is no longer one of this model's reasoning efforts ({}). Reopen Settings to pick from the current list.",
+                options.join(", ")
+            )))
+        }
+        _ => Err(CoreError::InvalidContent(format!(
+            "\"{effort}\" can't be set: this model doesn't publish reasoning efforts to choose from."
+        ))),
+    }
 }
 
 /// Choose the global approval mode.
@@ -1120,14 +1275,18 @@ pub(crate) async fn chat(
             None
         }
         Some(ProviderKind::OpenRouter) => {
-            let effective = neuralnote_core::ai::effective_reasoning(
-                cfg.reasoning,
+            // Fail-open on WHETHER to reason, closed on the effort: a stored
+            // effort only goes out while the verdict says the model reasons,
+            // which is the only state in which its menu was actually read (§4.2).
+            let ask = neuralnote_core::ai::effective_reasoning_ask(
+                cfg.reasoning_preference.enabled,
+                cfg.reasoning_preference.effort.as_deref(),
                 cfg.cached_reasoning_support(key_present),
             );
-            chat_via_openrouter(&mut run, &cfg.model, effective).await
+            chat_via_openrouter(&mut run, &cfg.model, ask).await
         }
         Some(ProviderKind::Local) => {
-            let reasoning_opt_in = cfg.reasoning;
+            let reasoning_opt_in = cfg.reasoning_preference.enabled;
             match cfg.local_model_tag {
                 Some(tag) => chat_via_local(&mut run, &app, &state, &tag, reasoning_opt_in).await,
                 None => {
@@ -1400,11 +1559,12 @@ fn stop_if_chat_run_closed(run: &mut ChatRun<'_>) -> bool {
 /// The OpenRouter chat arm: read the key, build the client, run the shared
 /// pipeline. Split out of `chat` so each provider's error handling stays flat;
 /// every failure lands on the sink (never silent). `reasoning` is the effective
-/// cached-capability-aware flag computed by the caller.
+/// cached-capability-aware ask computed by the caller — `None` sends no
+/// `reasoning` object at all.
 async fn chat_via_openrouter(
     run: &mut ChatRun<'_>,
     model: &str,
-    reasoning: bool,
+    reasoning: Option<neuralnote_core::ai::openai::ReasoningAsk>,
 ) -> Option<neuralnote_core::ai::UndoLedger> {
     use neuralnote_core::ai::{run_chat, ChatEvent, SkillServices};
 
@@ -1625,9 +1785,9 @@ mod tests {
     use neuralnote_core::ai::{
         read_provider_config, run_chat, write_provider_config, ChatEvent, Completion, EventSink,
         Guards, HardwareSpec, KeywordRetriever, LlmClient, LlmRequest, NoUserPrompt,
-        ProbedReasoning, ProviderConfig, ProviderKind, ReasoningProbeTarget, ReasoningSupport,
-        SkillEnvironment, SkillLookupError, SkillRegistry, SkillServices, ToolCall,
-        FIXTURE_SKILL_ID, YOUTUBE_DISTIL_SKILL_ID,
+        ProbedReasoning, ProviderConfig, ProviderKind, ReasoningControl, ReasoningProbeTarget,
+        ReasoningSupport, SkillEnvironment, SkillLookupError, SkillRegistry, SkillServices,
+        ToolCall, FIXTURE_SKILL_ID, YOUTUBE_DISTIL_SKILL_ID,
     };
     use neuralnote_core::CoreResult;
     use std::collections::BTreeSet;
@@ -1703,7 +1863,10 @@ mod tests {
             dir.path(),
             &ProviderConfig {
                 model: "vendor/old".into(),
-                reasoning: true,
+                reasoning_preference: neuralnote_core::ai::ReasoningPreference {
+                    enabled: true,
+                    effort: None,
+                },
                 ..Default::default()
             },
         )
@@ -1715,7 +1878,7 @@ mod tests {
             dir.path(),
             |config| {
                 if reasoning_starts_first {
-                    config.reasoning = false;
+                    config.reasoning_preference.enabled = false;
                 } else {
                     config.model = "vendor/new".into();
                 }
@@ -1739,7 +1902,7 @@ mod tests {
         let persisted = read_provider_config(dir.path()).unwrap();
         assert_eq!(persisted.model, "vendor/new");
         assert!(
-            !persisted.reasoning,
+            !persisted.reasoning_preference.enabled,
             "a concurrent reasoning opt-out must not be restored from a stale model-selection snapshot"
         );
     }
@@ -1792,7 +1955,10 @@ mod tests {
             dir.path(),
             &ProviderConfig {
                 model: "vendor/old".into(),
-                reasoning: true,
+                reasoning_preference: neuralnote_core::ai::ReasoningPreference {
+                    enabled: true,
+                    effort: None,
+                },
                 ..Default::default()
             },
         )
@@ -1803,7 +1969,7 @@ mod tests {
         let mut second = read_provider_config(dir.path()).unwrap();
 
         // First opts reasoning OFF and commits.
-        first.reasoning = false;
+        first.reasoning_preference.enabled = false;
         write_provider_config(dir.path(), &first).unwrap();
         // Second selects a new model from its stale snapshot and commits.
         second.model = "vendor/new".into();
@@ -1812,7 +1978,7 @@ mod tests {
         let persisted = read_provider_config(dir.path()).unwrap();
         assert_eq!(persisted.model, "vendor/new");
         assert!(
-            persisted.reasoning,
+            persisted.reasoning_preference.enabled,
             "without serialization the stale second write restores reasoning=true: the opt-out is lost"
         );
     }
@@ -1824,7 +1990,10 @@ mod tests {
             dir.path(),
             &ProviderConfig {
                 active_provider: Some(ProviderKind::OpenRouter),
-                reasoning: true,
+                reasoning_preference: neuralnote_core::ai::ReasoningPreference {
+                    enabled: true,
+                    effort: None,
+                },
                 ..Default::default()
             },
         )
@@ -1834,7 +2003,7 @@ mod tests {
         // the active provider to Local — the exact `set_active_provider` config write.
         overlapping_gated_writers(
             dir.path(),
-            |config| config.reasoning = false,
+            |config| config.reasoning_preference.enabled = false,
             |second_dir, second_gate| {
                 second_gate
                     .update(second_dir, false, |cfg| {
@@ -1853,7 +2022,7 @@ mod tests {
             "the concurrent provider switch must survive"
         );
         assert!(
-            !persisted.reasoning,
+            !persisted.reasoning_preference.enabled,
             "the provider switch must not restore reasoning from a stale snapshot"
         );
     }
@@ -1901,7 +2070,10 @@ mod tests {
             dir.path(),
             &ProviderConfig {
                 model: "vendor/old".into(),
-                reasoning: true,
+                reasoning_preference: neuralnote_core::ai::ReasoningPreference {
+                    enabled: true,
+                    effort: None,
+                },
                 ..Default::default()
             },
         )
@@ -1913,7 +2085,7 @@ mod tests {
         // config half is modelled here by the model write it actually performs.)
         overlapping_gated_writers(
             dir.path(),
-            |config| config.reasoning = false,
+            |config| config.reasoning_preference.enabled = false,
             |second_dir, second_gate| {
                 second_gate
                     .update(second_dir, false, |cfg| {
@@ -1930,7 +2102,7 @@ mod tests {
             "the concurrent model write must survive"
         );
         assert!(
-            !persisted.reasoning,
+            !persisted.reasoning_preference.enabled,
             "the model write must not restore reasoning from a stale snapshot"
         );
     }
@@ -2093,7 +2265,8 @@ mod tests {
         let concurrent = ProviderConfig {
             active_provider: Some(ProviderKind::OpenRouter),
             model: "user/switched-to-this".into(),
-            reasoning: false, // the user toggled reasoning OFF mid-probe
+            // the user toggled reasoning OFF mid-probe
+            reasoning_preference: neuralnote_core::ai::ReasoningPreference::default(),
             reasoning_probe: probed("user/switched-to-this", ReasoningSupport::Unsupported),
             ..Default::default()
         };
@@ -2120,7 +2293,7 @@ mod tests {
             probed("user/switched-to-this", ReasoningSupport::Unsupported)
         );
         assert!(
-            !persisted.reasoning,
+            !persisted.reasoning_preference.enabled,
             "a concurrent opt-out must survive the probe"
         );
         assert_eq!(persisted.model, "user/switched-to-this");
@@ -2541,7 +2714,10 @@ mod tests {
         // local/key field) would be caught here.
         let on = build_ai_status(
             ProviderConfig {
-                reasoning: true,
+                reasoning_preference: neuralnote_core::ai::ReasoningPreference {
+                    enabled: true,
+                    effort: None,
+                },
                 ..Default::default()
             },
             true,
@@ -2550,7 +2726,7 @@ mod tests {
 
         let off = build_ai_status(
             ProviderConfig {
-                reasoning: false,
+                reasoning_preference: neuralnote_core::ai::ReasoningPreference::default(),
                 ..Default::default()
             },
             true,
@@ -3085,5 +3261,264 @@ mod tests {
             std::fs::read_to_string(vault.path().join("Kept.md")).unwrap(),
             "committed"
         );
+    }
+
+    /* ─────────────────────────  The reasoning control  ───────────────────────── */
+
+    /// A menu the catalogue could publish, and a distinct model id per test so
+    /// the process-global control cache cannot leak between them.
+    fn menu(options: &[&str]) -> ReasoningControl {
+        ReasoningControl::Efforts {
+            options: options.iter().map(|o| (*o).to_string()).collect(),
+            default_effort: Some(options[0].to_string()),
+            can_disable: true,
+        }
+    }
+
+    #[test]
+    fn an_unprobed_model_shows_no_control_rather_than_a_guessed_one() {
+        // Locked decision 2. `Unknown` is "the probe has not answered", which is
+        // not evidence of anything about the model — and a greyed-out menu of
+        // yesterday's options is exactly the guess this forbids.
+        for provider in [ProviderKind::OpenRouter, ProviderKind::Local] {
+            assert_eq!(
+                reasoning_control_for(Some(provider), ReasoningSupport::Unknown, None),
+                ReasoningControl::Pending
+            );
+            // Even with a catalogue answer in hand: until the verdict says this
+            // model reasons, the menu is not this model's to show.
+            assert_eq!(
+                reasoning_control_for(
+                    Some(provider),
+                    ReasoningSupport::Unknown,
+                    Some(menu(&["high", "low"]))
+                ),
+                ReasoningControl::Pending
+            );
+        }
+    }
+
+    #[test]
+    fn a_model_that_cannot_reason_and_a_missing_provider_both_show_nothing() {
+        assert_eq!(
+            reasoning_control_for(None, ReasoningSupport::Unknown, None),
+            ReasoningControl::Hidden
+        );
+        for provider in [ProviderKind::OpenRouter, ProviderKind::Local] {
+            assert_eq!(
+                reasoning_control_for(Some(provider), ReasoningSupport::Unsupported, None),
+                ReasoningControl::Hidden
+            );
+        }
+    }
+
+    #[test]
+    fn a_capable_local_model_gets_a_switch_because_ollama_publishes_no_menu() {
+        assert_eq!(
+            reasoning_control_for(Some(ProviderKind::Local), ReasoningSupport::Supported, None),
+            ReasoningControl::Toggle { default_on: false }
+        );
+    }
+
+    #[test]
+    fn a_capable_hosted_model_renders_the_catalogue_menu_verbatim() {
+        assert_eq!(
+            reasoning_control_for(
+                Some(ProviderKind::OpenRouter),
+                ReasoningSupport::Supported,
+                Some(menu(&["max", "xhigh"]))
+            ),
+            menu(&["max", "xhigh"])
+        );
+    }
+
+    #[test]
+    fn a_capable_hosted_model_the_catalogue_has_not_answered_for_stays_pending() {
+        // The verdict is persisted and the menu cache is not, so this is what a
+        // fresh launch looks like until the probe re-runs. It must read as "still
+        // checking", never as "this model cannot reason".
+        assert_eq!(
+            reasoning_control_for(
+                Some(ProviderKind::OpenRouter),
+                ReasoningSupport::Supported,
+                None
+            ),
+            ReasoningControl::Pending
+        );
+    }
+
+    #[test]
+    fn a_capable_hosted_model_that_publishes_no_reasoning_block_still_gets_a_switch() {
+        // `openrouter/auto-beta` is the real case: `"reasoning"` is in its
+        // `supported_parameters` and its reasoning block is `null`. It reasons,
+        // so hiding the control would take a working feature away — there is
+        // simply no menu and no published default to honour.
+        assert_eq!(
+            reasoning_control_for(
+                Some(ProviderKind::OpenRouter),
+                ReasoningSupport::Supported,
+                Some(ReasoningControl::Hidden)
+            ),
+            ReasoningControl::Toggle { default_on: false }
+        );
+    }
+
+    #[test]
+    fn the_status_carries_the_control_and_the_stored_effort() {
+        let model = "test/status-effort";
+        ai::cache_openrouter_reasoning_controls(
+            &serde_json::json!({
+                "data": [{ "id": model, "reasoning": {
+                    "mandatory": false,
+                    "supported_efforts": ["high", "low"],
+                    "default_effort": "high"
+                } }]
+            })
+            .to_string(),
+        );
+
+        let status = build_ai_status(
+            ProviderConfig {
+                active_provider: Some(ProviderKind::OpenRouter),
+                model: model.into(),
+                reasoning_preference: neuralnote_core::ai::ReasoningPreference {
+                    enabled: true,
+                    effort: Some("low".into()),
+                },
+                reasoning_probe: probed(model, ReasoningSupport::Supported),
+                ..ProviderConfig::default()
+            },
+            true,
+        );
+
+        assert_eq!(
+            status.reasoning_control,
+            ReasoningControl::Efforts {
+                options: vec!["high".into(), "low".into()],
+                default_effort: Some("high".into()),
+                can_disable: true,
+            }
+        );
+        assert!(status.openrouter.reasoning);
+        assert_eq!(status.openrouter.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    /// Warm the control cache for `model` with `options`, then build a config
+    /// selecting it with a `Supported` verdict — the state in which an effort can
+    /// legitimately be chosen.
+    fn config_with_probed_menu(dir: &Path, model: &str, options: &[&str]) {
+        ai::cache_openrouter_reasoning_controls(
+            &serde_json::json!({
+                "data": [{ "id": model, "reasoning": {
+                    "mandatory": false,
+                    "supported_efforts": options,
+                } }]
+            })
+            .to_string(),
+        );
+        write_provider_config(
+            dir,
+            &ProviderConfig {
+                active_provider: Some(ProviderKind::OpenRouter),
+                model: model.into(),
+                reasoning_probe: probed(model, ReasoningSupport::Supported),
+                ..ProviderConfig::default()
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn choosing_an_effort_off_the_menu_persists_it_and_opts_the_user_in() {
+        let dir = tempfile::tempdir().unwrap();
+        config_with_probed_menu(dir.path(), "test/effort-accept", &["xhigh", "low"]);
+
+        let status = set_reasoning_effort_in(
+            dir.path(),
+            &ProviderConfigMutationGate::default(),
+            true,
+            Some("xhigh".into()),
+        )
+        .unwrap();
+
+        assert!(status.openrouter.reasoning, "naming an effort IS opting in");
+        assert_eq!(status.openrouter.reasoning_effort.as_deref(), Some("xhigh"));
+        let persisted = read_provider_config(dir.path()).unwrap();
+        assert_eq!(
+            persisted.reasoning_preference,
+            neuralnote_core::ai::ReasoningPreference {
+                enabled: true,
+                effort: Some("xhigh".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn an_effort_the_current_menu_does_not_offer_is_refused_not_coerced() {
+        // The user never types an effort, so a value off the menu means the menu
+        // moved underneath the control. Coercing to something nearby would send
+        // an effort they did not choose, and silently.
+        let dir = tempfile::tempdir().unwrap();
+        config_with_probed_menu(dir.path(), "test/effort-reject", &["xhigh", "low"]);
+
+        let error = set_reasoning_effort_in(
+            dir.path(),
+            &ProviderConfigMutationGate::default(),
+            true,
+            Some("medium".into()),
+        )
+        .err()
+        .expect("an effort that is not on the menu must be refused");
+
+        assert!(
+            ai::error_detail(error).contains("medium"),
+            "the refusal must name the value it refused"
+        );
+        assert_eq!(
+            read_provider_config(dir.path())
+                .unwrap()
+                .reasoning_preference,
+            neuralnote_core::ai::ReasoningPreference::default(),
+            "a refused effort must leave the stored preference untouched"
+        );
+    }
+
+    #[test]
+    fn an_effort_is_refused_while_the_model_has_no_probed_menu_at_all() {
+        // Nothing to check the value against is not permission to store it —
+        // §4.2 allows an effort on the wire only when it came off a probed menu.
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                active_provider: Some(ProviderKind::OpenRouter),
+                model: "test/effort-unprobed".into(),
+                ..ProviderConfig::default()
+            },
+        )
+        .unwrap();
+
+        assert!(set_reasoning_effort_in(
+            dir.path(),
+            &ProviderConfigMutationGate::default(),
+            true,
+            Some("high".into()),
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn clearing_the_effort_returns_to_the_models_default_without_switching_reasoning_off() {
+        // "Take the model's own default effort" and "stop reasoning" are two
+        // different requests; the second one is `set_reasoning(false)`.
+        let dir = tempfile::tempdir().unwrap();
+        let gate = ProviderConfigMutationGate::default();
+        config_with_probed_menu(dir.path(), "test/effort-clear", &["xhigh", "low"]);
+        set_reasoning_effort_in(dir.path(), &gate, true, Some("xhigh".into())).unwrap();
+
+        let status = set_reasoning_effort_in(dir.path(), &gate, true, None).unwrap();
+
+        assert!(status.openrouter.reasoning);
+        assert_eq!(status.openrouter.reasoning_effort, None);
     }
 }

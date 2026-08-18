@@ -6,4 +6,14 @@ export type OpenRouterStatus = { hasKey: boolean, model: string,
  * OpenRouter status DTO for compatibility, while both providers use the same
  * persisted opt-in.
  */
-reasoning: boolean, };
+reasoning: boolean, 
+/**
+ * The effort the user picked off this model's own menu, or `null` for the
+ * model's own default. Sits beside `reasoning` for the same reason it does:
+ * one persisted preference, surfaced where the existing control reads it.
+ *
+ * Never a value we chose. It is only ever set by `set_reasoning_effort`,
+ * which refuses anything the probed menu does not offer, and it is cleared
+ * whenever the selected model changes.
+ */
+reasoningEffort: string | null, };

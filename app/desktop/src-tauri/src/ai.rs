@@ -17,8 +17,8 @@ use neuralnote_core::ai::tool_turn_reader::{StreamedToolTurn, ToolTurnReader};
 use neuralnote_core::ai::{openai, provider_config, tool_stream};
 use neuralnote_core::ai::{
     openrouter_reasoning_support, parse_openrouter_context_windows, parse_openrouter_input_pricing,
-    ChatEvent, Completion, EventSink, LlmClient, LlmMessage, LlmRequest, ReasoningSupport,
-    RetryDelay, Role, TokenUsage,
+    parse_openrouter_reasoning_controls, ChatEvent, Completion, EventSink, LlmClient, LlmMessage,
+    LlmRequest, ReasoningControl, ReasoningSupport, RetryDelay, Role, TokenUsage,
 };
 use neuralnote_core::capture::ModelPricing;
 use neuralnote_core::CoreError;
@@ -289,6 +289,12 @@ static OPENROUTER_PRICING_CACHE: OnceLock<Mutex<BTreeMap<String, ModelPricing>>>
 /// the prompt against the cloud model's real window (issue #22); a miss means
 /// "unknown" and budgeting stays inert — never guessed.
 static OPENROUTER_CONTEXT_WINDOW_CACHE: OnceLock<Mutex<BTreeMap<String, usize>>> = OnceLock::new();
+/// The reasoning control per model id, warmed from the SAME `/models` body as the
+/// two caches above. A miss means the catalogue has not answered for that id yet
+/// (never fetched, or a hand-typed model), which the status read surfaces as
+/// `Pending` — never as a guessed menu (decision 2).
+static OPENROUTER_REASONING_CONTROL_CACHE: OnceLock<Mutex<BTreeMap<String, ReasoningControl>>> =
+    OnceLock::new();
 
 /* ─────────────────────────────  Keychain  ──────────────────────────────── */
 
@@ -742,6 +748,7 @@ pub async fn probe_openrouter_reasoning(model: &str) -> ReasoningSupport {
 
     cache_openrouter_pricing(&body, model);
     cache_openrouter_model_windows(&body);
+    cache_openrouter_reasoning_controls(&body);
     openrouter_reasoning_support(&body, model)
 }
 
@@ -798,6 +805,34 @@ pub fn cached_openrouter_context_window(model: &str) -> Option<usize> {
         .copied()
 }
 
+/// Warm the reasoning-control cache from a validated public `/models` body, on
+/// the same terms as the window cache above: tolerant, opportunistic, and warmed
+/// from the one fetch the probe already makes. Two fetches would be two caches
+/// with two staleness windows for one question.
+pub fn cache_openrouter_reasoning_controls(models_json: &str) {
+    let Some(controls) = parse_openrouter_reasoning_controls(models_json) else {
+        return;
+    };
+    let mut cache = OPENROUTER_REASONING_CONTROL_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.extend(controls);
+}
+
+/// What the catalogue says this model's reasoning control should be. `None` = the
+/// catalogue has not answered for this id — no fetch yet this session, or an id
+/// it does not list — which the caller renders as "still checking" rather than
+/// inventing a menu for it.
+pub fn cached_openrouter_reasoning_control(model: &str) -> Option<ReasoningControl> {
+    OPENROUTER_REASONING_CONTROL_CACHE
+        .get_or_init(|| Mutex::new(BTreeMap::new()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(model)
+        .cloned()
+}
+
 /* ─────────────────────────────  LLM client  ────────────────────────────── */
 
 /// OpenAI-compatible [`LlmClient`]. Holds one reusable HTTP client and endpoint
@@ -816,11 +851,15 @@ pub struct OpenAiChatClient {
     /// budgets the assembled prompt against the real window (issue #22); `None`
     /// means unknown and budgeting stays inert.
     context_window_tokens: Option<usize>,
-    /// Whether to request streamed reasoning tokens — on the tool-deciding turns
-    /// as well as the answer turn, which is one ask rather than two. The caller
-    /// combines the user's opt-in with the selected model's capability before client
-    /// construction, for both OpenRouter and Ollama.
-    reasoning: bool,
+    /// What to ask the provider for on every turn that carries reasoning — the
+    /// tool-deciding turns as well as the answer turn, which is one ask rather
+    /// than two. `None` sends no `reasoning` object at all.
+    ///
+    /// The caller resolves it (`effective_reasoning_ask`) from the user's stored
+    /// preference and the selected model's capability before construction, for
+    /// both OpenRouter and Ollama. Holding the resolved ask rather than a flag is
+    /// what stops an effort being reconstructed, or guessed, down here.
+    reasoning: Option<openai::ReasoningAsk>,
 }
 
 impl OpenAiChatClient {
@@ -831,7 +870,7 @@ impl OpenAiChatClient {
         connect_timeout: Duration,
         read_timeout: Duration,
         num_ctx: Option<u32>,
-        reasoning: bool,
+        reasoning: Option<openai::ReasoningAsk>,
     ) -> Self {
         // Timeouts so a stalled/half-open endpoint can't hang `chat` forever with no
         // event (the "failures are never silent" contract). `connect_timeout` guards
@@ -865,7 +904,7 @@ impl OpenAiChatClient {
         self
     }
 
-    pub fn new(api_key: String, reasoning: bool) -> Self {
+    pub fn new(api_key: String, reasoning: Option<openai::ReasoningAsk>) -> Self {
         Self::new_with(
             OPENROUTER_URL.to_string(),
             Some(api_key),
@@ -873,7 +912,7 @@ impl OpenAiChatClient {
             Duration::from_secs(10),
             Duration::from_secs(120),
             None,      // OpenRouter sizes its own (large) context window.
-            reasoning, // Billed reasoning tokens — on only when the user opts in.
+            reasoning, // Billed reasoning tokens — sent only when the user opted in.
         )
     }
 
@@ -892,14 +931,14 @@ impl OpenAiChatClient {
     }
 
     /// What this client asks the provider for on a turn that carries reasoning.
-    /// Every such turn asks the same thing — planning and answer alike — so a
-    /// second, hidden reasoning setting cannot appear by drift.
+    /// Every such turn asks the same thing — planning and answer alike (locked
+    /// decision 7) — so a second, hidden reasoning setting cannot appear by
+    /// drift.
     ///
-    /// `Enabled` rather than an effort: the client is built from a boolean
-    /// opt-in, so no effort has been chosen. Naming one here would substitute our
-    /// guess for the model's own default.
+    /// It is handed back exactly as the caller resolved it. Nothing is decided
+    /// here, because an effort may only be a value the model's own menu offered.
     fn reasoning_ask(&self) -> Option<openai::ReasoningAsk> {
-        self.reasoning.then_some(openai::ReasoningAsk::Enabled)
+        self.reasoning.clone()
     }
 
     /// The tool-deciding turn's wire body. Streamed, **uncapped** so long
@@ -1354,7 +1393,7 @@ mod tests {
             Duration::from_secs(3600),
             Duration::from_secs(3600),
             None,
-            false,
+            None,
         );
         let judge = ApprovalJudge::new(&client, "some/model");
 
@@ -2219,22 +2258,98 @@ mod tests {
     #[test]
     fn openai_client_requests_reasoning_only_when_enabled() {
         // The answer turn is the one that can carry the billed reasoning request.
-        // `new(key, false)` must omit it entirely; `new(key, true)` must ask for it
-        // — proving the opt-in flag threads through to the wire body.
+        // A client built with no ask must omit it entirely; one built with an ask
+        // must carry it — proving the opt-in threads through to the wire body.
         let req = LlmRequest {
             model: "anthropic/claude-sonnet-4.5".into(),
             messages: vec![LlmMessage::user("q")],
             tools: Vec::new(),
         };
 
-        let off = OpenAiChatClient::new("sk-test".into(), false).answer_wire_body(&req);
+        let off = OpenAiChatClient::new("sk-test".into(), None).answer_wire_body(&req);
         assert!(
             off.get("reasoning").is_none(),
             "reasoning must be omitted when the user hasn't opted in"
         );
 
-        let on = OpenAiChatClient::new("sk-test".into(), true).answer_wire_body(&req);
+        let on = OpenAiChatClient::new("sk-test".into(), Some(openai::ReasoningAsk::Enabled))
+            .answer_wire_body(&req);
         assert_eq!(on["reasoning"]["enabled"], true);
+    }
+
+    #[test]
+    fn a_chosen_effort_reaches_the_wire_on_both_turn_types() {
+        // Locked decision 7: the effort the user picked applies to the planning
+        // turns as well as the answer, so there is one knob rather than a hidden
+        // second setting. The value goes out verbatim — never lower-cased, never
+        // mapped onto a tier scale of ours.
+        let client = OpenAiChatClient::new(
+            "sk-test".into(),
+            Some(openai::ReasoningAsk::Effort("xHigh".into())),
+        );
+        let req = tool_request();
+
+        let answer = client.answer_wire_body(&req);
+        assert_eq!(
+            answer["reasoning"],
+            serde_json::json!({ "effort": "xHigh" })
+        );
+        assert_eq!(
+            client.tool_wire_body(&req, true)["reasoning"],
+            answer["reasoning"]
+        );
+        assert_eq!(
+            client.tool_wire_body(&req, false)["reasoning"],
+            answer["reasoning"]
+        );
+    }
+
+    #[test]
+    fn reasoning_control_cache_warms_from_the_same_catalogue_body() {
+        // One fetch, one cache. A second call for the effort menu would be a
+        // second cache with its own staleness.
+        let id = TEST_ID.fetch_add(1, Ordering::SeqCst);
+        let menu = format!("test/control-menu-{id}");
+        let silent = format!("test/control-silent-{id}");
+        let unlisted = format!("test/control-unlisted-{id}");
+        assert_eq!(cached_openrouter_reasoning_control(&menu), None);
+
+        cache_openrouter_reasoning_controls(
+            &serde_json::json!({
+                "data": [
+                    { "id": menu, "reasoning": {
+                        "mandatory": false,
+                        "supported_efforts": ["high", "low", "none"],
+                        "default_effort": "high"
+                    } },
+                    { "id": silent }
+                ]
+            })
+            .to_string(),
+        );
+
+        assert_eq!(
+            cached_openrouter_reasoning_control(&menu),
+            Some(ReasoningControl::Efforts {
+                options: vec!["high".into(), "low".into()],
+                default_effort: Some("high".into()),
+                can_disable: true,
+            })
+        );
+        // Listed but silent IS an answer, and a different one from "not in this
+        // body at all" — only the second leaves the control unanswered.
+        assert_eq!(
+            cached_openrouter_reasoning_control(&silent),
+            Some(ReasoningControl::Hidden)
+        );
+        assert_eq!(cached_openrouter_reasoning_control(&unlisted), None);
+
+        // A malformed body warms nothing and leaves the cache intact (fail-open).
+        cache_openrouter_reasoning_controls("{not json");
+        assert_eq!(
+            cached_openrouter_reasoning_control(&silent),
+            Some(ReasoningControl::Hidden)
+        );
     }
 
     /* ─────────────  The streamed tool-deciding turn (contract C6)  ───────────── */
@@ -2342,7 +2457,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(5),
             None,
-            false,
+            None,
         )
     }
 
@@ -2356,7 +2471,7 @@ mod tests {
             Duration::from_secs(5),
             Duration::from_secs(5),
             Some(num_ctx),
-            false,
+            None,
         )
     }
 
@@ -2453,7 +2568,7 @@ mod tests {
         // Reasoning because the tool-deciding turn is where a run spends most of
         // its wall clock, and the rail renders those frames now instead of
         // dropping them — so asking for them buys the planning phase a voice.
-        let client = OpenAiChatClient::new("sk-test".into(), true);
+        let client = OpenAiChatClient::new("sk-test".into(), Some(openai::ReasoningAsk::Enabled));
         let req = tool_request();
 
         let streamed = client.tool_wire_body(&req, true);
@@ -2485,7 +2600,7 @@ mod tests {
         // The opt-in is the only thing that turns reasoning on, and it now gates
         // up to 16 planning turns rather than one answer turn — so a client built
         // without it must send no `reasoning` object anywhere.
-        let client = OpenAiChatClient::new("sk-test".into(), false);
+        let client = OpenAiChatClient::new("sk-test".into(), None);
         let req = tool_request();
 
         assert!(
@@ -2774,7 +2889,7 @@ mod tests {
             Duration::from_secs(1),
             Duration::from_secs(1),
             Some(neuralnote_core::ai::local::OLLAMA_NUM_CTX),
-            false,
+            None,
         );
         assert_eq!(
             local.context_window_tokens(),
@@ -2783,7 +2898,7 @@ mod tests {
 
         // OpenRouter: unknown until the catalogue cache warms (inert-with-reason),
         // then the catalogue `context_length`.
-        let cloud = OpenAiChatClient::new("sk-test".into(), false);
+        let cloud = OpenAiChatClient::new("sk-test".into(), None);
         assert_eq!(cloud.context_window_tokens(), None);
         let cloud = cloud.with_context_window(Some(200_000));
         assert_eq!(cloud.context_window_tokens(), Some(200_000));

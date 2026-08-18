@@ -365,7 +365,7 @@ async fn openrouter_behavioural_eval() {
     };
 
     let vault = fixture_vault();
-    let client = desktop_lib::OpenAiChatClient::new(api_key, false);
+    let client = desktop_lib::OpenAiChatClient::new(api_key, None);
     run_five_cases(vault.path(), neuralnote_core::ai::DEFAULT_MODEL, &client).await;
 }
 
