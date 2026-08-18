@@ -11,9 +11,15 @@
 // The measurements are taken at the docked pane's own content width, derived
 // from the tokens rather than guessed: `--chat-width`'s floor is 26.25rem, the
 // transcript pads it `px-4`, the turn `px-3` inside a 1px border, and the
-// timeline fold `px-2.5`. That leaves the head 342px, which is the narrowest
-// this component is ever asked to lay out and therefore the only width where a
-// second line could appear.
+// timeline fold `px-2.5`. That leaves the head 342px.
+//
+// That is the width of the FLOOR of the base token, and it is not the narrowest
+// the pane is ever laid out: `styles.css` narrows `--chat-width` to 25.5rem at
+// ≤1280px — the app's own default window — and further below that. `HEAD_WIDTH`
+// is left where it is because the footprint assertions below are equalities
+// between two mounts and hold at any width, while `TOOL_LINE_WIDTH` measures a
+// WRAP, which appears at one width and not another. A wrap defect that survived
+// review is what that distinction costs when it is not made.
 
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
@@ -30,6 +36,14 @@ import { STALL_AFTER_MS } from "./turnLiveness";
 
 /** 26.25rem − 2×16 (transcript) − 2×12 (turn) − 2×1 (border) − 2×10 (fold). */
 const HEAD_WIDTH = 342;
+
+/** The same chain at the `--chat-width` the app's own default window resolves
+ *  (25.5rem, the ≤1280px tier): 408 − 32 − 24 − 2 = 350, and the fold's `px-2.5`
+ *  is left on because this host renders the fold itself. Inside it a tool node's
+ *  line gets 268px — 330 − 2 (fold border) − 20 (`px-2.5`) − 18 (the rail's
+ *  `pl-[18px]`) − 22 (glyph + `gap-2`) — and 268 is where the title line wraps. */
+const DOCKED_HOST_WIDTH = 330;
+const TOOL_LINE_WIDTH = 268;
 
 const mounted: Array<{ host: HTMLElement; root: Root }> = [];
 
@@ -54,9 +68,9 @@ afterEach(() => {
  *  and a case that feeds a past `lastEventAt` then measures a threshold against
  *  a clock captured a millisecond too early — green or red depending on which
  *  side of a millisecond boundary the two `Date.now()` calls landed. */
-function mount(overrides: Partial<AssistantMessage>) {
+function mount(overrides: Partial<AssistantMessage>, width = HEAD_WIDTH) {
   const host = document.createElement("div");
-  host.style.width = `${HEAD_WIDTH}px`;
+  host.style.width = `${width}px`;
   document.body.append(host);
   const root = createRoot(host);
   mounted.push({ host, root });
@@ -287,6 +301,132 @@ describe("a running tool's progress line holds the footprint it hands over", () 
 
     expect(settled.nodes[0].textContent).toContain("Details");
     expect(height(settled.nodes[0])).toBe(height(running.nodes[0]));
+  });
+});
+
+describe("a settled node breaks between its parts, never inside one", () => {
+  /** One line of the rail's own type: 0.6875rem at `leading-snug` = 15.125.
+   *
+   *  It is exactly that, and not the taller box a mixed-font line produces,
+   *  precisely BECAUSE each part is its own inline-block: the mono run's ascent
+   *  and descent are resolved inside its own box instead of stretching the line
+   *  it sits on. */
+  const LINE = 15.125;
+
+  /** The title line of the first node, at the width the wrap appears at. */
+  function titleLine(call: Partial<ToolCallView>) {
+    const { nodes } = mount(
+      { phase: "planning", toolCalls: [toolCall({ title: "Search notes", ...call })] },
+      DOCKED_HOST_WIDTH,
+    );
+    return nodes[0].querySelector("p")!;
+  }
+
+  it("keeps a summary whole instead of orphaning its last word", () => {
+    // The reported line, verbatim: at 268px this read
+    // `Search notes · spaced repetition · 12` / `spans`, with the summary's own
+    // last word alone on the second line. The break belongs before the `·`.
+    const line = titleLine({
+      status: "ok",
+      summary: "12 spans",
+      arguments: JSON.stringify({ query: "spaced repetition" }),
+    });
+
+    expect(line.getBoundingClientRect().width).toBeCloseTo(TOOL_LINE_WIDTH, 0);
+    const summary = [...line.querySelectorAll("span")].find((span) =>
+      span.textContent?.startsWith("· 12 spans"),
+    )!;
+    // One line of its own, wherever it landed — a part that fits nowhere on the
+    // line it started on moves whole rather than splitting.
+    expect(summary.getBoundingClientRect().height).toBeCloseTo(LINE, 1);
+  });
+
+  it("keeps a two-word settlement whole too", () => {
+    // `refused by NeuralNote` and `run ended first` are the same shape as the
+    // summary and would orphan the same way; they are also the lines a user
+    // reads most carefully.
+    const line = titleLine({
+      status: "rejected",
+      summary: "12 spans",
+      arguments: JSON.stringify({ query: "spaced repetition" }),
+    });
+
+    const label = [...line.querySelectorAll("span")].find((span) =>
+      span.textContent?.startsWith("· refused"),
+    )!;
+    expect(label.getBoundingClientRect().height).toBeCloseTo(LINE, 1);
+  });
+
+  it("reads the same as it always did, one space between the parts", () => {
+    // The separator travels with the part it introduces and the space before it
+    // stays outside, so the sentence is unchanged — the fix is where the line
+    // may break, not what it says.
+    const line = titleLine({
+      status: "ok",
+      summary: "12 spans",
+      arguments: JSON.stringify({ query: "spaced repetition" }),
+    });
+
+    expect(line.textContent).toBe("Search notes · spaced repetition · 12 spans");
+  });
+
+  it("wraps a summary longer than the column instead of scrolling the pane", () => {
+    // The trap in the obvious fix. `whitespace-nowrap` keeps the part whole and
+    // pushes the pane into horizontal scroll the first time a note name runs
+    // past the column — ablated, this case goes red exactly that way.
+    //
+    // The name has no hyphen, slash, dot or space in it on purpose: those are
+    // all break opportunities, and a fixture carrying one wraps under any
+    // setting and would prove nothing. This one can only be broken by
+    // `overflow-wrap`, which is also the only thing that keeps the box's
+    // MIN-CONTENT width inside the column.
+    const line = titleLine({
+      status: "ok",
+      summary: "SpacedRepetitionAndTheForgettingCurveInPracticeAnnotated",
+      arguments: JSON.stringify({ query: "spaced repetition" }),
+    });
+
+    expect(line.scrollWidth).toBeLessThanOrEqual(line.clientWidth);
+    // And it really is longer than one line — otherwise the case above proves
+    // nothing about a part that has to break inside itself.
+    expect(line.getBoundingClientRect().height).toBeGreaterThan(2 * LINE);
+  });
+
+  it("keeps a plan step's own verdict whole as well", () => {
+    // The same anatomy one level up, and the same defect: a model-written step
+    // label runs to the column edge and the step's account — "skipped as
+    // unnecessary", "did not work" — breaks across two lines of it. Fixing the
+    // cited line and leaving its sibling would be fixing the instance.
+    const { nodes } = mount(
+      {
+        phase: "planning",
+        planSteps: [
+          {
+            id: "s1",
+            label: "Check whether the vault already has notes on this",
+            status: "skipped",
+          },
+        ],
+      },
+      DOCKED_HOST_WIDTH,
+    );
+    const account = [...nodes[0].querySelectorAll("span")].find((span) =>
+      span.textContent?.startsWith("· skipped"),
+    )!;
+
+    expect(account.getBoundingClientRect().height).toBeCloseTo(LINE, 1);
+    expect(nodes[0].querySelector("p")!.textContent).toBe(
+      "Check whether the vault already has notes on this · skipped as unnecessary",
+    );
+  });
+
+  it("does not move the line the user was already reading", () => {
+    // A settled node is not transient, but it sits above every node dispatched
+    // after it: a part that changed the line COUNT would push the rest of the
+    // rail down. One line before, one line after.
+    const short = titleLine({ status: "ok", summary: "12 spans" });
+
+    expect(short.getBoundingClientRect().height).toBeCloseTo(LINE, 1);
   });
 });
 

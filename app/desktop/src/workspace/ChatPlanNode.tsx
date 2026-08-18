@@ -15,7 +15,7 @@ import type { LucideIcon } from "lucide-react";
 import { cn } from "../lib/cn";
 import type { StepStatus } from "../lib/types";
 import type { PlanStepView } from "./chatMessage";
-import { TimelineNode } from "./ChatTimelineNodes";
+import { QUALIFIER, TimelineNode } from "./ChatTimelineNodes";
 
 /** How each declared status reads.
  *
@@ -123,7 +123,16 @@ export function PlanStepNode({
             describes — the reading order the glyph column has visually. */}
         {!chrome.visible && <span className="sr-only">{`${chrome.account}: `}</span>}
         <span className={chrome.labelTone}>{step.label}</span>
-        {chrome.visible && <span className={chrome.tone}> · {chrome.account}</span>}
+        {/* Kept whole for the same reason a tool node's summary is (`QUALIFIER`
+            carries the whole argument): both visible accounts are more than one
+            word, and left to ordinary inline layout the step's own verdict
+            breaks across two lines of a model-written label. */}
+        {chrome.visible && (
+          <>
+            {" "}
+            <span className={cn(QUALIFIER, chrome.tone)}>· {chrome.account}</span>
+          </>
+        )}
       </p>
       {nodes.length > 0 && (
         // The nested list needs no indent of its own: it starts where the step's

@@ -225,6 +225,40 @@ const HINT_FIELDS = [
  *  account. */
 const MAX_HINT_CHARS = 64;
 
+/** A ` · x` qualifier on a node's title line, kept whole.
+ *
+ *  The line is a sequence of parts separated by `·`, and left to ordinary inline
+ *  layout it breaks at ANY space in it — so a settled search read
+ *  `Search notes · spaced repetition · 12` / `spans` at the docked width, with
+ *  the summary's own last word orphaned onto a line by itself. The break belongs
+ *  BETWEEN the parts, never inside one.
+ *
+ *  `inline-block` is what makes a part atomic: it takes its shrink-to-fit width,
+ *  moves whole to the next line when it does not fit on this one, and — the
+ *  reason this is not `whitespace-nowrap` — is capped at the column's width, so
+ *  a part longer than the column wraps inside itself instead of pushing the pane
+ *  into horizontal scroll. That cap is exactly what `nowrap` would throw away.
+ *
+ *  Two companions, both load-bearing:
+ *
+ *  * `wrap-anywhere` (`overflow-wrap: anywhere`) rather than the `break-words`
+ *    it inherits. Only `anywhere` contributes its break opportunities to
+ *    MIN-CONTENT width; under `break-word` an unbreakable 60-character summary
+ *    would size this box past the column and overflow the pane, which is the
+ *    guarantee the browser tier asserts.
+ *  * `align-top`, which does two jobs and is ablation-proved on the first.
+ *    Baseline-aligning a `nn-mono` box on a line of Inter resolves two different
+ *    ascent/descent pairs against one baseline and grows the line box —
+ *    measured 16.125 against `leading-snug`'s own 15.125, on the most ordinary
+ *    settled node there is. And because an inline-block's baseline is its LAST
+ *    line, a part that wrapped internally would otherwise drag the text beside
+ *    it down a row.
+ *
+ *  The separator sits inside the box so it travels with the part it introduces;
+ *  the space before it is a plain text node outside, where it stays a break
+ *  opportunity instead of being trimmed at the start of a line. */
+export const QUALIFIER = "inline-block align-top wrap-anywhere";
+
 /** The widened disclosure's column heading. Quiet enough to be furniture. */
 const COLUMN_LABEL =
   "text-[0.5625rem] font-semibold uppercase tracking-[0.08em] text-muted-foreground/60";
@@ -361,14 +395,29 @@ export function ToolNode({
               never renders a label the model invented. */}
           {call.title}
         </span>
+        {/* The hint is the one part deliberately left to flow: it runs to 64
+            characters, which is wider than the column on its own, and made
+            atomic it would abandon the tail of the title's line before wrapping
+            anyway. It is also the part whose internal breaks read best — it is
+            a sentence the model wrote. */}
         {showHint && (
           <span className="nn-mono text-muted-foreground/70"> · {hint}</span>
         )}
         {summary !== null && (
-          <span className="nn-mono text-muted-foreground/70"> · {summary}</span>
+          <>
+            {" "}
+            <span className={cn(QUALIFIER, "nn-mono text-muted-foreground/70")}>
+              · {summary}
+            </span>
+          </>
         )}
         {settled !== null && settled.label !== "" && (
-          <span className={settled.tone}> · {settled.label}</span>
+          <>
+            {" "}
+            <span className={cn(QUALIFIER, settled.tone)}>
+              · {settled.label}
+            </span>
+          </>
         )}
       </p>
       {settled === null && <ProgressLine text={call.progress} />}
