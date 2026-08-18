@@ -28,6 +28,7 @@ import { cn } from "../lib/cn";
 import type { ReasoningControl } from "../lib/types";
 import { buttonVariants } from "@/components/ui/button";
 import { InlineError } from "./ProviderCard";
+import { reasoningAlwaysOn } from "./reasoningSupport";
 
 /** The `<select>` value standing for "send no effort at all" —
  *  `setReasoningEffort(null)`. It is NOT one of the model's values and never
@@ -42,9 +43,13 @@ const BILLED = "Reasoning tokens are billed by OpenRouter.";
 const LABEL = "Show model reasoning";
 
 /** Which affordance sits beside the label. Derived from the variant alone —
- *  `efforts` splits on `can_disable` because that is the field that says whether
- *  there is an off position at all (amendment D1 folded the `"none"` sentinel
- *  into it, so off is one affordance, always, and never a menu item). */
+ *  whether there is an off position at all is `reasoningAlwaysOn`'s answer, the
+ *  same one the composer's chip reads (amendment D1 folded the `"none"` sentinel
+ *  into it, so off is one affordance, always, and never a menu item).
+ *
+ *  Shared rather than re-derived here on purpose: this pane and the composer
+ *  render the same fact, and the second copy is what let them tell one model's
+ *  user two different things. */
 type Affordance = "checkbox" | "alwaysOn" | "checking" | "unavailable";
 
 function affordanceFor(control: ReasoningControl): Affordance {
@@ -54,11 +59,9 @@ function affordanceFor(control: ReasoningControl): Affordance {
     case "pending":
       return "checking";
     case "locked":
-      return "alwaysOn";
     case "toggle":
-      return "checkbox";
     case "efforts":
-      return control.canDisable ? "checkbox" : "alwaysOn";
+      return reasoningAlwaysOn(control) ? "alwaysOn" : "checkbox";
   }
 }
 

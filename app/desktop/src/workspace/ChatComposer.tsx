@@ -92,7 +92,7 @@ export function ChatComposer({
   onToggleReasoning,
   savingReasoning,
   capability,
-  reasoningOn,
+  reasoningIndicatorOn,
   reasoningReasonId,
 }: Readonly<{
   stopError: string | null;
@@ -123,7 +123,10 @@ export function ChatComposer({
   onToggleReasoning: () => void;
   savingReasoning: boolean;
   capability: ReasoningCapability;
-  reasoningOn: boolean;
+  /** Whether the reasoning affordance reads as ON — the persisted opt-in OR a
+   *  model whose reasoning cannot be turned off. Derived by
+   *  `useChatPaneProvider`; this file renders it and derives nothing. */
+  reasoningIndicatorOn: boolean;
   reasoningReasonId: string;
 }>) {
   return (
@@ -220,18 +223,18 @@ export function ChatComposer({
           // lives in toggleReasoning.
           disabled={savingReasoning}
           aria-disabled={capability.disabled || undefined}
-          aria-pressed={reasoningOn}
+          aria-pressed={reasoningIndicatorOn}
           aria-label="Show model reasoning"
           aria-describedby={capability.reason ? reasoningReasonId : undefined}
           className={cn(
             "flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.625rem] font-medium ring-1 ring-inset transition-colors motion-reduce:transition-none",
             "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
-            reasoningOn
+            reasoningIndicatorOn
               ? "bg-primary/10 text-primary ring-primary/30"
               : "text-muted-foreground ring-border",
             savingReasoning || capability.disabled
               ? "cursor-not-allowed opacity-50"
-              : !reasoningOn && "hover:bg-muted hover:text-foreground",
+              : !reasoningIndicatorOn && "hover:bg-muted hover:text-foreground",
           )}
           >
             <Brain className="size-3 shrink-0" aria-hidden />

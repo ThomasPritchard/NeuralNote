@@ -431,6 +431,51 @@ describe("ChatPane — composer reasoning toggle", () => {
     expect(mockAiStatus).toHaveBeenCalledTimes(1);
   });
 
+  it("reads as on for a mandatory model whatever the persisted opt-in says", async () => {
+    // Two surfaces, one fact. Settings renders `locked` as "Always on" from the
+    // control; the chip used to render the persisted opt-in, so a user who had
+    // once opted out saw the composer say reasoning was off on a model that
+    // always reasons — the same fact, answered two ways.
+    const locked = openRouterActive(DEFAULT_MODEL, {
+      reasoning: false,
+      reasoningSupported: "supported",
+      reasoningControl: { kind: "locked" },
+    });
+    mockAiStatus.mockResolvedValue(locked);
+    mockRefreshSupport.mockResolvedValue(locked);
+    const { user } = setup();
+
+    const toggle = await findChip();
+    await waitFor(() => expect(toggle).toHaveAttribute("aria-pressed", "true"));
+
+    // And it is not a toggle: there is no off position to write, exactly as
+    // Settings renders no checkbox for this control.
+    await user.click(toggle);
+    expect(mockSetReasoning).not.toHaveBeenCalled();
+    expect(toggle).toHaveAttribute("aria-pressed", "true");
+  });
+
+  it("still follows the opt-in on a model that reasons by default but can be told not to", async () => {
+    // `default_on` is the MODEL's default, never the user's setting.
+    const optional = openRouterActive(DEFAULT_MODEL, {
+      reasoning: false,
+      reasoningSupported: "supported",
+      reasoningControl: { kind: "toggle", defaultOn: true },
+    });
+    mockAiStatus.mockResolvedValue(optional);
+    mockRefreshSupport.mockResolvedValue(optional);
+    mockSetReasoning.mockResolvedValue(
+      openRouterActive(DEFAULT_MODEL, { reasoning: true }),
+    );
+    const { user } = setup();
+
+    const toggle = await findChip();
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+
+    await user.click(toggle);
+    expect(mockSetReasoning).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
   it("surfaces a rejected reasoning write inline and stays off", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive());
     mockSetReasoning.mockRejectedValue({

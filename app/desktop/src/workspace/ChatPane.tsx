@@ -256,7 +256,7 @@ export function ChatPane({
             onToggleReasoning={() => void provider.toggleReasoning()}
             savingReasoning={provider.savingReasoning}
             capability={provider.capability}
-            reasoningOn={provider.reasoningOn}
+            reasoningIndicatorOn={provider.reasoningIndicatorOn}
             reasoningReasonId={provider.reasoningReasonId}
           />
         </>
