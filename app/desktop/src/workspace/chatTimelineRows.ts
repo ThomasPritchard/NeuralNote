@@ -7,7 +7,7 @@
 // React, nothing here reads or composes backend prose.
 
 import type { ApprovalDegradedReason } from "../lib/types";
-import { reasoningSegments } from "./chatMessage";
+import { reasoningSegments } from "./chatTurnReadouts";
 import type {
   AssistantMessage,
   PlanStepView,

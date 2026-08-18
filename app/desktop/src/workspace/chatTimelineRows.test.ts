@@ -10,11 +10,11 @@ import { describe, expect, it } from "vitest";
 import type { ChatEvent, StepStatus } from "../lib/types";
 import {
   emptyAssistant,
-  reduceAssistant,
   type AssistantMessage,
   type PlanStepView,
   type ToolCallView,
 } from "./chatMessage";
+import { reduceAssistant } from "./chatMessageReducer";
 import {
   keyed,
   railCalls,

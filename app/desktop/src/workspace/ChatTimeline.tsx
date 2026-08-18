@@ -20,7 +20,7 @@
 // every label from the backend, so nothing here composes or matches prose.
 
 import { ChevronRight, Hourglass, Loader2 } from "lucide-react";
-import { searchOutcome, summarizeActivity } from "./chatMessage";
+import { searchOutcome, summarizeActivity } from "./chatTurnReadouts";
 import type { AssistantMessage, ToolCallView } from "./chatMessage";
 import { cn } from "../lib/cn";
 import { approvalNodeState } from "./approvalCopy";

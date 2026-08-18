@@ -20,10 +20,10 @@ import { render, screen, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   emptyAssistant,
-  reduceAssistant,
   type AssistantMessage,
   type ChatMessage,
 } from "./chatMessage";
+import { reduceAssistant } from "./chatMessageReducer";
 import type { ChatEvent, NoteKind } from "../lib/types";
 
 // `SkillReportCard` (rendered by the same turn once a write lands) calls the

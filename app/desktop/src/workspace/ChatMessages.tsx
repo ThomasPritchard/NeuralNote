@@ -16,7 +16,7 @@ import {
   modelReportedProvenance,
   resolveAnswerMarkers,
   showsNothingFoundCard,
-} from "./chatMessage";
+} from "./chatTurnReadouts";
 import type {
   AssistantMessage,
   ChatMessage,

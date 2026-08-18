@@ -11,6 +11,16 @@
 //
 // The import of `AssistantMessage` is type-only, so the apparent cycle with
 // `chatMessage.ts` is erased at compile time and there is no runtime cycle.
+//
+// **This file is deliberately over the 500-line guardrail, and `foldEvent` is
+// deliberately over the 50-line function tripwire.** The switch is ~60% of it
+// and cannot be broken up without losing the guarantee above; the rest is the
+// per-arm correlation rules, and those touch five *different* fields of the turn
+// (`activity`, `toolCalls`, `noteEdits`, `toolApprovals`, `reasoningBoundaries`)
+// while sharing nothing but a shape. Grouping them into one "helpers" module
+// would split on that shape rather than on a responsibility, and would move each
+// rule's rationale away from the single arm it explains. Measured, not assumed:
+// deleting one arm reds `tsc` with TS2366 at `foldEvent`.
 
 import type { ChatEvent, PlaylistPosition } from "../lib/types";
 import type {

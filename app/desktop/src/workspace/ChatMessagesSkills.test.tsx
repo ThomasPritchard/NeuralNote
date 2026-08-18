@@ -7,7 +7,8 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { emptyAssistant, reduceAssistant, type AssistantMessage } from "./chatMessage";
+import { emptyAssistant, type AssistantMessage } from "./chatMessage";
+import { reduceAssistant } from "./chatMessageReducer";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();

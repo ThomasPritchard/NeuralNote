@@ -10,13 +10,8 @@ import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import type { ChatEvent } from "../lib/types";
 import { toHistory } from "./chatHistory";
-import {
-  emptyAssistant,
-  markAssistantStopped,
-  reduceAssistantForTurn,
-  userMessage,
-  type ChatMessage,
-} from "./chatMessage";
+import { emptyAssistant, userMessage, type ChatMessage } from "./chatMessage";
+import { markAssistantStopped, reduceAssistantForTurn } from "./chatTurnStream";
 import type { SkillPickerEntry } from "./skillAutocomplete";
 
 export interface ChatPaneChat {

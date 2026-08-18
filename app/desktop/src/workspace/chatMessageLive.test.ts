@@ -7,12 +7,12 @@ import { describe, expect, it } from "vitest";
 import type { ChatEvent } from "../lib/types";
 import {
   emptyAssistant,
-  reduceAssistant,
-  reduceAssistantForTurn,
   userMessage,
   type AssistantMessage,
   type ChatMessage,
 } from "./chatMessage";
+import { reduceAssistant } from "./chatMessageReducer";
+import { reduceAssistantForTurn } from "./chatTurnStream";
 import { STALL_AFTER_MS, turnLiveness } from "./turnLiveness";
 
 function run(events: ChatEvent[]): AssistantMessage {
