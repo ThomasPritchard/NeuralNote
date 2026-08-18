@@ -15,6 +15,7 @@
 //! [`EvidenceSpan`] shape, with no change to the chat layer.
 
 pub mod approval;
+mod call_channel;
 pub mod capabilities;
 pub mod elicitation;
 pub mod events;
@@ -39,6 +40,7 @@ pub mod tools;
 pub mod verify;
 pub mod write_policy;
 pub mod youtube;
+mod youtube_preview;
 mod youtube_route;
 mod youtube_selection;
 mod youtube_tool_errors;

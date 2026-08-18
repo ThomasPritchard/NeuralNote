@@ -1,5 +1,6 @@
 //! Model-facing schemas and dispatch policy for the YouTube distil skill.
 
+use crate::ai::call_channel::CallChannel;
 use crate::ai::elicitation::{elicit_user, ElicitationOutcome};
 use crate::ai::events::{ChatEvent, ElicitOption, Elicitation};
 use crate::ai::llm::UserPrompt;
@@ -9,6 +10,7 @@ use crate::ai::youtube::{
     CaptionPayload, CaptionRequest, MetadataPayload, PotMode, YoutubeAnnotation, YoutubeIo,
     YoutubeToolSession, YoutubeUrl,
 };
+use crate::ai::youtube_preview;
 use crate::ai::youtube_tool_errors::{settle_capture_error, settle_session_capture_error};
 use crate::capture::{
     estimate_transcript_cost, parse_video_metadata, parse_vtt, render_youtube_transcript,
@@ -37,6 +39,7 @@ fn default_language() -> String {
 }
 
 pub(super) async fn dispatch_fetch_video_info(
+    call_id: &str,
     args_json: &str,
     context: &mut ToolContext<'_>,
 ) -> ToolResult {
@@ -48,37 +51,43 @@ pub(super) async fn dispatch_fetch_video_info(
         Ok(url) => url,
         Err(error) => return settle_capture_error(error),
     };
-    let (io, session) = match youtube_services(context) {
-        Ok(services) => services,
+    let mut work = match youtube_work(context, call_id) {
+        Ok(work) => work,
         Err(error) => return settle_capture_error(error),
     };
-    if let Err(error) = session.validate_playlist_capture_url(&url) {
-        return settle_session_capture_error(session, error);
+    if let Err(error) = work.session.validate_playlist_capture_url(&url) {
+        return settle_session_capture_error(work.session, error);
     }
-    let payload = match inspect_with_retry(io, session, &url).await {
+    let payload = match inspect_with_retry(&mut work, &url).await {
         Ok(payload) => payload,
-        Err(error) => return settle_session_capture_error(session, error),
+        Err(error) => return settle_session_capture_error(work.session, error),
     };
     let metadata = match parse_video_metadata(&payload.json) {
         Ok(metadata) => metadata,
-        Err(error) => return settle_session_capture_error(session, error),
+        Err(error) => return settle_session_capture_error(work.session, error),
     };
     let metadata_video_id = match crate::capture::VideoId::new(&metadata.video_id) {
         Ok(video_id) => video_id,
-        Err(error) => return settle_session_capture_error(session, error),
+        Err(error) => return settle_session_capture_error(work.session, error),
     };
-    if let Err(error) = session.validate_playlist_video_id(&metadata_video_id) {
-        return settle_session_capture_error(session, error);
+    if let Err(error) = work.session.validate_playlist_video_id(&metadata_video_id) {
+        return settle_session_capture_error(work.session, error);
     }
+    // Only once every check has passed, so a video the run is about to refuse
+    // never gets a card. The round beacon has already gone out, which is the
+    // ordering `ChatEvent::VideoPreview` requires of its emitter.
+    let preview = youtube_preview::video_preview(work.io, &metadata, &metadata_video_id).await;
+    work.channel.send(preview);
     let genuinely_absent = metadata.captions.is_genuinely_absent()
         && !payload
             .annotations
             .contains(&YoutubeAnnotation::SubtitleListingWithheld);
-    let annotations = combined_annotations(session, payload.annotations);
+    let annotations = combined_annotations(work.session, payload.annotations);
     action(video_info_json(&metadata, &annotations, genuinely_absent).to_string())
 }
 
 pub(super) async fn dispatch_fetch_captions(
+    call_id: &str,
     args_json: &str,
     context: &mut ToolContext<'_>,
 ) -> ToolResult {
@@ -102,19 +111,19 @@ pub(super) async fn dispatch_fetch_captions(
         ));
     }
     let pricing = context.pricing.cloned();
-    let (io, session) = match youtube_services(context) {
-        Ok(services) => services,
+    let mut work = match youtube_work(context, call_id) {
+        Ok(work) => work,
         Err(error) => return settle_capture_error(error),
     };
-    if let Err(error) = session.validate_playlist_capture_url(&url) {
-        return settle_session_capture_error(session, error);
+    if let Err(error) = work.session.validate_playlist_capture_url(&url) {
+        return settle_session_capture_error(work.session, error);
     }
-    let (payload, metadata, video_id) = match inspect_validated_metadata(io, session, &url).await {
+    let (payload, metadata, video_id) = match inspect_validated_metadata(&mut work, &url).await {
         Ok(value) => value,
-        Err(error) => return settle_session_capture_error(session, error),
+        Err(error) => return settle_session_capture_error(work.session, error),
     };
     let selection = match prepare_caption_selection(
-        session,
+        work.session,
         &url,
         &metadata,
         video_id.clone(),
@@ -122,7 +131,7 @@ pub(super) async fn dispatch_fetch_captions(
         language,
     ) {
         Ok(selection) => selection,
-        Err(error) => return settle_session_capture_error(session, error),
+        Err(error) => return settle_session_capture_error(work.session, error),
     };
     let request = CaptionRequest {
         url,
@@ -130,19 +139,19 @@ pub(super) async fn dispatch_fetch_captions(
         source: selection.source,
         pot: PotMode::Prefer,
     };
-    let payload = match captions_with_retry(io, session, &request).await {
+    let payload = match captions_with_retry(&mut work, &request).await {
         Ok(payload) => payload,
-        Err(error) => return settle_session_capture_error(session, error),
+        Err(error) => return settle_session_capture_error(work.session, error),
     };
     let rendered =
         match render_caption_payload(&payload, selection.source, &selection.language, &video_id) {
             Ok(rendered) => rendered,
-            Err(error) => return settle_session_capture_error(session, error),
+            Err(error) => return settle_session_capture_error(work.session, error),
         };
-    let mut annotations = combined_annotations(session, payload.annotations);
+    let mut annotations = combined_annotations(work.session, payload.annotations);
     let cost_estimate =
         transcript_cost_or_annotation(rendered.word_count, pricing, &mut annotations);
-    report_transcript_source(context, &rendered.provenance);
+    report_transcript_source(&mut work.channel, &rendered.provenance);
     action(
         json!({
             "video_id": metadata.video_id,
@@ -160,22 +169,21 @@ pub(super) async fn dispatch_fetch_captions(
 /// The label is the same string the model receives, so the timeline and the model
 /// can never disagree about provenance — and the UI never has to read it back out
 /// of the model's prose. No note exists yet at this point, hence no `rel_path`.
-fn report_transcript_source(context: &mut ToolContext<'_>, provenance: &str) {
-    context.sink.send(ChatEvent::TranscriptSource {
+fn report_transcript_source(channel: &mut CallChannel<'_>, provenance: &str) {
+    channel.send(ChatEvent::TranscriptSource {
         label: provenance.to_string(),
         rel_path: None,
     });
 }
 
 async fn inspect_validated_metadata(
-    io: &dyn YoutubeIo,
-    session: &mut YoutubeToolSession,
+    work: &mut YoutubeWork<'_>,
     url: &YoutubeUrl,
 ) -> Result<(MetadataPayload, VideoMetadata, crate::capture::VideoId), CaptureError> {
-    let payload = inspect_with_retry(io, session, url).await?;
+    let payload = inspect_with_retry(work, url).await?;
     let metadata = parse_video_metadata(&payload.json)?;
     let video_id = crate::capture::VideoId::new(&metadata.video_id)?;
-    session.validate_playlist_video_id(&video_id)?;
+    work.session.validate_playlist_video_id(&video_id)?;
     Ok((payload, metadata, video_id))
 }
 
@@ -245,6 +253,10 @@ pub(super) async fn dispatch_transcribe_audio(
         // not the model asking for something it may not have.
         Err(error) => return fail(error.to_string()),
     };
+    // Before the availability check, not after: installing Whisper compiles it
+    // from source, so the wait starts here rather than at the first audio frame.
+    CallChannel::new(&mut *context.sink, call_id)
+        .progress("Checking that local transcription is available");
     if let Err(result) = ensure_whisper_available(
         call_id,
         &optional_requirements,
@@ -256,23 +268,26 @@ pub(super) async fn dispatch_transcribe_audio(
     {
         return result;
     }
-    let (io, session) = match youtube_services(context) {
-        Ok(services) => services,
+    let mut work = match youtube_work(context, call_id) {
+        Ok(work) => work,
         Err(error) => return settle_capture_error(error),
     };
-    let model = session.whisper_model();
-    let payload = match transcription_with_retry(io, session, &url, model).await {
+    let model = work.session.whisper_model();
+    work.channel.progress(format!(
+        "Transcribing the audio locally with Whisper ({model}); this can take several minutes"
+    ));
+    let payload = match transcription_with_retry(&mut work, &url, model).await {
         Ok(payload) => payload,
-        Err(error) => return settle_session_capture_error(session, error),
+        Err(error) => return settle_session_capture_error(work.session, error),
     };
-    if session.cancellation().is_cancelled() {
+    if work.session.cancellation().is_cancelled() {
         return settle_capture_error(CaptureError::Cancelled(
             "transcription was cancelled".into(),
         ));
     }
     let cues = match parse_vtt(&payload.vtt) {
         Ok(cues) => cues,
-        Err(error) => return settle_session_capture_error(session, error),
+        Err(error) => return settle_session_capture_error(work.session, error),
     };
     let rendered = match render_youtube_transcript(
         &cues,
@@ -282,12 +297,12 @@ pub(super) async fn dispatch_transcribe_audio(
         &video_id,
     ) {
         Ok(rendered) => rendered,
-        Err(error) => return settle_session_capture_error(session, error),
+        Err(error) => return settle_session_capture_error(work.session, error),
     };
-    let mut annotations = combined_annotations(session, payload.annotations);
+    let mut annotations = combined_annotations(work.session, payload.annotations);
     let cost_estimate =
         transcript_cost_or_annotation(rendered.word_count, pricing, &mut annotations);
-    report_transcript_source(context, &rendered.provenance);
+    report_transcript_source(&mut work.channel, &rendered.provenance);
     action(
         json!({
             "transcript": rendered.text,
@@ -415,16 +430,35 @@ fn whisper_install_question(call_id: &str, eligibility: &Eligibility) -> Elicita
     }
 }
 
-fn youtube_services<'a>(
+/// Everything one YouTube tool call needs at once: the host seam, the per-run
+/// session, and its own channel to the user.
+///
+/// The three are handed out together because they are three disjoint fields of a
+/// single [`ToolContext`], so taking them one at a time would mean borrowing the
+/// context more than once. Bundling the channel in is what stops a long tool
+/// from being unable to say anything while it works — the seam was already
+/// there, but only the first two were ever reachable from inside a retry.
+pub(super) struct YoutubeWork<'a> {
+    pub(super) io: &'a dyn YoutubeIo,
+    pub(super) session: &'a mut YoutubeToolSession,
+    pub(super) channel: CallChannel<'a>,
+}
+
+fn youtube_work<'a>(
     context: &'a mut ToolContext<'_>,
-) -> Result<(&'a dyn YoutubeIo, &'a mut YoutubeToolSession), CaptureError> {
+    call_id: &'a str,
+) -> Result<YoutubeWork<'a>, CaptureError> {
     let session = context.youtube_session.as_deref_mut().ok_or_else(|| {
         CaptureError::RequirementMissing("YouTube per-run state is not wired".into())
     })?;
     if let Some(error) = session.terminal_error() {
         return Err(error.clone());
     }
-    Ok((context.youtube_io, session))
+    Ok(YoutubeWork {
+        io: context.youtube_io,
+        session,
+        channel: CallChannel::new(&mut *context.sink, call_id),
+    })
 }
 
 pub(super) fn validate_youtube_url(value: &str) -> Result<YoutubeUrl, CaptureError> {
@@ -511,16 +545,21 @@ fn render_caption_payload(
     )
 }
 
+/// Every attempt below narrates itself before it goes out, retries included. A
+/// retried network call that says nothing is not quieter than a hang — it is
+/// indistinguishable from one, which is the whole complaint.
 async fn inspect_with_retry(
-    io: &dyn YoutubeIo,
-    session: &mut YoutubeToolSession,
+    work: &mut YoutubeWork<'_>,
     url: &YoutubeUrl,
 ) -> Result<MetadataPayload, CaptureError> {
-    match io.inspect_metadata(url).await {
-        Err(error) => match session.decide(&error) {
+    work.channel.progress("Looking up the video on YouTube");
+    match work.io.inspect_metadata(url).await {
+        Err(error) => match work.session.decide(&error) {
             CaptureAction::UpdateExtractorAndRetry => {
-                update_extractor(io, session).await;
-                io.inspect_metadata(url).await
+                update_extractor(work).await;
+                work.channel
+                    .progress("Retrying the video lookup with the updated extractor");
+                work.io.inspect_metadata(url).await
             }
             _ => Err(error),
         },
@@ -529,21 +568,26 @@ async fn inspect_with_retry(
 }
 
 async fn captions_with_retry(
-    io: &dyn YoutubeIo,
-    session: &mut YoutubeToolSession,
+    work: &mut YoutubeWork<'_>,
     request: &CaptionRequest,
 ) -> Result<CaptionPayload, CaptureError> {
     let mut attempt = request.clone();
+    work.channel
+        .progress(format!("Fetching the {} caption track", attempt.language));
     loop {
-        match io.fetch_caption_vtt(&attempt).await {
+        match work.io.fetch_caption_vtt(&attempt).await {
             Ok(payload) => return Ok(payload),
-            Err(error) => match session.decide(&error) {
+            Err(error) => match work.session.decide(&error) {
                 CaptureAction::UpdateExtractorAndRetry => {
-                    update_extractor(io, session).await;
+                    update_extractor(work).await;
+                    work.channel
+                        .progress("Retrying the caption fetch with the updated extractor");
                 }
                 CaptureAction::ContinueWithoutPot if attempt.pot == PotMode::Prefer => {
-                    annotate_pot_fallback(session, &error);
+                    annotate_pot_fallback(work.session, &error);
                     attempt.pot = PotMode::Disabled;
+                    work.channel
+                        .progress("Retrying the caption fetch without the optional POT sidecar");
                 }
                 _ => return Err(error),
             },
@@ -552,29 +596,32 @@ async fn captions_with_retry(
 }
 
 async fn transcription_with_retry(
-    io: &dyn YoutubeIo,
-    session: &mut YoutubeToolSession,
+    work: &mut YoutubeWork<'_>,
     url: &YoutubeUrl,
     model: &str,
 ) -> Result<CaptionPayload, CaptureError> {
-    match io
-        .transcribe_audio(url, model, session.cancellation())
+    match work
+        .io
+        .transcribe_audio(url, model, work.session.cancellation())
         .await
     {
-        Err(error) if session.cancellation().is_cancelled() => Err(cancelled_after(
+        Err(error) if work.session.cancellation().is_cancelled() => Err(cancelled_after(
             "transcription was cancelled before a fallback retry",
             &error,
         )),
-        Err(error) => match session.decide(&error) {
+        Err(error) => match work.session.decide(&error) {
             CaptureAction::UpdateExtractorAndRetry => {
-                update_extractor(io, session).await;
-                if session.cancellation().is_cancelled() {
+                update_extractor(work).await;
+                if work.session.cancellation().is_cancelled() {
                     Err(cancelled_after(
                         "transcription was cancelled during extractor update",
                         &error,
                     ))
                 } else {
-                    io.transcribe_audio(url, model, session.cancellation())
+                    work.channel
+                        .progress("Retrying the transcription with the updated extractor");
+                    work.io
+                        .transcribe_audio(url, model, work.session.cancellation())
                         .await
                 }
             }
@@ -603,12 +650,22 @@ fn cancelled_after(what_happened: &str, cause: &CaptureError) -> CaptureError {
     ))
 }
 
-pub(super) async fn update_extractor(io: &dyn YoutubeIo, session: &mut YoutubeToolSession) {
-    if let Err(error) = io.update_extractor().await {
-        session.annotate(format!(
+/// Run the host's `yt-dlp -U`, which is a download and can take real time.
+///
+/// It announces itself on entry rather than only on failure, because the wait
+/// happens either way — and it reports a failed update to the user as well as to
+/// the model. The annotation alone reached the transcript and the tool result;
+/// the person watching a run stall on a broken self-update saw nothing at all.
+pub(super) async fn update_extractor(work: &mut YoutubeWork<'_>) {
+    work.channel
+        .progress("Updating yt-dlp; the extractor is out of date");
+    if let Err(error) = work.io.update_extractor().await {
+        let detail = format!(
             "yt-dlp update failed ({}); continued with the current binary",
             error.code()
-        ));
+        );
+        work.channel.progress(detail.clone());
+        work.session.annotate(detail);
     }
 }
 

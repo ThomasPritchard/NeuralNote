@@ -1,18 +1,17 @@
 //! Implementation-authored playlist selection and high-usage confirmation.
 
+use crate::ai::call_channel::CallChannel;
 use crate::ai::elicitation::{elicit_user, ElicitationOutcome};
 use crate::ai::events::{ElicitOption, Elicitation};
 use crate::ai::llm::UserPrompt;
 use crate::ai::tools::{action, reject, ToolContext, ToolResult};
 use crate::ai::youtube::{PlaylistPayload, VideoId, YoutubeIo, YoutubeToolSession, YoutubeUrl};
 use crate::ai::youtube_tool_errors::{settle_capture_error, settle_session_capture_error};
-use crate::ai::youtube_tools::{update_extractor, validate_youtube_url};
+use crate::ai::youtube_tools::{update_extractor, validate_youtube_url, YoutubeWork};
 use crate::capture::{
-    estimate_transcript_cost, parse_playlist, validate_thumbnail, CaptureAction, CaptureError,
+    estimate_transcript_cost, parse_playlist, thumbnail_data_uri, CaptureAction, CaptureError,
     CostEstimate, PricingInput,
 };
-use base64::engine::general_purpose::STANDARD;
-use base64::Engine as _;
 use serde::Deserialize;
 use serde_json::json;
 use std::collections::BTreeSet;
@@ -51,9 +50,20 @@ pub(super) async fn dispatch_select_playlist_videos(
     if let Err(error) = session.ensure_playlist_uninitialized() {
         return settle_session_capture_error(session, error);
     }
-    let playlist = match load_playlist(io, session, &url).await {
-        Ok(playlist) => playlist,
-        Err(error) => return settle_session_capture_error(session, error),
+    // Bundled only for the enumeration, which is the one step here that can retry
+    // a network call behind the user's back. The elicitation below wants the sink
+    // and the session as separate borrows again, so the bundle ends with the
+    // block rather than outliving its reason to exist.
+    let playlist = {
+        let mut work = YoutubeWork {
+            io,
+            session: &mut *session,
+            channel: CallChannel::new(&mut *context.sink, call_id),
+        };
+        match load_playlist(&mut work, &url).await {
+            Ok(playlist) => playlist,
+            Err(error) => return settle_session_capture_error(work.session, error),
+        }
     };
     let selected =
         match elicit_playlist_selection(call_id, &playlist, io, session, user_prompt, context.sink)
@@ -88,11 +98,10 @@ pub(super) async fn dispatch_select_playlist_videos(
 }
 
 async fn load_playlist(
-    io: &dyn YoutubeIo,
-    session: &mut YoutubeToolSession,
+    work: &mut YoutubeWork<'_>,
     url: &YoutubeUrl,
 ) -> Result<crate::capture::Playlist, CaptureError> {
-    let payload = enumerate_with_retry(io, session, url).await?;
+    let payload = enumerate_with_retry(work, url).await?;
     let playlist = parse_playlist(&payload.json)?;
     if playlist.unavailable_entries_skipped > 0 {
         let entry = if playlist.unavailable_entries_skipped == 1 {
@@ -100,7 +109,7 @@ async fn load_playlist(
         } else {
             "entries"
         };
-        session.annotate(format!(
+        work.session.annotate(format!(
             "skipped {} unavailable playlist {entry} returned by yt-dlp",
             playlist.unavailable_entries_skipped
         ));
@@ -350,26 +359,19 @@ fn estimate_playlist_selection_cost(
 }
 
 async fn enumerate_with_retry(
-    io: &dyn YoutubeIo,
-    session: &mut YoutubeToolSession,
+    work: &mut YoutubeWork<'_>,
     url: &YoutubeUrl,
 ) -> Result<PlaylistPayload, CaptureError> {
-    match io.enumerate_playlist(url).await {
-        Err(error) => match session.decide(&error) {
+    match work.io.enumerate_playlist(url).await {
+        Err(error) => match work.session.decide(&error) {
             CaptureAction::UpdateExtractorAndRetry => {
-                update_extractor(io, session).await;
-                io.enumerate_playlist(url).await
+                update_extractor(work).await;
+                work.channel
+                    .progress("Retrying the playlist listing with the updated extractor");
+                work.io.enumerate_playlist(url).await
             }
             _ => Err(error),
         },
         success => success,
     }
-}
-
-fn thumbnail_data_uri(media_type: &str, bytes: &[u8]) -> Result<String, CaptureError> {
-    validate_thumbnail(media_type, bytes)?;
-    Ok(format!(
-        "data:{media_type};base64,{}",
-        STANDARD.encode(bytes)
-    ))
 }

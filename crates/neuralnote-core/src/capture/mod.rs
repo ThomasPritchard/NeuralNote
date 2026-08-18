@@ -43,7 +43,8 @@ pub use vtt::{
     MAX_VTT_LINE_BYTES,
 };
 pub use youtube::{
-    classify_ytdlp_failure, parse_playlist, parse_video_metadata, validate_thumbnail,
-    validate_youtube_timestamp_url, CaptionInventory, CaptionSelection, CaptionSource, Playlist,
-    PlaylistEntry, VideoId, VideoMetadata, YoutubeUrl, MAX_THUMBNAIL_BYTES,
+    classify_ytdlp_failure, parse_playlist, parse_video_metadata, thumbnail_data_uri,
+    validate_thumbnail, validate_youtube_timestamp_url, CaptionInventory, CaptionSelection,
+    CaptionSource, Playlist, PlaylistEntry, VideoId, VideoMetadata, YoutubeUrl,
+    MAX_THUMBNAIL_BYTES,
 };
