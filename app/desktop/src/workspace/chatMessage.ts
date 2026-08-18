@@ -10,7 +10,6 @@ import type {
   ApprovalResolution,
   ApprovalRule,
   ChatEvent,
-  ChatTurn,
   ElicitOption,
   GatedTool,
   NoteKind,
@@ -58,6 +57,27 @@ export interface PendingElicitation {
   multiSelect: boolean;
 }
 
+/** One query a call ran, and what the vault returned for it.
+ *
+ *  The count stays per query and is never summed into the node: "12 spans" and
+ *  "nothing" are two different facts about two different questions, and a total
+ *  hides the second inside the first. */
+export interface ToolSearchView {
+  query: string;
+  /** Spans the search returned, or `null` while its `retrieved` cue has yet to
+   *  report. `null` is "hasn't said yet" and must never render as zero —
+   *  telling a user their vault covers nothing it demonstrably covers is the
+   *  same class of failure as a wrong citation (#122). */
+  hitCount: number | null;
+}
+
+/** One span of one note a call opened. */
+export interface ToolReadView {
+  relPath: string;
+  startLine: number;
+  endLine: number;
+}
+
 /** One tool call the model made, and how it settled. `status === null` means the
  *  call is still in flight: the backend emits exactly one settlement per call on
  *  every path, so a node that stays null after the turn ends is a backend bug,
@@ -88,6 +108,16 @@ export interface ToolCallView {
    *  Optional because a node only carries what actually arrived — a call that
    *  never narrated itself has no line, which is different from an empty one. */
   progress?: string;
+  /** What this call searched for, attached by the `callId` the cue carries —
+   *  never by arrival order, which parallel calls make meaningless and which
+   *  would put one call's query on another call's node.
+   *
+   *  Absent on a call that searched nothing, and on one whose cue named no call
+   *  at all: that cue still drives `activity` exactly as it always has. */
+  searches?: ToolSearchView[];
+  /** Which notes this call opened, and the lines it read, correlated the same
+   *  way and absent under the same conditions as `searches`. */
+  reads?: ToolReadView[];
 }
 
 /** A note the model is composing, as the backend's partial parse of the streamed
@@ -544,7 +574,7 @@ export function reduceAssistantForTurn(
   // fresh array would still commit a render, and the transcript's scroll-follow
   // re-asserts its pin on every commit. The only event that reaches here with
   // nothing to say is a `toolProgress` naming a call this turn never saw live —
-  // which the wire cannot produce (see `withProgress`). A `keepalive` does not
+  // which the wire cannot produce (see `withLiveCall`). A `keepalive` does not
   // qualify: it refreshes the liveness the head reads, which is a real change
   // to real state.
   if (reduced === turn) return messages;
@@ -617,35 +647,6 @@ export function resolveAnswerMarkers(
   return answer.replace(/ ?\[(e\d+)\]/gi, (whole, id: string) =>
     verified.has(id.toLowerCase()) ? whole : "",
   );
-}
-
-/** A `reading` step with the number of times that note was read consecutively
- *  folded in — so five back-to-back reads of one note render as one row (`×5`),
- *  not five identical lines. Its range widens to span every folded read. */
-export type GroupedStep =
-  | { kind: "search"; query: string; hitCount?: number }
-  | { kind: "reading"; relPath: string; startLine: number; endLine: number; count: number }
-  | { kind: "verifying" }
-  | { kind: "dropped"; reason: string };
-
-/** Collapse *consecutive* reads of the same note into a single counted row. Only
- *  consecutive runs merge, so the trace stays in execution order (a note re-read
- *  after other steps still shows again) — the common bloat case is a burst of reads
- *  of one note, which this flattens. Searches stay per-row: distinct queries are the
- *  point of the "watch it search" trace. */
-export function groupActivity(activity: ActivityStep[]): GroupedStep[] {
-  const out: GroupedStep[] = [];
-  for (const step of activity) {
-    const last = out.at(-1);
-    if (step.kind === "reading" && last?.kind === "reading" && last.relPath === step.relPath) {
-      last.count += 1;
-      last.startLine = Math.min(last.startLine, step.startLine);
-      last.endLine = Math.max(last.endLine, step.endLine);
-      continue;
-    }
-    out.push(step.kind === "reading" ? { ...step, count: 1 } : step);
-  }
-  return out;
 }
 
 /** The one-line footer the collapsed trace shows once the turn is done. `notesRead`
@@ -724,114 +725,4 @@ export function searchOutcome(activity: ActivityStep[]): RetrievalOutcome {
   if (searches === 0) return { kind: "none" };
   if (spans > 0) return { kind: "hits", spans };
   return awaitingReport ? { kind: "pending" } : { kind: "empty" };
-}
-
-/** Strip every `[eN]` citation marker from a prior answer before it re-enters a
- *  later turn's context. Evidence ids are assigned fresh per run (the Rust registry
- *  starts empty each `run_chat`), so a marker carried forward refers to nothing in
- *  the new turn's registry — and if the model echoes it, the verifier can validate it
- *  against an *unrelated* freshly-retrieved span, surfacing as a "verified" citation
- *  whose source text doesn't match the prose claim (SUS-1 — the exact failure the moat
- *  forbids). History is plain conversational context, so the markers add nothing;
- *  dropping all of them (verified or not) closes the hole at the source. */
-export function stripCitationMarkers(answer: string): string {
-  return answer.replace(/ ?\[e\d+\]/gi, "");
-}
-
-/** Cap on how many prior turns are resent as context. Without it, every `chat`
- *  request carries the entire transcript, so per-turn token cost grows linearly with
- *  conversation length and a long chat eventually trips the provider's context limit
- *  (PA-003). We keep the most recent turns and drop older ones — recency is what the
- *  next answer usually needs. (The core separately caps tool-result content within a
- *  run via `max_context_chars`; this bounds the conversation history.) */
-const MAX_HISTORY_TURNS = 20;
-const MAX_CONTINUATION_PLAN_LABEL_CHARS = 240;
-
-function continuationPlanLabel(label: string): string {
-  const flattened = label.replace(/\s+/gu, " ").trim();
-  const chars = Array.from(flattened);
-  if (chars.length <= MAX_CONTINUATION_PLAN_LABEL_CHARS) return flattened;
-  return `${chars.slice(0, MAX_CONTINUATION_PLAN_LABEL_CHARS).join("")}…`;
-}
-
-/** A host-authored record of durable or incomplete run state for a later turn.
- *  Provider errors are deliberately not copied into model context: the next turn
- *  needs to know what completed, not receive transport prose as an instruction. */
-function continuationRecord(turn: AssistantMessage): string | null {
-  if (!turn.done) return null;
-  const hasRecord =
-    turn.writtenNotes.length > 0 ||
-    turn.existingNotes.length > 0 ||
-    turn.partialRun !== null ||
-    turn.stopped ||
-    turn.error !== null;
-  if (!hasRecord) return null;
-
-  const lines = ["NeuralNote continuation record:"];
-  if (turn.writtenNotes.length > 0) {
-    lines.push(
-      "Completed note writes:",
-      ...turn.writtenNotes.map((note) => `- ${note.relPath} (${note.kind})`),
-    );
-  }
-  if (turn.existingNotes.length > 0) {
-    lines.push(
-      "Notes already present and left unchanged:",
-      ...turn.existingNotes.map((note) => `- ${note.relPath} (${note.kind})`),
-    );
-  }
-  if (turn.planSteps.length > 0) {
-    lines.push(
-      "Plan state:",
-      ...turn.planSteps.map(
-        (step) => `- [${step.status}] ${continuationPlanLabel(step.label)}`,
-      ),
-    );
-  }
-  if (turn.partialRun !== null) {
-    lines.push(`Run ended early: ${turn.partialRun}`);
-  } else if (turn.stopped) {
-    lines.push("The run was stopped before it completed.");
-  }
-  if (turn.error !== null) {
-    const recordedWork =
-      turn.writtenNotes.length > 0 ||
-      turn.existingNotes.length > 0 ||
-      turn.planSteps.length > 0;
-    lines.push(
-      recordedWork
-        ? "The final answer failed after the recorded work."
-        : "The run failed before producing a final answer.",
-    );
-  }
-  lines.push(
-    turn.writtenNotes.length > 0
-      ? "Continue from this record without repeating completed note writes."
-      : "Use this status when responding to the next turn.",
-  );
-  return lines.join("\n");
-}
-
-function assistantHistoryContent(turn: AssistantMessage): string {
-  const answer = stripCitationMarkers(turn.answer);
-  const record = continuationRecord(turn);
-  if (answer.trim() === "") return record ?? "";
-  return record === null ? answer : `${answer}\n\n${record}`;
-}
-
-/** The prior conversation as plain `ChatTurn`s, for the next `chat` request.
- *  Empty assistant turns are dropped only when they have neither an answer nor a
- *  host-authored continuation record; `[eN]` markers are stripped so stale ids
- *  can't re-enter a later run and mis-cite (see `stripCitationMarkers`); and the
- *  history is windowed to the last `MAX_HISTORY_TURNS` so per-turn cost stays
- *  bounded (see above). */
-export function toHistory(messages: ChatMessage[]): ChatTurn[] {
-  return messages
-    .map((m): ChatTurn =>
-      m.role === "user"
-        ? { role: "user", content: m.content }
-        : { role: "assistant", content: assistantHistoryContent(m) },
-    )
-    .filter((turn) => turn.content.trim() !== "")
-    .slice(-MAX_HISTORY_TURNS);
 }

@@ -9,11 +9,11 @@ import { useCallback, useRef, useState, type RefObject } from "react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import type { ChatEvent } from "../lib/types";
+import { toHistory } from "./chatHistory";
 import {
   emptyAssistant,
   markAssistantStopped,
   reduceAssistantForTurn,
-  toHistory,
   userMessage,
   type ChatMessage,
 } from "./chatMessage";

@@ -20,6 +20,7 @@ import type {
   ReasoningBoundary,
   ToolApprovalView,
   ToolCallView,
+  ToolSearchView,
 } from "./chatMessage";
 
 /** Fold a `retrieved` event into the matching `searching` row (→ "searching X →
@@ -69,34 +70,65 @@ function withSettlement(
   return [...calls, { name: "", title: "", arguments: "", stepId: null, ...settlement }];
 }
 
-/** Leave a running tool's latest line on the node that sent it.
+/** Enrich the node the backend says raised this cue, and no other.
  *
- *  Matches the newest still-unsettled node with this id, exactly as
+ *  Matches the newest still-unsettled node with that id, exactly as
  *  `withSettlement` does and for the same reason: a finished node must not be
- *  made to look like it is still working.
+ *  made to look like it is still working. The backend emits every cue between
+ *  announcing a call and settling it, so the live node is always the right one.
  *
- *  An id matching no live node changes nothing — and, unlike a settlement, is
- *  not appended as a row of its own. There is no anomaly to make visible: the
- *  id cannot be wrong. A tool emits through `CallChannel`, which carries the
- *  dispatched call's id and exposes no general `send`, so progress addressed to
- *  someone else's node is unwritable rather than merely unwritten
+ *  **Correlation is on the id the cue carries, never on arrival order.**
+ *  Parallel tool calls are supported, so ordering would attach one call's query
+ *  to another call's node — a false claim about provenance, in the one surface
+ *  whose whole job is provenance.
+ *
+ *  `id === null`, or an id matching no live node, changes nothing — and,
+ *  unlike a settlement, is not appended as a row of its own. `null` is
+ *  ordinary: a retrieval cue may have no dispatched call behind it, and it
+ *  still drives `activity` exactly as it always has. A non-null id that misses
+ *  is not an anomaly worth a row either, because the id cannot be wrong: a tool
+ *  emits through `CallChannel`, which carries the dispatched call's id and
+ *  exposes no general `send`, so a cue addressed to someone else's node is
+ *  unwritable rather than merely unwritten
  *  (`crates/neuralnote-core/src/ai/call_channel.rs`). What appending WOULD
  *  produce is a rail node with no name, no title and no arguments — the three
  *  things a tool node consists of. */
-function withProgress(
+function withLiveCall(
   calls: ToolCallView[],
-  id: string,
-  message: string,
+  id: string | null,
+  enrich: (call: ToolCallView) => ToolCallView,
 ): ToolCallView[] {
+  if (id === null) return calls;
   for (let i = calls.length - 1; i >= 0; i--) {
     const call = calls[i];
     if (call.id === id && call.status === null) {
       const next = calls.slice();
-      next[i] = { ...call, progress: message };
+      next[i] = enrich(call);
       return next;
     }
   }
   return calls;
+}
+
+/** Fold a `retrieved` count into the query it answers, on one call's own list.
+ *
+ *  Mirrors `withHitCount` over the node instead of the activity trace: the
+ *  newest still-unreported entry for that query takes the count, and a count
+ *  whose query is missing is appended rather than dropped. */
+function withCallHitCount(
+  searches: ToolSearchView[],
+  query: string,
+  hitCount: number,
+): ToolSearchView[] {
+  for (let i = searches.length - 1; i >= 0; i--) {
+    const search = searches[i];
+    if (search.query === query && search.hitCount === null) {
+      const next = searches.slice();
+      next[i] = { ...search, hitCount };
+      return next;
+    }
+  }
+  return [...searches, { query, hitCount }];
 }
 
 /** Fold a live note preview into the edit that owns its id, or start one.
@@ -289,7 +321,10 @@ function foldEvent(turn: AssistantMessage, event: ChatEvent): AssistantMessage {
       //
       // Never collapse this into a `default:` arm — the exhaustive switch is
       // what makes a new backend event a compile error here.
-      const toolCalls = withProgress(turn.toolCalls, event.id, event.message);
+      const toolCalls = withLiveCall(turn.toolCalls, event.id, (call) => ({
+        ...call,
+        progress: event.message,
+      }));
       return toolCalls === turn.toolCalls ? turn : { ...turn, toolCalls };
     }
     case "skillActivated":
@@ -460,13 +495,28 @@ function foldEvent(turn: AssistantMessage, event: ChatEvent): AssistantMessage {
         approvalDegraded: turn.approvalDegraded ?? event.reason,
       };
     case "searching":
+      // Two destinations, one ledger: `activity` stays the trace the settled
+      // summary counts, and the node gains a VIEW of the query it ran. The
+      // summary is not recomputed from the nodes — two independently-computed
+      // provenance lines in one turn eventually disagree.
       return {
         ...turn,
         phase: "searching",
         activity: [...turn.activity, { kind: "search", query: event.query }],
+        toolCalls: withLiveCall(turn.toolCalls, event.callId, (call) => ({
+          ...call,
+          searches: [...(call.searches ?? []), { query: event.query, hitCount: null }],
+        })),
       };
     case "retrieved":
-      return { ...turn, activity: withHitCount(turn.activity, event.query, event.hitCount) };
+      return {
+        ...turn,
+        activity: withHitCount(turn.activity, event.query, event.hitCount),
+        toolCalls: withLiveCall(turn.toolCalls, event.callId, (call) => ({
+          ...call,
+          searches: withCallHitCount(call.searches ?? [], event.query, event.hitCount),
+        })),
+      };
     case "reading":
       return {
         ...turn,
@@ -475,6 +525,13 @@ function foldEvent(turn: AssistantMessage, event: ChatEvent): AssistantMessage {
           ...turn.activity,
           { kind: "reading", relPath: event.relPath, startLine: event.startLine, endLine: event.endLine },
         ],
+        toolCalls: withLiveCall(turn.toolCalls, event.callId, (call) => ({
+          ...call,
+          reads: [
+            ...(call.reads ?? []),
+            { relPath: event.relPath, startLine: event.startLine, endLine: event.endLine },
+          ],
+        })),
       };
     case "verifying":
       return {

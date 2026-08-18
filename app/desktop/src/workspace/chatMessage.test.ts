@@ -1,13 +1,13 @@
 // The pure chat view-model fold: each ChatEvent variant lands in the right
-// slot, `retrieved` merges into its `searching` row, deltas accumulate, and a
-// run ends (done clears the working state) on both `done` and `error`. History
-// building drops blank turns.
+// slot, `retrieved` merges into its `searching` row and onto the node that ran
+// it, deltas accumulate, and a run ends (done clears the working state) on both
+// `done` and `error`. What a turn hands to the NEXT request is its own file:
+// `chatHistory.test.ts`.
 
 import { describe, expect, it } from "vitest";
 import type { ChatEvent } from "../lib/types";
 import {
   emptyAssistant,
-  groupActivity,
   isPartialSkillRun,
   markAssistantStopped,
   reasoningSegments,
@@ -16,10 +16,8 @@ import {
   resolveAnswerMarkers,
   searchOutcome,
   showsNothingFoundCard,
-  stripCitationMarkers,
   summarizeActivity,
   modelReportedProvenance,
-  toHistory,
   userMessage,
   type ActivityStep,
   type AssistantMessage,
@@ -283,22 +281,25 @@ describe("reduceAssistant — grounded progress", () => {
     expect(reduceAssistant(searched, { type: "keepalive" })).toBe(searched);
   });
 
-  it("ignores the retrieval correlation key rather than rendering it", () => {
-    // The key exists so a later phase can attach a cue to the node that raised
-    // it. Until then a correlated cue and an uncorrelated one must produce the
-    // same turn — that is the degradation guarantee, checked rather than stated.
-    const correlated = run([
-      { type: "searching", query: "spacing", callId: "call-7" },
-      { type: "retrieved", query: "spacing", hitCount: 2, callId: "call-7" },
-      { type: "reading", relPath: "n.md", startLine: 1, endLine: 2, callId: "call-8" },
-    ]);
+  it("renders a cue with no call behind it exactly as it always did", () => {
+    // The degradation guarantee, checked rather than stated: `callId` is
+    // optional because at least one retrieval path has no dispatched call to
+    // name, and a cue arriving without one must attach to nothing and leave the
+    // trace it has always driven untouched.
     const uncorrelated = run([
+      { type: "toolCall", id: "call-7", name: "search_notes", title: "Search notes",
+        arguments: "{}", stepId: null, },
       { type: "searching", query: "spacing", callId: null },
       { type: "retrieved", query: "spacing", hitCount: 2, callId: null },
       { type: "reading", relPath: "n.md", startLine: 1, endLine: 2, callId: null },
     ]);
 
-    expect(correlated).toEqual(uncorrelated);
+    expect(uncorrelated.toolCalls[0].searches).toBeUndefined();
+    expect(uncorrelated.toolCalls[0].reads).toBeUndefined();
+    expect(uncorrelated.activity).toEqual([
+      { kind: "search", query: "spacing", hitCount: 2 },
+      { kind: "reading", relPath: "n.md", startLine: 1, endLine: 2 },
+    ]);
   });
 });
 
@@ -664,6 +665,70 @@ describe("reduceAssistant — the tool timeline", () => {
 
     expect(turn.toolCalls).toHaveLength(1);
     expect(turn.toolCalls[0].progress).toBeUndefined();
+  });
+
+  it("puts each query and its own hit count on the call that ran it", () => {
+    // Two searches in flight at once. Correlation is on the call id the cue
+    // carries, never arrival order: parallel calls are supported, so ordering
+    // would put one call's query on the other call's node — a provenance lie in
+    // the one surface whose whole job is provenance. The counts stay per query
+    // rather than summed, because "12 spans" and "0 spans" are two facts.
+    const turn = run([
+      { type: "toolCall", id: "c1", name: "search_notes", title: "Search notes",
+        arguments: '{"query":"spacing"}', stepId: null, },
+      { type: "toolCall", id: "c2", name: "search_notes", title: "Search notes",
+        arguments: '{"query":"chloroplasts"}', stepId: null, },
+      { type: "searching", query: "spacing", callId: "c1" },
+      { type: "searching", query: "chloroplasts", callId: "c2" },
+      { type: "retrieved", query: "chloroplasts", hitCount: 0, callId: "c2" },
+      { type: "retrieved", query: "spacing", hitCount: 12, callId: "c1" },
+    ]);
+
+    expect(turn.toolCalls[0].searches).toEqual([{ query: "spacing", hitCount: 12 }]);
+    expect(turn.toolCalls[1].searches).toEqual([{ query: "chloroplasts", hitCount: 0 }]);
+  });
+
+  it("holds a query's count as unknown until its own retrieval reports", () => {
+    // Between `searching` and `retrieved` the count has not been said yet, and
+    // "hasn't said yet" must never render as zero — that is the #122 failure,
+    // telling a user their vault holds nothing on a subject it covers.
+    const turn = run([
+      { type: "toolCall", id: "c1", name: "search_notes", title: "Search notes",
+        arguments: "{}", stepId: null, },
+      { type: "searching", query: "spacing", callId: "c1" },
+    ]);
+
+    expect(turn.toolCalls[0].searches).toEqual([{ query: "spacing", hitCount: null }]);
+  });
+
+  it("puts the note and the lines it opened on the call that read them", () => {
+    const turn = run([
+      { type: "toolCall", id: "c1", name: "read_note", title: "Read note",
+        arguments: '{"rel_path":"Spaced.md"}', stepId: null, },
+      { type: "reading", relPath: "Spaced.md", startLine: 12, endLine: 28, callId: "c1" },
+    ]);
+
+    expect(turn.toolCalls[0].reads).toEqual([
+      { relPath: "Spaced.md", startLine: 12, endLine: 28 },
+    ]);
+  });
+
+  it("keeps the activity trace as the one ledger the settled summary counts", () => {
+    // The enrichment is a view onto the node, not a second ledger:
+    // `summarizeActivity` and `searchOutcome` still read `activity`, and two
+    // independently-computed provenance lines in one turn eventually disagree.
+    const turn = run([
+      { type: "toolCall", id: "c1", name: "search_notes", title: "Search notes",
+        arguments: "{}", stepId: null, },
+      { type: "searching", query: "spacing", callId: "c1" },
+      { type: "retrieved", query: "spacing", hitCount: 12, callId: "c1" },
+      { type: "reading", relPath: "Spaced.md", startLine: 1, endLine: 4, callId: "c1" },
+    ]);
+
+    expect(turn.activity).toEqual([
+      { kind: "search", query: "spacing", hitCount: 12 },
+      { kind: "reading", relPath: "Spaced.md", startLine: 1, endLine: 4 },
+    ]);
   });
 
   it("leaves the progress phase to the events that actually name one", () => {
@@ -1076,167 +1141,6 @@ describe("reduceAssistant — citations, coverage, terminal events", () => {
   });
 });
 
-describe("toHistory", () => {
-  it("maps turns to ChatTurns and preserves an answerless failure as status", () => {
-    const messages: ChatMessage[] = [
-      userMessage("what is spacing?"),
-      { ...emptyAssistant(), answer: "It's spacing.", done: true },
-      userMessage("and recall?"),
-      { ...emptyAssistant(), error: "boom", done: true }, // errored, no answer
-    ];
-    expect(toHistory(messages)).toEqual([
-      { role: "user", content: "what is spacing?" },
-      { role: "assistant", content: "It's spacing." },
-      { role: "user", content: "and recall?" },
-      {
-        role: "assistant",
-        content: [
-          "NeuralNote continuation record:",
-          "The run failed before producing a final answer.",
-          "Use this status when responding to the next turn.",
-        ].join("\n"),
-      },
-    ]);
-  });
-
-  it("windows history to the most recent turns so it can't grow unbounded (PA-003)", () => {
-    // 60 non-empty turns in → only the last 20 come out, and they're the newest.
-    const messages: ChatMessage[] = Array.from({ length: 30 }, (_, i) => [
-      userMessage(`q${i}`),
-      { ...emptyAssistant(), answer: `a${i}`, done: true } as ChatMessage,
-    ]).flat();
-    const history = toHistory(messages);
-    expect(history).toHaveLength(20);
-    // The window keeps the tail: last entry is the final assistant answer.
-    expect(history.at(-1)).toEqual({ role: "assistant", content: "a29" });
-    expect(history[0]).toEqual({ role: "user", content: "q20" });
-  });
-
-  it("strips [eN] markers from assistant answers so stale ids can't re-enter (SUS-1)", () => {
-    // Evidence ids reset per run, so a turn-1 marker means nothing in turn 2 — and
-    // could collide with an unrelated new span. History must carry the prose, not the ids.
-    const messages: ChatMessage[] = [
-      userMessage("q"),
-      { ...emptyAssistant(), answer: "Spacing is 8px [e1] and grids use it [e2].", done: true },
-    ];
-    expect(toHistory(messages)).toEqual([
-      { role: "user", content: "q" },
-      { role: "assistant", content: "Spacing is 8px and grids use it." },
-    ]);
-  });
-
-  it("preserves durable progress when a failed run produced no prose answer", () => {
-    const failed = {
-      ...emptyAssistant(),
-      done: true,
-      error: "the model returned an empty answer",
-      writtenNotes: [
-        { relPath: "Areas/OpSec/Reference/Literature.md", kind: "literature" as const },
-        { relPath: "Areas/OpSec/Reference/Transcript.md", kind: "transcript" as const },
-      ],
-      planSteps: [
-        { id: "collect", label: "Collect the source", status: "done" as const },
-        { id: "write", label: "Write the remaining note", status: "running" as const },
-      ],
-      partialRun: "the run reached a work limit before finishing",
-    };
-
-    const history = toHistory([userMessage("Distil this video"), failed]);
-
-    expect(history).toEqual([
-      { role: "user", content: "Distil this video" },
-      {
-        role: "assistant",
-        content: [
-          "NeuralNote continuation record:",
-          "Completed note writes:",
-          "- Areas/OpSec/Reference/Literature.md (literature)",
-          "- Areas/OpSec/Reference/Transcript.md (transcript)",
-          "Plan state:",
-          "- [done] Collect the source",
-          "- [running] Write the remaining note",
-          "Run ended early: the run reached a work limit before finishing",
-          "The final answer failed after the recorded work.",
-          "Continue from this record without repeating completed note writes.",
-        ].join("\n"),
-      },
-    ]);
-    expect(history[1].content).not.toContain("the model returned an empty answer");
-  });
-
-  it("flattens and bounds model-authored plan labels in continuation history", () => {
-    const failed = {
-      ...emptyAssistant(),
-      done: true,
-      error: "provider failed",
-      planSteps: [
-        {
-          id: "hostile",
-          label: `Keep context\n${"x".repeat(2_000)}`,
-          status: "running" as const,
-        },
-      ],
-    };
-
-    const history = toHistory([userMessage("continue"), failed]);
-    const content = history[1].content;
-
-    expect(content.split("\n")).toHaveLength(5);
-    expect(Array.from(content).length).toBeLessThan(500);
-    expect(content).toContain("- [running] Keep context ");
-    expect(content).toContain("…\nThe final answer failed after the recorded work.");
-  });
-
-  // Reasoning is LIVE-ONLY. Planning rounds reason out loud now, so a turn can
-  // hold thousands of reasoning characters — none of which the model may ever be
-  // shown again. Today `assistantHistoryContent` holds that by never reading
-  // `thinking`, which nothing would notice if it stopped being true. These two
-  // are what notices.
-  it("never returns a turn's reasoning to the model, even when nothing else was said", () => {
-    const reasoning = "The user wants two things; let me search the vault first.";
-    const history = toHistory([
-      userMessage("what is spacing?"),
-      { ...emptyAssistant(), thinking: reasoning, answer: "", done: true },
-    ]);
-
-    expect(history).toEqual([{ role: "user", content: "what is spacing?" }]);
-  });
-
-  it("sends the answer and the continuation record, never the reasoning beside them", () => {
-    const reasoning = "Round 3: the transcript note is already written, so skip it.";
-    const history = toHistory([
-      userMessage("distil this"),
-      {
-        ...emptyAssistant(),
-        thinking: reasoning,
-        answer: "Done — the note is in Literature.",
-        done: true,
-        writtenNotes: [{ relPath: "Literature/One.md", kind: "literature" as const }],
-      },
-    ]);
-
-    expect(history[1].content).toContain("Done — the note is in Literature.");
-    expect(history[1].content).toContain("Completed note writes:");
-    // Both branches of the history content, one assertion: whatever it built,
-    // the reasoning is not in it.
-    expect(history.map((turn) => turn.content).join("\n")).not.toContain(reasoning);
-  });
-});
-
-describe("stripCitationMarkers", () => {
-  it("removes every [eN] marker (verified or not) with its leading space", () => {
-    expect(stripCitationMarkers("A [e1] and B [e9].")).toBe("A and B.");
-  });
-
-  it("matches uppercase markers, mirroring the Rust extractor's case-folding", () => {
-    expect(stripCitationMarkers("A [E1] then [e2]!")).toBe("A then!");
-  });
-
-  it("leaves marker-free text untouched", () => {
-    expect(stripCitationMarkers("No citations here.")).toBe("No citations here.");
-  });
-});
-
 const cite = (id: string): CitationView => ({
   id,
   relPath: "a.md",
@@ -1270,40 +1174,6 @@ describe("resolveAnswerMarkers", () => {
     expect(resolveAnswerMarkers("A [E1] and B [E9].", [cite("e1")], true)).toBe(
       "A [E1] and B.",
     );
-  });
-});
-
-describe("groupActivity", () => {
-  it("collapses a run of consecutive reads of one note into a counted, widened row", () => {
-    const steps: ActivityStep[] = [
-      { kind: "reading", relPath: "AI.md", startLine: 10, endLine: 20 },
-      { kind: "reading", relPath: "AI.md", startLine: 5, endLine: 12 },
-      { kind: "reading", relPath: "AI.md", startLine: 30, endLine: 40 },
-    ];
-    // Five-in-a-row of the same note collapse to one ×N row spanning every read.
-    expect(groupActivity(steps)).toEqual([
-      { kind: "reading", relPath: "AI.md", startLine: 5, endLine: 40, count: 3 },
-    ]);
-  });
-
-  it("keeps non-consecutive reads of the same note separate (execution order)", () => {
-    const steps: ActivityStep[] = [
-      { kind: "reading", relPath: "A.md", startLine: 1, endLine: 2 },
-      { kind: "search", query: "x" },
-      { kind: "reading", relPath: "A.md", startLine: 3, endLine: 4 },
-    ];
-    const grouped = groupActivity(steps);
-    expect(grouped).toHaveLength(3);
-    expect(grouped.filter((s) => s.kind === "reading")).toHaveLength(2);
-  });
-
-  it("leaves searches, verifying and dropped rows untouched", () => {
-    const steps: ActivityStep[] = [
-      { kind: "search", query: "a", hitCount: 3 },
-      { kind: "verifying" },
-      { kind: "dropped", reason: "quote gone" },
-    ];
-    expect(groupActivity(steps)).toEqual(steps);
   });
 });
 
