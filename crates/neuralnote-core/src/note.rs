@@ -486,3 +486,7 @@ pub(crate) fn title_from(
     }
     stem.to_string()
 }
+
+#[cfg(test)]
+#[path = "note_tests.rs"]
+mod tests;

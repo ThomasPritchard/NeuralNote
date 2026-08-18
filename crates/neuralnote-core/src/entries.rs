@@ -161,9 +161,16 @@ fn apply_case_only_rename(
 }
 
 /// Move a file or folder to `new_parent`, keeping its name. Refuses to move a
-/// folder into its own descendant.
+/// folder into its own descendant, and refuses to move the vault root at all.
 pub fn move_entry(root: &Path, path: &Path, new_parent: &Path) -> CoreResult<TreeNode> {
-    let path = ensure_within(root, path)?;
+    // `ensure_descendant` on what is being moved, `ensure_within` on where it is
+    // going: the vault root is a legitimate *destination* but never a legitimate
+    // thing to relocate. Containment alone admits the root (it is contained in
+    // itself), and the self-move branch below only catches a root `path` by
+    // coincidence — `new_parent` is already proven inside the root, so
+    // `starts_with` is trivially true there. Naming the boundary here keeps the
+    // refusal when that branch is narrowed (issue #194).
+    let path = ensure_descendant(root, path)?;
     let new_parent = ensure_within(root, new_parent)?;
     if !path.exists() {
         return Err(CoreError::NotFound(path.display().to_string()));

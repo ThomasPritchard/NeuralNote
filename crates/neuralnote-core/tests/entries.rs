@@ -300,6 +300,36 @@ fn deleting_the_vault_root_is_refused() {
     );
 }
 
+/// Naming the vault root as the entry to *move* has to be refused at the vault
+/// boundary, not by accident further down.
+///
+/// `move_entry` proves `new_parent` is inside the root before comparing the two,
+/// so when `path` IS the root every legal destination satisfies
+/// `new_parent.starts_with(&path)` and the call lands in the self-move refusal.
+/// That is incidental, not a boundary check: narrow the self-move rule — to
+/// `path.is_dir()`, say — and the whole vault becomes movable with the rest of
+/// this suite still green. Pinning the *vault-boundary* error is what makes the
+/// rule survive that edit (issue #194).
+#[test]
+fn moving_the_vault_root_is_refused() {
+    let enclosing = vault();
+    let root = enclosing.path().join("MyVault");
+    fs::create_dir(&root).unwrap();
+    create_folder(&root, &root, "Dest").unwrap();
+    create_note(&root, &root, "Keep").unwrap();
+
+    let error = move_entry(&root, &root, &root.join("Dest")).unwrap_err();
+
+    assert!(
+        error.to_string().contains("outside vault"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        root.join("Keep.md").exists(),
+        "the vault root was moved by an operation that named it as the entry to move"
+    );
+}
+
 /// The case-only rename branch takes `path.parent()` as its working directory and
 /// runs two `std::fs::rename` calls there with no containment check of its own.
 /// When `path` is the vault root that parent is *outside* the vault, so the vault
