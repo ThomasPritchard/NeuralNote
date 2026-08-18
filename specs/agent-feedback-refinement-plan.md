@@ -791,3 +791,83 @@ one change.
 
 Phase 4 already owns `youtube_tools.rs` for long-tool progress, so the fetch belongs there and
 introduces no new file contention. The amendment commit must land before P3 ∥ P4 start.
+
+---
+
+# Amendment B — per-round reasoning boundaries belong to Phase 5
+
+Recorded after Phase 3 (`8027481`) landed.
+
+## The consequence Phase 3 created
+
+Reasoning now streams on every planning round (typically 3-5, up to 16 when a skill raises the
+ceiling) as well as the answer turn. All of it concatenates into a single
+`AssistantMessage.thinking` string with **no round boundary**, so the disclosure shows several
+distinct trains of thought as one undifferentiated blob. This is a real, visible consequence of
+the feature, not a cosmetic nicety.
+
+## The wire already carries both boundaries — no amendment needed
+
+Phase 3's report claimed there is no wire event marking the answer turn's start. **That is wrong**,
+and it was the stated reason for deferring the work as expensive. Checked against source:
+
+- `ChatEvent::PlanningRound` marks the start of each planning round.
+- `ChatEvent::Verifying` is emitted at `orchestrator/session.rs:139`, between `collect_evidence`
+  (`session.rs:110`) and `stream_final_answer` (`session.rs:163`). The comment at `session.rs:137`
+  describes it as exactly this cue.
+- `chatMessageReducer.ts` already folds both (`:198` and `:422`).
+
+So the boundaries are derivable from the FROZEN wire. No new event, no contract change, no
+bindings regeneration.
+
+## Why it lands in Phase 5 and not earlier
+
+The remaining cost is real but purely local: `AssistantMessage.thinking` changes from `string` to a
+per-round structure, which touches `chatTimelineRows.ts:105-106` and the rail nodes. Phase 5
+already owns `chatMessage.ts`, `chatTimelineRows.ts` and `ChatTimelineNodes.tsx` and is already
+restructuring those rows. Doing it in Phase 5 is one restructure; doing it in Phase 3 would have
+been two, with a freeze-list collision in between.
+
+**Phase 5 must therefore also:** segment `thinking` per round, label each segment with its round
+(and the answer turn as its own final segment), and keep the disclosure collapsed by default as it
+is today. Do not concatenate rounds into one string.
+
+---
+
+# Amendment C — two defects Phase 4 surfaced, both owned by Phase 5
+
+## C1. `ToolProgress` is emitted but inert, and that FIRES A FALSE STALL NOTICE
+
+Phase 4 emits `ToolProgress` from the long YouTube tools. The reducer folds it to identity
+(`chatMessageReducer.ts:233`, `return turn`) and nothing renders it. Verified: no `.tsx` file
+references `toolProgress`.
+
+The consequence is not merely "a feature is missing". `foldWithLiveness` short-circuits on an
+identity fold, so `lastEventAt` never advances while a long tool is running. `turnLiveness.ts:70`
+raises the stall notice at `now - lastEventAt >= STALL_AFTER_MS` (45s). **A healthy 4-minute
+Whisper transcription therefore shows the user "the model has been quiet for a while" — a false
+alarm, during precisely the operation this workstream exists to make legible.**
+
+The three reducer comments reading "Nothing emits it yet" are now false and must be corrected.
+
+**Phase 5 must:** fold `ToolProgress` so it stamps `lastEventAt`, and render it. No phase in the
+original plan claimed `ToolProgress` rendering — this is a genuine gap in the plan, not a
+rescoping.
+
+## C2. The thumbnail fetch is awaited inline behind a 30-second timeout
+
+Amendment A says a thumbnail fetch must NEVER delay the distil run. Phase 4 inherited the existing
+seam's bounds (256 KiB cap, 5s connect / 30s total, `service.rs:76-77`) rather than inventing new
+numbers, which was the right instinct — but the fetch is `await`ed inline, so a black-holed CDN
+costs up to 30 seconds per video. That violates the locked constraint.
+
+Phase 4's own recommendation, which stands: **a 3-second per-request timeout in `thumbnail.rs`.**
+It also strictly improves the already-shipped playlist-selection path, which today can spend 30s
+per thumbnail across up to 50 thumbnails a page.
+
+Routes considered and rejected by Phase 4, recorded so they are not re-litigated: `tokio::time::
+timeout` in the core breaks the "core owns no clock" rule (`services.rs:17-21`) and panics under
+the `futures::executor::block_on` test harness; tightening the shell client changes the shipped
+selection path more broadly than intended.
+
+This is Rust, not presentation — it belongs with Phase 5's logic lane, not its rendering lane.
