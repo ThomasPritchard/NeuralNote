@@ -7,9 +7,10 @@
 // with its own source.
 
 import { describe, expect, it } from "vitest";
-import type { StepStatus } from "../lib/types";
+import type { ChatEvent, StepStatus } from "../lib/types";
 import {
   emptyAssistant,
+  reduceAssistant,
   type AssistantMessage,
   type PlanStepView,
   type ToolCallView,
@@ -213,5 +214,54 @@ describe("timelineRows — identity", () => {
       row.kind === "step" ? row.children.map((child) => child.key) : [row.key],
     );
     expect(groupedKeys).toEqual(flatKeys);
+  });
+});
+
+/** A turn that reasoned twice while planning and once more before answering.
+ *  Built by folding the events, so the offsets are the reducer's own. */
+function reasonedTwice(): AssistantMessage {
+  const script: ChatEvent[] = [
+    { type: "planningRound", round: 1, maxRounds: 8, playlist: null },
+    { type: "thinking", delta: "which notes cover this" },
+    { type: "planningRound", round: 2, maxRounds: 8, playlist: null },
+    { type: "thinking", delta: "the second one looked closer" },
+    { type: "verifying" },
+    { type: "thinking", delta: "now to answer it" },
+  ];
+  return script.reduce(reduceAssistant, emptyAssistant());
+}
+
+describe("timelineEntries — reasoning", () => {
+  it("gives each train of thought its own node instead of one blob", () => {
+    // Reasoning streams on every planning round as well as on the answer turn.
+    // Run together they read as one rambling thought; the rail shows them as
+    // the separate acts they were, each carrying where it came from.
+    const turn = reasonedTwice();
+
+    const reasoning = timelineEntries(turn, railCalls(turn)).filter(
+      (entry) => entry.kind === "thinking",
+    );
+
+    expect(reasoning).toEqual([
+      { kind: "thinking", source: { kind: "round", round: 1 }, text: "which notes cover this" },
+      {
+        kind: "thinking",
+        source: { kind: "round", round: 2 },
+        text: "the second one looked closer",
+      },
+      { kind: "thinking", source: { kind: "answer" }, text: "now to answer it" },
+    ]);
+  });
+
+  it("keys each reasoning node by its occurrence so a later one cannot remount it", () => {
+    // The rail is append-only: a second train of thought must not take the key
+    // of the first, which would remount a disclosure the user had opened.
+    const turn = reasonedTwice();
+
+    const keys = keyed(timelineEntries(turn, railCalls(turn)))
+      .filter((item) => item.entry.kind === "thinking")
+      .map((item) => item.key);
+
+    expect(keys).toEqual(["thinking#0", "thinking#1", "thinking#2"]);
   });
 });

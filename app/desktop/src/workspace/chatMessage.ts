@@ -153,6 +153,46 @@ export interface TranscriptSourceView {
   relPath: string | null;
 }
 
+/** Which turn of the run one train of thought came from.
+ *
+ *  Reasoning streams on every tool-deciding round AND on the answer turn, so a
+ *  run produces several distinct trains of thought rather than one. Both
+ *  boundaries are already on the wire and need no event of their own:
+ *  `planningRound` opens a round, and `verifying` — emitted between evidence
+ *  collection and the streamed answer — opens the answer turn. */
+export type ReasoningSource =
+  /** One tool-deciding round's reasoning, labelled with the round it came from.
+   *  The number is the beacon's, so it survives a ceiling that grows mid-run. */
+  | { kind: "round"; round: number }
+  /** The answer turn's own reasoning — the run's last train of thought. */
+  | { kind: "answer" }
+  /** Reasoning that arrived before any boundary named a turn for it. The wire
+   *  cannot produce this (the beacon precedes the first model request), so in
+   *  practice it is a turn assembled by hand — and it renders unlabelled rather
+   *  than being attributed to a guess. */
+  | { kind: "unattributed" };
+
+/** Where one train of thought gives way to the next.
+ *
+ *  Only the boundary is stored, never a second copy of the text: `thinking`
+ *  stays the one place reasoning accumulates, and `reasoningSegments` is a view
+ *  onto it. Two stores of the same prose eventually disagree, and this one is
+ *  the disclosure a user reads to see what the model was doing. */
+export interface ReasoningBoundary {
+  /** Which turn the reasoning from `at` onwards belongs to. `unattributed` is
+   *  excluded because nothing ever announces it — it is what the *absence* of a
+   *  boundary produces. */
+  source: Exclude<ReasoningSource, { kind: "unattributed" }>;
+  /** How many characters of `thinking` had arrived when this turn began. */
+  at: number;
+}
+
+/** One train of thought, and which turn of the run produced it. */
+export interface ReasoningSegment {
+  source: ReasoningSource;
+  text: string;
+}
+
 /** Which tool-deciding round the run is on, as the last beacon said.
  *
  *  `max` is never cached: activating a skill raises the ceiling mid-run, so the
@@ -283,8 +323,13 @@ export interface AssistantMessage {
   /** Pinned at turn creation because reasoning can be toggled off mid-stream;
    *  the finished turn stays self-describing against the opt-in it ran under. */
   reasoningRequested: boolean;
-  /** Optional streamed reasoning tokens (rendered collapsed). */
+  /** Every reasoning token the run streamed, in arrival order — the one place
+   *  reasoning is stored. Read it for "did any reasoning arrive at all"; read
+   *  `reasoningSegments` to render it, because a run reasons several separate
+   *  times and this string runs those trains of thought together. */
   thinking: string;
+  /** Where each train of thought starts within `thinking`, in order. */
+  reasoningBoundaries: ReasoningBoundary[];
   /** The streamed answer markdown, accumulated delta by delta. */
   answer: string;
   citations: CitationView[];
@@ -344,6 +389,7 @@ export function emptyAssistant(
     activity: [],
     reasoningRequested,
     thinking: "",
+    reasoningBoundaries: [],
     answer: "",
     citations: [],
     coverage: null,
@@ -413,6 +459,34 @@ export function showsNothingFoundCard(turn: AssistantMessage): boolean {
     retrievalAgrees &&
     !turn.activity.some((step) => step.kind === "dropped")
   );
+}
+
+/** The turn's reasoning as the separate trains of thought it actually was.
+ *
+ *  A run reasons on every tool-deciding round and again on the answer turn, and
+ *  those are different trains of thought about different questions. Rendered as
+ *  one string they read as a single rambling one, which is what the boundaries
+ *  exist to end.
+ *
+ *  A segment that reasoned about nothing is left out rather than rendered as an
+ *  empty labelled fold — a disclosure that opens onto nothing is worse than no
+ *  disclosure. Text arriving before any boundary keeps its own leading segment
+ *  rather than being attributed to whichever turn came next.
+ */
+export function reasoningSegments(turn: AssistantMessage): ReasoningSegment[] {
+  const { thinking, reasoningBoundaries: boundaries } = turn;
+  const segments: ReasoningSegment[] = [];
+  const add = (source: ReasoningSource, from: number, to: number) => {
+    const text = thinking.slice(from, to);
+    if (text.trim() !== "") segments.push({ source, text });
+  };
+  const endOf = (index: number) => boundaries[index]?.at ?? thinking.length;
+
+  add({ kind: "unattributed" }, 0, endOf(0));
+  boundaries.forEach((boundary, index) => {
+    add(boundary.source, boundary.at, endOf(index + 1));
+  });
+  return segments;
 }
 
 /** Fold one event in, and date the turn by it.

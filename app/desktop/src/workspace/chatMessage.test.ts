@@ -10,6 +10,7 @@ import {
   groupActivity,
   isPartialSkillRun,
   markAssistantStopped,
+  reasoningSegments,
   reduceAssistant,
   reduceAssistantForTurn,
   resolveAnswerMarkers,
@@ -957,6 +958,60 @@ describe("reduceAssistant — streamed text", () => {
     ]);
     expect(turn.thinking).toBe("let me check");
     expect(turn.answer).toBe("Spaced repetition works.");
+  });
+});
+
+describe("reasoningSegments", () => {
+  it("keeps each round's reasoning apart from the answer turn's", () => {
+    // Reasoning streams on every tool-deciding round as well as on the answer
+    // turn, so one turn holds several distinct trains of thought. Run together
+    // they read as one blob. Both boundaries are already on the wire: the round
+    // beacon opens a round, `verifying` opens the answer turn.
+    const turn = run([
+      { type: "planningRound", round: 1, maxRounds: 8, playlist: null },
+      { type: "thinking", delta: "which notes cover this" },
+      { type: "planningRound", round: 2, maxRounds: 8, playlist: null },
+      { type: "thinking", delta: "the second one looked closer" },
+      { type: "verifying" },
+      { type: "thinking", delta: "now to answer it" },
+    ]);
+
+    expect(reasoningSegments(turn)).toEqual([
+      { source: { kind: "round", round: 1 }, text: "which notes cover this" },
+      { source: { kind: "round", round: 2 }, text: "the second one looked closer" },
+      { source: { kind: "answer" }, text: "now to answer it" },
+    ]);
+    // The flat accumulation is untouched — the backstop notice reads it to tell
+    // "reasoning was on and produced nothing" from "it produced something".
+    expect(turn.thinking).toBe(
+      "which notes cover thisthe second one looked closernow to answer it",
+    );
+  });
+
+  it("leaves out a round that reasoned about nothing", () => {
+    // A round with no reasoning has nothing to disclose, and an empty labelled
+    // fold would be a row that opens onto nothing.
+    const turn = run([
+      { type: "planningRound", round: 1, maxRounds: 8, playlist: null },
+      { type: "planningRound", round: 2, maxRounds: 8, playlist: null },
+      { type: "thinking", delta: "one tool should do it" },
+    ]);
+
+    expect(reasoningSegments(turn)).toEqual([
+      { source: { kind: "round", round: 2 }, text: "one tool should do it" },
+    ]);
+  });
+
+  it("keeps reasoning no boundary claimed rather than attributing it to a guess", () => {
+    // A turn whose reasoning arrived before anything named a turn for it. The
+    // wire cannot produce that — the beacon precedes the first request — but a
+    // turn assembled by hand can, and the reasoning must still show. It renders
+    // unlabelled rather than being called the answer turn's.
+    const turn = { ...emptyAssistant(), thinking: "weighing it up" };
+
+    expect(reasoningSegments(turn)).toEqual([
+      { source: { kind: "unattributed" }, text: "weighing it up" },
+    ]);
   });
 });
 

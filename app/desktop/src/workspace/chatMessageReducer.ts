@@ -17,6 +17,7 @@ import type {
   ActivityStep,
   AssistantMessage,
   NoteEditView,
+  ReasoningBoundary,
   ToolApprovalView,
   ToolCallView,
 } from "./chatMessage";
@@ -181,6 +182,19 @@ function approvalAfter(
   return updated[updated.findIndex((approval) => approval.id === id)];
 }
 
+/** Open a new train of thought at whatever has accumulated so far.
+ *
+ *  Recorded on the event that STARTS a turn rather than on the first reasoning
+ *  delta of it, because that event is the only thing that knows which turn is
+ *  beginning. A turn that then reasons about nothing leaves a zero-length
+ *  segment, which `reasoningSegments` drops. */
+function withBoundary(
+  turn: AssistantMessage,
+  source: ReasoningBoundary["source"],
+): ReasoningBoundary[] {
+  return [...turn.reasoningBoundaries, { source, at: turn.thinking.length }];
+}
+
 /** Whether two beacons are talking about the same playlist item.
  *
  *  Both `null` counts as the same: a run with no playlist in flight does not
@@ -230,6 +244,12 @@ function foldEvent(turn: AssistantMessage, event: ChatEvent): AssistantMessage {
         ...turn,
         phase: "planning",
         round: { current: event.round, max: event.maxRounds },
+        // Each round reasons about its own question, so the beacon that opens
+        // one also opens that round's train of thought.
+        reasoningBoundaries: withBoundary(turn, {
+          kind: "round",
+          round: event.round,
+        }),
         // Re-read, never merged: the beacon re-states the item every round, so
         // a finished playlist clears itself here instead of leaving "video 3 of
         // 3" standing over the answer turn.
@@ -461,6 +481,9 @@ function foldEvent(turn: AssistantMessage, event: ChatEvent): AssistantMessage {
         ...turn,
         phase: "verifying",
         activity: [...turn.activity, { kind: "verifying" }],
+        // Emitted between the last round and the streamed answer, so it is also
+        // where the answer turn's own reasoning starts.
+        reasoningBoundaries: withBoundary(turn, { kind: "answer" }),
       };
     case "citationDropped":
       return {
