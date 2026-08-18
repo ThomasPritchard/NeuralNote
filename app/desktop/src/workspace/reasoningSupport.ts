@@ -1,7 +1,13 @@
-// The shared capability view-model behind the two reasoning toggles (the chat
-// composer chip and the Settings checkbox): one derivation of "is the control
-// disabled, and why" from the probed `ReasoningSupport`, so the two surfaces can
-// never disagree on the states or the copy.
+// The capability view-model behind the chat composer's reasoning chip: one
+// derivation of "is the control disabled, and why" from the probed
+// `ReasoningSupport`.
+//
+// Settings does NOT use this. Its control is `ReasoningControl` — a value the
+// backend computes per model, covering the same "can't reason" case plus the
+// three this verdict cannot express (still checking, forced on, and an effort
+// menu). The two answer different questions: this one is "may the send path ask
+// for reasoning", which fails OPEN on an unprobed model, while the control is
+// "what may the user choose", which fails closed (spec §4.2).
 //
 // Only a *verified* "unsupported" disables. "unknown" fails OPEN — the probe
 // could not run (offline, a hand-typed model id, an upstream 5xx), and the user

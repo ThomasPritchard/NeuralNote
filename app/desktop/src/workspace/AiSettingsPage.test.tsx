@@ -25,6 +25,8 @@ vi.mock("../lib/api", async (importActual) => {
     setActiveProvider: vi.fn(),
     saveApiKey: vi.fn(),
     setReasoning: vi.fn(),
+    setReasoningEffort: vi.fn(),
+    refreshReasoningSupport: vi.fn(),
     detectHardware: vi.fn(),
     localCandidates: vi.fn(),
     recommendLocalModel: vi.fn(),
@@ -44,6 +46,8 @@ const mockAiStatus = vi.mocked(api.aiStatus);
 const mockSetActive = vi.mocked(api.setActiveProvider);
 const mockSaveKey = vi.mocked(api.saveApiKey);
 const mockSetReasoning = vi.mocked(api.setReasoning);
+const mockSetReasoningEffort = vi.mocked(api.setReasoningEffort);
+const mockRefreshReasoning = vi.mocked(api.refreshReasoningSupport);
 const mockHardware = vi.mocked(api.detectHardware);
 const mockCandidates = vi.mocked(api.localCandidates);
 const mockRecommend = vi.mocked(api.recommendLocalModel);
@@ -606,23 +610,46 @@ describe("AiSettingsPage — OpenRouter", () => {
   });
 });
 
-describe("AiSettingsPage — OpenRouter reasoning toggle", () => {
+
+describe("AiSettingsPage — OpenRouter reasoning control", () => {
   const REASONING_TOGGLE = { name: /show model reasoning/i };
-  /** OR_ACTIVE with the reasoning opt-in persisted. */
-  const OR_REASONING_ON: AiStatus = {
+  const EFFORT_MENU = { name: "Reasoning effort" };
+  /** A model whose probe has answered and which publishes no effort menu — the
+   *  plain on/off case, and the shape the toggle assertions below need. */
+  const OR_TOGGLE: AiStatus = {
     ...OR_ACTIVE,
-    openrouter: { ...OR_ACTIVE.openrouter, reasoning: true },
+    reasoningSupported: "supported",
+    reasoningControl: { kind: "toggle", defaultOn: false },
+  };
+  /** …with the opt-in persisted. */
+  const OR_REASONING_ON: AiStatus = {
+    ...OR_TOGGLE,
+    openrouter: { ...OR_TOGGLE.openrouter, reasoning: true },
+  };
+  /** A real catalogue menu, verbatim. Its sibling `deepseek-v4-flash-0731`
+   *  publishes `["max","high","low"]` — same family, nothing shared but "high" —
+   *  which is why nothing about these values may be compiled in. */
+  const OR_EFFORTS: AiStatus = {
+    ...OR_TOGGLE,
+    reasoningControl: {
+      kind: "efforts",
+      options: ["xhigh", "high"],
+      defaultEffort: "high",
+      canDisable: true,
+    },
+    openrouter: { ...OR_TOGGLE.openrouter, model: "deepseek/deepseek-v4-flash" },
   };
 
-  it("offers no reasoning toggle when no key is connected", async () => {
+  it("offers no reasoning control when no key is connected", async () => {
     setup(); // UNCONFIGURED default: hasKey false
     // Settle on the card's no-key affordance before asserting absence.
     expect(await screen.findByRole("button", { name: "Connect a key…" })).toBeInTheDocument();
     expect(screen.queryByRole("checkbox", REASONING_TOGGLE)).not.toBeInTheDocument();
+    expect(screen.queryByText(/show model reasoning/i)).not.toBeInTheDocument();
   });
 
   it("reflects the persisted reasoning state: off unchecked, on checked", async () => {
-    mockAiStatus.mockResolvedValue(OR_ACTIVE); // reasoning: false
+    mockAiStatus.mockResolvedValue(OR_TOGGLE); // reasoning: false
     const first = render(<AiSettingsPage />);
     expect(await screen.findByRole("checkbox", REASONING_TOGGLE)).not.toBeChecked();
     first.unmount();
@@ -633,7 +660,7 @@ describe("AiSettingsPage — OpenRouter reasoning toggle", () => {
   });
 
   it("opts in with one set_reasoning call and renders the status it returns", async () => {
-    mockAiStatus.mockResolvedValue(OR_ACTIVE); // initial load: reasoning off
+    mockAiStatus.mockResolvedValue(OR_TOGGLE); // initial load: reasoning off
     mockSetReasoning.mockResolvedValue(OR_REASONING_ON); // the write's own echo
     const { user } = setup();
 
@@ -653,7 +680,7 @@ describe("AiSettingsPage — OpenRouter reasoning toggle", () => {
   // Rendering the status the write returned removes that window entirely.
   it("shows the opt-in even when a subsequent status read would fail", async () => {
     mockAiStatus
-      .mockResolvedValueOnce(OR_ACTIVE) // initial load succeeds: reasoning off
+      .mockResolvedValueOnce(OR_TOGGLE) // initial load succeeds: reasoning off
       .mockRejectedValue({ kind: "io", message: "config unreadable" }); // every later read fails
     mockSetReasoning.mockResolvedValue(OR_REASONING_ON); // but the write persisted
     const { user } = setup();
@@ -670,7 +697,7 @@ describe("AiSettingsPage — OpenRouter reasoning toggle", () => {
   });
 
   it("surfaces a rejected reasoning write inline and stays unchecked", async () => {
-    mockAiStatus.mockResolvedValue(OR_ACTIVE);
+    mockAiStatus.mockResolvedValue(OR_TOGGLE);
     mockSetReasoning.mockRejectedValue({ kind: "io", message: "reasoning write failed" });
     const { user } = setup();
 
@@ -681,35 +708,37 @@ describe("AiSettingsPage — OpenRouter reasoning toggle", () => {
     expect(screen.getByRole("checkbox", REASONING_TOGGLE)).not.toBeChecked();
   });
 
-  it("disables the toggle and names the model when the probe verified no support", async () => {
+  it("renders no control, and names the model, when the probe verified no support", async () => {
     mockAiStatus.mockResolvedValue({
       ...OR_ACTIVE,
       reasoningSupported: "unsupported",
+      reasoningControl: { kind: "hidden" },
     });
     setup();
 
-    const toggle = await screen.findByRole("checkbox", REASONING_TOGGLE);
-    expect(toggle).toBeDisabled();
-    // Disabled but never a mystery: the hint slot (already aria-associated)
-    // carries the why, naming the selected model — visible AND announced.
-    expect(toggle).toHaveAccessibleDescription(
-      "anthropic/claude-sonnet-4.5 can't return reasoning.",
-    );
+    // The row stays — a setting that vanished on a model change would read as a
+    // broken pane — but there is nothing left to operate, and the reason names
+    // the model rather than leaving a dead control behind.
+    expect(await screen.findByText(/show model reasoning/i)).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", REASONING_TOGGLE)).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", EFFORT_MENU)).not.toBeInTheDocument();
     expect(
       screen.getByText("anthropic/claude-sonnet-4.5 can't return reasoning."),
     ).toBeInTheDocument();
-    // No billing note for a toggle that can't spend anything.
+    // No billing note for a setting that can't spend anything.
     expect(
       screen.queryByText("Reasoning tokens are billed by OpenRouter."),
     ).not.toBeInTheDocument();
   });
 
-  it("does not disable the OpenRouter toggle from a LOCAL model's verdict", async () => {
-    // reasoningSupported is keyed to the *effective* provider's model — when Local
-    // is active it describes the local tag, not the OpenRouter model. This card must
-    // not pair that verdict with `openrouter.model`: doing so declares a
-    // reasoning-capable OpenRouter model "can't return reasoning" (a fabrication) and
-    // disables a billed control the local model has nothing to do with.
+  it("renders no reasoning control at all while a LOCAL model is active", async () => {
+    // `reasoningSupported` and `reasoningControl` are both keyed to the
+    // *effective* provider's model — when Local is active they describe the local
+    // tag, not the OpenRouter model this card names. Pairing one model's verdict
+    // with another model's id would declare a reasoning-capable OpenRouter model
+    // "can't return reasoning" (a fabrication) and mis-set a billed control. The
+    // card renders the block only when OpenRouter is the model being configured,
+    // which makes that pairing impossible rather than merely guarded.
     mockAiStatus.mockResolvedValue({
       activeProvider: "local",
       reasoningSupported: "unsupported", // the LOCAL model's verdict
@@ -720,21 +749,91 @@ describe("AiSettingsPage — OpenRouter reasoning toggle", () => {
     });
     setup();
 
-    const toggle = await screen.findByRole("checkbox", REASONING_TOGGLE);
-    expect(toggle).not.toBeDisabled();
+    expect(await screen.findByRole("button", { name: "Use OpenRouter" })).toBeInTheDocument();
+    expect(screen.queryByText(/show model reasoning/i)).not.toBeInTheDocument();
     expect(
       screen.queryByText("openai/gpt-4.1 can't return reasoning."),
     ).not.toBeInTheDocument();
   });
 
-  it("keeps the toggle enabled on an unprobed model — unknown fails open", async () => {
-    mockAiStatus.mockResolvedValue(OR_ACTIVE); // reasoningSupported: "unknown"
+  it("shows a checking state, and no guessed control, before the probe answers", async () => {
+    mockAiStatus.mockResolvedValue(OR_ACTIVE); // reasoningControl: pending
     setup();
 
-    const toggle = await screen.findByRole("checkbox", REASONING_TOGGLE);
-    expect(toggle).toBeEnabled();
+    // Locked decision 2: nothing may be shown that has not been probed. A greyed
+    // menu of yesterday's options is exactly the guess this forbids, and so is a
+    // toggle that implies the shape is already known.
+    expect(await screen.findByText(/show model reasoning/i)).toBeInTheDocument();
+    expect(screen.queryByRole("checkbox", REASONING_TOGGLE)).not.toBeInTheDocument();
+    expect(screen.queryByRole("combobox", EFFORT_MENU)).not.toBeInTheDocument();
+    expect(screen.getByRole("status")).toHaveTextContent("Checking…");
+  });
+
+  it("resolves a pending control from the probe, without a status re-read", async () => {
+    // This page reads `ai_status` once, on mount, and the shell's effort-menu
+    // cache is not persisted — so a pane opened inside the launch probe window
+    // has no other way out of "checking". The probe's response is the one status
+    // read that carries a resolved control on a cold launch.
+    mockAiStatus.mockResolvedValue(OR_ACTIVE); // pending
+    mockRefreshReasoning.mockResolvedValue(OR_EFFORTS);
+    const { user } = setup();
+
+    await user.click(await screen.findByRole("button", { name: "Check again" }));
+
+    expect(mockRefreshReasoning).toHaveBeenCalledOnce();
+    expect(await screen.findByRole("combobox", EFFORT_MENU)).toBeInTheDocument();
+  });
+
+  it("renders the model's own effort menu, verbatim and in its own order", async () => {
+    mockAiStatus.mockResolvedValue(OR_EFFORTS);
+    setup();
+
+    const menu = await screen.findByRole("combobox", EFFORT_MENU);
     expect(
-      screen.getByText("Reasoning tokens are billed by OpenRouter."),
+      within(menu)
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["Model default (high)", "xhigh", "high"]);
+  });
+
+  it("sets an effort with one call and renders the status it returns", async () => {
+    const withEffort: AiStatus = {
+      ...OR_EFFORTS,
+      openrouter: { ...OR_EFFORTS.openrouter, reasoning: true, reasoningEffort: "xhigh" },
+    };
+    mockAiStatus.mockResolvedValue(OR_EFFORTS);
+    mockSetReasoningEffort.mockResolvedValue(withEffort);
+    const { user } = setup();
+
+    await user.selectOptions(await screen.findByRole("combobox", EFFORT_MENU), "xhigh");
+
+    // The value the model spelled, not one this app normalised.
+    expect(mockSetReasoningEffort).toHaveBeenCalledExactlyOnceWith("xhigh");
+    // Picking an effort is itself the opt-in, and the echo is what says so.
+    await waitFor(() =>
+      expect(screen.getByRole("checkbox", REASONING_TOGGLE)).toBeChecked(),
+    );
+    expect(await screen.findByRole("combobox", EFFORT_MENU)).toHaveValue("xhigh");
+  });
+
+  it("surfaces a refused effort rather than coercing to something nearby", async () => {
+    // The shell refuses an effort the currently probed menu does not offer —
+    // the menu moved underneath the control, which is a real condition worth
+    // seeing. Silently coercing would bill the user for an effort they never
+    // chose.
+    mockAiStatus.mockResolvedValue(OR_EFFORTS);
+    mockSetReasoningEffort.mockRejectedValue({
+      kind: "invalidContent",
+      message: '"xhigh" is no longer one of this model\'s reasoning efforts (high). Reopen Settings to pick from the current list.',
+    });
+    const { user } = setup();
+
+    await user.selectOptions(await screen.findByRole("combobox", EFFORT_MENU), "xhigh");
+
+    expect(
+      await screen.findByText(/no longer one of this model's reasoning efforts/),
     ).toBeInTheDocument();
+    // Nothing was persisted, so the menu still shows what the config holds.
+    expect(screen.getByRole("combobox", EFFORT_MENU)).toHaveValue("");
   });
 });
