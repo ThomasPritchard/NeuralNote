@@ -200,6 +200,10 @@ export function OpenRouterCard({
           model={status.openrouter.model}
           reasoningOn={reasoning}
           effort={status.openrouter.reasoningEffort}
+          // Optional on the wire (absent is the ordinary case), one
+          // representation in the view: `null` means nothing is being
+          // substituted and `reasoningEffort` above is the whole truth.
+          effortOverride={status.openrouter.reasoningEffortOverride ?? null}
           saving={savingReasoning}
           rechecking={rechecking}
           error={reasoningError}

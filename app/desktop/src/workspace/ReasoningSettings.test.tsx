@@ -38,6 +38,7 @@ function setup(
       model={MODEL}
       reasoningOn={false}
       effort={null}
+      effortOverride={null}
       saving={false}
       rechecking={false}
       error={null}
@@ -299,6 +300,108 @@ describe("ReasoningSettings — efforts", () => {
     expect(
       screen.getByText(/Picking one turns reasoning on, and bills more/),
     ).toBeInTheDocument();
+  });
+});
+
+describe("ReasoningSettings — a stored effort the menu stopped accepting", () => {
+  // Amendment E3: the model keeps its id and shrinks its published menu, so the
+  // backend keeps the preference and substitutes for the request alone. Before
+  // this the control rendered BLANK — the stored value is not on the list the
+  // `<select>` draws from — while every run billed for the substitute, and the
+  // only witness was a log line no desktop user opens.
+  const SHRUNK: ReasoningControl = {
+    kind: "efforts",
+    options: ["high", "low"],
+    defaultEffort: "high",
+    canDisable: true,
+  };
+  const OVERRIDE = { stored: "xhigh", sending: "high" };
+
+  it("still shows the stored value in the control rather than nothing at all", () => {
+    setup(SHRUNK, { effort: "xhigh", reasoningOn: true, effortOverride: OVERRIDE });
+
+    // The bug, pinned: a blank control is a setting that looks lost.
+    expect(screen.getByRole("combobox", { name: "Reasoning effort" })).toHaveValue(
+      "xhigh",
+    );
+  });
+
+  it("keeps the model's own menu contiguous and the orphan out of it", () => {
+    setup(SHRUNK, { effort: "xhigh", reasoningOn: true, effortOverride: OVERRIDE });
+
+    const menu = screen.getByRole("combobox", { name: "Reasoning effort" });
+    // Verbatim and in the model's own order, with the stored value after them.
+    expect(renderedEfforts()).toEqual(["high", "low", "xhigh"]);
+    // And it cannot be re-picked: sending it is exactly what the backend
+    // refuses, so a selectable entry would be a control that lies.
+    expect(within(menu).getByRole("option", { name: "xhigh" })).toBeDisabled();
+  });
+
+  it("names both halves — what was chosen and what runs actually ask for", () => {
+    setup(SHRUNK, { effort: "xhigh", reasoningOn: true, effortOverride: OVERRIDE });
+
+    expect(
+      screen.getByRole("combobox", { name: "Reasoning effort" }),
+    ).toHaveAccessibleDescription(
+      "This model no longer offers xhigh, so runs ask for high instead. " +
+        "Your choice is kept. The model's own effort names, in its own order. " +
+        "More effort means more billed tokens on every step of a run.",
+    );
+  });
+
+  it("says the provider's own default is what goes out when no effort is named", () => {
+    // `sending: null` is the same convention `effort` already uses — name no
+    // effort and take whatever the provider does by default.
+    setup(
+      { ...SHRUNK, defaultEffort: null },
+      {
+        effort: "xhigh",
+        reasoningOn: true,
+        effortOverride: { stored: "xhigh", sending: null },
+      },
+    );
+
+    expect(screen.getByRole("combobox", { name: "Reasoning effort" })).toHaveAccessibleDescription(
+      /This model no longer offers xhigh, so runs use its default instead\./,
+    );
+  });
+
+  it("explains itself on a model that dropped its menu entirely", () => {
+    // `toggle` and `locked` reach the same rule by the other route: no menu at
+    // all, so there is no control to render blank — and the stored effort is
+    // still not being sent, which is the half a user paying for tokens needs.
+    setup(
+      { kind: "toggle", defaultOn: false },
+      {
+        reasoningOn: true,
+        effort: "xhigh",
+        effortOverride: { stored: "xhigh", sending: null },
+      },
+    );
+
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+    expect(screen.getByRole("checkbox", { name: LABEL })).toHaveAccessibleDescription(
+      /This model no longer offers xhigh, so runs use its default instead\./,
+    );
+  });
+
+  it("is not the error voice, and costs nothing when nothing is substituted", () => {
+    // Nothing failed: the model changed what it publishes and the preference is
+    // intact. Borrowing the destructive channel would report the opposite of
+    // what happened — and would fire a screen reader's alert for news that is
+    // not urgent.
+    const { unmount } = setup(SHRUNK, {
+      effort: "xhigh",
+      reasoningOn: true,
+      effortOverride: OVERRIDE,
+    });
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+    unmount();
+
+    // The ordinary case renders no notice at all — no reserved slot, no text.
+    setup(SHRUNK, { effort: "high", reasoningOn: true });
+    expect(screen.queryByText(/no longer offers/)).not.toBeInTheDocument();
+    expect(renderedEfforts()).toEqual(["high", "low"]);
   });
 });
 

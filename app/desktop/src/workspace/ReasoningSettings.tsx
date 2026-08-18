@@ -21,11 +21,17 @@
 //      `toggle` and `locked` occupy exactly the same box: a probe resolving
 //      underneath the user moves nothing. Only `efforts` grows, by exactly the
 //      one row that holds its menu.
+//   4. **A substitution is shown, never implied.** When the model's menu stops
+//      accepting the stored effort the backend keeps the preference and sends
+//      something else (amendment E3). Rendering only the menu would leave the
+//      control blank — a value that is not on the list it draws from — while
+//      every run bills for the substitute. So the stored value stays visible in
+//      the control that owns it, and one line says what is going out instead.
 
 import { useId } from "react";
-import { Check, Loader2 } from "lucide-react";
+import { Check, Info, Loader2 } from "lucide-react";
 import { cn } from "../lib/cn";
-import type { ReasoningControl } from "../lib/types";
+import type { ReasoningControl, ReasoningEffortOverride } from "../lib/types";
 import { buttonVariants } from "@/components/ui/button";
 import { InlineError } from "./ProviderCard";
 import { reasoningAlwaysOn } from "./reasoningSupport";
@@ -111,6 +117,66 @@ function modelDefaultLabel(defaultEffort: string | null): string {
   return defaultEffort === null ? "Model default" : `Model default (${defaultEffort})`;
 }
 
+/** The group the orphaned choice sits in, so the model's own list stays exactly
+ *  the model's own list. The value inside it is still rendered verbatim — what
+ *  the group says is that it is no longer on offer, which is a fact about
+ *  availability rather than a claim about what the effort means. */
+const ORPHAN_GROUP = "No longer offered";
+
+/** The substitution, in one sentence, in the pane's own vocabulary ("a run" is
+ *  what the hint beside it already calls the thing being billed).
+ *
+ *  Two shapes, near-identical in length on purpose (85 and 88 characters at the
+ *  catalogue's own values): they differ by whether the model publishes a default
+ *  — nothing the user did — so they must not lay out differently. Measured in
+ *  the browser tier at 578px, which is this element's width in the narrowest
+ *  window the app will open: `min(920 − 32, max-w-4xl)` − 192 (nav) − 48
+ *  (`sm:px-6`) − 32 (card `p-4`) − 20 (own `px-2.5`) − 18 (glyph + gap). Both
+ *  are one line there, and no `min-h` reservation is taken because a slot held
+ *  open for a state almost nobody is in shows as a blank second line for
+ *  everybody who is.
+ *
+ *  Deliberately NOT the error voice. Nothing failed — the model changed what it
+ *  publishes, the preference is intact, and it applies again the moment the menu
+ *  carries it. The reassurance is the last clause, and it is the reason this
+ *  reads as an explanation rather than as a write that went wrong. */
+function EffortOverrideNotice({
+  id,
+  override,
+}: Readonly<{ id: string; override: ReasoningEffortOverride }>) {
+  return (
+    // A quiet well, not a tinted banner: it is told apart from the hint below it
+    // by its ground, never by hue — the destructive and warning tones both say
+    // "something needs fixing", which is the opposite of what happened. The
+    // idiom is the key form's (`bg-background/50` + the theme hairline) at one
+    // step smaller.
+    <p
+      id={id}
+      className="flex items-start gap-1.5 rounded-md bg-background/50 px-2.5 py-1.5 text-[0.6875rem] leading-snug text-foreground/80 ring-1 ring-inset ring-border"
+    >
+      <Info className="mt-px size-3 shrink-0 text-muted-foreground" aria-hidden />
+      <span className="min-w-0 flex-1 break-words">
+        This model no longer offers <Effort value={override.stored} />, so runs{" "}
+        {override.sending === null ? (
+          "use its default"
+        ) : (
+          <>
+            ask for <Effort value={override.sending} />
+          </>
+        )}{" "}
+        instead. Your choice is kept.
+      </span>
+    </p>
+  );
+}
+
+/** One effort value inside prose. Mono and a shade brighter than the sentence
+ *  around it, so the two values a reader is comparing are the two things that
+ *  stand out — typography carrying the emphasis, not a colour. */
+function Effort({ value }: Readonly<{ value: string }>) {
+  return <span className="nn-mono text-foreground">{value}</span>;
+}
+
 function AlwaysOn() {
   return (
     // Not a badge: the accent lives in the icon (a graphic, so 3:1 is the bar
@@ -162,6 +228,7 @@ export function ReasoningSettings({
   model,
   reasoningOn,
   effort,
+  effortOverride,
   saving,
   rechecking,
   error,
@@ -181,6 +248,13 @@ export function ReasoningSettings({
   /** The persisted effort, or `null` for "send none". Only ever a value read off
    *  this model's own menu. */
   effort: string | null;
+  /** The substitution the send path is applying right now, or `null` when what
+   *  the user chose is what goes out. Present only while the current menu will
+   *  not accept the stored effort — which is also the only way `effort` above
+   *  can fail to match an option, so this is what keeps the control from
+   *  rendering blank. Not derived here: the backend resolved it with the same
+   *  call the send path uses. */
+  effortOverride: ReasoningEffortOverride | null;
   /** A preference write is in flight. */
   saving: boolean;
   /** A capability re-check is in flight. */
@@ -192,8 +266,15 @@ export function ReasoningSettings({
 }>) {
   const hintId = useId();
   const effortId = useId();
+  const overrideId = useId();
   const affordance = affordanceFor(control);
   const hint = hintFor(control, model, reasoningOn);
+  // The news before the standing description: a screen-reader user hears what
+  // this model is doing with their setting first, and the general account of the
+  // menu second. One string for both controls, because only one of them exists
+  // at a time and the substitution is a fact about the whole setting.
+  const describedBy =
+    effortOverride === null ? hintId : `${overrideId} ${hintId}`;
 
   return (
     <div className="flex flex-col gap-1.5">
@@ -213,7 +294,7 @@ export function ReasoningSettings({
               checked={reasoningOn}
               onChange={onToggle}
               disabled={saving}
-              aria-describedby={hintId}
+              aria-describedby={describedBy}
               className="size-3.5 shrink-0 accent-primary disabled:cursor-not-allowed disabled:opacity-50"
             />
             <span>{LABEL}</span>
@@ -251,7 +332,7 @@ export function ReasoningSettings({
             id={effortId}
             value={effort ?? MODEL_DEFAULT}
             disabled={saving}
-            aria-describedby={hintId}
+            aria-describedby={describedBy}
             onChange={(event) =>
               onPickEffort(
                 event.target.value === MODEL_DEFAULT ? null : event.target.value,
@@ -269,8 +350,31 @@ export function ReasoningSettings({
                 {option}
               </option>
             ))}
+            {/* The stored value, kept in the control so it never renders blank —
+                a `<select>` whose value matches no option shows nothing at all,
+                which reads as a setting that was lost rather than one that is
+                being substituted. Disabled because it cannot be sent: it is
+                here to be SEEN, and picking it again would only re-store what is
+                already stored. Last, and in its own group, so the model's own
+                menu stays contiguous above it. */}
+            {effortOverride !== null && (
+              <optgroup label={ORPHAN_GROUP}>
+                <option value={effortOverride.stored} disabled>
+                  {effortOverride.stored}
+                </option>
+              </optgroup>
+            )}
           </select>
         </div>
+      )}
+
+      {/* Under the control it explains and above the standing hint, so nothing
+          the user can operate moves when it appears. Absent is the ordinary
+          case and costs exactly nothing: there is no reserved slot, because a
+          slot held open for a state almost no one is in is a permanent tax to
+          avoid a one-off growth at the bottom of a block. */}
+      {effortOverride !== null && (
+        <EffortOverrideNotice id={overrideId} override={effortOverride} />
       )}
 
       {/* `2lh` — exactly two of this paragraph's own lines — so a one-line hint
