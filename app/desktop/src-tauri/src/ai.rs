@@ -855,10 +855,12 @@ pub struct OpenAiChatClient {
     /// tool-deciding turns as well as the answer turn, which is one ask rather
     /// than two. `None` sends no `reasoning` object at all.
     ///
-    /// The caller resolves it (`effective_reasoning_ask`) from the user's stored
-    /// preference and the selected model's capability before construction, for
-    /// both OpenRouter and Ollama. Holding the resolved ask rather than a flag is
-    /// what stops an effort being reconstructed, or guessed, down here.
+    /// The caller resolves it (`effective_reasoning_ask`, over an effort
+    /// `sendable_effort` has already checked against the model's current menu)
+    /// from the user's stored preference and the selected model's capability
+    /// before construction, for both OpenRouter and Ollama. Holding the resolved
+    /// ask rather than a flag is what stops an effort being reconstructed, or
+    /// guessed, down here.
     reasoning: Option<openai::ReasoningAsk>,
 }
 

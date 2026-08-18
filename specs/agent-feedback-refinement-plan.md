@@ -644,7 +644,9 @@ open. Concretely:
 - When the control is `Pending`, an opted-in user's turn sends `ReasoningAsk::Enabled` —
   `{"enabled": true}`, no `effort`.
 - **An effort value is only ever sent when it was read off a probed menu.** There is no
-  fallback effort, no remembered effort from a previous model, no compiled-in default.
+  remembered effort from a previous model and no compiled-in default. *Amended by E3:* a stored
+  effort the model's **current** menu no longer lists falls back to that menu's own
+  `default_effort` — still a value read off this model's probed menu, never an invented one.
 
 The asymmetry is deliberate and worth stating in the code: guessing a *menu* invents user-facing
 options that may not exist, while omitting an *effort* just takes the provider's own default.

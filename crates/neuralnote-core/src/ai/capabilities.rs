@@ -449,6 +449,12 @@ pub fn effective_reasoning(opt_in: bool, support: ReasoningSupport) -> bool {
 ///
 /// The asymmetry is the point: guessing a menu invents user-facing options that
 /// may not exist, while omitting an effort costs nothing but a default.
+///
+/// `effort` must already be one the model's **current** menu offers — nothing
+/// here checks it, and a `Supported` verdict sends whatever is named verbatim.
+/// [`sendable_effort`] is what reconciles a stored preference against a menu
+/// that moved underneath it (amendment E3), so callers resolving an ask from
+/// persisted config go through it first.
 pub fn effective_reasoning_ask(
     opt_in: bool,
     effort: Option<&str>,
@@ -462,6 +468,61 @@ pub fn effective_reasoning_ask(
             Some(ReasoningAsk::Effort(effort.to_string()))
         }
         _ => Some(ReasoningAsk::Enabled),
+    }
+}
+
+/// The stored effort this turn may actually send, reconciled against the menu
+/// the catalogue offers *right now* (amendment E3).
+///
+/// A model can keep its id while its published `supported_efforts` shrinks,
+/// leaving a stored effort the provider would reject outright — failing a whole
+/// run over a preference. So an effort survives only while the current control
+/// still lists it. Otherwise it falls back to the menu's own `default_effort`,
+/// and to `None` — which [`effective_reasoning_ask`] sends as plain
+/// `ReasoningAsk::Enabled` — when the model publishes no default.
+///
+/// Nothing is invented and §4.2 still holds: [`reasoning_control`] has already
+/// filtered `default_effort` down to a value the menu carries, so every effort
+/// that leaves here was read off this model's own menu.
+///
+/// [`ReasoningControl::Pending`] is the one control that leaves the stored value
+/// alone (amendment E2): it means the catalogue has not answered, which is not
+/// evidence the menu shrank. Discarding a value read off this same model's
+/// probed menu would silently ignore the user's setting for every turn of the
+/// cold-launch probe window.
+///
+/// **Tolerated, not silent**, same shape as [`lenient_reasoning`] above: a
+/// billed preference being overridden is exactly the quiet degradation this
+/// project forbids, so the override is logged where it is decided.
+pub fn sendable_effort<'a>(
+    control: &'a ReasoningControl,
+    stored: Option<&'a str>,
+) -> Option<&'a str> {
+    let stored = stored?;
+    match control {
+        ReasoningControl::Pending => Some(stored),
+        ReasoningControl::Efforts { options, .. }
+            if options.iter().any(|option| option == stored) =>
+        {
+            Some(stored)
+        }
+        _ => {
+            let fallback = published_default_effort(control);
+            log::warn!(
+                "capabilities: the stored reasoning effort {stored:?} is not on this model's \
+                 current menu; asking for {} instead",
+                fallback.unwrap_or("the provider's own default")
+            );
+            fallback
+        }
+    }
+}
+
+/// The default effort a control publishes, if it publishes a menu at all.
+fn published_default_effort(control: &ReasoningControl) -> Option<&str> {
+    match control {
+        ReasoningControl::Efforts { default_effort, .. } => default_effort.as_deref(),
+        _ => None,
     }
 }
 
@@ -1140,6 +1201,100 @@ mod tests {
         ] {
             assert_eq!(effective_reasoning_ask(false, Some("xhigh"), support), None);
         }
+    }
+
+    /* ───────  A menu that shrank under a stable model (amendment E3)  ─────── */
+
+    fn menu(options: &[&str], default_effort: Option<&str>) -> ReasoningControl {
+        ReasoningControl::Efforts {
+            options: options.iter().map(|o| (*o).to_string()).collect(),
+            default_effort: default_effort.map(str::to_string),
+            can_disable: true,
+        }
+    }
+
+    #[test]
+    fn an_effort_the_current_menu_still_offers_survives_untouched() {
+        assert_eq!(
+            sendable_effort(&menu(&["high", "low"], Some("high")), Some("low")),
+            Some("low")
+        );
+    }
+
+    #[test]
+    fn a_stored_effort_the_menu_dropped_falls_back_to_the_models_own_default() {
+        // Amendment E3. The model kept its id and shrank its menu, so the stored
+        // effort would now be rejected by the provider — failing a whole run over
+        // a preference. Fall back to the default the menu itself publishes.
+        let control = menu(&["high", "low"], Some("high"));
+
+        assert_eq!(sendable_effort(&control, Some("xhigh")), Some("high"));
+        assert_eq!(
+            effective_reasoning_ask(
+                true,
+                sendable_effort(&control, Some("xhigh")),
+                ReasoningSupport::Supported
+            ),
+            Some(ReasoningAsk::Effort("high".into()))
+        );
+    }
+
+    #[test]
+    fn a_stored_effort_the_menu_dropped_falls_back_to_plain_enabled_with_no_default() {
+        // The same case for a model that publishes no `default_effort`: name no
+        // effort at all and take the provider's own, rather than guessing one.
+        let control = menu(&["high", "low"], None);
+
+        assert_eq!(sendable_effort(&control, Some("xhigh")), None);
+        assert_eq!(
+            effective_reasoning_ask(
+                true,
+                sendable_effort(&control, Some("xhigh")),
+                ReasoningSupport::Supported
+            ),
+            Some(ReasoningAsk::Enabled)
+        );
+    }
+
+    #[test]
+    fn a_user_who_chose_no_effort_is_not_handed_the_menus_default() {
+        // The fallback exists for a choice the menu dropped, not for a choice
+        // never made. "Take the model's own default" is what storing no effort
+        // already means, and preselecting one here would start naming a value on
+        // the wire that the user never picked.
+        assert_eq!(
+            sendable_effort(&menu(&["high", "low"], Some("high")), None),
+            None
+        );
+    }
+
+    #[test]
+    fn a_model_that_publishes_no_menu_at_all_sends_no_effort() {
+        // Nothing here lists an effort, so no effort may go out — the same rule,
+        // reached from the menu-less controls rather than from a shrunken menu.
+        for control in [
+            ReasoningControl::Toggle { default_on: true },
+            ReasoningControl::Locked,
+            ReasoningControl::Hidden,
+        ] {
+            assert_eq!(
+                sendable_effort(&control, Some("xhigh")),
+                None,
+                "{control:?} offers no effort menu"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unanswered_menu_leaves_the_stored_effort_alone() {
+        // Amendment E2: `Pending` is "the catalogue has not answered", which is
+        // not evidence the menu shrank. The stored value was read off this same
+        // model's probed menu, so discarding it here would silently ignore the
+        // user's setting for every turn of the cold-launch probe window.
+        assert_eq!(
+            sendable_effort(&ReasoningControl::Pending, Some("xhigh")),
+            Some("xhigh")
+        );
     }
 
     #[test]

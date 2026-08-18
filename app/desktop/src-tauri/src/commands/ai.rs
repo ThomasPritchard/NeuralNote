@@ -387,6 +387,33 @@ fn selected_reasoning_control(
     )
 }
 
+/// What the hosted lane asks the provider for on every turn of this run.
+///
+/// Two facts decide it, and they fail in opposite directions (§4.2). WHETHER to
+/// reason comes from the persisted verdict and fails **open** — an `Unknown`
+/// probe still reasons. WHICH effort comes from the menu the catalogue offers
+/// right now and fails **closed**: `sendable_effort` drops any stored effort
+/// that menu no longer lists, so an effort a shrunken menu would have the
+/// provider reject never reaches the wire (amendment E3). Only the outgoing
+/// request is adjusted; the stored preference is untouched, so it comes back on
+/// its own if the menu does.
+///
+/// The verdict and the menu answer at different times — the verdict is persisted
+/// and the control cache is not — which is why both are read here rather than
+/// one being inferred from the other. A `Pending` control means the catalogue
+/// has not answered yet, and a stored effort survives it (amendment E2).
+fn openrouter_reasoning_ask(
+    cfg: &neuralnote_core::ai::ProviderConfig,
+    key_present: bool,
+) -> Option<neuralnote_core::ai::openai::ReasoningAsk> {
+    let control = selected_reasoning_control(cfg, key_present);
+    neuralnote_core::ai::effective_reasoning_ask(
+        cfg.reasoning_preference.enabled,
+        neuralnote_core::ai::sendable_effort(&control, cfg.reasoning_preference.effort.as_deref()),
+        cfg.cached_reasoning_support(key_present),
+    )
+}
+
 /// Map the persisted config onto the provider-aware status DTO. Split from the
 /// command (which owns only the config read) so the config → status mapping — notably
 /// that `reasoning` surfaces on the OpenRouter status — is unit-testable without an
@@ -1295,23 +1322,7 @@ pub(crate) async fn chat(
             None
         }
         Some(ProviderKind::OpenRouter) => {
-            // Fail-open on WHETHER to reason, closed on the effort: a stored
-            // effort only goes out while the verdict says the model reasons.
-            //
-            // That is the VERDICT, not the control. The verdict is persisted and
-            // the menu cache is not, so on a cold launch this sends a stored
-            // effort while `AiStatus` still reports the control as `Pending` —
-            // which §4.2's "when the control is `Pending` … no `effort`"
-            // sentence, read literally, forbids. The effort being sent was read
-            // off this same model's probed menu (a model change clears it), so
-            // it satisfies §4.2's governing rule; dropping it would silently
-            // ignore the user's setting for every turn inside the ~8s probe
-            // window. Flagged for a ruling rather than resolved here.
-            let ask = neuralnote_core::ai::effective_reasoning_ask(
-                cfg.reasoning_preference.enabled,
-                cfg.reasoning_preference.effort.as_deref(),
-                cfg.cached_reasoning_support(key_present),
-            );
+            let ask = openrouter_reasoning_ask(&cfg, key_present);
             chat_via_openrouter(&mut run, &cfg.model, ask).await
         }
         Some(ProviderKind::Local) => {
@@ -3430,6 +3441,110 @@ mod tests {
         );
         assert!(status.openrouter.reasoning);
         assert_eq!(status.openrouter.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    /* ─────  What the send path asks for when the menu moved (amendment E3)  ───── */
+
+    /// Warm the control cache with the menu `model` publishes right now.
+    fn warm_catalogue_menu(model: &str, reasoning: serde_json::Value) {
+        ai::cache_openrouter_reasoning_controls(
+            &serde_json::json!({ "data": [{ "id": model, "reasoning": reasoning }] }).to_string(),
+        );
+    }
+
+    /// A hosted config that selects `model` with a `Supported` verdict and
+    /// `effort` already stored — the state a menu can shrink underneath.
+    fn openrouter_config_with_effort(model: &str, effort: &str) -> ProviderConfig {
+        ProviderConfig {
+            active_provider: Some(ProviderKind::OpenRouter),
+            model: model.into(),
+            reasoning_preference: neuralnote_core::ai::ReasoningPreference {
+                enabled: true,
+                effort: Some(effort.into()),
+            },
+            reasoning_probe: probed(model, ReasoningSupport::Supported),
+            ..ProviderConfig::default()
+        }
+    }
+
+    #[test]
+    fn a_menu_that_still_offers_the_stored_effort_sends_it_verbatim() {
+        let model = "test/send-menu-unchanged";
+        warm_catalogue_menu(
+            model,
+            serde_json::json!({ "supported_efforts": ["high", "low"], "default_effort": "high" }),
+        );
+
+        assert_eq!(
+            openrouter_reasoning_ask(&openrouter_config_with_effort(model, "low"), true),
+            Some(neuralnote_core::ai::openai::ReasoningAsk::Effort(
+                "low".into()
+            ))
+        );
+    }
+
+    #[test]
+    fn a_menu_that_dropped_the_stored_effort_sends_the_models_published_default() {
+        // Amendment E3. The model kept its id and shrank its menu, so sending
+        // `xhigh` would have the provider reject the turn outright — failing a
+        // run over a preference. The menu's own default goes out instead, and
+        // the stored preference is left alone: a shrunken menu can come back,
+        // and rewriting the user's setting from one catalogue fetch would not.
+        let model = "test/send-shrunken-menu";
+        warm_catalogue_menu(
+            model,
+            serde_json::json!({ "supported_efforts": ["high", "low"], "default_effort": "high" }),
+        );
+        let cfg = openrouter_config_with_effort(model, "xhigh");
+
+        assert_eq!(
+            openrouter_reasoning_ask(&cfg, true),
+            Some(neuralnote_core::ai::openai::ReasoningAsk::Effort(
+                "high".into()
+            ))
+        );
+        assert_eq!(
+            cfg.reasoning_preference.effort.as_deref(),
+            Some("xhigh"),
+            "the outgoing request is adjusted, not the stored preference"
+        );
+    }
+
+    #[test]
+    fn a_shrunken_menu_with_no_published_default_sends_plain_enabled() {
+        // Nothing on this menu is the user's choice and nothing is the model's,
+        // so name no effort and take the provider's own.
+        let model = "test/send-shrunken-menu-no-default";
+        warm_catalogue_menu(
+            model,
+            serde_json::json!({ "supported_efforts": ["high", "low"] }),
+        );
+
+        assert_eq!(
+            openrouter_reasoning_ask(&openrouter_config_with_effort(model, "xhigh"), true),
+            Some(neuralnote_core::ai::openai::ReasoningAsk::Enabled)
+        );
+    }
+
+    #[test]
+    fn a_catalogue_that_has_not_answered_yet_still_sends_the_stored_effort() {
+        // Amendment E2. The verdict is persisted and the menu cache is not, so
+        // this is every turn of the ~8s probe window after a cold launch. The
+        // stored value was read off this same model's own menu, so dropping it
+        // here would silently ignore the user's setting on each of those turns.
+        let cfg = openrouter_config_with_effort("test/send-cold-catalogue", "xhigh");
+
+        assert_eq!(
+            selected_reasoning_control(&cfg, true),
+            ReasoningControl::Pending,
+            "an unwarmed catalogue must leave the control unanswered"
+        );
+        assert_eq!(
+            openrouter_reasoning_ask(&cfg, true),
+            Some(neuralnote_core::ai::openai::ReasoningAsk::Effort(
+                "xhigh".into()
+            ))
+        );
     }
 
     /// Warm the control cache for `model` with `options`, then build a config
