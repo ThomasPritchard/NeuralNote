@@ -15,5 +15,10 @@ reasoning: boolean,
  * Never a value we chose. It is only ever set by `set_reasoning_effort`,
  * which refuses anything the probed menu does not offer, and it is cleared
  * whenever the selected model changes.
+ *
+ * It is the STORED value, which since amendment E3 is not always the one on
+ * the wire: a menu that shrinks under a model leaves the preference intact
+ * and substitutes for the request alone (`reasoning_ask`). This field is
+ * what the user chose, not what the last turn sent.
  */
 reasoningEffort: string | null, };

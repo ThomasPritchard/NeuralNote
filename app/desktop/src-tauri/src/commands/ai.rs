@@ -216,6 +216,11 @@ pub(crate) struct OpenRouterStatus {
     /// Never a value we chose. It is only ever set by `set_reasoning_effort`,
     /// which refuses anything the probed menu does not offer, and it is cleared
     /// whenever the selected model changes.
+    ///
+    /// It is the STORED value, which since amendment E3 is not always the one on
+    /// the wire: a menu that shrinks under a model leaves the preference intact
+    /// and substitutes for the request alone (`reasoning_ask`). This field is
+    /// what the user chose, not what the last turn sent.
     reasoning_effort: Option<String>,
 }
 
@@ -389,28 +394,27 @@ fn selected_reasoning_control(
 
 /// What the hosted lane asks the provider for on every turn of this run.
 ///
-/// Two facts decide it, and they fail in opposite directions (§4.2). WHETHER to
-/// reason comes from the persisted verdict and fails **open** — an `Unknown`
-/// probe still reasons. WHICH effort comes from the menu the catalogue offers
-/// right now and fails **closed**: `sendable_effort` drops any stored effort
-/// that menu no longer lists, so an effort a shrunken menu would have the
-/// provider reject never reaches the wire (amendment E3). Only the outgoing
+/// Three facts decide it and the core owns how they combine (§4.2): the stored
+/// preference, the persisted verdict, and the menu the catalogue offers right
+/// now. WHETHER to reason fails **open** — an `Unknown` probe still reasons —
+/// while the effort fails **closed**, so an effort a shrunken menu would have
+/// the provider reject never reaches the wire (amendment E3). Only the outgoing
 /// request is adjusted; the stored preference is untouched, so it comes back on
 /// its own if the menu does.
 ///
-/// The verdict and the menu answer at different times — the verdict is persisted
-/// and the control cache is not — which is why both are read here rather than
-/// one being inferred from the other. A `Pending` control means the catalogue
-/// has not answered yet, and a stored effort survives it (amendment E2).
+/// This shell's whole job is producing the third fact. The control comes from
+/// `selected_reasoning_control` rather than the cache directly, so the menu the
+/// send path checks against is the same value `set_reasoning_effort` validates
+/// and the status read hands the UI — a send path checking against anything else
+/// could drop an effort the user was just offered.
 fn openrouter_reasoning_ask(
     cfg: &neuralnote_core::ai::ProviderConfig,
     key_present: bool,
 ) -> Option<neuralnote_core::ai::openai::ReasoningAsk> {
-    let control = selected_reasoning_control(cfg, key_present);
-    neuralnote_core::ai::effective_reasoning_ask(
-        cfg.reasoning_preference.enabled,
-        neuralnote_core::ai::sendable_effort(&control, cfg.reasoning_preference.effort.as_deref()),
+    neuralnote_core::ai::reasoning_ask(
+        &cfg.reasoning_preference,
         cfg.cached_reasoning_support(key_present),
+        &selected_reasoning_control(cfg, key_present),
     )
 }
 
@@ -3497,16 +3501,14 @@ mod tests {
         );
         let cfg = openrouter_config_with_effort(model, "xhigh");
 
+        // The stored preference is untouched by construction rather than by
+        // assertion: this resolution takes `&ProviderConfig` and writes nothing,
+        // so no signature it could have would let it rewrite the preference.
         assert_eq!(
             openrouter_reasoning_ask(&cfg, true),
             Some(neuralnote_core::ai::openai::ReasoningAsk::Effort(
                 "high".into()
             ))
-        );
-        assert_eq!(
-            cfg.reasoning_preference.effort.as_deref(),
-            Some("xhigh"),
-            "the outgoing request is adjusted, not the stored preference"
         );
     }
 

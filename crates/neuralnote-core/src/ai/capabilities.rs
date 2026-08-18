@@ -1,6 +1,7 @@
 //! Pure model-capability parsing shared by hosted and local AI providers.
 
 use crate::ai::openai::ReasoningAsk;
+use crate::ai::provider_config::ReasoningPreference;
 use crate::capture::ModelPricing;
 use crate::error::{CoreError, CoreResult};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -471,6 +472,32 @@ pub fn effective_reasoning_ask(
     }
 }
 
+/// What to ask the provider for on every turn of this run: the user's stored
+/// preference, resolved against the model's probed verdict and reconciled
+/// against the menu the catalogue offers *right now*.
+///
+/// This is the whole decision, in one place, deliberately. The two halves it
+/// composes read different facts that arrive at different times — the verdict is
+/// persisted, the menu cache is not — and resolving an ask without consulting
+/// the menu is exactly the bug amendment E3 rules out. [`sendable_effort`] is
+/// therefore private and reachable only from here, after the opt-in gate: a
+/// preference the user switched off is not overridden by anything, so a turn
+/// that sends no `reasoning` object at all must not report one.
+pub fn reasoning_ask(
+    preference: &ReasoningPreference,
+    support: ReasoningSupport,
+    control: &ReasoningControl,
+) -> Option<ReasoningAsk> {
+    if !effective_reasoning(preference.enabled, support) {
+        return None;
+    }
+    effective_reasoning_ask(
+        preference.enabled,
+        sendable_effort(control, preference.effort.as_deref()),
+        support,
+    )
+}
+
 /// The stored effort this turn may actually send, reconciled against the menu
 /// the catalogue offers *right now* (amendment E3).
 ///
@@ -491,44 +518,51 @@ pub fn effective_reasoning_ask(
 /// probed menu would silently ignore the user's setting for every turn of the
 /// cold-launch probe window.
 ///
+/// The remaining three controls are menu-less rather than shrunken, and they say
+/// so in their own words: pointing whoever reads the log at a menu that never
+/// existed would send them looking for the wrong thing. They are named one by
+/// one rather than caught by a `_`, so the day a control variant is added — a
+/// `max_tokens` budget is already parsed and documented as the other half of
+/// this knob — this function fails to compile instead of silently absorbing it.
+///
 /// **Tolerated, not silent**, same shape as [`lenient_reasoning`] above: a
 /// billed preference being overridden is exactly the quiet degradation this
 /// project forbids, so the override is logged where it is decided.
-pub fn sendable_effort<'a>(
-    control: &'a ReasoningControl,
-    stored: Option<&'a str>,
-) -> Option<&'a str> {
+fn sendable_effort<'a>(control: &'a ReasoningControl, stored: Option<&'a str>) -> Option<&'a str> {
     let stored = stored?;
     match control {
         ReasoningControl::Pending => Some(stored),
-        ReasoningControl::Efforts { options, .. }
-            if options.iter().any(|option| option == stored) =>
-        {
-            Some(stored)
-        }
-        _ => {
-            let fallback = published_default_effort(control);
+        ReasoningControl::Efforts {
+            options,
+            default_effort,
+            ..
+        } => {
+            if options.iter().any(|option| option == stored) {
+                return Some(stored);
+            }
+            let fallback = default_effort.as_deref();
             log::warn!(
-                "capabilities: the stored reasoning effort {stored:?} is not on this model's \
-                 current menu; asking for {} instead",
+                "capabilities: this model's menu no longer offers the stored reasoning effort \
+                 {stored:?}; asking for {} instead",
                 fallback.unwrap_or("the provider's own default")
             );
             fallback
         }
-    }
-}
-
-/// The default effort a control publishes, if it publishes a menu at all.
-fn published_default_effort(control: &ReasoningControl) -> Option<&str> {
-    match control {
-        ReasoningControl::Efforts { default_effort, .. } => default_effort.as_deref(),
-        _ => None,
+        ReasoningControl::Toggle { .. } | ReasoningControl::Locked | ReasoningControl::Hidden => {
+            log::warn!(
+                "capabilities: this model publishes no effort menu any more, so the stored \
+                 reasoning effort {stored:?} cannot be sent; asking for the provider's own \
+                 default instead"
+            );
+            None
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::warning_capture;
 
     /// Six whole records captured verbatim from OpenRouter's public `/models`
     /// endpoint on 2026-08-18. Captured rather than hand-written on purpose: a
@@ -1283,6 +1317,92 @@ mod tests {
                 "{control:?} offers no effort menu"
             );
         }
+    }
+
+    /// The stored preference a user who opted in and picked `effort` would have.
+    fn preference(effort: Option<&str>) -> ReasoningPreference {
+        ReasoningPreference {
+            enabled: true,
+            effort: effort.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_whole_ask_reconciles_the_stored_effort_against_the_current_menu() {
+        assert_eq!(
+            reasoning_ask(
+                &preference(Some("xhigh")),
+                ReasoningSupport::Supported,
+                &menu(&["high", "low"], Some("high")),
+            ),
+            Some(ReasoningAsk::Effort("high".into()))
+        );
+    }
+
+    #[test]
+    fn a_dropped_effort_is_reported_where_someone_can_read_it() {
+        // The other half of the E3 ruling. Without this the warning could be
+        // deleted and the suite would stay green, leaving a billed preference
+        // overridden with nothing anywhere saying why.
+        let mark = warning_capture::capture();
+        let control = menu(&["high", "low"], Some("high"));
+
+        assert_eq!(
+            sendable_effort(&control, Some("e3-dropped-effort")),
+            Some("high")
+        );
+
+        assert!(
+            warning_capture::recorded(mark, "e3-dropped-effort"),
+            "the override must name the effort it dropped: {:?}",
+            warning_capture::since(mark)
+        );
+        assert!(
+            warning_capture::recorded(mark, "no longer offers"),
+            "and must say the menu dropped it: {:?}",
+            warning_capture::since(mark)
+        );
+    }
+
+    #[test]
+    fn a_turn_that_sends_no_reasoning_object_reports_no_override() {
+        // A preference the user switched off is not being overridden by a menu,
+        // and neither is one on a model the probe found cannot reason: both send
+        // no `reasoning` object at all. Reconciling before that gate would report
+        // an override on a turn that made no request, and a warning that cries
+        // wolf is what makes the real one ignorable.
+        //
+        // Both states are reachable and neither clears the stored effort:
+        // `set_reasoning(false)` flips only the bool, and `apply_reasoning_probe`
+        // writes a fresh verdict for the same model without touching it.
+        let mark = warning_capture::capture();
+
+        assert_eq!(
+            reasoning_ask(
+                &ReasoningPreference {
+                    enabled: false,
+                    effort: Some("e3-opted-out".into()),
+                },
+                ReasoningSupport::Supported,
+                &menu(&["high", "low"], Some("high")),
+            ),
+            None
+        );
+        assert_eq!(
+            reasoning_ask(
+                &preference(Some("e3-cannot-reason")),
+                ReasoningSupport::Unsupported,
+                &ReasoningControl::Hidden,
+            ),
+            None
+        );
+
+        assert!(
+            !warning_capture::recorded(mark, "e3-opted-out")
+                && !warning_capture::recorded(mark, "e3-cannot-reason"),
+            "a turn that asked for no reasoning must not report an overridden effort: {:?}",
+            warning_capture::since(mark)
+        );
     }
 
     #[test]
