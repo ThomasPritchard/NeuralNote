@@ -31,6 +31,7 @@ import type { NoteTabsController } from "./useNoteTabs";
 import {
   describeDiscard,
   persistedWorkspaceState,
+  warnUnhandledIntent,
   type PendingIntent,
 } from "./workspaceIntents";
 import { createWorkspaceStateWriter } from "./workspaceStateWriter";
@@ -297,6 +298,13 @@ export function useWorkspaceLifecycle({
           } catch (deleteError) {
             toast.error(api.errorMessage(deleteError));
           }
+          return;
+        default:
+          // Without this arm a NEW PendingIntent variant falls straight out of
+          // the callback: the confirmation is already cleared, so the user has
+          // approved a destructive action and nothing performs it. The `never`
+          // parameter makes adding one a build error here instead.
+          warnUnhandledIntent(intent);
       }
     },
     [close, closeWindow, openByPath, openExisting, refreshDir, toast],
@@ -304,7 +312,25 @@ export function useWorkspaceLifecycle({
 
   const requestIntent = useCallback(
     (intent: PendingIntent) => {
-      if (pendingIntentRef.current) return;
+      // One confirmation at a time: a second request while one is open is
+      // dropped, so a repeated Quit can't stack or duplicate its dialog.
+      //
+      // An OS window close is the exception, because it does not merely go
+      // unanswered — useWorkspaceMenu's close guard has already called
+      // preventDefault() by the time it gets here, so dropping it leaves the
+      // window refusing to close, repeatedly, with no dialog, toast or hint that
+      // an unrelated prompt is what is blocking it. (A toast cannot say so
+      // either: the open confirmation is a modal, and its overlay both dims and
+      // aria-hides the notification dock.) So it takes over instead — every
+      // intent it displaces is one the user just abandoned by asking to close,
+      // and any unsaved work it puts at risk is re-confirmed below under the
+      // close's own copy.
+      const pending = pendingIntentRef.current;
+      if (pending) {
+        const supersedes =
+          intent.kind === "close-window" && pending.kind !== intent.kind;
+        if (!supersedes) return;
+      }
       const mustConfirm =
         intent.kind === "delete-entry" ||
         (intent.kind === "close-tab"
@@ -313,12 +339,12 @@ export function useWorkspaceLifecycle({
                 ?.dirty,
             )
           : noteTabsRef.current.dirtyTabs.length > 0);
-      if (mustConfirm) {
-        pendingIntentRef.current = intent;
-        setPendingIntent(intent);
-      } else {
-        void performIntent(intent);
-      }
+      // Clearing on the non-confirming path matters when this request supersedes
+      // another: the displaced prompt must not stay on screen behind the action.
+      const next = mustConfirm ? intent : null;
+      pendingIntentRef.current = next;
+      setPendingIntent(next);
+      if (!mustConfirm) void performIntent(intent);
     },
     [performIntent],
   );

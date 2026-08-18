@@ -12,6 +12,7 @@ import { Download, Loader2 } from "lucide-react";
 import { usePreferences } from "../preferences/preferences";
 import { useToast } from "../notifications";
 import {
+  messageOf,
   updateService,
   type UpdateCheckSource,
   type UpdateState,
@@ -83,12 +84,6 @@ function installButtonLabel(status: UpdateState["status"]): string {
  * through the same unsaved-edit confirmation as quitting (issue #205).
  */
 type InstallGuard = (proceed: () => void) => void;
-
-function startInstall(): void {
-  void updateService.installAndRelaunch().catch(() => {
-    // The service publishes the failure into state for the dialog.
-  });
-}
 
 interface UpdateContextValue {
   state: UpdateState;
@@ -166,13 +161,39 @@ export function UpdateCoordinator({ children }: Readonly<{ children: ReactNode }
     };
   }, []);
 
+  const startInstall = useCallback(() => {
+    void updateService.installAndRelaunch().catch((error: unknown) => {
+      // Only a failure DURING the install reaches the dialog: the service sets
+      // `installFailed` from its own catch. Its two pre-state rejections — no
+      // update accepted, and an install already running — throw before the first
+      // setState, so nothing would be published and the user would see the
+      // button they just pressed do nothing at all. Report every one of them
+      // here; a redundant toast beside the dialog's alert is the cheap half of
+      // that trade, and an error toast outlives the dialog either way.
+      toast.error(`The update could not be installed. ${messageOf(error)}`, {
+        dedupKey: "update-install-failed",
+      });
+    });
+  }, [toast]);
+
   const install = useCallback(() => {
     // No guard registered means no vault is open, so there is no unsaved work
     // a relaunch could destroy — installing straight away is correct there.
     const guard = installGuardRef.current;
-    if (guard) guard(startInstall);
-    else startInstall();
-  }, []);
+    if (!guard) {
+      startInstall();
+      return;
+    }
+    // Stand the release notes down while the guard puts its own confirmation on
+    // screen — two stacked modals otherwise, with the lower one answering a
+    // question the user has already moved past. Reopened on the way through,
+    // because install progress and any install failure render ONLY here.
+    setDialogOpen(false);
+    guard(() => {
+      setDialogOpen(true);
+      startInstall();
+    });
+  }, [startInstall]);
 
   const value = useMemo(
     () => ({

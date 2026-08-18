@@ -2,6 +2,7 @@ import { tauriUpdatePlatform } from "./platform";
 import { createUpdateService } from "./service";
 
 export { getAutostartEnabled, setAutostartEnabled } from "./autostart";
+export { messageOf } from "./service";
 export type {
   UpdateCheckSource,
   UpdateMetadata,

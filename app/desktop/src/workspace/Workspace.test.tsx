@@ -1979,4 +1979,83 @@ describe("Workspace — update install guard", () => {
     requestInstall(proceed);
     expect(screen.getByText("Install update and relaunch?")).toBeInTheDocument();
   });
+
+  it("flushes pending workspace state before a confirmed install hands off", async () => {
+    let resolveSave!: () => void;
+    const savePending = new Promise<void>((resolve) => {
+      resolveSave = resolve;
+    });
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockInvoke.mockImplementation((command) => {
+      if (command === "load_workspace_state") return defaultInvoke(String(command));
+      if (command === "save_workspace_state") return savePending;
+      return Promise.resolve(undefined);
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "save_workspace_state",
+        expect.any(Object),
+      ),
+    );
+    const proceed = vi.fn();
+
+    requestInstall(proceed);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Install and relaunch" }),
+    );
+    // The relaunch is a process exit: hand off only once the newest ordered tab
+    // set is on disk, or the app comes back with a stale one.
+    expect(proceed).not.toHaveBeenCalled();
+
+    resolveSave();
+    await waitFor(() => expect(proceed).toHaveBeenCalledOnce());
+  });
+
+  it("lets an OS window close take over the install confirmation", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const proceed = vi.fn();
+
+    requestInstall(proceed);
+    expect(screen.getByText("Install update and relaunch?")).toBeInTheDocument();
+
+    // The close guard has ALREADY cancelled the native close before asking, so a
+    // dropped request leaves the window refusing to close with nothing on screen
+    // saying why. The close question replaces the one the user has abandoned.
+    const event = { preventDefault: vi.fn() };
+    act(() => win.state.closeCb!(event));
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(screen.getByText("Discard unsaved changes?")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Install update and relaunch?"),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Discard" }));
+    await waitFor(() => expect(win.destroy).toHaveBeenCalled());
+    expect(proceed).not.toHaveBeenCalled();
+  });
+
+  it("closes a clean window from behind a delete confirmation", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: false });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    act(() => captured.fileTree.onDeleteRequest(node("/v/Notes") as never));
+    expect(screen.getByText("Delete note?")).toBeInTheDocument();
+
+    const event = { preventDefault: vi.fn() };
+    act(() => win.state.closeCb!(event));
+
+    // Nothing is unsaved, so the close needs no confirmation of its own — and the
+    // superseded delete prompt must not be left on screen behind it.
+    await waitFor(() => expect(win.destroy).toHaveBeenCalled());
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "delete_entry",
+      expect.anything(),
+    );
+  });
 });

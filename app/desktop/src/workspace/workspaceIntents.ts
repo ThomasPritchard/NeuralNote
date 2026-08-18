@@ -45,12 +45,35 @@ export function persistedWorkspaceState(
   };
 }
 
+/** The unreachable arm of every dispatch over `PendingIntent`. `never` is the
+ *  guard that matters: adding a variant to the union without teaching a call
+ *  site about it stops being a silent inheritance of whatever generic copy or
+ *  no-op followed the chain, and becomes a BUILD error at each site — on a
+ *  destructive-action path where the wrong copy gets the wrong thing confirmed.
+ *  Same idiom as `useWorkspaceMenu`'s exhaustive MenuAction default; the runtime
+ *  warn is belt-and-braces if an untyped intent ever reaches one. */
+export function warnUnhandledIntent(intent: never): void {
+  console.warn("unhandled workspace intent:", intent);
+}
+
 export function confirmDialogTitle(intent: PendingIntent): string {
-  if (intent.kind === "delete-entry") {
-    const entityLabel = intent.node.kind === "folder" ? "folder" : "note";
-    return `Delete ${entityLabel}?`;
+  switch (intent.kind) {
+    case "delete-entry": {
+      const entityLabel = intent.node.kind === "folder" ? "folder" : "note";
+      return `Delete ${entityLabel}?`;
+    }
+    case "install-update":
+      return "Install update and relaunch?";
+    case "close-tab":
+    case "close-vault":
+    case "close-window":
+    case "quit-app":
+    case "open-vault":
+    case "open-recent":
+      break;
+    default:
+      warnUnhandledIntent(intent);
   }
-  if (intent.kind === "install-update") return "Install update and relaunch?";
   return "Discard unsaved changes?";
 }
 
@@ -60,8 +83,21 @@ export function isEditableTextNote(note: NoteDoc | null): boolean {
 }
 
 export function confirmDialogLabel(intent: PendingIntent): string {
-  if (intent.kind === "delete-entry") return "Move to Trash";
-  if (intent.kind === "install-update") return "Install and relaunch";
+  switch (intent.kind) {
+    case "delete-entry":
+      return "Move to Trash";
+    case "install-update":
+      return "Install and relaunch";
+    case "close-tab":
+    case "close-vault":
+    case "close-window":
+    case "quit-app":
+    case "open-vault":
+    case "open-recent":
+      break;
+    default:
+      warnUnhandledIntent(intent);
+  }
   return "Discard";
 }
 
@@ -77,21 +113,29 @@ export function describeDiscard(
   intent: PendingIntent,
   dirtyTabCount: number,
 ): string {
-  if (intent.kind === "delete-entry") {
-    const tabNoun = intent.dirtyCount === 1 ? "tab has" : "tabs have";
-    const dirtyWarning =
-      intent.dirtyCount > 0
-        ? ` ${intent.dirtyCount} open ${tabNoun} unsaved changes that will be lost.`
-        : "";
-    return `“${intent.node.name}” will be moved to the Trash.${dirtyWarning}`;
-  }
-  if (intent.kind === "close-tab") {
-    return "This note has edits that haven't been saved. If you continue, they'll be lost.";
-  }
-  if (intent.kind === "install-update") {
-    // Naming the relaunch matters: the consent already given in the update
-    // dialog was about release notes, not about losing unsaved work.
-    return `NeuralNote will relaunch to install the update. ${unsavedNotesClause(dirtyTabCount)} that will be lost.`;
+  switch (intent.kind) {
+    case "delete-entry": {
+      const tabNoun = intent.dirtyCount === 1 ? "tab has" : "tabs have";
+      const dirtyWarning =
+        intent.dirtyCount > 0
+          ? ` ${intent.dirtyCount} open ${tabNoun} unsaved changes that will be lost.`
+          : "";
+      return `“${intent.node.name}” will be moved to the Trash.${dirtyWarning}`;
+    }
+    case "close-tab":
+      return "This note has edits that haven't been saved. If you continue, they'll be lost.";
+    case "install-update":
+      // Naming the relaunch matters: the consent already given in the update
+      // dialog was about release notes, not about losing unsaved work.
+      return `NeuralNote will relaunch to install the update. ${unsavedNotesClause(dirtyTabCount)} that will be lost.`;
+    case "close-vault":
+    case "close-window":
+    case "quit-app":
+    case "open-vault":
+    case "open-recent":
+      break;
+    default:
+      warnUnhandledIntent(intent);
   }
   return `${unsavedNotesClause(dirtyTabCount)}. If you continue, they'll be lost.`;
 }
