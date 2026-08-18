@@ -46,6 +46,84 @@ async fn process_disappears_within(pid: i32, timeout: Duration) -> bool {
     }
 }
 
+/// Run one spec under a HANG detector rather than a latency budget.
+///
+/// The distinction is the whole of this file's flakiness history. What was here
+/// before was `timeout(2s)` around a call that measured 470-890ms under
+/// deliberate CPU and fork pressure (load average 23-46 on 14 cores) — a ceiling
+/// barely 2-3x the cost of spawning a shell, so a busier box overran it while
+/// the runner was working perfectly. That is a latency assertion, and no test
+/// here means to make one; it went red 4-of-6 at an untouched baseline.
+///
+/// The runner bounds itself instead: every outcome these tests assert is
+/// produced at or before the spec's own `timeout`, and the work after that
+/// deadline — SIGKILL the group, reap, join the readers — measured 30-80ms under
+/// the same load. [`TAIL_ALLOWANCE`] is that tail's budget at roughly 400x its
+/// measured cost, and **no passing assertion depends on its value**. It exists
+/// for one case that is otherwise unbounded: a runner that stopped terminating
+/// its child leaves a flooding stub with no EOF to reach, which would hang
+/// `cargo test` forever rather than fail. Verified by mutation — removing the
+/// termination reaches this panic; removing the output bound does not need it,
+/// because the runner's own deadline resolves that one by name.
+///
+/// This is the irreducible timing element in these tests, stated rather than
+/// tuned around: a duration has to stand in for "not coming back at all".
+#[cfg(unix)]
+async fn run_bounded_by_hang_detector(
+    command: &ProcessSpec,
+    cancellation: &CaptureCancellation,
+) -> Result<ProcessOutput, ProcessError> {
+    /// How long past the runner's own deadline is no longer slowness.
+    const TAIL_ALLOWANCE: Duration = Duration::from_secs(30);
+
+    tokio::time::timeout(
+        command.timeout + TAIL_ALLOWANCE,
+        TokioProcessRunner.run(command, cancellation),
+    )
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "the runner did not resolve within {TAIL_ALLOWANCE:?} of its own {:?} deadline, \
+             so it is not terminating the child",
+            command.timeout
+        )
+    })
+}
+
+/// A runner result rendered for a failure message, with buffer *lengths* where
+/// `{:?}` would print buffer contents.
+///
+/// Captured output is 64 bytes when these tests pass and hundreds of megabytes
+/// in the one world they exist to catch — a build that stopped bounding output,
+/// which now reads a flooding stub until the runner's own deadline. A panic
+/// nobody can scroll to the top of is the same dead end the destructuring in
+/// `stdout_overflow_is_bounded_and_stops_the_child` was added to escape.
+#[cfg(unix)]
+fn outcome_label(result: &Result<ProcessOutput, ProcessError>) -> String {
+    let sizes = |stdout: &[u8], stderr: &[u8]| {
+        format!(
+            "{} stdout bytes, {} stderr bytes",
+            stdout.len(),
+            stderr.len()
+        )
+    };
+    match result {
+        Ok(output) => format!(
+            "Ok(exit {:?}, {})",
+            output.status.code(),
+            sizes(&output.stdout, &output.stderr)
+        ),
+        Err(error @ ProcessError::TimedOut { stdout, stderr, .. })
+        | Err(error @ ProcessError::Cancelled { stdout, stderr })
+        | Err(error @ ProcessError::OutputOverflow { stdout, stderr, .. }) => {
+            format!("{error} ({})", sizes(stdout, stderr))
+        }
+        // Every remaining variant's `Display` carries its whole story and no
+        // captured output, so it is safe to print as it stands.
+        Err(error) => error.to_string(),
+    }
+}
+
 fn spec(program: impl Into<PathBuf>) -> ProcessSpec {
     ProcessSpec {
         program: program.into(),
@@ -153,12 +231,11 @@ async fn stdout_overflow_is_bounded_and_stops_the_child() {
     let mut command = spec(&script.path);
     command.stdout_limit = 64;
 
-    let result = tokio::time::timeout(
-        Duration::from_secs(2),
-        TokioProcessRunner.run(&command, &CaptureCancellation::default()),
-    )
-    .await
-    .expect("overflow must stop a noisy process");
+    // A hang detector, not a deadline the correct path has to beat — see
+    // `run_bounded_by_hang_detector`. A build that stopped capping output reads
+    // this flooding stub until `spec()`'s own timeout fires and returns
+    // `TimedOut`, which the match below rejects by name, well inside it.
+    let result = run_bounded_by_hang_detector(&command, &CaptureCancellation::default()).await;
 
     // Destructured rather than a single `matches!` so a failure names the clause. A
     // combined guard reports only "assertion failed" and drops every actual value,
@@ -188,7 +265,10 @@ async fn stdout_overflow_is_bounded_and_stops_the_child() {
                 String::from_utf8_lossy(&stderr),
             );
         }
-        other => panic!("expected a bounded stdout overflow, got {other:?}"),
+        ref other => panic!(
+            "expected a bounded stdout overflow, got {}",
+            outcome_label(other)
+        ),
     }
 }
 
@@ -199,46 +279,71 @@ async fn stderr_overflow_is_bounded_and_stops_the_child() {
     let mut command = spec(&script.path);
     command.stderr_limit = 64;
 
-    let result = tokio::time::timeout(
-        Duration::from_secs(2),
-        TokioProcessRunner.run(&command, &CaptureCancellation::default()),
-    )
-    .await
-    .expect("overflow must stop a noisy process");
+    // Same detector, same reason, as its stdout twin above.
+    let result = run_bounded_by_hang_detector(&command, &CaptureCancellation::default()).await;
 
-    assert!(matches!(
-        result,
+    // Destructured like its stdout twin, and for the reason recorded there: the
+    // `matches!` guard this replaces reported "assertion failed" and nothing
+    // else, so the one time it went red it named neither the clause nor a value.
+    match result {
         Err(ProcessError::OutputOverflow {
-            stream: OutputStream::Stderr,
-            limit: 64,
-            stdout,
-            stderr,
-        }) if stderr.len() == 64 && stdout.is_empty()
-    ));
+            stream,
+            limit,
+            ref stdout,
+            ref stderr,
+        }) => {
+            assert_eq!(stream, OutputStream::Stderr);
+            assert_eq!(limit, 64);
+            // Guaranteed by construction: `read_bounded` caps each append at
+            // `limit - retained.len()`, so the buffer cannot exceed the limit.
+            assert_eq!(stderr.len(), 64, "stderr must be truncated at the limit");
+            assert!(
+                stdout.is_empty(),
+                "expected no stdout from the overflow stub, got {:?}",
+                String::from_utf8_lossy(stdout),
+            );
+        }
+        ref other => panic!(
+            "expected a bounded stderr overflow, got {}",
+            outcome_label(other)
+        ),
+    }
 }
 
 #[cfg(unix)]
 #[tokio::test]
 async fn timeout_kills_and_reaps_the_child() {
-    let script = stub_script("printf '%s\n' \"$$\"; while :; do :; done");
+    // The child sleeps rather than spins. What this test needs is a child that
+    // does not exit before the deadline; burning a whole core for the length of
+    // that deadline adds nothing to any assertion here and adds real load to the
+    // box they all then have to survive — three tests in this file used to do it
+    // at once. `exec` keeps `$$`, the PID printed just above it, as the PID the
+    // runner kills, and /bin/sleep is spelled absolutely because `spec()` clears
+    // PATH. The 300s only has to outlast the deadline being tested.
+    let script = stub_script("printf '%s\n' \"$$\"; exec /bin/sleep 300");
     let mut command = spec(&script.path);
     command.timeout = Duration::from_secs(3);
 
-    let result = tokio::time::timeout(
-        Duration::from_secs(8),
-        TokioProcessRunner.run(&command, &CaptureCancellation::default()),
-    )
-    .await
-    .expect("runner timeout must resolve");
+    // The runner's deadline is the subject here, and a monotonic sleep fires late
+    // under load but never early, so nothing below measures elapsed time. What
+    // this replaces — `timeout(8s)` — allowed 5s of scheduling around a 3s
+    // deadline whose tail measures 30-80ms, which is a budget, not a detector.
+    //
+    // One irreducible timing element remains and is not tuned around: the child
+    // must be scheduled once, to print its PID, inside the runner's own 3s
+    // deadline. A box where spawning a shell takes three seconds fails here, and
+    // that is a real signal rather than noise.
+    let result = run_bounded_by_hang_detector(&command, &CaptureCancellation::default()).await;
 
     let Err(ProcessError::TimedOut {
         timeout,
-        stdout,
-        stderr,
+        ref stdout,
+        ref stderr,
     }) = result
     else {
-        panic!("expected timeout, got {result:?}");
+        panic!("expected timeout, got {}", outcome_label(&result));
     };
+    let (stdout, stderr) = (stdout.clone(), stderr.clone());
     let pid = String::from_utf8(stdout)
         .unwrap()
         .trim()
