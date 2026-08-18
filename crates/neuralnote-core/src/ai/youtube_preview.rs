@@ -54,11 +54,15 @@ pub(super) async fn video_preview(
 ///   response is never fully buffered. The pinned `mqdefault.jpg` runs to tens of
 ///   kilobytes, so this is headroom rather than a working limit.
 /// * **Time** — the host's thumbnail client, five seconds to connect and thirty
-///   in total, against a fixed Google CDN URL that no argument can redirect.
+///   in total. The request URL is derived entirely from a validated `VideoId`,
+///   so no model or user argument reaches it.
 ///
 /// [`thumbnail_data_uri`] then decodes the image and bounds its dimensions, so
 /// what crosses the wire is a picture rather than a payload wearing an image
-/// header.
+/// header. That decode is what carries the safety here, because the thumbnail
+/// client still follows redirects — unlike the catalogue client, which sets
+/// `redirect::Policy::none()` — so the bytes are not guaranteed to have come
+/// from the host the URL names.
 async fn thumbnail_or_none(io: &dyn YoutubeIo, video_id: &VideoId) -> Option<String> {
     match fetch_thumbnail_uri(io, video_id).await {
         Ok(uri) => Some(uri),
