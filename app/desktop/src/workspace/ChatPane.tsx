@@ -20,6 +20,7 @@ import { ChatComposer } from "./ChatComposer";
 import { KeyChangeCaveat } from "./KeyChangeCaveat";
 import { DisconnectedPane, KeySetupPanel } from "./KeySetupPanel";
 import { ProviderPicker } from "./ProviderPicker";
+import { reasoningAlwaysOn } from "./reasoningSupport";
 import type { SkillPickerEntry } from "./skillAutocomplete";
 import { useChatPaneChat } from "./useChatPaneChat";
 import { useChatPaneComposer } from "./useChatPaneComposer";
@@ -257,6 +258,11 @@ export function ChatPane({
             savingReasoning={provider.savingReasoning}
             capability={provider.capability}
             reasoningIndicatorOn={provider.reasoningIndicatorOn}
+            // Read off the control here rather than carried through the view
+            // model: `reasoningSupport` exists so the two surfaces that render
+            // this fact call ONE function, and a second copy is exactly how they
+            // once told the same user two different things.
+            reasoningLocked={reasoningAlwaysOn(provider.reasoningControl)}
             reasoningReasonId={provider.reasoningReasonId}
           />
         </>

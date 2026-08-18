@@ -26,6 +26,7 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 
 import "../styles.css";
+import { contrastRatio } from "../test/contrast";
 import type { ReasoningControl, ReasoningEffortOverride } from "../lib/types";
 import { ReasoningSettings } from "./ReasoningSettings";
 
@@ -199,58 +200,15 @@ describe("the absent case costs nothing, and the present one moves nothing", () 
   });
 });
 
-/** One sRGB channel, linearised for WCAG's relative-luminance formula. */
-function linearise(c: number): number {
-  const v = c / 255;
-  return v <= 0.04045 ? v / 12.92 : ((v + 0.055) / 1.055) ** 2.4;
-}
-
-/** Composite one element's text colour over the grounds behind it and return the
- *  WCAG contrast ratio.
- *
- *  Painted through a canvas rather than parsed by hand: a Tailwind alpha
- *  modifier resolves to `color-mix(in oklab, …)`, and `getComputedStyle` hands
- *  back an `oklab()` string whose components are 0–1 — read as 0–255 that is a
- *  wildly wrong ratio that can fake either verdict. Letting the engine both
- *  parse and composite it removes the arithmetic entirely. */
-function contrast(el: HTMLElement, backdrop: string): number {
-  const canvas = document.createElement("canvas");
-  canvas.width = 2;
-  canvas.height = 1;
-  const ctx = canvas.getContext("2d")!;
-
-  const paint = (colours: string[], x: number) => {
-    for (const colour of colours) {
-      ctx.fillStyle = "#ff00ff";
-      ctx.fillStyle = colour;
-      // A colour the canvas could not parse leaves fillStyle untouched, which
-      // would silently measure the sentinel instead. Catch that here.
-      expect(ctx.fillStyle).not.toBe("#ff00ff");
-      ctx.fillRect(x, 0, 1, 1);
-    }
-  };
-
-  const grounds = [backdrop, getComputedStyle(el).backgroundColor];
-  paint(grounds, 0);
-  paint([...grounds, getComputedStyle(el).color], 1);
-
-  const [ground, text] = [0, 1].map((x) => {
-    const [r, g, b] = ctx.getImageData(x, 0, 1, 1).data;
-    return 0.2126 * linearise(r) + 0.7152 * linearise(g) + 0.0722 * linearise(b);
-  });
-  const [light, dark] = text > ground ? [text, ground] : [ground, text];
-  return (light + 0.05) / (dark + 0.05);
-}
-
 describe("the notice reads as prose, not as a failure", () => {
   it("meets AA on the card it sits in, body and values alike", () => {
     const { notice, sentence } = mount({ stored: "xhigh", sending: "high" });
     // The provider card's own ground: `bg-background/40` over the settings card.
     const card = getComputedStyle(document.body).getPropertyValue("--card").trim();
 
-    expect(contrast(sentence!, card)).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio(sentence!, card)).toBeGreaterThanOrEqual(4.5);
     const value = notice!.querySelector<HTMLElement>(".nn-mono")!;
-    expect(contrast(value, card)).toBeGreaterThanOrEqual(4.5);
+    expect(contrastRatio(value, card)).toBeGreaterThanOrEqual(4.5);
   });
 
   it("borrows no failure colour: the destructive channel stays unused", () => {
