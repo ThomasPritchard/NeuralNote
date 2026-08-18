@@ -32,13 +32,15 @@ const LOADED: PreferencesBootstrap = {
   recoveryMessage: null,
 };
 
+const READ_FAILED_MESSAGE = "Your saved settings could not be read.";
+
 /** The preferences file could not be READ, so the user's stored bytes are
  *  intact and unseen. Writing anything would destroy settings they still have. */
 const READ_FAILED: PreferencesBootstrap = {
   preferences: { ...DEFAULT_PREFERENCES },
   recoveredFromCorrupt: false,
   readFailed: true,
-  recoveryMessage: "Your saved settings could not be read.",
+  recoveryMessage: READ_FAILED_MESSAGE,
 };
 
 /** The file was read but its JSON was unusable, so the core already fell back to
@@ -65,6 +67,29 @@ function Probe({ onResult }: Readonly<{ onResult?: (saved: boolean) => void }>) 
       </button>
     </>
   );
+}
+
+/** Reads the flag UpdateCoordinator honours before running a background update
+ *  check. Rendered from the real provider so the flag is DERIVED here rather
+ *  than hand-set the way UpdateCoordinator.test.tsx must set it. */
+function AutomaticChecksProbe() {
+  const { suppressAutomaticChecksThisLaunch } = usePreferences();
+  return (
+    <output aria-label="automatic update checks">
+      {suppressAutomaticChecksThisLaunch ? "suppressed" : "allowed"}
+    </output>
+  );
+}
+
+function renderAutomaticChecksProbe(initial: PreferencesBootstrap) {
+  render(
+    <ToastProvider>
+      <PreferencesProvider initial={initial}>
+        <AutomaticChecksProbe />
+      </PreferencesProvider>
+    </ToastProvider>,
+  );
+  return screen.getByLabelText("automatic update checks");
 }
 
 describe("preferences", () => {
@@ -169,6 +194,42 @@ describe("preferences", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(
       "Preferences were corrupt; safe defaults are active.",
     );
+  });
+
+  it("surfaces an unreadable-preferences launch as a persistent error too", () => {
+    render(
+      <ToastProvider>
+        <PreferencesProvider initial={READ_FAILED}>
+          <Probe />
+        </PreferencesProvider>
+      </ToastProvider>,
+    );
+    // Named explicitly rather than queried as "the alert": the other READ_FAILED
+    // tests ask for the WRITE-REFUSAL toast by name, so this one rendered beside
+    // them and went unobserved — narrowing the recovery notice back to corrupt
+    // recoveries would have left an unreadable-settings launch silent until the
+    // user happened to change a setting.
+    expect(
+      screen.getByRole("alert", {
+        name: `${READ_FAILED_MESSAGE} notification`,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("suppresses this launch's automatic update checks when settings were unreadable", () => {
+    expect(renderAutomaticChecksProbe(READ_FAILED)).toHaveTextContent("suppressed");
+  });
+
+  it("suppresses this launch's automatic update checks after a corrupt recovery", () => {
+    expect(renderAutomaticChecksProbe(CORRUPT_RECOVERED)).toHaveTextContent(
+      "suppressed",
+    );
+  });
+
+  it("leaves automatic update checks alone when the stored settings were read", () => {
+    // The negative case: without it, hard-coding the flag to `true` would pass
+    // both suppression tests above.
+    expect(renderAutomaticChecksProbe(LOADED)).toHaveTextContent("allowed");
   });
 
   it("refuses to write over settings it could not read, and says so", async () => {
