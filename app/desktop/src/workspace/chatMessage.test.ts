@@ -167,6 +167,23 @@ describe("turn-specific event and stop routing", () => {
     ).toBe(messages);
   });
 
+  it("returns the same list for an event that changed nothing", () => {
+    // Identity, not deep equality: a fresh array would commit a React render,
+    // and the transcript's scroll-follow re-asserts its pin on every commit. A
+    // keepalive means the socket is alive, not that anything happened, so it
+    // must not reach the DOM at all.
+    expect(reduceAssistantForTurn(messages, "turn-1", { type: "keepalive" })).toBe(
+      messages,
+    );
+    expect(
+      reduceAssistantForTurn(messages, "turn-1", {
+        type: "toolProgress",
+        id: "c1",
+        message: "3 of 8 videos",
+      }),
+    ).toBe(messages);
+  });
+
   it("marks only the matching active turn stopped and preserves partial evidence", () => {
     const next = markAssistantStopped(messages, "turn-1");
     const stopped = next[1] as AssistantMessage;

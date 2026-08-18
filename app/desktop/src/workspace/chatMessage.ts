@@ -364,8 +364,14 @@ export function reduceAssistantForTurn(
   if (turn.done && (!turn.stopped || !isPostStopSettlement(event))) {
     return messages;
   }
+  const reduced = reduceAssistant(turn, event);
+  // An event that changed nothing returns the SAME list, not a copy of it.
+  // `keepalive` says the socket is alive rather than that anything happened, and
+  // a fresh array would still commit a render — the transcript's scroll-follow
+  // re-asserts its pin on every commit, so an inert event must not produce one.
+  if (reduced === turn) return messages;
   const next = messages.slice();
-  next[index] = reduceAssistant(turn, event);
+  next[index] = reduced;
   return next;
 }
 
