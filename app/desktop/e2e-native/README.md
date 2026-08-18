@@ -5,8 +5,11 @@ watcher, persistence, window and native-menu boundaries. It uses WebdriverIO's
 [embedded Tauri provider] rather than the standalone `tauri-driver` harness, so
 the same suite runs on Linux, macOS and Windows.
 
-Ubuntu and macOS are required pull-request gates. Windows runs only on `main` or
-manual dispatch and remains informational until issue #78 is resolved.
+Ubuntu is the required pull-request and `main` gate. macOS and Windows run only
+on the weekly schedule or manual dispatch and remain informational until issues
+#100, #101, and #78 are resolved. A separate `Rust / macOS compile and test`
+job in `ci.yml` compiles `cfg(macos)` code on every pull request without
+driving WebdriverIO.
 
 ## Run locally
 

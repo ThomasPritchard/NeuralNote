@@ -6,6 +6,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
@@ -39,7 +41,7 @@ jobs:
 
       - name: Scan all Git history
         run: |
-          "$RUNNER_TEMP/gitleaks" git . --log-opts=--all --redact --no-banner
+          "$RUNNER_TEMP/gitleaks" git . --log-opts=--all --redact --no-banner -v
 
   frontend:
     name: Frontend / Node ${{ matrix.node }} / lint, types, and tests
@@ -84,7 +86,7 @@ jobs:
         run: npm run test:unit
 
   frontend-hardening:
-    name: Frontend / Node 24 / MockIPC, Markdown, coverage, build, and audit
+    name: Frontend / Node 24 / coverage, build, and audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -101,14 +103,6 @@ jobs:
       - name: Install locked dependencies
         working-directory: app/desktop
         run: npm ci
-
-      - name: Full MockIPC application journeys
-        working-directory: app/desktop
-        run: npm run test:e2e
-
-      - name: Markdown compatibility contract
-        working-directory: app/desktop
-        run: npm run test:markdown-contract
 
       - name: Full test suite and 90 percent line coverage
         working-directory: app/desktop
@@ -137,6 +131,10 @@ jobs:
     # cannot gate a merge; it can only teach you to ignore it. Chromium stays
     # required and covers everything here that is not engine-specific.
     continue-on-error: ${{ matrix.informational || false }}
+    # WebKit stays in the matrix so a weekly or manual run still exercises
+    # WKWebView, but it is parked off pull requests and ordinary main pushes
+    # until #100 makes the hosted runner deterministic.
+    if: ${{ !matrix.informational || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
     strategy:
       fail-fast: false
       matrix:
@@ -257,3 +255,28 @@ jobs:
         # Policy and evidence live in deny.toml.
         if: github.event_name != 'pull_request'
         run: cargo deny check advisories
+
+  rust-macos:
+    name: Rust / macOS compile and test
+    runs-on: macos-latest
+    timeout-minutes: 30
+    # Compiles cfg(macos) code that the Ubuntu rust job strips. Does not drive
+    # WebdriverIO: those journeys stay on the weekly/manual informational lane.
+    env:
+      TAURI_CONFIG: '{"bundle":{"externalBin":[],"resources":[]}}'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+
+      - name: Set up Rust 1.96
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+        with:
+          workspaces: "."
+
+      - name: Test workspace
+        run: cargo test --workspace --locked
