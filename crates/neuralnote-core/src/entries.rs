@@ -40,10 +40,23 @@ pub fn create_note(root: &Path, parent: &Path, name: &str) -> CoreResult<TreeNod
     let parent = ensure_within(root, parent)?;
     let file_name = ensure_md_extension(name.trim());
     let target = ensure_within(root, &parent.join(&file_name))?;
-    if target.exists() {
-        return Err(CoreError::AlreadyExists(file_name));
+    // `create_new` is `O_CREAT|O_EXCL`, which POSIX requires to fail `EEXIST` on a
+    // symlink — dangling or not — so the note can never be created THROUGH a link
+    // planted at this name (issue #193). It is also the clobber refusal itself:
+    // a separate `exists()` pre-check would only widen a check-then-create window,
+    // and `exists()` follows symlinks, so it reports `false` for the dangling link
+    // that is exactly the case being defended against.
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&target)
+    {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(CoreError::AlreadyExists(file_name));
+        }
+        Err(error) => return Err(error.into()),
     }
-    std::fs::write(&target, "")?;
     node_for(&canon_root(root)?, &target)
 }
 

@@ -4,13 +4,18 @@ use crate::error::{CoreError, CoreResult};
 use crate::model::NoteDoc;
 use crate::paths::{ensure_within, rel_path};
 use std::hash::{Hash, Hasher};
-use std::io::Read;
-use std::path::Path;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Per-process counter making each write's temp sibling unique, so two concurrent
 /// writers of the same note never collide on the temp path (PA-016).
 static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// How many temp names a single save will try before giving up. Bounded so a
+/// squatted name is skipped rather than failing the save, and so a directory full
+/// of squatting names ends in an explicit error rather than an unbounded loop.
+const MAX_TEMP_ATTEMPTS: usize = 32;
 
 /// Maximum complete UTF-8 source document accepted by the editable note write
 /// boundary. Checked before conflict reads or filesystem mutation.
@@ -266,17 +271,51 @@ pub fn write_note(
     let parent = path
         .parent()
         .ok_or_else(|| CoreError::OutsideVault(path.display().to_string()))?;
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(".{file_name}.{}.{seq}.nn-tmp", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, content) {
+    let (tmp, mut file) = create_temp_sibling(parent, &file_name)?;
+    if let Err(e) = file.write_all(content.as_bytes()) {
+        drop(file);
         let _ = std::fs::remove_file(&tmp); // don't leak a partially-written temp
         return Err(e.into());
     }
+    drop(file);
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp); // don't leak the temp on failure
         return Err(e.into());
     }
     Ok(build_doc(root, &path, content.to_string(), false))
+}
+
+/// Create and open the hidden temp sibling a save renames into place, refusing to
+/// follow a symlink squatting the name.
+///
+/// The name is fully predictable — a dot prefix that hides it from the tree scan,
+/// this process's id, and a counter that starts at zero — so anything able to drop
+/// a file in the vault can plant a link there first. `create_new` is
+/// `O_CREAT|O_EXCL`, which POSIX requires to fail `EEXIST` on a symlink rather than
+/// follow it, so the user's note content can never truncate whatever the link
+/// points at (issue #193). A taken name is skipped rather than failing the save,
+/// bounded by [`MAX_TEMP_ATTEMPTS`] so exhaustion is explicit rather than endless.
+/// Mirrors the same defence in [`crate::config_io`].
+fn create_temp_sibling(parent: &Path, file_name: &str) -> CoreResult<(PathBuf, std::fs::File)> {
+    (0..MAX_TEMP_ATTEMPTS)
+        .find_map(|_| {
+            let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
+            let tmp = parent.join(format!(".{file_name}.{}.{seq}.nn-tmp", std::process::id()));
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)
+            {
+                Ok(file) => Some(Ok((tmp, file))),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
+                Err(error) => Some(Err(CoreError::from(error))),
+            }
+        })
+        .unwrap_or_else(|| {
+            Err(CoreError::Io(
+                "could not save the note: no unique temporary file was available".into(),
+            ))
+        })
 }
 
 /// Title + frontmatter-stripped body for already-in-hand `raw` content, using the

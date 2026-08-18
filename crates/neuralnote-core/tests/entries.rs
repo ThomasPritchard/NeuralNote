@@ -12,6 +12,7 @@ use std::time::Instant;
 use neuralnote_core::entries::{
     create_folder, create_note, delete_entry, move_entry, rename_entry,
 };
+use neuralnote_core::CoreError;
 
 fn vault() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
@@ -25,6 +26,51 @@ fn create_refuses_to_clobber_an_existing_folder_or_note() {
 
     assert!(create_folder(vault.path(), vault.path(), "Projects").is_err());
     assert!(create_note(vault.path(), vault.path(), "Ideas").is_err());
+}
+
+/// A symlink planted in the vault whose target does not exist is invisible to
+/// both of `create_note`'s old guards: `ensure_within` cannot `canonicalize` it
+/// (so it took the "doesn't exist yet" branch and approved the in-vault name) and
+/// `Path::exists` follows the link, reporting `false`. The create then opened
+/// THROUGH the link and made a file outside the vault (issue #193). The error
+/// alone would not prove that — the outside path is the assertion that matters.
+#[cfg(unix)]
+#[test]
+fn create_note_refuses_a_dangling_symlink_and_creates_nothing_outside_the_vault() {
+    use std::os::unix::fs::symlink;
+
+    let vault = vault();
+    let outside = tempfile::tempdir().unwrap();
+    let planted = outside.path().join("planted.md");
+    symlink(&planted, vault.path().join("Ideas.md")).unwrap();
+
+    let error = create_note(vault.path(), vault.path(), "Ideas").unwrap_err();
+
+    assert!(
+        matches!(error, CoreError::OutsideVault(_)),
+        "expected an outside-vault refusal, got {error:?}"
+    );
+    assert!(
+        !planted.exists(),
+        "create_note wrote through the symlink to {}",
+        planted.display()
+    );
+}
+
+/// Regression guard for the clobber refusal the symlink fix must not disturb:
+/// a name already taken by a real file still reports `AlreadyExists`, by kind and
+/// by the name it names.
+#[test]
+fn create_note_reports_already_exists_by_kind_when_the_name_is_taken() {
+    let vault = vault();
+    create_note(vault.path(), vault.path(), "Ideas").unwrap();
+
+    let error = create_note(vault.path(), vault.path(), "Ideas").unwrap_err();
+
+    assert!(
+        matches!(&error, CoreError::AlreadyExists(name) if name == "Ideas.md"),
+        "expected AlreadyExists(\"Ideas.md\"), got {error:?}"
+    );
 }
 
 #[test]

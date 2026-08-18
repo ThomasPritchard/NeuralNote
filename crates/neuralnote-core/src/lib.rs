@@ -72,6 +72,45 @@ mod tests {
         assert!(paths::ensure_within(v.path(), &inside).is_ok());
     }
 
+    /// A symlink whose target does not exist fails `canonicalize` with the very
+    /// same `ENOENT` a genuinely missing file gives, so the "target doesn't exist
+    /// yet" branch used to rejoin the leaf onto the canonical parent and hand back
+    /// an in-vault path for a link pointing straight out of the vault (issue #193).
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_dangling_symlink_leaf_pointing_outside_the_vault() {
+        use std::os::unix::fs::symlink;
+
+        let v = vault();
+        let outside = tempfile::tempdir().unwrap();
+        let link = v.path().join("Research/dangling.md");
+        symlink(outside.path().join("planted.md"), &link).unwrap();
+
+        assert!(matches!(
+            paths::ensure_within(v.path(), &link),
+            Err(CoreError::OutsideVault(_))
+        ));
+    }
+
+    /// The live-symlink case is already refused through the `canonicalize` success
+    /// branch. Pinned so a future change to the non-existent-target branch cannot
+    /// regress the one that already works.
+    #[cfg(unix)]
+    #[test]
+    fn rejects_a_live_symlink_leaf_pointing_outside_the_vault() {
+        use std::os::unix::fs::symlink;
+
+        let v = vault();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        let link = v.path().join("Research/live.md");
+        symlink(outside.path(), &link).unwrap();
+
+        assert!(matches!(
+            paths::ensure_within(v.path(), &link),
+            Err(CoreError::OutsideVault(_))
+        ));
+    }
+
     #[test]
     fn validate_name_rejects_separators_and_navigation() {
         assert!(paths::validate_name("a/b").is_err());

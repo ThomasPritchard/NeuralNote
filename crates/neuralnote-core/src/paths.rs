@@ -11,7 +11,10 @@ use std::path::{Path, PathBuf};
 /// - Existing targets are `canonicalize`d (resolves `..` and follows symlinks),
 ///   then checked against the canonical root.
 /// - Non-existent targets (e.g. a file about to be created) have their *parent*
-///   canonicalised and containment-checked, then the leaf name is rejoined.
+///   canonicalised and containment-checked, then the leaf name is rejoined. A
+///   leaf that is itself a symlink never takes this branch — an unresolvable link
+///   is refused outright, because rejoining it would approve a path that writes
+///   through the link (issue #193).
 ///
 /// Returns the resolved path on success, or [`CoreError::OutsideVault`].
 pub fn ensure_within(root: &Path, target: &Path) -> CoreResult<PathBuf> {
@@ -22,6 +25,27 @@ pub fn ensure_within(root: &Path, target: &Path) -> CoreResult<PathBuf> {
     let resolved = match target.canonicalize() {
         Ok(p) => p,
         Err(_) => {
+            // `canonicalize` reports ENOENT for a DANGLING SYMLINK exactly as it
+            // does for a path that was never created, so "it failed" is not
+            // evidence the leaf is absent. Rejoining the leaf onto the canonical
+            // parent would then approve the link's in-vault path while every
+            // create/write through it follows the link straight out of the vault
+            // (issue #193). `symlink_metadata` does not follow the final
+            // component, so it sees the link itself.
+            //
+            // The predicate is deliberately tight: refuse only when the leaf IS a
+            // symlink, never merely because `symlink_metadata` succeeded.
+            // `canonicalize` also fails on a permission error over an ordinary
+            // file, and refusing that would break legitimate flows.
+            if target
+                .symlink_metadata()
+                .is_ok_and(|meta| meta.file_type().is_symlink())
+            {
+                return Err(CoreError::OutsideVault(format!(
+                    "{} is a symlink that cannot be resolved inside the vault",
+                    target.display()
+                )));
+            }
             // Target doesn't exist yet: validate via its parent.
             let parent = target
                 .parent()
