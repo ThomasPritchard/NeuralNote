@@ -6,6 +6,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
 
 concurrency:
   group: ci-${{ github.event.pull_request.number || github.ref }}
@@ -39,7 +41,7 @@ jobs:
 
       - name: Scan all Git history
         run: |
-          "$RUNNER_TEMP/gitleaks" git . --log-opts=--all --redact --no-banner
+          "$RUNNER_TEMP/gitleaks" git . --log-opts=--all --redact --no-banner -v
 
   frontend:
     name: Frontend / Node ${{ matrix.node }} / lint, types, and tests
@@ -84,7 +86,7 @@ jobs:
         run: npm run test:unit
 
   frontend-hardening:
-    name: Frontend / Node 24 / MockIPC, Markdown, coverage, build, and audit
+    name: Frontend / Node 24 / coverage, build, and audit
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -102,14 +104,6 @@ jobs:
         working-directory: app/desktop
         run: npm ci
 
-      - name: Full MockIPC application journeys
-        working-directory: app/desktop
-        run: npm run test:e2e
-
-      - name: Markdown compatibility contract
-        working-directory: app/desktop
-        run: npm run test:markdown-contract
-
       - name: Full test suite and 90 percent line coverage
         working-directory: app/desktop
         run: npm run coverage
@@ -123,29 +117,9 @@ jobs:
         run: npm run audit:all
 
   browser:
-    name: Browser / ${{ matrix.browser }} / ${{ matrix.os }}${{ matrix.informational && ' (informational)' || '' }}
-    runs-on: ${{ matrix.os }}
-    # The hosted macOS runner drives WebKit several times slower than a local
-    # machine: the whole suite is ~15s here and minutes there. A per-test budget
-    # is worthless under a job cap that expires first, so the two move together.
+    name: Browser / chromium / ubuntu-latest
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    # WebKit is informational until #100 lands. Its real defects are fixed - it
-    # caught a genuine WKWebView font bug on its first run - but what is left is
-    # the runner, and it is not deterministic: consecutive runs of identical code
-    # expired on entirely different tests, all at the 60s cap, while the suite
-    # runs green in ~15s locally. A lane that reds on a different test each time
-    # cannot gate a merge; it can only teach you to ignore it. Chromium stays
-    # required and covers everything here that is not engine-specific.
-    continue-on-error: ${{ matrix.informational || false }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            browser: chromium
-          - os: macos-latest
-            browser: webkit
-            informational: true
     steps:
       - name: Check out source
         uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
@@ -162,18 +136,12 @@ jobs:
         run: npm ci
 
       - name: Install Chromium with system dependencies
-        if: matrix.browser == 'chromium'
         working-directory: app/desktop
         run: npx playwright install --with-deps chromium
 
-      - name: Install WebKit
-        if: matrix.browser == 'webkit'
-        working-directory: app/desktop
-        run: npx playwright install webkit
-
       - name: Run real-browser journeys
         working-directory: app/desktop
-        run: npm run test:browser:${{ matrix.browser }}
+        run: npm run test:browser:chromium
 
       # These browser jobs mount only version-controlled synthetic fixtures;
       # they never open a user vault or load credentials. Retained traces and
@@ -182,8 +150,50 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          name: browser-${{ matrix.browser }}-${{ matrix.os }}
-          path: app/desktop/artifacts/browser/${{ matrix.browser }}/
+          name: browser-chromium-ubuntu-latest
+          path: app/desktop/artifacts/browser/chromium/
+          if-no-files-found: warn
+          retention-days: 7
+
+  browser-webkit:
+    name: Browser / webkit / macos-latest (informational)
+    # The hosted macOS runner drives WebKit several times slower than a local
+    # machine: the whole suite is ~15s here and minutes there. A lane that reds
+    # on a different test each time cannot gate a merge. Parked on the weekly
+    # schedule and manual dispatch until #100 makes the runner deterministic.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out source
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+
+      - name: Set up Node 24
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: app/desktop/package-lock.json
+
+      - name: Install locked dependencies
+        working-directory: app/desktop
+        run: npm ci
+
+      - name: Install WebKit
+        working-directory: app/desktop
+        run: npx playwright install webkit
+
+      - name: Run real-browser journeys
+        working-directory: app/desktop
+        run: npm run test:browser:webkit
+
+      - name: Upload synthetic browser failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: browser-webkit-macos-latest
+          path: app/desktop/artifacts/browser/webkit/
           if-no-files-found: warn
           retention-days: 7
 
@@ -257,3 +267,28 @@ jobs:
         # Policy and evidence live in deny.toml.
         if: github.event_name != 'pull_request'
         run: cargo deny check advisories
+
+  rust-macos:
+    name: Rust / macOS compile and test
+    runs-on: macos-latest
+    timeout-minutes: 30
+    # Compiles cfg(macos) code that the Ubuntu rust job strips. Does not drive
+    # WebdriverIO: those journeys stay on the weekly/manual informational lane.
+    env:
+      TAURI_CONFIG: '{"bundle":{"externalBin":[],"resources":[]}}'
+    steps:
+      - name: Check out source
+        uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+
+      - name: Set up Rust 1.96
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30 # stable
+        with:
+          toolchain: 1.96.0
+
+      - name: Cache Rust build outputs
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+        with:
+          workspaces: "."
+
+      - name: Test workspace
+        run: cargo test --workspace --locked

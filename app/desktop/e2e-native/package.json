@@ -30,6 +30,7 @@
   },
   "overrides": {
     "@wdio/native-utils": "2.6.0",
+    "deepmerge-ts": "8.0.1",
     "diff": "8.0.3",
     "serialize-javascript": "7.0.5",
     "mocha": "^11.7.6",
