@@ -1,6 +1,5 @@
 //! Implementation-authored playlist selection and high-usage confirmation.
 
-use crate::ai::call_channel::CallChannel;
 use crate::ai::elicitation::{elicit_user, ElicitationOutcome};
 use crate::ai::events::{ElicitOption, Elicitation};
 use crate::ai::llm::UserPrompt;
@@ -53,12 +52,13 @@ pub(super) async fn dispatch_select_playlist_videos(
     // Bundled only for the enumeration, which is the one step here that can retry
     // a network call behind the user's back. The elicitation below wants the sink
     // and the session as separate borrows again, so the bundle ends with the
-    // block rather than outliving its reason to exist.
+    // block rather than outliving its reason to exist. `from_parts` rather than
+    // `from_context` because `session` is already a live reborrow by this point.
     let playlist = {
-        let mut work = YoutubeWork {
-            io,
-            session: &mut *session,
-            channel: CallChannel::new(&mut *context.sink, call_id),
+        let mut work = match YoutubeWork::from_parts(io, &mut *session, &mut *context.sink, call_id)
+        {
+            Ok(work) => work,
+            Err(error) => return settle_capture_error(error),
         };
         match load_playlist(&mut work, &url).await {
             Ok(playlist) => playlist,
@@ -362,12 +362,16 @@ async fn enumerate_with_retry(
     work: &mut YoutubeWork<'_>,
     url: &YoutubeUrl,
 ) -> Result<PlaylistPayload, CaptureError> {
+    // Narrated on entry like its siblings, not only on retry: enumerating a
+    // long playlist is the longest wait before the picker appears, and it is
+    // the one the user is sitting and staring at.
+    work.channel.progress("Listing the playlist's videos");
     match work.io.enumerate_playlist(url).await {
         Err(error) => match work.session.decide(&error) {
             CaptureAction::UpdateExtractorAndRetry => {
-                update_extractor(work).await;
+                let update = update_extractor(work).await;
                 work.channel
-                    .progress("Retrying the playlist listing with the updated extractor");
+                    .progress(update.retrying("the playlist listing"));
                 work.io.enumerate_playlist(url).await
             }
             _ => Err(error),

@@ -1455,6 +1455,120 @@ fn a_failed_extractor_update_is_told_to_the_user_and_not_only_the_model() {
 }
 
 #[test]
+fn a_failed_extractor_update_never_claims_the_retry_uses_a_new_extractor() {
+    // `ToolProgress` is last-writer-wins by contract, so a failure announced and
+    // then immediately followed by another line is a failure the user never sees.
+    // Worse, the line that replaced it used to read "with the updated extractor"
+    // — asserting the update landed at the exact moment it had not.
+    let io = ScriptedYoutubeIo::new(Vec::new());
+    io.fail_updates(CaptureError::ExtractorStale("yt-dlp -U exited 1".into()));
+    *io.metadata.lock().unwrap() = VecDeque::from([
+        Err(CaptureError::ExtractorStale(
+            "nsig extraction failed".into(),
+        )),
+        Ok(MetadataPayload {
+            json: metadata("{}", "{}"),
+            annotations: Vec::new(),
+        }),
+    ]);
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_VIDEO_INFO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let messages = progress_messages(&events);
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("updated extractor")),
+        "nothing may claim an update that failed: {messages:?}"
+    );
+    // And the surviving line — the one the user is actually left looking at —
+    // has to carry the failure, not merely avoid contradicting it.
+    let last = messages.last().expect("the retry narrates itself");
+    assert!(
+        last.contains("extractor_stale") && last.contains("current"),
+        "the line left standing must say the retry runs on the old binary: {last}"
+    );
+}
+
+#[test]
+fn a_successful_extractor_update_says_so_on_the_line_that_survives() {
+    // The other half of the same contract: when the update DOES land, the line
+    // left standing must say so, or the honest-failure wording above would just
+    // be a pessimistic constant.
+    let io = ScriptedYoutubeIo::new(Vec::new());
+    *io.metadata.lock().unwrap() = VecDeque::from([
+        Err(CaptureError::ExtractorStale(
+            "nsig extraction failed".into(),
+        )),
+        Ok(MetadataPayload {
+            json: metadata("{}", "{}"),
+            annotations: Vec::new(),
+        }),
+    ]);
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_VIDEO_INFO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    assert_eq!(io.updates.load(Ordering::SeqCst), 1);
+    let messages = progress_messages(&events);
+    let last = messages.last().expect("the retry narrates itself");
+    assert!(
+        last.contains("updated extractor"),
+        "an update that landed must be reported as one: {last}"
+    );
+}
+
+#[test]
+fn a_transcription_retry_after_an_extractor_update_narrates_itself() {
+    // The third retry path. Its two existing tests both arm a cancellation that
+    // diverts before this branch, so the narration added here was never actually
+    // reached by a test — a line of code asserting it informs the user, with
+    // nothing proving it runs.
+    let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
+    io.push_transcription(Err(CaptureError::ExtractorStale(
+        "audio extraction went stale".into(),
+    )));
+    io.push_transcription(Ok(CaptionPayload {
+        vtt: VTT.to_vec(),
+        annotations: Vec::new(),
+    }));
+    let mut session = YoutubeToolSession::default();
+    prove_caption_absence(&io, &mut session);
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut session,
+        &environment(true),
+        TOOL_TRANSCRIBE_AUDIO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    assert_eq!(io.transcribe_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(io.updates.load(Ordering::SeqCst), 1);
+    let messages = progress_messages(&events);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Retrying the transcription")),
+        "the retry that actually happened must be visible: {messages:?}"
+    );
+}
+
+#[test]
 fn a_video_lookup_previews_the_video_it_found() {
     let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
     io.set_thumbnail(Ok(ThumbnailPayload {

@@ -18,13 +18,18 @@ use crate::capture::{thumbnail_data_uri, CaptureError, VideoId, VideoMetadata};
 /// The call site satisfies that by construction — the beacon opens a round and
 /// this runs inside a tool dispatched during that round — rather than by anyone
 /// remembering to.
+/// `video_id` is the single source for both the id on the wire and the image
+/// fetched for it. Reading the id from `metadata` while fetching the picture for
+/// a separately-passed `VideoId` would let a caller put one video's thumbnail on
+/// another video's card — the two agree at today's only call site, and nothing
+/// about the signature required them to.
 pub(super) async fn video_preview(
     io: &dyn YoutubeIo,
     metadata: &VideoMetadata,
     video_id: &VideoId,
 ) -> ChatEvent {
     ChatEvent::VideoPreview {
-        video_id: metadata.video_id.clone(),
+        video_id: video_id.as_ref().to_string(),
         title: metadata.title.clone(),
         duration_secs: metadata.duration_seconds,
         channel: metadata.channel.clone(),

@@ -2,7 +2,7 @@
 
 use crate::ai::call_channel::CallChannel;
 use crate::ai::elicitation::{elicit_user, ElicitationOutcome};
-use crate::ai::events::{ChatEvent, ElicitOption, Elicitation};
+use crate::ai::events::{ElicitOption, Elicitation};
 use crate::ai::llm::UserPrompt;
 use crate::ai::skills::{Eligibility, YOUTUBE_DISTIL_SKILL_ID};
 use crate::ai::tools::{action, fail, reject, ToolContext, ToolResult};
@@ -51,7 +51,7 @@ pub(super) async fn dispatch_fetch_video_info(
         Ok(url) => url,
         Err(error) => return settle_capture_error(error),
     };
-    let mut work = match youtube_work(context, call_id) {
+    let mut work = match YoutubeWork::from_context(context, call_id) {
         Ok(work) => work,
         Err(error) => return settle_capture_error(error),
     };
@@ -77,7 +77,7 @@ pub(super) async fn dispatch_fetch_video_info(
     // never gets a card. The round beacon has already gone out, which is the
     // ordering `ChatEvent::VideoPreview` requires of its emitter.
     let preview = youtube_preview::video_preview(work.io, &metadata, &metadata_video_id).await;
-    work.channel.send(preview);
+    work.channel.video_preview(preview);
     let genuinely_absent = metadata.captions.is_genuinely_absent()
         && !payload
             .annotations
@@ -111,7 +111,7 @@ pub(super) async fn dispatch_fetch_captions(
         ));
     }
     let pricing = context.pricing.cloned();
-    let mut work = match youtube_work(context, call_id) {
+    let mut work = match YoutubeWork::from_context(context, call_id) {
         Ok(work) => work,
         Err(error) => return settle_capture_error(error),
     };
@@ -170,10 +170,7 @@ pub(super) async fn dispatch_fetch_captions(
 /// can never disagree about provenance — and the UI never has to read it back out
 /// of the model's prose. No note exists yet at this point, hence no `rel_path`.
 fn report_transcript_source(channel: &mut CallChannel<'_>, provenance: &str) {
-    channel.send(ChatEvent::TranscriptSource {
-        label: provenance.to_string(),
-        rel_path: None,
-    });
+    channel.transcript_source(provenance);
 }
 
 async fn inspect_validated_metadata(
@@ -253,8 +250,11 @@ pub(super) async fn dispatch_transcribe_audio(
         // not the model asking for something it may not have.
         Err(error) => return fail(error.to_string()),
     };
-    // Before the availability check, not after: installing Whisper compiles it
-    // from source, so the wait starts here rather than at the first audio frame.
+    // After `transcription_authority` above, which rejects a run whose YouTube
+    // I/O is already blocked — announcing a check that a doomed run will never
+    // perform is its own small lie. Still before the availability check itself,
+    // because installing Whisper compiles it from source, so the wait starts
+    // here rather than at the first audio frame.
     CallChannel::new(&mut *context.sink, call_id)
         .progress("Checking that local transcription is available");
     if let Err(result) = ensure_whisper_available(
@@ -268,7 +268,7 @@ pub(super) async fn dispatch_transcribe_audio(
     {
         return result;
     }
-    let mut work = match youtube_work(context, call_id) {
+    let mut work = match YoutubeWork::from_context(context, call_id) {
         Ok(work) => work,
         Err(error) => return settle_capture_error(error),
     };
@@ -433,32 +433,69 @@ fn whisper_install_question(call_id: &str, eligibility: &Eligibility) -> Elicita
 /// Everything one YouTube tool call needs at once: the host seam, the per-run
 /// session, and its own channel to the user.
 ///
-/// The three are handed out together because they are three disjoint fields of a
-/// single [`ToolContext`], so taking them one at a time would mean borrowing the
-/// context more than once. Bundling the channel in is what stops a long tool
-/// from being unable to say anything while it works — the seam was already
-/// there, but only the first two were ever reachable from inside a retry.
+/// The three are bundled because the retry helpers need all three at the same
+/// time, and a helper taking `&mut ToolContext` cannot coexist with a live borrow
+/// of one of its fields. (Disjoint field borrows are perfectly legal — it is
+/// passing them *into* a function that forces the bundle.) Carrying the channel
+/// alongside is what stops a long tool from being unable to say anything while
+/// it works: the seam existed, but only the io and the session were ever
+/// reachable from inside a retry.
+///
+/// Constructing one asserts the run's YouTube I/O is still permitted, so the
+/// fields are private and both constructors run [`Self::guard`]. They were
+/// briefly public, and the struct literal in `youtube_selection` then bypassed
+/// the terminal-error check — correct only because that caller happened to
+/// repeat the check by hand nine lines earlier.
 pub(super) struct YoutubeWork<'a> {
     pub(super) io: &'a dyn YoutubeIo,
     pub(super) session: &'a mut YoutubeToolSession,
     pub(super) channel: CallChannel<'a>,
+    /// Private, and that is its entire job: a struct literal cannot name it from
+    /// another module, so every `YoutubeWork` outside this file must come from a
+    /// constructor — while `work.session` and `work.io` keep reading as fields.
+    _gated: Gated,
 }
 
-fn youtube_work<'a>(
-    context: &'a mut ToolContext<'_>,
-    call_id: &'a str,
-) -> Result<YoutubeWork<'a>, CaptureError> {
-    let session = context.youtube_session.as_deref_mut().ok_or_else(|| {
-        CaptureError::RequirementMissing("YouTube per-run state is not wired".into())
-    })?;
-    if let Some(error) = session.terminal_error() {
-        return Err(error.clone());
+/// Proof that [`YoutubeWork::guard`] ran. Unconstructible elsewhere.
+struct Gated;
+
+impl<'a> YoutubeWork<'a> {
+    /// Build from a whole [`ToolContext`], splitting its three disjoint fields.
+    fn from_context(
+        context: &'a mut ToolContext<'_>,
+        call_id: &'a str,
+    ) -> Result<Self, CaptureError> {
+        let session = context.youtube_session.as_deref_mut().ok_or_else(|| {
+            CaptureError::RequirementMissing("YouTube per-run state is not wired".into())
+        })?;
+        Self::from_parts(context.youtube_io, session, &mut *context.sink, call_id)
     }
-    Ok(YoutubeWork {
-        io: context.youtube_io,
-        session,
-        channel: CallChannel::new(&mut *context.sink, call_id),
-    })
+
+    /// Build from fields already borrowed out of a context — the shape a caller
+    /// is left with when it holds a live reborrow and cannot hand the whole
+    /// context over.
+    pub(super) fn from_parts(
+        io: &'a dyn YoutubeIo,
+        session: &'a mut YoutubeToolSession,
+        sink: &'a mut dyn crate::ai::events::EventSink,
+        call_id: &'a str,
+    ) -> Result<Self, CaptureError> {
+        Self::guard(session)?;
+        Ok(Self {
+            io,
+            session,
+            channel: CallChannel::new(sink, call_id),
+            _gated: Gated,
+        })
+    }
+
+    /// A block-shaped failure earlier in the run stops all further YouTube I/O.
+    fn guard(session: &YoutubeToolSession) -> Result<(), CaptureError> {
+        match session.terminal_error() {
+            Some(error) => Err(error.clone()),
+            None => Ok(()),
+        }
+    }
 }
 
 pub(super) fn validate_youtube_url(value: &str) -> Result<YoutubeUrl, CaptureError> {
@@ -556,9 +593,8 @@ async fn inspect_with_retry(
     match work.io.inspect_metadata(url).await {
         Err(error) => match work.session.decide(&error) {
             CaptureAction::UpdateExtractorAndRetry => {
-                update_extractor(work).await;
-                work.channel
-                    .progress("Retrying the video lookup with the updated extractor");
+                let update = update_extractor(work).await;
+                work.channel.progress(update.retrying("the video lookup"));
                 work.io.inspect_metadata(url).await
             }
             _ => Err(error),
@@ -579,9 +615,8 @@ async fn captions_with_retry(
             Ok(payload) => return Ok(payload),
             Err(error) => match work.session.decide(&error) {
                 CaptureAction::UpdateExtractorAndRetry => {
-                    update_extractor(work).await;
-                    work.channel
-                        .progress("Retrying the caption fetch with the updated extractor");
+                    let update = update_extractor(work).await;
+                    work.channel.progress(update.retrying("the caption fetch"));
                 }
                 CaptureAction::ContinueWithoutPot if attempt.pot == PotMode::Prefer => {
                     annotate_pot_fallback(work.session, &error);
@@ -611,15 +646,17 @@ async fn transcription_with_retry(
         )),
         Err(error) => match work.session.decide(&error) {
             CaptureAction::UpdateExtractorAndRetry => {
-                update_extractor(work).await;
+                let update = update_extractor(work).await;
                 if work.session.cancellation().is_cancelled() {
+                    // No retry line here on purpose: nothing is about to be
+                    // retried, and `update_extractor`'s own failure line is
+                    // exactly what should be left standing.
                     Err(cancelled_after(
                         "transcription was cancelled during extractor update",
                         &error,
                     ))
                 } else {
-                    work.channel
-                        .progress("Retrying the transcription with the updated extractor");
+                    work.channel.progress(update.retrying("the transcription"));
                     work.io
                         .transcribe_audio(url, model, work.session.cancellation())
                         .await
@@ -650,23 +687,55 @@ fn cancelled_after(what_happened: &str, cause: &CaptureError) -> CaptureError {
     ))
 }
 
+/// Whether the host's `yt-dlp -U` actually landed.
+///
+/// Returned rather than swallowed because of how [`ChatEvent::ToolProgress`]
+/// behaves: it is last-writer-wins, so the line a caller emits next is the one
+/// the user is left looking at for the whole retry. A caller that cannot tell
+/// the two outcomes apart can only guess, and the guess this code used to make
+/// was "with the updated extractor" — asserting the update landed at the exact
+/// moment it had not.
+#[derive(Debug, Clone, Copy)]
+pub(super) enum ExtractorUpdate {
+    Applied,
+    Failed { code: &'static str },
+}
+
+impl ExtractorUpdate {
+    /// The line to leave standing while `what` is re-attempted.
+    pub(super) fn retrying(self, what: &str) -> String {
+        match self {
+            Self::Applied => format!("Retrying {what} with the updated extractor"),
+            Self::Failed { code } => {
+                format!("yt-dlp update failed ({code}); retrying {what} on the current binary")
+            }
+        }
+    }
+}
+
 /// Run the host's `yt-dlp -U`, which is a download and can take real time.
 ///
 /// It announces itself on entry rather than only on failure, because the wait
-/// happens either way — and it reports a failed update to the user as well as to
-/// the model. The annotation alone reached the transcript and the tool result;
-/// the person watching a run stall on a broken self-update saw nothing at all.
-pub(super) async fn update_extractor(work: &mut YoutubeWork<'_>) {
+/// happens either way. A failure is reported three ways on purpose, each for a
+/// different reader: the log for whoever debugs it later, the channel for the
+/// person watching the run stall, and the session annotation for the model and
+/// the settled tool result. Only the log gets `detail()` — the other two carry
+/// the code, which is the stable handle and cannot leak a host path.
+pub(super) async fn update_extractor(work: &mut YoutubeWork<'_>) -> ExtractorUpdate {
     work.channel
         .progress("Updating yt-dlp; the extractor is out of date");
-    if let Err(error) = work.io.update_extractor().await {
-        let detail = format!(
-            "yt-dlp update failed ({}); continued with the current binary",
-            error.code()
-        );
-        work.channel.progress(detail.clone());
-        work.session.annotate(detail);
-    }
+    let Err(error) = work.io.update_extractor().await else {
+        return ExtractorUpdate::Applied;
+    };
+    let code = error.code();
+    log::warn!("yt-dlp update failed ({code}): {}", error.detail());
+    let detail = format!("yt-dlp update failed ({code}); continued with the current binary");
+    // Emitted here as well as folded into `retrying` below, so the failure still
+    // reaches the user on the one path that never retries — a run cancelled
+    // during the update, where this is the last line anyone sees.
+    work.channel.progress(detail.clone());
+    work.session.annotate(detail);
+    ExtractorUpdate::Failed { code }
 }
 
 fn annotate_pot_fallback(session: &mut YoutubeToolSession, error: &CaptureError) {

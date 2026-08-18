@@ -48,7 +48,7 @@ pub struct CaptionSelection {
 /// unvalidated because one of two call sites skipped the check. Callers hand the
 /// result across the event boundary — a webview that reads its images from here
 /// needs no third-party network allowlist.
-pub fn thumbnail_data_uri(media_type: &str, bytes: &[u8]) -> Result<String, CaptureError> {
+pub(crate) fn thumbnail_data_uri(media_type: &str, bytes: &[u8]) -> Result<String, CaptureError> {
     validate_thumbnail(media_type, bytes)?;
     Ok(format!(
         "data:{media_type};base64,{}",
