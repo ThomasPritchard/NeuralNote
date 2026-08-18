@@ -216,6 +216,10 @@ fn a_case_only_rename_lands_the_new_casing() {
 /// The filesystem root is the one path with no parent to rename within. It is
 /// only reachable when the vault root *is* `/`, but a caller that opened one must
 /// get a refusal rather than an unwrap on the missing parent.
+///
+/// Despite the name, this covers only that no-parent edge: it passed for a normal
+/// vault long after `rename_entry(root, root, …)` stopped being refused there.
+/// The general rule is pinned by `a_case_only_rename_of_the_vault_root_is_refused`.
 #[cfg(unix)]
 #[test]
 fn renaming_the_vault_root_itself_is_refused() {
@@ -226,6 +230,60 @@ fn renaming_the_vault_root_itself_is_refused() {
     assert!(
         error.to_string().contains("outside vault"),
         "unexpected error: {error}"
+    );
+}
+
+/// `ensure_within` is a *containment* predicate, and the vault root is trivially
+/// contained in itself (`resolved == root_c`). A destructive operation needs the
+/// strictly stronger property — a proper descendant — or one webview IPC call
+/// moves the user's entire second brain to the Trash (issue #194).
+#[test]
+fn deleting_the_vault_root_is_refused() {
+    let vault = vault();
+    create_note(vault.path(), vault.path(), "Keep").unwrap();
+
+    let error = delete_entry(vault.path(), vault.path()).unwrap_err();
+
+    assert!(
+        error.to_string().contains("outside vault"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        vault.path().join("Keep.md").exists(),
+        "the whole vault was trashed by a delete that named the root"
+    );
+}
+
+/// The case-only rename branch takes `path.parent()` as its working directory and
+/// runs two `std::fs::rename` calls there with no containment check of its own.
+/// When `path` is the vault root that parent is *outside* the vault, so the vault
+/// directory itself is renamed in place on the user's filesystem (issue #194).
+///
+/// A non-case-only root rename is already refused, because its `ensure_within` on
+/// `parent.join(final_name)` resolves outside the root — so only the case-only
+/// spelling reaches the unguarded path, and that is what this reproduces.
+#[test]
+fn a_case_only_rename_of_the_vault_root_is_refused() {
+    let enclosing = vault();
+    let root = enclosing.path().join("MyVault");
+    fs::create_dir(&root).unwrap();
+    create_note(&root, &root, "Keep").unwrap();
+
+    let error = rename_entry(&root, &root, "myvault").unwrap_err();
+
+    assert!(
+        error.to_string().contains("outside vault"),
+        "unexpected error: {error}"
+    );
+    let mut siblings: Vec<String> = fs::read_dir(enclosing.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    siblings.sort();
+    assert_eq!(
+        siblings,
+        vec!["MyVault".to_string()],
+        "the rename wrote outside the vault boundary"
     );
 }
 

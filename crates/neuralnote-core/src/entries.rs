@@ -3,7 +3,7 @@
 
 use crate::error::{CoreError, CoreResult};
 use crate::model::TreeNode;
-use crate::paths::{ensure_within, validate_name};
+use crate::paths::{ensure_descendant, ensure_within, validate_name};
 use crate::tree::node_for;
 use std::path::{Path, PathBuf};
 
@@ -50,7 +50,10 @@ pub fn create_note(root: &Path, parent: &Path, name: &str) -> CoreResult<TreeNod
 /// Rename a file or folder in place (keeps it in the same parent).
 pub fn rename_entry(root: &Path, path: &Path, new_name: &str) -> CoreResult<TreeNode> {
     validate_name(new_name)?;
-    let path = ensure_within(root, path)?;
+    // `ensure_descendant`, not `ensure_within`: the vault root is contained in
+    // itself, and renaming it moves the vault inside the user's filesystem —
+    // the case-only branch below would do it *outside* the boundary entirely.
+    let path = ensure_descendant(root, path)?;
     if !path.exists() {
         return Err(CoreError::NotFound(path.display().to_string()));
     }
@@ -106,6 +109,18 @@ fn apply_case_only_rename(
     parent: &Path,
     final_name: &str,
 ) -> CoreResult<TreeNode> {
+    // Both renames below run in `parent`, which is derived from the target rather
+    // than from the vault. Prove *the parent* is contained, then join onto that —
+    // these are the only writes in this module no `ensure_within` stands in front
+    // of, and for a vault-root target `parent` is outside the vault entirely.
+    //
+    // The check has to land on the parent rather than on the joined path: leaf
+    // names here differ from what is on disk only by case, and `ensure_within`
+    // canonicalises, which on a case-insensitive filesystem normalises the new
+    // casing straight back to the old one and collapses the rename to a no-op.
+    // `final_name` is separator-free (`validate_name`), so a contained parent
+    // makes the join contained too.
+    let parent = ensure_within(root, parent)?;
     let final_target = parent.join(final_name);
     if final_target.exists() && !is_same_entry(path, &final_target) {
         // A genuinely different file already holds that name (case-sensitive FS).
@@ -174,7 +189,9 @@ pub fn move_entry(root: &Path, path: &Path, new_parent: &Path) -> CoreResult<Tre
 /// origin path. That cost is accepted deliberately — see the comment on the
 /// macOS branch.
 pub fn delete_entry(root: &Path, path: &Path) -> CoreResult<()> {
-    let path = ensure_within(root, path)?;
+    // `ensure_descendant`, not `ensure_within`: the root passes containment, and
+    // deleting it would move the user's entire vault to the Trash on one IPC call.
+    let path = ensure_descendant(root, path)?;
     if !path.exists() {
         return Err(CoreError::NotFound(path.display().to_string()));
     }

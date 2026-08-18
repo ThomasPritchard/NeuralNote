@@ -43,6 +43,26 @@ pub fn ensure_within(root: &Path, target: &Path) -> CoreResult<PathBuf> {
     }
 }
 
+/// Resolve `target` and prove it is a *proper descendant* of `root` — inside the
+/// vault, and not the vault itself.
+///
+/// [`ensure_within`] answers containment, and a directory is trivially contained
+/// in itself, so it admits the vault root by design (creating a note *at* the
+/// root is legitimate). A destructive operation needs the stronger property: the
+/// root is a valid place to write into, never a valid thing to destroy. Naming it
+/// as a delete or rename target would take the user's entire vault, and the UI
+/// never offering it is not an authorization control (`AGENTS.md`).
+pub fn ensure_descendant(root: &Path, target: &Path) -> CoreResult<PathBuf> {
+    let resolved = ensure_within(root, target)?;
+    let root_c = root
+        .canonicalize()
+        .map_err(|e| CoreError::Io(format!("vault root unreadable: {e}")))?;
+    if resolved == root_c {
+        return Err(CoreError::OutsideVault(target.display().to_string()));
+    }
+    Ok(resolved)
+}
+
 /// Reject names that are empty, navigational, separator-bearing, or contain
 /// control characters — anything that could break out of the intended folder.
 pub fn validate_name(name: &str) -> CoreResult<()> {
