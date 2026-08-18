@@ -68,6 +68,36 @@ function withSettlement(
   return [...calls, { name: "", title: "", arguments: "", stepId: null, ...settlement }];
 }
 
+/** Leave a running tool's latest line on the node that sent it.
+ *
+ *  Matches the newest still-unsettled node with this id, exactly as
+ *  `withSettlement` does and for the same reason: a finished node must not be
+ *  made to look like it is still working.
+ *
+ *  An id matching no live node changes nothing — and, unlike a settlement, is
+ *  not appended as a row of its own. There is no anomaly to make visible: the
+ *  id cannot be wrong. A tool emits through `CallChannel`, which carries the
+ *  dispatched call's id and exposes no general `send`, so progress addressed to
+ *  someone else's node is unwritable rather than merely unwritten
+ *  (`crates/neuralnote-core/src/ai/call_channel.rs`). What appending WOULD
+ *  produce is a rail node with no name, no title and no arguments — the three
+ *  things a tool node consists of. */
+function withProgress(
+  calls: ToolCallView[],
+  id: string,
+  message: string,
+): ToolCallView[] {
+  for (let i = calls.length - 1; i >= 0; i--) {
+    const call = calls[i];
+    if (call.id === id && call.status === null) {
+      const next = calls.slice();
+      next[i] = { ...call, progress: message };
+      return next;
+    }
+  }
+  return calls;
+}
+
 /** Fold a live note preview into the edit that owns its id, or start one.
  *
  *  The body only ever grows and the backend re-sends the whole of it, so the
@@ -230,11 +260,18 @@ function foldEvent(turn: AssistantMessage, event: ChatEvent): AssistantMessage {
       // `reduceAssistantForTurn`, which is where "alive" and "progressed" are
       // deliberately kept apart.
       return turn;
-    case "toolProgress":
-      // Nothing emits it yet; folding it now would move the UI ahead of the
-      // contract. Never collapse this into a `default:` arm — the exhaustive
-      // switch is what makes a new backend event a compile error here.
-      return turn;
+    case "toolProgress": {
+      // A tool reporting from inside itself is progress, and dating it as such
+      // is not decoration: `foldWithLiveness` short-circuits on an identity
+      // fold, so while this returned `turn` a four-minute transcription left
+      // `lastEventAt` standing and the head raised its stall notice 45 seconds
+      // into a perfectly healthy run.
+      //
+      // Never collapse this into a `default:` arm — the exhaustive switch is
+      // what makes a new backend event a compile error here.
+      const toolCalls = withProgress(turn.toolCalls, event.id, event.message);
+      return toolCalls === turn.toolCalls ? turn : { ...turn, toolCalls };
+    }
     case "skillActivated":
       return {
         ...turn,

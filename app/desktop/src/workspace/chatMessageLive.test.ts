@@ -13,6 +13,7 @@ import {
   type AssistantMessage,
   type ChatMessage,
 } from "./chatMessage";
+import { STALL_AFTER_MS, turnLiveness } from "./turnLiveness";
 
 function run(events: ChatEvent[]): AssistantMessage {
   return events.reduce((turn, event) => reduceAssistant(turn, event), emptyAssistant());
@@ -23,6 +24,17 @@ const beacon = (
   maxRounds: number,
   playlist: { position: number; total: number } | null = null,
 ): ChatEvent => ({ type: "planningRound", round, maxRounds, playlist });
+
+/** The long tool the progress line belongs to: announced before it runs, and
+ *  still in flight while it narrates itself. */
+const transcribe: ChatEvent = {
+  type: "toolCall",
+  id: "c1",
+  name: "distil_youtube",
+  title: "Distil a YouTube video",
+  arguments: '{"url":"https://youtu.be/V1"}',
+  stepId: null,
+};
 
 const preview: ChatEvent = {
   type: "videoPreview",
@@ -70,11 +82,15 @@ describe("the phase the head names", () => {
   });
 
   it("does not let an inert event unsay the reasoning that is still arriving", () => {
+    // "Thinking" is derived from the event that just landed, so an event that
+    // changed nothing must not be able to clear it — nothing happened. The one
+    // event that can reach the fold with nothing to say is a progress line for
+    // a call this turn never saw live.
     const reasoning = run([{ type: "thinking", delta: "weighing" }]);
 
     const nudged = reduceAssistant(reasoning, {
       type: "toolProgress",
-      id: "c1",
+      id: "never-dispatched",
       message: "3 of 8 videos",
     });
 
@@ -171,5 +187,25 @@ describe("liveness stamping", () => {
 
     expect(turnAfter(pinged).lastAliveAt).toBe(30_000);
     expect(turnAfter(pinged).lastEventAt).toBe(1_000);
+  });
+
+  it("counts a running tool's progress as progress, so a long tool never looks stalled", () => {
+    // The defect this test exists for: `toolProgress` folded to identity, and
+    // `foldWithLiveness` short-circuits on an identity fold, so `lastEventAt`
+    // stood still for the whole of a four-minute transcription and the head
+    // told the user the model had gone quiet 45 seconds in. A tool reporting
+    // from inside itself is the clearest progress there is.
+    const dispatched = reduceAssistantForTurn(messages, "turn-1", transcribe, 1_000);
+
+    const narrated = reduceAssistantForTurn(
+      dispatched,
+      "turn-1",
+      { type: "toolProgress", id: "c1", message: "Transcribing audio" },
+      40_000,
+    );
+    const turn = turnAfter(narrated);
+
+    expect(turn.lastEventAt).toBe(40_000);
+    expect(turnLiveness(turn, 1_000 + STALL_AFTER_MS).stalled).toBe(false);
   });
 });

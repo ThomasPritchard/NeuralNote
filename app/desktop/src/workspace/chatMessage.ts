@@ -81,6 +81,13 @@ export interface ToolCallView {
    *  ungrouped, exactly as every node did before plans existed. It takes no part
    *  in settlement, which correlates on `id` alone. */
   stepId: string | null;
+  /** The latest line the running tool sent about itself, or absent while it has
+   *  said nothing. Rust-composed, never model prose, and last-writer-wins: a
+   *  long tool narrates its stages and only the current one is worth standing.
+   *
+   *  Optional because a node only carries what actually arrived — a call that
+   *  never narrated itself has no line, which is different from an empty one. */
+  progress?: string;
 }
 
 /** A note the model is composing, as the backend's partial parse of the streamed
@@ -461,10 +468,11 @@ export function reduceAssistantForTurn(
   const reduced = foldWithLiveness(turn, event, now);
   // An event that changed nothing returns the SAME list, not a copy of it: a
   // fresh array would still commit a render, and the transcript's scroll-follow
-  // re-asserts its pin on every commit. `toolProgress` is the variant that has
-  // nothing to say yet and so must not reach the DOM at all. A `keepalive` no
-  // longer qualifies — it now refreshes the liveness the head reads, which is a
-  // real change to real state.
+  // re-asserts its pin on every commit. The only event that reaches here with
+  // nothing to say is a `toolProgress` naming a call this turn never saw live —
+  // which the wire cannot produce (see `withProgress`). A `keepalive` does not
+  // qualify: it refreshes the liveness the head reads, which is a real change
+  // to real state.
   if (reduced === turn) return messages;
   const next = messages.slice();
   next[index] = reduced;

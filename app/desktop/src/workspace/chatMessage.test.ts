@@ -170,14 +170,15 @@ describe("turn-specific event and stop routing", () => {
   it("returns the same list for an event that changed nothing", () => {
     // Identity, not deep equality: a fresh array would commit a React render,
     // and the transcript's scroll-follow re-asserts its pin on every commit.
-    // `toolProgress` is the variant with nothing to say yet, so it must not
-    // reach the DOM at all. A keepalive no longer qualifies — it refreshes the
-    // liveness the live head reads (see `chatMessageLive.test.ts`), which is a
-    // real change to real state and has to commit.
+    // A progress line naming a call this turn never saw live is the only event
+    // left with nothing to say — and the wire cannot produce one, because a
+    // tool emits through `CallChannel` with the dispatched id. A keepalive does
+    // not qualify: it refreshes the liveness the live head reads (see
+    // `chatMessageLive.test.ts`), which has to commit.
     expect(
       reduceAssistantForTurn(messages, "turn-1", {
         type: "toolProgress",
-        id: "c1",
+        id: "never-dispatched",
         message: "3 of 8 videos",
       }),
     ).toBe(messages);
@@ -269,23 +270,16 @@ describe("reduceAssistant — grounded progress", () => {
     expect(turn.phase).toBe("verifying");
   });
 
-  it("leaves the CONTENT fold untouched for keepalive and tool progress", () => {
-    // Neither says anything about the conversation. A keepalive says the socket
-    // is alive, which the fold has no view state for — it is dated by
+  it("leaves the CONTENT fold untouched for a keepalive", () => {
+    // It says nothing about the conversation: a keepalive says the socket is
+    // alive, which the fold has no view state for — it is dated by
     // `reduceAssistantForTurn` instead, where "alive" and "progressed" are kept
-    // apart. Nothing emits `toolProgress` yet at all.
+    // deliberately apart.
     const searched = run([
       { type: "searching", query: "active recall", callId: "c1" },
     ]);
 
     expect(reduceAssistant(searched, { type: "keepalive" })).toBe(searched);
-    expect(
-      reduceAssistant(searched, {
-        type: "toolProgress",
-        id: "c1",
-        message: "3 of 8 videos",
-      }),
-    ).toBe(searched);
   });
 
   it("ignores the retrieval correlation key rather than rendering it", () => {
@@ -635,6 +629,40 @@ describe("reduceAssistant — the tool timeline", () => {
 
     expect(turn.toolCalls).toHaveLength(2);
     expect(turn.toolCalls[0].status).toBe("ok");
+  });
+
+  it("leaves a running tool's latest progress line on the node that sent it", () => {
+    // `toolProgress` is keyed to its call so it renders on that node rather than
+    // on a surface of its own, and it is last-writer-wins: the line worth
+    // leaving standing while the tool works is the one sent last.
+    const turn = run([
+      { type: "toolCall", id: "c1", name: "distil_youtube", title: "Distil a YouTube video",
+        arguments: "{}", stepId: null, },
+      { type: "toolCall", id: "c2", name: "search_notes", title: "Search notes", arguments: "{}",
+        stepId: null, },
+      { type: "toolProgress", id: "c1", message: "Fetching captions" },
+      { type: "toolProgress", id: "c1", message: "Transcribing audio" },
+    ]);
+
+    expect(turn.toolCalls[0].progress).toBe("Transcribing audio");
+    // Nothing narrated the second call, so it says nothing — never the first
+    // call's line, which is what arrival-order correlation would have given it.
+    expect(turn.toolCalls[1].progress).toBeUndefined();
+  });
+
+  it("never re-opens a settled call with a late progress line", () => {
+    // The tool's channel is dropped before its settlement is emitted, so
+    // progress after a result is a broken contract, and the one thing it must
+    // not do is make a finished node look like it is still working.
+    const turn = run([
+      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}",
+        stepId: null, },
+      { type: "toolResult", id: "c1", status: "ok", summary: null, detail: null, durationMs: 0 },
+      { type: "toolProgress", id: "c1", message: "still going" },
+    ]);
+
+    expect(turn.toolCalls).toHaveLength(1);
+    expect(turn.toolCalls[0].progress).toBeUndefined();
   });
 
   it("leaves the progress phase to the events that actually name one", () => {
