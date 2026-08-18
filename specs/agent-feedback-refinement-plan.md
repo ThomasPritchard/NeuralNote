@@ -871,3 +871,62 @@ the `futures::executor::block_on` test harness; tightening the shell client chan
 selection path more broadly than intended.
 
 This is Rust, not presentation — it belongs with Phase 5's logic lane, not its rendering lane.
+
+---
+
+# Amendment D — rulings for Phases 6 and 7, and Phase 5 cleanup
+
+Agreed with Tom 2026-08-18, after Phase 5 landed.
+
+## D1. `reasoning_control()` precedence — NORMALISE
+
+Off gets exactly ONE representation, so two models with identical behaviour render an identical
+control:
+
+- `supported_efforts` present -> `Efforts`. **Strip `"none"` from `options`**; its presence sets
+  `can_disable: true`. `can_disable` is false when `mandatory` is true. 38 of the 134
+  effort-capable models list `"none"` inside the array; the rest express off via
+  `mandatory: false`. Both now converge.
+- `supported_efforts` absent, `mandatory: true` -> `Locked`.
+- `supported_efforts` absent otherwise -> `Toggle { default_on }`. `default_on` follows
+  `default_enabled` where present, and defaults to **false** when absent (84 records carry only
+  `{"mandatory": false}`). Off is safer on cost and matches today's opt-in, which starts false.
+- Capability object absent entirely -> `Hidden`. Probe not yet answered -> `Pending` (decided by
+  the caller, not this function).
+
+Note this is a deliberate, bounded departure from decision 1's "native values verbatim": the
+VALUES stay verbatim, only the off-sentinel is normalised out of the list.
+
+## D2. Remove the unrendered `searches` / `reads` state
+
+Phase 5's logic lane added per-call `searches` / `reads` to `ToolCallView`; the design lane then
+declined to render either, because the query is already the argument hint and the counts are
+already the Rust-composed summary, so rendering them would show one act on one node twice. The
+reasoning holds, and the truncated-query case it was meant to cover is solved by the
+container-query fix instead.
+
+**Delete the state, its selectors and its tests.** Leaving it is the exact pattern
+`groupActivity()` was deleted for in the same phase.
+
+## D3. `coverage.notesRead` — KEEP. The premise for deleting it was wrong.
+
+Ruled "delete the state entirely" on the understanding it was unconsumed. **It is not.**
+`chatMessage.ts:487` reads `turn.coverage.notesRead.length === 0` as a load-bearing clause of
+`showsNothingFoundCard()`. It is *unrendered*, not *unused*, and deleting it would silently change
+when the "nothing found" card appears.
+
+Distinguish the two same-named things, which is what made this confusing:
+
+- `turn.coverage.notesRead: string[]` — from the `Coverage` wire event. Gates the card. **Keep.**
+- `summarizeActivity().notesRead: number` — a count derived from `turn.activity`. Rendered at
+  `ChatTimeline.tsx:154`. Always was. **Keep.**
+
+No change. The design lane's refusal to render a run-level list stands.
+
+## D4. The Phase 3 retry trade — KEEP as shipped
+
+Reasoning latches `EmissionGuard`, so a reasoning-enabled planning turn spends its one bounded
+retry at the first reasoning token. A replayed retry would append a second, different monologue
+into the same round's buffer with nothing marking the boundary, showing a train of thought the
+model never had. Failures before any frame (429/5xx/408, connect drops) still retry, and those are
+the failures the retry was written for. No change.
