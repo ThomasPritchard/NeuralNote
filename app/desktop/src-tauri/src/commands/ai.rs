@@ -362,18 +362,38 @@ fn reasoning_control_for(
     }
 }
 
+/// The control the selected model calls for right now. The one place this is
+/// decided, so what `set_reasoning_effort` validates against is the same value
+/// the status read hands the UI — a control validated against anything else
+/// could refuse an option the user was just offered.
+///
+/// The catalogue is consulted only on the hosted lane. Ollama publishes no
+/// effort menu, so a local model tag has nothing to look up.
+fn selected_reasoning_control(
+    cfg: &neuralnote_core::ai::ProviderConfig,
+    key_present: bool,
+) -> neuralnote_core::ai::ReasoningControl {
+    let provider = cfg.effective_provider(key_present);
+    let catalogue = match provider {
+        Some(ProviderKind::OpenRouter) => cfg
+            .selected_model(key_present)
+            .and_then(ai::cached_openrouter_reasoning_control),
+        _ => None,
+    };
+    reasoning_control_for(
+        provider,
+        cfg.cached_reasoning_support(key_present),
+        catalogue,
+    )
+}
+
 /// Map the persisted config onto the provider-aware status DTO. Split from the
 /// command (which owns only the config read) so the config → status mapping — notably
 /// that `reasoning` surfaces on the OpenRouter status — is unit-testable without an
 /// `AppHandle`.
 fn build_ai_status(cfg: neuralnote_core::ai::ProviderConfig, key_present: bool) -> AiStatus {
     let reasoning_supported = cfg.cached_reasoning_support(key_present);
-    let reasoning_control = reasoning_control_for(
-        cfg.effective_provider(key_present),
-        reasoning_supported,
-        cfg.selected_model(key_present)
-            .and_then(ai::cached_openrouter_reasoning_control),
-    );
+    let reasoning_control = selected_reasoning_control(&cfg, key_present);
     let approval_policy = cfg.approval_policy(key_present);
     let effective_modes: std::collections::BTreeMap<String, _> =
         neuralnote_core::ai::approval::ALL_GATED_TOOLS
@@ -551,15 +571,7 @@ fn set_reasoning_effort_in(
             cfg.reasoning_preference.effort = None;
             return Ok(());
         };
-        ensure_effort_is_offered(
-            &reasoning_control_for(
-                cfg.effective_provider(key_present),
-                cfg.cached_reasoning_support(key_present),
-                cfg.selected_model(key_present)
-                    .and_then(ai::cached_openrouter_reasoning_control),
-            ),
-            &effort,
-        )?;
+        ensure_effort_is_offered(&selected_reasoning_control(cfg, key_present), &effort)?;
         cfg.reasoning_preference = neuralnote_core::ai::ReasoningPreference {
             enabled: true,
             effort: Some(effort),
