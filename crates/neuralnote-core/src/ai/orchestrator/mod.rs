@@ -26,6 +26,7 @@ mod prompt;
 mod services;
 mod session;
 mod settlement;
+mod tool_batch;
 mod usage;
 
 pub use services::{NoRetryDelay, RetryDelay, SkillServices};
