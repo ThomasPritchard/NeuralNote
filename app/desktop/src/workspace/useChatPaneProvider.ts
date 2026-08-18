@@ -65,14 +65,24 @@ function reasoningProbeTarget(status: AiStatus | null): string | null {
 }
 
 /** A same-model status echo owns provider/config fields, but an `unknown`
- * capability must not erase a support verdict already returned by the probe. */
+ * capability must not erase a support verdict already returned by the probe.
+ *
+ * The control is kept with the verdict rather than taken from the echo, because
+ * the backend derives it FROM that verdict: an echo reading `unknown` reports
+ * the control as `pending`, so taking one and not the other would pair a
+ * "supported" verdict with a "still checking" control — two halves of one answer
+ * disagreeing. */
 function mergeStatusRead(current: AiStatus | null, next: AiStatus): AiStatus {
   if (
     current !== null &&
     reasoningProbeTarget(current) === reasoningProbeTarget(next) &&
     next.reasoningSupported === "unknown"
   ) {
-    return { ...next, reasoningSupported: current.reasoningSupported };
+    return {
+      ...next,
+      reasoningSupported: current.reasoningSupported,
+      reasoningControl: current.reasoningControl,
+    };
   }
   return next;
 }
@@ -221,7 +231,18 @@ export function useChatPaneProvider({
         ) return;
         // The probe owns capability only. Preserve any same-target provider or
         // reasoning state refreshed while its network request was in flight.
-        commitStatus({ ...current, reasoningSupported: fresh.reasoningSupported });
+        //
+        // `reasoningControl` comes across WITH the verdict, because it is the
+        // same answer: the probe's fetch is the only thing that warms the
+        // shell's effort-menu cache, so its response is the only status read
+        // that can carry a resolved control on a cold launch. Dropping it here
+        // would leave the control reading "still checking" for the whole
+        // session, however many times the menu was actually fetched.
+        commitStatus({
+          ...current,
+          reasoningSupported: fresh.reasoningSupported,
+          reasoningControl: fresh.reasoningControl,
+        });
       })
       .catch((e) => {
         if (

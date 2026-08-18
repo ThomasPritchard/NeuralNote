@@ -932,8 +932,8 @@ impl OpenAiChatClient {
 
     /// What this client asks the provider for on a turn that carries reasoning.
     /// Every such turn asks the same thing — planning and answer alike (locked
-    /// decision 7) — so a second, hidden reasoning setting cannot appear by
-    /// drift.
+    /// §4.3 mitigation (a)) — so a second, hidden reasoning setting cannot
+    /// appear by drift.
     ///
     /// It is handed back exactly as the caller resolved it. Nothing is decided
     /// here, because an effort may only be a value the model's own menu offered.
@@ -2279,10 +2279,17 @@ mod tests {
 
     #[test]
     fn a_chosen_effort_reaches_the_wire_on_both_turn_types() {
-        // Locked decision 7: the effort the user picked applies to the planning
-        // turns as well as the answer, so there is one knob rather than a hidden
-        // second setting. The value goes out verbatim — never lower-cased, never
-        // mapped onto a tier scale of ours.
+        // The effort the user picked applies to the planning turns as well as
+        // the answer, so there is one knob rather than a hidden second setting.
+        // That follows from the single `ReasoningAsk` per client the contract
+        // froze in Phase 1, and it is §4.3 mitigation (a) — which the plan lists
+        // as a recommendation, NOT a settled ruling (§6 open question 2 still
+        // puts the cost to Tom). Phase 3 already asks for reasoning on planning
+        // turns; all that is new here is that the effort rides the same ask
+        // rather than a second one being invented for it.
+        //
+        // The value goes out verbatim — never lower-cased, never mapped onto a
+        // tier scale of ours.
         let client = OpenAiChatClient::new(
             "sk-test".into(),
             Some(openai::ReasoningAsk::Effort("xHigh".into())),

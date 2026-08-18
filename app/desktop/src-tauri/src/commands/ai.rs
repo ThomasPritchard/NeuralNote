@@ -605,6 +605,14 @@ fn ensure_effort_is_offered(
                 options.join(", ")
             )))
         }
+        // `Pending` is not `Hidden`, here as everywhere else. Telling the user a
+        // model publishes no efforts because we have not finished asking would
+        // be the same conflation decision 2 forbids in the control, moved into
+        // the error channel — and it points whoever debugs it at the catalogue
+        // instead of at a cache that has not warmed yet.
+        neuralnote_core::ai::ReasoningControl::Pending => Err(CoreError::InvalidContent(format!(
+            "\"{effort}\" can't be set yet: this model's reasoning options are still being checked."
+        ))),
         _ => Err(CoreError::InvalidContent(format!(
             "\"{effort}\" can't be set: this model doesn't publish reasoning efforts to choose from."
         ))),
@@ -1288,8 +1296,17 @@ pub(crate) async fn chat(
         }
         Some(ProviderKind::OpenRouter) => {
             // Fail-open on WHETHER to reason, closed on the effort: a stored
-            // effort only goes out while the verdict says the model reasons,
-            // which is the only state in which its menu was actually read (§4.2).
+            // effort only goes out while the verdict says the model reasons.
+            //
+            // That is the VERDICT, not the control. The verdict is persisted and
+            // the menu cache is not, so on a cold launch this sends a stored
+            // effort while `AiStatus` still reports the control as `Pending` —
+            // which §4.2's "when the control is `Pending` … no `effort`"
+            // sentence, read literally, forbids. The effort being sent was read
+            // off this same model's probed menu (a model change clears it), so
+            // it satisfies §4.2's governing rule; dropping it would silently
+            // ignore the user's setting for every turn inside the ~8s probe
+            // window. Flagged for a ruling rather than resolved here.
             let ask = neuralnote_core::ai::effective_reasoning_ask(
                 cfg.reasoning_preference.enabled,
                 cfg.reasoning_preference.effort.as_deref(),
@@ -3517,6 +3534,45 @@ mod tests {
             Some("high".into()),
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_refusal_while_the_probe_is_still_running_does_not_call_the_model_incapable() {
+        // `Pending` is not `Hidden` in the error channel either. A capable model
+        // whose menu cache has not warmed yet must not be reported as publishing
+        // no efforts — that is the conflation decision 2 forbids, and it sends
+        // whoever debugs it to the catalogue instead of the cache.
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                active_provider: Some(ProviderKind::OpenRouter),
+                model: "test/effort-pending".into(),
+                // Supported, but nothing has warmed the control cache for it.
+                reasoning_probe: probed("test/effort-pending", ReasoningSupport::Supported),
+                ..ProviderConfig::default()
+            },
+        )
+        .unwrap();
+
+        let error = set_reasoning_effort_in(
+            dir.path(),
+            &ProviderConfigMutationGate::default(),
+            true,
+            Some("high".into()),
+        )
+        .err()
+        .expect("an unwarmed menu cannot authorise an effort");
+
+        let message = ai::error_detail(error);
+        assert!(
+            message.contains("still being checked"),
+            "expected a still-checking refusal, got: {message}"
+        );
+        assert!(
+            !message.contains("doesn't publish"),
+            "a capable model must never be reported as publishing no efforts: {message}"
+        );
     }
 
     #[test]

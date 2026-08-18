@@ -429,9 +429,17 @@ impl ChatSession<'_> {
         sink: &mut dyn EventSink,
     ) -> tools::ToolResult {
         // The "searching…" cue precedes the search so the UI shows it live. It
-        // names the call that runs it so the timeline can enrich that node rather
-        // than render the same act a second time — parallel calls make arrival
-        // order useless as a correlation key.
+        // names the call that runs it because arrival order is useless as a
+        // correlation key once calls run in parallel — attributing one call's
+        // query to another is a provenance lie in the surface whose whole job is
+        // provenance.
+        //
+        // The timeline does not currently read that id: it renders the cue on
+        // the run's activity trace only, having found that the node already
+        // carries both of the cue's facts (amendment D2). The id stays on the
+        // wire regardless — it is what makes the attribution correct at the
+        // source, and recovering it later would mean re-deriving provenance that
+        // had already shipped wrong.
         if call.name() == tools::TOOL_SEARCH_NOTES {
             if let Some(query) = peek_query(call.arguments()) {
                 sink.send(ChatEvent::Searching {

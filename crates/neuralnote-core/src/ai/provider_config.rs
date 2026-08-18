@@ -73,9 +73,11 @@ pub struct ReasoningPreference {
 ///
 /// It carries no serde field attributes: reading goes through the tolerant
 /// [`RawProviderConfig`] mirror (which owns every `default`) and writing through
-/// [`WireProviderConfig`] (which owns the on-disk shape, legacy mirror included).
-/// Both directions are explicit, so the file format can never drift from this
-/// type by an attribute nobody noticed.
+/// [`WireProviderConfig`] (which owns the on-disk shape, legacy mirror
+/// included). Both directions are written out by hand and both are exhaustive
+/// over this struct, so a field added here fails to compile until each side says
+/// what to do with it — the format cannot drift by an attribute nobody noticed,
+/// nor by a field nobody wired up.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderConfig {
     pub active_provider: Option<ProviderKind>,
@@ -120,10 +122,15 @@ pub struct ProviderConfig {
 /// The on-disk shape this build writes.
 ///
 /// `reasoningPreference` is authoritative. `reasoning` is written beside it as a
-/// legacy MIRROR of `enabled` — never read back by this build, and present only
-/// so a build predating the preference object still reads the user's opt-in
-/// instead of silently reverting them to off. It is derived on every write, so
-/// the two can never drift apart.
+/// legacy MIRROR of `enabled`, derived on every write so the two cannot drift.
+///
+/// It is written for a build that predates the preference object: without it,
+/// such a build would read the opt-in as `false` and silently revert the user to
+/// reasoning-off. It is not, however, dead on read — [`RawProviderConfig`] still
+/// reads `reasoning` as [`fold_reasoning_preference`]'s legacy input, and that
+/// is the entire migration path for every config written before this key
+/// existed. What this build never does is read it back out of a file that also
+/// carries `reasoningPreference`.
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WireProviderConfig<'a> {
@@ -144,17 +151,34 @@ impl Serialize for ProviderConfig {
     where
         S: Serializer,
     {
+        // Destructured, not accessed field-by-field: a new field on
+        // `ProviderConfig` then fails to COMPILE here rather than being silently
+        // left out of the file. `Deserialize` and `Default` are already
+        // exhaustive struct literals, so this is the one direction that could
+        // have drifted without the compiler saying so.
+        let ProviderConfig {
+            active_provider,
+            model,
+            local_model_tag,
+            reasoning_preference,
+            reasoning_probe,
+            reasoning_probe_generation,
+            disabled_skills,
+            approval_mode,
+            tool_approval_overrides,
+        } = self;
+
         WireProviderConfig {
-            active_provider: self.active_provider,
-            model: &self.model,
-            local_model_tag: self.local_model_tag.as_deref(),
-            reasoning: self.reasoning_preference.enabled,
-            reasoning_preference: &self.reasoning_preference,
-            reasoning_probe: self.reasoning_probe.as_ref(),
-            reasoning_probe_generation: self.reasoning_probe_generation,
-            disabled_skills: &self.disabled_skills,
-            approval_mode: self.approval_mode,
-            tool_approval_overrides: &self.tool_approval_overrides,
+            active_provider: *active_provider,
+            model,
+            local_model_tag: local_model_tag.as_deref(),
+            reasoning: reasoning_preference.enabled,
+            reasoning_preference,
+            reasoning_probe: reasoning_probe.as_ref(),
+            reasoning_probe_generation: *reasoning_probe_generation,
+            disabled_skills,
+            approval_mode: *approval_mode,
+            tool_approval_overrides,
         }
         .serialize(serializer)
     }
@@ -1459,6 +1483,118 @@ mod tests {
     }
 
     #[test]
+    fn the_legacy_shape_carries_populated_skill_and_override_state_across() {
+        // Both shipped fixtures happen to hold an empty `disabledSkills` and an
+        // empty `toolApprovalOverrides`, and empty is ALSO what a silent reset
+        // produces — so those two assertions cannot fail there. This is the same
+        // legacy shape with both fields populated, which is the case that can.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            config_file(dir.path()),
+            serde_json::to_string(&serde_json::json!({
+                "activeProvider": "openRouter",
+                "model": "vendor/legacy",
+                "reasoning": true,
+                "reasoningProbeGeneration": 12,
+                "disabledSkills": [FIXTURE_SKILL_ID],
+                "approvalMode": "yolo",
+                "toolApprovalOverrides": { GatedTool::WriteNote.name(): "alwaysAsk" },
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let config = read_provider_config(dir.path()).unwrap();
+
+        assert_eq!(config.disabled_skills, vec![FIXTURE_SKILL_ID.to_string()]);
+        assert_eq!(
+            config.tool_approval_overrides,
+            BTreeMap::from([(
+                GatedTool::WriteNote.name().to_string(),
+                ApprovalMode::AlwaysAsk
+            )])
+        );
+        assert_eq!(config.approval_mode, ApprovalMode::Yolo);
+        assert_eq!(config.reasoning_probe_generation, 12);
+        assert!(config.reasoning_preference.enabled);
+    }
+
+    #[test]
+    fn a_build_that_never_heard_of_the_preference_key_still_reads_the_whole_config() {
+        // Direction 2, made real rather than inferred: the pre-change on-disk
+        // shape, mirrored locally, deserialising a file THIS build wrote. An
+        // older build drops `reasoningPreference` as an unknown key and must
+        // still recover every other preference — including the opt-in, off the
+        // legacy bool.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct PreChangeConfig {
+            active_provider: Option<ProviderKind>,
+            model: String,
+            #[serde(default)]
+            reasoning: bool,
+            #[serde(default)]
+            reasoning_probe: Option<ProbedReasoning>,
+            #[serde(default)]
+            reasoning_probe_generation: u64,
+            #[serde(default)]
+            disabled_skills: Vec<String>,
+            #[serde(default)]
+            approval_mode: ApprovalMode,
+            #[serde(default)]
+            tool_approval_overrides: BTreeMap<String, ApprovalMode>,
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        write_provider_config(
+            dir.path(),
+            &ProviderConfig {
+                active_provider: Some(ProviderKind::OpenRouter),
+                model: "vendor/current".into(),
+                reasoning_preference: ReasoningPreference {
+                    enabled: true,
+                    effort: Some("xhigh".into()),
+                },
+                reasoning_probe: probed("vendor/current", ReasoningSupport::Supported),
+                reasoning_probe_generation: 4,
+                disabled_skills: vec![FIXTURE_SKILL_ID.into()],
+                approval_mode: ApprovalMode::Yolo,
+                tool_approval_overrides: BTreeMap::from([(
+                    GatedTool::WriteNote.name().to_string(),
+                    ApprovalMode::AlwaysAsk,
+                )]),
+                ..default_config()
+            },
+        )
+        .unwrap();
+
+        let old: PreChangeConfig =
+            serde_json::from_str(&fs::read_to_string(config_file(dir.path())).unwrap())
+                .expect("an older build must still parse a file this build wrote");
+
+        assert_eq!(old.active_provider, Some(ProviderKind::OpenRouter));
+        assert_eq!(old.model, "vendor/current");
+        assert!(old.reasoning, "the opt-in survives the downgrade");
+        assert_eq!(
+            old.reasoning_probe,
+            probed("vendor/current", ReasoningSupport::Supported)
+        );
+        assert_eq!(old.reasoning_probe_generation, 4);
+        assert_eq!(old.disabled_skills, vec![FIXTURE_SKILL_ID.to_string()]);
+        assert_eq!(old.approval_mode, ApprovalMode::Yolo);
+        assert_eq!(
+            old.tool_approval_overrides,
+            BTreeMap::from([(
+                GatedTool::WriteNote.name().to_string(),
+                ApprovalMode::AlwaysAsk
+            )])
+        );
+        // The effort is the one thing an older build cannot represent. It is
+        // left on disk untouched by a read; only a WRITE from that older build
+        // drops it, which is the accepted cost of the new key.
+    }
+
+    #[test]
     fn the_current_preference_shape_wins_over_the_legacy_flag() {
         // Same "current shape wins" precedence `fold_reasoning_probe` already
         // uses. A file written mid-migration can carry both.
@@ -1578,6 +1714,68 @@ mod tests {
             }
         );
         assert_eq!(config.reasoning_probe, None);
+    }
+
+    #[test]
+    fn a_provider_switch_clears_the_effort_the_same_way_a_model_change_does() {
+        // The target is provider AND model, so a switch to the local lane leaves
+        // the hosted model's menu behind just as surely as picking another
+        // model does. Correct by construction today; one refactor of
+        // `reasoning_probe_identity` from being wrong.
+        let mut config = ProviderConfig {
+            active_provider: Some(ProviderKind::OpenRouter),
+            model: "vendor/menu-model".into(),
+            local_model_tag: Some("qwen2.5:7b".into()),
+            reasoning_preference: ReasoningPreference {
+                enabled: true,
+                effort: Some("xhigh".into()),
+            },
+            ..default_config()
+        };
+
+        config
+            .mutate_with_reasoning_probe_invalidation(true, true, |cfg| {
+                cfg.active_provider = Some(ProviderKind::Local);
+                Ok(())
+            })
+            .unwrap();
+
+        assert_eq!(
+            config.reasoning_preference,
+            ReasoningPreference {
+                enabled: true,
+                effort: None,
+            }
+        );
+    }
+
+    #[test]
+    fn toggling_reasoning_off_and_on_again_restores_the_same_models_effort() {
+        // `set_reasoning` writes only `enabled`, so an effort can outlive an
+        // opt-out. That is deliberate rather than a leak: the model has not
+        // changed, so the effort is still a value off ITS menu, and a user who
+        // turns reasoning back on gets the setting they chose rather than a
+        // silent reset to the provider default.
+        let dir = tempfile::tempdir().unwrap();
+        let stored = ProviderConfig {
+            reasoning_preference: ReasoningPreference {
+                enabled: true,
+                effort: Some("xhigh".into()),
+            },
+            ..default_config()
+        };
+        write_provider_config(dir.path(), &stored).unwrap();
+
+        let mut config = read_provider_config(dir.path()).unwrap();
+        config.reasoning_preference.enabled = false;
+        write_provider_config(dir.path(), &config).unwrap();
+        let off = read_provider_config(dir.path()).unwrap();
+        assert_eq!(off.reasoning_preference.effort.as_deref(), Some("xhigh"));
+
+        config.reasoning_preference.enabled = true;
+        write_provider_config(dir.path(), &config).unwrap();
+
+        assert_eq!(read_provider_config(dir.path()).unwrap(), stored);
     }
 
     #[test]

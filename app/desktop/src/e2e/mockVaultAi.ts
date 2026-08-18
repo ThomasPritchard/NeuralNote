@@ -109,6 +109,16 @@ export const createAiBackend = (
       : published;
   };
 
+  /** Mirror of `ProviderConfig::invalidate_reasoning_probe`, which every write
+   *  that can move the provider/model target runs. Both things it drops belonged
+   *  to the model being left behind: the cached verdict, and the effort read off
+   *  THAT model's menu. The opt-in survives — whether to reason at all is the
+   *  user's preference, not the model's. */
+  const invalidateReasoningProbe = () => {
+    keyState.reasoningSupported = "unknown";
+    keyState.reasoningEffort = null;
+  };
+
   const buildAiStatus = (): AiStatus => ({
     activeProvider: effectiveProvider(),
     reasoningSupported: keyState.reasoningSupported,
@@ -202,6 +212,7 @@ export const createAiBackend = (
         return fail("invalidName", "model was not offered by the current OpenRouter menu");
       }
       keyState.model = model;
+      invalidateReasoningProbe();
       return buildAiStatus();
     },
     open_openrouter_rankings: () => undefined,
@@ -213,6 +224,7 @@ export const createAiBackend = (
     set_active_provider: (a) => {
       aiState.explicitProvider = a.provider as ProviderKind;
       if (a.localModelTag != null) aiState.localActiveTag = a.localModelTag as string;
+      invalidateReasoningProbe();
       return undefined;
     },
     set_reasoning: (a) => {

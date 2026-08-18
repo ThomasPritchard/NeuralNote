@@ -96,23 +96,25 @@ const OFF_SENTINEL: &str = "none";
 ///
 /// The precedence, in order, and why (amendment D1):
 ///
-/// 1. **A published menu wins.** `supported_efforts` is the only field that
-///    offers the user a choice, so a record carrying one renders [`Efforts`]
-///    even when it also carries `mandatory` or `supports_max_tokens`.
+/// 1. **A menu with something to pick wins.** `supported_efforts` is the only
+///    field that offers the user a choice, so a record carrying one renders
+///    [`Efforts`] even when it also carries `mandatory` or `supports_max_tokens`.
 ///    `mandatory: true` alongside a menu is not a contradiction — the user picks
 ///    how hard the model thinks without being able to stop it thinking — and a
 ///    `max_tokens` budget is a different knob that OpenRouter documents as
-///    mutually exclusive with `effort`.
+///    mutually exclusive with `effort`. A menu holding nothing but the off
+///    sentinel is not one of these: stripping leaves nothing to pick, so it
+///    takes the menu-less path below (see [`offerable_efforts`]).
 /// 2. **Off gets exactly one representation.** The catalogue spells "reasoning
 ///    can be turned off" two ways: `none` inside the menu, and `mandatory:
 ///    false` beside it. Both fold into `can_disable`, so two models that behave
 ///    identically render an identical control. Only `mandatory: true` takes the
 ///    off switch away.
-/// 3. **No menu, `mandatory: true` → [`Locked`].** On is the only state.
-/// 4. **No menu otherwise → [`Toggle`]**, following `default_enabled` where the
-///    record publishes one and starting **off** where it does not. Absent means
-///    the server never told us, reasoning tokens bill as output, and the
-///    existing opt-in already starts false.
+/// 3. **Nothing to pick, `mandatory: true` → [`Locked`].** On is the only state.
+/// 4. **Nothing to pick otherwise → [`Toggle`]**, following `default_enabled`
+///    where the record publishes one and starting **off** where it does not.
+///    Absent means the server never told us, reasoning tokens bill as output,
+///    and the existing opt-in already starts false.
 ///
 /// The effort VALUES are never touched: not lower-cased, not reordered, not
 /// checked against a compiled-in list. The live catalogue carries 21 distinct
@@ -133,8 +135,15 @@ pub fn reasoning_control(capability: Option<&RawReasoningCapability>) -> Reasoni
         return menuless_control(capability, mandatory);
     }
     ReasoningControl::Efforts {
+        // A default that is not on the menu is not a default. A record naming
+        // the off sentinel as its `default_effort` would otherwise preselect a
+        // value the menu no longer offers — which the effort-setting command
+        // then refuses, leaving a control whose own default it will not accept.
+        default_effort: capability
+            .default_effort
+            .clone()
+            .filter(|effort| options.contains(effort)),
         options,
-        default_effort: capability.default_effort.clone(),
         can_disable: !mandatory,
     }
 }
@@ -225,12 +234,25 @@ struct RawOpenRouterModel {
 /// rather than a guess. (`pricing` still carries the un-narrowed version of this
 /// exposure; narrowing it is a separate change, since its own parser is
 /// deliberately fallible.)
+///
+/// **Tolerated, not silent.** Absent and unreadable produce the same control, so
+/// without a line here a model whose menu changed shape would render as an
+/// ordinary no-menu model while a previously-stored effort kept going out on
+/// every turn — a billed setting degrading with nothing anywhere saying why.
+/// Same shape as the other tolerated faults in this crate (`search.rs`,
+/// `backlinks.rs`), which is what `log` is a dependency for.
 fn lenient_reasoning<'de, D>(deserializer: D) -> Result<Option<RawReasoningCapability>, D::Error>
 where
     D: Deserializer<'de>,
 {
     let value = serde_json::Value::deserialize(deserializer)?;
-    Ok(serde_json::from_value(value).ok().flatten())
+    match serde_json::from_value(value) {
+        Ok(capability) => Ok(capability),
+        Err(error) => {
+            log::warn!("capabilities: ignoring an unreadable model reasoning block: {error}");
+            Ok(None)
+        }
+    }
 }
 
 #[derive(Deserialize)]
@@ -403,7 +425,7 @@ pub fn ollama_reasoning_support(show_json: &str) -> ReasoningSupport {
 /// the model is not known to lack the capability.
 ///
 /// if a user enables reasoning then switches to a non-reasoning model,
-/// `config.reasoning` stays `true`; sending the reasoning request anyway would
+/// `config.reasoning_preference.enabled` stays `true`; sending the request anyway would
 /// make Phase A's empty-answer / zero-`Thinking` backstop fire on a perfectly
 /// normal turn. `Unknown` still sends (fail open).
 pub fn effective_reasoning(opt_in: bool, support: ReasoningSupport) -> bool {
@@ -1128,20 +1150,42 @@ mod tests {
         // this body at all" are different facts, and only the second is `Pending`.
         let controls = parse_openrouter_reasoning_controls(CAPTURED_MODELS).unwrap();
 
+        // Written out rather than computed by calling the function under test:
+        // three of these rows used to be `reasoning_control(captured(id))`, which
+        // agrees with the implementation by construction and would keep agreeing
+        // through any change to it.
         assert_eq!(
             controls,
             vec![
                 (
                     "openai/gpt-5.6-luna-pro".to_string(),
-                    reasoning_control(Some(&captured("openai/gpt-5.6-luna-pro")))
+                    ReasoningControl::Efforts {
+                        options: vec![
+                            "max".into(),
+                            "xhigh".into(),
+                            "high".into(),
+                            "medium".into(),
+                            "low".into(),
+                        ],
+                        default_effort: Some("medium".into()),
+                        can_disable: true,
+                    }
                 ),
                 (
                     "x-ai/grok-4.6".to_string(),
-                    reasoning_control(Some(&captured("x-ai/grok-4.6")))
+                    ReasoningControl::Efforts {
+                        options: vec!["xhigh".into(), "high".into(), "medium".into(), "low".into()],
+                        default_effort: Some("high".into()),
+                        can_disable: false,
+                    }
                 ),
                 (
                     "nvidia/nemotron-3-ultra-550b-a55b".to_string(),
-                    reasoning_control(Some(&captured("nvidia/nemotron-3-ultra-550b-a55b")))
+                    ReasoningControl::Efforts {
+                        options: vec!["high".into(), "medium".into()],
+                        default_effort: Some("high".into()),
+                        can_disable: true,
+                    }
                 ),
                 (
                     "inclusionai/ling-3.0-flash".to_string(),
@@ -1153,6 +1197,27 @@ mod tests {
                 ),
                 ("openrouter/auto-beta".to_string(), ReasoningControl::Hidden),
             ]
+        );
+    }
+
+    #[test]
+    fn a_default_effort_naming_the_off_sentinel_is_dropped_rather_than_preselected() {
+        // A record can name `none` as its default while also listing it as a
+        // menu item. The sentinel leaves the menu, so keeping it as the default
+        // would preselect a value the menu no longer offers — which the
+        // effort-setting command then refuses, leaving a control whose own
+        // default it will not accept.
+        assert_eq!(
+            reasoning_control(Some(&RawReasoningCapability {
+                supported_efforts: Some(vec!["high".into(), "none".into()]),
+                default_effort: Some("none".into()),
+                ..RawReasoningCapability::default()
+            })),
+            ReasoningControl::Efforts {
+                options: vec!["high".into()],
+                default_effort: None,
+                can_disable: true,
+            }
         );
     }
 
