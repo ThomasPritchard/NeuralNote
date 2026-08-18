@@ -73,11 +73,32 @@ function installButtonLabel(status: UpdateState["status"]): string {
   return "Install and relaunch";
 }
 
+/**
+ * A gate the install must pass before it starts. `proceed` is the continuation
+ * that actually installs, so the guard decides *when* — never *how*.
+ *
+ * This exists because the coordinator is mounted ABOVE VaultProvider (App.tsx)
+ * and so cannot see the workspace's dirty tabs. Rather than lift tab state up,
+ * the install is pushed down: the workspace registers a guard that routes it
+ * through the same unsaved-edit confirmation as quitting (issue #205).
+ */
+type InstallGuard = (proceed: () => void) => void;
+
+function startInstall(): void {
+  void updateService.installAndRelaunch().catch(() => {
+    // The service publishes the failure into state for the dialog.
+  });
+}
+
 interface UpdateContextValue {
   state: UpdateState;
   lastAutomaticError: string | null;
   check: (source: UpdateCheckSource) => Promise<void>;
   review: () => void;
+  /** Start installing, via the registered guard when there is one. */
+  install: () => void;
+  /** Register the guard; the returned function unregisters it. */
+  registerInstallGuard: (guard: InstallGuard) => () => void;
 }
 
 const UpdateContext = createContext<UpdateContextValue | null>(null);
@@ -91,6 +112,7 @@ export function UpdateCoordinator({ children }: Readonly<{ children: ReactNode }
   );
   const [dialogOpen, setDialogOpen] = useState(false);
   const checkedAutomatically = useRef(false);
+  const installGuardRef = useRef<InstallGuard | null>(null);
 
   useEffect(() => updateService.subscribe(setState), []);
 
@@ -137,20 +159,42 @@ export function UpdateCoordinator({ children }: Readonly<{ children: ReactNode }
     });
   }, [state, toast]);
 
+  const registerInstallGuard = useCallback((guard: InstallGuard) => {
+    installGuardRef.current = guard;
+    return () => {
+      if (installGuardRef.current === guard) installGuardRef.current = null;
+    };
+  }, []);
+
+  const install = useCallback(() => {
+    // No guard registered means no vault is open, so there is no unsaved work
+    // a relaunch could destroy — installing straight away is correct there.
+    const guard = installGuardRef.current;
+    if (guard) guard(startInstall);
+    else startInstall();
+  }, []);
+
   const value = useMemo(
     () => ({
       state,
       lastAutomaticError,
       check,
       review: () => setDialogOpen(true),
+      install,
+      registerInstallGuard,
     }),
-    [check, lastAutomaticError, state],
+    [check, install, lastAutomaticError, registerInstallGuard, state],
   );
 
   return (
     <UpdateContext.Provider value={value}>
       {children}
-      <UpdateDialog state={state} open={dialogOpen} onOpenChange={setDialogOpen} />
+      <UpdateDialog
+        state={state}
+        open={dialogOpen}
+        onOpenChange={setDialogOpen}
+        onInstall={install}
+      />
     </UpdateContext.Provider>
   );
 }
@@ -161,10 +205,11 @@ export function useUpdateCoordinator(): UpdateContextValue {
   return value;
 }
 
-function UpdateDialog({ state, open, onOpenChange }: Readonly<{
+function UpdateDialog({ state, open, onOpenChange, onInstall }: Readonly<{
   state: UpdateState;
   open: boolean;
   onOpenChange: (open: boolean) => void;
+  onInstall: () => void;
 }>) {
   const update = "update" in state ? state.update : null;
   const installing = state.status === "installing" || state.status === "relaunching";
@@ -190,11 +235,7 @@ function UpdateDialog({ state, open, onOpenChange }: Readonly<{
           <button
             type="button"
             disabled={installing}
-            onClick={() => {
-              void updateService.installAndRelaunch().catch(() => {
-                // The service publishes the failure into state for the dialog.
-              });
-            }}
+            onClick={onInstall}
             className={buttonVariants({ tone: "primary" })}
           >
             {installing ? <Loader2 className="size-4 animate-spin" aria-hidden /> : <Download className="size-4" aria-hidden />}

@@ -23,6 +23,7 @@ import * as api from "../lib/api";
 import { useVault } from "../lib/store";
 import { useToast } from "../notifications";
 import type { TreeNode } from "../lib/types";
+import { useUpdateCoordinator } from "../updates/UpdateCoordinator";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { vaultRelPath } from "./fileMeta";
 import { useVaultTree } from "./useVaultTree";
@@ -129,6 +130,19 @@ export function Workspace() {
     openByPath,
     refreshDir,
   });
+
+  // "Install and relaunch" is a path to process exit, and the update dialog sits
+  // above the vault provider where dirty tabs are invisible to it. Registering
+  // here routes that install through the same unsaved-edit guard as Quit, so a
+  // relaunch can never silently discard a draft (issue #205).
+  const { registerInstallGuard } = useUpdateCoordinator();
+  useEffect(
+    () =>
+      registerInstallGuard((install) =>
+        requestIntent({ kind: "install-update", install }),
+      ),
+    [registerInstallGuard, requestIntent],
+  );
 
   // Stable callbacks read the latest tabs without re-registering native listeners
   // on every editor keystroke.

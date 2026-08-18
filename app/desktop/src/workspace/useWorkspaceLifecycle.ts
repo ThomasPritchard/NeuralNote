@@ -274,6 +274,12 @@ export function useWorkspaceLifecycle({
             });
           }
           return;
+        case "install-update":
+          // Confirm BEFORE the install starts: it downloads, installs, then
+          // relaunches, and there is no cancellation point once it is running.
+          await workspaceWriterRef.current?.flush();
+          intent.install();
+          return;
         case "open-vault":
           await workspaceWriterRef.current?.flush();
           await openExisting();

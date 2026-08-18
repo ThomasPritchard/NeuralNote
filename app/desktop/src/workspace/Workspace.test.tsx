@@ -28,6 +28,21 @@ const notification = vi.hoisted(() => ({
   info: vi.fn(),
   dismiss: vi.fn(),
 }));
+// The update dialog lives above the vault provider, so it pushes its install
+// DOWN into the workspace through the coordinator context (issue #205). Capture
+// whatever guard the Workspace registers so tests can fire it directly.
+const updates = vi.hoisted(() => {
+  const state = { guard: null as ((proceed: () => void) => void) | null };
+  return {
+    state,
+    registerInstallGuard: vi.fn((guard: (proceed: () => void) => void) => {
+      state.guard = guard;
+      return () => {
+        if (state.guard === guard) state.guard = null;
+      };
+    }),
+  };
+});
 const openState = vi.hoisted(() => ({ current: null as unknown as OpenNote }));
 const tabsState = vi.hoisted(() => ({
   current: null as unknown as NoteTabsController,
@@ -101,6 +116,11 @@ vi.mock("./useVaultTree", () => ({
 }));
 vi.mock("../notifications", () => ({ useToast: () => notification }));
 vi.mock("./useNoteTabs", () => ({ useNoteTabs: () => tabsState.current }));
+vi.mock("../updates/UpdateCoordinator", () => ({
+  useUpdateCoordinator: () => ({
+    registerInstallGuard: updates.registerInstallGuard,
+  }),
+}));
 // The Workspace subscribes to MENU_ACTION; mock the event bus so listen()
 // resolves and tests can drive the registered handler directly.
 vi.mock("@tauri-apps/api/event", () => ({
@@ -383,6 +403,8 @@ beforeEach(() => {
   win.state.closeCb = undefined;
   win.destroy.mockClear();
   win.onCloseRequested.mockClear();
+  updates.state.guard = null;
+  updates.registerInstallGuard.mockClear();
   openState.current = makeOpen();
   tabsState.current = makeTabs();
   globalThis.localStorage?.clear();
@@ -1877,5 +1899,84 @@ describe("Workspace — menu action + intent failures", () => {
 
     act(() => captured.templateDialog.onClose());
     expect(screen.queryByTestId("template-insert-dialog")).not.toBeInTheDocument();
+  });
+});
+
+describe("Workspace — update install guard", () => {
+  /** Fire the guard the Workspace registered with the update coordinator. */
+  function requestInstall(proceed: () => void) {
+    act(() => updates.state.guard!(proceed));
+  }
+
+  it("installs the update straight away when nothing is unsaved", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: false });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const proceed = vi.fn();
+
+    requestInstall(proceed);
+
+    await waitFor(() => expect(proceed).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
+  it("holds the update install behind the unsaved-work guard", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const proceed = vi.fn();
+
+    requestInstall(proceed);
+
+    expect(screen.getByText("Install update and relaunch?")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "NeuralNote will relaunch to install the update. 1 open note has unsaved changes that will be lost.",
+      ),
+    ).toBeInTheDocument();
+    expect(proceed).not.toHaveBeenCalled();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Install and relaunch" }),
+    );
+
+    await waitFor(() => expect(proceed).toHaveBeenCalledOnce());
+  });
+
+  it("does not replace or duplicate an in-flight install request", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const first = vi.fn();
+    const second = vi.fn();
+
+    requestInstall(first);
+    requestInstall(second);
+
+    expect(screen.getAllByText("Install update and relaunch?")).toHaveLength(1);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Install and relaunch" }),
+    );
+
+    await waitFor(() => expect(first).toHaveBeenCalledOnce());
+    expect(second).not.toHaveBeenCalled();
+  });
+
+  it("leaves the app running when the install confirmation is cancelled", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const proceed = vi.fn();
+
+    requestInstall(proceed);
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(proceed).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+
+    // Cancelling must not latch the guard shut — a later install still asks.
+    requestInstall(proceed);
+    expect(screen.getByText("Install update and relaunch?")).toBeInTheDocument();
   });
 });
