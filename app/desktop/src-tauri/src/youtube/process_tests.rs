@@ -312,7 +312,24 @@ async fn stderr_overflow_is_bounded_and_stops_the_child() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn timeout_kills_and_reaps_the_child() {
+async fn timeout_kills_the_child_and_leaves_no_process_behind() {
+    // Named for what it can prove. It used to be called
+    // `timeout_kills_and_reaps_the_child`, and the reap half of that was a
+    // promise this vantage point cannot keep: the runner's own reap — the
+    // `child.wait()` in `terminate_process_tree` — is not observable from
+    // outside `run()`, because tokio's `Reaper::drop` calls `try_wait()` on the
+    // way out and collects any child that has already exited
+    // (`tokio-1.53.1/src/process/unix/reap.rs:122`). The child is SIGKILLed
+    // before that drop, so it is reaped either way and only the *identity of the
+    // reaper* changes. Ablated to confirm rather than argued: deleting the
+    // runner's `child.wait()` leaves this test green.
+    //
+    // What ablation does red, 3 runs of 3, is deleting the termination itself —
+    // through the hang detector above rather than through the PID probe below,
+    // because a child that is never killed never closes the pipes the runner is
+    // still reading. That is why the kill survives in the name and the reap
+    // does not.
+    //
     // The child sleeps rather than spins. What this test needs is a child that
     // does not exit before the deadline; burning a whole core for the length of
     // that deadline adds nothing to any assertion here and adds real load to the
@@ -351,7 +368,17 @@ async fn timeout_kills_and_reaps_the_child() {
         .unwrap();
     assert_eq!(timeout, Duration::from_secs(3));
     assert!(stderr.is_empty());
-    assert!(!process_exists(pid), "timed-out child {pid} must be reaped");
+    // Implied here rather than independently falsifiable — this stub holds its
+    // inherited pipes until it dies, so the runner cannot have returned at all
+    // unless the child was already gone. It is kept because the implication is
+    // the runner's, not the child's: EOF means the write ends closed, which is
+    // not the same fact as the process having exited. A runner that stopped
+    // killing a child that closed its own output would return here with the
+    // child still running, and this is the line that would catch it.
+    assert!(
+        !process_exists(pid),
+        "the runner returned with timed-out child {pid} still present"
+    );
 }
 
 #[cfg(unix)]
@@ -387,7 +414,12 @@ async fn timeout_remains_active_until_inherited_output_pipes_close() {
 
 #[cfg(unix)]
 #[tokio::test]
-async fn cancellation_kills_and_reaps_before_process_completion() {
+async fn cancellation_kills_the_child_before_it_can_complete() {
+    // Renamed for the same reason as `timeout_kills_the_child_and_leaves_no_
+    // process_behind` above, and on the same evidence: cancellation terminates
+    // through the same `terminate_process_tree`, so its reap is equally beyond
+    // this vantage point. The ablation was run across the whole file at once —
+    // deleting the runner's `child.wait()` leaves all ten of these green.
     let script =
         stub_script("printf '%s\n' \"$$\"; printf '%s\n' \"$$\" > \"$1\"; while :; do :; done");
     let readiness = tempfile::tempdir().expect("create readiness directory");
@@ -430,5 +462,8 @@ async fn cancellation_kills_and_reaps_before_process_completion() {
         .parse::<i32>()
         .unwrap();
     assert!(stderr.is_empty());
-    assert!(!process_exists(pid), "cancelled child {pid} must be reaped");
+    assert!(
+        !process_exists(pid),
+        "the runner returned with cancelled child {pid} still present"
+    );
 }
