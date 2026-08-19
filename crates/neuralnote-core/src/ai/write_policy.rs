@@ -218,6 +218,33 @@ impl WriteBudget {
         self.per_item_writes.len()
     }
 
+    /// Whether `work_item` names one of this run's work items.
+    ///
+    /// Nothing host-side computes this index: the model supplies it, and a run
+    /// has exactly one work item unless a validated playlist selection grew the
+    /// budget. The tool seam asks before writing, so an index the run does not
+    /// have is answered with guidance rather than an array-bounds refusal.
+    pub fn has_work_item(&self, work_item: usize) -> bool {
+        work_item < self.per_item_writes.len()
+    }
+
+    /// Why `work_item` is not one of this run's items, and which value to use.
+    ///
+    /// One wording for both altitudes — the model-facing refusal at the tool
+    /// seam and this budget's own guard below — so the two can never drift into
+    /// telling a caller different things about the same run.
+    pub fn unknown_work_item_message(&self, work_item: usize) -> String {
+        let addressable = match self.per_item_writes.len() {
+            0 => "it has no work items at all".to_string(),
+            1 => "it has a single work item, so use work_item 0".to_string(),
+            count => format!(
+                "it has {count} work items, so use a work_item from 0 to {}",
+                count - 1
+            ),
+        };
+        format!("work_item {work_item} is not part of this run: {addressable}")
+    }
+
     fn ensure_work_items(&mut self, work_items: usize) -> CoreResult<()> {
         if work_items <= self.per_item_writes.len() {
             return Ok(());
@@ -235,12 +262,20 @@ impl WriteBudget {
         Ok(())
     }
 
+    /// The last-line guard on the `per_item_writes[work_item]` index, for any
+    /// caller that reaches the policy without asking [`Self::has_work_item`].
+    ///
+    /// It stays a `CoreError::InvalidName` deliberately. That variant is the
+    /// vault's cross-boundary contract, and this is a model-protocol error the
+    /// UI can never receive — it is converted to text for the chat timeline and
+    /// never switched on — so a new variant would widen a typed contract for a
+    /// reader that does not exist. What made the old wording user-visible was
+    /// the tool seam letting it through; that seam now refuses first.
     fn ensure_item(&self, work_item: usize) -> CoreResult<()> {
-        if work_item >= self.per_item_writes.len() {
-            return Err(CoreError::InvalidName(format!(
-                "work item {work_item} is outside this run's {} work items",
-                self.per_item_writes.len()
-            )));
+        if !self.has_work_item(work_item) {
+            return Err(CoreError::InvalidName(
+                self.unknown_work_item_message(work_item),
+            ));
         }
         Ok(())
     }

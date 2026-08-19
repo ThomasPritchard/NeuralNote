@@ -954,6 +954,31 @@ fn zero_items_and_out_of_range_work_item_are_rejected() {
 }
 
 #[test]
+fn an_unknown_work_item_is_explained_by_the_shape_of_the_run_that_rejected_it() {
+    // One wording serves the model-facing refusal at the tool seam and this
+    // budget's own guard, so what it says has to hold for every run shape a
+    // caller can build — including the two the app never reaches on its own.
+    let none = WriteBudget::new(0).unwrap();
+    let single = WriteBudget::new(1).unwrap();
+    let several = WriteBudget::new(3).unwrap();
+
+    assert!(!single.has_work_item(1));
+    assert!(several.has_work_item(2));
+    assert_eq!(
+        none.unknown_work_item_message(0),
+        "work_item 0 is not part of this run: it has no work items at all"
+    );
+    assert_eq!(
+        single.unknown_work_item_message(1),
+        "work_item 1 is not part of this run: it has a single work item, so use work_item 0"
+    );
+    assert_eq!(
+        several.unknown_work_item_message(9),
+        "work_item 9 is not part of this run: it has 3 work items, so use a work_item from 0 to 2"
+    );
+}
+
+#[test]
 fn write_failure_consumes_no_budget_and_records_no_undo_entry() {
     let vault = tempfile::tempdir().unwrap();
     let mut run = session(1);
