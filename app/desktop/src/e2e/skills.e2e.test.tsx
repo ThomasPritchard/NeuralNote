@@ -170,7 +170,9 @@ describe("Journey 8: skill run — activate via @, elicit, write, undo", () => {
     expect(
       screen.getByText("You edited this note after the run wrote it."),
     ).toBeInTheDocument();
-    expect(screen.getByText(/1 note deleted, 1 note kept\./)).toBeInTheDocument();
+    expect(
+      screen.getByText("Undo finished — 1 note deleted, 1 kept."),
+    ).toBeInTheDocument();
   });
 
   it("timed-out consent (§3.4): the card goes dormant but stays clickable, and a late click is an ordinary chat turn", async () => {

@@ -3,7 +3,9 @@
 // rationale), plus Undo. Undo reports per-file outcomes verbatim — a file kept
 // because the user edited it is surfaced, never folded into a bare "done" —
 // and a failed removal keeps the button as "Retry undo" (the backend restores
-// its authority over failed runs).
+// its authority over failed runs). The announced summary keeps the same
+// distinction (`undoSummary`): a failure is never counted as a note the user
+// kept, because the announcement is all a screen reader gets.
 //
 // Undo is the app's one UNCONFIRMED destructive verb, and it is the only one
 // that does not route through the Trash: it unlinks (#208). Everywhere else the
@@ -58,6 +60,38 @@ function outcomeCopy(result: UndoFileResult): string {
     case "failed":
       return "Couldn't be removed";
   }
+}
+
+/** The one sentence an undo is announced with. Every outcome the backend
+ *  reports gets its own word, because a note that FAILED to delete is not a note
+ *  the user chose to keep — folding the two together describes a clean,
+ *  intentional result at the exact moment nothing worked. This `<output>` is the
+ *  only part of the card a screen reader hears; the per-file rows carry the
+ *  detail silently, so the failure has to be audible here or nowhere (#208).
+ *
+ *  Failures lead the sentence and change the verdict word — "finished" is a
+ *  claim about the whole run — and a zero says nothing at all, so the ordinary
+ *  clean case stays one short clause. */
+function undoSummary(files: readonly UndoFileResult[]): string {
+  const tally = (status: UndoFileResult["status"]) =>
+    files.filter((file) => file.status === status).length;
+  const failed = tally("failed");
+  const parts = [
+    { n: failed, label: "couldn't be removed" },
+    { n: tally("deleted"), label: "deleted" },
+    { n: tally("skippedEdited"), label: "kept" },
+    { n: tally("skippedMissing"), label: "already gone" },
+  ].filter((part) => part.n > 0);
+
+  if (parts.length === 0) return "Undo finished — no notes to remove.";
+  // The noun rides the first clause only: "1 note deleted, 1 kept" is one
+  // sentence, where repeating "note" in every clause reads as a list of four.
+  const clauses = parts.map((part, index) =>
+    index === 0
+      ? `${count(part.n, "note", "notes")} ${part.label}`
+      : `${part.n} ${part.label}`,
+  );
+  return `${failed > 0 ? "Undo incomplete" : "Undo finished"} — ${clauses.join(", ")}.`;
 }
 
 function OutcomeGlyph({ status }: Readonly<{ status: UndoFileResult["status"] }>) {
@@ -168,8 +202,6 @@ export function SkillReportCard({
     report?.files.find((f) => f.relPath === relPath);
   const failedCount =
     report?.files.filter((f) => f.status === "failed").length ?? 0;
-  const deletedCount =
-    report?.files.filter((f) => f.status === "deleted").length ?? 0;
 
   // The button's four lives: absent when nothing was written (an already-present
   // note is not this run's to remove), fresh Undo, a retry after any failure, and
@@ -324,13 +356,17 @@ export function SkillReportCard({
 
       {/* Always-mounted status slot: empty it reads as padding; on undo it
           announces the summary politely (partial success is a status, not an
-          alert — the per-file rows above carry the detail). */}
-      <output className="min-h-4 text-[0.625rem] leading-snug text-muted-foreground/70">
-        {report &&
-          `Undo finished — ${count(deletedCount, "note deleted", "notes deleted")}` +
-            (report.files.length - deletedCount > 0
-              ? `, ${count(report.files.length - deletedCount, "note kept", "notes kept")}.`
-              : ".")}
+          alert — the per-file rows above carry the detail). A summary that
+          reports a failure is lifted out of the quiet grey: the sighted reader
+          gets the same weight the announcement carries, without a second tone
+          colour as body copy at this size. */}
+      <output
+        className={cn(
+          "min-h-4 text-[0.625rem] leading-snug",
+          failedCount > 0 ? "text-foreground/90" : "text-muted-foreground/70",
+        )}
+      >
+        {report && undoSummary(report.files)}
       </output>
 
       {undo.status === "error" && (
