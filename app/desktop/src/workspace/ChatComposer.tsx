@@ -33,10 +33,11 @@ import {
 
 /** The box both reasoning shapes wear — identical geometry and type, so what
  *  changes on a model switch is what the strip SAYS and never what it occupies.
- *  Load-bearing: the strip has no slack at the docked width (376px holds a
- *  114.8px model menu, an 83.2px chip and a keyboard hint that already wraps),
- *  so a shape one word wider does not push anything aside — it wraps the pill
- *  itself onto three lines and grows the composer by 30px. Measured. */
+ *  Load-bearing: the strip has no slack at the docked width — 376px holds a
+ *  151.1px model menu, an 83.2px chip and a 121.7px keyboard hint, and those
+ *  plus the gaps come to 368px, which is all there is. So a shape one word
+ *  wider does not push anything aside; it wraps the pill itself onto three
+ *  lines and grows the composer by 30px. Measured. */
 const REASONING_CHIP =
   "flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[0.625rem] font-medium";
 
@@ -334,8 +335,28 @@ export function ChatComposer({
             </button>
           )}
         </div>
-        <p className="nn-compact-label text-right text-[0.625rem] leading-none text-muted-foreground/60">
-          Enter to send · Shift+Enter for a new line
+        {/* One shortcut, not two.
+         *
+         *  The old line taught both — `Enter to send · Shift+Enter for a new
+         *  line` — and needed 195px of a strip that had 158px to give it, so it
+         *  had always rendered as two ragged right-aligned lines. Nothing in
+         *  English says both facts in the ~130px this strip can spare.
+         *
+         *  So it says the one that has to be said. Enter-to-send teaches itself
+         *  correctly on the first press, and the way a user discovers it BY
+         *  ACCIDENT — reaching for a paragraph break and sending half a
+         *  question instead — is precisely what this sentence prevents. The
+         *  half that survives is the half whose absence costs something.
+         *
+         *  `shrink-0` decides who pays when the bar is full: not this. The model
+         *  name beside it already truncates by design, so it absorbs the loss
+         *  and the hint never wraps again at any model length. That trade GIVES
+         *  the name room rather than taking it, because the wrapping hint was
+         *  drawing its own shrink share out of the menu: 114.8px → 151.1px with
+         *  the default model, 119.6px → 151.1px with the longest label the menu
+         *  will show. */}
+        <p className="nn-compact-label shrink-0 text-[0.625rem] leading-none text-muted-foreground/60">
+          Shift+Enter for a new line
         </p>
       </div>
       {capability.reason && (

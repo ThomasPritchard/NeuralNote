@@ -36,14 +36,23 @@ const CONTROLS: Record<"toggle" | "locked", ReasoningControl> = {
   locked: { kind: "locked" },
 };
 
-function status(): AiStatus {
+/** The shortest model label the shipped default resolves to, and one long
+ *  enough that the menu's own `max-w-[11rem]` truncates it. The strip's width
+ *  budget is the interesting variable here, and the model name is the only
+ *  thing on it that varies by more than a pixel. */
+const MODELS = {
+  short: "deepseek/deepseek-v4-flash",
+  long: "anthropic/claude-opus-4-1-20250805",
+};
+
+function status(model: string): AiStatus {
   return {
     activeProvider: "openRouter",
     reasoningSupported: "supported",
     reasoningControl: CONTROLS.toggle,
     openrouter: {
       hasKey: true,
-      model: "deepseek/deepseek-v4-flash",
+      model,
       reasoning: true,
       reasoningEffort: null,
     },
@@ -84,7 +93,7 @@ const pane = () =>
 /** One composer at the docked pane's width, in one of the two reasoning shapes.
  *  The host carries `px-4` itself so the strip gets exactly the width the
  *  shipped pane gives it. */
-function mount(locked: boolean, on = true) {
+function mount(locked: boolean, on = true, model = MODELS.short) {
   const host = document.createElement("div");
   host.style.width = `${25.5 * 16}px`;
   document.body.append(host);
@@ -116,7 +125,7 @@ function mount(locked: boolean, on = true) {
         onComposerFocus={() => {}}
         onSend={() => {}}
         onCancel={() => {}}
-        status={status()}
+        status={status(model)}
         onStatusChange={() => {}}
         onOpenSettings={() => {}}
         onToggleReasoning={() => {}}
@@ -137,15 +146,30 @@ function mount(locked: boolean, on = true) {
   const chip = locked
     ? qualifier!.parentElement!
     : host.querySelector<HTMLElement>("button[aria-label='Show model reasoning']")!;
+  const strip = chip.parentElement!.parentElement!;
   return {
     /** The meta strip: the chip's grandparent (chip → left group → strip). */
-    strip: chip.parentElement!.parentElement!,
+    strip,
     chip,
+    menu: host.querySelector<HTMLElement>("button[aria-label^='Choose AI model']")!,
+    hint: strip.querySelector<HTMLElement>("p")!,
     footer: host.firstElementChild as HTMLElement,
   };
 }
 
 const height = (el: Element) => el.getBoundingClientRect().height;
+const width = (el: Element) => el.getBoundingClientRect().width;
+
+/** How many line boxes an element's text actually occupies. A height check is a
+ *  proxy for this and a poor one — a wrapped paragraph has `scrollHeight ===
+ *  clientHeight` like any other, and a height compared against a constant stops
+ *  meaning "one line" the moment a leading token moves. A Range over the
+ *  contents returns one rect per line box, which is the thing itself. */
+function lineCount(el: Element): number {
+  const range = document.createRange();
+  range.selectNodeContents(el);
+  return range.getClientRects().length;
+}
 
 /** The colour a Tailwind `ring-*` reaches the DOM as. Tailwind lays a fixed
  *  stack of box-shadow slots and leaves the ones it is not using at
@@ -276,5 +300,56 @@ describe("the accent is legible in every shape the strip renders", () => {
     const on = mount(false, true);
 
     expect(ringColour(on.chip)).toBe(getComputedStyle(on.chip).color);
+  });
+});
+
+describe("the keyboard hint holds one line", () => {
+  // The strip is the narrowest it is ever asked to lay this out at: below
+  // 1050px `.nn-compact-label` hides the hint outright, and between there and
+  // 1280px `--chat-width` is 25.5rem, so 376px is the floor, not an average.
+  //
+  // Measured there, with `deepseek-v4-flash` in the menu: menu 114.8, chip
+  // 83.2, gaps 12, leaving 158 for the hint. The line it used to carry needed
+  // 195.1 and had wrapped since it was written.
+  it("fits at the docked width, and costs the model name nothing", () => {
+    const { hint, strip, menu } = mount(false, true);
+
+    expect(width(strip)).toBeCloseTo(STRIP_WIDTH, 0);
+    expect(lineCount(hint)).toBe(1);
+    expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
+    // The line count alone cannot police the copy, because `shrink-0` means a
+    // hint too long to fit starves its neighbour instead of wrapping — the old
+    // line under this pin leaves the menu 77.7px and cuts the name to 28px of
+    // the 112px it wants. So the guard is a floor on the menu, set at the
+    // 114.8px the wrapping hint used to leave it: this change must give the
+    // model name room, never take it. Measured after: 151.1px.
+    expect(width(menu)).toBeGreaterThan(114.8);
+  });
+
+  it("still fits when the model name is long enough to truncate", () => {
+    // This is what `shrink-0` buys, and the only case that proves it: with a
+    // short model label there is 36px of slack and nothing shrinks at all, so
+    // an unpinned hint passes the test above and still wraps in the shipped app.
+    const { hint, strip, menu } = mount(false, true, MODELS.long);
+
+    expect(lineCount(hint)).toBe(1);
+    expect(strip.scrollWidth).toBeLessThanOrEqual(strip.clientWidth);
+    // And the name is not what suffers for it. The wrapping hint used to take
+    // its own shrink share out of the menu, which left it 119.6px; refusing to
+    // shrink hands the whole deficit to the item that truncates by design, and
+    // the name comes out wider than it was before.
+    expect(width(menu)).toBeGreaterThan(119.6);
+  });
+
+  it("does not move the strip when the model name changes underneath it", () => {
+    // Ambient, not clicked: a status poll or a menu picked elsewhere can swap
+    // the model label at any moment, and the composer is pinned to the bottom
+    // of a transcript.
+    const short = mount(false, true);
+    const long = mount(false, true, MODELS.long);
+
+    expect(height(long.hint)).toBe(height(short.hint));
+    expect(height(long.strip)).toBe(height(short.strip));
+    expect(height(long.footer)).toBe(height(short.footer));
   });
 });
