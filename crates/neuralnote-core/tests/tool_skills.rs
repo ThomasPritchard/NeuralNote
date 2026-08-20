@@ -624,17 +624,36 @@ fn write_note_advertises_what_a_work_item_is_rather_than_leaving_it_to_be_guesse
         description.contains("Use 0"),
         "the advertised argument must name the value a run with one work item takes: {work_item}"
     );
+    // `contains("Use 0")` alone is satisfied by prose that still only describes
+    // the playlist case — "for playlists, Use 0-based indices" would pass it and
+    // leave a single-video run exactly as ambiguous as before.
+    assert!(
+        description.contains("single work item"),
+        "the description must say a run has ONE work item by default, not only how \
+         playlists index: {work_item}"
+    );
+    assert_eq!(
+        (&work_item["default"], &work_item["minimum"]),
+        (&serde_json::json!(0), &serde_json::json!(0)),
+        "prose replaces neither the declared default nor the declared floor: {work_item}"
+    );
 }
 
 #[test]
 fn write_note_refuses_an_unknown_work_item_by_naming_the_one_this_run_has() {
     // Observed in the real app during a SINGLE-video YouTube distil: the model
     // sent `work_item: 1` for a legitimate note, and the run had one work item.
-    // Nothing host-side computes that index — the model does, and until now the
-    // only prose describing it was the distil skill's playlist step. A refusal
-    // that only says the index is "outside this run's 1 work items" leaves the
-    // model to guess again, and it cost the user a second approval of the same
-    // note. Name the value it must use instead.
+    // Nothing host-side computes that index — the model does, and the only prose
+    // that described a NON-zero one was the distil skill's playlist step. A
+    // refusal that only says the index is "outside this run's 1 work items"
+    // leaves the model to guess again. Name the value it must use instead.
+    //
+    // There is exactly ONE producer of this sentence — `write_policy.rs`'s
+    // `ensure_item`. An earlier draft of this test asserted a
+    // "write_note refused:" prefix to tell a seam copy apart from a policy copy;
+    // no such prefix exists anywhere in the codebase and there is no second
+    // producer to tell apart, so the assertion tested an invented string rather
+    // than the code. Grep before adding a marker assertion back.
     let mut harness = Harness::built_in();
     harness.call(
         "activate",
