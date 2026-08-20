@@ -87,6 +87,16 @@ pub(super) fn extract_source_archive(
                 "source archive expands beyond the safety limit",
             ));
         }
+        // Every codeload tarball opens with a `pax_global_header` record, which
+        // `tar` hands to us rather than consuming (as it does GNU long names and
+        // pax *local* extensions). It is archive metadata with no archive root
+        // and nothing to write, so the entry rules below — which police what
+        // actually lands on disk — do not apply to it, and neither does the path
+        // check above them. Skipping before `unpack_in` also means it can never
+        // be written, whatever it claims to contain.
+        if entry.header().entry_type().is_pax_global_extensions() {
+            continue;
+        }
         let path = entry
             .path()
             .map_err(|error| source_error(format!("source path is invalid: {error}")))?;
