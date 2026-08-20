@@ -2,6 +2,14 @@
 // active-skill chip row, the `@` suggestion popup, the input + send/stop button,
 // and the meta strip (model menu, reasoning opt-in chip, keyboard hint). Purely
 // presentational — every value and handler is supplied by the pane's hooks.
+//
+// The reasoning affordance has two shapes, and which one renders is a fact about
+// the model rather than a style: where the model publishes no off position there
+// is nothing to write, so it is a READOUT and not a control. A pressable chip
+// that silently does nothing is the worse of the two failures — the click looks
+// broken rather than the model looking mandatory — and a `button` with
+// `aria-pressed` announces itself as a toggle to a screen reader whatever the
+// pixels do.
 
 import {
   type ChangeEvent,
@@ -22,6 +30,53 @@ import {
   skillOptionId,
   type SkillPickerNotice,
 } from "./SkillPicker";
+
+/** The box both reasoning shapes wear — identical geometry and type, so what
+ *  changes on a model switch is what the strip SAYS and never what it occupies.
+ *  Load-bearing: the strip has no slack at the docked width — 376px holds a
+ *  151.1px model menu, an 83.2px chip and a 121.7px keyboard hint, and those
+ *  plus the gaps come to 368px, which is all there is. So a shape one word
+ *  wider does not push anything aside; it wraps the pill itself onto three
+ *  lines and grows the composer by 30px. Measured. */
+const REASONING_CHIP =
+  "flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[0.625rem] font-medium";
+
+/** The on colours. `text-primary` in both shapes: "reasoning is on" must not
+ *  look like two different facts depending on who decided it.
+ *
+ *  No fill goes with it. A `bg-primary/10` tint under this same accent measured
+ *  **4.18:1** against the pane the composer actually sits on (`bg-sidebar`, not
+ *  `--background`) — under AA's 4.5 for 10px text, and under it in two of the
+ *  six themes. The accent on the bare pane is 4.82:1 and clears AA in all six.
+ *  The tint was buying a tenth of a shade of "on" and costing the contrast of
+ *  the word that says it. */
+const REASONING_ON = "text-primary";
+
+/** Reasoning on a model that cannot be told not to — a state, not an affordance.
+ *
+ *  A `<span>`, so nothing announces a pressed state that cannot change and
+ *  nothing takes a tab stop that leads nowhere. What tells it from the control
+ *  is the app's own state idiom, the one Settings already uses for this exact
+ *  fact: the accent lives in the word and the glyph, and the ring — the mark
+ *  that reads as a button's boundary — is gone. Under a pointer it says the
+ *  same thing again, with no hover response and no hand cursor before the
+ *  click rather than after it.
+ *
+ *  The sentence itself has nowhere visible to go on a strip with no spare
+ *  pixels, so it is carried where it costs none: in the accessible name, and in
+ *  the hover title for anyone who asks. */
+function ReasoningState() {
+  return (
+    <span
+      title="This model always reasons — it can't be turned off."
+      className={cn(REASONING_CHIP, REASONING_ON, "cursor-default")}
+    >
+      <Brain className="size-3 shrink-0" aria-hidden />
+      Reasoning
+      <span className="sr-only">, always on</span>
+    </span>
+  );
+}
 
 function ComposerActionButton({
   buttonRef,
@@ -92,7 +147,8 @@ export function ChatComposer({
   onToggleReasoning,
   savingReasoning,
   capability,
-  reasoningOn,
+  reasoningIndicatorOn,
+  reasoningLocked,
   reasoningReasonId,
 }: Readonly<{
   stopError: string | null;
@@ -123,7 +179,15 @@ export function ChatComposer({
   onToggleReasoning: () => void;
   savingReasoning: boolean;
   capability: ReasoningCapability;
-  reasoningOn: boolean;
+  /** Whether the reasoning affordance reads as ON — the persisted opt-in OR a
+   *  model whose reasoning cannot be turned off. Derived by
+   *  `useChatPaneProvider`; this file renders it and derives nothing. */
+  reasoningIndicatorOn: boolean;
+  /** This model reasons on every turn and the persisted opt-in cannot stop it,
+   *  so there is no off position to write and `toggleReasoning` is a no-op.
+   *  `reasoningAlwaysOn`'s answer, read where the fact is rendered — the same
+   *  one Settings reads for its "Always on" affordance. */
+  reasoningLocked: boolean;
   reasoningReasonId: string;
 }>) {
   return (
@@ -209,37 +273,90 @@ export function ChatComposer({
               onOpenSettings={onOpenSettings}
             />
           )}
-          <button
-          type="button"
-          onClick={onToggleReasoning}
-          // Two different inert states, split on purpose. A write in
-          // flight is transient — native disabled is fine. "unsupported"
-          // is EXPLANATORY: aria-disabled keeps the chip focusable so a
-          // keyboard/SR user can reach it and get the why (the visible
-          // line below, wired via aria-describedby); the click guard
-          // lives in toggleReasoning.
-          disabled={savingReasoning}
-          aria-disabled={capability.disabled || undefined}
-          aria-pressed={reasoningOn}
-          aria-label="Show model reasoning"
-          aria-describedby={capability.reason ? reasoningReasonId : undefined}
-          className={cn(
-            "flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.625rem] font-medium ring-1 ring-inset transition-colors motion-reduce:transition-none",
-            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
-            reasoningOn
-              ? "bg-primary/10 text-primary ring-primary/30"
-              : "text-muted-foreground ring-border",
-            savingReasoning || capability.disabled
-              ? "cursor-not-allowed opacity-50"
-              : !reasoningOn && "hover:bg-muted hover:text-foreground",
+          {reasoningLocked ? (
+            <ReasoningState />
+          ) : (
+            <button
+            type="button"
+            onClick={onToggleReasoning}
+            // Two different inert states, split on purpose. A write in
+            // flight is transient — native disabled is fine. "unsupported"
+            // is EXPLANATORY: aria-disabled keeps the chip focusable so a
+            // keyboard/SR user can reach it and get the why (the visible
+            // line below, wired via aria-describedby); the click guard
+            // lives in toggleReasoning.
+            //
+            // The third inert state is not here at all: a mandatory model
+            // renders the readout above instead, because "inert with an
+            // explanation" and "not a control in the first place" are
+            // different facts and only one of them is a button.
+            disabled={savingReasoning}
+            aria-disabled={capability.disabled || undefined}
+            aria-pressed={reasoningIndicatorOn}
+            aria-label="Show model reasoning"
+            aria-describedby={capability.reason ? reasoningReasonId : undefined}
+            className={cn(
+              REASONING_CHIP,
+              // The ring is now the ONE mark that says "control": both control
+              // states wear it, the readout does not, so a boundary means
+              // exactly one thing on this strip.
+              "ring-1 ring-inset transition-colors motion-reduce:transition-none",
+              "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
+              reasoningIndicatorOn
+                // Full opacity, not the old `/30`. A boundary is non-text
+                // information (WCAG 1.4.11, 3:1) and against this pane `/30`
+                // measures 1.63:1 and `/60` 2.66:1; full primary is the first
+                // value that clears 3:1 in every theme, at 4.82:1 — the same
+                // ratio as the word it encloses, because it is the same colour.
+                ? cn(REASONING_ON, "ring-primary")
+                : "text-muted-foreground ring-border",
+              savingReasoning || capability.disabled
+                ? "cursor-not-allowed opacity-50"
+                : cn(
+                    // Tailwind v4 stopped giving buttons a hand cursor, which
+                    // had quietly made the readout's `cursor-default` a
+                    // distinction it did not actually draw. Asking for it back
+                    // is what makes that comment true.
+                    "cursor-pointer",
+                    // The strip's hover idiom is "fill on hover", and the two
+                    // states take it in opposite directions: the off chip may
+                    // lighten because its text lightens with it, while the on
+                    // chip must not — `hover:bg-muted` under this accent
+                    // measures 4.36:1. Sunken darkens instead and reads 5.55:1,
+                    // a bigger lightness step than the off chip's own hover.
+                    reasoningIndicatorOn
+                      ? "hover:bg-surface-sunken"
+                      : "hover:bg-muted hover:text-foreground",
+                  ),
+            )}
+            >
+              <Brain className="size-3 shrink-0" aria-hidden />
+              Reasoning
+            </button>
           )}
-          >
-            <Brain className="size-3 shrink-0" aria-hidden />
-            Reasoning
-          </button>
         </div>
-        <p className="nn-compact-label text-right text-[0.625rem] leading-none text-muted-foreground/60">
-          Enter to send · Shift+Enter for a new line
+        {/* One shortcut, not two.
+         *
+         *  The old line taught both — `Enter to send · Shift+Enter for a new
+         *  line` — and needed 195px of a strip that had 158px to give it, so it
+         *  had always rendered as two ragged right-aligned lines. Nothing in
+         *  English says both facts in the ~130px this strip can spare.
+         *
+         *  So it says the one that has to be said. Enter-to-send teaches itself
+         *  correctly on the first press, and the way a user discovers it BY
+         *  ACCIDENT — reaching for a paragraph break and sending half a
+         *  question instead — is precisely what this sentence prevents. The
+         *  half that survives is the half whose absence costs something.
+         *
+         *  `shrink-0` decides who pays when the bar is full: not this. The model
+         *  name beside it already truncates by design, so it absorbs the loss
+         *  and the hint never wraps again at any model length. That trade GIVES
+         *  the name room rather than taking it, because the wrapping hint was
+         *  drawing its own shrink share out of the menu: 114.8px → 151.1px with
+         *  the default model, 119.6px → 151.1px with the longest label the menu
+         *  will show. */}
+        <p className="nn-compact-label shrink-0 text-[0.625rem] leading-none text-muted-foreground/60">
+          Shift+Enter for a new line
         </p>
       </div>
       {capability.reason && (

@@ -1,10 +1,17 @@
 // The chat pane's provider/status concern: which AI provider is effective, the
 // view that status implies (first-run picker, guided setup, local hand-off,
-// skipped, or live chat), the reasoning opt-in + its probed capability, and the
-// key-save flow. The webview never sees the API key — it asks `aiStatus` which
-// provider is effective and mirrors the core's `effective_reasoning`. All state,
-// refs, effects, and the pure status→destination helpers live here so the pane
-// only presents what this hook resolves.
+// skipped, or live chat), the reasoning opt-in + the model's probed capability
+// and computed control, and the key-save flow. The webview never sees the API
+// key — it asks `aiStatus` which provider is effective and mirrors the core's
+// `effective_reasoning`. All state, refs, effects, and the pure status→destination
+// helpers live here so the pane only presents what this hook resolves.
+//
+// Reasoning arrives as three separate facts, deliberately: the persisted opt-in
+// (`reasoningOn`), what the send path will actually request (`effectiveReasoning`,
+// the mirror of the core), and what the model's control says the user may choose
+// (`reasoningControl`, and `reasoningIndicatorOn` derived from it). Collapsing the
+// first into the third is the bug that made the composer and Settings answer the
+// same question two ways.
 
 import {
   useCallback,
@@ -17,8 +24,21 @@ import {
 } from "react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
-import type { AiStatus } from "../lib/types";
-import { reasoningCapability, type ReasoningCapability } from "./reasoningSupport";
+import type {
+  AiStatus,
+  ReasoningControl,
+  ReasoningEffortOverride,
+} from "../lib/types";
+import {
+  reasoningAlwaysOn,
+  reasoningCapability,
+  type ReasoningCapability,
+} from "./reasoningSupport";
+
+/** What the control is before any status has arrived. Not a guess at a shape the
+ *  model may not have — "the probe has not answered" is exactly this state, and
+ *  it is the same one the backend reports for an unresolved probe. */
+const UNREAD_CONTROL: ReasoningControl = { kind: "pending" };
 
 export type View =
   | "loading"
@@ -65,14 +85,24 @@ function reasoningProbeTarget(status: AiStatus | null): string | null {
 }
 
 /** A same-model status echo owns provider/config fields, but an `unknown`
- * capability must not erase a support verdict already returned by the probe. */
+ * capability must not erase a support verdict already returned by the probe.
+ *
+ * The control is kept with the verdict rather than taken from the echo, because
+ * the backend derives it FROM that verdict: an echo reading `unknown` reports
+ * the control as `pending`, so taking one and not the other would pair a
+ * "supported" verdict with a "still checking" control — two halves of one answer
+ * disagreeing. */
 function mergeStatusRead(current: AiStatus | null, next: AiStatus): AiStatus {
   if (
     current !== null &&
     reasoningProbeTarget(current) === reasoningProbeTarget(next) &&
     next.reasoningSupported === "unknown"
   ) {
-    return { ...next, reasoningSupported: current.reasoningSupported };
+    return {
+      ...next,
+      reasoningSupported: current.reasoningSupported,
+      reasoningControl: current.reasoningControl,
+    };
   }
   return next;
 }
@@ -86,8 +116,25 @@ export interface ChatPaneProvider {
   savingReasoning: boolean;
   reasoningError: string | null;
   capability: ReasoningCapability;
+  /** The persisted opt-in, and nothing else. What `toggleReasoning` writes. */
   reasoningOn: boolean;
+  /** What the composer's reasoning affordance should read as: on when the user
+   *  opted in, and on regardless for a model that cannot be stopped reasoning.
+   *
+   *  Deliberately separate from `reasoningOn`. They answer different questions —
+   *  "what did the user choose" versus "does this model reason" — and the chip
+   *  reading the first for the second is what let it say "off" on a model
+   *  Settings was correctly calling "Always on". */
+  reasoningIndicatorOn: boolean;
   effectiveReasoning: boolean;
+  /** What control the selected model calls for, straight from the backend. The
+   *  same value Settings renders, so the two surfaces cannot disagree — and
+   *  `pending` until a status has actually arrived, never a guessed menu. */
+  reasoningControl: ReasoningControl;
+  /** The effort substitution the send path is applying right now, or `null` when
+   *  what the user chose is what goes out (amendment E3). `null` rather than the
+   *  wire's absent key, so absence has one representation in the view model. */
+  reasoningEffortOverride: ReasoningEffortOverride | null;
   reasoningReasonId: string;
   /** The last key save landed in the keychain but could not be announced to the
    *  app's other windows — see `KeyChangeCaveat`. The pane renders the notice;
@@ -221,7 +268,18 @@ export function useChatPaneProvider({
         ) return;
         // The probe owns capability only. Preserve any same-target provider or
         // reasoning state refreshed while its network request was in flight.
-        commitStatus({ ...current, reasoningSupported: fresh.reasoningSupported });
+        //
+        // `reasoningControl` comes across WITH the verdict, because it is the
+        // same answer: the probe's fetch is the only thing that warms the
+        // shell's effort-menu cache, so its response is the only status read
+        // that can carry a resolved control on a cold launch. Dropping it here
+        // would leave the control reading "still checking" for the whole
+        // session, however many times the menu was actually fetched.
+        commitStatus({
+          ...current,
+          reasoningSupported: fresh.reasoningSupported,
+          reasoningControl: fresh.reasoningControl,
+        });
       })
       .catch((e) => {
         if (
@@ -244,6 +302,13 @@ export function useChatPaneProvider({
     status?.reasoningSupported ?? "unknown",
     model,
   );
+  // The control the backend computed for this model, carried through untouched
+  // so the composer renders the same answer Settings does.
+  const reasoningControl = status?.reasoningControl ?? UNREAD_CONTROL;
+  const alwaysOn = reasoningAlwaysOn(reasoningControl);
+  const reasoningIndicatorOn = reasoningOn || alwaysOn;
+  const reasoningEffortOverride =
+    status?.openrouter.reasoningEffortOverride ?? null;
   // What the backend will *actually* request — the frontend mirror of the core's
   // `effective_reasoning` (opt-in AND not a known-unsupported model). The backstop
   // notice pins THIS, not the raw opt-in: on an unsupported model the app sends no
@@ -255,7 +320,11 @@ export function useChatPaneProvider({
     // The unsupported state uses aria-disabled and stays FOCUSABLE (a native
     // disabled control can't be reached to hear why it is off), so the DOM
     // does not block activation — this guard is what makes the click a no-op.
-    if (savingReasoning || capability.disabled) return;
+    //
+    // `alwaysOn` joins it for the same reason Settings renders no checkbox at
+    // all for those controls: there is no off position to write, so a write from
+    // here would persist a preference whose effect never becomes visible.
+    if (savingReasoning || capability.disabled || alwaysOn) return;
     setSavingReasoning(true);
     setReasoningError(null);
     try {
@@ -271,7 +340,7 @@ export function useChatPaneProvider({
     } finally {
       setSavingReasoning(false);
     }
-  }, [savingReasoning, capability.disabled, reasoningOn, applyStatus]);
+  }, [savingReasoning, capability.disabled, alwaysOn, reasoningOn, applyStatus]);
 
   const dismissKeyChangeCaveat = useCallback(() => setKeyChangeCaveat(false), []);
 
@@ -315,7 +384,10 @@ export function useChatPaneProvider({
     reasoningError,
     capability,
     reasoningOn,
+    reasoningIndicatorOn,
     effectiveReasoning,
+    reasoningControl,
+    reasoningEffortOverride,
     reasoningReasonId,
     keyChangeCaveat,
     dismissKeyChangeCaveat,

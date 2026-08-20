@@ -11,6 +11,7 @@ import type {
   OpenRouterModelMenu,
   ProviderKind,
   PullEvent,
+  ReasoningControl,
   SkillListing,
 } from "../lib/types";
 import {
@@ -50,6 +51,13 @@ export const createAiBackend = (
     // Mirrors `ProviderConfig.reasoning`, whose serde default is false: reasoning
     // tokens are billed, so they are opt-in. Mutated by set_reasoning.
     reasoning: opts.apiKey?.reasoning ?? false,
+    // Mirrors `ProviderConfig.reasoning_preference.effort`: only ever a value the
+    // model's own menu offered, and cleared whenever the model changes.
+    reasoningEffort: opts.apiKey?.reasoningEffort ?? null,
+    // Mirrors the shell's `cached_openrouter_reasoning_control`: what the
+    // catalogue published for this model, or `undefined` for "it has not
+    // answered", which is what makes the control `pending`.
+    catalogueControl: opts.apiKey?.catalogueControl,
     // Mirrors `ProviderConfig.cached_reasoning_support()`, which is "unknown"
     // until a model is probed — and "unknown" keeps the toggle enabled, so an
     // unprobed fixture fails open exactly as the real config does.
@@ -82,13 +90,44 @@ export const createAiBackend = (
    *  choice wins, else a stored key reads as "openRouter", else null — the
    *  first-run picker), plus each provider's own state. Shared by `ai_status` and
    *  `set_reasoning`, exactly as the Rust command pair shares the real one. */
+  /** Mirror of the shell's `reasoning_control_for`. The verdict leads: an
+   *  unanswered probe is `pending` (never a guessed menu), a model known not to
+   *  reason is `hidden`, the local lane is a plain switch because Ollama
+   *  publishes no menu, and a capable hosted model gets whatever the catalogue
+   *  published — with a listed-but-silent one falling back to a switch, since it
+   *  reasons and simply named no efforts. */
+  const reasoningControlFor = (): ReasoningControl => {
+    const provider = effectiveProvider();
+    if (provider === null) return { kind: "hidden" };
+    if (keyState.reasoningSupported === "unsupported") return { kind: "hidden" };
+    if (keyState.reasoningSupported === "unknown") return { kind: "pending" };
+    if (provider === "local") return { kind: "toggle", defaultOn: false };
+    const published = keyState.catalogueControl;
+    if (published === undefined) return { kind: "pending" };
+    return published.kind === "hidden"
+      ? { kind: "toggle", defaultOn: false }
+      : published;
+  };
+
+  /** Mirror of `ProviderConfig::invalidate_reasoning_probe`, which every write
+   *  that can move the provider/model target runs. Both things it drops belonged
+   *  to the model being left behind: the cached verdict, and the effort read off
+   *  THAT model's menu. The opt-in survives — whether to reason at all is the
+   *  user's preference, not the model's. */
+  const invalidateReasoningProbe = () => {
+    keyState.reasoningSupported = "unknown";
+    keyState.reasoningEffort = null;
+  };
+
   const buildAiStatus = (): AiStatus => ({
     activeProvider: effectiveProvider(),
     reasoningSupported: keyState.reasoningSupported,
+    reasoningControl: reasoningControlFor(),
     openrouter: {
       hasKey: keyState.hasKey,
       model: keyState.model,
       reasoning: keyState.reasoning,
+      reasoningEffort: keyState.reasoningEffort,
     },
     local: { activeModelTag: aiState.localActiveTag },
     approval: buildApprovalStatus(),
@@ -173,6 +212,7 @@ export const createAiBackend = (
         return fail("invalidName", "model was not offered by the current OpenRouter menu");
       }
       keyState.model = model;
+      invalidateReasoningProbe();
       return buildAiStatus();
     },
     open_openrouter_rankings: () => undefined,
@@ -184,6 +224,7 @@ export const createAiBackend = (
     set_active_provider: (a) => {
       aiState.explicitProvider = a.provider as ProviderKind;
       if (a.localModelTag != null) aiState.localActiveTag = a.localModelTag as string;
+      invalidateReasoningProbe();
       return undefined;
     },
     set_reasoning: (a) => {
@@ -191,6 +232,24 @@ export const createAiBackend = (
       // renders this rather than re-reading, so a failed re-read can never show
       // "off" while the config says "on".
       keyState.reasoning = a.enabled as boolean;
+      return buildAiStatus();
+    },
+    set_reasoning_effort: (a) => {
+      // Mirror of the real command: clearing is always allowed and leaves the
+      // opt-in alone, while naming an effort is REFUSED unless the currently
+      // published menu offers it — the shell never coerces a value the user did
+      // not pick — and naming one opts them in.
+      const effort = a.effort as string | null;
+      if (effort === null) {
+        keyState.reasoningEffort = null;
+        return buildAiStatus();
+      }
+      const control = reasoningControlFor();
+      if (control.kind !== "efforts" || !control.options.includes(effort)) {
+        throw { kind: "invalidContent", message: effort };
+      }
+      keyState.reasoning = true;
+      keyState.reasoningEffort = effort;
       return buildAiStatus();
     },
     set_approval_mode: (a) => {

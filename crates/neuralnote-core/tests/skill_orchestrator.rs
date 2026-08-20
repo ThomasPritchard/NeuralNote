@@ -114,6 +114,7 @@ fn environment() -> SkillEnvironment {
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     }
 }
 

@@ -68,7 +68,7 @@ describe("Journey 8: local AI — unsupported hardware", () => {
 
 describe("Journey 8: local AI — download then chat locally", () => {
   const successScript: ChatEvent[] = [
-    { type: "searching", query: "mitochondria" },
+    { type: "searching", query: "mitochondria", callId: null },
     { type: "answer", delta: "The mitochondrion is the " },
     { type: "answer", delta: "powerhouse of the cell." },
     { type: "done" },

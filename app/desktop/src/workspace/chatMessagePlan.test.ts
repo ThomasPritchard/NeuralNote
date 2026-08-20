@@ -10,7 +10,8 @@
 
 import { describe, expect, it } from "vitest";
 import type { ChatEvent, StepStatus } from "../lib/types";
-import { emptyAssistant, reduceAssistant, type AssistantMessage } from "./chatMessage";
+import { emptyAssistant, type AssistantMessage } from "./chatMessage";
+import { reduceAssistant } from "./chatMessageReducer";
 
 const fold = (events: ChatEvent[], from: AssistantMessage = emptyAssistant()) =>
   events.reduce(reduceAssistant, from);
@@ -102,7 +103,7 @@ describe("the declared plan", () => {
     const turn = fold([
       declared,
       status("s1", "done"),
-      { type: "searching", query: "spaced repetition" },
+      { type: "searching", query: "spaced repetition", callId: null },
       { type: "answer", delta: "..." },
       { type: "done" },
     ]);

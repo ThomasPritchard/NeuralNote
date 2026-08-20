@@ -7,7 +7,8 @@
 import { act, render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { emptyAssistant, reduceAssistant, type AssistantMessage } from "./chatMessage";
+import { emptyAssistant, type AssistantMessage } from "./chatMessage";
+import { reduceAssistant } from "./chatMessageReducer";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -42,13 +43,6 @@ const MISSING_YTDLP_FAILURE = {
   message: MISSING_YTDLP_MESSAGE,
   missingBinary: "yt-dlp",
 };
-
-const PLAYFUL_PROGRESS_PAIRS = [
-  ["Sending message", "Thinking"],
-  ["Dispatching a tiny messenger", "Connecting the dots"],
-  ["Knocking on the model's door", "Rummaging through the mental drawers"],
-  ["Launching a thought balloon", "Consulting the inner librarian"],
-] as const;
 
 function renderMessages(turn: AssistantMessage, runIds: Record<number, string> = {}) {
   const onOpenCitation = vi.fn();
@@ -441,59 +435,11 @@ describe("ChatMessages — skill turns", () => {
     expect(screen.queryByText("Searching your vault")).not.toBeInTheDocument();
   });
 
-  it("varies the playful copy across prompts while keeping one voice per prompt", () => {
-    const labels = [
-      "Summarise my project notes",
-      "What did I decide about search?",
-      "Find the meeting follow-ups",
-      "Explain the citation strategy",
-      "Draft a short release note",
-      "Connect the ideas in this folder",
-    ].map((prompt) => {
-      const view = render(
-        <ChatMessages
-          messages={[{ role: "user", content: prompt }, emptyAssistant()]}
-          onOpenCitation={vi.fn()}
-          onOpenNote={vi.fn()}
-          onSendFollowUp={vi.fn()}
-          busy
-          runIds={{}}
-        />,
-      );
-      const first = view.container.querySelector("output")?.textContent;
-      view.rerender(
-        <ChatMessages
-          messages={[
-            { role: "user", content: prompt },
-            reduceAssistant(emptyAssistant(), { type: "processing" }),
-          ]}
-          onOpenCitation={vi.fn()}
-          onOpenNote={vi.fn()}
-          onSendFollowUp={vi.fn()}
-          busy
-          runIds={{}}
-        />,
-      );
-      const thinking = view.container.querySelector("output")?.textContent;
-      expect(
-        PLAYFUL_PROGRESS_PAIRS.some(
-          ([sending, matchingThinking]) =>
-            sending === first && matchingThinking === thinking,
-        ),
-      ).toBe(true);
-      view.unmount();
-      return first;
-    });
-
-    expect(new Set(labels).size).toBeGreaterThan(1);
-    expect(
-      labels.every((label) =>
-        PLAYFUL_PROGRESS_PAIRS.some(([sending]) => sending === label),
-      ),
-    ).toBe(true);
-  });
-
-  it("shows thinking only after Processing and search only after Searching", () => {
+  it("names each phase only once the event that grounds it has arrived", () => {
+    // The head used to say "Thinking" on `processing` — an event emitted before
+    // a single token had been asked for. Every label below is now backed by the
+    // event that makes it true, and "Thinking" belongs to the one event that
+    // proves reasoning is arriving.
     const accepted = reduceAssistant(emptyAssistant(), { type: "processing" });
     const { rerender } = render(
       <ChatMessages
@@ -505,13 +451,42 @@ describe("ChatMessages — skill turns", () => {
         runIds={{}}
       />,
     );
-    const thinkingLabel = document.querySelector("output")?.textContent;
-    expect(PLAYFUL_PROGRESS_PAIRS.map(([, thinking]) => thinking)).toContain(
-      thinkingLabel,
-    );
+    expect(screen.getByText("Sending message")).toBeInTheDocument();
+    expect(screen.queryByText("Thinking")).not.toBeInTheDocument();
     expect(screen.queryByText("Searching your vault")).not.toBeInTheDocument();
 
-    const searching = reduceAssistant(accepted, { type: "searching", query: "notes" });
+    const planning = reduceAssistant(accepted, {
+      type: "planningRound",
+      round: 1,
+      maxRounds: 8,
+      playlist: null,
+    });
+    rerender(
+      <ChatMessages
+        messages={[{ role: "user", content: "question" }, planning]}
+        onOpenCitation={vi.fn()}
+        onOpenNote={vi.fn()}
+        onSendFollowUp={vi.fn()}
+        busy
+        runIds={{}}
+      />,
+    );
+    expect(screen.getByText("Planning")).toBeInTheDocument();
+
+    const reasoning = reduceAssistant(planning, { type: "thinking", delta: "weighing" });
+    rerender(
+      <ChatMessages
+        messages={[{ role: "user", content: "question" }, reasoning]}
+        onOpenCitation={vi.fn()}
+        onOpenNote={vi.fn()}
+        onSendFollowUp={vi.fn()}
+        busy
+        runIds={{}}
+      />,
+    );
+    expect(screen.getByText("Thinking")).toBeInTheDocument();
+
+    const searching = reduceAssistant(reasoning, { type: "searching", query: "notes", callId: null });
     rerender(
       <ChatMessages
         messages={[{ role: "user", content: "question" }, searching]}
@@ -529,6 +504,7 @@ describe("ChatMessages — skill turns", () => {
       relPath: "Notes/Example.md",
       startLine: 1,
       endLine: 2,
+      callId: null,
     });
     rerender(
       <ChatMessages
@@ -609,5 +585,41 @@ describe("ChatMessages — skill turns", () => {
     );
     expect(screen.getByText("1 note written")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Undo" })).toBeEnabled();
+  });
+
+  it("keeps a narrating tool's progress line out of every live region on the turn", () => {
+    // The deliberate decision this guards is at `ChatMessages.tsx:95`: the
+    // per-row churn of a run (15-20 mutations) stays silent, and liveness is
+    // scoped to the phase line, the answer, and the error box. A long tool now
+    // narrates itself every few seconds on its node, which under a turn-wide
+    // live region would be a screen reader interrupted through a four-minute
+    // transcription.
+    //
+    // Asserted HERE, through the whole turn, and not in `ChatTimeline.test.tsx`:
+    // the rail rendered on its own cannot see a live region added to the turn
+    // wrapper ABOVE it, which is exactly where one would be added.
+    renderMessages(
+      skillTurn({
+        toolCalls: [
+          {
+            id: "c1",
+            name: "transcribe_audio",
+            title: "Transcribe audio",
+            arguments: '{"url":"https://youtu.be/abc"}',
+            status: null,
+            summary: null,
+            detail: null,
+            stepId: null,
+            progress: "Transcribing the audio locally with Whisper",
+          },
+        ],
+      }),
+    );
+
+    const line = screen.getByText("Transcribing the audio locally with Whisper");
+    expect(line.closest("[aria-live], [role='status'], output")).toBeNull();
+    // Nor is it hidden: for a long call this is the only account of what is
+    // happening, so it stays readable to anyone who navigates to the node.
+    expect(line.closest("[aria-hidden='true']")).toBeNull();
   });
 });

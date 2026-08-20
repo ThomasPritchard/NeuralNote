@@ -265,7 +265,10 @@ mod tests {
             dir.path(),
             &ProviderConfig {
                 model: "vendor/old".into(),
-                reasoning: true,
+                reasoning_preference: neuralnote_core::ai::ReasoningPreference {
+                    enabled: true,
+                    effort: None,
+                },
                 ..Default::default()
             },
         )
@@ -295,7 +298,7 @@ mod tests {
         std::thread::scope(|scope| {
             let update = scope.spawn(|| {
                 gate.update(dir.path(), false, |config| {
-                    config.reasoning = false;
+                    config.reasoning_preference.enabled = false;
                     Ok(())
                 })
             });
@@ -318,7 +321,7 @@ mod tests {
 
         let persisted = neuralnote_core::ai::read_provider_config(dir.path()).unwrap();
         assert_eq!(persisted.model, "vendor/new");
-        assert!(!persisted.reasoning);
+        assert!(!persisted.reasoning_preference.enabled);
     }
 
     #[test]

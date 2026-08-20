@@ -72,6 +72,10 @@ impl ShellYoutubeIo {
             })?;
         }
         let workspace = CaptureWorkspace::new(&app_data_dir)?;
+        // The 30-second ceiling here is NOT what a thumbnail fetch runs under:
+        // `thumbnail_request` overrides it per request with its own three-second
+        // deadline, because a nice-to-have must never delay a run. Read that
+        // number in `thumbnail.rs`, not this one.
         let client = reqwest::Client::builder()
             .connect_timeout(std::time::Duration::from_secs(5))
             .timeout(std::time::Duration::from_secs(30))

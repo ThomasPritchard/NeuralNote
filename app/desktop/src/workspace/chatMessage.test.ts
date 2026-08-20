@@ -1,93 +1,19 @@
 // The pure chat view-model fold: each ChatEvent variant lands in the right
-// slot, `retrieved` merges into its `searching` row, deltas accumulate, and a
-// run ends (done clears the working state) on both `done` and `error`. History
-// building drops blank turns.
+// slot, `retrieved` merges into its `searching` row and onto the node that ran
+// it, deltas accumulate, and a run ends (done clears the working state) on both
+// `done` and `error`.
+//
+// Its siblings each cover one neighbouring file: `chatMessageApproval`,
+// `chatMessagePlan`, `chatMessageToolTimeline` and `chatMessageLive` cover the
+// rest of the same fold — the tool-node list is entirely the third of those;
+// `chatTurnStream.test.ts` covers routing an event onto the transcript;
+// `chatTurnReadouts.test.ts` covers what the UI derives from a settled turn; and
+// what a turn hands to the NEXT request is `chatHistory.test.ts`.
 
 import { describe, expect, it } from "vitest";
 import type { ChatEvent } from "../lib/types";
-import {
-  emptyAssistant,
-  groupActivity,
-  isPartialSkillRun,
-  markAssistantStopped,
-  reduceAssistant,
-  reduceAssistantForTurn,
-  resolveAnswerMarkers,
-  searchOutcome,
-  showsNothingFoundCard,
-  stripCitationMarkers,
-  summarizeActivity,
-  modelReportedProvenance,
-  toHistory,
-  userMessage,
-  type ActivityStep,
-  type AssistantMessage,
-  type ChatMessage,
-  type CitationView,
-} from "./chatMessage";
-
-describe("skill report context", () => {
-  it("reports the transcript sources the backend named, in first-seen order", () => {
-    const turn = run([
-      { type: "transcriptSource", label: "captions:en-auto", relPath: null },
-      { type: "transcriptSource", label: "whisper:small.en", relPath: null },
-      { type: "transcriptSource", label: "captions:en-auto", relPath: null },
-    ]);
-
-    expect(modelReportedProvenance(turn)).toEqual([
-      "captions:en-auto",
-      "whisper:small.en",
-    ]);
-  });
-
-  it("never mistakes a transcript label mentioned in prose for a real source", () => {
-    // The old regex scraped `captions:`/`whisper:` out of concatenated model
-    // prose, so any answer that merely QUOTED a label claimed it as provenance.
-    const turn = {
-      ...emptyAssistant(),
-      skillSteps: ["Video 1 of 3 landed with captions:en-auto."],
-      answer: "Transcript provenance: whisper:small.en",
-    };
-
-    expect(modelReportedProvenance(turn)).toEqual([]);
-  });
-
-  it("marks a settled skill run partial only when the backend said it was", () => {
-    const partial = {
-      ...emptyAssistant(),
-      done: true,
-      skillActivations: [{ id: "youtube-distil", name: "YouTube distil" }],
-      writtenNotes: [{ relPath: "Literature/One.md", kind: "literature" as const }],
-      partialRun: "the run was stopped before it finished every item",
-    };
-    expect(isPartialSkillRun(partial)).toBe(true);
-    expect(isPartialSkillRun({ ...partial, writtenNotes: [] })).toBe(false);
-    expect(isPartialSkillRun({ ...partial, done: false })).toBe(false);
-    expect(isPartialSkillRun({ ...partial, skillActivations: [] })).toBe(false);
-    expect(
-      isPartialSkillRun({
-        ...partial,
-        partialRun: null,
-        stopped: true,
-      }),
-    ).toBe(true);
-  });
-
-  it("never calls a whole run partial just because the answer says 'cancelled'", () => {
-    // The old regex matched any answer that MENTIONED the word, so asking
-    // "why was my flight cancelled?" reported the run as incomplete.
-    const complete = {
-      ...emptyAssistant(),
-      done: true,
-      skillActivations: [{ id: "youtube-distil", name: "YouTube distil" }],
-      writtenNotes: [{ relPath: "Literature/One.md", kind: "literature" as const }],
-      skillSteps: ["Cancelled after video 1 of 4."],
-      answer: "The talk explains why the launch was cancelled.",
-    };
-
-    expect(isPartialSkillRun(complete)).toBe(false);
-  });
-});
+import { emptyAssistant, type AssistantMessage } from "./chatMessage";
+import { reduceAssistant } from "./chatMessageReducer";
 
 /** Fold a whole event script over a fresh assistant turn. */
 function run(events: ChatEvent[]): AssistantMessage {
@@ -127,116 +53,14 @@ describe("emptyAssistant", () => {
   });
 });
 
-describe("turn-specific event and stop routing", () => {
-  const turnOne = {
-    ...emptyAssistant(false, "turn-1"),
-    answer: "partial one",
-    citations: [
-      {
-        id: "e1",
-        relPath: "One.md",
-        startLine: 1,
-        endLine: 2,
-        text: "one",
-      },
-    ],
-  };
-  const turnTwo = emptyAssistant(false, "turn-2");
-  const messages: ChatMessage[] = [
-    userMessage("first"),
-    turnOne,
-    userMessage("second"),
-    turnTwo,
-  ];
-
-  it("folds a streamed event into only the matching assistant turn", () => {
-    const next = reduceAssistantForTurn(messages, "turn-1", {
-      type: "answer",
-      delta: " continued",
-    });
-
-    expect((next[1] as AssistantMessage).answer).toBe("partial one continued");
-    expect((next[3] as AssistantMessage).answer).toBe("");
-  });
-
-  it("ignores an event whose turn id is absent", () => {
-    expect(
-      reduceAssistantForTurn(messages, "turn-missing", {
-        type: "done",
-      }),
-    ).toBe(messages);
-  });
-
-  it("marks only the matching active turn stopped and preserves partial evidence", () => {
-    const next = markAssistantStopped(messages, "turn-1");
-    const stopped = next[1] as AssistantMessage;
-
-    expect(stopped).toMatchObject({
-      turnId: "turn-1",
-      answer: "partial one",
-      stopped: true,
-      done: true,
-      error: null,
-    });
-    expect(stopped.citations).toEqual(turnOne.citations);
-    expect(next[3]).toBe(turnTwo);
-  });
-
-  it("does not relabel an already-completed or failed turn", () => {
-    const completed = { ...turnOne, done: true };
-    const failed = { ...turnTwo, done: true, error: "provider failed" };
-    const settled: ChatMessage[] = [completed, failed];
-
-    expect(markAssistantStopped(settled, "turn-1")).toBe(settled);
-    expect(markAssistantStopped(settled, "turn-2")).toBe(settled);
-  });
-
-  it("settles an in-flight tool after stop and still hides late answer or error", () => {
-    // Stop marks the turn done so the composer re-opens. A later toolResult
-    // used to be dropped, leaving the playlist-enumeration node spinning.
-    const live = reduceAssistant(emptyAssistant(false, "turn-1"), {
-      type: "toolCall",
-      id: "c1",
-      name: "select_playlist_videos",
-      title: "Choose playlist videos",
-      arguments: "{}",
-      stepId: null,
-    });
-    const stopped = markAssistantStopped([live], "turn-1");
-    const settled = reduceAssistantForTurn(stopped, "turn-1", {
-      type: "toolResult",
-      id: "c1",
-      status: "cancelled",
-      summary: null,
-      detail: "YouTube capture was cancelled",
-    });
-    const withPartial = reduceAssistantForTurn(settled, "turn-1", {
-      type: "partialRun",
-      reason: "the run was stopped before it finished every item",
-    });
-    const afterLate = reduceAssistantForTurn(withPartial, "turn-1", {
-      type: "answer",
-      delta: "late answer must stay hidden",
-    });
-    const turn = afterLate[0] as AssistantMessage;
-
-    expect(turn.toolCalls[0]?.status).toBe("cancelled");
-    expect(turn.partialRun).toBe(
-      "the run was stopped before it finished every item",
-    );
-    expect(turn.answer).toBe("");
-    expect(turn.error).toBeNull();
-  });
-});
-
 describe("reduceAssistant — grounded progress", () => {
   it("moves through only phases confirmed by backend events", () => {
     let turn = emptyAssistant();
 
     turn = reduceAssistant(turn, { type: "processing" });
-    expect(turn.phase).toBe("thinking");
+    expect(turn.phase).toBe("sending");
 
-    turn = reduceAssistant(turn, { type: "searching", query: "active recall" });
+    turn = reduceAssistant(turn, { type: "searching", query: "active recall", callId: null });
     expect(turn.phase).toBe("searching");
 
     turn = reduceAssistant(turn, {
@@ -244,11 +68,43 @@ describe("reduceAssistant — grounded progress", () => {
       relPath: "Learning.md",
       startLine: 3,
       endLine: 8,
+      callId: null,
     });
     expect(turn.phase).toBe("reading");
 
     turn = reduceAssistant(turn, { type: "verifying" });
     expect(turn.phase).toBe("verifying");
+  });
+
+  it("leaves the CONTENT fold untouched for a keepalive", () => {
+    // It says nothing about the conversation: a keepalive says the socket is
+    // alive, which the fold has no view state for — it is dated by
+    // `reduceAssistantForTurn` instead, where "alive" and "progressed" are kept
+    // deliberately apart.
+    const searched = run([
+      { type: "searching", query: "active recall", callId: "c1" },
+    ]);
+
+    expect(reduceAssistant(searched, { type: "keepalive" })).toBe(searched);
+  });
+
+  it("renders a cue with no call behind it exactly as it always did", () => {
+    // The degradation guarantee, checked rather than stated: `callId` is
+    // optional because at least one retrieval path has no dispatched call to
+    // name, and a cue arriving without one must leave the trace it has always
+    // driven untouched.
+    const uncorrelated = run([
+      { type: "toolCall", id: "call-7", name: "search_notes", title: "Search notes",
+        arguments: "{}", stepId: null, },
+      { type: "searching", query: "spacing", callId: null },
+      { type: "retrieved", query: "spacing", hitCount: 2, callId: null },
+      { type: "reading", relPath: "n.md", startLine: 1, endLine: 2, callId: null },
+    ]);
+
+    expect(uncorrelated.activity).toEqual([
+      { kind: "search", query: "spacing", hitCount: 2 },
+      { kind: "reading", relPath: "n.md", startLine: 1, endLine: 2 },
+    ]);
   });
 });
 
@@ -381,219 +237,6 @@ describe("reduceAssistant — skills bank", () => {
   });
 });
 
-describe("reduceAssistant — the tool timeline", () => {
-  it("opens a node when a call is announced and settles it in place", () => {
-    const turn = run([
-      {
-        type: "toolCall",
-        id: "c1",
-        name: "search_notes",
-        title: "Search notes",
-        arguments: '{"query":"spaced repetition"}',
-        stepId: null,
-      },
-      {
-        type: "toolResult",
-        id: "c1",
-        status: "ok",
-        summary: "12 spans",
-        detail: null,
-      },
-    ]);
-
-    expect(turn.toolCalls).toEqual([
-      {
-        id: "c1",
-        name: "search_notes",
-        title: "Search notes",
-        arguments: '{"query":"spaced repetition"}',
-        status: "ok",
-        summary: "12 spans",
-        detail: null,
-        stepId: null,
-      },
-    ]);
-  });
-
-  it("leaves an unsettled call visibly in flight rather than guessing at it", () => {
-    const turn = run([
-      {
-        type: "toolCall",
-        id: "c1",
-        name: "list_notes",
-        title: "List notes",
-        arguments: "{}",
-        stepId: null,
-      },
-    ]);
-
-    expect(turn.toolCalls[0].status).toBeNull();
-    expect(turn.toolCalls[0].summary).toBeNull();
-  });
-
-  it("settles each call against its own id, not the most recent one", () => {
-    const turn = run([
-      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}",
-        stepId: null, },
-      { type: "toolCall", id: "c2", name: "list_folders", title: "List folders", arguments: "{}",
-        stepId: null, },
-      { type: "toolResult", id: "c2", status: "rejected", summary: null, detail: "nope" },
-    ]);
-
-    expect(turn.toolCalls.map((call) => call.status)).toEqual([null, "rejected"]);
-    expect(turn.toolCalls[1].detail).toBe("nope");
-  });
-
-  it("keeps a settlement whose call never arrived rather than dropping it", () => {
-    // Mirrors `withHitCount`: a backend that breaks its own pairing contract
-    // must produce a visible anomaly, never a silently discarded event.
-    const turn = run([
-      { type: "toolResult", id: "ghost", status: "error", summary: null, detail: "boom" },
-    ]);
-
-    expect(turn.toolCalls).toEqual([
-      {
-        id: "ghost",
-        name: "",
-        title: "",
-        arguments: "",
-        status: "error",
-        summary: null,
-        detail: "boom",
-        // No announcement means no dispatch we ever saw, so there is no step to
-        // affiliate it with. Null, never a guess at whichever step is current.
-        stepId: null,
-      },
-    ]);
-  });
-
-  it("carries the step the call was dispatched under onto the node", () => {
-    const turn = run([
-      {
-        type: "toolCall",
-        id: "c1",
-        name: "search_notes",
-        title: "Search notes",
-        arguments: "{}",
-        stepId: "s2",
-      },
-    ]);
-
-    expect(turn.toolCalls[0].stepId).toBe("s2");
-  });
-
-  it("leaves a call dispatched under no plan unaffiliated, and folds it as before", () => {
-    // The pre-plan case, which is the common one: no step, no grouping, and a
-    // node otherwise identical to the one the reducer built before plans existed.
-    const turn = run([
-      {
-        type: "toolCall",
-        id: "c1",
-        name: "search_notes",
-        title: "Search notes",
-        arguments: '{"query":"widgets"}',
-        stepId: null,
-      },
-      { type: "toolResult", id: "c1", status: "ok", summary: "3 spans", detail: null },
-    ]);
-
-    expect(turn.planSteps).toEqual([]);
-    expect(turn.toolCalls).toEqual([
-      {
-        id: "c1",
-        name: "search_notes",
-        title: "Search notes",
-        arguments: '{"query":"widgets"}',
-        status: "ok",
-        summary: "3 spans",
-        detail: null,
-        stepId: null,
-      },
-    ]);
-  });
-
-  it("settles a call on its id alone, whatever step it was affiliated with", () => {
-    // `toolResult` carries no step of its own, and the affiliation must play no
-    // part in the match — nor be blanked by the settlement that lands on it.
-    const turn = run([
-      {
-        type: "toolCall",
-        id: "c1",
-        name: "search_notes",
-        title: "Search notes",
-        arguments: "{}",
-        stepId: "s1",
-      },
-      {
-        type: "toolCall",
-        id: "c2",
-        name: "list_notes",
-        title: "List notes",
-        arguments: "{}",
-        stepId: null,
-      },
-      { type: "toolResult", id: "c2", status: "ok", summary: null, detail: null },
-      { type: "toolResult", id: "c1", status: "rejected", summary: null, detail: "nope" },
-    ]);
-
-    expect(turn.toolCalls.map((call) => [call.id, call.status, call.stepId])).toEqual([
-      ["c1", "rejected", "s1"],
-      ["c2", "ok", null],
-    ]);
-  });
-
-  it("does not re-parent an already-dispatched node when a later step starts", () => {
-    // The affiliation is stamped by the backend at dispatch. A plan arriving
-    // afterwards restatuses the rail; it must never reach back into a node that
-    // already went out.
-    const turn = run([
-      {
-        type: "toolCall",
-        id: "c1",
-        name: "search_notes",
-        title: "Search notes",
-        arguments: "{}",
-        stepId: null,
-      },
-      {
-        type: "plan",
-        steps: [
-          { id: "s1", label: "Search the vault" },
-          { id: "s2", label: "Read the best matches" },
-        ],
-      },
-      { type: "planStepStatus", id: "s1", status: "running" },
-    ]);
-
-    expect(turn.planSteps.map((step) => step.status)).toEqual(["running", "pending"]);
-    expect(turn.toolCalls[0].stepId).toBeNull();
-  });
-
-  it("never re-settles a call that already settled", () => {
-    const turn = run([
-      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}",
-        stepId: null, },
-      { type: "toolResult", id: "c1", status: "ok", summary: null, detail: null },
-      { type: "toolResult", id: "c1", status: "rejected", summary: null, detail: "late" },
-    ]);
-
-    expect(turn.toolCalls).toHaveLength(2);
-    expect(turn.toolCalls[0].status).toBe("ok");
-  });
-
-  it("leaves the progress phase to the events that actually name one", () => {
-    // A tool node is not a phase. Announcing a call must not overwrite the
-    // phase a `searching`/`reading` event established.
-    const turn = run([
-      { type: "reading", relPath: "n.md", startLine: 1, endLine: 2 },
-      { type: "toolCall", id: "c1", name: "list_notes", title: "List notes", arguments: "{}",
-        stepId: null, },
-    ]);
-
-    expect(turn.phase).toBe("reading");
-  });
-});
-
 /** One live-preview event. A settled preview also carries the path and kind,
  *  because those only finish arriving once the arguments have closed. */
 function preview(body: string, complete = false, id = "c1"): ChatEvent {
@@ -686,129 +329,11 @@ describe("reduceAssistant — the live note preview", () => {
   });
 });
 
-/** One search, with its `retrieved` report or without it. `null` leaves the hit
- *  count undefined — the in-flight shape, which is not zero. */
-const settledSearch = (query: string, hitCount: number | null): ChatEvent[] =>
-  hitCount === null
-    ? [{ type: "searching", query }]
-    : [{ type: "searching", query }, { type: "retrieved", query, hitCount }];
-
-/** Close a run with a coverage footer that read no note — the state the empty-
- *  retrieval card is eligible in. */
-const finishHavingReadNothing = (searchedTerms: string[]): ChatEvent[] => [
-  { type: "coverage", searchedTerms, notesRead: [], truncated: false, skippedFiles: 0 },
-  { type: "done" },
-];
-
-describe("showsNothingFoundCard", () => {
-  // A genuine miss: the search surfaced nothing worth reading, so the turn read
-  // no note and cited none. `notesRead` is empty — that is what makes "nothing
-  // covers this" a true statement rather than a contradiction of the footer.
-  const searchedCoverage = {
-    searchedTerms: ["active recall"],
-    notesRead: [],
-    truncated: false,
-    skippedFiles: 0,
-  };
-  const finishedMiss: AssistantMessage = {
-    ...emptyAssistant(),
-    coverage: searchedCoverage,
-    done: true,
-  };
-
-  it("shows when a finished search read and cited nothing", () => {
-    expect(showsNothingFoundCard(finishedMiss)).toBe(true);
-  });
-
-  it("stays hidden when a note was read but not cited", () => {
-    // The model read a relevant note and answered in prose without an [eN]
-    // marker (a hedge, or a weak model paraphrasing). Zero citations, but the
-    // vault plainly *did* cover it — the footer names the note. Claiming
-    // "nothing covers this" here is a false statement about the user's notes;
-    // the answer and the footer carry the account instead.
-    const coverage = { ...searchedCoverage, notesRead: ["Learning.md"] };
-    expect(showsNothingFoundCard({ ...finishedMiss, coverage })).toBe(false);
-  });
-
-  it("stays hidden while the turn is running", () => {
-    expect(showsNothingFoundCard({ ...finishedMiss, done: false })).toBe(false);
-  });
-
-  it("stays hidden when the turn failed", () => {
-    expect(showsNothingFoundCard({ ...finishedMiss, error: "search failed" })).toBe(false);
-  });
-
-  it("stays hidden without coverage", () => {
-    expect(showsNothingFoundCard({ ...finishedMiss, coverage: null })).toBe(false);
-  });
-
-  it("stays hidden when the turn searched no terms", () => {
-    const coverage = { ...searchedCoverage, searchedTerms: [] };
-    expect(showsNothingFoundCard({ ...finishedMiss, coverage })).toBe(false);
-  });
-
-  it("stays hidden when every citation was dropped in verification", () => {
-    // Zero surviving citations has two very different causes. The vault may
-    // genuinely hold nothing — or it held the note and the verifier rejected
-    // the quote (`a_citation_whose_note_changed_mid_answer_is_dropped`).
-    // Telling the user "nothing covers this" in the second case is a false
-    // statement about their own notes. The dropped rows in the activity trace
-    // are the honest account; the card must stand down.
-    const turn: AssistantMessage = {
-      ...finishedMiss,
-      activity: [{ kind: "dropped", reason: "quote not found in source" }],
-    };
-    expect(showsNothingFoundCard(turn)).toBe(false);
-  });
-
-  it("stays hidden when at least one citation survived", () => {
-    const citation: CitationView = {
-      id: "e1",
-      relPath: "Learning.md",
-      startLine: 3,
-      endLine: 7,
-      text: "Active recall improves retention.",
-    };
-    expect(showsNothingFoundCard({ ...finishedMiss, citations: [citation] })).toBe(false);
-  });
-
-  // ── The retrieval veto (#122) ─────────────────────────────────────────────
-  // Built from events through the real reducer, because the property under test
-  // is that a hit count which crossed the wire reaches this decision at all.
-
-  it("stays hidden when the searches returned spans the model never opened", () => {
-    // The reported run: no note read and no citation survived, which used to be
-    // the whole test — but eleven spans came back, so the vault plainly does
-    // cover this. "Nothing in your vault covers this" is then a false statement
-    // about the user's own notes, and a louder one than the rail summary's.
-    const turn = run([
-      ...settledSearch("markdown", 6),
-      ...settledSearch("spaced repetition", 5),
-      ...finishHavingReadNothing(["markdown", "spaced repetition"]),
-    ]);
-    expect(showsNothingFoundCard(turn)).toBe(false);
-  });
-
-  it("still shows when every search reported and every one of them was empty", () => {
-    // The veto must not swallow the card's real purpose: this is a genuine miss,
-    // and the on-ramp is exactly what the user needs here.
-    const turn = run([...settledSearch("quokka", 0), ...finishHavingReadNothing(["quokka"])]);
-    expect(showsNothingFoundCard(turn)).toBe(true);
-  });
-
-  it("stays hidden when a search never reported what it found", () => {
-    // The run ended with the count still undefined. Nothing established that the
-    // vault is empty, so "not yet known" must not be rendered as "no".
-    const turn = run([...settledSearch("focus", null), ...finishHavingReadNothing(["focus"])]);
-    expect(showsNothingFoundCard(turn)).toBe(false);
-  });
-});
-
 describe("reduceAssistant — activity log", () => {
   it("appends a search row, then merges the retrieved count into it", () => {
     const turn = run([
-      { type: "searching", query: "active recall" },
-      { type: "retrieved", query: "active recall", hitCount: 3 },
+      { type: "searching", query: "active recall", callId: null },
+      { type: "retrieved", query: "active recall", hitCount: 3, callId: null },
     ]);
     expect(turn.activity).toEqual([
       { kind: "search", query: "active recall", hitCount: 3 },
@@ -817,9 +342,9 @@ describe("reduceAssistant — activity log", () => {
 
   it("keeps two same-query searches distinct, filling each pending count once", () => {
     const turn = run([
-      { type: "searching", query: "spacing" },
-      { type: "searching", query: "spacing" },
-      { type: "retrieved", query: "spacing", hitCount: 2 },
+      { type: "searching", query: "spacing", callId: null },
+      { type: "searching", query: "spacing", callId: null },
+      { type: "retrieved", query: "spacing", hitCount: 2, callId: null },
     ]);
     // The most recent pending search takes the count; the first stays pending.
     expect(turn.activity).toEqual([
@@ -829,13 +354,13 @@ describe("reduceAssistant — activity log", () => {
   });
 
   it("keeps a retrieved count even if its search row never arrived", () => {
-    const turn = run([{ type: "retrieved", query: "orphan", hitCount: 5 }]);
+    const turn = run([{ type: "retrieved", query: "orphan", hitCount: 5, callId: null }]);
     expect(turn.activity).toEqual([{ kind: "search", query: "orphan", hitCount: 5 }]);
   });
 
   it("records reading, verifying and dropped-citation rows in order", () => {
     const turn = run([
-      { type: "reading", relPath: "Spaced-Repetition.md", startLine: 12, endLine: 28 },
+      { type: "reading", relPath: "Spaced-Repetition.md", startLine: 12, endLine: 28, callId: null },
       { type: "verifying" },
       { type: "citationDropped", reason: "quote not found" },
     ]);
@@ -904,7 +429,7 @@ describe("reduceAssistant — citations, coverage, terminal events", () => {
     });
   });
 
-  it("retains a truncated listing-only coverage footer without showing nothing found", () => {
+  it("retains a truncated listing-only coverage footer verbatim", () => {
     const footer = {
       searchedTerms: [],
       notesRead: [],
@@ -914,7 +439,6 @@ describe("reduceAssistant — citations, coverage, terminal events", () => {
     const turn = run([{ type: "coverage", ...footer }, { type: "done" }]);
     expect(turn.coverage).not.toBeNull();
     expect(turn.coverage).toEqual(footer);
-    expect(showsNothingFoundCard(turn)).toBe(false);
   });
 
   it("marks the turn done on `done`", () => {
@@ -934,286 +458,5 @@ describe("reduceAssistant — citations, coverage, terminal events", () => {
     const next = reduceAssistant(start, { type: "answer", delta: "x" });
     expect(start.answer).toBe("");
     expect(next).not.toBe(start);
-  });
-});
-
-describe("toHistory", () => {
-  it("maps turns to ChatTurns and preserves an answerless failure as status", () => {
-    const messages: ChatMessage[] = [
-      userMessage("what is spacing?"),
-      { ...emptyAssistant(), answer: "It's spacing.", done: true },
-      userMessage("and recall?"),
-      { ...emptyAssistant(), error: "boom", done: true }, // errored, no answer
-    ];
-    expect(toHistory(messages)).toEqual([
-      { role: "user", content: "what is spacing?" },
-      { role: "assistant", content: "It's spacing." },
-      { role: "user", content: "and recall?" },
-      {
-        role: "assistant",
-        content: [
-          "NeuralNote continuation record:",
-          "The run failed before producing a final answer.",
-          "Use this status when responding to the next turn.",
-        ].join("\n"),
-      },
-    ]);
-  });
-
-  it("windows history to the most recent turns so it can't grow unbounded (PA-003)", () => {
-    // 60 non-empty turns in → only the last 20 come out, and they're the newest.
-    const messages: ChatMessage[] = Array.from({ length: 30 }, (_, i) => [
-      userMessage(`q${i}`),
-      { ...emptyAssistant(), answer: `a${i}`, done: true } as ChatMessage,
-    ]).flat();
-    const history = toHistory(messages);
-    expect(history).toHaveLength(20);
-    // The window keeps the tail: last entry is the final assistant answer.
-    expect(history.at(-1)).toEqual({ role: "assistant", content: "a29" });
-    expect(history[0]).toEqual({ role: "user", content: "q20" });
-  });
-
-  it("strips [eN] markers from assistant answers so stale ids can't re-enter (SUS-1)", () => {
-    // Evidence ids reset per run, so a turn-1 marker means nothing in turn 2 — and
-    // could collide with an unrelated new span. History must carry the prose, not the ids.
-    const messages: ChatMessage[] = [
-      userMessage("q"),
-      { ...emptyAssistant(), answer: "Spacing is 8px [e1] and grids use it [e2].", done: true },
-    ];
-    expect(toHistory(messages)).toEqual([
-      { role: "user", content: "q" },
-      { role: "assistant", content: "Spacing is 8px and grids use it." },
-    ]);
-  });
-
-  it("preserves durable progress when a failed run produced no prose answer", () => {
-    const failed = {
-      ...emptyAssistant(),
-      done: true,
-      error: "the model returned an empty answer",
-      writtenNotes: [
-        { relPath: "Areas/OpSec/Reference/Literature.md", kind: "literature" as const },
-        { relPath: "Areas/OpSec/Reference/Transcript.md", kind: "transcript" as const },
-      ],
-      planSteps: [
-        { id: "collect", label: "Collect the source", status: "done" as const },
-        { id: "write", label: "Write the remaining note", status: "running" as const },
-      ],
-      partialRun: "the run reached a work limit before finishing",
-    };
-
-    const history = toHistory([userMessage("Distil this video"), failed]);
-
-    expect(history).toEqual([
-      { role: "user", content: "Distil this video" },
-      {
-        role: "assistant",
-        content: [
-          "NeuralNote continuation record:",
-          "Completed note writes:",
-          "- Areas/OpSec/Reference/Literature.md (literature)",
-          "- Areas/OpSec/Reference/Transcript.md (transcript)",
-          "Plan state:",
-          "- [done] Collect the source",
-          "- [running] Write the remaining note",
-          "Run ended early: the run reached a work limit before finishing",
-          "The final answer failed after the recorded work.",
-          "Continue from this record without repeating completed note writes.",
-        ].join("\n"),
-      },
-    ]);
-    expect(history[1].content).not.toContain("the model returned an empty answer");
-  });
-
-  it("flattens and bounds model-authored plan labels in continuation history", () => {
-    const failed = {
-      ...emptyAssistant(),
-      done: true,
-      error: "provider failed",
-      planSteps: [
-        {
-          id: "hostile",
-          label: `Keep context\n${"x".repeat(2_000)}`,
-          status: "running" as const,
-        },
-      ],
-    };
-
-    const history = toHistory([userMessage("continue"), failed]);
-    const content = history[1].content;
-
-    expect(content.split("\n")).toHaveLength(5);
-    expect(Array.from(content).length).toBeLessThan(500);
-    expect(content).toContain("- [running] Keep context ");
-    expect(content).toContain("…\nThe final answer failed after the recorded work.");
-  });
-});
-
-describe("stripCitationMarkers", () => {
-  it("removes every [eN] marker (verified or not) with its leading space", () => {
-    expect(stripCitationMarkers("A [e1] and B [e9].")).toBe("A and B.");
-  });
-
-  it("matches uppercase markers, mirroring the Rust extractor's case-folding", () => {
-    expect(stripCitationMarkers("A [E1] then [e2]!")).toBe("A then!");
-  });
-
-  it("leaves marker-free text untouched", () => {
-    expect(stripCitationMarkers("No citations here.")).toBe("No citations here.");
-  });
-});
-
-const cite = (id: string): CitationView => ({
-  id,
-  relPath: "a.md",
-  startLine: 1,
-  endLine: 1,
-  text: "x",
-});
-
-describe("resolveAnswerMarkers", () => {
-
-  it("leaves markers untouched while the turn is still streaming", () => {
-    // Citations arrive after the answer streams — don't strip mid-generation.
-    expect(resolveAnswerMarkers("Claim [e1]", [], false)).toBe("Claim [e1]");
-  });
-
-  it("keeps verified markers and strips dropped ones once done", () => {
-    // e1 is verified; e9 was dropped by the verifier — it must not linger as a
-    // live reference. The leading space goes with it (no double space).
-    expect(resolveAnswerMarkers("A [e1] and B [e9].", [cite("e1")], true)).toBe(
-      "A [e1] and B.",
-    );
-  });
-
-  it("strips a marker with no matching citation at all", () => {
-    expect(resolveAnswerMarkers("Bare claim [e3].", [], true)).toBe("Bare claim.");
-  });
-
-  it("matches an uppercase marker, mirroring the Rust extractor's case-folding", () => {
-    // The verified id is lowercase e1; an uppercase [E1] must still resolve to it,
-    // and an uppercase dropped [E9] must still be stripped.
-    expect(resolveAnswerMarkers("A [E1] and B [E9].", [cite("e1")], true)).toBe(
-      "A [E1] and B.",
-    );
-  });
-});
-
-describe("groupActivity", () => {
-  it("collapses a run of consecutive reads of one note into a counted, widened row", () => {
-    const steps: ActivityStep[] = [
-      { kind: "reading", relPath: "AI.md", startLine: 10, endLine: 20 },
-      { kind: "reading", relPath: "AI.md", startLine: 5, endLine: 12 },
-      { kind: "reading", relPath: "AI.md", startLine: 30, endLine: 40 },
-    ];
-    // Five-in-a-row of the same note collapse to one ×N row spanning every read.
-    expect(groupActivity(steps)).toEqual([
-      { kind: "reading", relPath: "AI.md", startLine: 5, endLine: 40, count: 3 },
-    ]);
-  });
-
-  it("keeps non-consecutive reads of the same note separate (execution order)", () => {
-    const steps: ActivityStep[] = [
-      { kind: "reading", relPath: "A.md", startLine: 1, endLine: 2 },
-      { kind: "search", query: "x" },
-      { kind: "reading", relPath: "A.md", startLine: 3, endLine: 4 },
-    ];
-    const grouped = groupActivity(steps);
-    expect(grouped).toHaveLength(3);
-    expect(grouped.filter((s) => s.kind === "reading")).toHaveLength(2);
-  });
-
-  it("leaves searches, verifying and dropped rows untouched", () => {
-    const steps: ActivityStep[] = [
-      { kind: "search", query: "a", hitCount: 3 },
-      { kind: "verifying" },
-      { kind: "dropped", reason: "quote gone" },
-    ];
-    expect(groupActivity(steps)).toEqual(steps);
-  });
-});
-
-describe("summarizeActivity", () => {
-  it("counts searches, DISTINCT notes, drops and verification", () => {
-    const steps: ActivityStep[] = [
-      { kind: "search", query: "a" },
-      { kind: "search", query: "b" },
-      { kind: "reading", relPath: "A.md", startLine: 1, endLine: 2 },
-      { kind: "reading", relPath: "A.md", startLine: 3, endLine: 4 }, // same note, read twice
-      { kind: "reading", relPath: "B.md", startLine: 1, endLine: 2 },
-      { kind: "verifying" },
-      { kind: "dropped", reason: "x" },
-    ];
-    expect(summarizeActivity(steps)).toEqual({
-      searches: 2,
-      notesRead: 2, // A.md counted once despite two reads — provenance honesty
-      dropped: 1,
-      verified: true,
-      totalSteps: 7,
-    });
-  });
-
-  it("reports an empty trace as all-zero", () => {
-    expect(summarizeActivity([])).toEqual({
-      searches: 0,
-      notesRead: 0,
-      dropped: 0,
-      verified: false,
-      totalSteps: 0,
-    });
-  });
-});
-
-describe("searchOutcome", () => {
-  // The type exists because #122 collapsed three states into two: the summary
-  // asked whether anything had been READ and then reported whether anything had
-  // been FOUND. Each state is pinned separately here because each one licenses a
-  // different sentence in front of the user.
-
-  it("reports no retrieval at all when no search ran", () => {
-    expect(searchOutcome([])).toEqual({ kind: "none" });
-    expect(searchOutcome([{ kind: "verifying" }])).toEqual({ kind: "none" });
-  });
-
-  it("totals the spans across every search that reported", () => {
-    const steps: ActivityStep[] = [
-      { kind: "search", query: "markdown", hitCount: 6 },
-      { kind: "search", query: "spaced repetition", hitCount: 5 },
-    ];
-    // The total the head prints has to be the sum of what the nodes beneath it
-    // print, or the summary contradicts its own children — which is the bug.
-    expect(searchOutcome(steps)).toEqual({ kind: "hits", spans: 11 });
-  });
-
-  it("reports empty only when every search reported and every one was zero", () => {
-    const steps: ActivityStep[] = [
-      { kind: "search", query: "quokka", hitCount: 0 },
-      { kind: "search", query: "wallaby", hitCount: 0 },
-    ];
-    expect(searchOutcome(steps)).toEqual({ kind: "empty" });
-  });
-
-  it("reports pending, never empty, while a search has yet to report", () => {
-    // `hitCount` is undefined between `searching` and `retrieved`. Reading that
-    // as zero is what let "nothing found" appear before the vault had answered.
-    expect(searchOutcome([{ kind: "search", query: "focus" }])).toEqual({ kind: "pending" });
-  });
-
-  it("still reports pending when the searches that HAVE reported found nothing", () => {
-    const steps: ActivityStep[] = [
-      { kind: "search", query: "quokka", hitCount: 0 },
-      { kind: "search", query: "focus" },
-    ];
-    expect(searchOutcome(steps)).toEqual({ kind: "pending" });
-  });
-
-  it("lets a reported hit outrank a straggler that has not answered", () => {
-    // Once one search has come back with spans, retrieval demonstrably found
-    // something and a later straggler cannot unsay it.
-    const steps: ActivityStep[] = [
-      { kind: "search", query: "markdown", hitCount: 6 },
-      { kind: "search", query: "focus" },
-    ];
-    expect(searchOutcome(steps)).toEqual({ kind: "hits", spans: 6 });
   });
 });

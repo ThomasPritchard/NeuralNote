@@ -1,22 +1,31 @@
-//! The tool-deciding loop: approve, dispatch, settle, budget.
+//! The evidence loop: how many model turns to spend, and when to stop.
+//!
+//! One responsibility, at one altitude. Each turn is budgeted against the
+//! model's context window, announced with the round it is about to run, and then
+//! asked which tools to call. What happens to those calls — gating, dispatch,
+//! settlement — is [`super::tool_batch`], one level down; this file only reads
+//! back what the batch did and decides whether there is another turn in the run.
+//!
+//! The two ways a run ends are both here: an exhausted budget or iteration
+//! ceiling, which is a partial answer, and the model deciding it has enough,
+//! which is a complete one. Telling them apart is what the caller renders as
+//! "coverage".
 
 use super::context_budget::fit_prompt_to_window;
-use super::coverage::{push_unique, CoverageAcc};
-use super::playlist::{handle_empty_tool_turn, playlist_preflight, LoopControl, PlaylistLoopState};
-use super::session::ChatSession;
-use super::settlement::{
-    emit_tool_call, emit_tool_result, playlist_failure_reason, settle_skipped, settlement_for,
-    RefusedCall, SkippedCall, ToolSettlement,
+use super::coverage::CoverageAcc;
+use super::playlist::{
+    handle_empty_tool_turn, playlist_position, playlist_preflight, LoopControl, PlaylistLoopState,
 };
+use super::session::ChatSession;
+use super::tool_batch::ToolBatchControl;
 use super::usage::EmissionGuard;
-use super::PARTIAL_RUN_CANCELLED;
-use crate::ai::approval::{self, ApprovalContext, ApprovalDecision, ApprovalGate, ApprovedCall};
-use crate::ai::events::{ChatEvent, EventSink};
+use crate::ai::approval::ApprovalGate;
+use crate::ai::events::{ChatEvent, EventSink, PlaylistPosition};
 use crate::ai::evidence::EvidenceRegistry;
-use crate::ai::llm::{Completion, LlmMessage, LlmRequest, ToolCall};
+use crate::ai::llm::{Completion, LlmMessage, LlmRequest};
 use crate::ai::plan::RunPlan;
 use crate::ai::skills::ActiveSkills;
-use crate::ai::tools::{self, dispatch, ToolOutcome};
+use crate::ai::tools;
 use crate::ai::write_policy::WriteSession;
 use crate::ai::youtube::YoutubeToolSession;
 use crate::error::CoreResult;
@@ -25,13 +34,6 @@ use std::time::Duration;
 pub(super) enum EvidenceCollection {
     Answer { guard_tripped: bool },
     CompleteTurn,
-}
-
-#[derive(Default)]
-struct ToolBatchControl {
-    budget_hit: bool,
-    complete_turn: bool,
-    cancelled: bool,
 }
 
 impl ChatSession<'_> {
@@ -77,6 +79,19 @@ impl ChatSession<'_> {
             let budgeted =
                 fit_prompt_to_window(messages, self.model, self.llm.context_window_tokens());
             coverage.truncated |= budgeted.lost;
+            // Announced here, through the raw sink, so it is structurally outside the
+            // retry `EmissionGuard` that `complete_tool_turn` builds around the turn:
+            // that guard bars a retry on anything the user can already SEE, and this
+            // beacon is neither the provider's output nor something a replay could
+            // rewind, so counting it would silently disable the one bounded retry.
+            //
+            // The ceiling is re-read every round on purpose — activating a skill
+            // raises it — so the pair the UI renders is always this round's pair.
+            sink.send(round_beacon(
+                consumed,
+                active_skills.max_iterations(consumed),
+                playlist_position(youtube_session),
+            ));
             // This tool-DECIDING turn is idempotent (no tool has run yet), so a single
             // transient transport failure is retried once rather than aborting the run.
             let completion = self
@@ -121,211 +136,6 @@ impl ChatSession<'_> {
         }
     }
 
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_tool_calls(
-        &self,
-        calls: &[ToolCall],
-        messages: &mut Vec<LlmMessage>,
-        active_skills: &mut ActiveSkills,
-        writes: &mut WriteSession,
-        youtube_session: &mut YoutubeToolSession,
-        plan: &mut RunPlan,
-        authorized_tools: &std::collections::BTreeSet<String>,
-        registry: &mut EvidenceRegistry,
-        coverage: &mut CoverageAcc,
-        gate: &mut ApprovalGate,
-        sink: &mut dyn EventSink,
-        context_chars: &mut usize,
-    ) -> ToolBatchControl {
-        let mut control = ToolBatchControl::default();
-        let mut playlist_cancelled = false;
-        let batch_playlist_item = youtube_session
-            .playlist_current()
-            .map(|(index, _, _)| index);
-        let mut playlist_batch_closed = false;
-        for call in calls {
-            // Announce the call BEFORE anything can go wrong with it, so one that
-            // is skipped, cancelled, rejected or fails still reaches the timeline
-            // instead of vanishing. Every branch below settles it exactly once.
-            // This is also where the step affiliation is stamped — the plan as it
-            // stands at THIS call's dispatch, not as it ends up.
-            emit_tool_call(sink, call, plan);
-            if playlist_batch_closed {
-                settle_skipped(messages, sink, call, SkippedCall::StalePlaylistBatch);
-                continue;
-            }
-            if !playlist_cancelled
-                && youtube_session.playlist_is_active()
-                && youtube_session.cancellation().is_cancelled()
-            {
-                youtube_session.cancel_playlist_remaining();
-                playlist_cancelled = true;
-                if !control.cancelled {
-                    control.cancelled = true;
-                    sink.send(ChatEvent::PartialRun {
-                        reason: PARTIAL_RUN_CANCELLED.to_string(),
-                    });
-                }
-            }
-            if playlist_cancelled {
-                settle_skipped(messages, sink, call, SkippedCall::PlaylistCancelled);
-                continue;
-            }
-            if control.budget_hit {
-                settle_skipped(messages, sink, call, SkippedCall::EvidenceBudgetSpent);
-                continue;
-            }
-            let (tool_control, settlement) = self
-                .push_tool_result(
-                    messages,
-                    call,
-                    active_skills,
-                    writes,
-                    youtube_session,
-                    plan,
-                    authorized_tools,
-                    registry,
-                    coverage,
-                    gate,
-                    sink,
-                    context_chars,
-                )
-                .await;
-            control.complete_turn |= tool_control == tools::ToolControl::CompleteTurn;
-            if settlement.status() == crate::ai::events::ToolStatus::Cancelled && !control.cancelled
-            {
-                control.cancelled = true;
-                sink.send(ChatEvent::PartialRun {
-                    reason: PARTIAL_RUN_CANCELLED.to_string(),
-                });
-            }
-            emit_tool_result(sink, &call.id, settlement);
-            let current_playlist_item = youtube_session
-                .playlist_current()
-                .map(|(index, _, _)| index);
-            playlist_batch_closed = current_playlist_item != batch_playlist_item
-                || (batch_playlist_item.is_some()
-                    && call.name == tools::TOOL_SELECT_PLAYLIST_VIDEOS);
-            // Check the caps INSIDE the per-call loop: one turn issuing many
-            // search calls (each up to MAX_SEARCH_RESULTS spans) must not blow
-            // past the caps before the guard fires — that is the token-cost spike
-            // the guard exists to prevent (a BYO-key user pays for it).
-            if self.evidence_budget_spent(registry, *context_chars, active_skills) {
-                control.budget_hit = true;
-            }
-        }
-        control
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn push_tool_result(
-        &self,
-        messages: &mut Vec<LlmMessage>,
-        call: &ToolCall,
-        active_skills: &mut ActiveSkills,
-        writes: &mut WriteSession,
-        youtube_session: &mut YoutubeToolSession,
-        plan: &mut RunPlan,
-        authorized_tools: &std::collections::BTreeSet<String>,
-        registry: &mut EvidenceRegistry,
-        coverage: &mut CoverageAcc,
-        gate: &mut ApprovalGate,
-        sink: &mut dyn EventSink,
-        context_chars: &mut usize,
-    ) -> (tools::ToolControl, ToolSettlement) {
-        // The gate is the single door in front of dispatch, and the ONLY producer
-        // of the `ApprovedCall` dispatch requires. A refusal still pushes exactly
-        // one result for this call and settles its node: denial is not
-        // run-cancellation, and the remaining calls in the batch stay gated.
-        let approved = match self.approve(gate, call, writes, sink).await {
-            Ok(approved) => approved,
-            Err(refusal) => {
-                messages.push(LlmMessage::tool_result(
-                    &call.id,
-                    &call.name,
-                    refusal.tool_result_content(),
-                ));
-                if youtube_session.playlist_is_active()
-                    && call.name != tools::TOOL_SELECT_PLAYLIST_VIDEOS
-                {
-                    youtube_session
-                        .fail_playlist_item(format!("tool '{}' was not approved", call.name));
-                }
-                return (tools::ToolControl::Continue, refusal.settlement());
-            }
-        };
-        let result = self
-            .handle_tool_call(
-                &approved,
-                active_skills,
-                writes,
-                youtube_session,
-                plan,
-                authorized_tools,
-                registry,
-                coverage,
-                sink,
-            )
-            .await;
-        if youtube_session.playlist_is_active() && call.name != tools::TOOL_SELECT_PLAYLIST_VIDEOS {
-            if let Some(reason) = playlist_failure_reason(&result.outcome, &call.name) {
-                youtube_session.fail_playlist_item(reason);
-            }
-        }
-        let settlement = settlement_for(&result);
-        *context_chars += result.content.len();
-        messages.push(LlmMessage::tool_result(
-            &call.id,
-            &call.name,
-            result.content,
-        ));
-        (result.control, settlement)
-    }
-
-    /// Take one declared call through the approval gate.
-    ///
-    /// An **ungated** tool needs no decision at all — the four read-only vault
-    /// tools, `skill_step`, `ask_user`, and any name the model invented — so it is
-    /// admitted by [`ApprovedCall::ungated`], the one constructor that provably
-    /// cannot authorise a gated call. Everything the gate covers goes through
-    /// [`approval::decide`], which is its only other constructor.
-    async fn approve(
-        &self,
-        gate: &mut ApprovalGate,
-        call: &ToolCall,
-        writes: &WriteSession,
-        sink: &mut dyn EventSink,
-    ) -> Result<ApprovedCall, RefusedCall> {
-        if let Some(approved) = ApprovedCall::ungated(call) {
-            return Ok(approved);
-        }
-        // Budget headroom is one of the classified scalars and one clause of the
-        // eligibility rule. It comes from the run's already-enforced budget, so
-        // the gate reads the same number the write path will enforce.
-        let budget = writes.budget();
-        let writes_remaining = budget.total_cap().saturating_sub(budget.total_writes());
-        let context = ApprovalContext {
-            root: self.root,
-            classifier: self.skill_services.approval_classifier,
-            prompt: self.skill_services.approval_prompt,
-        };
-        match approval::decide(gate, &context, call, writes_remaining, sink).await {
-            ApprovalDecision::Approved(approved) => Ok(approved),
-            ApprovalDecision::Denied(resolution) => Err(RefusedCall::Denied(resolution)),
-            ApprovalDecision::HardDenied(denial) => Err(RefusedCall::HardDenied(denial.message())),
-        }
-    }
-
-    fn evidence_budget_spent(
-        &self,
-        registry: &EvidenceRegistry,
-        context_chars: usize,
-        active_skills: &ActiveSkills,
-    ) -> bool {
-        registry.len() >= self.guards.max_spans
-            || context_chars >= active_skills.max_context_chars(self.guards.max_context_chars)
-    }
-
     /// Run one tool-DECIDING turn with a single bounded retry on a transient
     /// transport failure.
     ///
@@ -345,26 +155,19 @@ impl ChatSession<'_> {
     ///
     /// A non-transient failure or a user-stopped run is never retried either.
     ///
-    /// **It opens by saying the run is working** (#126). Nothing else can reach the
-    /// user during this turn — only a `write_note` preview can, and only on a
-    /// provider that streams tool calls — so an answered question was followed by a
-    /// whole round-trip of silence, and by TWO on a provider that does not stream
-    /// tool turns and re-runs the turn buffered. The pane went on showing whichever
-    /// phase word it last had ("searching", while the model was composing). One
-    /// [`ChatEvent::Processing`] before the turn is the honest correction: it is the
-    /// variant that already means "working", which the run genuinely is.
+    /// **The caller announces the round before calling this** (#126). Nothing else
+    /// can reach the user during this turn — only a `write_note` preview can, and
+    /// only on a provider that streams tool calls — so an answered question was
+    /// followed by a whole round-trip of silence, and by TWO on a provider that
+    /// does not stream tool turns and re-runs the turn buffered. The pane went on
+    /// showing whichever phase word it last had ("searching", while the model was
+    /// composing). [`ChatEvent::PlanningRound`], emitted by `collect_evidence`
+    /// outside the guard below, is the honest correction.
     pub(super) async fn complete_tool_turn(
         &self,
         request: &LlmRequest,
         sink: &mut dyn EventSink,
     ) -> CoreResult<Completion> {
-        // Sent through the raw sink, BEFORE the guard below wraps it, and once for
-        // the whole call rather than once per attempt. Both matter. The guard bars a
-        // retry on anything the user can already SEE — a half-composed note — and
-        // this beacon is neither the provider's output nor something a replay could
-        // rewind, so counting it would silently disable the one bounded retry. Once
-        // per call also keeps the turn to a single event no matter how it goes.
-        sink.send(ChatEvent::Processing);
         let mut retries = MAX_COMPLETE_RETRIES;
         let mut sink = EmissionGuard {
             inner: sink,
@@ -399,101 +202,50 @@ impl ChatSession<'_> {
     fn run_cancelled(&self) -> bool {
         self.skill_services.capture_cancellation.is_cancelled()
     }
+}
 
-    /// Dispatch one tool call, emitting the live step events and folding its result
-    /// into the coverage accumulator.
-    #[allow(clippy::too_many_arguments)]
-    async fn handle_tool_call(
-        &self,
-        call: &ApprovedCall,
-        active_skills: &mut ActiveSkills,
-        writes: &mut WriteSession,
-        youtube_session: &mut YoutubeToolSession,
-        plan: &mut RunPlan,
-        authorized_tools: &std::collections::BTreeSet<String>,
-        registry: &mut EvidenceRegistry,
-        coverage: &mut CoverageAcc,
-        sink: &mut dyn EventSink,
-    ) -> tools::ToolResult {
-        // The "searching…" cue precedes the search so the UI shows it live.
-        if call.name() == tools::TOOL_SEARCH_NOTES {
-            if let Some(query) = peek_query(call.arguments()) {
-                sink.send(ChatEvent::Searching { query });
-            }
-        }
-        let result = {
-            let mut context = tools::ToolContext::new(
-                self.root,
-                self.skill_services.registry,
-                self.skill_services.environment,
-                active_skills,
-                self.skill_services.note_writer,
-                writes,
-                sink,
-                authorized_tools,
-            )
-            .with_youtube(self.skill_services.youtube_io, youtube_session)
-            .with_youtube_requirements(self.skill_services.youtube_requirements)
-            .with_vault_profile_io(self.skill_services.vault_profile_io)
-            // The same token `run_cancelled` reads. A call that comes apart
-            // because the user pressed Stop must not be attributed to the vault.
-            .with_cancellation(self.skill_services.capture_cancellation.clone())
-            .with_plan(plan);
-            if let Some(pricing) = self.skill_services.pricing {
-                context = context.with_pricing(pricing);
-            }
-            dispatch(
-                call,
-                self.provider,
-                registry,
-                self.skill_services.user_prompt,
-                &mut context,
-            )
-            .await
-        };
-        match &result.outcome {
-            ToolOutcome::Searched {
-                query,
-                hit_count,
-                truncated,
-                skipped_files,
-                notes_read,
-            } => {
-                sink.send(ChatEvent::Retrieved {
-                    query: query.clone(),
-                    hit_count: *hit_count,
-                });
-                push_unique(&mut coverage.searched_terms, query);
-                for rel in notes_read {
-                    push_unique(&mut coverage.notes_read, rel);
-                }
-                coverage.truncated |= *truncated;
-                // max, not sum: each full search re-reports the same skip count, so
-                // summing would inflate it.
-                coverage.skipped_files = coverage.skipped_files.max(*skipped_files);
-            }
-            ToolOutcome::Read {
-                rel_path,
-                start_line,
-                end_line,
-            } => {
-                sink.send(ChatEvent::Reading {
-                    rel_path: rel_path.clone(),
-                    start_line: *start_line,
-                    end_line: *end_line,
-                });
-                push_unique(&mut coverage.notes_read, rel_path);
-            }
-            // Metadata listing needs no event; a refused or failed call's error
-            // is in the tool result the model reads and in the settlement the
-            // timeline node renders.
-            ToolOutcome::Listed
-            | ToolOutcome::Action
-            | ToolOutcome::Rejected
-            | ToolOutcome::Cancelled
-            | ToolOutcome::Failed { .. } => {}
-        }
-        result
+/// The beacon for the round about to run: its 1-based number, and the ceiling to
+/// show beside it.
+///
+/// **The ceiling is clamped to never sit below the round it accompanies**, and
+/// that is not defensive padding — it is the difference between two things
+/// [`ActiveSkills::max_iterations`](crate::ai::skills::ActiveSkills::max_iterations)
+/// deliberately conflates. That function seeds its fold at
+/// `base.max(consumed)`: a FLOOR, there so a late skill activation cannot
+/// retroactively lower the ceiling below turns already spent. Read as a display
+/// denominator it is wrong, because once `consumed` passes every declared cap it
+/// returns `consumed` itself — one below the round being announced.
+///
+/// An ordinary run never gets there, because the iteration guard stops it first.
+/// A playlist does: `iteration_guard_reached` is false while a playlist is
+/// active, so the loop runs past the ceiling by design (each item may spend up
+/// to `MAX_PLAYLIST_TURNS_PER_ITEM` turns, and a playlist has many items).
+/// Unclamped, that puts "round 17 of 16" on the wire — arithmetically impossible,
+/// and it would then have the denominator chase the numerator for the rest of
+/// the run, telling the user they are permanently one round from finished.
+///
+/// The clamp stays as the backstop for the ordinary path, where what it says —
+/// "at the ceiling" — is true, if thin. What it could never do is give a
+/// playlist an honest denominator, because there isn't one to be had in rounds.
+/// So the beacon carries `playlist` beside the pair: the number of videos the
+/// user picked is fixed for the run and cannot be overtaken, which dissolves the
+/// moving ceiling rather than clamping around it. Whoever renders these numbers
+/// counts videos while `playlist` is present and rounds when it is not.
+///
+/// Both numbers saturate rather than wrap: a wrapped round would read as a run
+/// starting over, the exact confusion `PlanningRound` replaced `Processing` to end.
+pub(super) fn round_beacon(
+    consumed: usize,
+    max_iterations: usize,
+    playlist: Option<PlaylistPosition>,
+) -> ChatEvent {
+    let round = u32::try_from(consumed)
+        .unwrap_or(u32::MAX)
+        .saturating_add(1);
+    ChatEvent::PlanningRound {
+        round,
+        max_rounds: u32::try_from(max_iterations).unwrap_or(u32::MAX).max(round),
+        playlist,
     }
 }
 
@@ -534,15 +286,6 @@ fn collection_after_tool_batch(
         });
     }
     None
-}
-
-/// Extract the `query` field from a search tool call's raw JSON arguments, if present.
-fn peek_query(args_json: &str) -> Option<String> {
-    serde_json::from_str::<serde_json::Value>(args_json)
-        .ok()?
-        .get("query")?
-        .as_str()
-        .map(str::to_string)
 }
 
 // ── Bounded retry for idempotent tool-decision turns (PA-029) ────────────────

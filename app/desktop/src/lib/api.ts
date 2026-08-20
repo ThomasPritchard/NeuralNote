@@ -382,6 +382,24 @@ export const setActiveProvider = (
 export const setReasoning = (enabled: boolean) =>
   sequenceAiConfigMutation(() => invoke<AiStatus>("set_reasoning", { enabled }));
 
+/** Choose the effort this model reasons at, or clear it with `null` to take the
+ *  model's own default.
+ *
+ *  Only ever call this with a value from the `efforts` control the same status
+ *  read handed you — the shell REFUSES anything the currently probed menu does
+ *  not offer, and surfaces the refusal rather than coercing to something nearby.
+ *  There is no fallback effort and no remembered one from a previous model.
+ *
+ *  Naming an effort also opts the user in, because picking one off the menu is
+ *  what opting in looks like there; clearing it does not opt them out (that is
+ *  `setReasoning(false)`, which the control exposes separately when the model
+ *  allows it). Returns the freshly persisted status, for the same reason
+ *  `setReasoning` does. */
+export const setReasoningEffort = (effort: string | null) =>
+  sequenceAiConfigMutation(() =>
+    invoke<AiStatus>("set_reasoning_effort", { effort }),
+  );
+
 /** Choose the global approval mode.
  *
  *  Returns the freshly persisted status for the same reason `setReasoning` does,

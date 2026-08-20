@@ -1,0 +1,14 @@
+{
+  "activeProvider": "local",
+  "model": "moonshotai/kimi-k3",
+  "localModelTag": "qwen3.5:27b",
+  "reasoning": true,
+  "reasoningProbe": {
+    "model": "qwen3.5:27b",
+    "support": "supported"
+  },
+  "reasoningProbeGeneration": 97,
+  "disabledSkills": [],
+  "approvalMode": "alwaysAsk",
+  "toolApprovalOverrides": {}
+}

@@ -188,7 +188,7 @@ function call(patch: Partial<ToolCallView> = {}): ToolCallView {
 
 function renderTimeline(turn: ReturnType<typeof emptyAssistant>, answering = false) {
   return render(
-    <ChatTimeline turn={turn} prompt="capture that" answering={answering} suppressLive={false} />,
+    <ChatTimeline turn={turn} answering={answering} suppressLive={false} />,
   );
 }
 

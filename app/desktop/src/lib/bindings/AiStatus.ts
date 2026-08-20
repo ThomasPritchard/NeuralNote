@@ -3,6 +3,7 @@ import type { ApprovalStatus } from "./ApprovalStatus";
 import type { LocalStatus } from "./LocalStatus";
 import type { OpenRouterStatus } from "./OpenRouterStatus";
 import type { ProviderKind } from "./ProviderKind";
+import type { ReasoningControl } from "./ReasoningControl";
 import type { ReasoningSupport } from "./ReasoningSupport";
 
 /**
@@ -12,4 +13,14 @@ import type { ReasoningSupport } from "./ReasoningSupport";
  * yet. This is a pure config read — it never starts the sidecar or touches the
  * keychain, so the UI can poll it cheaply.
  */
-export type AiStatus = { activeProvider: ProviderKind | null, reasoningSupported: ReasoningSupport, openrouter: OpenRouterStatus, local: LocalStatus, approval: ApprovalStatus, };
+export type AiStatus = { activeProvider: ProviderKind | null, reasoningSupported: ReasoningSupport, 
+/**
+ * What reasoning control the UI should render for the selected model, and
+ * nothing more. `reasoning_supported` stays because it answers a different
+ * question — *can* this model reason, which is what the send path fails open
+ * on — while this answers *what may the user choose*, which fails closed.
+ *
+ * Everything the control renders is in this value; the frontend derives no
+ * part of it, and in particular never invents a menu.
+ */
+reasoningControl: ReasoningControl, openrouter: OpenRouterStatus, local: LocalStatus, approval: ApprovalStatus, };

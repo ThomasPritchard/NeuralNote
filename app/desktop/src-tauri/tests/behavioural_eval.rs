@@ -108,6 +108,7 @@ async fn run_case(
         },
         app_data_bin_dir: std::path::PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     let skill_services = SkillServices::new(
         &registry,
@@ -365,7 +366,7 @@ async fn openrouter_behavioural_eval() {
     };
 
     let vault = fixture_vault();
-    let client = desktop_lib::OpenAiChatClient::new(api_key, false);
+    let client = desktop_lib::OpenAiChatClient::new(api_key, None);
     run_five_cases(vault.path(), neuralnote_core::ai::DEFAULT_MODEL, &client).await;
 }
 

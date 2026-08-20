@@ -12,7 +12,12 @@ import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { vi } from "vitest";
 import * as api from "../lib/api";
-import type { AiStatus, ChatEvent, ReasoningSupport } from "../lib/types";
+import type {
+  AiStatus,
+  ChatEvent,
+  ReasoningControl,
+  ReasoningSupport,
+} from "../lib/types";
 import { ChatPane } from "./ChatPane";
 import { ALWAYS_ASK_APPROVAL_STATUS } from "../lib/approvalStatusFixture";
 
@@ -30,27 +35,52 @@ export const SECOND_TURN_ID = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e22";
 // ── AiStatus builders (the three effective-provider shapes the pane branches on) ──
 // `reasoningSupported` defaults to "unknown": no model has been probed, and
 // "unknown" is the fail-open verdict that leaves the reasoning toggle enabled.
+// `reasoningControl` follows it exactly as the shell derives it — an unanswered
+// probe is "pending" (never a guessed menu), and no provider at all is "hidden".
 export const unconfigured = (): AiStatus => ({
   activeProvider: null,
   reasoningSupported: "unknown",
-  openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false },
+  reasoningControl: { kind: "hidden" },
+  openrouter: {
+    hasKey: false,
+    model: DEFAULT_MODEL,
+    reasoning: false,
+    reasoningEffort: null,
+  },
   local: { activeModelTag: null },
   approval: ALWAYS_ASK_APPROVAL_STATUS,
 });
 export const openRouterActive = (
   model = DEFAULT_MODEL,
-  opts: { reasoning?: boolean; reasoningSupported?: ReasoningSupport } = {},
+  opts: {
+    reasoning?: boolean;
+    reasoningSupported?: ReasoningSupport;
+    reasoningControl?: ReasoningControl;
+    reasoningEffort?: string | null;
+  } = {},
 ): AiStatus => ({
   activeProvider: "openRouter",
   reasoningSupported: opts.reasoningSupported ?? "unknown",
-  openrouter: { hasKey: true, model, reasoning: opts.reasoning ?? false },
+  reasoningControl: opts.reasoningControl ?? { kind: "pending" },
+  openrouter: {
+    hasKey: true,
+    model,
+    reasoning: opts.reasoning ?? false,
+    reasoningEffort: opts.reasoningEffort ?? null,
+  },
   local: { activeModelTag: null },
   approval: ALWAYS_ASK_APPROVAL_STATUS,
 });
 export const localActive = (tag: string | null): AiStatus => ({
   activeProvider: "local",
   reasoningSupported: "unknown",
-  openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false },
+  reasoningControl: { kind: "pending" },
+  openrouter: {
+    hasKey: false,
+    model: DEFAULT_MODEL,
+    reasoning: false,
+    reasoningEffort: null,
+  },
   local: { activeModelTag: tag },
   approval: ALWAYS_ASK_APPROVAL_STATUS,
 });
@@ -118,14 +148,15 @@ export const CITED_RUN: ChatEvent[] = [
     arguments: '{"query":"active recall"}',
     stepId: null,
   },
-  { type: "searching", query: "active recall" },
-  { type: "retrieved", query: "active recall", hitCount: 3 },
+  { type: "searching", query: "active recall", callId: "call-search" },
+  { type: "retrieved", query: "active recall", hitCount: 3, callId: "call-search" },
   {
     type: "toolResult",
     id: "call-search",
     status: "ok",
     summary: "3 spans",
     detail: null,
+    durationMs: 0,
   },
   {
     type: "toolCall",
@@ -135,13 +166,14 @@ export const CITED_RUN: ChatEvent[] = [
     arguments: '{"rel_path":"Spaced-Repetition.md","start_line":12,"end_line":28}',
     stepId: null,
   },
-  { type: "reading", relPath: "Spaced-Repetition.md", startLine: 12, endLine: 28 },
+  { type: "reading", relPath: "Spaced-Repetition.md", startLine: 12, endLine: 28, callId: "call-read" },
   {
     type: "toolResult",
     id: "call-read",
     status: "ok",
     summary: "Spaced-Repetition.md:12–28",
     detail: null,
+    durationMs: 0,
   },
   { type: "verifying" },
   { type: "answer", delta: "Active recall " },

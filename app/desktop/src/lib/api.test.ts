@@ -55,6 +55,7 @@ import {
   selectOpenRouterModel,
   setActiveProvider,
   setReasoning,
+  setReasoningEffort,
   setSkillEnabled,
   setMenuEditing,
   undoSkillRun,
@@ -103,7 +104,8 @@ describe("errorMessage", () => {
 const makeStatus = (model: string, reasoning: boolean): AiStatus => ({
   activeProvider: "openRouter",
   reasoningSupported: "unknown",
-  openrouter: { hasKey: true, model, reasoning },
+  reasoningControl: { kind: "pending" },
+  openrouter: { hasKey: true, model, reasoning, reasoningEffort: null },
   local: { activeModelTag: null },
   approval: ALWAYS_ASK_APPROVAL_STATUS,
 });
@@ -137,6 +139,24 @@ describe("AI config mutation sequencing", () => {
     });
     resolveModel(makeStatus("vendor/new", false));
     await expect(second).resolves.toEqual(makeStatus("vendor/new", false));
+  });
+
+  it("sends the chosen effort verbatim and takes its turn in the mutation queue", async () => {
+    // The value came off the model's own menu, so the transport must not
+    // normalise it on the way out — 21 distinct menus exist and any casing rule
+    // of ours would be wrong for some of them.
+    const chosen = makeStatus("vendor/current", true);
+    mockInvoke.mockResolvedValue(chosen as never);
+
+    await expect(setReasoningEffort("xHigh")).resolves.toEqual(chosen);
+    await expect(setReasoningEffort(null)).resolves.toEqual(chosen);
+
+    expect(mockInvoke.mock.calls).toEqual([
+      ["set_reasoning_effort", { effort: "xHigh" }],
+      // `null` clears the effort back to the model's own default; it is a real
+      // value here, never an omitted argument.
+      ["set_reasoning_effort", { effort: null }],
+    ]);
   });
 
   it("keeps provider selection and its status read inside the same mutation slot", async () => {

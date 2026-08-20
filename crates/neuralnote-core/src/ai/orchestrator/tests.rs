@@ -1,5 +1,5 @@
 use super::citations::{extract_cited_ids, strip_cited_markers};
-use super::collect::{EvidenceCollection, RETRY_BACKOFF};
+use super::collect::{round_beacon, EvidenceCollection, RETRY_BACKOFF};
 use super::context_budget::{
     context_window_tokens, estimate_tokens, fit_prompt_to_window, total_tokens,
     ANSWER_RESERVE_TOKENS, LOCAL_CONTEXT_WINDOW_TOKENS, PROMPT_OVERHEAD_TOKENS,
@@ -12,7 +12,7 @@ use super::*;
 use crate::ai::approval::{
     ApprovalMode, ApprovalPolicy, DenyingApprovalPrompt, UnavailableApprovalClassifier,
 };
-use crate::ai::events::{TokenUsage, ToolStatus, VecSink};
+use crate::ai::events::{PlaylistPosition, TokenUsage, ToolStatus, VecSink};
 use crate::ai::evidence::EvidenceRegistry;
 use crate::ai::llm::{Completion, LlmRequest, NoUserPrompt, Role, ToolCall, UserPrompt};
 use crate::ai::local::HardwareSpec;
@@ -631,6 +631,7 @@ fn youtube_test_environment() -> SkillEnvironment {
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
+        unusable_binaries: Default::default(),
     }
 }
 
@@ -694,6 +695,7 @@ fn playlist_orchestrator_processes_21_transcripts_with_bounded_context_and_full_
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
+        unusable_binaries: Default::default(),
     };
     let pricing = PricingInput::Local;
     let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
@@ -784,6 +786,349 @@ fn playlist_orchestrator_processes_21_transcripts_with_bounded_context_and_full_
     assert_eq!(completion_requests.len(), 22);
 }
 
+/// A playlist run whose beacons can be read: three videos, two writes each.
+fn run_three_video_playlist() -> Vec<ChatEvent> {
+    let vault = tempfile::tempdir().unwrap();
+    let selected = (0..3)
+        .map(|index| format!("V{index:010}"))
+        .collect::<Vec<_>>();
+    let prompt = PlaylistPrompt(Mutex::new(VecDeque::from([
+        Some(selected.clone()),
+        Some(vec!["continue".into()]),
+    ])));
+    let mut script = vec![tool_call(
+        "select",
+        "select_playlist_videos",
+        r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-orchestrator_3"}"#,
+    )];
+    for (work_item, video_id) in selected.iter().enumerate() {
+        script.push(Completion {
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: format!("literature-{work_item}"),
+                    name: "write_note".into(),
+                    arguments: serde_json::json!({
+                        "rel_path": format!("literature-{work_item}.md"),
+                        "content": format!("# Lecture {work_item}\n\nDistilled from {video_id}."),
+                        "kind": "literature",
+                        "work_item": work_item,
+                    })
+                    .to_string(),
+                },
+                ToolCall {
+                    id: format!("transcript-{work_item}"),
+                    name: "write_note".into(),
+                    arguments: serde_json::json!({
+                        "rel_path": format!("transcript-{work_item}.md"),
+                        "content": realistic_transcript(video_id),
+                        "kind": "transcript",
+                        "work_item": work_item,
+                    })
+                    .to_string(),
+                },
+            ],
+        });
+    }
+    let llm = MockLlmClient::new(script, "Playlist complete.");
+    let retriever = KeywordRetriever::new(vault.path());
+    let skills = SkillRegistry::built_in(&[]).unwrap();
+    let environment = youtube_test_environment();
+    let pricing = PricingInput::Local;
+    let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+        .with_approval(
+            unattended_policy(),
+            &TEST_APPROVAL_PROMPT,
+            &TEST_APPROVAL_CLASSIFIER,
+        )
+        .with_youtube_io(&PlaylistIo(3))
+        .with_pricing(&pricing);
+    let mut sink = VecSink::default();
+    block_on(run_chat(
+        "Distil this playlist",
+        &[],
+        vec![YOUTUBE_DISTIL_SKILL_ID.into()],
+        vault.path(),
+        "test-model",
+        &retriever,
+        &llm,
+        &services,
+        &mut sink,
+        &Guards::default(),
+    ))
+    .unwrap();
+    sink.events
+}
+
+/// A playlist whose videos can actually be looked up, so `fetch_video_info`
+/// reaches metadata and emits a preview. The thumbnail is deliberately absent:
+/// the degraded card is the path a playlist run most often takes and it must not
+/// change the ordering being asserted.
+struct PreviewPlaylistIo;
+
+#[async_trait]
+impl YoutubeIo for PreviewPlaylistIo {
+    async fn inspect_metadata(&self, url: &YoutubeUrl) -> Result<MetadataPayload, CaptureError> {
+        let video_id = url.video_id().expect("the script only sends watch URLs");
+        Ok(MetadataPayload {
+            json: serde_json::to_vec(&serde_json::json!({
+                "id": video_id.as_ref(),
+                "title": format!("Realistic lecture {}", video_id.as_ref()),
+                "uploader": "Test channel",
+                "duration": 3600,
+                "subtitles": {"en": [{"ext": "vtt"}]},
+                "automatic_captions": {},
+            }))
+            .unwrap(),
+            annotations: Vec::new(),
+        })
+    }
+
+    async fn fetch_caption_vtt(
+        &self,
+        _request: &CaptionRequest,
+    ) -> Result<CaptionPayload, CaptureError> {
+        Err(CaptureError::CaptionsAbsent("unused in this script".into()))
+    }
+
+    async fn enumerate_playlist(&self, _url: &YoutubeUrl) -> Result<PlaylistPayload, CaptureError> {
+        let entries = (0..3)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("V{index:010}"),
+                    "title": format!("Realistic lecture {index}"),
+                    "duration": 3600,
+                })
+            })
+            .collect::<Vec<_>>();
+        Ok(PlaylistPayload {
+            json: serde_json::to_vec(&serde_json::json!({
+                "_type": "playlist",
+                "id": "PL-preview_3",
+                "title": "Three lectures",
+                "entries": entries,
+            }))
+            .unwrap(),
+        })
+    }
+
+    async fn fetch_thumbnail(&self, _video_id: &VideoId) -> Result<ThumbnailPayload, CaptureError> {
+        Err(CaptureError::ThumbnailRejected(
+            "fixture has no image".into(),
+        ))
+    }
+
+    async fn transcribe_audio(
+        &self,
+        _url: &YoutubeUrl,
+        _model: &str,
+        _cancellation: &CaptureCancellation,
+    ) -> Result<CaptionPayload, CaptureError> {
+        Err(CaptureError::TranscriptionFailed(
+            "unused in this script".into(),
+        ))
+    }
+
+    async fn update_extractor(&self) -> Result<(), CaptureError> {
+        Err(CaptureError::ExtractorStale("unused in this script".into()))
+    }
+}
+
+/// Three videos, looked up and written the way a greedy model actually behaves:
+/// the round that finishes one video's notes ALSO reaches for the next video's
+/// details in the same batch. That is the shape that can carry a lookup past the
+/// item its beacon named, so it is the shape the ordering has to survive — the
+/// batch guard turns the greedy trailing call into a stale skip, and the honest
+/// re-issue in the next round is where the preview actually comes from.
+fn run_three_video_playlist_with_lookups() -> Vec<ChatEvent> {
+    let vault = tempfile::tempdir().unwrap();
+    let selected = (0..3)
+        .map(|index| format!("V{index:010}"))
+        .collect::<Vec<_>>();
+    let prompt = PlaylistPrompt(Mutex::new(VecDeque::from([Some(selected.clone())])));
+    let lookup = |work_item: usize, video_id: &str, suffix: &str| {
+        tool_call(
+            &format!("info-{work_item}{suffix}"),
+            "fetch_video_info",
+            &serde_json::json!({
+                "url": format!("https://www.youtube.com/watch?v={video_id}"),
+            })
+            .to_string(),
+        )
+    };
+    let mut script = vec![tool_call(
+        "select",
+        "select_playlist_videos",
+        r#"{"playlist_url":"https://www.youtube.com/playlist?list=PL-preview_3"}"#,
+    )];
+    script.push(lookup(0, &selected[0], ""));
+    for (work_item, video_id) in selected.iter().enumerate() {
+        let mut calls = vec![
+            ToolCall {
+                id: format!("literature-{work_item}"),
+                name: "write_note".into(),
+                arguments: serde_json::json!({
+                    "rel_path": format!("literature-{work_item}.md"),
+                    "content": format!("# Lecture {work_item}\n\nDistilled from {video_id}."),
+                    "kind": "literature",
+                    "work_item": work_item,
+                })
+                .to_string(),
+            },
+            ToolCall {
+                id: format!("transcript-{work_item}"),
+                name: "write_note".into(),
+                arguments: serde_json::json!({
+                    "rel_path": format!("transcript-{work_item}.md"),
+                    "content": realistic_transcript(video_id),
+                    "kind": "transcript",
+                    "work_item": work_item,
+                })
+                .to_string(),
+            },
+        ];
+        // The greedy trailing lookup, and then the re-issue the model makes after
+        // being told the batch went stale.
+        if let Some(next) = selected.get(work_item + 1) {
+            calls.push(lookup(work_item + 1, next, "-greedy").tool_calls.remove(0));
+        }
+        script.push(Completion {
+            content: None,
+            tool_calls: calls,
+        });
+        if let Some(next) = selected.get(work_item + 1) {
+            script.push(lookup(work_item + 1, next, ""));
+        }
+    }
+    let llm = MockLlmClient::new(script, "Playlist complete.");
+    let retriever = KeywordRetriever::new(vault.path());
+    let skills = SkillRegistry::built_in(&[]).unwrap();
+    let environment = youtube_test_environment();
+    let pricing = PricingInput::Local;
+    let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
+        .with_approval(
+            unattended_policy(),
+            &TEST_APPROVAL_PROMPT,
+            &TEST_APPROVAL_CLASSIFIER,
+        )
+        .with_youtube_io(&PreviewPlaylistIo)
+        .with_pricing(&pricing);
+    let mut sink = VecSink::default();
+    block_on(run_chat(
+        "Distil this playlist",
+        &[],
+        vec![YOUTUBE_DISTIL_SKILL_ID.into()],
+        vault.path(),
+        "test-model",
+        &retriever,
+        &llm,
+        &services,
+        &mut sink,
+        &Guards::default(),
+    ))
+    .unwrap();
+    sink.events
+}
+
+#[test]
+fn a_playlist_preview_is_never_retired_by_the_beacon_that_follows_it() {
+    // `VideoPreview` carries no playlist position: the consumer reads that number
+    // off `PlanningRound` and retires a preview the moment a beacon names a
+    // DIFFERENT item. So a preview emitted for a video the next beacon has
+    // already moved past would blink out immediately — a card that appears and
+    // vanishes rather than one that never appeared, which is the worse bug.
+    //
+    // The guarantee is not held here. It is held by `handle_tool_calls` closing
+    // a batch the instant the playlist item advances, so no `fetch_video_info`
+    // can ever run for an item the round's beacon did not name. This test is what
+    // goes red if that guard is loosened.
+    let events = run_three_video_playlist_with_lookups();
+
+    let mut in_flight: Option<PlaylistPosition> = None;
+    let mut checked = 0usize;
+    let mut previewed: Option<PlaylistPosition> = None;
+    for event in &events {
+        match event {
+            ChatEvent::PlanningRound { playlist, .. } => {
+                if let Some(at_preview) = previewed.take() {
+                    // A finished playlist clearing the card is correct — the item
+                    // really is over. Naming a different item is not.
+                    assert!(
+                        playlist.is_none() || *playlist == Some(at_preview),
+                        "a preview raised at {at_preview:?} was retired by a beacon naming {playlist:?}"
+                    );
+                    checked += 1;
+                }
+                in_flight = *playlist;
+            }
+            ChatEvent::VideoPreview { .. } => {
+                previewed = in_flight;
+                assert!(
+                    in_flight.is_some(),
+                    "a preview during a playlist must follow a beacon that names its item"
+                );
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::VideoPreview { .. }))
+            .count(),
+        3,
+        "one preview per video, or this test proved nothing: {events:?}"
+    );
+    assert_eq!(checked, 3, "every preview must be followed by a beacon");
+}
+
+#[test]
+fn a_playlist_round_beacon_names_the_video_it_is_working_on() {
+    // A playlist bypasses the iteration guard by design, so `round N of
+    // max_rounds` runs past its ceiling and the clamp pins the pair at "one
+    // round from done" for the rest of the run. The playlist's own length is
+    // the denominator that cannot move — it was fixed when the user chose the
+    // videos — so during a playlist the beacon says which video is in flight
+    // and the head counts videos instead of rounds.
+    let events = run_three_video_playlist();
+
+    let positions = events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::PlanningRound { playlist, .. } => Some(*playlist),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+
+    assert!(positions.len() > 3, "one beacon per round: {positions:?}");
+    // The first round is the one that DECIDES the selection, so no playlist
+    // exists yet and the beacon says so rather than guessing "video 1 of ?".
+    assert_eq!(positions[0], None);
+    let during = &positions[1..];
+    assert!(
+        during.iter().all(|position| position.is_some()),
+        "every round after the selection names its video: {positions:?}"
+    );
+    let numbered = during.iter().flatten().collect::<Vec<_>>();
+    assert!(
+        numbered
+            .iter()
+            .all(|position| position.total == 3 && (1..=3).contains(&position.position)),
+        "1-based and never past a denominator that cannot move: {numbered:?}"
+    );
+    assert!(
+        numbered
+            .windows(2)
+            .all(|pair| pair[0].position <= pair[1].position),
+        "a playlist only ever moves forward: {numbered:?}"
+    );
+    assert_eq!(
+        numbered.last().map(|position| position.position),
+        Some(3),
+        "the run reaches the last video: {numbered:?}"
+    );
+}
+
 #[test]
 fn playlist_cancellation_inside_a_batched_turn_skips_later_calls_and_keeps_partial_ledger() {
     let vault = tempfile::tempdir().unwrap();
@@ -832,6 +1177,7 @@ fn playlist_cancellation_inside_a_batched_turn_skips_later_calls_and_keeps_parti
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
+        unusable_binaries: Default::default(),
     };
     let cancellation = CaptureCancellation::default();
     let writer = CancellingWriter(cancellation.clone());
@@ -961,6 +1307,7 @@ fn rejected_playlist_batch_cannot_cascade_into_the_next_work_item() {
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
+        unusable_binaries: Default::default(),
     };
     let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
         .with_approval(
@@ -1527,6 +1874,7 @@ fn run_with_provider_and_cancellation(
         },
         app_data_bin_dir: std::path::PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     let services = SkillServices::new(
         &skills,
@@ -1628,6 +1976,7 @@ fn run_metered(root: &Path, llm: &MeteredLlm) -> Vec<ChatEvent> {
         },
         app_data_bin_dir: std::path::PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     let services = SkillServices::new(
         &skills,
@@ -2229,6 +2578,7 @@ fn terminal_skill_recovery_finishes_every_parallel_tool_result_before_stopping()
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     let calls = vec![
         ToolCall {
@@ -2445,10 +2795,17 @@ fn happy_path_searches_reads_and_emits_a_verified_citation() {
     let events = run(v.path(), &mock, &Guards::default());
 
     assert!(matches!(events.first(), Some(ChatEvent::Processing)));
-    // One beacon for the accepted run, then one more before each tool-deciding
-    // turn (#126) — never one per row of anything. Counted from the turns the
-    // mock was actually asked for rather than written as a number, so the
-    // bound is on the RATE rather than on this script's length.
+    // `Processing` means "the run was accepted" and says it exactly once. The
+    // per-round beacon is `PlanningRound`, which carries a round number and so
+    // cannot read as a fresh start when it repeats.
+    assert_eq!(
+        count(&events, |event| matches!(event, ChatEvent::Processing)),
+        1
+    );
+    // One round beacon before each tool-deciding turn (#126) — never one per row
+    // of anything. Counted from the turns the mock was actually asked for rather
+    // than written as a number, so the bound is on the RATE rather than on this
+    // script's length.
     //
     // What it does NOT bound is beacons per ATTEMPT. Nothing in this run
     // fails, so one `complete` call is one turn is one round-trip, and a
@@ -2458,12 +2815,34 @@ fn happy_path_searches_reads_and_emits_a_verified_citation() {
     // `a_streamed_tool_turn_that_failed_before_emitting_is_still_retried_once`,
     // which retries once and still admits exactly one.
     assert_eq!(
-        count(&events, |event| matches!(event, ChatEvent::Processing)),
-        1 + mock.completion_requests().len()
+        count(&events, |event| matches!(
+            event,
+            ChatEvent::PlanningRound { .. }
+        )),
+        mock.completion_requests().len()
     );
+    // The rounds count up from 1 and never restart, and no round ever exceeds
+    // the ceiling it was measured against.
+    let rounds: Vec<(u32, u32)> = events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::PlanningRound {
+                round, max_rounds, ..
+            } => Some((*round, *max_rounds)),
+            _ => None,
+        })
+        .collect();
+    for (index, (round, max_rounds)) in rounds.iter().enumerate() {
+        assert_eq!(
+            *round,
+            u32::try_from(index).unwrap() + 1,
+            "rounds are 1-based and strictly increasing: {rounds:?}"
+        );
+        assert!(round <= max_rounds, "round {round} of {max_rounds}");
+    }
     assert!(events
         .iter()
-        .any(|e| matches!(e, ChatEvent::Searching { query } if query == "components")));
+        .any(|e| matches!(e, ChatEvent::Searching { query, .. } if query == "components")));
     assert!(events
         .iter()
         .any(|e| matches!(e, ChatEvent::Retrieved { hit_count, .. } if *hit_count == 1)));
@@ -2471,7 +2850,7 @@ fn happy_path_searches_reads_and_emits_a_verified_citation() {
     // quotes line 1 alone and reports the range it actually carries (PA-003) — the
     // timeline shows what was read, never a wider claim than the evidence.
     assert!(events.iter().any(
-        |e| matches!(e, ChatEvent::Reading { rel_path, start_line, end_line }
+        |e| matches!(e, ChatEvent::Reading { rel_path, start_line, end_line, .. }
         if rel_path == "Research/widgets.md" && *start_line == 1 && *end_line == 1)
     ));
     assert!(events.iter().any(|e| matches!(e, ChatEvent::Verifying)));
@@ -2490,7 +2869,7 @@ fn happy_path_searches_reads_and_emits_a_verified_citation() {
     // Event ordering: search cue precedes retrieval; verify precedes citation.
     let pos = |pred: fn(&ChatEvent) -> bool| events.iter().position(pred).unwrap();
     assert!(
-        pos(|e| matches!(e, ChatEvent::Processing))
+        pos(|e| matches!(e, ChatEvent::PlanningRound { .. }))
             < pos(|e| matches!(e, ChatEvent::Searching { .. }))
     );
     assert!(
@@ -3090,7 +3469,7 @@ fn folder_scoped_search_flows_through_the_loop() {
     let events = run(v.path(), &mock, &Guards::default());
     assert!(events
         .iter()
-        .any(|e| matches!(e, ChatEvent::Searching { query } if query == "components")));
+        .any(|e| matches!(e, ChatEvent::Searching { query, .. } if query == "components")));
     assert!(events.iter().any(|e| matches!(
         e,
         ChatEvent::Citation { rel_path, .. } if rel_path == "Research/widgets.md"
@@ -3382,6 +3761,7 @@ fn local_run_reports_budget_loss_and_never_front_truncates_grounding() {
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     let services = SkillServices::new(
         &skills,
@@ -3461,6 +3841,7 @@ fn run_budgeted_turn(model: &str, llm: &MockLlmClient) -> (Vec<Vec<LlmMessage>>,
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     let services = SkillServices::new(
         &skills,
@@ -3579,6 +3960,7 @@ fn retry_env() -> RetryEnv {
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     RetryEnv {
         _vault: vault,
@@ -3875,7 +4257,7 @@ impl LlmClient for StreamingToolLlm {
     }
 }
 
-fn run_streamed_tool_turn(llm: &StreamingToolLlm) -> (CoreResult<Completion>, VecSink) {
+fn run_streamed_tool_turn(llm: &dyn LlmClient) -> (CoreResult<Completion>, VecSink) {
     let env = retry_env();
     let services = SkillServices::new(
         &env.skills,
@@ -3895,6 +4277,50 @@ fn run_streamed_tool_turn(llm: &StreamingToolLlm) -> (CoreResult<Completion>, Ve
     let mut sink = VecSink::default();
     let result = block_on(session.complete_tool_turn(&tool_decision_request(), &mut sink));
     (result, sink)
+}
+
+#[test]
+fn a_run_past_its_ceiling_still_never_announces_a_round_above_it() {
+    // The invariant measured at the configuration that can actually break it.
+    // The happy-path assertion runs a script with no playlist and no skill
+    // activation, so `consumed` never approaches the ceiling there and that
+    // assertion only ever sees the passing case.
+    //
+    // The playlist path bypasses the iteration guard entirely
+    // (`iteration_guard_reached` is false while a playlist is active), and each
+    // item may spend up to MAX_PLAYLIST_TURNS_PER_ITEM turns, so a multi-video
+    // playlist runs well past the ceiling by design.
+    //
+    // `ActiveSkills::max_iterations` cannot be the raw denominator there: it
+    // seeds its fold at `base.max(consumed)` — a FLOOR protecting history from a
+    // late activation, not a ceiling — so once `consumed` passes every declared
+    // cap it returns `consumed` itself, one BELOW the round being announced.
+    // "Round 17 of 16" is arithmetically impossible and reads as a bug; worse,
+    // the denominator would then chase the numerator forever, telling the user
+    // the run is permanently one round from finishing.
+    //
+    // A playlist now travels its own honest pair beside these two
+    // (`a_playlist_round_beacon_names_the_video_it_is_working_on`), so the
+    // clamp is no longer what a playlist user reads. It stays as the backstop
+    // for every other way `consumed` can reach the ceiling — measured here with
+    // no playlist position at all, which is precisely the case with nothing
+    // else to fall back on.
+    let base_ceiling = Guards::default().max_iterations;
+    let skill_ceiling = 16;
+    for consumed in 0..(base_ceiling + skill_ceiling + 8) {
+        // Exactly what `collect_evidence` passes, floor included.
+        let max_iterations = base_ceiling.max(skill_ceiling).max(consumed);
+        let ChatEvent::PlanningRound {
+            round, max_rounds, ..
+        } = round_beacon(consumed, max_iterations, None)
+        else {
+            panic!("round_beacon announces a round");
+        };
+        assert!(
+            round <= max_rounds,
+            "round {round} of {max_rounds} at consumed={consumed}"
+        );
+    }
 }
 
 #[test]
@@ -3930,16 +4356,147 @@ fn a_streamed_tool_turn_that_failed_before_emitting_is_still_retried_once() {
 
     assert!(result.is_err(), "both attempts failed");
     assert_eq!(llm.attempts(), 2, "retried exactly once");
-    // This used to read `sink.events.is_empty()`. The turn now opens by saying
-    // the run is working (#126), and that beacon must NOT be mistaken for
-    // something a replay could rewind — if it were counted as an emission, the
-    // retry above would silently stop happening. So the claim is stated
-    // precisely instead of loosened: the provider published nothing across BOTH
-    // attempts, and the beacon went out once for the call rather than per try.
+    // The round beacon (`PlanningRound`) is emitted by `collect_evidence` BEFORE
+    // this call, so it is outside the retry guard by construction rather than by
+    // statement order — the turn itself publishes nothing at all. That pairing is
+    // what keeps the retry alive: put any emission back inside the loop and
+    // `sink.emitted` latches, the retry above silently stops happening, and the
+    // `attempts == 2` assertion goes red.
+    assert!(
+        sink.events.is_empty(),
+        "the turn published nothing across BOTH attempts, got {:?}",
+        sink.events
+    );
+}
+
+#[test]
+fn reasoning_does_count_as_something_the_user_has_seen_and_costs_the_turn_its_retry() {
+    // The deliberate counterpart to the keepalive exemption below, and the
+    // reason it is a separate exemption rather than a general one.
+    //
+    // The tool turn now streams reasoning, and reasoning is NOT contentless: a
+    // replay does not repeat what the user already read, it appends a second
+    // monologue to the same round's buffer with nothing on screen marking the
+    // boundary — one train of thought the model never had. So it latches the
+    // guard, like every other visible event, and this turn spends its retry.
+    //
+    // The cost is real and is stated here rather than discovered later: a
+    // mid-stream socket drop on a reasoning-enabled run is no longer retried.
+    // What survives is every failure that happens BEFORE the first frame — the
+    // whole 429/5xx/408 and connect-timeout class the retry was written for
+    // (see `a_streamed_tool_turn_that_failed_before_emitting_is_still_retried_once`),
+    // and the full turn for a user who did not opt into reasoning.
+    struct ReasoningThenFailingToolTurn {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for ReasoningThenFailingToolTurn {
+        async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+            panic!("a client that streams tool turns must not fall back to the buffered one")
+        }
+
+        async fn complete_tool_streaming(
+            &self,
+            _req: &LlmRequest,
+            sink: &mut dyn EventSink,
+        ) -> CoreResult<Completion> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            sink.send(ChatEvent::Thinking {
+                delta: "The user wants".into(),
+            });
+            Err(CoreError::Llm(
+                "openrouter returned 429 Too Many Requests".into(),
+            ))
+        }
+
+        async fn complete_streaming(
+            &self,
+            _req: &LlmRequest,
+            _sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            panic!("the answer turn is not reached")
+        }
+    }
+
+    let llm = ReasoningThenFailingToolTurn {
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+    };
+
+    let (result, sink) = run_streamed_tool_turn(&llm);
+
+    assert!(result.is_err(), "the failure is surfaced, not swallowed");
+    assert_eq!(
+        llm.attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "reasoning was on screen, so there is no replay"
+    );
     assert_eq!(
         sink.events,
-        vec![ChatEvent::Processing],
-        "only the beacon, and only one of it"
+        vec![ChatEvent::Thinking {
+            delta: "The user wants".into()
+        }],
+        "the one attempt's reasoning reached the user exactly once"
+    );
+}
+
+#[test]
+fn a_keepalive_does_not_count_as_something_the_user_has_seen() {
+    // The tool turn forwards keepalives now, because it is the turn whose
+    // silence the live head has to explain. That must not quietly cost the turn
+    // its one bounded retry: a keepalive carries no content, renders nothing on
+    // its own, and a second one says exactly what the first did — so a replay
+    // has nothing to rewind. This is the same exemption `record_usage` already
+    // has, measured on the retry rather than on the guard's private field.
+    struct KeepaliveThenFailingToolTurn {
+        attempts: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait]
+    impl LlmClient for KeepaliveThenFailingToolTurn {
+        async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+            panic!("a client that streams tool turns must not fall back to the buffered one")
+        }
+
+        async fn complete_tool_streaming(
+            &self,
+            _req: &LlmRequest,
+            sink: &mut dyn EventSink,
+        ) -> CoreResult<Completion> {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            sink.send(ChatEvent::Keepalive);
+            Err(CoreError::Llm(
+                "openrouter returned 429 Too Many Requests".into(),
+            ))
+        }
+
+        async fn complete_streaming(
+            &self,
+            _req: &LlmRequest,
+            _sink: &mut dyn EventSink,
+        ) -> CoreResult<String> {
+            panic!("the answer turn is not reached")
+        }
+    }
+
+    let llm = KeepaliveThenFailingToolTurn {
+        attempts: std::sync::atomic::AtomicUsize::new(0),
+    };
+
+    let (result, sink) = run_streamed_tool_turn(&llm);
+
+    assert!(result.is_err(), "both attempts failed");
+    assert_eq!(
+        llm.attempts.load(std::sync::atomic::Ordering::SeqCst),
+        2,
+        "retried exactly once despite the keepalive"
+    );
+    assert_eq!(
+        sink.events,
+        vec![ChatEvent::Keepalive, ChatEvent::Keepalive],
+        "each attempt's liveness signal still reaches the user"
     );
 }
 
@@ -4037,12 +4594,15 @@ fn an_answered_question_is_followed_by_a_beacon_rather_than_silence() {
                 if id == "prompt" && *status == ToolStatus::Ok)
         })
         .expect("the answered question settles");
-    assert_eq!(
-        events.get(settled + 1),
-        Some(&ChatEvent::Processing),
+    assert!(
+        matches!(
+            events.get(settled + 1),
+            Some(ChatEvent::PlanningRound { round: 2, .. })
+        ),
         "a full provider round-trip starts here, and nothing else can be \
          emitted during it — so without a beacon the pane keeps showing \
-         whichever phase word it last had. Got: {:?}",
+         whichever phase word it last had. It names its round, so the second \
+         one cannot read as the run starting over. Got: {:?}",
         &events[settled..],
     );
     assert!(
@@ -4119,7 +4679,7 @@ impl LlmClient for UnstreamableToolLlm {
 }
 
 #[test]
-fn a_turn_the_provider_reruns_buffered_still_gets_one_beacon_before_both_round_trips() {
+fn a_turn_the_provider_reruns_buffered_publishes_nothing_between_its_round_trips() {
     let env = retry_env();
     let services = SkillServices::new(
         &env.skills,
@@ -4146,10 +4706,10 @@ fn a_turn_the_provider_reruns_buffered_still_gets_one_beacon_before_both_round_t
         2,
         "the worse case the issue names: this turn really did run twice"
     );
-    assert_eq!(
-        sink.events,
-        vec![ChatEvent::Processing],
-        "the beacon precedes the pair, so ONE covers both — and the two \
-         round-trips publish nothing else between them"
+    assert!(
+        sink.events.is_empty(),
+        "the caller's single `PlanningRound` covers both round-trips precisely \
+         because the pair publishes nothing of its own, got {:?}",
+        sink.events
     );
 }

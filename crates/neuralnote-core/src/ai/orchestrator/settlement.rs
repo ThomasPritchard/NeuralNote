@@ -7,6 +7,7 @@ use crate::ai::llm::{LlmMessage, ToolCall};
 use crate::ai::plan::RunPlan;
 use crate::ai::tool_registry;
 use crate::ai::tools::{self, ToolOutcome};
+use std::time::Instant;
 
 /// Bound on the `detail` text crossing the event wire. A tool result can be a
 /// whole transcript; the disclosure is a peek at one, not a copy of it.
@@ -176,15 +177,16 @@ impl RefusedCall {
 pub(super) fn settle_skipped(
     messages: &mut Vec<LlmMessage>,
     sink: &mut dyn EventSink,
-    call: &ToolCall,
+    dispatched: &Dispatched,
     skipped: SkippedCall,
 ) {
+    let call = dispatched.call;
     messages.push(LlmMessage::tool_result(
         &call.id,
         &call.name,
         skipped.tool_result_content(),
     ));
-    emit_tool_result(sink, &call.id, skipped.settlement());
+    emit_tool_result(sink, dispatched, skipped.settlement());
 }
 
 /// Announce a declared call before anything can go wrong with it. The title comes
@@ -194,7 +196,11 @@ pub(super) fn settle_skipped(
 /// The step affiliation is read off `plan` **here**, at dispatch, because that is
 /// when it is true. Resolving it later — at render, or from the plan's final state
 /// — would re-parent nodes every time a step moved.
-pub(super) fn emit_tool_call(sink: &mut dyn EventSink, call: &ToolCall, plan: &RunPlan) {
+pub(super) fn emit_tool_call<'a>(
+    sink: &mut dyn EventSink,
+    call: &'a ToolCall,
+    plan: &RunPlan,
+) -> Dispatched<'a> {
     sink.send(ChatEvent::ToolCall {
         id: call.id.clone(),
         name: call.name.clone(),
@@ -202,14 +208,52 @@ pub(super) fn emit_tool_call(sink: &mut dyn EventSink, call: &ToolCall, plan: &R
         arguments: call.arguments.clone(),
         step_id: plan.running_step_id().map(str::to_string),
     });
+    Dispatched {
+        call,
+        at: Instant::now(),
+    }
 }
 
-pub(super) fn emit_tool_result(sink: &mut dyn EventSink, id: &str, settlement: ToolSettlement) {
+/// A call that has been announced: which call it was, and when.
+///
+/// Returned by [`emit_tool_call`] and required by every settlement helper, which
+/// buys two invariants for one parameter. The settling event can only carry the
+/// id of the call that was actually dispatched — "exactly one `ToolResult` per
+/// `ToolCall`, correlated on `id`" stops depending on two call sites passing the
+/// same string. And `duration_ms` can only ever measure dispatch → settlement,
+/// never whichever clock happened to be in scope.
+///
+/// Reading a monotonic clock is a measurement, not a timer: the core still owns
+/// no waiting.
+// `must_use` catches an outright discard, which is the accident worth catching
+// cheaply. It cannot catch a bind-and-never-settle — "exactly one ToolResult per
+// ToolCall" is held by the per-call loop settling on every branch, not by this.
+#[must_use = "the settlement helpers need this, so discarding it strands the call"]
+pub(super) struct Dispatched<'a> {
+    call: &'a ToolCall,
+    at: Instant,
+}
+
+impl Dispatched<'_> {
+    /// Milliseconds since dispatch, saturating rather than wrapping. A run long
+    /// enough to overflow `u64` milliseconds cannot happen, but a silent wrap
+    /// would report a fast call, which is the one reading that would mislead.
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+}
+
+pub(super) fn emit_tool_result(
+    sink: &mut dyn EventSink,
+    dispatched: &Dispatched,
+    settlement: ToolSettlement,
+) {
     sink.send(ChatEvent::ToolResult {
-        id: id.to_string(),
+        id: dispatched.call.id.clone(),
         status: settlement.status,
         summary: settlement.summary,
         detail: settlement.detail,
+        duration_ms: dispatched.elapsed_ms(),
     });
 }
 
@@ -394,8 +438,13 @@ mod settlement_tests {
         ] {
             let mut messages = Vec::new();
             let mut sink = VecSink::default();
+            let call = call("search_notes");
+            let dispatched = Dispatched {
+                call: &call,
+                at: Instant::now(),
+            };
 
-            settle_skipped(&mut messages, &mut sink, &call("search_notes"), skipped);
+            settle_skipped(&mut messages, &mut sink, &dispatched, skipped);
 
             assert_eq!(messages.len(), 1, "the model needs one result per call");
             assert!(messages[0]
@@ -403,15 +452,26 @@ mod settlement_tests {
                 .as_deref()
                 .expect("a tool result always carries content")
                 .contains("skipped"));
-            assert_eq!(
-                sink.events,
-                vec![ChatEvent::ToolResult {
-                    id: "c1".into(),
-                    status: ToolStatus::Rejected,
-                    summary: None,
-                    detail: Some(skipped.reason().to_string()),
-                }]
-            );
+            // Matched field by field rather than compared whole: `duration_ms` is a
+            // real measurement, so pinning it to a number would be asserting the
+            // speed of the test machine.
+            let [ChatEvent::ToolResult {
+                id,
+                status,
+                summary,
+                detail,
+                duration_ms: _,
+            }] = sink.events.as_slice()
+            else {
+                panic!(
+                    "a skipped call settles its node exactly once: {:?}",
+                    sink.events
+                );
+            };
+            assert_eq!(id, "c1");
+            assert_eq!(*status, ToolStatus::Rejected);
+            assert_eq!(*summary, None);
+            assert_eq!(detail.as_deref(), Some(skipped.reason()));
         }
     }
 

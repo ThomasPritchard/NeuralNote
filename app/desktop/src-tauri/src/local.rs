@@ -459,6 +459,10 @@ fn kill_sidecar(sidecar: Option<OllamaSidecar>) {
 /// Build the local chat client with the effective reasoning flag. Ollama's
 /// OpenAI-compatible endpoint maps thinking onto `reasoning`, so a capable local
 /// model can stream thinking when the user opts in.
+///
+/// A **flag**, not an ask: Ollama's `/api/show` publishes a `thinking` capability
+/// and no effort menu, so this lane never has an effort to name. Taking a bool
+/// here makes that structural rather than a convention someone has to remember.
 pub fn ollama_chat_client(port: u16, reasoning: bool) -> crate::ai::OpenAiChatClient {
     crate::ai::OpenAiChatClient::new_with(
         format!("http://127.0.0.1:{port}/v1/chat/completions"),
@@ -467,7 +471,7 @@ pub fn ollama_chat_client(port: u16, reasoning: bool) -> crate::ai::OpenAiChatCl
         Duration::from_secs(10),
         Duration::from_secs(300),
         Some(OLLAMA_NUM_CTX),
-        reasoning,
+        reasoning.then_some(neuralnote_core::ai::openai::ReasoningAsk::Enabled),
     )
 }
 

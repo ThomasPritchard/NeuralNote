@@ -67,9 +67,9 @@ const emptySearch = (id: string, query: string): ChatEvent[] => [
     arguments: JSON.stringify({ query }),
     stepId: null,
   },
-  { type: "searching", query },
-  { type: "retrieved", query, hitCount: 0 },
-  { type: "toolResult", id, status: "ok", summary: "0 spans", detail: null },
+  { type: "searching", query, callId: null },
+  { type: "retrieved", query, hitCount: 0, callId: null },
+  { type: "toolResult", id, status: "ok", summary: "0 spans", detail: null, durationMs: 0 },
 ];
 
 /** One search that DID return spans, in the same frame order. No `reading`
@@ -84,9 +84,9 @@ const hitSearch = (id: string, query: string, hits: number): ChatEvent[] => [
     arguments: JSON.stringify({ query }),
     stepId: null,
   },
-  { type: "searching", query },
-  { type: "retrieved", query, hitCount: hits },
-  { type: "toolResult", id, status: "ok", summary: `${hits} spans`, detail: null },
+  { type: "searching", query, callId: null },
+  { type: "retrieved", query, hitCount: hits, callId: null },
+  { type: "toolResult", id, status: "ok", summary: `${hits} spans`, detail: null, durationMs: 0 },
 ];
 
 beforeEach(() => {
@@ -266,6 +266,7 @@ describe("ChatPane — chat view", () => {
         status: "cancelled",
         summary: null,
         detail: "YouTube capture was cancelled",
+        durationMs: 0,
       });
       emit({
         type: "partialRun",
@@ -477,8 +478,8 @@ describe("ChatPane — chat view", () => {
         arguments: '{"query":"recall"}',
         stepId: null,
       });
-      onEvent({ type: "searching", query: "recall" });
-      onEvent({ type: "toolResult", id: "call-0", status: "ok", summary: "3 spans", detail: null });
+      onEvent({ type: "searching", query: "recall", callId: null });
+      onEvent({ type: "toolResult", id: "call-0", status: "ok", summary: "3 spans", detail: null, durationMs: 0 });
       for (let n = 1; n <= 10; n++) {
         const relPath = `Note-${String(n).padStart(2, "0")}.md`;
         onEvent({
@@ -489,13 +490,14 @@ describe("ChatPane — chat view", () => {
           arguments: JSON.stringify({ rel_path: relPath, start_line: n, end_line: n + 3 }),
           stepId: null,
         });
-        onEvent({ type: "reading", relPath, startLine: n, endLine: n + 3 });
+        onEvent({ type: "reading", relPath, startLine: n, endLine: n + 3, callId: null });
         onEvent({
           type: "toolResult",
           id: `call-${n}`,
           status: "ok",
           summary: `${relPath}:${n}–${n + 3}`,
           detail: null,
+          durationMs: 0,
         });
       }
       return gate.promise; // never resolves → done stays false
@@ -535,9 +537,9 @@ describe("ChatPane — chat view", () => {
         arguments: '{"query":"spacing"}',
         stepId: null,
       },
-      { type: "searching", query: "spacing" },
-      { type: "retrieved", query: "spacing", hitCount: 1 },
-      { type: "toolResult", id: "c1", status: "ok", summary: "1 span", detail: null },
+      { type: "searching", query: "spacing", callId: "c1" },
+      { type: "retrieved", query: "spacing", hitCount: 1, callId: "c1" },
+      { type: "toolResult", id: "c1", status: "ok", summary: "1 span", detail: null, durationMs: 0 },
       { type: "answer", delta: "Spacing is spreading review over time." },
       { type: "done" },
     ]);
@@ -565,13 +567,14 @@ describe("ChatPane — chat view", () => {
         arguments: JSON.stringify({ rel_path: relPath, start_line: 123, end_line: 456 }),
         stepId: null,
       },
-      { type: "reading", relPath, startLine: 123, endLine: 456 },
+      { type: "reading", relPath, startLine: 123, endLine: 456, callId: "c1" },
       {
         type: "toolResult",
         id: "c1",
         status: "ok",
         summary: `${relPath}:123–456`,
         detail: null,
+        durationMs: 0,
       },
       { type: "answer", delta: "A cited answer [e1]." },
       {
@@ -654,7 +657,7 @@ describe("ChatPane — chat view", () => {
         arguments: '{"query":"focus"}',
         stepId: null,
       },
-      { type: "searching", query: "focus" },
+      { type: "searching", query: "focus", callId: "c1" },
       { type: "answer", delta: "Let me pull that together." },
     ]);
 
@@ -744,7 +747,7 @@ describe("ChatPane — chat view", () => {
 
   it("surfaces an inline, non-fatal error event and re-enables the composer", async () => {
     await askInChat("q", [
-      { type: "searching", query: "x" },
+      { type: "searching", query: "x", callId: null },
       { type: "error", message: "rate limited by OpenRouter" },
     ]);
 
@@ -754,7 +757,7 @@ describe("ChatPane — chat view", () => {
 
   it("keeps the usage footer after the error card on a failed turn", async () => {
     await askInChat("q", [
-      { type: "searching", query: "x" },
+      { type: "searching", query: "x", callId: null },
       {
         type: "usage",
         elapsedMs: 8412,
@@ -796,7 +799,7 @@ describe("ChatPane — chat view", () => {
 
     const gate = deferred<string>();
     mockChat.mockImplementation((_turnId, _p, _h, onEvent) => {
-      onEvent({ type: "searching", query: "x" });
+      onEvent({ type: "searching", query: "x", callId: null });
       return gate.promise; // stays in-flight
     });
 
@@ -846,9 +849,9 @@ describe("ChatPane — chat view", () => {
 
   it("surfaces a dropped citation in the summary (glyph + destructive) and defaults the trace open (citation fidelity)", async () => {
     await askInChat("q", [
-      { type: "searching", query: "recall" },
-      { type: "retrieved", query: "recall", hitCount: 2 },
-      { type: "reading", relPath: "Recall.md", startLine: 1, endLine: 5 },
+      { type: "searching", query: "recall", callId: null },
+      { type: "retrieved", query: "recall", hitCount: 2, callId: null },
+      { type: "reading", relPath: "Recall.md", startLine: 1, endLine: 5, callId: null },
       { type: "verifying" },
       { type: "citationDropped", reason: "quote not found" },
       { type: "answer", delta: "partial answer" },
@@ -885,8 +888,8 @@ describe("ChatPane — the nothing-found card", () => {
 
   it("lists the searched terms when the turn searched and nothing survived", async () => {
     await askInChat("anything on quokkas?", [
-      { type: "searching", query: "quokka" },
-      { type: "retrieved", query: "quokka", hitCount: 0 },
+      { type: "searching", query: "quokka", callId: null },
+      { type: "retrieved", query: "quokka", hitCount: 0, callId: null },
       { type: "answer", delta: "Your notes don't mention quokkas." },
       {
         type: "coverage",
@@ -916,7 +919,7 @@ describe("ChatPane — the nothing-found card", () => {
 
   it("shows no card when the run errored — the error box speaks alone", async () => {
     await askInChat("q", [
-      { type: "searching", query: "x" },
+      { type: "searching", query: "x", callId: null },
       {
         type: "coverage",
         searchedTerms: ["x"],

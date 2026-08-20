@@ -42,7 +42,8 @@ const DEFAULT_MODEL = "anthropic/claude-sonnet-4.5";
 const openRouterActive = (): AiStatus => ({
   activeProvider: "openRouter",
   reasoningSupported: "unknown",
-  openrouter: { hasKey: true, model: DEFAULT_MODEL, reasoning: false },
+  reasoningControl: { kind: "pending" },
+  openrouter: { hasKey: true, model: DEFAULT_MODEL, reasoning: false, reasoningEffort: null },
   local: { activeModelTag: null },
   approval: ALWAYS_ASK_APPROVAL_STATUS,
 });

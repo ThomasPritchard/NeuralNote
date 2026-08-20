@@ -95,7 +95,12 @@ fn write_note_schema() -> Value {
                 "rel_path": { "type": "string", "description": "Vault-relative .md path." },
                 "content": { "type": "string" },
                 "kind": { "type": "string", "enum": ["literature", "atomic", "transcript"] },
-                "work_item": { "type": "integer", "minimum": 0, "default": 0 }
+                "work_item": {
+                    "type": "integer",
+                    "minimum": 0,
+                    "default": 0,
+                    "description": "Which unit of work this note belongs to. Use 0: a run has a single work item unless a playlist selection created more, and the host then names the index to use for each video."
+                }
             },
             "required": ["rel_path", "content", "kind"],
             "additionalProperties": false
@@ -238,6 +243,16 @@ pub(super) fn dispatch_write_note(args_json: &str, context: &mut ToolContext<'_>
         if let Err(error) = session.validate_playlist_work_item(args.work_item) {
             return settle_capture_error(error);
         }
+    }
+    // Nothing host-side computes `work_item` — the model does, from prose that
+    // only ever described the playlist case. A run with one work item must
+    // therefore say which value to use, here, before the approval the user has
+    // already given is spent on a write the budget would refuse for an argument
+    // the user never sees. The playlist check above is the stricter twin: while
+    // a selection is in flight, only the item in flight is addressable.
+    let budget = context.writes.budget();
+    if !budget.has_work_item(args.work_item) {
+        return reject(budget.unknown_work_item_message(args.work_item));
     }
     match write_note_policy(
         context.vault_root,

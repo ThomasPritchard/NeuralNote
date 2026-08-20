@@ -93,8 +93,14 @@ struct ScriptedYoutubeIo {
     captions: Mutex<VecDeque<Result<CaptionPayload, CaptureError>>>,
     caption_pot_modes: Mutex<Vec<PotMode>>,
     transcriptions: Mutex<VecDeque<Result<CaptionPayload, CaptureError>>>,
+    /// Answered on every call rather than popped, because the preview asks for a
+    /// thumbnail once per lookup and a script that ran dry would fail the test
+    /// for the wrong reason.
+    thumbnail: Mutex<Result<ThumbnailPayload, CaptureError>>,
     updates: AtomicUsize,
+    update_failure: Mutex<Option<CaptureError>>,
     transcribe_calls: AtomicUsize,
+    thumbnail_calls: AtomicUsize,
     cancel_during_transcription: std::sync::atomic::AtomicBool,
     cancel_during_update: Mutex<Option<CaptureCancellation>>,
 }
@@ -113,11 +119,22 @@ impl ScriptedYoutubeIo {
             captions: Mutex::new(VecDeque::new()),
             caption_pot_modes: Mutex::new(Vec::new()),
             transcriptions: Mutex::new(VecDeque::new()),
+            thumbnail: Mutex::new(Err(CaptureError::ThumbnailRejected("unused".into()))),
             updates: AtomicUsize::new(0),
+            update_failure: Mutex::new(None),
             transcribe_calls: AtomicUsize::new(0),
+            thumbnail_calls: AtomicUsize::new(0),
             cancel_during_transcription: std::sync::atomic::AtomicBool::new(false),
             cancel_during_update: Mutex::new(None),
         }
+    }
+
+    fn set_thumbnail(&self, value: Result<ThumbnailPayload, CaptureError>) {
+        *self.thumbnail.lock().unwrap() = value;
+    }
+
+    fn fail_updates(&self, error: CaptureError) {
+        *self.update_failure.lock().unwrap() = Some(error);
     }
 
     fn push_caption(&self, value: Result<CaptionPayload, CaptureError>) {
@@ -165,7 +182,11 @@ impl YoutubeIo for ScriptedYoutubeIo {
     }
 
     async fn fetch_thumbnail(&self, _video_id: &VideoId) -> Result<ThumbnailPayload, CaptureError> {
-        Err(CaptureError::ThumbnailRejected("unused".into()))
+        self.thumbnail_calls.fetch_add(1, Ordering::SeqCst);
+        match &*self.thumbnail.lock().unwrap() {
+            Ok(payload) => Ok(payload.clone()),
+            Err(error) => Err(error.clone()),
+        }
     }
 
     async fn transcribe_audio(
@@ -193,7 +214,10 @@ impl YoutubeIo for ScriptedYoutubeIo {
         if let Some(cancellation) = self.cancel_during_update.lock().unwrap().take() {
             cancellation.cancel();
         }
-        Ok(())
+        match self.update_failure.lock().unwrap().clone() {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
     }
 }
 
@@ -217,6 +241,7 @@ fn environment(whisper_installed: bool) -> SkillEnvironment {
         },
         app_data_bin_dir: bin,
         available_binaries: files,
+        unusable_binaries: Default::default(),
     }
 }
 
@@ -1198,4 +1223,452 @@ fn cancellation_during_extractor_update_prevents_transcription_retry() {
         "the error that triggered the update must survive: {}",
         result.content
     );
+}
+
+/// Every `ToolProgress` in order, paired with the call id it is keyed to. The id
+/// matters as much as the message: progress that lands on the wrong node renders
+/// on the wrong row.
+fn tool_progress(events: &[ChatEvent]) -> Vec<(String, String)> {
+    events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::ToolProgress { id, message } => Some((id.clone(), message.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+fn progress_messages(events: &[ChatEvent]) -> Vec<String> {
+    tool_progress(events)
+        .into_iter()
+        .map(|(_, message)| message)
+        .collect()
+}
+
+/// The one preview this run emitted, unwrapped into the fields a card renders.
+type PreviewFields = (String, String, Option<u64>, Option<String>, Option<String>);
+
+fn only_preview(events: &[ChatEvent]) -> PreviewFields {
+    let previews: Vec<&ChatEvent> = events
+        .iter()
+        .filter(|event| matches!(event, ChatEvent::VideoPreview { .. }))
+        .collect();
+    assert_eq!(
+        previews.len(),
+        1,
+        "expected exactly one preview: {previews:?}"
+    );
+    match previews[0] {
+        ChatEvent::VideoPreview {
+            video_id,
+            title,
+            duration_secs,
+            channel,
+            thumbnail_data_uri,
+        } => (
+            video_id.clone(),
+            title.clone(),
+            *duration_secs,
+            channel.clone(),
+            thumbnail_data_uri.clone(),
+        ),
+        other => unreachable!("filtered to previews, got {other:?}"),
+    }
+}
+
+fn jpeg_bytes() -> Vec<u8> {
+    let mut buffer = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::new_rgb8(2, 2)
+        .write_to(&mut buffer, image::ImageFormat::Jpeg)
+        .unwrap();
+    buffer.into_inner()
+}
+
+#[test]
+fn a_long_transcription_says_what_it_is_doing_before_it_starts() {
+    // Whisper can run for minutes with nothing on the channel between the
+    // `ToolCall` and the `ToolResult`, which is indistinguishable from a hang.
+    // The tool now narrates itself from inside.
+    let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
+    io.push_transcription(Ok(CaptionPayload {
+        vtt: VTT.to_vec(),
+        annotations: Vec::new(),
+    }));
+    let mut session = YoutubeToolSession::default();
+    prove_caption_absence(&io, &mut session);
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut session,
+        &environment(true),
+        TOOL_TRANSCRIBE_AUDIO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let progress = tool_progress(&events);
+    assert!(
+        !progress.is_empty() && progress.iter().all(|(id, _)| id == "youtube-call"),
+        "progress must key to the call it belongs to: {progress:?}"
+    );
+    let messages = progress_messages(&events);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("local transcription")),
+        "the availability check is its own wait: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Whisper") && message.contains("small.en")),
+        "the long wait must name what is running: {messages:?}"
+    );
+}
+
+#[test]
+fn a_silent_caption_retry_becomes_a_visible_one() {
+    // A retry that says nothing is indistinguishable from a longer silence,
+    // which is the exact complaint this work exists to fix.
+    let io = ScriptedYoutubeIo::new(metadata(r#"{"en":[{"ext":"vtt"}]}"#, "{}"));
+    io.push_caption(Err(CaptureError::ExtractorStale("stale extractor".into())));
+    io.push_caption(Ok(CaptionPayload {
+        vtt: VTT.to_vec(),
+        annotations: Vec::new(),
+    }));
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_CAPTIONS,
+        &format!(r#"{{"url":"{URL}","lang":"en"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let messages = progress_messages(&events);
+    assert!(
+        messages.iter().any(|message| message.contains("yt-dlp")),
+        "the extractor update is a wait of its own: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.to_lowercase().contains("retrying")),
+        "the retry must read as a retry: {messages:?}"
+    );
+}
+
+#[test]
+fn a_pot_fallback_retry_reaches_the_user_and_not_only_the_model() {
+    // The fallback used to land in `session.annotate`, which reaches the model
+    // and the tool result but never the person watching the rail.
+    let io = ScriptedYoutubeIo::new(metadata(r#"{"en":[{"ext":"vtt"}]}"#, "{}"));
+    io.push_caption(Err(CaptureError::PotUnavailable("sidecar down".into())));
+    io.push_caption(Ok(CaptionPayload {
+        vtt: VTT.to_vec(),
+        annotations: Vec::new(),
+    }));
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_CAPTIONS,
+        &format!(r#"{{"url":"{URL}","lang":"en"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let messages = progress_messages(&events);
+    assert!(
+        messages.iter().any(|message| message.contains("POT")),
+        "the POT fallback must be visible on the timeline: {messages:?}"
+    );
+}
+
+#[test]
+fn a_video_lookup_narrates_its_first_attempt_and_not_only_its_retry() {
+    // The lookup shells out to yt-dlp against YouTube, so its FIRST attempt is
+    // already a wait worth narrating. Announcing only the retry would leave the
+    // opening tool of a distil run silent for its whole duration on the ordinary
+    // path — and would say nothing at all where the caption fetch beside it
+    // announces every attempt it makes.
+    let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_VIDEO_INFO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    assert_eq!(io.updates.load(Ordering::SeqCst), 0);
+    let messages = progress_messages(&events);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Looking up the video")),
+        "the ordinary path must narrate too, not only the retry: {messages:?}"
+    );
+}
+
+#[test]
+fn a_failed_extractor_update_is_told_to_the_user_and_not_only_the_model() {
+    // `update_extractor` annotated the session and said nothing else, so a
+    // yt-dlp self-update that failed was a silent wait followed by a second
+    // failure the user could not account for.
+    let io = ScriptedYoutubeIo::new(Vec::new());
+    io.fail_updates(CaptureError::ExtractorStale("yt-dlp -U exited 1".into()));
+    *io.metadata.lock().unwrap() = VecDeque::from([
+        Err(CaptureError::ExtractorStale(
+            "nsig extraction failed".into(),
+        )),
+        Ok(MetadataPayload {
+            json: metadata("{}", "{}"),
+            annotations: Vec::new(),
+        }),
+    ]);
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_VIDEO_INFO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let messages = progress_messages(&events);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Updating yt-dlp")),
+        "the update announces itself on entry, not only on failure: {messages:?}"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("extractor_stale")),
+        "a failed update is a failure, and failures are never silent: {messages:?}"
+    );
+}
+
+#[test]
+fn a_failed_extractor_update_never_claims_the_retry_uses_a_new_extractor() {
+    // `ToolProgress` is last-writer-wins by contract, so a failure announced and
+    // then immediately followed by another line is a failure the user never sees.
+    // Worse, the line that replaced it used to read "with the updated extractor"
+    // — asserting the update landed at the exact moment it had not.
+    let io = ScriptedYoutubeIo::new(Vec::new());
+    io.fail_updates(CaptureError::ExtractorStale("yt-dlp -U exited 1".into()));
+    *io.metadata.lock().unwrap() = VecDeque::from([
+        Err(CaptureError::ExtractorStale(
+            "nsig extraction failed".into(),
+        )),
+        Ok(MetadataPayload {
+            json: metadata("{}", "{}"),
+            annotations: Vec::new(),
+        }),
+    ]);
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_VIDEO_INFO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let messages = progress_messages(&events);
+    assert!(
+        !messages
+            .iter()
+            .any(|message| message.contains("updated extractor")),
+        "nothing may claim an update that failed: {messages:?}"
+    );
+    // And the surviving line — the one the user is actually left looking at —
+    // has to carry the failure, not merely avoid contradicting it.
+    let last = messages.last().expect("the retry narrates itself");
+    assert!(
+        last.contains("extractor_stale") && last.contains("current"),
+        "the line left standing must say the retry runs on the old binary: {last}"
+    );
+}
+
+#[test]
+fn a_successful_extractor_update_says_so_on_the_line_that_survives() {
+    // The other half of the same contract: when the update DOES land, the line
+    // left standing must say so, or the honest-failure wording above would just
+    // be a pessimistic constant.
+    let io = ScriptedYoutubeIo::new(Vec::new());
+    *io.metadata.lock().unwrap() = VecDeque::from([
+        Err(CaptureError::ExtractorStale(
+            "nsig extraction failed".into(),
+        )),
+        Ok(MetadataPayload {
+            json: metadata("{}", "{}"),
+            annotations: Vec::new(),
+        }),
+    ]);
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_VIDEO_INFO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    assert_eq!(io.updates.load(Ordering::SeqCst), 1);
+    let messages = progress_messages(&events);
+    let last = messages.last().expect("the retry narrates itself");
+    assert!(
+        last.contains("updated extractor"),
+        "an update that landed must be reported as one: {last}"
+    );
+}
+
+#[test]
+fn a_transcription_retry_after_an_extractor_update_narrates_itself() {
+    // The third retry path. Its two existing tests both arm a cancellation that
+    // diverts before this branch, so the narration added here was never actually
+    // reached by a test — a line of code asserting it informs the user, with
+    // nothing proving it runs.
+    let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
+    io.push_transcription(Err(CaptureError::ExtractorStale(
+        "audio extraction went stale".into(),
+    )));
+    io.push_transcription(Ok(CaptionPayload {
+        vtt: VTT.to_vec(),
+        annotations: Vec::new(),
+    }));
+    let mut session = YoutubeToolSession::default();
+    prove_caption_absence(&io, &mut session);
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut session,
+        &environment(true),
+        TOOL_TRANSCRIBE_AUDIO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    assert_eq!(io.transcribe_calls.load(Ordering::SeqCst), 2);
+    assert_eq!(io.updates.load(Ordering::SeqCst), 1);
+    let messages = progress_messages(&events);
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.contains("Retrying the transcription")),
+        "the retry that actually happened must be visible: {messages:?}"
+    );
+}
+
+#[test]
+fn a_video_lookup_previews_the_video_it_found() {
+    let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
+    io.set_thumbnail(Ok(ThumbnailPayload {
+        media_type: "image/jpeg".into(),
+        bytes: jpeg_bytes(),
+    }));
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_VIDEO_INFO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let (video_id, title, duration, channel, thumbnail) = only_preview(&events);
+    assert_eq!(video_id, "iG9CE55wbtY");
+    assert_eq!(title, "Do schools kill creativity?");
+    assert_eq!(duration, Some(123));
+    assert_eq!(channel.as_deref(), Some("TED"));
+    // Same transport as `ElicitOption::image_data_uri`: the webview never talks
+    // to Google, so it needs no third-party network allowlist.
+    assert!(
+        thumbnail
+            .as_deref()
+            .is_some_and(|uri| uri.starts_with("data:image/jpeg;base64,")),
+        "{thumbnail:?}"
+    );
+    assert_eq!(io.thumbnail_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn a_thumbnail_that_times_out_still_leaves_a_preview_standing() {
+    // The degraded path, and the likely one. A timeout arrives from the host as
+    // a rejected thumbnail; the card renders text-only rather than not at all.
+    let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
+    io.set_thumbnail(Err(CaptureError::ThumbnailRejected(
+        "thumbnail request failed: operation timed out".into(),
+    )));
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_VIDEO_INFO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let (_, title, _, _, thumbnail) = only_preview(&events);
+    assert_eq!(title, "Do schools kill creativity?");
+    assert_eq!(thumbnail, None);
+}
+
+#[test]
+fn an_oversized_thumbnail_never_reaches_the_channel() {
+    // The byte cap runs before any decode, so an oversized payload is refused
+    // without being parsed and never bloats the event channel.
+    let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
+    io.set_thumbnail(Ok(ThumbnailPayload {
+        media_type: "image/jpeg".into(),
+        bytes: vec![0xFF; neuralnote_core::capture::MAX_THUMBNAIL_BYTES + 1],
+    }));
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_VIDEO_INFO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let (_, _, _, _, thumbnail) = only_preview(&events);
+    assert_eq!(thumbnail, None);
+}
+
+#[test]
+fn a_thumbnail_failure_of_any_kind_never_fails_the_video_lookup() {
+    // Playlist selection escalates a non-`ThumbnailRejected` error to a failed
+    // tool call. The preview must not: it is a nice-to-have hanging off a lookup
+    // that has already succeeded, so EVERY error degrades to no image.
+    let io = ScriptedYoutubeIo::new(metadata("{}", "{}"));
+    io.set_thumbnail(Err(CaptureError::MetadataUnavailable(
+        "the image host answered with nonsense".into(),
+    )));
+
+    let (result, events) = call_collecting_events(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_VIDEO_INFO,
+        &format!(r#"{{"url":"{URL}"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(value["video_id"], "iG9CE55wbtY");
+    let (_, _, _, _, thumbnail) = only_preview(&events);
+    assert_eq!(thumbnail, None);
 }

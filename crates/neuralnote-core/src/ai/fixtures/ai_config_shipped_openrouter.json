@@ -1,0 +1,14 @@
+{
+  "activeProvider": "openRouter",
+  "model": "deepseek/deepseek-v4-flash-0731",
+  "localModelTag": "qwen3.5:27b",
+  "reasoning": true,
+  "reasoningProbe": {
+    "model": "deepseek/deepseek-v4-flash-0731",
+    "support": "supported"
+  },
+  "reasoningProbeGeneration": 36,
+  "disabledSkills": [],
+  "approvalMode": "approveForMe",
+  "toolApprovalOverrides": {}
+}

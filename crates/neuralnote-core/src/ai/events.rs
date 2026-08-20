@@ -42,6 +42,25 @@ pub struct Elicitation {
     pub multi_select: bool,
 }
 
+/// Which item of a selected playlist is in flight.
+///
+/// The denominator is the playlist's own length — fixed when the user picked the
+/// videos and unable to move afterwards, unlike
+/// [`ChatEvent::PlanningRound::max_rounds`], which a mid-run skill activation can
+/// raise. That is the whole reason this exists: during a playlist the run's
+/// progress is measured in videos, which is both the honest unit of work and the
+/// only one with a stable ceiling.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
+#[serde(rename_all = "camelCase")]
+#[ts(export)]
+pub struct PlaylistPosition {
+    /// 1-based: the first selected video is 1, so it pairs directly with
+    /// `total` as "video 2 of 3".
+    pub position: u32,
+    /// How many videos the user selected. Constant for the run.
+    pub total: u32,
+}
+
 /// How a dispatched tool call settled. Mirrors [`crate::ai::tools::ToolOutcome`]'s
 /// discriminant but is the UI-facing vocabulary: `Rejected` (bad args/path — the
 /// orchestrator refused) and `Denied` (the user refused) are different stories and
@@ -111,13 +130,96 @@ pub enum ToolStatus {
 )]
 #[ts(export)]
 pub enum ChatEvent {
-    /// The run is working and nothing more specific is true yet: the backend has
-    /// accepted it and is preparing a model request. Emitted once when the run is
-    /// accepted, and again before each tool-deciding round-trip — that turn can
-    /// take fifteen seconds and emits nothing else, so without it the last phase
-    /// word simply goes stale on screen (#126). Deliberately repeatable and
-    /// idempotent: it re-states the phase, it does not announce a new thing.
+    /// The run has been accepted and is preparing its first model request.
+    ///
+    /// Emitted AT MOST ONCE per run, at the top of the orchestrator — never
+    /// twice, and not at all when setting up the write session fails, which
+    /// surfaces [`ChatEvent::Error`] and returns before this point. The per-round
+    /// beacon is [`ChatEvent::PlanningRound`], which carries a round number and
+    /// therefore cannot reset the phase backwards the way a repeated `Processing`
+    /// did.
     Processing,
+    /// A tool-deciding round-trip is starting. Emitted once per round, before the
+    /// model request goes out, through the raw sink and before the retry guard in
+    /// `orchestrator::collect` wraps it — counting it would disable the one
+    /// bounded retry that turn is allowed.
+    ///
+    /// It replaces the per-round `Processing` that used to keep the phase word
+    /// from going stale during a turn that can take fifteen seconds and emits
+    /// nothing else (#126); unlike `Processing` it says *which* round, so a
+    /// repeat cannot read as a fresh start.
+    PlanningRound {
+        /// 1-based. The first tool-deciding turn is round 1.
+        round: u32,
+        /// The ceiling as computed for THIS round.
+        ///
+        /// Re-read every emission and it CAN GROW mid-run: activating a skill
+        /// raises the ceiling ([`ActiveSkills::max_iterations`](crate::ai::skills::ActiveSkills::max_iterations)
+        /// folds each active skill's declared cap over the base). The UI must
+        /// render the latest pair and never cache the denominator.
+        max_rounds: u32,
+        /// Which video of a selected playlist this round is working on, or
+        /// `None` when no playlist is in flight.
+        ///
+        /// Re-stated on every beacon rather than announced once, so the pair the
+        /// head renders is always this round's pair and the end of a playlist
+        /// clears itself. During a playlist this is the honest progress reading:
+        /// `max_rounds` above is a ceiling the iteration guard deliberately does
+        /// not enforce while a playlist runs (each item may spend its own
+        /// bounded allowance), whereas the playlist length cannot move.
+        playlist: Option<PlaylistPosition>,
+    },
+    /// The provider is alive and has sent nothing else. Forwarded from an SSE
+    /// comment line (OpenRouter sends `: OPENROUTER PROCESSING`), which the
+    /// stream classifier used to resolve to "ignorable" and drop.
+    ///
+    /// Carries no payload on purpose: it says "the socket is alive", not
+    /// "progress happened". It refreshes the transport-liveness signal and must
+    /// NOT reset a stall detector, which watches for progress.
+    Keepalive,
+    /// A long-running tool reporting from inside itself, keyed to the
+    /// [`ChatEvent::ToolCall`] it belongs to so it renders on that node rather
+    /// than on a separate surface.
+    ///
+    /// `message` is Rust-composed, never model prose — the same rule
+    /// [`ChatEvent::ToolCall`]'s `title` follows. Repeatable; the UI shows the
+    /// latest.
+    ToolProgress {
+        /// The [`ChatEvent::ToolCall`] id.
+        id: String,
+        message: String,
+    },
+    /// The video the run is about to work on, for a preview card beside the
+    /// live head.
+    ///
+    /// **It carries no playlist position.** The position is owned by the
+    /// [`ChatEvent::PlanningRound`] beacon alone, so the card and the head read
+    /// one number from one emitter and can never disagree about which video is
+    /// in flight. That places an ordering requirement on whoever emits this:
+    /// **it follows the beacon that first announces its item**, so a preview
+    /// belonging to the previous video is cleared by the beacon rather than left
+    /// standing beside the new one.
+    ///
+    /// Everything here is host-read metadata, never model prose.
+    VideoPreview {
+        /// The YouTube video id, so a card can be told apart from its successor
+        /// even when two videos share a title.
+        video_id: String,
+        title: String,
+        /// Absent when the extractor reported no duration — which it does — and
+        /// an absent duration must render as absent rather than as `0`.
+        duration_secs: Option<u64>,
+        channel: Option<String>,
+        /// The thumbnail, bounded and validated host-side and carried as a data
+        /// URI exactly as [`ElicitOption::image_data_uri`] already is, so the
+        /// webview needs no third-party network allowlist.
+        ///
+        /// A **nice-to-have**: the fetch is capped and timed out, and a
+        /// thumbnail that fails, exceeds its cap, or is rejected arrives as
+        /// `None` rather than delaying or failing the run. `None` is the
+        /// degraded path the card must render usefully, not an error.
+        thumbnail_data_uri: Option<String>,
+    },
     /// A skill became active and granted its declared tools.
     SkillActivated { id: String, name: String },
     /// A user-facing progress update emitted by an active skill.
@@ -184,6 +286,18 @@ pub enum ChatEvent {
         summary: Option<String>,
         /// Bounded result or error text for the disclosure. Truncated Rust-side.
         detail: Option<String>,
+        /// Wall-clock time from dispatch to settlement. Measured with `Instant`,
+        /// which the core already treats as a measurement rather than a timer.
+        /// Never optional: the orchestrator always knows how long it waited, and
+        /// a call that never ran waited approximately nothing rather than an
+        /// unknown amount.
+        ///
+        /// **It is time-to-settle, not time-in-the-tool.** The approval gate sits
+        /// between dispatch and settlement, so a gated call the user leaves
+        /// sitting reports the human's thinking time too — up to the gate's
+        /// 120-second budget. Anything rendering this beside a tool name has to
+        /// say "took", never "spent working".
+        duration_ms: u64,
     },
     /// How a transcript was actually obtained, reported by the tool that obtained
     /// it — so provenance is read off the wire, never scraped out of model prose.
@@ -266,14 +380,36 @@ pub enum ChatEvent {
     /// not once per call.
     ToolApprovalDegraded { reason: ApprovalDegradedReason },
     /// A search is about to run for `query` (the live "searching…" cue).
-    Searching { query: String },
+    Searching {
+        query: String,
+        /// The [`ChatEvent::ToolCall`] that ran it — see [`ChatEvent::Retrieved`].
+        call_id: Option<String>,
+    },
     /// `query` finished, yielding `hit_count` evidence spans.
-    Retrieved { query: String, hit_count: u32 },
+    ///
+    /// `call_id` is the correlation key for all three retrieval cues. These cues
+    /// are emitted BY the tool calls above them on the rail, so the timeline can
+    /// enrich the tool node in place rather than render the same act twice. It
+    /// does not do so yet — today the rail drops these cues — and this key is
+    /// what makes that possible without guessing: tool calls run in parallel, so
+    /// arrival order is not a correlation key, and inferring one from it would
+    /// put the wrong query on the wrong node.
+    ///
+    /// `Option`, not `String`: the cues come from the retrieval layer and a path
+    /// may have no dispatched call behind it. `None` means "no node to attach
+    /// to" and renders exactly as it did before the key existed.
+    Retrieved {
+        query: String,
+        hit_count: u32,
+        call_id: Option<String>,
+    },
     /// A bounded line range of a note is being read into evidence.
     Reading {
         rel_path: String,
         start_line: u32,
         end_line: u32,
+        /// The [`ChatEvent::ToolCall`] that read it — see [`ChatEvent::Retrieved`].
+        call_id: Option<String>,
     },
     /// Optional model reasoning tokens (surfaced only if the client streams them).
     Thinking { delta: String },
@@ -414,10 +550,181 @@ mod tests {
         assert_eq!(json(&ChatEvent::Verifying)["type"], "verifying");
         assert_eq!(
             json(&ChatEvent::Searching {
-                query: "widgets".into()
+                query: "widgets".into(),
+                call_id: None,
             })["type"],
             "searching"
         );
+    }
+
+    #[test]
+    fn planning_round_carries_both_numbers_in_camel_case() {
+        // The denominator travels with every emission precisely because it can
+        // grow mid-run, so the UI never has to remember one.
+        let event = ChatEvent::PlanningRound {
+            round: 2,
+            max_rounds: 12,
+            playlist: None,
+        };
+        assert_eq!(
+            json(&event),
+            serde_json::json!({
+                "type": "planningRound",
+                "round": 2,
+                "maxRounds": 12,
+                "playlist": null,
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn a_planning_round_inside_a_playlist_names_the_item_in_flight() {
+        // The playlist length is the one denominator that cannot move: it was
+        // fixed when the user picked the videos. `max_rounds` still travels
+        // beside it, unchanged, because a run is still spending rounds.
+        let event = ChatEvent::PlanningRound {
+            round: 9,
+            max_rounds: 16,
+            playlist: Some(PlaylistPosition {
+                position: 2,
+                total: 3,
+            }),
+        };
+        assert_eq!(
+            json(&event),
+            serde_json::json!({
+                "type": "planningRound",
+                "round": 9,
+                "maxRounds": 16,
+                "playlist": { "position": 2, "total": 3 },
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn a_video_preview_carries_its_thumbnail_as_a_data_uri() {
+        // Same transport as `ElicitOption::image_data_uri`: the image crosses as
+        // a bounded data URI, so the webview never talks to a third party.
+        let event = ChatEvent::VideoPreview {
+            video_id: "iG9CE55wbtY".into(),
+            title: "Spaced repetition, explained".into(),
+            duration_secs: Some(742),
+            channel: Some("Study Lab".into()),
+            thumbnail_data_uri: Some("data:image/jpeg;base64,AAAA".into()),
+        };
+        assert_eq!(
+            json(&event),
+            serde_json::json!({
+                "type": "videoPreview",
+                "videoId": "iG9CE55wbtY",
+                "title": "Spaced repetition, explained",
+                "durationSecs": 742,
+                "channel": "Study Lab",
+                "thumbnailDataUri": "data:image/jpeg;base64,AAAA",
+            })
+        );
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn a_video_preview_without_a_thumbnail_is_null_rather_than_an_empty_string() {
+        // The degraded path, and the likely one: the thumbnail is a
+        // nice-to-have whose fetch may be capped, timed out, or rejected. An
+        // empty string would render as a broken image; `null` says there is no
+        // image and the card draws its text-only self.
+        let event = ChatEvent::VideoPreview {
+            video_id: "iG9CE55wbtY".into(),
+            title: "Spaced repetition, explained".into(),
+            duration_secs: None,
+            channel: None,
+            thumbnail_data_uri: None,
+        };
+        assert_eq!(json(&event)["thumbnailDataUri"], serde_json::Value::Null);
+        assert_eq!(json(&event)["durationSecs"], serde_json::Value::Null);
+        assert_eq!(json(&event)["channel"], serde_json::Value::Null);
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn keepalive_is_a_payload_free_camel_case_event() {
+        // No payload on purpose: it says the socket is alive, not that progress
+        // happened.
+        assert_eq!(
+            json(&ChatEvent::Keepalive),
+            serde_json::json!({ "type": "keepalive" })
+        );
+    }
+
+    #[test]
+    fn tool_progress_is_keyed_to_the_call_it_reports_on() {
+        assert_eq!(
+            json(&ChatEvent::ToolProgress {
+                id: "call-1".into(),
+                message: "3 of 8 videos".into(),
+            }),
+            serde_json::json!({
+                "type": "toolProgress",
+                "id": "call-1",
+                "message": "3 of 8 videos",
+            })
+        );
+    }
+
+    #[test]
+    fn a_correlated_retrieval_cue_names_the_call_that_ran_it() {
+        let event = ChatEvent::Retrieved {
+            query: "widgets".into(),
+            hit_count: 3,
+            call_id: Some("call-7".into()),
+        };
+        assert_eq!(json(&event)["callId"], "call-7");
+        assert_eq!(
+            serde_json::from_value::<ChatEvent>(json(&event)).unwrap(),
+            event
+        );
+    }
+
+    #[test]
+    fn an_uncorrelated_retrieval_cue_carries_a_null_call_id_not_an_empty_string() {
+        // The degradation guarantee: a cue with no dispatched call behind it says
+        // "no node to attach to" explicitly. An empty string would look like a
+        // real id and attach the cue to nothing at all.
+        for event in [
+            ChatEvent::Searching {
+                query: "widgets".into(),
+                call_id: None,
+            },
+            ChatEvent::Retrieved {
+                query: "widgets".into(),
+                hit_count: 0,
+                call_id: None,
+            },
+            ChatEvent::Reading {
+                rel_path: "a/b.md".into(),
+                start_line: 1,
+                end_line: 2,
+                call_id: None,
+            },
+        ] {
+            let value = json(&event);
+            assert_eq!(value["callId"], serde_json::Value::Null);
+            assert_ne!(value["callId"], "");
+            assert_eq!(serde_json::from_value::<ChatEvent>(value).unwrap(), event);
+        }
     }
 
     #[test]
@@ -433,6 +740,7 @@ mod tests {
             rel_path: "a/b.md".into(),
             start_line: 3,
             end_line: 5,
+            call_id: None,
         });
         assert_eq!(v["relPath"], "a/b.md");
         assert_eq!(v["startLine"], 3);
@@ -609,6 +917,7 @@ mod tests {
                 status: ToolStatus::Rejected,
                 summary: None,
                 detail: Some("unknown tool 'nope'".into()),
+                duration_ms: 4,
             }),
             serde_json::json!({
                 "type": "toolResult",
@@ -616,6 +925,7 @@ mod tests {
                 "status": "rejected",
                 "summary": null,
                 "detail": "unknown tool 'nope'",
+                "durationMs": 4,
             })
         );
     }

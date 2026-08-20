@@ -6,7 +6,8 @@
 
 import { describe, expect, it } from "vitest";
 import type { ChatEvent } from "../lib/types";
-import { emptyAssistant, reduceAssistant, type AssistantMessage } from "./chatMessage";
+import { emptyAssistant, type AssistantMessage } from "./chatMessage";
+import { reduceAssistant } from "./chatMessageReducer";
 
 const fold = (events: ChatEvent[], from: AssistantMessage = emptyAssistant()) =>
   events.reduce(reduceAssistant, from);
@@ -167,7 +168,7 @@ describe("the approval gate's view state", () => {
   });
 
   it("does not leave a security sheet on screen after a stop", async () => {
-    const { markAssistantStopped } = await import("./chatMessage");
+    const { markAssistantStopped } = await import("./chatTurnStream");
     const turn = fold([requested], emptyAssistant(false, "turn-1"));
     const [stopped] = markAssistantStopped([turn], "turn-1") as AssistantMessage[];
     expect(stopped.pendingApproval).toBeNull();
@@ -187,7 +188,7 @@ describe("the approval gate's view state", () => {
       },
       requested,
       { type: "toolApprovalResolved", id: "call-1", decision: "denied" },
-      { type: "toolResult", id: "call-1", status: "denied", summary: null, detail: "Denied. Nothing was written." },
+      { type: "toolResult", id: "call-1", status: "denied", summary: null, detail: "Denied. Nothing was written.", durationMs: 0 },
     ]);
     expect(turn.toolCalls[0].status).toBe("denied");
     expect(turn.toolApprovals[0].resolution).toBe("denied");

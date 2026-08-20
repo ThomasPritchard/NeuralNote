@@ -3,6 +3,8 @@
 use crate::capture::youtube_ids::valid_video_id;
 pub use crate::capture::youtube_ids::{VideoId, YoutubeUrl};
 use crate::capture::CaptureError;
+use base64::engine::general_purpose::STANDARD;
+use base64::Engine as _;
 use chrono::NaiveDate;
 use image::{ImageFormat, ImageReader};
 use serde::{Deserialize, Serialize};
@@ -37,6 +39,21 @@ pub enum CaptionSource {
 pub struct CaptionSelection {
     pub language: String,
     pub source: CaptionSource,
+}
+
+/// Encode a fetched thumbnail as the `data:` URI the webview renders.
+///
+/// Validation is not a separate step a caller can forget: every path to a data
+/// URI runs [`validate_thumbnail`] first, so an image can never reach a client
+/// unvalidated because one of two call sites skipped the check. Callers hand the
+/// result across the event boundary — a webview that reads its images from here
+/// needs no third-party network allowlist.
+pub(crate) fn thumbnail_data_uri(media_type: &str, bytes: &[u8]) -> Result<String, CaptureError> {
+    validate_thumbnail(media_type, bytes)?;
+    Ok(format!(
+        "data:{media_type};base64,{}",
+        STANDARD.encode(bytes)
+    ))
 }
 
 /// Validate untrusted thumbnail bytes before either a client boundary or the

@@ -104,6 +104,12 @@ pub struct SkillEnvironment {
     /// name covers both executable [`Requirement::Binary`] files and inert
     /// [`Requirement::Asset`] files so adding the asset kind stays additive.
     pub available_binaries: BTreeSet<PathBuf>,
+    /// Requirement paths the host found but judged unusable, against the reason.
+    /// A file can be sitting right there and still be unable to run, and telling
+    /// the user it is "missing" would be false; the host's reason is shown
+    /// instead. Absent from this map means nothing was wrong, not merely that
+    /// nothing was checked.
+    pub unusable_binaries: BTreeMap<PathBuf, String>,
 }
 
 /// Aggregate eligibility that preserves detection failures separately from facts
@@ -290,10 +296,16 @@ fn evaluate_requirement_file(
         return;
     }
     let expected = directory.join(name);
-    if !env.available_binaries.contains(&expected) {
-        unmet.push(format!(
+    if env.available_binaries.contains(&expected) {
+        return;
+    }
+    match env.unusable_binaries.get(&expected) {
+        // Present but unusable. Saying "missing" would send the user looking for
+        // a file that is exactly where they expect it to be.
+        Some(reason) => unmet.push(format!("required {kind} '{name}' cannot be used: {reason}")),
+        None => unmet.push(format!(
             "required {kind} '{name}' is missing from the {directory_label}"
-        ));
+        )),
     }
 }
 

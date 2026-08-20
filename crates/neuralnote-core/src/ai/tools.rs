@@ -438,10 +438,10 @@ async fn run_tool(
         }
         RegisteredTool::WriteNote => skill_tools::dispatch_write_note(args_json, context),
         RegisteredTool::FetchVideoInfo => {
-            youtube_tools::dispatch_fetch_video_info(args_json, context).await
+            youtube_tools::dispatch_fetch_video_info(call_id, args_json, context).await
         }
         RegisteredTool::FetchCaptions => {
-            youtube_tools::dispatch_fetch_captions(args_json, context).await
+            youtube_tools::dispatch_fetch_captions(call_id, args_json, context).await
         }
         RegisteredTool::TranscribeAudio => {
             youtube_tools::dispatch_transcribe_audio(call_id, args_json, user_prompt, context).await
@@ -865,6 +865,7 @@ mod tests {
             },
             app_data_bin_dir: PathBuf::from("/app-data/bin"),
             available_binaries: BTreeSet::new(),
+            unusable_binaries: Default::default(),
         };
         let mut active = ActiveSkills::new(8);
         let mut writes = WriteSession::new(1).unwrap();

@@ -7,9 +7,11 @@
 // React, nothing here reads or composes backend prose.
 
 import type { ApprovalDegradedReason } from "../lib/types";
+import { reasoningSegments } from "./chatTurnReadouts";
 import type {
   AssistantMessage,
   PlanStepView,
+  ReasoningSource,
   SkillActivationFailure,
   ToolApprovalView,
   ToolCallView,
@@ -21,7 +23,10 @@ import type {
  *  to an interleaving the events cannot support. */
 export type TimelineEntry =
   | { kind: "failure"; failure: SkillActivationFailure }
-  | { kind: "thinking"; text: string }
+  /** One train of thought, and which turn of the run produced it. A run reasons
+   *  once per tool-deciding round and again before answering, so a turn
+   *  contributes several of these rather than one. */
+  | { kind: "thinking"; text: string; source: ReasoningSource }
   | { kind: "degraded"; reason: ApprovalDegradedReason }
   | { kind: "approval"; approval: ToolApprovalView }
   | { kind: "tool"; call: ToolCallView }
@@ -102,8 +107,11 @@ export function timelineEntries(
     kind: "failure" as const,
     failure,
   }));
-  if (turn.thinking.trim() !== "") {
-    entries.push({ kind: "thinking", text: turn.thinking });
+  // One node per train of thought, in the order they were reasoned. Segments
+  // that reasoned about nothing are already left out, so a run with no reasoning
+  // adds no node at all — exactly as one flat string did.
+  for (const segment of reasoningSegments(turn)) {
+    entries.push({ kind: "thinking", text: segment.text, source: segment.source });
   }
   if (turn.approvalDegraded !== null) {
     entries.push({ kind: "degraded", reason: turn.approvalDegraded });

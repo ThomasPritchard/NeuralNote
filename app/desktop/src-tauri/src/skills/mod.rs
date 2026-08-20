@@ -532,6 +532,7 @@ mod tests {
             },
             app_data_bin_dir: vault.path().join("bin"),
             available_binaries: BTreeSet::new(),
+            unusable_binaries: Default::default(),
         };
         let (policy, approval_prompt, approval_classifier) = unattended_approval_for_tests();
         let services = SkillServices::new(

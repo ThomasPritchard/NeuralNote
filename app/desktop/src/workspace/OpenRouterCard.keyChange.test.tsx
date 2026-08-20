@@ -36,7 +36,8 @@ const mockSaveKey = vi.mocked(api.saveApiKey);
 const OR_ACTIVE: AiStatus = {
   activeProvider: "openRouter",
   reasoningSupported: "unknown",
-  openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5", reasoning: false },
+  reasoningControl: { kind: "pending" },
+  openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5", reasoning: false, reasoningEffort: null },
   local: { activeModelTag: null },
   approval: ALWAYS_ASK_APPROVAL_STATUS,
 };

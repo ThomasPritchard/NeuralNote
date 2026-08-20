@@ -431,6 +431,82 @@ describe("ChatPane — composer reasoning toggle", () => {
     expect(mockAiStatus).toHaveBeenCalledTimes(1);
   });
 
+  it("reads as a state, not a control, for a mandatory model", async () => {
+    // Two surfaces, one fact. Settings renders `locked` as "Always on" from the
+    // control and offers no checkbox at all; the composer used to keep a
+    // pressable chip whose click had quietly become a no-op — a control that
+    // looks broken rather than a model that is mandatory. The words are
+    // deliberately Settings' own.
+    const locked = openRouterActive(DEFAULT_MODEL, {
+      reasoning: false,
+      reasoningSupported: "supported",
+      reasoningControl: { kind: "locked" },
+    });
+    mockAiStatus.mockResolvedValue(locked);
+    mockRefreshSupport.mockResolvedValue(locked);
+    setup();
+
+    // The state is in the accessible name, where it costs the strip nothing:
+    // the composer's meta row has no spare pixels at the docked width.
+    const qualifier = await screen.findByText(", always on");
+    expect(qualifier.parentElement).toHaveTextContent(/Reasoning,\s*always on/);
+
+    // Not a toggle in the accessibility tree either: nothing announces a pressed
+    // state that cannot change, and nothing takes a tab stop that leads nowhere.
+    expect(
+      screen.queryByRole("button", { name: "Show model reasoning" }),
+    ).not.toBeInTheDocument();
+    expect(qualifier.closest("button")).toBeNull();
+    expect(qualifier.parentElement).not.toHaveAttribute("aria-pressed");
+    expect(mockSetReasoning).not.toHaveBeenCalled();
+  });
+
+  it("reads the same way for the OTHER control with no off position", async () => {
+    // `locked` is not the only mandatory shape: an `efforts` menu that publishes
+    // no off position is the same fact by the other route (amendment D1 folded
+    // them into one field). A variant that answered this question differently
+    // would put a dead toggle back on one of the two.
+    const mandatory = openRouterActive(DEFAULT_MODEL, {
+      reasoning: true,
+      reasoningSupported: "supported",
+      reasoningControl: {
+        kind: "efforts",
+        options: ["xhigh", "high"],
+        defaultEffort: "high",
+        canDisable: false,
+      },
+    });
+    mockAiStatus.mockResolvedValue(mandatory);
+    mockRefreshSupport.mockResolvedValue(mandatory);
+    setup();
+
+    expect(await screen.findByText(", always on")).toBeInTheDocument();
+    expect(
+      screen.queryByRole("button", { name: "Show model reasoning" }),
+    ).not.toBeInTheDocument();
+  });
+
+  it("still follows the opt-in on a model that reasons by default but can be told not to", async () => {
+    // `default_on` is the MODEL's default, never the user's setting.
+    const optional = openRouterActive(DEFAULT_MODEL, {
+      reasoning: false,
+      reasoningSupported: "supported",
+      reasoningControl: { kind: "toggle", defaultOn: true },
+    });
+    mockAiStatus.mockResolvedValue(optional);
+    mockRefreshSupport.mockResolvedValue(optional);
+    mockSetReasoning.mockResolvedValue(
+      openRouterActive(DEFAULT_MODEL, { reasoning: true }),
+    );
+    const { user } = setup();
+
+    const toggle = await findChip();
+    expect(toggle).toHaveAttribute("aria-pressed", "false");
+
+    await user.click(toggle);
+    expect(mockSetReasoning).toHaveBeenCalledExactlyOnceWith(true);
+  });
+
   it("surfaces a rejected reasoning write inline and stays off", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive());
     mockSetReasoning.mockRejectedValue({

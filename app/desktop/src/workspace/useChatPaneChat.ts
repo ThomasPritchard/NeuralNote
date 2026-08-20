@@ -9,14 +9,9 @@ import { useCallback, useRef, useState, type RefObject } from "react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import type { ChatEvent } from "../lib/types";
-import {
-  emptyAssistant,
-  markAssistantStopped,
-  reduceAssistantForTurn,
-  toHistory,
-  userMessage,
-  type ChatMessage,
-} from "./chatMessage";
+import { toHistory } from "./chatHistory";
+import { emptyAssistant, userMessage, type ChatMessage } from "./chatMessage";
+import { markAssistantStopped, reduceAssistantForTurn } from "./chatTurnStream";
 import type { SkillPickerEntry } from "./skillAutocomplete";
 
 export interface ChatPaneChat {

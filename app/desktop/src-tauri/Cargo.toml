@@ -50,6 +50,12 @@ sysinfo = "0.39"
 sha2 = "0.10"
 flate2 = "1"
 tar = "0.4.46"
+# Bounds-checked Mach-O reader for the installed-requirement health check. A
+# locally compiled executable can be present, executable, and still unable to
+# launch, so its load commands are read rather than the binary being run — see
+# `macho_linkage.rs`. Only the read path for Mach-O is compiled in; `memchr` is
+# its single dependency and is already in the graph.
+object = { version = "0.40", default-features = false, features = ["read_core", "macho", "std"] }
 # Unix filesystem capabilities for the skills shell: statvfs free-space probes,
 # stable directory FDs, openat create-only writes, and macOS F_GETPATH/xattrs.
 libc = "0.2"

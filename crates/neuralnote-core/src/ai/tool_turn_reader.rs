@@ -304,9 +304,62 @@ mod tests {
             ),
             "a turn that carried nothing must ask for the buffered fallback"
         );
+        // The frame reasoned, so a `Thinking` event is expected and correct —
+        // reasoning happened and the user saw it. What must NOT be here is a
+        // card: the buffered fallback about to run cannot replay reasoning (it
+        // streams nothing at all), but it would replay a note preview over one
+        // already on screen.
         assert!(
-            sink.events.is_empty(),
-            "nothing reached the user, so the fallback cannot replay over a card"
+            sink.events
+                .iter()
+                .all(|event| matches!(event, ChatEvent::Thinking { .. })),
+            "only the frame's reasoning reached the user, got {:?}",
+            sink.events
+        );
+        assert!(
+            previews(&sink).is_empty(),
+            "no card is on screen, so the fallback cannot replay over one"
+        );
+    }
+
+    #[test]
+    fn reasoning_interleaved_with_the_fragments_leaves_the_call_byte_identical() {
+        // Now that the tool turn asks for reasoning, its frames no longer sit
+        // politely at the head of the stream — they arrive between fragments.
+        // Reassembly must step over them exactly as it stepped over them before,
+        // so the note the model composed is the note that gets dispatched: one
+        // reasoning token folded into a `content` argument is a corrupted note
+        // body, and it would look like the model wrote it.
+        let reasoning: Vec<&str> = CAPTURE
+            .lines()
+            .filter(|line| line.starts_with("data:") && line.contains("reasoning.text"))
+            .collect();
+        assert!(!reasoning.is_empty(), "the capture still reasons");
+        let mut wire: Vec<&str> = Vec::new();
+        for (n, frame) in frames_for(COMPLETED_CALL).into_iter().enumerate() {
+            wire.push(reasoning[n % reasoning.len()]);
+            wire.push(frame);
+        }
+
+        let mut sink = VecSink::default();
+        let (reader, outcome) = read_lines(&wire, &mut sink);
+        assert!(!outcome.unwrap());
+
+        let completion = completed(reader.finish(&mut sink).unwrap());
+        assert_eq!(
+            completion.tool_calls.first().unwrap().arguments,
+            captured_arguments(COMPLETED_CALL),
+            "interleaved reasoning must not change one byte of the call"
+        );
+        assert!(
+            completion.content.is_none(),
+            "and it must not become the turn's prose either"
+        );
+        assert!(
+            sink.events
+                .iter()
+                .any(|event| matches!(event, ChatEvent::Thinking { .. })),
+            "the reasoning still reached the user live"
         );
     }
 

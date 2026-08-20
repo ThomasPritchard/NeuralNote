@@ -12,6 +12,7 @@ import type {
   InstalledModel,
   ProviderKind,
   PullEvent,
+  ReasoningControl,
   ReasoningSupport,
   Recommendation,
   RecentVault,
@@ -98,6 +99,15 @@ export interface CreateMockVaultOptions {
     hasKey: boolean;
     model?: string;
     reasoning?: boolean;
+    /** The effort the stored preference already holds, as `set_reasoning_effort`
+     *  would have left it. Only meaningful alongside a `catalogueControl` that
+     *  offers it — the real command refuses anything the probed menu does not. */
+    reasoningEffort?: string | null;
+    /** What the OpenRouter catalogue published for this model, as the shell's
+     *  control cache holds it. Left unset the catalogue has said nothing, which
+     *  is the real state before a probe runs and renders as `pending` — never as
+     *  a guessed menu. */
+    catalogueControl?: ReasoningControl;
     reasoningSupported?: ReasoningSupport;
     /** The verdict the `refresh_reasoning_support` probe *discovers and
      *  persists* when it runs, mirroring the real command (probe → persist →

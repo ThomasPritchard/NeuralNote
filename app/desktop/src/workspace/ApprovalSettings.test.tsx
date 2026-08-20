@@ -62,7 +62,8 @@ function aiStatus(approval: ApprovalStatus): AiStatus {
   return {
     activeProvider: "openRouter",
     reasoningSupported: "unknown",
-    openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5", reasoning: false },
+    reasoningControl: { kind: "pending" },
+    openrouter: { hasKey: true, model: "anthropic/claude-sonnet-4.5", reasoning: false, reasoningEffort: null },
     local: { activeModelTag: null },
     approval,
   };

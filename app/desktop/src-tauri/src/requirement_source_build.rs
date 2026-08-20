@@ -87,6 +87,16 @@ pub(super) fn extract_source_archive(
                 "source archive expands beyond the safety limit",
             ));
         }
+        // Every codeload tarball opens with a `pax_global_header` record, which
+        // `tar` hands to us rather than consuming (as it does GNU long names and
+        // pax *local* extensions). It is archive metadata with no archive root
+        // and nothing to write, so the entry rules below — which police what
+        // actually lands on disk — do not apply to it, and neither does the path
+        // check above them. Skipping before `unpack_in` also means it can never
+        // be written, whatever it claims to contain.
+        if entry.header().entry_type().is_pax_global_extensions() {
+            continue;
+        }
         let path = entry
             .path()
             .map_err(|error| source_error(format!("source path is invalid: {error}")))?;
@@ -149,6 +159,14 @@ pub(super) fn whisper_build_specs(
             "-B".into(),
             build.as_os_str().to_owned(),
             "-DCMAKE_BUILD_TYPE=Release".into(),
+            // whisper.cpp defaults BUILD_SHARED_LIBS to ON everywhere except
+            // Emscripten and MinGW, so a default configure emits a `whisper-cli`
+            // that loads six `@rpath` dylibs through an `LC_RPATH` pointing at
+            // this staging build directory. Only the executable is published and
+            // the staging tree is deleted immediately afterwards, so that binary
+            // dies in dyld the first time the user transcribes anything. Linking
+            // the libraries in keeps the one-regular-file publish contract honest.
+            "-DBUILD_SHARED_LIBS=OFF".into(),
         ]),
         common(vec![
             "--build".into(),
@@ -494,9 +512,84 @@ pub(crate) async fn install_whisper_from_source(
         app_data_dir,
         recipe.name,
         &canonical_output,
-    )
+    )?;
+    // Everything above happens while the staging tree still exists, which is
+    // exactly the condition under which the original defect was invisible: the
+    // build succeeded, the file was published, and it could not start once the
+    // tree went away. Drop the staging tree first, then prove the installed
+    // binary launches from app-data alone.
+    drop(staging);
+    sink.send(PullEvent::Progress {
+        status: "Checking the installed whisper-cli runs".into(),
+        digest: None,
+        completed: None,
+        total: None,
+        percent: None,
+    });
+    verify_installed_binary(app_data_dir, recipe.name, cancellation).await
+}
+
+/// Launch the freshly installed executable once, with the build tree gone.
+///
+/// This is the only check that speaks for dyld itself — architecture, code
+/// signature, the shared cache, and the whole transitive dependency graph — and
+/// the recurring polls are a cheap screen next to it. It is affordable here
+/// because it happens once per install, and it is not the ambient risk that
+/// running a user-supplied file would be: this is the artefact just compiled
+/// from a checksum-pinned source in a private directory.
+///
+/// A failure removes the published file. Leaving an executable that cannot start
+/// is what sent the original failure downstream to look like broken
+/// transcription, and "not installed" is the honest state to leave behind.
+async fn verify_installed_binary(
+    app_data_dir: &Path,
+    name: &str,
+    cancellation: &CaptureCancellation,
+) -> CoreResult<()> {
+    let installed = app_data_dir.join("bin").join(name);
+    let spec = ProcessSpec {
+        program: installed.clone(),
+        args: vec![OsString::from("--version")],
+        cwd: Some(app_data_dir.to_path_buf()),
+        environment: EnvironmentPolicy::ClearAndSet(BTreeMap::from([
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("HOME"), app_data_dir.as_os_str().to_owned()),
+            (
+                OsString::from("TMPDIR"),
+                app_data_dir.as_os_str().to_owned(),
+            ),
+        ])),
+        timeout: Duration::from_secs(60),
+        stdout_limit: 64 * 1024,
+        stderr_limit: 64 * 1024,
+    };
+    let failure = match TokioProcessRunner.run(&spec, cancellation).await {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => format!(
+            "it exited with {}; {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(512)
+                .collect::<String>()
+        ),
+        Err(error) => format!("it could not be started: {error}"),
+    };
+    if let Err(error) = std::fs::remove_file(&installed) {
+        log::warn!("could not remove the unusable '{name}' that was just built: {error}");
+    }
+    Err(source_error(format!(
+        "the compiled {name} does not run on this machine, so it was not kept: {failure}"
+    )))
 }
 
 #[cfg(test)]
 #[path = "requirement_source_build_tests.rs"]
 mod tests;
+
+// The harness compiles the real whisper.cpp with `xcrun` and then reads the
+// installed binary's Mach-O linkage, so it is macOS-only twice over. It is
+// `#[ignore]`d opt-in besides, so no default run loses anything elsewhere.
+#[cfg(all(test, target_os = "macos"))]
+#[path = "requirement_source_build_live.rs"]
+mod live;

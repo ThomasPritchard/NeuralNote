@@ -1,21 +1,33 @@
 // The pure `ChatEvent` → `AssistantMessage` fold, split out of `chatMessage.ts`
 // when the approval-gate events pushed that file past the 500-line guardrail.
 //
-// **The `: AssistantMessage` return annotation on `reduceAssistant` is the whole
-// totality guarantee, and it travelled here with the function on purpose.** That
-// annotation plus `strict` is what makes an unhandled `ChatEvent` variant a
-// compile error (TS2366, "function lacks ending return statement"). There is no
-// `assertNever` behind it; lose the annotation in a later move and the safety net
-// disappears silently.
+// **The `: AssistantMessage` return annotation on `foldEvent` — the function
+// holding the switch — is the whole totality guarantee.** That annotation plus
+// `strict` is what makes an unhandled `ChatEvent` variant a compile error
+// (TS2366, "function lacks ending return statement"). There is no `assertNever`
+// behind it; lose the annotation in a later move and the safety net disappears
+// silently. It sits on `foldEvent` rather than on `reduceAssistant` because the
+// switch is what has to be exhaustive; `reduceAssistant` wraps it.
 //
 // The import of `AssistantMessage` is type-only, so the apparent cycle with
 // `chatMessage.ts` is erased at compile time and there is no runtime cycle.
+//
+// **This file is deliberately over the 500-line guardrail, and `foldEvent` is
+// deliberately over the 50-line function tripwire.** The switch is ~60% of it
+// and cannot be broken up without losing the guarantee above; the rest is the
+// per-arm correlation rules, and those touch five *different* fields of the turn
+// (`activity`, `toolCalls`, `noteEdits`, `toolApprovals`, `reasoningBoundaries`)
+// while sharing nothing but a shape. Grouping them into one "helpers" module
+// would split on that shape rather than on a responsibility, and would move each
+// rule's rationale away from the single arm it explains. Measured, not assumed:
+// deleting one arm reds `tsc` with TS2366 at `foldEvent`.
 
-import type { ChatEvent } from "../lib/types";
+import type { ChatEvent, PlaylistPosition } from "../lib/types";
 import type {
   ActivityStep,
   AssistantMessage,
   NoteEditView,
+  ReasoningBoundary,
   ToolApprovalView,
   ToolCallView,
 } from "./chatMessage";
@@ -65,6 +77,46 @@ function withSettlement(
   // A node for a call we never saw announced has no dispatch we could have read
   // a step off, so it is affiliated with nothing rather than with a guess.
   return [...calls, { name: "", title: "", arguments: "", stepId: null, ...settlement }];
+}
+
+/** Enrich the node the backend says raised this cue, and no other.
+ *
+ *  Matches the newest still-unsettled node with that id, exactly as
+ *  `withSettlement` does and for the same reason: a finished node must not be
+ *  made to look like it is still working. The backend emits every cue between
+ *  announcing a call and settling it, so the live node is always the right one.
+ *
+ *  **Correlation is on the id the cue carries, never on arrival order.**
+ *  Parallel tool calls are supported, so ordering would attach one call's query
+ *  to another call's node — a false claim about provenance, in the one surface
+ *  whose whole job is provenance.
+ *
+ *  `id === null`, or an id matching no live node, changes nothing — and,
+ *  unlike a settlement, is not appended as a row of its own. `null` is
+ *  ordinary: a retrieval cue may have no dispatched call behind it, and it
+ *  still drives `activity` exactly as it always has. A non-null id that misses
+ *  is not an anomaly worth a row either, because the id cannot be wrong: a tool
+ *  emits through `CallChannel`, which carries the dispatched call's id and
+ *  exposes no general `send`, so a cue addressed to someone else's node is
+ *  unwritable rather than merely unwritten
+ *  (`crates/neuralnote-core/src/ai/call_channel.rs`). What appending WOULD
+ *  produce is a rail node with no name, no title and no arguments — the three
+ *  things a tool node consists of. */
+function withLiveCall(
+  calls: ToolCallView[],
+  id: string | null,
+  enrich: (call: ToolCallView) => ToolCallView,
+): ToolCallView[] {
+  if (id === null) return calls;
+  for (let i = calls.length - 1; i >= 0; i--) {
+    const call = calls[i];
+    if (call.id === id && call.status === null) {
+      const next = calls.slice();
+      next[i] = enrich(call);
+      return next;
+    }
+  }
+  return calls;
 }
 
 /** Fold a live note preview into the edit that owns its id, or start one.
@@ -150,16 +202,119 @@ function approvalAfter(
   return updated[updated.findIndex((approval) => approval.id === id)];
 }
 
+/** Open a new train of thought at whatever has accumulated so far.
+ *
+ *  Recorded on the event that STARTS a turn rather than on the first reasoning
+ *  delta of it, because that event is the only thing that knows which turn is
+ *  beginning. A turn that then reasons about nothing leaves a zero-length
+ *  segment, which `reasoningSegments` drops. */
+function withBoundary(
+  turn: AssistantMessage,
+  source: ReasoningBoundary["source"],
+): ReasoningBoundary[] {
+  return [...turn.reasoningBoundaries, { source, at: turn.thinking.length }];
+}
+
+/** Whether two beacons are talking about the same playlist item.
+ *
+ *  Both `null` counts as the same: a run with no playlist in flight does not
+ *  change item from one round to the next, so a preview outside a playlist
+ *  survives its rounds exactly as one inside a playlist does. */
+function sameVideo(
+  before: PlaylistPosition | null,
+  after: PlaylistPosition | null,
+): boolean {
+  return before?.position === after?.position;
+}
+
 /** Immutably fold one streamed `ChatEvent` into the assistant turn's view
  *  state. Total over the `ChatEvent` union — a new variant is a compile error
- *  here, so the UI can never silently ignore a backend event. */
+ *  here, so the UI can never silently ignore a backend event.
+ *
+ *  Pure, and deliberately clock-free: the timestamps the live head runs on are
+ *  stamped by `reduceAssistantForTurn`, which is the one caller that owns the
+ *  outside world. */
 export function reduceAssistant(
   turn: AssistantMessage,
   event: ChatEvent,
 ): AssistantMessage {
+  const folded = foldEvent(turn, event);
+  // "Thinking" is a claim about right now, so it is derived from the event that
+  // just landed rather than latched by one and cleared by hand somewhere else.
+  // An event that changed nothing cannot unsay it — nothing happened.
+  if (folded === turn) return turn;
+  const reasoningStreaming = event.type === "thinking";
+  return folded.reasoningStreaming === reasoningStreaming
+    ? folded
+    : { ...folded, reasoningStreaming };
+}
+
+/** The event-by-event fold. **The `: AssistantMessage` return annotation is the
+ *  totality guarantee** — with `strict`, an unhandled variant is a compile
+ *  error (TS2366) rather than a silently ignored event. */
+function foldEvent(turn: AssistantMessage, event: ChatEvent): AssistantMessage {
   switch (event.type) {
     case "processing":
-      return { ...turn, phase: "thinking" };
+      // The run was accepted and is preparing its first request. That is all it
+      // says: it is emitted before a single token has been asked for, so it is
+      // no evidence at all that the model is reasoning.
+      return { ...turn, phase: "sending" };
+    case "planningRound":
+      return {
+        ...turn,
+        phase: "planning",
+        round: { current: event.round, max: event.maxRounds },
+        // Each round reasons about its own question, so the beacon that opens
+        // one also opens that round's train of thought.
+        reasoningBoundaries: withBoundary(turn, {
+          kind: "round",
+          round: event.round,
+        }),
+        // Re-read, never merged: the beacon re-states the item every round, so
+        // a finished playlist clears itself here instead of leaving "video 3 of
+        // 3" standing over the answer turn.
+        playlist: event.playlist,
+        // The preview belongs to the item that was in flight when it arrived.
+        // A beacon naming a different item retires it, so a video whose preview
+        // never arrives shows no card rather than the previous video's.
+        videoPreview: sameVideo(turn.playlist, event.playlist)
+          ? turn.videoPreview
+          : null,
+      };
+    case "videoPreview":
+      return {
+        ...turn,
+        videoPreview: {
+          videoId: event.videoId,
+          title: event.title,
+          durationSecs: event.durationSecs,
+          channel: event.channel,
+          // Carried through as absent, never coerced to "": the card's
+          // text-only form is the degraded path, not a broken image.
+          thumbnailDataUri: event.thumbnailDataUri,
+        },
+      };
+    case "keepalive":
+      // No view state: a keepalive says the socket is alive, not that anything
+      // happened. It is consumed by the liveness stamp in
+      // `reduceAssistantForTurn`, which is where "alive" and "progressed" are
+      // deliberately kept apart.
+      return turn;
+    case "toolProgress": {
+      // A tool reporting from inside itself is progress, and dating it as such
+      // is not decoration: `foldWithLiveness` short-circuits on an identity
+      // fold, so while this returned `turn` a four-minute transcription left
+      // `lastEventAt` standing and the head raised its stall notice 45 seconds
+      // into a perfectly healthy run.
+      //
+      // Never collapse this into a `default:` arm — the exhaustive switch is
+      // what makes a new backend event a compile error here.
+      const toolCalls = withLiveCall(turn.toolCalls, event.id, (call) => ({
+        ...call,
+        progress: event.message,
+      }));
+      return toolCalls === turn.toolCalls ? turn : { ...turn, toolCalls };
+    }
     case "skillActivated":
       return {
         ...turn,
@@ -328,13 +483,21 @@ export function reduceAssistant(
         approvalDegraded: turn.approvalDegraded ?? event.reason,
       };
     case "searching":
+      // One ledger, not two. A retrieval cue drives `activity` and nothing else:
+      // the query is already the tool node's argument hint and the hit count is
+      // already its Rust-composed summary, so a per-call copy would put one act
+      // on one node twice — and two independently-maintained provenance lines in
+      // one turn eventually disagree.
       return {
         ...turn,
         phase: "searching",
         activity: [...turn.activity, { kind: "search", query: event.query }],
       };
     case "retrieved":
-      return { ...turn, activity: withHitCount(turn.activity, event.query, event.hitCount) };
+      return {
+        ...turn,
+        activity: withHitCount(turn.activity, event.query, event.hitCount),
+      };
     case "reading":
       return {
         ...turn,
@@ -349,6 +512,9 @@ export function reduceAssistant(
         ...turn,
         phase: "verifying",
         activity: [...turn.activity, { kind: "verifying" }],
+        // Emitted between the last round and the streamed answer, so it is also
+        // where the answer turn's own reasoning starts.
+        reasoningBoundaries: withBoundary(turn, { kind: "answer" }),
       };
     case "citationDropped":
       return {

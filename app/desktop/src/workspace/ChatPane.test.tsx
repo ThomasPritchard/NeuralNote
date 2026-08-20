@@ -141,7 +141,8 @@ describe("ChatPane — first-run provider branching", () => {
     mockAiStatus.mockResolvedValue({
       activeProvider: "openRouter",
       reasoningSupported: "unknown",
-      openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false },
+      reasoningControl: { kind: "pending" },
+      openrouter: { hasKey: false, model: DEFAULT_MODEL, reasoning: false, reasoningEffort: null },
       local: { activeModelTag: null },
       approval: ALWAYS_ASK_APPROVAL_STATUS,
     });
@@ -311,7 +312,8 @@ describe("ChatPane — key setup", () => {
     mockAiStatus.mockResolvedValue({
       activeProvider: null,
       reasoningSupported: "unknown",
-      openrouter: { hasKey: false, model: "acme/echoed-default", reasoning: false },
+      reasoningControl: { kind: "hidden" },
+      openrouter: { hasKey: false, model: "acme/echoed-default", reasoning: false, reasoningEffort: null },
       local: { activeModelTag: null },
       approval: ALWAYS_ASK_APPROVAL_STATUS,
     });

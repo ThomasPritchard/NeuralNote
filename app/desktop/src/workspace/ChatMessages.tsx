@@ -16,7 +16,7 @@ import {
   modelReportedProvenance,
   resolveAnswerMarkers,
   showsNothingFoundCard,
-} from "./chatMessage";
+} from "./chatTurnReadouts";
 import type {
   AssistantMessage,
   ChatMessage,
@@ -34,13 +34,8 @@ import {
   UsageFooter,
 } from "./ChatTurnNotices";
 
-// Re-exported so `playfulProgressCopy.test.ts` (and any other importer) can keep
-// pulling it from "./ChatMessages" even though it now lives in its own module.
-export { playfulProgressCopy } from "./playfulProgressCopy";
-
 function AssistantTurn({
   turn,
-  prompt,
   onOpenCitation,
   onOpenNote,
   onSendFollowUp,
@@ -50,7 +45,6 @@ function AssistantTurn({
   onElicitAnswered,
 }: Readonly<{
   turn: AssistantMessage;
-  prompt: string;
   onOpenCitation: (citation: CitationView) => void;
   onOpenNote: (relPath: string) => void;
   /** Issues an ordinary chat turn (a dormant elicitation's late answer). */
@@ -120,7 +114,6 @@ function AssistantTurn({
       />
       <ChatTimeline
         turn={turn}
-        prompt={prompt}
         answering={answering}
         suppressLive={hasSkillNarrative}
       />
@@ -265,23 +258,20 @@ export function ChatMessages({
   // "the nth user / nth assistant message" is a durable identity. Content can't
   // key an assistant turn — it mutates as the answer streams.
   const counts = { user: 0, assistant: 0 };
-  let latestUserPrompt = "";
   const keyed = messages.map((message, index) => {
     const n = counts[message.role];
     counts[message.role] = n + 1;
-    if (message.role === "user") latestUserPrompt = message.content;
-    return { message, index, key: `${message.role}-${n}`, prompt: latestUserPrompt };
+    return { message, index, key: `${message.role}-${n}` };
   });
   return (
     <div className="flex flex-col gap-3.5">
-      {keyed.map(({ message, index, key, prompt }) =>
+      {keyed.map(({ message, index, key }) =>
         message.role === "user" ? (
           <UserBubble key={key} content={message.content} />
         ) : (
           <AssistantTurn
             key={key}
             turn={message}
-            prompt={prompt}
             onOpenCitation={onOpenCitation}
             onOpenNote={onOpenNote}
             onSendFollowUp={onSendFollowUp}

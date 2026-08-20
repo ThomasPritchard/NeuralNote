@@ -39,9 +39,9 @@ const searchCall: ChatEvent[] = [
     arguments: '{"query":"photosynthesis"}',
     stepId: null,
   },
-  { type: "searching", query: "photosynthesis" },
-  { type: "retrieved", query: "photosynthesis", hitCount: 3 },
-  { type: "toolResult", id: "call-search", status: "ok", summary: "3 spans", detail: null },
+  { type: "searching", query: "photosynthesis", callId: "call-search" },
+  { type: "retrieved", query: "photosynthesis", hitCount: 3, callId: "call-search" },
+  { type: "toolResult", id: "call-search", status: "ok", summary: "3 spans", detail: null, durationMs: 0 },
 ];
 const readCall: ChatEvent[] = [
   {
@@ -52,13 +52,14 @@ const readCall: ChatEvent[] = [
     arguments: `{"rel_path":"${NOTE_REL}","start_line":12,"end_line":18}`,
     stepId: null,
   },
-  { type: "reading", relPath: NOTE_REL, startLine: 12, endLine: 18 },
+  { type: "reading", relPath: NOTE_REL, startLine: 12, endLine: 18, callId: "call-read" },
   {
     type: "toolResult",
     id: "call-read",
     status: "ok",
     summary: `${NOTE_REL}:12–18`,
     detail: null,
+    durationMs: 0,
   },
 ];
 
@@ -205,7 +206,7 @@ describe("Journey 7: cited chat — streamed run", () => {
   it("renders each progressive phase before the answer and terminal frame", async () => {
     const { user, advanceNextFrame } = await openWorkspace({
       chatScript: [
-        { type: "searching", query: "photosynthesis" },
+        { type: "searching", query: "photosynthesis", callId: null },
         { type: "answer", delta: "Plants need light." },
         { type: "done" },
       ],
@@ -359,9 +360,9 @@ describe("Journey 7: cited chat — the timeline rail", () => {
         arguments: '{"query":"photosynthesis"}',
         stepId: null,
       },
-      { type: "searching", query: "photosynthesis" },
-      { type: "retrieved", query: "photosynthesis", hitCount: 3 },
-      { type: "toolResult", id: "ok-1", status: "ok", summary: "3 spans", detail: null },
+      { type: "searching", query: "photosynthesis", callId: "ok-1" },
+      { type: "retrieved", query: "photosynthesis", hitCount: 3, callId: "ok-1" },
+      { type: "toolResult", id: "ok-1", status: "ok", summary: "3 spans", detail: null, durationMs: 0 },
       {
         type: "toolCall",
         id: "rejected-1",
@@ -376,6 +377,7 @@ describe("Journey 7: cited chat — the timeline rail", () => {
         status: "rejected",
         summary: null,
         detail: "note not found: Missing.md",
+        durationMs: 0,
       },
       {
         type: "toolCall",
@@ -391,6 +393,7 @@ describe("Journey 7: cited chat — the timeline rail", () => {
         status: "error",
         summary: null,
         detail: "the caption service timed out",
+        durationMs: 0,
       },
       { type: "answer", delta: "Here is what I could find." },
       { type: "done" },
@@ -482,7 +485,7 @@ describe("Journey 7: cited chat — a note write, previewed as it composes", () 
         }),
         stepId: null,
       },
-      { type: "toolResult", id: "call-write", status: "ok", summary: null, detail: null },
+      { type: "toolResult", id: "call-write", status: "ok", summary: null, detail: null, durationMs: 0 },
       { type: "noteWritten", relPath: WRITE_REL, kind: "atomic" },
       { type: "answer", delta: "Captured it." },
       { type: "done" },
@@ -558,7 +561,7 @@ describe("Journey 7: cited chat — a note write, previewed as it composes", () 
 describe("Journey 7: cited chat — surfaced error", () => {
   it("shows a run error inline instead of a silent blank, and frees the composer", async () => {
     const errorScript: ChatEvent[] = [
-      { type: "searching", query: "quantum gravity" },
+      { type: "searching", query: "quantum gravity", callId: null },
       { type: "error", message: "The model provider is unreachable." },
     ];
     const { user, advanceAllFrames } = await openWorkspace({ chatScript: errorScript });

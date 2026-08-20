@@ -28,6 +28,20 @@ mod commands;
 mod event_names;
 mod key_revision;
 mod local;
+// Synthetic Mach-O bytes, not a reader of them: the fixtures are built by hand
+// out of integers and have no platform dependency, so they compile wherever the
+// installer and detection tests that use them do. Off macOS the adversarial
+// subset only `macho_linkage`'s own tests read goes unused, because that module
+// is not compiled there.
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod macho_fixtures;
+// Mach-O is a macOS format, and the requirement it guards is compiled locally
+// only on macOS (the source build shells out to `xcrun`). On any other target
+// there is no linkage question to ask, so the module is not compiled at all
+// rather than condemning every ELF executable as unreadable.
+#[cfg(target_os = "macos")]
+mod macho_linkage;
 mod menu;
 mod openrouter_catalogue;
 #[cfg(test)]
@@ -335,6 +349,7 @@ pub fn run() {
             commands::ai::open_openrouter_rankings,
             commands::ai::set_active_provider,
             commands::ai::set_reasoning,
+            commands::ai::set_reasoning_effort,
             commands::ai::set_approval_mode,
             commands::ai::set_tool_approval_override,
             commands::ai::refresh_reasoning_support,

@@ -19,13 +19,15 @@
 // Presentational only: every count comes from the reducer's own selectors and
 // every label from the backend, so nothing here composes or matches prose.
 
-import { ChevronRight, Loader2 } from "lucide-react";
-import { searchOutcome, summarizeActivity } from "./chatMessage";
+import { ChevronRight, Hourglass, Loader2 } from "lucide-react";
+import { searchOutcome, summarizeActivity } from "./chatTurnReadouts";
 import type { AssistantMessage, ToolCallView } from "./chatMessage";
-import { playfulProgressCopy } from "./playfulProgressCopy";
+import { cn } from "../lib/cn";
 import { approvalNodeState } from "./approvalCopy";
 import { ApprovalDegradedNode, ToolApprovalNode } from "./ChatApprovalNode";
 import { PlanStepNode } from "./ChatPlanNode";
+import { VideoPreviewCard } from "./ChatVideoPreview";
+import { useTurnLiveness } from "./turnLiveness";
 import {
   ActivationFailureNode,
   DroppedNode,
@@ -48,14 +50,19 @@ function count(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
 }
 
-/** A phase is visible only after the event that grounds it arrives. */
-function livePhase(phase: AssistantMessage["phase"], prompt: string): string {
-  const playful = playfulProgressCopy(prompt);
-  switch (phase) {
+/** What the run is actually doing, named plainly.
+ *
+ *  A phase is visible only after the event that grounds it arrives, and
+ *  "Thinking" is not one of them: it is a claim that reasoning tokens are
+ *  arriving right now, so it is read off `reasoningStreaming` and disappears
+ *  with the deltas. */
+function livePhase(turn: AssistantMessage): string {
+  if (turn.reasoningStreaming) return "Thinking";
+  switch (turn.phase) {
     case "sending":
-      return playful.sending;
-    case "thinking":
-      return playful.thinking;
+      return "Sending message";
+    case "planning":
+      return "Planning";
     case "searching":
       return "Searching your vault";
     case "reading":
@@ -73,7 +80,7 @@ function TimelineEntryNode({
     case "failure":
       return <ActivationFailureNode failure={entry.failure} last={last} />;
     case "thinking":
-      return <ThinkingNode text={entry.text} last={last} />;
+      return <ThinkingNode text={entry.text} source={entry.source} last={last} />;
     case "degraded":
       return <ApprovalDegradedNode reason={entry.reason} last={last} />;
     case "approval":
@@ -185,29 +192,171 @@ function SummaryLine({
   );
 }
 
-/** The live head: the phase the run is genuinely in, plus a running tally.
+/** The run clock, to the second. Under a minute it is bare seconds; past one it
+ *  takes the same `2m 05s` shape `formatElapsed` uses for the settled figure, so
+ *  the live readout and the record it hands over to read as one thing.
  *
- *  Only the phase word is a live region — it changes ~3× a run. The tally is
- *  aria-hidden because its per-node churn would otherwise announce 15–20 times.
- *  (`<output>` carries an implicit status role and renders inline.) */
+ *  Whole seconds, no decimal: the readout is re-read once a second, and a tenths
+ *  digit would be stale for most of the second it was showing. `formatElapsed`
+ *  keeps its decimal precisely because it is describing something that stopped. */
+function formatLiveElapsed(ms: number): string {
+  const total = Math.floor(Math.max(0, ms) / 1000);
+  if (total < 60) return `${total}s`;
+  return `${Math.floor(total / 60)}m ${String(total % 60).padStart(2, "0")}s`;
+}
+
+/** How much internal work has happened, in ONE slot rather than two.
+ *
+ *  The round pair and the node tally answer the same question — how much has
+ *  this run got through — so the head shows whichever of them is the better
+ *  answer rather than both. The round wins wherever it exists because it comes
+ *  with a denominator; the tally fills the short window before the first
+ *  planning beacon, when there is no round to report yet.
+ *
+ *  During a playlist the round deliberately loses its denominator. `max_rounds`
+ *  is the iteration ceiling, which a playlist blows straight past (three videos
+ *  reach ~24 rounds under a cap of 16) and which a mid-run skill activation can
+ *  raise anyway. The honest denominator during a playlist is the playlist's own
+ *  length, and that is already in the phase line — so the round stays as a bare
+ *  count of model turns instead of claiming a ceiling it is not measured
+ *  against. */
+function workCounter(turn: AssistantMessage, nodeCount: number): string | null {
+  if (turn.round !== null) {
+    return turn.playlist !== null
+      ? `round ${turn.round.current}`
+      : `round ${turn.round.current} of ${turn.round.max}`;
+  }
+  return nodeCount > 0 ? count(nodeCount, "step", "steps") : null;
+}
+
+/** The ticking half of the head, isolated in its own component so the
+ *  once-a-second commit repaints one span instead of the whole rail — which
+ *  carries rendered markdown and would re-parse it every tick.
+ *
+ *  **`aria-hidden`, deliberately.** `<summary>` is a focusable control whose
+ *  accessible name is composed from its contents, so an un-hidden clock would
+ *  rewrite that name once a second under a screen reader's cursor. The stall
+ *  notice is the thing that gets announced; the clock is for the eye. */
+function LiveElapsed({ turn }: Readonly<{ turn: AssistantMessage }>) {
+  // `true` rather than a threaded prop: this renders only inside `LiveHead`,
+  // which the timeline mounts only while the run is live. The interval is
+  // therefore torn down by unmounting, not by flipping a flag.
+  const { elapsedMs } = useTurnLiveness(turn, true);
+  // Null until the first event lands. Rendering `0s` there would report a
+  // measurement of a run that has not started reporting — a different statement.
+  if (elapsedMs === null) return null;
+  return (
+    <span aria-hidden className="nn-mono shrink-0 tabular-nums">
+      · {formatLiveElapsed(elapsedMs)}
+    </span>
+  );
+}
+
+/** The live head: the phase the run is genuinely in, where it has got to, and
+ *  how long it has been going.
+ *
+ *  What is announced and what is not is the whole design here. The live region
+ *  holds the phase and, during a playlist, the item in flight — two low-churn
+ *  statements (the phase changes ~3× a run; the item changes once per video,
+ *  against a denominator that cannot move). Everything in the right-hand cluster
+ *  is `aria-hidden`: the node tally churns 15–20 times a run, the round counter
+ *  as often, and the clock every second.
+ *
+ *  The layout cannot change height. The phase group truncates and the counters
+ *  never shrink, so a long phase on a narrow pane loses its tail rather than
+ *  wrapping the head onto a second line and jolting the transcript under it.
+ *
+ *  Under `prefers-reduced-motion` the spinner is frozen, which leaves the phase
+ *  word and the clock as the only evidence the run is alive. They are sized and
+ *  worded to carry that on their own — the clock is never the thing that gets
+ *  truncated away. */
 function LiveHead({
-  phase,
-  prompt,
+  turn,
   nodeCount,
-}: Readonly<{ phase: AssistantMessage["phase"]; prompt: string; nodeCount: number }>) {
+}: Readonly<{ turn: AssistantMessage; nodeCount: number }>) {
+  const counter = workCounter(turn, nodeCount);
   return (
     <>
       <Loader2
         className="size-3.5 shrink-0 animate-spin text-primary motion-reduce:animate-none"
         aria-hidden
       />
-      <output>{livePhase(phase, prompt)}</output>
-      {nodeCount > 0 && (
-        <span aria-hidden className="font-normal text-muted-foreground/60">
-          · {count(nodeCount, "step", "steps")}
-        </span>
-      )}
+      <output className="min-w-0 truncate">
+        {livePhase(turn)}
+        {turn.playlist !== null && (
+          <span className="font-normal text-muted-foreground/70">
+            {" · "}
+            Video {turn.playlist.position} of {turn.playlist.total}
+          </span>
+        )}
+      </output>
+      <span className="flex shrink-0 items-center gap-1.5 font-normal text-muted-foreground/60">
+        {counter !== null && (
+          <span aria-hidden className="shrink-0">
+            · {counter}
+          </span>
+        )}
+        <LiveElapsed turn={turn} />
+      </span>
     </>
+  );
+}
+
+/** Nothing has progressed for a while — said once, never counted down.
+ *
+ *  A counting-down prompt manufactures urgency, which is why the approval sheet
+ *  renders its expiry once and leaves it alone (`approvalCopy.expiryLine`). This
+ *  is the same ruling applied to a slow run: a threshold crossing, not a timer.
+ *  Neither sentence claims a failure, because nothing has failed — the run is
+ *  still open in both.
+ *
+ *  The two states are genuinely different news and get different registers.
+ *  Keepalives still arriving means the connection is fine and the model is
+ *  thinking — that sentence says what WE are doing, and reads muted. Nothing
+ *  arriving at all means the provider itself has gone quiet — that sentence says
+ *  what IT is doing, and takes the warning tone, on the glyph only, with the
+ *  words in `text-foreground`, because a tinted fill drags its own ground toward
+ *  the tone colour and pushes tinted body text under AA.
+ *
+ *  Both are short on purpose. Measured in a real browser at the docked pane's
+ *  narrowest width, the first drafts of these sentences wrapped onto a second
+ *  line, which is a notice about a stalled run pushing the transcript down at
+ *  the exact moment its whole job is to be reassuring.
+ *
+ *  Mounted empty from the start of the run and holding one line of its own type,
+ *  so it both announces reliably (a live region inserted together with its text
+ *  is often skipped by screen readers) and reserves its own footprint. The
+ *  notice appearing at 45 seconds moves nothing.
+ *
+ *  `1.375em` is `leading-snug`'s own ratio, applied to this element's own font
+ *  size — one line, with no pixel value to drift. `1lh` says the same thing more
+ *  directly and is not used: the unit needs Safari 16.4, and a webview older
+ *  than that would drop the declaration and quietly lose the reservation. */
+function StallNotice({
+  turn,
+  live,
+}: Readonly<{ turn: AssistantMessage; live: boolean }>) {
+  const { stalled, silent } = useTurnLiveness(turn, live);
+  if (!live) return null;
+  return (
+    <output className="mt-1.5 flex min-h-[1.375em] items-center gap-1.5 text-[0.6875rem] leading-snug">
+      {stalled && (
+        <>
+          <Hourglass
+            className={cn(
+              "size-3 shrink-0",
+              silent ? "text-warning" : "text-muted-foreground/70",
+            )}
+            aria-hidden
+          />
+          <span className={silent ? "text-foreground" : "text-muted-foreground"}>
+            {silent
+              ? "The model has been quiet for a while."
+              : "Still working. Nothing new for a while."}
+          </span>
+        </>
+      )}
+    </output>
   );
 }
 
@@ -255,12 +404,10 @@ function needsAttention(turn: AssistantMessage, calls: ToolCallView[]): boolean 
  *  a user who re-opens it afterwards keeps it open. */
 export function ChatTimeline({
   turn,
-  prompt,
   answering,
   suppressLive,
 }: Readonly<{
   turn: AssistantMessage;
-  prompt: string;
   /** Answer tokens have started arriving — the answer is the live focus now. */
   answering: boolean;
   /** A skill narrative (header/steps/question) is already carrying the live
@@ -304,7 +451,7 @@ export function ChatTimeline({
             aria-hidden
           />
           {live ? (
-            <LiveHead phase={turn.phase} prompt={prompt} nodeCount={nodeCount} />
+            <LiveHead turn={turn} nodeCount={nodeCount} />
           ) : (
             <SummaryLine
               turn={turn}
@@ -314,6 +461,13 @@ export function ChatTimeline({
             />
           )}
         </summary>
+        {/* What the run is working on, directly under the head that says how far
+            through it is. Live only: once the answer is streaming, the video is
+            the answer's subject and the card is one more thing between the user
+            and it. */}
+        {live && (
+          <VideoPreviewCard preview={turn.videoPreview} playlist={turn.playlist} />
+        )}
         {rows.length > 0 && (
           // A floor under the live rail, not a ceiling: the first node or two
           // sit in a reserved footprint so the block does not jolt a row taller
@@ -336,6 +490,12 @@ export function ChatTimeline({
           </ol>
         )}
       </details>
+      {/* Outside the fold on purpose. The fold's `open` is derived but not
+          re-asserted, so a user who collapsed it keeps it collapsed — and
+          "wondering whether the app has hung" is exactly the moment someone has
+          tidied the rail away. A notice about the run must not be inside the
+          thing it explains. */}
+      <StallNotice turn={turn} live={live} />
     </section>
   );
 }

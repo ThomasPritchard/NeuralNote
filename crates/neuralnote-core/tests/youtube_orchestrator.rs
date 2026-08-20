@@ -156,6 +156,7 @@ fn environment() -> SkillEnvironment {
             bin.join("bgutil-pot"),
             assets.join("bgutil-plugin.zip"),
         ]),
+        unusable_binaries: Default::default(),
     }
 }
 
@@ -283,4 +284,172 @@ fn youtube_skill_context_override_allows_routing_after_a_long_transcript() {
         2,
         "the 60k general chat cap must not end a YouTube distil run immediately after transcript capture"
     );
+}
+
+/// Fails the first metadata lookup as a stale extractor, so the tool takes the
+/// update-and-retry branch — the branch that used to be pure silence.
+#[derive(Default)]
+struct StaleThenFreshIo {
+    lookups: AtomicUsize,
+}
+
+#[async_trait]
+impl YoutubeIo for StaleThenFreshIo {
+    async fn inspect_metadata(&self, _url: &YoutubeUrl) -> Result<MetadataPayload, CaptureError> {
+        if self.lookups.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(CaptureError::ExtractorStale(
+                "nsig extraction failed".into(),
+            ));
+        }
+        Ok(MetadataPayload {
+            json: br#"{"id":"iG9CE55wbtY","title":"A talk","uploader":"TED","duration":10,"subtitles":{},"automatic_captions":{}}"#.to_vec(),
+            annotations: Vec::new(),
+        })
+    }
+
+    async fn fetch_caption_vtt(
+        &self,
+        _request: &CaptionRequest,
+    ) -> Result<CaptionPayload, CaptureError> {
+        Err(CaptureError::CaptionsAbsent("unused".into()))
+    }
+
+    async fn enumerate_playlist(&self, _url: &YoutubeUrl) -> Result<PlaylistPayload, CaptureError> {
+        Err(CaptureError::PlaylistInvalid("unused".into()))
+    }
+
+    async fn fetch_thumbnail(&self, _video_id: &VideoId) -> Result<ThumbnailPayload, CaptureError> {
+        Err(CaptureError::ThumbnailRejected("no image here".into()))
+    }
+
+    async fn transcribe_audio(
+        &self,
+        _url: &YoutubeUrl,
+        _model: &str,
+        _cancellation: &CaptureCancellation,
+    ) -> Result<CaptionPayload, CaptureError> {
+        Err(CaptureError::TranscriptionFailed("unused".into()))
+    }
+
+    async fn update_extractor(&self) -> Result<(), CaptureError> {
+        Ok(())
+    }
+}
+
+fn run_one_video_lookup(io: &dyn YoutubeIo) -> Vec<ChatEvent> {
+    let vault = tempfile::tempdir().unwrap();
+    let retriever = KeywordRetriever::new(vault.path());
+    let registry = SkillRegistry::built_in(&[]).unwrap();
+    let environment = environment();
+    let (policy, approval_prompt, approval_classifier) = support::unattended_approval();
+    let services = SkillServices::new(&registry, &environment, &NoUserPrompt, &FsBackend, 1)
+        .with_approval(policy, approval_prompt, approval_classifier)
+        .with_youtube_io(io)
+        .with_vault_profile_io(&UnavailableVaultProfileIo)
+        .with_capture_cancellation(CaptureCancellation::default());
+    let llm = ScriptedLlm {
+        turns: Mutex::new(VecDeque::from([
+            Completion {
+                content: None,
+                tool_calls: vec![ToolCall {
+                    id: "info".into(),
+                    name: "fetch_video_info".into(),
+                    arguments: r#"{"url":"https://www.youtube.com/watch?v=iG9CE55wbtY"}"#.into(),
+                }],
+            },
+            Completion {
+                content: Some("ready".into()),
+                tool_calls: Vec::new(),
+            },
+        ])),
+        requests: Mutex::new(Vec::new()),
+    };
+    let mut sink = Sink::default();
+
+    block_on(run_chat(
+        "distil this video",
+        &[],
+        vec![YOUTUBE_DISTIL_SKILL_ID.into()],
+        vault.path(),
+        "test-model",
+        &retriever,
+        &llm,
+        &services,
+        &mut sink,
+        &Guards::default(),
+    ))
+    .unwrap();
+
+    sink.0
+}
+
+fn position(events: &[ChatEvent], matches: impl Fn(&ChatEvent) -> bool) -> usize {
+    events
+        .iter()
+        .position(matches)
+        .unwrap_or_else(|| panic!("no matching event in {events:?}"))
+}
+
+#[test]
+fn a_retrying_tool_speaks_between_its_call_and_its_result() {
+    // The interleaving is the property, not the presence: progress emitted after
+    // the node settled would render on a finished row, and progress emitted
+    // before the call was announced has no row to render on at all.
+    let io = StaleThenFreshIo::default();
+
+    let events = run_one_video_lookup(&io);
+
+    assert_eq!(io.lookups.load(Ordering::SeqCst), 2);
+    let call = position(
+        &events,
+        |event| matches!(event, ChatEvent::ToolCall { id, .. } if id == "info"),
+    );
+    let result = position(
+        &events,
+        |event| matches!(event, ChatEvent::ToolResult { id, .. } if id == "info"),
+    );
+    let progress: Vec<usize> = events
+        .iter()
+        .enumerate()
+        .filter_map(|(index, event)| match event {
+            ChatEvent::ToolProgress { id, .. } if id == "info" => Some(index),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        !progress.is_empty(),
+        "a retried network call must not be silent: {events:?}"
+    );
+    assert!(
+        progress.iter().all(|index| (call..result).contains(index)),
+        "progress {progress:?} must fall between the call at {call} and the result at {result}"
+    );
+}
+
+#[test]
+fn a_video_preview_follows_the_beacon_that_announces_its_item() {
+    // `VideoPreview` deliberately carries no playlist position: the consumer
+    // reads that number off `PlanningRound` instead, and retires a preview when
+    // a beacon names a different item. A preview that arrived FIRST would be
+    // retired by the very beacon that announced it.
+    let io = MetadataIo(AtomicUsize::new(0));
+
+    let events = run_one_video_lookup(&io);
+
+    let beacon = position(&events, |event| {
+        matches!(event, ChatEvent::PlanningRound { .. })
+    });
+    let preview = position(&events, |event| {
+        matches!(event, ChatEvent::VideoPreview { .. })
+    });
+    assert!(
+        beacon < preview,
+        "the beacon at {beacon} must precede the preview at {preview}: {events:?}"
+    );
+    // And the preview belongs to the video the lookup actually resolved.
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ChatEvent::VideoPreview { video_id, title, .. }
+            if video_id == "iG9CE55wbtY" && title == "A talk"
+    )));
 }

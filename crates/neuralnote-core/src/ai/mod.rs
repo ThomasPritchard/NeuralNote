@@ -15,6 +15,7 @@
 //! [`EvidenceSpan`] shape, with no change to the chat layer.
 
 pub mod approval;
+mod call_channel;
 pub mod capabilities;
 pub mod elicitation;
 pub mod events;
@@ -39,6 +40,7 @@ pub mod tools;
 pub mod verify;
 pub mod write_policy;
 pub mod youtube;
+mod youtube_preview;
 mod youtube_route;
 mod youtube_selection;
 mod youtube_tool_errors;
@@ -46,10 +48,11 @@ mod youtube_tool_schemas;
 mod youtube_tools;
 
 pub use capabilities::{
-    effective_reasoning, ollama_reasoning_support, openrouter_reasoning_support,
-    parse_ollama_capabilities, parse_openrouter_context_windows, parse_openrouter_input_pricing,
-    parse_openrouter_models, supports_reasoning, supports_thinking, ModelCapabilities,
-    ReasoningSupport,
+    effective_reasoning, effective_reasoning_ask, ollama_reasoning_support,
+    openrouter_reasoning_support, parse_ollama_capabilities, parse_openrouter_context_windows,
+    parse_openrouter_input_pricing, parse_openrouter_models, parse_openrouter_reasoning_controls,
+    reasoning_ask, reasoning_effort_override, supports_reasoning, supports_thinking,
+    ModelCapabilities, ReasoningControl, ReasoningEffortOverride, ReasoningSupport,
 };
 pub use elicitation::{elicit_user, ElicitationOutcome};
 pub use events::{ChatEvent, ElicitOption, Elicitation, EventSink, TokenUsage, ToolStatus};
@@ -74,7 +77,7 @@ pub use orchestrator::{
 pub use plan::{PlanStep, RunPlan, StepStatus};
 pub use provider_config::{
     read_provider_config, write_provider_config, ProbedReasoning, ProviderConfig, ProviderKind,
-    ReasoningProbeTarget,
+    ReasoningPreference, ReasoningProbeTarget,
 };
 pub use requirement_binaries::{
     lookup_requirement_binary, lookup_requirement_source_build, requirement_binaries,

@@ -201,7 +201,10 @@ fn model_selection_changes_only_the_model_and_rejects_unoffered_values() {
         active_provider: Some(neuralnote_core::ai::ProviderKind::Local),
         model: "vendor/old".into(),
         local_model_tag: Some("qwen2.5:7b".into()),
-        reasoning: true,
+        reasoning_preference: neuralnote_core::ai::ReasoningPreference {
+            enabled: true,
+            effort: None,
+        },
         reasoning_probe: Some(neuralnote_core::ai::ProbedReasoning {
             model: "vendor/old".into(),
             support: neuralnote_core::ai::ReasoningSupport::Supported,
@@ -224,7 +227,10 @@ fn model_selection_changes_only_the_model_and_rejects_unoffered_values() {
     assert_eq!(persisted.model, "vendor/new");
     assert_eq!(persisted.active_provider, original.active_provider);
     assert_eq!(persisted.local_model_tag, original.local_model_tag);
-    assert_eq!(persisted.reasoning, original.reasoning);
+    assert_eq!(
+        persisted.reasoning_preference,
+        original.reasoning_preference
+    );
     assert_eq!(persisted.reasoning_probe, original.reasoning_probe);
     assert_eq!(
         persisted.reasoning_probe_generation,

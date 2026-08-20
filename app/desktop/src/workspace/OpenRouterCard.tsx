@@ -2,17 +2,16 @@
 // Owns all of the key-form state; the page (AiSettingsPage) hands it the
 // shared status and the one provider-switch channel.
 
-import { useId, useState } from "react";
+import { useState } from "react";
 import { Check, KeyRound } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
-import { cn } from "../lib/cn";
 import type { AiStatus } from "../lib/types";
 import { buttonVariants } from "@/components/ui/button";
 import { KeyChangeCaveat } from "./KeyChangeCaveat";
 import { FIELD, LABEL } from "./KeySetupPanel";
 import { InlineError, ProviderCard } from "./ProviderCard";
-import { reasoningCapability } from "./reasoningSupport";
+import { ReasoningSettings } from "./ReasoningSettings";
 
 interface OpenRouterCardProps {
   status: AiStatus | null;
@@ -52,8 +51,8 @@ export function OpenRouterCard({
   const [keyChangeCaveat, setKeyChangeCaveat] = useState(false);
   const [orError, setOrError] = useState<string | null>(null);
   const [savingReasoning, setSavingReasoning] = useState(false);
+  const [rechecking, setRechecking] = useState(false);
   const [reasoningError, setReasoningError] = useState<string | null>(null);
-  const reasoningHintId = useId();
 
   const hasKey = status?.openrouter.hasKey ?? false;
   const orActive = status?.activeProvider === "openRouter";
@@ -61,17 +60,13 @@ export function OpenRouterCard({
   // the status its own write returned, so the control never shows an un-persisted
   // state, and a rejected write leaves it untouched.
   const reasoning = status?.openrouter.reasoning ?? false;
-  // The probed capability — shared with the chat pane's chip (one derivation,
-  // one copy). Only a verified "unsupported" disables; "unknown" fails open.
-  //
-  // `reasoningSupported` describes the *effective* provider's model, so it may
-  // be the local model's verdict. Only trust it here when OpenRouter is the
-  // effective provider; otherwise fail open (`unknown`), or a local model's
-  // "unsupported" would falsely disable — and mislabel — the OpenRouter toggle.
-  const capability = reasoningCapability(
-    orActive ? (status?.reasoningSupported ?? "unknown") : "unknown",
-    status?.openrouter.model ?? "",
-  );
+  // `reasoningControl` describes the *effective* provider's model, so while Local
+  // is active it is the local model's control — which has nothing to say about
+  // the OpenRouter model this card names. Rendering it here would pair one
+  // model's verdict with another model's id, so the block appears only when
+  // OpenRouter is the model actually being configured. That makes the
+  // mislabelling structurally impossible rather than guarded against.
+  const showsReasoning = hasKey && orActive && status !== null;
 
   const openKeyForm = () => {
     setKeyError(null);
@@ -107,20 +102,40 @@ export function OpenRouterCard({
     }
   };
 
-  const toggleReasoning = async () => {
+  /** Run one reasoning-preference write and render exactly what it persisted.
+   *
+   *  Never a follow-up `refreshStatus`: that swallows its own failure, so a
+   *  read that failed after the write landed would leave the control showing
+   *  "off" while the config says "on" — billing the user for tokens they never
+   *  agreed to. Both writes share this for the same reason. */
+  const writePreference = async (run: () => Promise<AiStatus>) => {
     if (savingReasoning) return;
     setSavingReasoning(true);
     setReasoningError(null);
     try {
-      // Render what the write persisted, not a follow-up read. `refreshStatus`
-      // swallows its own failure, so using it here would let a failed re-read
-      // leave the box unticked while the config says reasoning is on — billing
-      // the user for tokens they never agreed to.
-      applyStatus(await api.setReasoning(!reasoning));
+      applyStatus(await run());
     } catch (e) {
       setReasoningError(errorMessage(e));
     } finally {
       setSavingReasoning(false);
+    }
+  };
+
+  /** Re-ask the capability probe. The shell's effort-menu cache is not
+   *  persisted, so a Settings pane opened inside the launch window reads
+   *  `pending` and — since this page loads its status once, on mount — would
+   *  stay there. The probe's response is the one status read that carries a
+   *  resolved control on a cold launch, so this is what resolves it. */
+  const recheckCapabilities = async () => {
+    if (rechecking) return;
+    setRechecking(true);
+    setReasoningError(null);
+    try {
+      applyStatus(await api.refreshReasoningSupport());
+    } catch (e) {
+      setReasoningError(errorMessage(e));
+    } finally {
+      setRechecking(false);
     }
   };
 
@@ -179,36 +194,25 @@ export function OpenRouterCard({
       </div>
       {orError && <InlineError>{orError}</InlineError>}
 
-      {hasKey && (
-        <div className="flex flex-col gap-1">
-          <label
-            title={capability.reason ?? undefined}
-            className={cn(
-              "flex w-fit items-center gap-2 text-[0.75rem] text-foreground/90",
-              capability.disabled ? "cursor-not-allowed" : "cursor-pointer",
-            )}
-          >
-            <input
-              type="checkbox"
-              checked={reasoning}
-              onChange={() => void toggleReasoning()}
-              disabled={savingReasoning || capability.disabled}
-              aria-describedby={reasoningHintId}
-              className="size-3.5 shrink-0 accent-primary disabled:cursor-not-allowed disabled:opacity-50"
-            />
-            <span>Show model reasoning</span>
-          </label>
-          {/* The hint slot is already aria-associated, so when the probe
-              verified the model can't reason it carries the "why" — visible
-              and announced — instead of a billing note for a moot toggle. */}
-          <p
-            id={reasoningHintId}
-            className="pl-5.5 text-[0.6875rem] leading-snug text-muted-foreground"
-          >
-            {capability.reason ?? "Reasoning tokens are billed by OpenRouter."}
-          </p>
-          {reasoningError && <InlineError>{reasoningError}</InlineError>}
-        </div>
+      {showsReasoning && (
+        <ReasoningSettings
+          control={status.reasoningControl}
+          model={status.openrouter.model}
+          reasoningOn={reasoning}
+          effort={status.openrouter.reasoningEffort}
+          // Optional on the wire (absent is the ordinary case), one
+          // representation in the view: `null` means nothing is being
+          // substituted and `reasoningEffort` above is the whole truth.
+          effortOverride={status.openrouter.reasoningEffortOverride ?? null}
+          saving={savingReasoning}
+          rechecking={rechecking}
+          error={reasoningError}
+          onToggle={() => void writePreference(() => api.setReasoning(!reasoning))}
+          onPickEffort={(effort) =>
+            void writePreference(() => api.setReasoningEffort(effort))
+          }
+          onRecheck={() => void recheckCapabilities()}
+        />
       )}
 
       {keyFormOpen && (

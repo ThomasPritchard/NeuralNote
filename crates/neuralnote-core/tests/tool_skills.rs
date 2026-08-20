@@ -67,6 +67,7 @@ fn environment(free_disk_bytes: u64) -> SkillEnvironment {
         hardware: hardware(free_disk_bytes),
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     }
 }
 
@@ -586,17 +587,105 @@ fn write_note_rejects_policy_failures_without_emitting_a_written_event() {
     );
 
     let result = harness.call(
-        "write-outside-budget",
+        "write-into-a-missing-folder",
         TOOL_WRITE_NOTE,
-        r#"{"rel_path":"Rejected.md","content":"never written","kind":"atomic","work_item":1}"#,
+        r#"{"rel_path":"Missing/Rejected.md","content":"never written","kind":"atomic","work_item":0}"#,
     );
 
     assert_eq!(result.outcome, ToolOutcome::Rejected);
     let content: serde_json::Value = serde_json::from_str(&result.content).unwrap();
     let error = content["error"].as_str().unwrap();
-    assert!(error.starts_with("write_note failed:"));
-    assert!(error.contains("work item 1 is outside this run's 1 work items"));
-    assert!(!harness.vault.path().join("Rejected.md").exists());
+    assert!(
+        error.starts_with("write_note failed:"),
+        "unexpected error: {error}"
+    );
+    assert!(error.contains("not found"), "unexpected error: {error}");
+    assert!(!harness.vault.path().join("Missing").exists());
+    assert!(!harness
+        .events()
+        .iter()
+        .any(|event| matches!(event, ChatEvent::NoteWritten { .. })));
+}
+
+#[test]
+fn write_note_advertises_what_a_work_item_is_rather_than_leaving_it_to_be_guessed() {
+    // `minimum: 0` with no upper bound and no prose is the whole of what a
+    // non-playlist run used to say about this argument: its legal range is
+    // run-dependent and the model cannot read it. The default has to be stated
+    // where the argument is declared, not only in a skill's playlist step.
+    let schemas = tools::tool_schemas(&BTreeSet::from([TOOL_WRITE_NOTE.to_string()]));
+    let write_note = schemas
+        .iter()
+        .find(|schema| schema["function"]["name"] == TOOL_WRITE_NOTE)
+        .expect("write_note is advertised once granted");
+    let work_item = &write_note["function"]["parameters"]["properties"]["work_item"];
+
+    let description = work_item["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("Use 0"),
+        "the advertised argument must name the value a run with one work item takes: {work_item}"
+    );
+    // `contains("Use 0")` alone is satisfied by prose that still only describes
+    // the playlist case — "for playlists, Use 0-based indices" would pass it and
+    // leave a single-video run exactly as ambiguous as before.
+    assert!(
+        description.contains("single work item"),
+        "the description must say a run has ONE work item by default, not only how \
+         playlists index: {work_item}"
+    );
+    assert_eq!(
+        (&work_item["default"], &work_item["minimum"]),
+        (&serde_json::json!(0), &serde_json::json!(0)),
+        "prose replaces neither the declared default nor the declared floor: {work_item}"
+    );
+}
+
+#[test]
+fn write_note_refuses_an_unknown_work_item_by_naming_the_one_this_run_has() {
+    // Observed in the real app during a SINGLE-video YouTube distil: the model
+    // sent `work_item: 1` for a legitimate note, and the run had one work item.
+    // Nothing host-side computes that index — the model does, and the only prose
+    // that described a NON-zero one was the distil skill's playlist step. A
+    // refusal that only says the index is "outside this run's 1 work items"
+    // leaves the model to guess again. Name the value it must use instead.
+    //
+    // There is exactly ONE producer of this sentence — `write_policy.rs`'s
+    // `ensure_item`. An earlier draft of this test asserted a
+    // "write_note refused:" prefix to tell a seam copy apart from a policy copy;
+    // no such prefix exists anywhere in the codebase and there is no second
+    // producer to tell apart, so the assertion tested an invented string rather
+    // than the code. Grep before adding a marker assertion back.
+    let mut harness = Harness::built_in();
+    harness.call(
+        "activate",
+        TOOL_USE_SKILL,
+        &format!(r#"{{"id":"{FIXTURE_SKILL_ID}"}}"#),
+    );
+
+    let result = harness.call(
+        "write-unknown-work-item",
+        TOOL_WRITE_NOTE,
+        r#"{"rel_path":"Refused.md","content":"never written","kind":"literature","work_item":1}"#,
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Rejected);
+    let content: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    let error = content["error"].as_str().unwrap();
+    assert!(
+        error.contains("work_item 1 is not part of this run"),
+        "the refusal must name the rejected value: {error}"
+    );
+    assert!(
+        error.contains("use work_item 0"),
+        "the refusal must name the value to use instead: {error}"
+    );
+    // An out-of-range budget index is not a malformed note name. Reporting one
+    // as the other is what the user actually read in the timeline.
+    assert!(
+        !error.contains("invalid name"),
+        "an indexing refusal must not read as a name error: {error}"
+    );
+    assert!(!harness.vault.path().join("Refused.md").exists());
     assert!(!harness
         .events()
         .iter()

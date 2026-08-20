@@ -70,6 +70,7 @@ const answered: ChatEvent = {
   status: "ok",
   summary: "Continue",
   detail: `{"chosen_ids":["continue"]}`,
+  durationMs: 0,
 };
 
 const gatedWrite: ChatEvent[] = [
@@ -92,7 +93,7 @@ const gatedWrite: ChatEvent[] = [
 ];
 
 const approvedTail: ChatEvent[] = [
-  { type: "toolResult", id: WRITE_ID, status: "ok", summary: NOTE_REL, detail: null },
+  { type: "toolResult", id: WRITE_ID, status: "ok", summary: NOTE_REL, detail: null, durationMs: 0 },
   { type: "noteWritten", relPath: NOTE_REL, kind: "atomic" },
   { type: "answer", delta: "Saved that as a note." },
   { type: "done" },

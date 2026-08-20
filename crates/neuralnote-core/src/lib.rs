@@ -21,6 +21,8 @@ mod temp_sibling;
 pub mod templates;
 pub mod tree;
 pub mod vault;
+#[cfg(test)]
+mod warning_capture;
 pub mod workspace_state;
 
 pub use error::{CoreError, CoreResult};
