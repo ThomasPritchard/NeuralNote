@@ -7,6 +7,7 @@
 //! shape, so the chat layer never changes.
 
 use crate::ai::evidence::EvidenceSpan;
+use crate::ai::verify::lines_carried;
 use crate::error::CoreResult;
 use crate::model::{FileHit, NoteDoc, SearchResponse, TreeNode};
 use crate::note::{content_hash, read_note};
@@ -443,13 +444,18 @@ impl RetrievalProvider for KeywordRetriever {
 }
 
 /// Slice an inclusive 1-based line range out of `lines` (as produced by
-/// `split_inclusive('\n')`), returning the clamped range and the exact quoted text.
+/// `split_inclusive('\n')`), returning the quoted text and the range that text
+/// actually covers.
 ///
 /// The text is a verbatim substring of the note (lines are concatenated with their
 /// original endings intact), so the verifier's `raw.contains(text)` always holds
 /// for an unchanged note — even for CRLF notes. It is trimmed of its trailing
-/// newline and bounded to `max_bytes`; both are safe because a prefix of a
-/// substring is still a substring.
+/// newline and bounded to `max_bytes`; both are safe for the *quote*, because a
+/// prefix of a substring is still a substring — but neither is safe for the
+/// *range*, which is why the returned `end` is derived from the surviving bytes
+/// rather than from the requested line. A citation may never claim a line it does
+/// not quote, and no later check can catch it if it does: the verifier sees a
+/// truncated quote as the substring it still is (PA-003).
 fn slice_lines(
     lines: &[&str],
     start_line: u32,
@@ -469,7 +475,11 @@ fn slice_lines(
     let trimmed_len = text.trim_end_matches(['\r', '\n']).len();
     text.truncate(trimmed_len);
     bound_to_char_boundary(&mut text, max_bytes);
-    (start, end, text)
+    // Text that survived both cuts decides the end line. A quote emptied outright
+    // (a blank line, a budget too small for the first char) collapses to `start`;
+    // the verifier drops it for having nothing to quote.
+    let quoted_end = start.saturating_add(lines_carried(&text).saturating_sub(1));
+    (start, quoted_end, text)
 }
 
 /// Truncate `text` to at most `max_bytes`, backing up to the nearest char boundary
@@ -762,9 +772,11 @@ mod tests {
         let v = vault();
         let r = KeywordRetriever::new(v.path());
         let span = r.read_note_span("Research/widgets.md", 1, 2, 2000).unwrap();
-        assert_eq!((span.start_line, span.end_line), (1, 2));
         // Lines 1-2 are the H1 then a blank line; trailing newlines are trimmed.
         assert_eq!(span.text, "# Widgets");
+        // So the quote carries line 1 alone, and the range says so. Reporting 1-2
+        // would claim a line the citation does not quote.
+        assert_eq!((span.start_line, span.end_line), (1, 1));
     }
 
     #[test]
@@ -788,6 +800,103 @@ mod tests {
         assert!(span.text.len() <= 5);
         // Truncation landed on a char boundary (valid UTF-8), never inside a code point.
         assert!(std::str::from_utf8(span.text.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn read_note_span_ends_at_the_last_line_its_quote_reaches() {
+        // 60 lines of 46 bytes each: a 2000-byte budget cuts the quote inside line 44,
+        // so the reported range must end at 44. Claiming 1–60 would attribute the
+        // answer to 16 lines the citation never carried, and the verifier cannot see
+        // it — a prefix of a substring is still a substring (AGENTS.md invariant 1).
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=60)
+            .map(|i| format!("line {i:02} {}\n", "x".repeat(37)))
+            .collect();
+        fs::write(dir.path().join("long.md"), &body).unwrap();
+        let r = KeywordRetriever::new(dir.path());
+
+        let span = r.read_note_span("long.md", 1, 60, 2000).unwrap();
+
+        assert!(span.text.len() <= 2000, "the budget must be honoured");
+        // Every line names its own number, so the last line of the quote states the
+        // end line the span may honestly claim — read out of the text rather than
+        // recomputed with the arithmetic under test.
+        let last_quoted = span.text.lines().next_back().unwrap();
+        let reached: u32 = last_quoted
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            (span.start_line, span.end_line),
+            (1, reached),
+            "the range must stop where the truncated quote stops"
+        );
+        // The quote is still a verbatim substring, so the verifier's check holds.
+        let doc = read_note(dir.path(), &dir.path().join("long.md")).unwrap();
+        assert!(doc.raw.contains(&span.text));
+    }
+
+    #[test]
+    fn read_note_span_does_not_claim_a_line_the_budget_stopped_short_of() {
+        // The budget lands exactly on a line ending: lines 1-2 are quoted whole and
+        // line 3 contributes nothing, so the range must end at 2. The off-by-one this
+        // guards is the tempting one — counting the trailing newline as a third line.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("n.md"), "l1xx\nl2xx\nl3xx\nl4xx\n").unwrap();
+        let r = KeywordRetriever::new(dir.path());
+
+        let span = r.read_note_span("n.md", 1, 4, 10).unwrap();
+
+        assert_eq!(span.text, "l1xx\nl2xx\n");
+        assert_eq!((span.start_line, span.end_line), (1, 2));
+    }
+
+    #[test]
+    fn read_note_span_keeps_range_and_quote_in_step_on_a_crlf_note() {
+        // CRLF is where a byte budget can cut between the \r and its \n. The quote
+        // must stay a verbatim substring (the verifier's check) and the range must
+        // still describe only the lines the surviving bytes reach.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("crlf.md"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+        let r = KeywordRetriever::new(dir.path());
+        let doc = read_note(dir.path(), &dir.path().join("crlf.md")).unwrap();
+
+        // Cut inside line 2: the range reaches 2, not the requested 3.
+        let into_line_two = r.read_note_span("crlf.md", 1, 3, 9).unwrap();
+        assert_eq!(into_line_two.text, "alpha\r\nbe");
+        assert_eq!(
+            (into_line_two.start_line, into_line_two.end_line),
+            (1, 2),
+            "the quote reaches line 2, so the range ends there"
+        );
+        assert!(doc.raw.contains(&into_line_two.text));
+
+        // Cut between the \r and the \n: line 1 is all the quote carries.
+        let mid_ending = r.read_note_span("crlf.md", 1, 3, 6).unwrap();
+        assert_eq!(mid_ending.text, "alpha\r");
+        assert_eq!((mid_ending.start_line, mid_ending.end_line), (1, 1));
+        assert!(doc.raw.contains(&mid_ending.text));
+    }
+
+    #[test]
+    fn a_span_the_budget_emptied_claims_no_line_and_is_dropped() {
+        // A budget too small for the first multibyte char leaves nothing quotable.
+        // The range must collapse rather than claim lines the empty quote never
+        // carried, and the verifier refuses it outright — a citation with no evidence
+        // is worse than no citation.
+        use crate::ai::verify::CitationVerifier;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("m.md"), "ünïcödé lïné\nsecond line\n").unwrap();
+        let r = KeywordRetriever::new(dir.path());
+
+        let span = r.read_note_span("m.md", 1, 2, 1).unwrap();
+
+        assert!(span.text.is_empty(), "no whole char fits in one byte");
+        assert_eq!((span.start_line, span.end_line), (1, 1));
+        let err = CitationVerifier::new(dir.path()).verify(&span).unwrap_err();
+        assert!(err.contains("no quotable text"), "{err}");
     }
 
     #[test]
@@ -1084,8 +1193,9 @@ mod tests {
             "the note is read from disk once"
         );
         // Both spans still reflect the note correctly (same hash, distinct ranges).
+        // The 1-2 read quotes line 1 only — line 2 is blank — so its range ends at 1.
         assert_eq!(a.content_hash, b.content_hash);
-        assert_eq!((a.start_line, a.end_line), (1, 2));
+        assert_eq!((a.start_line, a.end_line), (1, 1));
         assert_eq!((b.start_line, b.end_line), (3, 3));
     }
 

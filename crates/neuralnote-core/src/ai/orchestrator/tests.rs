@@ -2467,9 +2467,12 @@ fn happy_path_searches_reads_and_emits_a_verified_citation() {
     assert!(events
         .iter()
         .any(|e| matches!(e, ChatEvent::Retrieved { hit_count, .. } if *hit_count == 1)));
+    // The read asked for lines 1-2; line 2 of the fixture is blank, so the span
+    // quotes line 1 alone and reports the range it actually carries (PA-003) — the
+    // timeline shows what was read, never a wider claim than the evidence.
     assert!(events.iter().any(
         |e| matches!(e, ChatEvent::Reading { rel_path, start_line, end_line }
-        if rel_path == "Research/widgets.md" && *start_line == 1 && *end_line == 2)
+        if rel_path == "Research/widgets.md" && *start_line == 1 && *end_line == 1)
     ));
     assert!(events.iter().any(|e| matches!(e, ChatEvent::Verifying)));
     assert!(count(&events, |e| matches!(e, ChatEvent::Answer { .. })) >= 1);
