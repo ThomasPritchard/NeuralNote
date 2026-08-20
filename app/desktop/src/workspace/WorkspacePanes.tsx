@@ -10,6 +10,7 @@ import type {
   SetStateAction,
 } from "react";
 import type { LoadedDir } from "../lib/store";
+import type { VaultTreeStatus } from "./useVaultTree";
 import type { TreeNode } from "../lib/types";
 import { ChatSlot } from "./ChatSlot";
 import { FileTree } from "./FileTree";
@@ -71,6 +72,11 @@ export interface WorkspacePanesProps {
   onOpenNote: (relPath: string) => void;
   open: OpenNote;
   noteIndex: NoteIndexEntry[];
+  /** Whether `noteIndex` is a completed vault read. An empty index that failed
+   *  to read must not present itself as "this vault has no notes" in the `[[`
+   *  autocomplete (issue #209). Required, like `noteIndex` itself — the status
+   *  travels with the data it describes. */
+  noteIndexStatus: VaultTreeStatus;
   onSearchTag: (tag: string) => void;
   reportError: (message: string) => void;
   // Chat
@@ -117,6 +123,7 @@ export function WorkspacePanes({
   onOpenNote,
   open,
   noteIndex,
+  noteIndexStatus,
   onSearchTag,
   reportError,
   showChat,
@@ -218,6 +225,7 @@ export function WorkspacePanes({
           <NotePane
             open={open}
             noteIndex={noteIndex}
+            noteIndexStatus={noteIndexStatus}
             onOpenLink={onOpenNote}
             onSearchTag={onSearchTag}
             reportError={reportError}

@@ -1,9 +1,10 @@
 # Native end-to-end tests drive the real application through WebdriverIO's
-# embedded Tauri provider. Ubuntu is the required pull-request gate; macOS runs
-# informationally until #100 lands, and runs strictly more journeys than the
-# required lane does - see `required-native` for which ones only it covers.
-# Windows is a main/manual informational lane - see the `windows-informational`
-# job for what is currently known, and not known, about it.
+# embedded Tauri provider. Ubuntu is the required pull-request and main gate.
+# macOS and Windows stay informational and run only on the weekly schedule or
+# manual dispatch until #100/#101/#78 are settled. macOS still runs strictly
+# more journeys than Ubuntu - see `required-native` for which ones only it
+# covers. Windows has never produced a pass-rate on this runner; see the
+# `windows-informational` job.
 
 name: e2e-native
 
@@ -20,6 +21,8 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+  schedule:
+    - cron: "17 6 * * 1"
 
 concurrency:
   group: e2e-native-${{ github.ref }}
@@ -30,45 +33,13 @@ permissions:
 
 jobs:
   required-native:
-    name: Native Tauri (${{ matrix.label }})
-    runs-on: ${{ matrix.platform }}
-    # Matches the widened per-wait budget in `nativeWait`: this suite passes
-    # locally and expired on the hosted macOS runner, and a per-wait budget the
-    # job cap outlives is no budget at all.
+    name: Native Tauri (Ubuntu)
+    runs-on: ubuntu-latest
     timeout-minutes: 30
-    # macOS is informational until #100 lands. The suite passes locally, and the
-    # runner's 1024x768 display clamps the app's 1280x820 window until the note
-    # column is too narrow to render the lines the journeys reach for. Three
-    # fixes narrowed it - budgets, first-run picker, document-level scrolling.
-    # Diagnosis was slow because the artifact recorded only `errorType`, so every
-    # cause produced byte-identical metadata; it now also carries a redacted
-    # first message line plus the assertion code and operator, which tells the
-    # suite's assertion failures apart. See `native-artifacts.ts`.
-    #
-    # Ubuntu does NOT run the same journeys - macOS runs strictly more, so this
-    # demotion is a real coverage gap, not a duplicate lane. The real macOS save
-    # accelerator in `specs/50-workspace-ui.spec.ts` is gated behind `macOsIt`,
-    # and the native fullscreen journey in `specs/40-window.spec.ts` returns
-    # early off darwin. Nothing required covers either, so a regression in one
-    # can merge green. The environments also differ in the dimension blamed
-    # above: Ubuntu runs under xvfb at 1440x900, macOS bare on the runner's
-    # smaller display.
-    continue-on-error: ${{ matrix.informational || false }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - platform: ubuntu-latest
-            label: Ubuntu
-          - platform: macos-latest
-            label: macOS (informational)
-            informational: true
-
     steps:
       - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
 
       - name: Tauri system dependencies (Ubuntu)
-        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -105,12 +76,59 @@ jobs:
         run: npm ci
 
       - name: Native Tauri E2E (Ubuntu)
-        if: runner.os == 'Linux'
         working-directory: app/desktop/e2e-native
         run: xvfb-run --auto-servernum --server-args="-screen 0 1440x900x24" npm test
 
+      - name: Upload redacted failure artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: native-e2e-${{ runner.os }}-${{ github.run_attempt }}
+          path: app/desktop/e2e-native/artifacts/
+          if-no-files-found: ignore
+          retention-days: 7
+
+  macos-informational:
+    name: Native Tauri (macOS informational)
+    # Parked until #100/#101 land. The suite passes locally; the hosted runner's
+    # 1024x768 display clamps the app's 1280x820 window. Ubuntu does not run the
+    # same journeys (macOS save accelerator, fullscreen), so this is a real
+    # coverage gap, not a duplicate lane.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    continue-on-error: true
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@1af3b93b6815bc44a9784bd300feb67ff0d1eeb3 # v6.0.0
+
+      - name: Setup Rust 1.96
+        uses: dtolnay/rust-toolchain@4be7066ada62dd38de10e7b70166bc74ed198c30
+        with:
+          toolchain: 1.96.0
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2.8.1
+        with:
+          workspaces: "."
+
+      - name: Setup Node 24 LTS
+        uses: actions/setup-node@48b55a011bda9f5d6aeb4c2d9c7362e8dae4041e # v6.4.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: |
+            app/desktop/package-lock.json
+            app/desktop/e2e-native/package-lock.json
+
+      - name: Install desktop dependencies
+        working-directory: app/desktop
+        run: npm ci
+
+      - name: Install native E2E dependencies
+        working-directory: app/desktop/e2e-native
+        run: npm ci
+
       - name: Native Tauri E2E (macOS)
-        if: runner.os == 'macOS'
         working-directory: app/desktop/e2e-native
         run: npm test
 
@@ -136,15 +154,13 @@ jobs:
     # with CRLF, so those lookups returned -1. Fixed by normalising line endings
     # at read time in `app/desktop/e2e-native/ci-workflow.test.ts`.
     #
-    # What #78 originally asked is deferred, not answered: `npm test` runs
-    # `test:config` before `run-native.ts`, so the native suite has not executed
-    # on Windows since this job was restructured, and there is no current
-    # evidence either way about its stability here. The lane stays informational
-    # until it produces some. Once several consecutive `main` runs get past
-    # `test:config` and actually drive the app, that pass rate settles #78 on
-    # data - stabilise the lane, or drop it because Windows is not a release
-    # target for this macOS-only alpha.
-    if: github.event_name != 'pull_request'
+    # What #78 originally asked is deferred, not answered: a 2026-08-18 `main`
+    # run did get past `test:config` and then failed the suite. The lane is
+    # parked off pull requests and ordinary `main` pushes because Windows is
+    # not a release target for this macOS-only alpha. Weekly and manual runs
+    # keep producing the pass-rate data; stabilise or drop from that, not from
+    # every merge.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     continue-on-error: true
     runs-on: windows-latest
     timeout-minutes: 15

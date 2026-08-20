@@ -5,6 +5,7 @@
  */
 export type Backlink = { sourceRel: string, sourceTitle: string, snippet: string, 
 /**
- * 1-based line number in the source note body.
+ * 1-based line number in the source note's raw file (frontmatter included),
+ * so it matches the line search reports for the same text.
  */
 line: number, };

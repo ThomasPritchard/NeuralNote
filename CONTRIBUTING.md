@@ -87,7 +87,7 @@ cargo test --workspace --locked
 npm --prefix app/desktop run check:bindings
 ```
 
-Pull requests targeting `main` run these fast, secret-free checks in GitHub Actions. Native WebDriver tests and the complete coverage, build, and dependency-audit suite run after merge on pushes to `main`.
+Pull requests targeting `main` run the secret-free GitHub Actions suite: Gitleaks, both Node lines, frontend coverage/build/audit, Chromium journeys, Ubuntu Rust, and a macOS Rust compile so `cfg(macos)` cannot merge unchecked. Ubuntu native WebDriver also runs when desktop, crate, or workflow paths change. WebKit, native macOS, and native Windows are weekly or manual informational lanes, not pull-request gates.
 
 Install the Rust gate tools once:
 
@@ -121,7 +121,17 @@ Keep the pull request easy to review:
 - State any skipped check and why it could not run.
 - Do not combine generated output, dependency upgrades, and unrelated cleanup unless they are required by the same change.
 
-Target pull requests at `main`. Maintainers configure branch protection to require the fast `Secrets / Gitleaks`, `Frontend / lint, types, and tests`, and `Rust / test, lint, format, and bindings` checks.
+Target pull requests at `main`. Branch protection requires the published check names:
+
+- `Secrets / Gitleaks`
+- `Frontend / Node 22 / lint, types, and tests`
+- `Frontend / Node 24 / lint, types, and tests`
+- `Frontend / Node 24 / coverage, build, and audit`
+- `Rust / test, lint, format, and bindings`
+- `Rust / macOS compile and test`
+- `Browser / chromium / ubuntu-latest`
+
+Do not require `Native Tauri (Ubuntu)`: that workflow is path-filtered, so a docs-only pull request would sit pending forever.
 
 Maintainers may ask for a smaller pull request when a change mixes concerns or makes citation and vault-safety review difficult.
 

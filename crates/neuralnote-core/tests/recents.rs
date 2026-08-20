@@ -90,7 +90,7 @@ fn a_recents_file_that_is_a_directory_is_read_as_empty_and_fails_the_write() {
     assert!(fs::read_dir(config.path())
         .unwrap()
         .filter_map(Result::ok)
-        .all(|entry| !entry.file_name().to_string_lossy().ends_with(".tmp")));
+        .all(|entry| !entry.file_name().to_string_lossy().ends_with(".nn-tmp")));
 }
 
 #[cfg(unix)]

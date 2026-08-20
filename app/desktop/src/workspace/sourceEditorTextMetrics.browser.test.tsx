@@ -251,6 +251,7 @@ describe("sourceEditorTextMetrics in a real browser", () => {
     await act(async () => {
       root!.render(
         <SourceNoteEditor
+          noteIndexStatus="ready"
           sessionKey={`text-metrics-${mounts}`}
           loadedHash={`text-metrics-${mounts}`}
           value={source}

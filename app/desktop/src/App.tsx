@@ -1,12 +1,12 @@
 import { VaultProvider, useVault } from "./lib/store";
 import { Welcome } from "./welcome/Welcome";
 import { Workspace } from "./workspace/Workspace";
-import type { AppPreferencesLoad } from "./lib/types";
 import { ToastProvider } from "./notifications";
 import { QuarantineRecoveryListener } from "./notifications/QuarantineRecoveryListener";
 import {
   DEFAULT_PREFERENCES,
   PreferencesProvider,
+  type PreferencesBootstrap,
 } from "./preferences/preferences";
 import { UpdateCoordinator } from "./updates/UpdateCoordinator";
 import { WhatsNewModal } from "./whats-new/WhatsNewModal";
@@ -18,15 +18,16 @@ function Router() {
   return status === "open" ? <Workspace /> : <Welcome />;
 }
 
-const DEFAULT_LOAD: AppPreferencesLoad = {
+const DEFAULT_LOAD: PreferencesBootstrap = {
   preferences: DEFAULT_PREFERENCES,
   recoveredFromCorrupt: false,
+  readFailed: false,
   recoveryMessage: null,
 };
 
 export default function App({
   initialPreferences = DEFAULT_LOAD,
-}: Readonly<{ initialPreferences?: AppPreferencesLoad }>) {
+}: Readonly<{ initialPreferences?: PreferencesBootstrap }>) {
   return (
     <ToastProvider>
       <QuarantineRecoveryListener />

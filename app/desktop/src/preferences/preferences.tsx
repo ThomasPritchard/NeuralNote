@@ -35,16 +35,39 @@ export function applyPreferences(
   root.style.fontSize = FONT_SCALE_PERCENT[preferences.fontScale];
 }
 
-export async function bootstrapPreferences(): Promise<AppPreferencesLoad> {
+/** Shown when a write is refused because the stored settings were never read. */
+export const WRITE_REFUSED_MESSAGE =
+  "Your saved settings could not be read, so they have not been overwritten. This change was not saved. Restart NeuralNote to try again.";
+
+/** The bootstrap outcome, widened with a signal the generated `AppPreferencesLoad`
+ *  cannot carry: whether the preferences file could not be READ at all.
+ *
+ *  The two failure modes need opposite write policies, so one flag cannot serve
+ *  both. `recoveredFromCorrupt` means the file was read but its JSON was junk —
+ *  the core already fell back to defaults, and overwriting those unusable bytes
+ *  is a repair. `readFailed` means the bytes were never seen and are presumed
+ *  intact, so writing anything destroys settings the user still has.
+ *
+ *  Required rather than optional on purpose: an optional boolean lets a call site
+ *  construct a bootstrap without deciding which case it is in, and the case it
+ *  would silently default to is the destructive one. */
+export type PreferencesBootstrap = AppPreferencesLoad & { readFailed: boolean };
+
+export async function bootstrapPreferences(): Promise<PreferencesBootstrap> {
   try {
     const loaded = await api.loadAppPreferences();
     applyPreferences(loaded.preferences);
-    return loaded;
+    return { ...loaded, readFailed: false };
   } catch (error) {
-    const fallback: AppPreferencesLoad = {
+    const fallback: PreferencesBootstrap = {
       preferences: { ...DEFAULT_PREFERENCES },
-      recoveredFromCorrupt: true,
-      recoveryMessage: `Preferences could not be loaded. Safe defaults are active for this launch. ${errorMessage(error)}`,
+      // The core only rejects when the file could not be READ: a missing file and
+      // unparseable JSON both RESOLVE (the latter with `recoveredFromCorrupt`).
+      // So this branch is never a corrupt recovery — claiming otherwise is what
+      // let the next write persist these defaults over settings that were fine.
+      recoveredFromCorrupt: false,
+      readFailed: true,
+      recoveryMessage: `Your saved settings could not be read, so defaults are in use for this launch. They have not been changed, and new changes cannot be saved until they can be read. ${errorMessage(error)}`,
     };
     applyPreferences(fallback.preferences);
     return fallback;
@@ -66,29 +89,41 @@ const PreferencesContext = createContext<PreferencesContextValue | null>(null);
 export function PreferencesProvider({
   initial,
   children,
-}: Readonly<{ initial: AppPreferencesLoad; children: ReactNode }>) {
+}: Readonly<{ initial: PreferencesBootstrap; children: ReactNode }>) {
   const [preferences, setPreferences] = useState(initial.preferences);
   const [saving, setSaving] = useState(false);
   const toast = useToast();
+
+  /** True when `preferences` are compiled-in defaults rather than the user's own,
+   *  from either failure mode. Both owe the user a persistent explanation, and
+   *  neither may let a background update check act on a preference we never read. */
+  const usingFallbackDefaults = initial.recoveredFromCorrupt || initial.readFailed;
 
   useEffect(() => {
     applyPreferences(preferences);
   }, [preferences]);
 
   useEffect(() => {
-    if (!initial.recoveredFromCorrupt) return;
+    if (!usingFallbackDefaults) return;
     toast.error(
       initial.recoveryMessage ??
         "Preferences were corrupt. Safe defaults are active for this launch.",
       { dedupKey: "preferences-recovery" },
     );
-  }, [initial.recoveredFromCorrupt, initial.recoveryMessage, toast]);
+  }, [usingFallbackDefaults, initial.recoveryMessage, toast]);
 
   const update = useCallback(
     async (
       patch: Partial<AppPreferences>,
       confirmation = "Settings saved",
     ): Promise<boolean> => {
+      // Fail closed. `preferences` here are defaults standing in for settings we
+      // never managed to read, so saving them would overwrite a file that is
+      // still intact — silently and permanently.
+      if (initial.readFailed) {
+        toast.error(WRITE_REFUSED_MESSAGE, { dedupKey: "preferences-read-failed" });
+        return false;
+      }
       const next = { ...preferences, ...patch };
       setSaving(true);
       try {
@@ -105,17 +140,17 @@ export function PreferencesProvider({
         setSaving(false);
       }
     },
-    [preferences, toast],
+    [initial.readFailed, preferences, toast],
   );
 
   const value = useMemo(
     () => ({
       preferences,
       saving,
-      suppressAutomaticChecksThisLaunch: initial.recoveredFromCorrupt,
+      suppressAutomaticChecksThisLaunch: usingFallbackDefaults,
       update,
     }),
-    [initial.recoveredFromCorrupt, preferences, saving, update],
+    [usingFallbackDefaults, preferences, saving, update],
   );
 
   return (

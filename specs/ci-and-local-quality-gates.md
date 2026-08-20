@@ -1,17 +1,19 @@
 # CI and Local Quality Gates
 
-**Status:** Implemented locally; hosted execution pending the first push
-**Last reviewed:** 2026-07-13
+**Status:** Implemented. Hosted GitHub Actions run on pull requests, pushes to `main`, a weekly Monday schedule, and manual dispatch.
+**Last reviewed:** 2026-08-18
 
 ## Decision
 
 NeuralNote will use GitHub Actions for contributor-facing verification and a
 repository-owned Docker Compose environment for maintainer-only SonarQube analysis.
 
-Pull requests receive fast feedback from linting, type checking, unit tests, Rust
-checks, generated-binding validation, and secret scanning. Pushes to `main` run the
-complete verification suite, including mockIPC journeys, coverage gates, dependency
-audits, production builds, and native Tauri end-to-end tests.
+Pull requests receive secret-free feedback from linting, type checking, unit
+tests, frontend coverage/build/audit, Chromium journeys, Ubuntu and macOS Rust
+checks, generated-binding validation, secret scanning, and Ubuntu native
+WebDriver. Pushes to `main` add the Rust coverage and `cargo-deny` gates.
+WebKit, native macOS, and native Windows are weekly or manual informational
+lanes until those runners are deterministic.
 
 SonarQube remains local. It is not called from GitHub-hosted runners and is not a
 required check for external contributors. The local environment is reproducible from
@@ -21,7 +23,7 @@ tracked configuration, but credentials and analysis tokens remain untracked.
 
 - Give contributors fast, deterministic pull request feedback.
 - Run the full Definition of Done verification after changes land on `main`.
-- Keep native end-to-end coverage without making every pull request wait for it.
+- Keep native end-to-end coverage on Ubuntu without making every pull request wait for the flaky macOS and Windows informational lanes.
 - Detect committed secrets in both current files and Git history.
 - Add a real frontend lint gate with a deliberately scoped Oxlint configuration.
 - Make first-time setup, including local SonarQube, discoverable for people and agents.
@@ -39,12 +41,17 @@ tracked configuration, but credentials and analysis tokens remain untracked.
 
 ## Current Constraints
 
-- The desktop package has type checking and Vitest scripts, but no lint command.
-- `test:run` currently includes both unit/component tests and mockIPC journey tests.
-- Native WebdriverIO tests already run in a separate workflow on Linux and Windows.
+- The desktop package has Oxlint, TypeScript, Vitest unit, mockIPC, browser, and
+  coverage scripts. `coverage` re-runs the full Vitest suite, so CI must not
+  precede it with a separate `test:e2e` or markdown-contract step.
+- Native WebdriverIO tests live in `.github/workflows/e2e.yml`. Ubuntu is the
+  required lane. macOS and Windows are informational and run only on the weekly
+  schedule or manual dispatch.
 - `scripts/rust-quality-gate.sh` checks formatting, Clippy, generated bindings, Rust
-  coverage, and dependency advisories. Its advisory step can skip when the registry is
-  unavailable, so hosted CI needs a separate mandatory `cargo audit` invocation.
+  coverage, and `cargo-deny`. Hosted CI invokes `cargo deny check advisories` on
+  `main` (and on schedule/dispatch), not `cargo audit`.
+- No merge-blocking job may skip compiling `#[cfg(target_os = "macos")]` code. The
+  `Rust / macOS compile and test` job exists for that; it does not drive WebdriverIO.
 - `sonar-project.properties` already consumes frontend and Rust LCOV reports.
 - `.env.sonar` is local, permission-restricted, and must never be printed or committed.
 - GitHub-hosted runners cannot reach the local SonarQube instance.
@@ -58,43 +65,47 @@ whose base branch is `main`.
 
 The pull request path contains these required checks:
 
-1. Gitleaks scans the full Git history.
-2. The desktop package runs Oxlint.
-3. TypeScript runs with `tsc --noEmit`.
-4. Vitest runs unit and component tests only, explicitly excluding `src/e2e/**`.
-5. Rust runs workspace tests with the lockfile enforced.
-6. Rust runs Clippy across all targets and features with warnings denied.
-7. Rust formatting is checked.
-8. Generated TypeScript bindings are regenerated and checked for drift.
+1. Gitleaks scans the full Git history with `-v` so a finding names the rule and file.
+2. Both supported Node lines (22 and 24) run Oxlint, `tsc --noEmit`, the browser
+   typecheck, and Vitest unit/component tests (`src/e2e/**` excluded).
+3. Node 24 runs `coverage` (which includes mockIPC journeys), the production
+   build, and `audit:all` (desktop `npm audit` plus `scripts/audit-e2e-native.mjs`).
+4. Chromium real-browser journeys run on Ubuntu.
+5. Ubuntu Rust runs workspace tests, the `native-e2e` feature boundary, Clippy,
+   rustfmt, and generated-binding drift.
+6. macOS Rust compiles and tests the workspace so `cfg(macos)` cannot merge unchecked.
 
 These checks are the branch-protection candidates. They do not require repository
-secrets and must also work for pull requests from forks.
+secrets and must also work for pull requests from forks. Published check names
+must match `CONTRIBUTING.md` exactly. Do not require `Native Tauri (Ubuntu)`:
+that workflow is path-filtered, so a docs-only pull request would sit pending.
 
 ### Main branch verification
 
-The same `ci.yml` runs its full path for pushes to `main`. It includes every pull
-request check plus:
+The same `ci.yml` runs its full path for pushes to `main`. Frontend coverage,
+the production build, and `audit:all` already run on pull requests. Pushes to
+`main` add:
 
-1. All frontend tests, including mockIPC journey tests.
-2. Frontend LCOV generation with a 90 percent line coverage threshold.
-3. A production frontend build.
-4. Rust LCOV generation with the existing 90 percent line coverage threshold.
-5. A mandatory `cargo audit` run with network access.
-6. A mandatory high-severity npm dependency audit across both the desktop and
-   native-WebDriver lockfiles. The desktop lockfile is audited directly with
-   `npm audit --audit-level=high`; the native-WebDriver lockfile (CI-only dev
-   tooling, no shipped artifact) goes through `scripts/audit-e2e-native.mjs`, a
-   fail-closed wrapper that exits non-zero on any high/critical advisory except
-   explicitly accepted residuals recorded inline in its `ACCEPTED` map (each bound
-   to one package, with rationale and a removal trigger), and exits 2 whenever the
-   audit cannot run or its report schema is not understood.
+1. Rust LCOV generation with the existing 90 percent line coverage threshold,
+   scoped to `-p neuralnote-core`.
+2. A mandatory `cargo deny check advisories` run with network access.
 
-Native Tauri end-to-end tests remain in `.github/workflows/e2e.yml`. That workflow
-runs on pushes to `main` and by manual dispatch, using its existing Linux and Windows
-matrix. It no longer runs for pull requests.
+`audit:all` still covers both lockfiles. The desktop lockfile is audited with
+`npm audit --audit-level=high`; the native-WebDriver lockfile (CI-only dev
+tooling, no shipped artifact) goes through `scripts/audit-e2e-native.mjs`, a
+fail-closed wrapper that exits non-zero on any high/critical advisory except
+explicitly accepted residuals recorded inline in its `ACCEPTED` map (each bound
+to one package, with rationale and a removal trigger), and exits 2 whenever the
+audit cannot run or its report schema is not understood.
 
-The main branch is considered fully verified only when both `ci.yml` and the native
-end-to-end workflow succeed.
+Native Tauri end-to-end tests remain in `.github/workflows/e2e.yml`. Ubuntu runs
+on pull requests (path-filtered) and on pushes to `main`. macOS and Windows run
+only on the weekly Monday schedule (`17 6 * * 1`) or manual dispatch, and stay
+`continue-on-error`. The same schedule and dispatch triggers run WebKit.
+
+The main branch is considered fully verified only when both `ci.yml` and the
+required Ubuntu native job succeed. Informational reds do not fail those
+workflows.
 
 ### Release verification
 
@@ -263,9 +274,10 @@ Implementation updates these public documents:
 
 ## Repository Settings
 
-After the workflow lands and its check names are visible, a maintainer configures
-branch protection for `main` to require the fast pull request jobs before merge.
-Native end-to-end jobs are not pull request requirements because they run after merge.
+Branch protection on `main` requires the published names listed in
+`CONTRIBUTING.md`. Informational WebKit and native macOS/Windows jobs are not
+required. Native Ubuntu is not required either, because its workflow is
+path-filtered.
 
 Repository settings remain a manual operation. The workflow must not assume permission
 to modify branch protection.
@@ -295,8 +307,11 @@ bindings and coverage reports are verification outputs, not hand-edited source f
 
 ## Acceptance Criteria
 
-- Pull requests targeting `main` run only the fast, secret-free quality gates.
-- Pushes to `main` run the full hosted verification suite and native end-to-end matrix.
+- Pull requests targeting `main` run the secret-free quality gates, including
+  frontend coverage/build/audit, Chromium, Ubuntu Rust, and macOS Rust compile.
+- Pushes to `main` add Rust coverage and `cargo-deny`. Ubuntu native WebDriver
+  runs on relevant pull requests and on `main`; WebKit and native macOS/Windows
+  run weekly or on manual dispatch only.
 - Release jobs no longer attempt to contact a local SonarQube server.
 - Oxlint is installed, configured, and green in the desktop package.
 - Frontend unit tests are separable from mockIPC journey tests.

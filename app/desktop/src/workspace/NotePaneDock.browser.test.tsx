@@ -157,7 +157,7 @@ function Harness({ messages }: Readonly<{ messages: string[] }>) {
         />
         <div className="nn-workspace-panes flex min-h-0 flex-1 overflow-hidden">
           <div className="flex min-w-0 flex-1">
-            <NotePane open={openNote()} />
+            <NotePane noteIndexStatus="ready" open={openNote()} />
           </div>
         </div>
         <div

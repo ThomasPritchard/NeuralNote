@@ -192,6 +192,7 @@ async function mountRevealed(source: string, revealCell: string): Promise<Editor
   await act(async () => {
     root!.render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey={`table-wiring-${mounts}`}
         loadedHash={`table-wiring-${mounts}`}
         value={source}

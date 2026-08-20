@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import { act, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { beforeEach, describe, expect, it, vi } from "vitest";
@@ -62,6 +63,15 @@ vi.mock("../updater", async (importOriginal) => {
 });
 
 import { UpdateCoordinator, useUpdateCoordinator } from "./UpdateCoordinator";
+
+/** Stands in for the workspace: registers an unsaved-edit guard on the install. */
+function InstallGuardHarness({
+  guard,
+}: Readonly<{ guard: (proceed: () => void) => void }>) {
+  const { registerInstallGuard } = useUpdateCoordinator();
+  useEffect(() => registerInstallGuard(guard), [guard, registerInstallGuard]);
+  return null;
+}
 
 function AutomaticErrorStatus() {
   const { lastAutomaticError } = useUpdateCoordinator();
@@ -193,6 +203,32 @@ describe("UpdateCoordinator", () => {
     ).toBeInTheDocument();
   });
 
+  it("surfaces an install rejection the dialog can never show", async () => {
+    const user = userEvent.setup();
+    // The service publishes `installFailed` only for failures DURING the install.
+    // Its two pre-state rejections — nothing accepted to install, and an install
+    // already running — throw before the first setState, so the dialog stays on
+    // its release notes and the user sees the button do nothing at all.
+    mocks.service.installAndRelaunch.mockRejectedValue(
+      new Error("An update installation is already in progress."),
+    );
+    render(<UpdateCoordinator>App</UpdateCoordinator>);
+    act(() => mocks.publishState(available));
+    await waitFor(() => expect(mocks.toast.info).toHaveBeenCalledOnce());
+
+    act(() => mocks.toast.info.mock.calls[0]?.[1]?.action?.onClick());
+    await user.click(
+      screen.getByRole("button", { name: "Install and relaunch" }),
+    );
+
+    await waitFor(() =>
+      expect(mocks.toast.error).toHaveBeenCalledWith(
+        "The update could not be installed. An update installation is already in progress.",
+        { dedupKey: "update-install-failed" },
+      ),
+    );
+  });
+
   it("surfaces automatic check errors once and retains the message in context", () => {
     render(
       <UpdateCoordinator>
@@ -239,5 +275,121 @@ describe("UpdateCoordinator", () => {
       "Automatic update check failed. the platform `darwin-aarch64` was not found in the response `platforms` object",
       { dedupKey: "automatic-update-error" },
     );
+  });
+});
+
+describe("UpdateCoordinator — unsaved-work guard on install", () => {
+  beforeEach(() => {
+    mocks.resetListeners();
+    mocks.service.getState.mockReturnValue({ status: "idle" });
+    mocks.service.getLastAutomaticError.mockReturnValue(null);
+    mocks.service.check.mockReset().mockResolvedValue({ status: "idle" });
+    mocks.service.installAndRelaunch.mockReset().mockResolvedValue(undefined);
+    mocks.toast.error.mockReset();
+    mocks.toast.info.mockReset();
+  });
+
+  /** Drive the real consent path: available toast -> release-notes dialog -> install. */
+  async function pressInstall(user: ReturnType<typeof userEvent.setup>) {
+    act(() => mocks.publishState(available));
+    await waitFor(() => expect(mocks.toast.info).toHaveBeenCalledOnce());
+    act(() => mocks.toast.info.mock.calls[0]?.[1]?.action?.onClick());
+    await user.click(
+      screen.getByRole("button", { name: "Install and relaunch" }),
+    );
+  }
+
+  it("hands the install to a registered guard instead of starting it", async () => {
+    const user = userEvent.setup();
+    let proceed!: () => void;
+    const guard = vi.fn((run: () => void) => {
+      proceed = run;
+    });
+    render(
+      <UpdateCoordinator>
+        <InstallGuardHarness guard={guard} />
+      </UpdateCoordinator>,
+    );
+
+    await pressInstall(user);
+
+    expect(guard).toHaveBeenCalledOnce();
+    expect(mocks.service.installAndRelaunch).not.toHaveBeenCalled();
+
+    act(() => proceed());
+
+    expect(mocks.service.installAndRelaunch).toHaveBeenCalledOnce();
+  });
+
+  it("steps out of the way while the guard asks, then returns for the install", async () => {
+    const user = userEvent.setup();
+    let proceed!: () => void;
+    const guard = vi.fn((run: () => void) => {
+      proceed = run;
+    });
+    render(
+      <UpdateCoordinator>
+        <InstallGuardHarness guard={guard} />
+      </UpdateCoordinator>,
+    );
+
+    await pressInstall(user);
+
+    // The guard raises its own confirmation. Leaving the release notes open
+    // stacks two modals, and the confirmation is the one being answered.
+    expect(
+      screen.queryByRole("heading", { name: "NeuralNote 0.1.1 is available" }),
+    ).not.toBeInTheDocument();
+
+    act(() => proceed());
+
+    // Back for the install itself: progress, and any failure, are only ever
+    // rendered here, so a guarded install must not run behind a closed dialog.
+    expect(
+      screen.getByRole("heading", { name: "NeuralNote 0.1.1 is available" }),
+    ).toBeInTheDocument();
+    expect(mocks.service.installAndRelaunch).toHaveBeenCalledOnce();
+  });
+
+  it("stays out of the way when the guard is never satisfied", async () => {
+    const user = userEvent.setup();
+    const guard = vi.fn();
+    render(
+      <UpdateCoordinator>
+        <InstallGuardHarness guard={guard} />
+      </UpdateCoordinator>,
+    );
+
+    await pressInstall(user);
+
+    expect(
+      screen.queryByRole("heading", { name: "NeuralNote 0.1.1 is available" }),
+    ).not.toBeInTheDocument();
+    expect(mocks.service.installAndRelaunch).not.toHaveBeenCalled();
+  });
+
+  it("installs directly when no guard is registered, as on the welcome screen", async () => {
+    const user = userEvent.setup();
+    render(<UpdateCoordinator>App</UpdateCoordinator>);
+
+    await pressInstall(user);
+
+    expect(mocks.service.installAndRelaunch).toHaveBeenCalledOnce();
+  });
+
+  it("installs directly again once the guard unregisters", async () => {
+    const user = userEvent.setup();
+    const guard = vi.fn();
+    const view = render(
+      <UpdateCoordinator>
+        <InstallGuardHarness guard={guard} />
+      </UpdateCoordinator>,
+    );
+    view.rerender(<UpdateCoordinator>App</UpdateCoordinator>);
+
+    await pressInstall(user);
+
+    expect(guard).not.toHaveBeenCalled();
+    expect(mocks.service.installAndRelaunch).toHaveBeenCalledOnce();
   });
 });

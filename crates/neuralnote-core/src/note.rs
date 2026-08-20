@@ -3,10 +3,11 @@
 use crate::error::{CoreError, CoreResult};
 use crate::model::NoteDoc;
 use crate::paths::{ensure_within, rel_path};
+use crate::temp_sibling::create_temp_sibling;
 use std::hash::{Hash, Hasher};
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 /// Per-process counter making each write's temp sibling unique, so two concurrent
 /// writers of the same note never collide on the temp path (PA-016).
@@ -266,12 +267,14 @@ pub fn write_note(
     let parent = path
         .parent()
         .ok_or_else(|| CoreError::OutsideVault(path.display().to_string()))?;
-    let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(".{file_name}.{}.{seq}.nn-tmp", std::process::id()));
-    if let Err(e) = std::fs::write(&tmp, content) {
+    let (tmp, mut file) =
+        create_temp_sibling(parent, &file_name, &TMP_SEQ, "could not save the note")?;
+    if let Err(e) = file.write_all(content.as_bytes()) {
+        drop(file);
         let _ = std::fs::remove_file(&tmp); // don't leak a partially-written temp
         return Err(e.into());
     }
+    drop(file);
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp); // don't leak the temp on failure
         return Err(e.into());
@@ -293,6 +296,21 @@ pub(crate) struct Parsed {
     pub(crate) frontmatter_raw: Option<String>,
     pub(crate) frontmatter_error: Option<String>,
     pub(crate) body: String,
+}
+
+/// How many file lines precede the body [`parse_frontmatter`] extracted from
+/// `raw`. Add it to a body-relative line number to get the line the user sees in
+/// the file, so every surface (search, backlinks) cites the same line for the same
+/// text — a citation that points at the wrong line is worse than no citation.
+///
+/// `body` must be the [`Parsed::body`] produced from this same `raw`. When there
+/// is no frontmatter — including the unterminated-block case, where the body falls
+/// back to the whole file — the offset is 0 and body lines are already file lines.
+pub(crate) fn body_line_offset(raw: &str, body: &str) -> usize {
+    raw.len()
+        .checked_sub(body.len())
+        .map(|body_start| raw[..body_start].lines().count())
+        .unwrap_or(0)
 }
 
 /// Extract a leading `---` … `---` YAML block (Obsidian/Jekyll style) and parse
@@ -432,3 +450,7 @@ pub(crate) fn title_from(
     }
     stem.to_string()
 }
+
+#[cfg(test)]
+#[path = "note_tests.rs"]
+mod tests;

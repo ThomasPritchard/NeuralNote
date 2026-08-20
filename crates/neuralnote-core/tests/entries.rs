@@ -12,6 +12,7 @@ use std::time::Instant;
 use neuralnote_core::entries::{
     create_folder, create_note, delete_entry, move_entry, rename_entry,
 };
+use neuralnote_core::CoreError;
 
 fn vault() -> tempfile::TempDir {
     tempfile::tempdir().unwrap()
@@ -25,6 +26,51 @@ fn create_refuses_to_clobber_an_existing_folder_or_note() {
 
     assert!(create_folder(vault.path(), vault.path(), "Projects").is_err());
     assert!(create_note(vault.path(), vault.path(), "Ideas").is_err());
+}
+
+/// A symlink planted in the vault whose target does not exist is invisible to
+/// both of `create_note`'s old guards: `ensure_within` cannot `canonicalize` it
+/// (so it took the "doesn't exist yet" branch and approved the in-vault name) and
+/// `Path::exists` follows the link, reporting `false`. The create then opened
+/// THROUGH the link and made a file outside the vault (issue #193). The error
+/// alone would not prove that — the outside path is the assertion that matters.
+#[cfg(unix)]
+#[test]
+fn create_note_refuses_a_dangling_symlink_and_creates_nothing_outside_the_vault() {
+    use std::os::unix::fs::symlink;
+
+    let vault = vault();
+    let outside = tempfile::tempdir().unwrap();
+    let planted = outside.path().join("planted.md");
+    symlink(&planted, vault.path().join("Ideas.md")).unwrap();
+
+    let error = create_note(vault.path(), vault.path(), "Ideas").unwrap_err();
+
+    assert!(
+        matches!(error, CoreError::OutsideVault(_)),
+        "expected an outside-vault refusal, got {error:?}"
+    );
+    assert!(
+        !planted.exists(),
+        "create_note wrote through the symlink to {}",
+        planted.display()
+    );
+}
+
+/// Regression guard for the clobber refusal the symlink fix must not disturb:
+/// a name already taken by a real file still reports `AlreadyExists`, by kind and
+/// by the name it names.
+#[test]
+fn create_note_reports_already_exists_by_kind_when_the_name_is_taken() {
+    let vault = vault();
+    create_note(vault.path(), vault.path(), "Ideas").unwrap();
+
+    let error = create_note(vault.path(), vault.path(), "Ideas").unwrap_err();
+
+    assert!(
+        matches!(&error, CoreError::AlreadyExists(name) if name == "Ideas.md"),
+        "expected AlreadyExists(\"Ideas.md\"), got {error:?}"
+    );
 }
 
 #[test]
@@ -216,6 +262,10 @@ fn a_case_only_rename_lands_the_new_casing() {
 /// The filesystem root is the one path with no parent to rename within. It is
 /// only reachable when the vault root *is* `/`, but a caller that opened one must
 /// get a refusal rather than an unwrap on the missing parent.
+///
+/// Despite the name, this covers only that no-parent edge: it passed for a normal
+/// vault long after `rename_entry(root, root, …)` stopped being refused there.
+/// The general rule is pinned by `a_case_only_rename_of_the_vault_root_is_refused`.
 #[cfg(unix)]
 #[test]
 fn renaming_the_vault_root_itself_is_refused() {
@@ -226,6 +276,90 @@ fn renaming_the_vault_root_itself_is_refused() {
     assert!(
         error.to_string().contains("outside vault"),
         "unexpected error: {error}"
+    );
+}
+
+/// `ensure_within` is a *containment* predicate, and the vault root is trivially
+/// contained in itself (`resolved == root_c`). A destructive operation needs the
+/// strictly stronger property — a proper descendant — or one webview IPC call
+/// moves the user's entire second brain to the Trash (issue #194).
+#[test]
+fn deleting_the_vault_root_is_refused() {
+    let vault = vault();
+    create_note(vault.path(), vault.path(), "Keep").unwrap();
+
+    let error = delete_entry(vault.path(), vault.path()).unwrap_err();
+
+    assert!(
+        error.to_string().contains("outside vault"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        vault.path().join("Keep.md").exists(),
+        "the whole vault was trashed by a delete that named the root"
+    );
+}
+
+/// Naming the vault root as the entry to *move* has to be refused at the vault
+/// boundary, not by accident further down.
+///
+/// `move_entry` proves `new_parent` is inside the root before comparing the two,
+/// so when `path` IS the root every legal destination satisfies
+/// `new_parent.starts_with(&path)` and the call lands in the self-move refusal.
+/// That is incidental, not a boundary check: narrow the self-move rule — to
+/// `path.is_dir()`, say — and the whole vault becomes movable with the rest of
+/// this suite still green. Pinning the *vault-boundary* error is what makes the
+/// rule survive that edit (issue #194).
+#[test]
+fn moving_the_vault_root_is_refused() {
+    let enclosing = vault();
+    let root = enclosing.path().join("MyVault");
+    fs::create_dir(&root).unwrap();
+    create_folder(&root, &root, "Dest").unwrap();
+    create_note(&root, &root, "Keep").unwrap();
+
+    let error = move_entry(&root, &root, &root.join("Dest")).unwrap_err();
+
+    assert!(
+        error.to_string().contains("outside vault"),
+        "unexpected error: {error}"
+    );
+    assert!(
+        root.join("Keep.md").exists(),
+        "the vault root was moved by an operation that named it as the entry to move"
+    );
+}
+
+/// The case-only rename branch takes `path.parent()` as its working directory and
+/// runs two `std::fs::rename` calls there with no containment check of its own.
+/// When `path` is the vault root that parent is *outside* the vault, so the vault
+/// directory itself is renamed in place on the user's filesystem (issue #194).
+///
+/// A non-case-only root rename is already refused, because its `ensure_within` on
+/// `parent.join(final_name)` resolves outside the root — so only the case-only
+/// spelling reaches the unguarded path, and that is what this reproduces.
+#[test]
+fn a_case_only_rename_of_the_vault_root_is_refused() {
+    let enclosing = vault();
+    let root = enclosing.path().join("MyVault");
+    fs::create_dir(&root).unwrap();
+    create_note(&root, &root, "Keep").unwrap();
+
+    let error = rename_entry(&root, &root, "myvault").unwrap_err();
+
+    assert!(
+        error.to_string().contains("outside vault"),
+        "unexpected error: {error}"
+    );
+    let mut siblings: Vec<String> = fs::read_dir(enclosing.path())
+        .unwrap()
+        .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+        .collect();
+    siblings.sort();
+    assert_eq!(
+        siblings,
+        vec!["MyVault".to_string()],
+        "the rename wrote outside the vault boundary"
     );
 }
 

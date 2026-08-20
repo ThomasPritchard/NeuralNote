@@ -7,9 +7,10 @@
 //! shape, so the chat layer never changes.
 
 use crate::ai::evidence::EvidenceSpan;
-use crate::error::CoreResult;
+use crate::ai::verify::lines_carried;
+use crate::error::{CoreError, CoreResult};
 use crate::model::{FileHit, NoteDoc, SearchResponse, TreeNode};
-use crate::note::{content_hash, read_note};
+use crate::note::{content_hash, read_note, MAX_EDITABLE_NOTE_BYTES};
 use crate::search::search_vault_with_content;
 use crate::tree::{read_tree, text_note_files};
 use serde::{Deserialize, Serialize};
@@ -429,6 +430,7 @@ impl RetrievalProvider for KeywordRetriever {
     ) -> CoreResult<EvidenceSpan> {
         // read_note runs ensure_within, so a `../` in rel_path is refused, not read.
         let doc = self.cached_note(&self.root.join(rel_path))?;
+        refuse_content_free_doc(&doc)?;
         let lines: Vec<&str> = doc.raw.split_inclusive('\n').collect();
         let (start, end, text) = slice_lines(&lines, start_line, end_line, max_bytes);
         Ok(EvidenceSpan {
@@ -442,14 +444,54 @@ impl RetrievalProvider for KeywordRetriever {
     }
 }
 
+/// Refuse a note the READER would not load, before its emptiness can be mistaken
+/// for content. [`read_note`] answers `Ok` with a flagged, content-free
+/// [`NoteDoc`] in two states — a file past [`MAX_EDITABLE_NOTE_BYTES`], and a
+/// non-UTF-8 attachment — with `raw`, `body` and `content_hash` all empty. Slicing
+/// that `raw` yields a *successful* empty span at lines 1..1, which tells the model
+/// the note is empty and books it into the coverage footer as read: a false premise
+/// about a note the user can see has content, and a gap the footer then hides
+/// (AGENTS.md invariant 3, PA-005).
+///
+/// [`CoreError::InvalidContent`] is the variant on purpose: `settle_vault_error`
+/// buckets it as a REJECTION the model can recover from by quoting another note,
+/// not as a failure the user reads as something broken. The message names the real
+/// reason so the model is told what it hit rather than being left with silence.
+///
+/// The check keys on the reader's own flags, never on `raw` being empty — a
+/// genuinely empty note WAS read, and still deserves its honest empty span.
+fn refuse_content_free_doc(doc: &NoteDoc) -> CoreResult<()> {
+    // Same precedence the reader applies: the resource limit is decided before
+    // binary-vs-text classification, so an oversized attachment reports its size
+    // rather than its encoding.
+    if doc.exceeds_editable_size {
+        return Err(CoreError::InvalidContent(format!(
+            "{} is {} bytes, past the {MAX_EDITABLE_NOTE_BYTES}-byte readable note limit, so none of its text can be quoted",
+            doc.rel_path, doc.size_bytes
+        )));
+    }
+    if doc.binary {
+        return Err(CoreError::InvalidContent(format!(
+            "{} is not a text note (its bytes are not valid UTF-8), so none of its text can be quoted",
+            doc.rel_path
+        )));
+    }
+    Ok(())
+}
+
 /// Slice an inclusive 1-based line range out of `lines` (as produced by
-/// `split_inclusive('\n')`), returning the clamped range and the exact quoted text.
+/// `split_inclusive('\n')`), returning the quoted text and the range that text
+/// actually covers.
 ///
 /// The text is a verbatim substring of the note (lines are concatenated with their
 /// original endings intact), so the verifier's `raw.contains(text)` always holds
 /// for an unchanged note — even for CRLF notes. It is trimmed of its trailing
-/// newline and bounded to `max_bytes`; both are safe because a prefix of a
-/// substring is still a substring.
+/// newline and bounded to `max_bytes`; both are safe for the *quote*, because a
+/// prefix of a substring is still a substring — but neither is safe for the
+/// *range*, which is why the returned `end` is derived from the surviving bytes
+/// rather than from the requested line. A citation may never claim a line it does
+/// not quote, and no later check can catch it if it does: the verifier sees a
+/// truncated quote as the substring it still is (PA-003).
 fn slice_lines(
     lines: &[&str],
     start_line: u32,
@@ -469,7 +511,11 @@ fn slice_lines(
     let trimmed_len = text.trim_end_matches(['\r', '\n']).len();
     text.truncate(trimmed_len);
     bound_to_char_boundary(&mut text, max_bytes);
-    (start, end, text)
+    // Text that survived both cuts decides the end line. A quote emptied outright
+    // (a blank line, a budget too small for the first char) collapses to `start`;
+    // the verifier drops it for having nothing to quote.
+    let quoted_end = start.saturating_add(lines_carried(&text).saturating_sub(1));
+    (start, quoted_end, text)
 }
 
 /// Truncate `text` to at most `max_bytes`, backing up to the nearest char boundary
@@ -762,9 +808,11 @@ mod tests {
         let v = vault();
         let r = KeywordRetriever::new(v.path());
         let span = r.read_note_span("Research/widgets.md", 1, 2, 2000).unwrap();
-        assert_eq!((span.start_line, span.end_line), (1, 2));
         // Lines 1-2 are the H1 then a blank line; trailing newlines are trimmed.
         assert_eq!(span.text, "# Widgets");
+        // So the quote carries line 1 alone, and the range says so. Reporting 1-2
+        // would claim a line the citation does not quote.
+        assert_eq!((span.start_line, span.end_line), (1, 1));
     }
 
     #[test]
@@ -791,10 +839,183 @@ mod tests {
     }
 
     #[test]
+    fn read_note_span_ends_at_the_last_line_its_quote_reaches() {
+        // 60 lines of 46 bytes each: a 2000-byte budget cuts the quote inside line 44,
+        // so the reported range must end at 44. Claiming 1–60 would attribute the
+        // answer to 16 lines the citation never carried, and the verifier cannot see
+        // it — a prefix of a substring is still a substring (AGENTS.md invariant 1).
+        let dir = tempfile::tempdir().unwrap();
+        let body: String = (1..=60)
+            .map(|i| format!("line {i:02} {}\n", "x".repeat(37)))
+            .collect();
+        fs::write(dir.path().join("long.md"), &body).unwrap();
+        let r = KeywordRetriever::new(dir.path());
+
+        let span = r.read_note_span("long.md", 1, 60, 2000).unwrap();
+
+        assert!(span.text.len() <= 2000, "the budget must be honoured");
+        // Every line names its own number, so the last line of the quote states the
+        // end line the span may honestly claim — read out of the text rather than
+        // recomputed with the arithmetic under test.
+        let last_quoted = span.text.lines().next_back().unwrap();
+        let reached: u32 = last_quoted
+            .split_whitespace()
+            .nth(1)
+            .unwrap()
+            .parse()
+            .unwrap();
+        assert_eq!(
+            (span.start_line, span.end_line),
+            (1, reached),
+            "the range must stop where the truncated quote stops"
+        );
+        // The quote is still a verbatim substring, so the verifier's check holds.
+        let doc = read_note(dir.path(), &dir.path().join("long.md")).unwrap();
+        assert!(doc.raw.contains(&span.text));
+    }
+
+    #[test]
+    fn read_note_span_does_not_claim_a_line_the_budget_stopped_short_of() {
+        // The budget lands exactly on a line ending: lines 1-2 are quoted whole and
+        // line 3 contributes nothing, so the range must end at 2. The off-by-one this
+        // guards is the tempting one — counting the trailing newline as a third line.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("n.md"), "l1xx\nl2xx\nl3xx\nl4xx\n").unwrap();
+        let r = KeywordRetriever::new(dir.path());
+
+        let span = r.read_note_span("n.md", 1, 4, 10).unwrap();
+
+        assert_eq!(span.text, "l1xx\nl2xx\n");
+        assert_eq!((span.start_line, span.end_line), (1, 2));
+    }
+
+    #[test]
+    fn read_note_span_keeps_range_and_quote_in_step_on_a_crlf_note() {
+        // CRLF is where a byte budget can cut between the \r and its \n. The quote
+        // must stay a verbatim substring (the verifier's check) and the range must
+        // still describe only the lines the surviving bytes reach.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("crlf.md"), "alpha\r\nbeta\r\ngamma\r\n").unwrap();
+        let r = KeywordRetriever::new(dir.path());
+        let doc = read_note(dir.path(), &dir.path().join("crlf.md")).unwrap();
+
+        // Cut inside line 2: the range reaches 2, not the requested 3.
+        let into_line_two = r.read_note_span("crlf.md", 1, 3, 9).unwrap();
+        assert_eq!(into_line_two.text, "alpha\r\nbe");
+        assert_eq!(
+            (into_line_two.start_line, into_line_two.end_line),
+            (1, 2),
+            "the quote reaches line 2, so the range ends there"
+        );
+        assert!(doc.raw.contains(&into_line_two.text));
+
+        // Cut between the \r and the \n: line 1 is all the quote carries.
+        let mid_ending = r.read_note_span("crlf.md", 1, 3, 6).unwrap();
+        assert_eq!(mid_ending.text, "alpha\r");
+        assert_eq!((mid_ending.start_line, mid_ending.end_line), (1, 1));
+        assert!(doc.raw.contains(&mid_ending.text));
+    }
+
+    #[test]
+    fn a_span_the_budget_emptied_claims_no_line_and_is_dropped() {
+        // A budget too small for the first multibyte char leaves nothing quotable.
+        // The range must collapse rather than claim lines the empty quote never
+        // carried, and the verifier refuses it outright — a citation with no evidence
+        // is worse than no citation.
+        use crate::ai::verify::CitationVerifier;
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("m.md"), "ünïcödé lïné\nsecond line\n").unwrap();
+        let r = KeywordRetriever::new(dir.path());
+
+        let span = r.read_note_span("m.md", 1, 2, 1).unwrap();
+
+        assert!(span.text.is_empty(), "no whole char fits in one byte");
+        assert_eq!((span.start_line, span.end_line), (1, 1));
+        let err = CitationVerifier::new(dir.path()).verify(&span).unwrap_err();
+        assert!(err.contains("no quotable text"), "{err}");
+    }
+
+    #[test]
     fn read_note_span_refuses_path_escape() {
         let v = vault();
         let r = KeywordRetriever::new(v.path());
         assert!(r.read_note_span("../../etc/passwd", 1, 1, 100).is_err());
+    }
+
+    #[test]
+    fn read_note_span_refuses_a_note_over_the_editable_size_limit() {
+        // A note the reader REFUSES to load must reach the model as a read
+        // failure. `read_note` hands back a flagged, content-free doc for it, and
+        // slicing that empty `raw` yields a successful 1..1 span quoting nothing —
+        // telling the model "this note is empty" about a note the user can see has
+        // content, and booking it as covered in the honesty footer (AGENTS.md
+        // invariant 3, PA-005).
+        //
+        // The fixture is sparse on purpose: `set_len` makes a genuinely over-cap
+        // file without writing 8 MiB, and `read_note`'s metadata preflight decides
+        // from that length alone — the same production branch a migrated vault's
+        // dumped log takes.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("big.md");
+        let file = fs::File::create(&f).unwrap();
+        file.set_len(crate::note::MAX_EDITABLE_NOTE_BYTES as u64 + 1)
+            .unwrap();
+        drop(file);
+        let r = KeywordRetriever::new(dir.path());
+
+        let err = r.read_note_span("big.md", 1, 3, 2000).unwrap_err();
+
+        // The variant is what `settle_vault_error` buckets on: `InvalidContent` is
+        // a rejection the model can recover from by looking elsewhere, not a
+        // failure that reads to the user as something broken.
+        let CoreError::InvalidContent(message) = &err else {
+            panic!("an unreadable note is a refusal, not {err:?}");
+        };
+        assert!(message.contains("big.md"), "{message}");
+        // Name the real reason — the size limit — rather than the empty note.
+        assert!(
+            message.contains(&crate::note::MAX_EDITABLE_NOTE_BYTES.to_string()),
+            "the message must state the limit it broke: {message}"
+        );
+    }
+
+    #[test]
+    fn read_note_span_refuses_a_non_utf8_attachment() {
+        // The other content-free state: an attachment whose extension is not a
+        // text note and whose bytes are not UTF-8 comes back as a `binary` doc with
+        // empty `raw`. Quoting nothing from it is the same false premise.
+        let dir = tempfile::tempdir().unwrap();
+        // 0xFF is invalid UTF-8 in any position, and `.png` is not a text-note
+        // extension — so `read_note` takes its binary branch rather than decoding
+        // lossily.
+        fs::write(dir.path().join("diagram.png"), [0xFFu8, 0xD8, 0xFF, 0x00]).unwrap();
+        let r = KeywordRetriever::new(dir.path());
+
+        let err = r.read_note_span("diagram.png", 1, 5, 2000).unwrap_err();
+
+        let CoreError::InvalidContent(message) = &err else {
+            panic!("an unreadable attachment is a refusal, not {err:?}");
+        };
+        assert!(message.contains("diagram.png"), "{message}");
+        assert!(
+            message.contains("not a text note"),
+            "the message must say the file is not text: {message}"
+        );
+    }
+
+    #[test]
+    fn read_note_span_still_reads_a_genuinely_empty_note() {
+        // The guard keys on the reader's refusal flags, never on emptiness — a
+        // note that really is empty was read successfully and still has an honest
+        // empty span. Widening the refusal to "raw is empty" would refuse it too.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("blank.md"), "").unwrap();
+        let r = KeywordRetriever::new(dir.path());
+
+        let span = r.read_note_span("blank.md", 1, 3, 2000).unwrap();
+
+        assert!(span.text.is_empty());
+        assert_eq!((span.start_line, span.end_line), (1, 1));
     }
 
     #[test]
@@ -1084,8 +1305,9 @@ mod tests {
             "the note is read from disk once"
         );
         // Both spans still reflect the note correctly (same hash, distinct ranges).
+        // The 1-2 read quotes line 1 only — line 2 is blank — so its range ends at 1.
         assert_eq!(a.content_hash, b.content_hash);
-        assert_eq!((a.start_line, a.end_line), (1, 2));
+        assert_eq!((a.start_line, a.end_line), (1, 1));
         assert_eq!((b.start_line, b.end_line), (3, 3));
     }
 

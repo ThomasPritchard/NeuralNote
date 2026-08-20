@@ -66,6 +66,7 @@ export function renderApp(opts?: CreateMockVaultOptions): RenderAppResult {
           lastSeenWhatsNewVersion: CURRENT_RELEASE_NOTES.version,
         },
         recoveredFromCorrupt: false,
+        readFailed: false,
         recoveryMessage: null,
       }}
     />,

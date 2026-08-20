@@ -10,7 +10,7 @@
 use crate::error::{CoreError, CoreResult};
 use crate::links::{self, LinkResolutionIndex};
 use crate::model::{Backlink, Backlinks, TreeNode, UnlinkedMention};
-use crate::note::title_and_body;
+use crate::note::{self, title_and_body};
 use crate::search;
 use crate::tree::{markdown_files, read_tree};
 use std::path::Path;
@@ -18,6 +18,9 @@ use std::path::Path;
 struct NoteText {
     title: String,
     body: String,
+    /// File lines preceding `body` (its YAML frontmatter). Added to every
+    /// body-relative line number so the panel cites the same line as search.
+    body_line_offset: u32,
 }
 
 /// Read directional linked mentions and unlinked plain-title mentions for
@@ -78,7 +81,7 @@ fn scan_source(
                 source_rel: node.rel_path.clone(),
                 source_title: note.title.clone(),
                 snippet: occ.snippet,
-                line: occ.line,
+                line: occ.line.saturating_add(note.body_line_offset),
             });
         }
     }
@@ -93,7 +96,7 @@ fn add_unlinked_mention(
     target_title: &str,
     unlinked: &mut Vec<UnlinkedMention>,
 ) {
-    for (line, snippet) in find_title_mentions(&note.body, target_title) {
+    for (line, snippet) in find_title_mentions(note, target_title) {
         unlinked.push(UnlinkedMention {
             source_rel: node.rel_path.clone(),
             source_title: note.title.clone(),
@@ -113,7 +116,12 @@ fn read_note_text(node: &TreeNode, skipped_files: &mut u32) -> Option<NoteText> 
         }
     };
     let (title, body) = title_and_body(&raw, &links::stem_of(&node.name));
-    Some(NoteText { title, body })
+    let body_line_offset = u32::try_from(note::body_line_offset(&raw, &body)).unwrap_or(u32::MAX);
+    Some(NoteText {
+        title,
+        body,
+        body_line_offset,
+    })
 }
 
 fn target_title(node: &TreeNode, skipped_files: &mut u32) -> String {
@@ -123,15 +131,20 @@ fn target_title(node: &TreeNode, skipped_files: &mut u32) -> String {
     }
 }
 
-fn find_title_mentions(body: &str, title: &str) -> Vec<(u32, String)> {
+/// Plain-text mentions of `title` in `note`'s body, each with its **file** line
+/// number (the body-relative index shifted past the frontmatter).
+fn find_title_mentions(note: &NoteText, title: &str) -> Vec<(u32, String)> {
     let folded_title = search::fold(title.trim());
     if folded_title.is_empty() {
         return Vec::new();
     }
+    let body = note.body.as_str();
     let masked = links::mask_code(body);
     let mut mentions = Vec::new();
     for (idx, (line, masked_line)) in body.lines().zip(masked.lines()).enumerate() {
-        let line_no = u32::try_from(idx + 1).unwrap_or(u32::MAX);
+        let line_no = u32::try_from(idx + 1)
+            .unwrap_or(u32::MAX)
+            .saturating_add(note.body_line_offset);
         for (start, end) in title_matches_in_line(masked_line, &folded_title) {
             mentions.push((line_no, search::clip_line_around(line, (start, end))));
         }

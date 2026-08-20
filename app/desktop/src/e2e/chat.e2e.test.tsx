@@ -445,7 +445,7 @@ describe("Journey 7: cited chat — the timeline rail", () => {
     expect(within(existing).getByText("Already here.md")).toBeInTheDocument();
     // Undo removes what this run wrote; it must never reach the user's own note.
     await user.click(screen.getByRole("button", { name: "Undo" }));
-    expect(await screen.findByText(/Undo finished — 1 note removed\./)).toBeInTheDocument();
+    expect(await screen.findByText(/Undo finished — 1 note deleted\./)).toBeInTheDocument();
     expect(within(existing).getByText(/Left as it was/)).toBeInTheDocument();
   });
 });

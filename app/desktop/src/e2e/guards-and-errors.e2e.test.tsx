@@ -3,7 +3,9 @@
 //      tab, while the destructive OS window-close path still requires explicit
 //      discard consent.
 //   9. Error surfacing — when a backend command rejects, the failure is shown in
-//      a real error channel; it is never swallowed.
+//      a real error channel; it is never swallowed — and, where the failure has
+//      a lasting on-screen consequence, that surface tells the truth for the
+//      rest of the session rather than only until a toast is dismissed.
 
 import { describe, it, expect } from "vitest";
 import { act, screen, waitFor, within } from "@testing-library/react";
@@ -106,5 +108,61 @@ describe("Journey 9: error surfacing", () => {
 
     expect(await screen.findByText("could not read note from disk")).toBeInTheDocument();
     expect(screen.getByRole("button", { name: /Retry/ })).toBeInTheDocument();
+  });
+
+  it("never renders a failed vault-index read as a note count, and retries in place", async () => {
+    // The read must fail on the FIRST index read, before the workspace mounts —
+    // that is the shape that used to leave `tree` at its initial `[]` for the
+    // whole session (issue #209).
+    const { user, backend } = renderApp({ seed: TWO_NOTES, recents });
+    backend.setFailure("read_tree", { kind: "io", message: "vault root unreadable" });
+
+    await user.click(await screen.findByRole("button", { name: "Open My Brain" }));
+
+    // The sidebar reads through the separate lazy `list_dir` path, so the real
+    // contents are on screen — which is what made "0 notes" a visible lie.
+    expect(await screen.findByText("A.md")).toBeInTheDocument();
+    expect(screen.getByText("B.md")).toBeInTheDocument();
+
+    // The failure reaches a toast AND stays on the footer after it is gone.
+    expect(await screen.findByText("vault root unreadable")).toBeInTheDocument();
+    expect(await screen.findByText("Counts unavailable")).toBeInTheDocument();
+    expect(screen.queryByText("0 notes")).not.toBeInTheDocument();
+    expect(screen.queryByText("0 folders")).not.toBeInTheDocument();
+    expect(screen.getByTestId("vault-health")).toHaveAttribute("data-health", "unavailable");
+
+    // Retry re-reads the index in place — no reopening the vault.
+    backend.clearFailure("read_tree");
+    await user.click(screen.getByRole("button", { name: "Retry reading the vault" }));
+
+    expect(await screen.findByText("2 notes")).toBeInTheDocument();
+    expect(screen.getByText("0 folders")).toBeInTheDocument();
+    await waitFor(() =>
+      expect(screen.queryByText("Counts unavailable")).not.toBeInTheDocument(),
+    );
+    expect(screen.getByTestId("vault-health")).toHaveAttribute("data-health", "healthy");
+  });
+
+  it("says the [[ index is unavailable rather than offering an empty list", async () => {
+    // The same failed read, followed all the way down the other branch of the
+    // chain: Workspace -> WorkspacePanes -> NotePane -> SourceNoteEditor -> the
+    // completion source. Nothing is stubbed between them here, so a severed
+    // status prop at any hop shows up as an empty popup — which reads as "this
+    // vault has no notes to link to" rather than "the index could not be read"
+    // (issue #209).
+    const { user, backend } = renderApp({ seed: TWO_NOTES, recents });
+    backend.setFailure("read_tree", { kind: "io", message: "vault root unreadable" });
+    await user.click(await screen.findByRole("button", { name: "Open My Brain" }));
+
+    await user.click(await screen.findByRole("button", { name: "A.md" }));
+    const editor = await screen.findByRole("textbox", { name: "Note content" });
+    await user.click(editor);
+    await user.keyboard("{Control>}{End}{/Control}");
+    // userEvent reads "[[" as its own escape for a single "[".
+    await user.type(editor, " [[[[");
+
+    const listbox = await screen.findByRole("listbox");
+    expect(within(listbox).getByText("Vault index unavailable")).toBeInTheDocument();
+    expect(within(listbox).getByText("Refresh the vault to retry")).toBeInTheDocument();
   });
 });

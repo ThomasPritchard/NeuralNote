@@ -11,6 +11,13 @@
 // immediate read on open, then a debounced re-read on every external change
 // (Obsidian sync, git pull). The teardown mirrors the store's watcher exactly, so
 // a late-resolving subscription can never leak across a vault reopen.
+//
+// The tree alone cannot say WHY it is empty, so the hook reports a `status`
+// beside it. A rejected read used to leave the initial `[]` in place, which the
+// footer rendered as a confident "0 notes · 0 folders" beside a healthy dot
+// while the sidebar listed the vault's real contents (issue #209). A failure
+// must never render as data, so it now shows up in the state, not only in the
+// transient toast `onError` raises.
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -23,6 +30,18 @@ import type { TreeNode } from "../lib/types";
 const REFRESH_DEBOUNCE_MS = 300;
 
 /**
+ * Whether the tree in hand is a completed read.
+ *
+ * - `"loading"` — the first read for this vault is in flight; the tree still
+ *   describes the previous vault (or nothing at all).
+ * - `"ready"` — the tree IS the answer, so an empty one is a genuinely empty
+ *   vault (or no vault open).
+ * - `"failed"` — the last read rejected, so the tree is stale or was never
+ *   populated. Consumers must not present it as a fact about the vault.
+ */
+export type VaultTreeStatus = "loading" | "ready" | "failed";
+
+/**
  * The whole vault tree, kept live with the open vault.
  *
  * @param vaultPath the open vault's path, or `undefined` when none is open.
@@ -31,15 +50,22 @@ const REFRESH_DEBOUNCE_MS = 300;
  * @param onError invoked with a display message when a read (or the subscription)
  *   fails, so the failure is surfaced rather than swallowed.
  * @returns `tree` — the full `TreeNode[]` (`[]` when no vault is open and until
- *   the first read lands) — and `refresh`, an imperative re-read for the manual
- *   Refresh action (the watcher already covers external edits; this is the
- *   user-initiated path that must not depend on a live subscription).
+ *   the first read lands); `status` — whether that array is a completed read, so
+ *   a genuinely empty vault is distinguishable from one whose index failed to
+ *   read; and `refresh`, an imperative re-read for the manual Refresh action and
+ *   for retrying a failed read (the watcher already covers external edits; this
+ *   is the user-initiated path that must not depend on a live subscription).
  */
 export function useVaultTree(
   vaultPath: string | undefined,
   onError?: (message: string) => void,
-): { tree: TreeNode[]; refresh: () => void } {
+): { tree: TreeNode[]; status: VaultTreeStatus; refresh: () => void } {
   const [tree, setTree] = useState<TreeNode[]>([]);
+  // Seeded from the first render rather than defaulted, so an open vault never
+  // has a frame where an unread `[]` claims to be a finished read.
+  const [status, setStatus] = useState<VaultTreeStatus>(
+    vaultPath ? "loading" : "ready",
+  );
   // Holds the live effect's `load` so the stable `refresh` handle can re-read the
   // CURRENT vault without re-subscribing the watcher. Cleared on teardown, so a
   // refresh fired during a reopen window no-ops rather than reading a stale vault.
@@ -47,7 +73,10 @@ export function useVaultTree(
 
   useEffect(() => {
     if (!vaultPath) {
+      // No vault open is a complete answer — there are genuinely no notes —
+      // rather than a read that is pending or has failed.
       setTree([]);
+      setStatus("ready");
       loadRef.current = undefined;
       return;
     }
@@ -59,16 +88,30 @@ export function useVaultTree(
     const load = async () => {
       try {
         const result = await api.readTree();
-        if (!cancelled) setTree(result);
+        if (!cancelled) {
+          setTree(result);
+          setStatus("ready");
+        }
       } catch (e) {
         // A read that lands after teardown belongs to an abandoned vault — its
         // error would be stale, so the guard drops it. While the hook is live
-        // (`cancelled` false), the failure is always surfaced, never swallowed.
-        if (!cancelled) onError?.(errorMessage(e));
+        // (`cancelled` false), the failure is surfaced twice over and swallowed
+        // by neither route: `onError` raises the transient toast, and `status`
+        // keeps the failure on screen after that toast is gone. The tree itself
+        // is left alone — the last good read is stale, but wiping it to `[]`
+        // would restate the very "0 notes" lie the status exists to prevent.
+        if (!cancelled) {
+          setStatus("failed");
+          onError?.(errorMessage(e));
+        }
       }
     };
     loadRef.current = () => void load();
 
+    // Every effect run reads a (possibly different) vault, so the tree in hand
+    // describes the previous one until this read lands — including when the run
+    // follows a failure, which must not persist into the new vault.
+    setStatus("loading");
     void load();
 
     void api
@@ -99,5 +142,5 @@ export function useVaultTree(
   // Stable across renders; delegates to whichever effect run is live.
   const refresh = useCallback(() => loadRef.current?.(), []);
 
-  return { tree, refresh };
+  return { tree, status, refresh };
 }

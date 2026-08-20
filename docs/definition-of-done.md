@@ -49,9 +49,12 @@ feature must meet, a heavier bar for security-adjacent changes, and deeper gates
   unreachable/offline). **INCOMPLETE is not green:** the gate exits non-zero (`2`) and never
   prints GREEN, so an incomplete run can't be mistaken for a pass — re-run with the tooling
   installed and network before trusting it.
-- **Main branch CI** — all frontend tests including mockIPC journeys, frontend and Rust
-  90 % line-coverage gates, production build, dependency audits, and the Linux/Windows native
-  WebDriver matrix. A red post-merge check blocks release readiness and is fixed immediately.
+- **Main branch CI** — all frontend tests including mockIPC journeys (via the
+  coverage run), frontend and Rust 90 % line-coverage gates, production build,
+  dependency audits, Ubuntu native WebDriver, and the macOS Rust compile. WebKit
+  and native macOS/Windows WebDriver are weekly or manual informational lanes, not
+  release blockers. A red required post-merge check blocks release readiness and
+  is fixed immediately.
 - **macOS release verification** — the selected lane passes its platform checks. Ad-hoc releases
   require strict `codesign` verification plus the Tauri updater signature. Developer ID releases
   additionally require Gatekeeper assessment and notarisation. Before declaring a release ready,

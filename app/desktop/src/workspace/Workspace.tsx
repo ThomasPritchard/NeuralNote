@@ -23,6 +23,7 @@ import * as api from "../lib/api";
 import { useVault } from "../lib/store";
 import { useToast } from "../notifications";
 import type { TreeNode } from "../lib/types";
+import { useUpdateCoordinator } from "../updates/UpdateCoordinator";
 import { ConfirmDialog } from "./ConfirmDialog";
 import { vaultRelPath } from "./fileMeta";
 import { useVaultTree } from "./useVaultTree";
@@ -66,10 +67,14 @@ export function Workspace() {
   // moat-adjacent). This keeps a full read_tree for those consumers only, while
   // the sidebar tree stays lazy. `reportError` is a stable useCallback, so this
   // doesn't re-read every render.
-  const { tree: fullTree, refresh: refreshFullTree } = useVaultTree(
-    vault?.path,
-    reportError,
-  );
+  // `fullTreeStatus` travels with the tree everywhere it goes. The array alone
+  // cannot say WHY it is empty, and every consumer below renders "there is
+  // nothing here" from an empty one (issue #209).
+  const {
+    tree: fullTree,
+    status: fullTreeStatus,
+    refresh: refreshFullTree,
+  } = useVaultTree(vault?.path, reportError);
   const toast = useToast();
   const noteTabs = useNoteTabs();
   const open = noteTabs.active;
@@ -129,6 +134,19 @@ export function Workspace() {
     openByPath,
     refreshDir,
   });
+
+  // "Install and relaunch" is a path to process exit, and the update dialog sits
+  // above the vault provider where dirty tabs are invisible to it. Registering
+  // here routes that install through the same unsaved-edit guard as Quit, so a
+  // relaunch can never silently discard a draft (issue #205).
+  const { registerInstallGuard } = useUpdateCoordinator();
+  useEffect(
+    () =>
+      registerInstallGuard((install) =>
+        requestIntent({ kind: "install-update", install }),
+      ),
+    [registerInstallGuard, requestIntent],
+  );
 
   // Stable callbacks read the latest tabs without re-registering native listeners
   // on every editor keystroke.
@@ -378,9 +396,16 @@ export function Workspace() {
         aiStatusVersion={aiStatusVersion}
         onOpenChatSettings={() => handleOpenSettings("ai")}
         openNoteAt={openNoteAt}
+        noteIndexStatus={fullTreeStatus}
       />
 
-      <StatusBar vaultName={vault.name} tree={fullTree} note={open.note} />
+      <StatusBar
+        vaultName={vault.name}
+        tree={fullTree}
+        status={fullTreeStatus}
+        onRetry={refreshFullTree}
+        note={open.note}
+      />
 
       <SettingsModal
         open={settingsOpen}
@@ -392,6 +417,7 @@ export function Workspace() {
         templates={templates}
         vaultPath={vault.path}
         tree={fullTree}
+        treeStatus={fullTreeStatus}
         onCreate={handleCreateFromTemplate}
         onClose={() => setTemplateInsertOpen(false)}
       />

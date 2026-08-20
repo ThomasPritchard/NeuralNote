@@ -1,7 +1,6 @@
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { describe, expect, it, vi } from "vitest";
-import type { AppPreferencesLoad } from "../lib/types";
+import { beforeEach, describe, expect, it, vi } from "vitest";
 
 vi.mock("../lib/api", async (importActual) => {
   const actual = await importActual<typeof import("../lib/api")>();
@@ -13,12 +12,14 @@ import { ToastProvider } from "../notifications";
 import {
   DEFAULT_PREFERENCES,
   PreferencesProvider,
+  WRITE_REFUSED_MESSAGE,
   applyPreferences,
   bootstrapPreferences,
   usePreferences,
+  type PreferencesBootstrap,
 } from "./preferences";
 
-const LOADED: AppPreferencesLoad = {
+const LOADED: PreferencesBootstrap = {
   preferences: {
     automaticUpdateChecks: true,
     theme: "forestLight",
@@ -27,22 +28,77 @@ const LOADED: AppPreferencesLoad = {
     lastSeenWhatsNewVersion: "0.1.1",
   },
   recoveredFromCorrupt: false,
+  readFailed: false,
   recoveryMessage: null,
 };
 
-function Probe() {
+const READ_FAILED_MESSAGE = "Your saved settings could not be read.";
+
+/** The preferences file could not be READ, so the user's stored bytes are
+ *  intact and unseen. Writing anything would destroy settings they still have. */
+const READ_FAILED: PreferencesBootstrap = {
+  preferences: { ...DEFAULT_PREFERENCES },
+  recoveredFromCorrupt: false,
+  readFailed: true,
+  recoveryMessage: READ_FAILED_MESSAGE,
+};
+
+/** The file was read but its JSON was unusable, so the core already fell back to
+ *  defaults. The stored bytes are junk — overwriting them is a repair, not a loss. */
+const CORRUPT_RECOVERED: PreferencesBootstrap = {
+  preferences: { ...DEFAULT_PREFERENCES },
+  recoveredFromCorrupt: true,
+  readFailed: false,
+  recoveryMessage: "Preferences were corrupt; safe defaults are active.",
+};
+
+function Probe({ onResult }: Readonly<{ onResult?: (saved: boolean) => void }>) {
   const { preferences, update } = usePreferences();
   return (
     <>
       <output>{preferences.theme}</output>
-      <button type="button" onClick={() => void update({ theme: "oceanBlueDark" })}>
+      <button
+        type="button"
+        onClick={() =>
+          void update({ theme: "oceanBlueDark" }).then((saved) => onResult?.(saved))
+        }
+      >
         change theme
       </button>
     </>
   );
 }
 
+/** Reads the flag UpdateCoordinator honours before running a background update
+ *  check. Rendered from the real provider so the flag is DERIVED here rather
+ *  than hand-set the way UpdateCoordinator.test.tsx must set it. */
+function AutomaticChecksProbe() {
+  const { suppressAutomaticChecksThisLaunch } = usePreferences();
+  return (
+    <output aria-label="automatic update checks">
+      {suppressAutomaticChecksThisLaunch ? "suppressed" : "allowed"}
+    </output>
+  );
+}
+
+function renderAutomaticChecksProbe(initial: PreferencesBootstrap) {
+  render(
+    <ToastProvider>
+      <PreferencesProvider initial={initial}>
+        <AutomaticChecksProbe />
+      </PreferencesProvider>
+    </ToastProvider>,
+  );
+  return screen.getByLabelText("automatic update checks");
+}
+
 describe("preferences", () => {
+  // Reset, not clear: every test below installs the api behaviour it needs, so a
+  // leaked implementation would let one test's rejection surface in another's toast.
+  beforeEach(() => {
+    vi.resetAllMocks();
+  });
+
   it("applies theme, family, and scale before React mounts", () => {
     applyPreferences(LOADED.preferences, document.documentElement);
     expect(document.documentElement).toHaveAttribute("data-theme", "forestLight");
@@ -92,7 +148,11 @@ describe("preferences", () => {
 
     const loaded = await bootstrapPreferences();
 
-    expect(loaded.recoveredFromCorrupt).toBe(true);
+    // The core only throws when the file could not be READ — unparseable JSON
+    // resolves with `recoveredFromCorrupt: true`. So a throw is never a corrupt
+    // recovery, and labelling it as one is what let defaults be written back.
+    expect(loaded.readFailed).toBe(true);
+    expect(loaded.recoveredFromCorrupt).toBe(false);
     expect(loaded.preferences).toEqual(DEFAULT_PREFERENCES);
     expect(loaded.recoveryMessage).toContain("preferences.json is unreadable");
     expect(document.documentElement).toHaveAttribute(
@@ -126,13 +186,7 @@ describe("preferences", () => {
   it("surfaces corrupt preference recovery as a persistent error", () => {
     render(
       <ToastProvider>
-        <PreferencesProvider
-          initial={{
-            ...LOADED,
-            recoveredFromCorrupt: true,
-            recoveryMessage: "Preferences were corrupt; safe defaults are active.",
-          }}
-        >
+        <PreferencesProvider initial={CORRUPT_RECOVERED}>
           <Probe />
         </PreferencesProvider>
       </ToastProvider>,
@@ -140,5 +194,109 @@ describe("preferences", () => {
     expect(screen.getByRole("alert")).toHaveTextContent(
       "Preferences were corrupt; safe defaults are active.",
     );
+  });
+
+  it("surfaces an unreadable-preferences launch as a persistent error too", () => {
+    render(
+      <ToastProvider>
+        <PreferencesProvider initial={READ_FAILED}>
+          <Probe />
+        </PreferencesProvider>
+      </ToastProvider>,
+    );
+    // Named explicitly rather than queried as "the alert": the other READ_FAILED
+    // tests ask for the WRITE-REFUSAL toast by name, so this one rendered beside
+    // them and went unobserved — narrowing the recovery notice back to corrupt
+    // recoveries would have left an unreadable-settings launch silent until the
+    // user happened to change a setting.
+    expect(
+      screen.getByRole("alert", {
+        name: `${READ_FAILED_MESSAGE} notification`,
+      }),
+    ).toBeInTheDocument();
+  });
+
+  it("suppresses this launch's automatic update checks when settings were unreadable", () => {
+    expect(renderAutomaticChecksProbe(READ_FAILED)).toHaveTextContent("suppressed");
+  });
+
+  it("suppresses this launch's automatic update checks after a corrupt recovery", () => {
+    expect(renderAutomaticChecksProbe(CORRUPT_RECOVERED)).toHaveTextContent(
+      "suppressed",
+    );
+  });
+
+  it("leaves automatic update checks alone when the stored settings were read", () => {
+    // The negative case: without it, hard-coding the flag to `true` would pass
+    // both suppression tests above.
+    expect(renderAutomaticChecksProbe(LOADED)).toHaveTextContent("allowed");
+  });
+
+  it("refuses to write over settings it could not read, and says so", async () => {
+    const saved = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <ToastProvider>
+        <PreferencesProvider initial={READ_FAILED}>
+          <Probe onResult={saved} />
+        </PreferencesProvider>
+      </ToastProvider>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "change theme" }));
+
+    expect(api.saveAppPreferences).not.toHaveBeenCalled();
+    expect(saved).toHaveBeenCalledWith(false);
+    expect(
+      screen.getByRole("alert", {
+        name: `${WRITE_REFUSED_MESSAGE} notification`,
+      }),
+    ).toBeInTheDocument();
+    // The DOM assertion above only proves *which* message shows. Pin what it has
+    // to SAY, so the copy cannot be quietly watered down into a vague failure.
+    expect(WRITE_REFUSED_MESSAGE).toMatch(/could not be read/i);
+    expect(WRITE_REFUSED_MESSAGE).toMatch(/not been overwritten/i);
+  });
+
+  it("raises one refusal, not one per attempt, while settings are unreadable", async () => {
+    const user = userEvent.setup();
+    render(
+      <ToastProvider>
+        <PreferencesProvider initial={READ_FAILED}>
+          <Probe />
+        </PreferencesProvider>
+      </ToastProvider>,
+    );
+
+    const change = screen.getByRole("button", { name: "change theme" });
+    await user.click(change);
+    await user.click(change);
+
+    expect(
+      screen.getAllByRole("alert", {
+        name: `${WRITE_REFUSED_MESSAGE} notification`,
+      }),
+    ).toHaveLength(1);
+  });
+
+  it("still saves after a corrupt-parse recovery, whose stored bytes are junk", async () => {
+    vi.mocked(api.saveAppPreferences).mockResolvedValue(undefined);
+    const saved = vi.fn();
+    const user = userEvent.setup();
+    render(
+      <ToastProvider>
+        <PreferencesProvider initial={CORRUPT_RECOVERED}>
+          <Probe onResult={saved} />
+        </PreferencesProvider>
+      </ToastProvider>,
+    );
+
+    await user.click(screen.getByRole("button", { name: "change theme" }));
+
+    expect(api.saveAppPreferences).toHaveBeenCalledWith({
+      ...DEFAULT_PREFERENCES,
+      theme: "oceanBlueDark",
+    });
+    expect(saved).toHaveBeenCalledWith(true);
   });
 });

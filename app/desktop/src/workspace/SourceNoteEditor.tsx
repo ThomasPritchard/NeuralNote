@@ -38,6 +38,7 @@ import {
   refreshObsidianPreview,
 } from "./obsidianLivePreview";
 import { createWikilinkCompletionSource } from "./wikilinkCompletion";
+import type { VaultTreeStatus } from "./useVaultTree";
 import { formatSourceSelections } from "./sourceEditorFormatting";
 import { tableKeymap } from "./sourceEditorTableCommands";
 import type { FormatAction } from "./markdownFormat";
@@ -62,6 +63,11 @@ export interface SourceNoteEditorProps {
   onPreviewError?: (message: string | null) => void;
   reportError?: (message: string) => void;
   noteIndex?: readonly NoteIndexEntry[];
+  /** Whether `noteIndex` is a completed vault read. An empty index that failed
+   *  to read must say so in the `[[` popup rather than offer nothing (#209).
+   *  Required, and deliberately without a default: defaulting to `"ready"` is
+   *  the claim this prop exists to stop anyone making by accident. */
+  noteIndexStatus: VaultTreeStatus;
   onOpenLink?: (relPath: string) => void;
   onSearchTag?: (tag: string) => void;
   sourceRelPath?: string;
@@ -125,6 +131,7 @@ export function SourceNoteEditor({
   onPreviewError,
   reportError,
   noteIndex = EMPTY_NOTE_INDEX,
+  noteIndexStatus,
   onOpenLink,
   onSearchTag,
   sourceRelPath = "",
@@ -146,6 +153,7 @@ export function SourceNoteEditor({
   const previewErrorRef = useRef(onPreviewError);
   const valueRef = useRef(value);
   const noteIndexRef = useRef(noteIndex);
+  const noteIndexStatusRef = useRef(noteIndexStatus);
   const openLinkRef = useRef(onOpenLink);
   const searchTagRef = useRef(onSearchTag);
   const sourceRelPathRef = useRef(sourceRelPath);
@@ -157,6 +165,7 @@ export function SourceNoteEditor({
   previewErrorRef.current = onPreviewError;
   valueRef.current = value;
   noteIndexRef.current = noteIndex;
+  noteIndexStatusRef.current = noteIndexStatus;
   openLinkRef.current = onOpenLink;
   searchTagRef.current = onSearchTag;
   sourceRelPathRef.current = sourceRelPath;
@@ -211,7 +220,13 @@ export function SourceNoteEditor({
       tableScrollSync,
       EditorView.lineWrapping,
       autocompletion({
-        override: [(context) => createWikilinkCompletionSource(noteIndexRef.current)(context)],
+        override: [
+          (context) =>
+            createWikilinkCompletionSource(
+              noteIndexRef.current,
+              noteIndexStatusRef.current,
+            )(context),
+        ],
         activateOnTyping: true,
         selectOnOpen: true,
       }),

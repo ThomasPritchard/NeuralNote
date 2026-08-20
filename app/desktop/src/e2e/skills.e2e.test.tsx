@@ -156,15 +156,23 @@ describe("Journey 8: skill run — activate via @, elicit, write, undo", () => {
     await waitFor(() =>
       expect(screen.getByLabelText("Ask across your vault")).toBeEnabled(),
     );
-    await user.click(await screen.findByRole("button", { name: "Undo" }));
+    // The permanence reaches the user through the real seam, before the click:
+    // this unlink does not route through the Trash, unlike the file-tree delete.
+    const undoButton = await screen.findByRole("button", { name: "Undo" });
+    expect(undoButton).toHaveAccessibleDescription(/permanently deletes/i);
+    await user.click(undoButton);
 
-    // Per-file honesty through the real undo_skill_run seam: one removed, one
+    // Per-file honesty through the real undo_skill_run seam: one deleted, one
     // kept because the user edited it — never a bare "done".
-    expect(await screen.findByText("Removed")).toBeInTheDocument();
+    expect(
+      await screen.findByText(/Deleted permanently — not in the Trash/),
+    ).toBeInTheDocument();
     expect(
       screen.getByText("You edited this note after the run wrote it."),
     ).toBeInTheDocument();
-    expect(screen.getByText(/1 note removed, 1 note kept\./)).toBeInTheDocument();
+    expect(
+      screen.getByText("Undo finished — 1 note deleted, 1 kept."),
+    ).toBeInTheDocument();
   });
 
   it("timed-out consent (§3.4): the card goes dormant but stays clickable, and a late click is an ordinary chat turn", async () => {

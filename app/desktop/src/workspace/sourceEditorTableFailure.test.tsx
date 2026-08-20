@@ -90,6 +90,7 @@ describe("a failure in the table decoration path", () => {
 
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="table-throw-mount"
         loadedHash="table-throw-mount"
         value={NOTE}
@@ -115,6 +116,7 @@ describe("a failure in the table decoration path", () => {
 
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="table-throw-report"
         loadedHash="table-throw-report"
         value={NOTE}
@@ -146,6 +148,7 @@ describe("a failure in the table decoration path", () => {
 
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="table-throw-channel"
         loadedHash="table-throw-channel"
         value={NOTE}
@@ -191,6 +194,7 @@ describe("a failure in the table decoration path", () => {
 
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="table-throw-recovery"
         loadedHash="table-throw-recovery"
         value={NOTE}
@@ -221,6 +225,7 @@ describe("a failure in the table decoration path", () => {
 
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="table-throw-preservation"
         loadedHash="table-throw-preservation"
         value={NOTE}
@@ -244,6 +249,7 @@ describe("a failure in the table decoration path", () => {
 
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="table-throw-typing"
         loadedHash="table-throw-typing"
         value={NOTE}

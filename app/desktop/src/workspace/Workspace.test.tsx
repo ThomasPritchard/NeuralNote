@@ -9,6 +9,7 @@ import { MENU_ACTION } from "../lib/bindings/events";
 import type { TreeNode } from "../lib/types";
 import type { OpenNote } from "./useOpenNote";
 import type { NoteTab, NoteTabsController } from "./useNoteTabs";
+import type { VaultTreeStatus } from "./useVaultTree";
 
 // Controllable store + open-note state, captured child props, and a fake Tauri
 // window so the close-guard and navigation guards can be driven directly.
@@ -17,8 +18,17 @@ const { mockUseVault } = vi.hoisted(() => ({ mockUseVault: vi.fn() }));
 // it here so Workspace's note index / status counts / template picker read a
 // controllable tree and the hook's own read_tree + tree-changed subscription
 // don't run inside these Workspace unit tests.
-const { fullTreeRef, refreshFullTreeMock } = vi.hoisted(() => ({
+// `fullTreeStatusRef` defaults to "ready" — the status the stub must report for
+// the footer to render counts at all. It is a handle rather than a constant so a
+// test can drive the failed/loading branches, which the failed-index case in
+// "note index + rel-path opener threading" does (issue #209). Every consumer of
+// that status is mocked in this file, so what these tests own is the WIRING: the
+// value reaching each child. What each child then renders is proved where it
+// lives — StatusBar.vaultRead.test.tsx, TemplateInsertDialog.test.tsx,
+// SourceNoteEditor.test.tsx, and the failed-read e2e journey.
+const { fullTreeRef, fullTreeStatusRef, refreshFullTreeMock } = vi.hoisted(() => ({
   fullTreeRef: { current: [] as TreeNode[] },
+  fullTreeStatusRef: { current: "ready" as VaultTreeStatus },
   refreshFullTreeMock: vi.fn(),
 }));
 const notification = vi.hoisted(() => ({
@@ -28,6 +38,21 @@ const notification = vi.hoisted(() => ({
   info: vi.fn(),
   dismiss: vi.fn(),
 }));
+// The update dialog lives above the vault provider, so it pushes its install
+// DOWN into the workspace through the coordinator context (issue #205). Capture
+// whatever guard the Workspace registers so tests can fire it directly.
+const updates = vi.hoisted(() => {
+  const state = { guard: null as ((proceed: () => void) => void) | null };
+  return {
+    state,
+    registerInstallGuard: vi.fn((guard: (proceed: () => void) => void) => {
+      state.guard = guard;
+      return () => {
+        if (state.guard === guard) state.guard = null;
+      };
+    }),
+  };
+});
 const openState = vi.hoisted(() => ({ current: null as unknown as OpenNote }));
 const tabsState = vi.hoisted(() => ({
   current: null as unknown as NoteTabsController,
@@ -36,6 +61,7 @@ const captured = vi.hoisted(() => ({
   fileTree: {} as Record<string, (...a: never[]) => void>,
   notePane: {} as {
     onSearchTag: (tag: string) => void;
+    noteIndexStatus: VaultTreeStatus;
   },
   ribbon: {} as {
     navigationExpanded: boolean;
@@ -79,6 +105,7 @@ const captured = vi.hoisted(() => ({
   templateDialog: {} as {
     open: boolean;
     templates: Array<{ relPath: string; name: string }>;
+    treeStatus: VaultTreeStatus;
     onCreate: (template: string, name: string, parentPath: string) => void;
     onClose: () => void;
   },
@@ -97,10 +124,19 @@ const win = vi.hoisted(() => {
 
 vi.mock("../lib/store", () => ({ useVault: mockUseVault }));
 vi.mock("./useVaultTree", () => ({
-  useVaultTree: () => ({ tree: fullTreeRef.current, refresh: refreshFullTreeMock }),
+  useVaultTree: () => ({
+    tree: fullTreeRef.current,
+    status: fullTreeStatusRef.current,
+    refresh: refreshFullTreeMock,
+  }),
 }));
 vi.mock("../notifications", () => ({ useToast: () => notification }));
 vi.mock("./useNoteTabs", () => ({ useNoteTabs: () => tabsState.current }));
+vi.mock("../updates/UpdateCoordinator", () => ({
+  useUpdateCoordinator: () => ({
+    registerInstallGuard: updates.registerInstallGuard,
+  }),
+}));
 // The Workspace subscribes to MENU_ACTION; mock the event bus so listen()
 // resolves and tests can drive the registered handler directly.
 vi.mock("@tauri-apps/api/event", () => ({
@@ -134,7 +170,10 @@ vi.mock("./FileTree", () => ({
   },
 }));
 vi.mock("./NotePane", () => ({
-  NotePane: (props: { onSearchTag: (tag: string) => void }) => {
+  NotePane: (props: {
+    onSearchTag: (tag: string) => void;
+    noteIndexStatus: VaultTreeStatus;
+  }) => {
     captured.notePane = props;
     return <div data-testid="notepane" />;
   },
@@ -165,6 +204,7 @@ vi.mock("./TemplateInsertDialog", () => ({
   TemplateInsertDialog: (props: {
     open: boolean;
     templates: Array<{ relPath: string; name: string }>;
+    treeStatus: VaultTreeStatus;
     onCreate: (template: string, name: string, parentPath: string) => void;
     onClose: () => void;
   }) => {
@@ -212,8 +252,16 @@ vi.mock("./GraphView", () => ({
   },
 }));
 vi.mock("./StatusBar", () => ({
-  StatusBar: ({ vaultName }: { vaultName: string }) => (
-    <div data-testid="statusbar">{vaultName}</div>
+  StatusBar: ({
+    vaultName,
+    status,
+  }: {
+    vaultName: string;
+    status: VaultTreeStatus;
+  }) => (
+    <div data-testid="statusbar" data-status={status}>
+      {vaultName}
+    </div>
   ),
 }));
 
@@ -376,6 +424,7 @@ function vaultCtx(over: Record<string, unknown> = {}) {
 beforeEach(() => {
   mockUseVault.mockReset();
   fullTreeRef.current = [];
+  fullTreeStatusRef.current = "ready";
   refreshFullTreeMock.mockReset();
   Object.values(notification).forEach((mock) => mock.mockReset());
   mockInvoke.mockReset();
@@ -383,6 +432,8 @@ beforeEach(() => {
   win.state.closeCb = undefined;
   win.destroy.mockClear();
   win.onCloseRequested.mockClear();
+  updates.state.guard = null;
+  updates.registerInstallGuard.mockClear();
   openState.current = makeOpen();
   tabsState.current = makeTabs();
   globalThis.localStorage?.clear();
@@ -479,6 +530,48 @@ describe("Workspace — note index + rel-path opener threading", () => {
     expect((captured.notePane as { noteIndex?: unknown }).noteIndex).toEqual([
       { relPath: "Target.md", stem: "target" },
     ]);
+  });
+
+  it("hands a failed vault read to every surface that would otherwise claim a complete index", async () => {
+    // The reviewer's demonstration for issue #209: delete one of these prop
+    // pass-throughs in Workspace.tsx and, before the props became required,
+    // every consumer quietly defaulted to "ready" — the incomplete-folder notice
+    // and the "[[ index unavailable" notice stopped rendering and the whole
+    // suite stayed green. Each hop is asserted here so a severed chain fails
+    // loudly at the level that severs it.
+    fullTreeStatusRef.current = "failed";
+    fullTreeRef.current = [];
+    mockInvoke.mockImplementation((command) => {
+      if (command === "list_templates") {
+        return Promise.resolve([{ relPath: "Templates/Daily.md", name: "Daily" }]);
+      }
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    // The footer withholds its counts (StatusBar renders the notice + retry).
+    expect(screen.getByTestId("statusbar")).toHaveAttribute("data-status", "failed");
+    // The editor's `[[` popup says the index is unavailable instead of offering
+    // an empty list that reads as "this vault has no notes".
+    expect(captured.notePane.noteIndexStatus).toBe("failed");
+
+    // The template picker's folder list is walked from the same tree, so it
+    // carries the same caveat.
+    await act(async () => captured.ribbon.onInsertTemplate());
+    expect(screen.getByTestId("template-insert-dialog")).toBeInTheDocument();
+    expect(captured.templateDialog.treeStatus).toBe("failed");
+  });
+
+  it("keeps a completed vault read out of the incomplete-index surfaces", () => {
+    // The other half of the same wiring: "ready" must arrive as "ready", or the
+    // app cries wolf on every healthy vault.
+    fullTreeRef.current = [node("/v/Target.md")];
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    expect(captured.notePane.noteIndexStatus).toBe("ready");
+    expect(screen.getByTestId("statusbar")).toHaveAttribute("data-status", "ready");
   });
 
   it("opens wikilink/backlink targets through the tab controller", async () => {
@@ -1877,5 +1970,163 @@ describe("Workspace — menu action + intent failures", () => {
 
     act(() => captured.templateDialog.onClose());
     expect(screen.queryByTestId("template-insert-dialog")).not.toBeInTheDocument();
+  });
+});
+
+describe("Workspace — update install guard", () => {
+  /** Fire the guard the Workspace registered with the update coordinator. */
+  function requestInstall(proceed: () => void) {
+    act(() => updates.state.guard!(proceed));
+  }
+
+  it("installs the update straight away when nothing is unsaved", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: false });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const proceed = vi.fn();
+
+    requestInstall(proceed);
+
+    await waitFor(() => expect(proceed).toHaveBeenCalledOnce());
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+  });
+
+  it("holds the update install behind the unsaved-work guard", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const proceed = vi.fn();
+
+    requestInstall(proceed);
+
+    expect(screen.getByText("Install update and relaunch?")).toBeInTheDocument();
+    expect(
+      screen.getByText(
+        "NeuralNote will relaunch to install the update. 1 open note has unsaved changes that will be lost.",
+      ),
+    ).toBeInTheDocument();
+    expect(proceed).not.toHaveBeenCalled();
+
+    await userEvent.click(
+      screen.getByRole("button", { name: "Install and relaunch" }),
+    );
+
+    await waitFor(() => expect(proceed).toHaveBeenCalledOnce());
+  });
+
+  it("does not replace or duplicate an in-flight install request", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const first = vi.fn();
+    const second = vi.fn();
+
+    requestInstall(first);
+    requestInstall(second);
+
+    expect(screen.getAllByText("Install update and relaunch?")).toHaveLength(1);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Install and relaunch" }),
+    );
+
+    await waitFor(() => expect(first).toHaveBeenCalledOnce());
+    expect(second).not.toHaveBeenCalled();
+  });
+
+  it("leaves the app running when the install confirmation is cancelled", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const proceed = vi.fn();
+
+    requestInstall(proceed);
+    await userEvent.click(screen.getByRole("button", { name: "Cancel" }));
+
+    expect(proceed).not.toHaveBeenCalled();
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(screen.getByTestId("filetree")).toBeInTheDocument();
+
+    // Cancelling must not latch the guard shut — a later install still asks.
+    requestInstall(proceed);
+    expect(screen.getByText("Install update and relaunch?")).toBeInTheDocument();
+  });
+
+  it("flushes pending workspace state before a confirmed install hands off", async () => {
+    let resolveSave!: () => void;
+    const savePending = new Promise<void>((resolve) => {
+      resolveSave = resolve;
+    });
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockInvoke.mockImplementation((command) => {
+      if (command === "load_workspace_state") return defaultInvoke(String(command));
+      if (command === "save_workspace_state") return savePending;
+      return Promise.resolve(undefined);
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith(
+        "save_workspace_state",
+        expect.any(Object),
+      ),
+    );
+    const proceed = vi.fn();
+
+    requestInstall(proceed);
+    await userEvent.click(
+      screen.getByRole("button", { name: "Install and relaunch" }),
+    );
+    // The relaunch is a process exit: hand off only once the newest ordered tab
+    // set is on disk, or the app comes back with a stale one.
+    expect(proceed).not.toHaveBeenCalled();
+
+    resolveSave();
+    await waitFor(() => expect(proceed).toHaveBeenCalledOnce());
+  });
+
+  it("lets an OS window close take over the install confirmation", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: true });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    const proceed = vi.fn();
+
+    requestInstall(proceed);
+    expect(screen.getByText("Install update and relaunch?")).toBeInTheDocument();
+
+    // The close guard has ALREADY cancelled the native close before asking, so a
+    // dropped request leaves the window refusing to close with nothing on screen
+    // saying why. The close question replaces the one the user has abandoned.
+    const event = { preventDefault: vi.fn() };
+    act(() => win.state.closeCb!(event));
+
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(screen.getByText("Discard unsaved changes?")).toBeInTheDocument();
+    expect(
+      screen.queryByText("Install update and relaunch?"),
+    ).not.toBeInTheDocument();
+
+    await userEvent.click(screen.getByRole("button", { name: "Discard" }));
+    await waitFor(() => expect(win.destroy).toHaveBeenCalled());
+    expect(proceed).not.toHaveBeenCalled();
+  });
+
+  it("closes a clean window from behind a delete confirmation", async () => {
+    openState.current = makeOpen({ path: "/v/a.md", dirty: false });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+    act(() => captured.fileTree.onDeleteRequest(node("/v/Notes") as never));
+    expect(screen.getByText("Delete note?")).toBeInTheDocument();
+
+    const event = { preventDefault: vi.fn() };
+    act(() => win.state.closeCb!(event));
+
+    // Nothing is unsaved, so the close needs no confirmation of its own — and the
+    // superseded delete prompt must not be left on screen behind it.
+    await waitFor(() => expect(win.destroy).toHaveBeenCalled());
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument();
+    expect(mockInvoke).not.toHaveBeenCalledWith(
+      "delete_entry",
+      expect.anything(),
+    );
   });
 });

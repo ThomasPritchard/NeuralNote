@@ -15,7 +15,7 @@ use caseless::Caseless;
 use crate::error::CoreResult;
 use crate::links::mask_code;
 use crate::model::{FileHit, SearchMatch, SearchResponse, TreeNode};
-use crate::note::{decode_note_text, parse_frontmatter, title_and_body, title_from, Parsed};
+use crate::note::{self, decode_note_text, parse_frontmatter, title_and_body, title_from, Parsed};
 use crate::tree::{read_tree, text_note_files};
 use icu_properties::{props::GeneralCategory, CodePointMapData, CodePointMapDataBorrowed};
 use std::borrow::Cow;
@@ -278,11 +278,7 @@ fn scan_tag_content(
         return (matches, false);
     }
 
-    let body_line_offset = raw
-        .len()
-        .checked_sub(parsed.body.len())
-        .map(|body_start| raw[..body_start].lines().count())
-        .unwrap_or(0);
+    let body_line_offset = note::body_line_offset(raw, &parsed.body);
     let masked = mask_tag_syntax(&parsed.body);
     for (idx, (line, masked_line)) in parsed.body.lines().zip(masked.lines()).enumerate() {
         let ranges = matching_tag_ranges(line, masked_line, query);

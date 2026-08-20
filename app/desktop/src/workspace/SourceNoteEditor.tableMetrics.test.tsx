@@ -96,6 +96,7 @@ function mount(value: string): Mounted {
   const onChange = vi.fn();
   const { container } = render(
     <SourceNoteEditor
+      noteIndexStatus="ready"
       sessionKey={`table-metrics-${mounts}`}
       loadedHash={`table-metrics-${mounts}`}
       value={value}
