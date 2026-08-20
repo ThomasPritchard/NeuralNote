@@ -2504,6 +2504,92 @@ fn happy_path_searches_reads_and_emits_a_verified_citation() {
 }
 
 #[test]
+fn a_note_the_reader_refuses_is_never_reported_as_read() {
+    // The downstream half of PA-005. A vault file the reader will not load — over
+    // the editable size cap, or a non-UTF-8 attachment — must settle as a REJECTED
+    // read rather than a successful empty span, and a rejection must leave no trace
+    // of a read behind it: no `Reading` in the timeline, no entry in the coverage
+    // footer. Booking a note as covered when zero bytes of it were seen is exactly
+    // the silent gap AGENTS.md invariant 3 forbids.
+    let v = vault();
+    // Sparse on purpose: `set_len` makes a genuinely over-cap file without writing
+    // 8 MiB, and `read_note`'s metadata preflight decides from that length alone.
+    // `.log` keeps it out of the search scan set, so the sweep below stays cheap.
+    let file = fs::File::create(v.path().join("archive.log")).unwrap();
+    file.set_len(crate::note::MAX_EDITABLE_NOTE_BYTES as u64 + 1)
+        .unwrap();
+    drop(file);
+    fs::write(v.path().join("diagram.png"), [0xFFu8, 0xD8, 0xFF, 0x00]).unwrap();
+
+    let mock = MockLlmClient::new(
+        vec![
+            tool_call("c1", "search_notes", r#"{"query":"components"}"#),
+            tool_call(
+                "c2",
+                "read_note_span",
+                r#"{"rel_path":"archive.log","start_line":1,"end_line":3}"#,
+            ),
+            tool_call(
+                "c3",
+                "read_note_span",
+                r#"{"rel_path":"diagram.png","start_line":1,"end_line":5}"#,
+            ),
+            final_turn(),
+        ],
+        "Widgets are small components [e1].",
+    );
+    let events = run(v.path(), &mock, &Guards::default());
+
+    assert_eq!(
+        count(&events, |e| matches!(e, ChatEvent::Reading { .. })),
+        0,
+        "a refused read must not render as a read: {events:?}"
+    );
+    let notes_read = events
+        .iter()
+        .find_map(|e| match e {
+            ChatEvent::Coverage { notes_read, .. } => Some(notes_read.clone()),
+            _ => None,
+        })
+        .expect("the search alone emits a coverage footer");
+    assert_eq!(
+        notes_read,
+        vec!["Research/widgets.md".to_string()],
+        "only a note actually read may be booked as covered"
+    );
+
+    // …and the model is TOLD why, rather than handed a quote of nothing. An empty
+    // `text` reaching it is the false premise itself: it reads as "this note is
+    // empty" about a note that is anything but.
+    let refusals: Vec<String> = events
+        .iter()
+        .filter_map(|e| match e {
+            ChatEvent::ToolResult { id, detail, .. } if id == "c2" || id == "c3" => detail.clone(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        2,
+        "both reads must answer the model: {events:?}"
+    );
+    assert!(
+        refusals[0].contains("readable note limit"),
+        "the over-cap read must name the limit: {}",
+        refusals[0]
+    );
+    assert!(
+        refusals[1].contains("not a text note"),
+        "the attachment read must name the file as non-text: {}",
+        refusals[1]
+    );
+    assert!(
+        !refusals.iter().any(|d| d.contains(r#""text":"""#)),
+        "no empty evidence span may reach the model: {refusals:?}"
+    );
+}
+
+#[test]
 fn coverage_footer_reports_searched_terms_and_notes_read() {
     let v = vault();
     let mock = MockLlmClient::new(

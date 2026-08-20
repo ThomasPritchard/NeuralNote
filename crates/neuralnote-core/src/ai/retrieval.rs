@@ -8,9 +8,9 @@
 
 use crate::ai::evidence::EvidenceSpan;
 use crate::ai::verify::lines_carried;
-use crate::error::CoreResult;
+use crate::error::{CoreError, CoreResult};
 use crate::model::{FileHit, NoteDoc, SearchResponse, TreeNode};
-use crate::note::{content_hash, read_note};
+use crate::note::{content_hash, read_note, MAX_EDITABLE_NOTE_BYTES};
 use crate::search::search_vault_with_content;
 use crate::tree::{read_tree, text_note_files};
 use serde::{Deserialize, Serialize};
@@ -430,6 +430,7 @@ impl RetrievalProvider for KeywordRetriever {
     ) -> CoreResult<EvidenceSpan> {
         // read_note runs ensure_within, so a `../` in rel_path is refused, not read.
         let doc = self.cached_note(&self.root.join(rel_path))?;
+        refuse_content_free_doc(&doc)?;
         let lines: Vec<&str> = doc.raw.split_inclusive('\n').collect();
         let (start, end, text) = slice_lines(&lines, start_line, end_line, max_bytes);
         Ok(EvidenceSpan {
@@ -441,6 +442,41 @@ impl RetrievalProvider for KeywordRetriever {
             text,
         })
     }
+}
+
+/// Refuse a note the READER would not load, before its emptiness can be mistaken
+/// for content. [`read_note`] answers `Ok` with a flagged, content-free
+/// [`NoteDoc`] in two states — a file past [`MAX_EDITABLE_NOTE_BYTES`], and a
+/// non-UTF-8 attachment — with `raw`, `body` and `content_hash` all empty. Slicing
+/// that `raw` yields a *successful* empty span at lines 1..1, which tells the model
+/// the note is empty and books it into the coverage footer as read: a false premise
+/// about a note the user can see has content, and a gap the footer then hides
+/// (AGENTS.md invariant 3, PA-005).
+///
+/// [`CoreError::InvalidContent`] is the variant on purpose: `settle_vault_error`
+/// buckets it as a REJECTION the model can recover from by quoting another note,
+/// not as a failure the user reads as something broken. The message names the real
+/// reason so the model is told what it hit rather than being left with silence.
+///
+/// The check keys on the reader's own flags, never on `raw` being empty — a
+/// genuinely empty note WAS read, and still deserves its honest empty span.
+fn refuse_content_free_doc(doc: &NoteDoc) -> CoreResult<()> {
+    // Same precedence the reader applies: the resource limit is decided before
+    // binary-vs-text classification, so an oversized attachment reports its size
+    // rather than its encoding.
+    if doc.exceeds_editable_size {
+        return Err(CoreError::InvalidContent(format!(
+            "{} is {} bytes, past the {MAX_EDITABLE_NOTE_BYTES}-byte readable note limit, so none of its text can be quoted",
+            doc.rel_path, doc.size_bytes
+        )));
+    }
+    if doc.binary {
+        return Err(CoreError::InvalidContent(format!(
+            "{} is not a text note (its bytes are not valid UTF-8), so none of its text can be quoted",
+            doc.rel_path
+        )));
+    }
+    Ok(())
 }
 
 /// Slice an inclusive 1-based line range out of `lines` (as produced by
@@ -904,6 +940,82 @@ mod tests {
         let v = vault();
         let r = KeywordRetriever::new(v.path());
         assert!(r.read_note_span("../../etc/passwd", 1, 1, 100).is_err());
+    }
+
+    #[test]
+    fn read_note_span_refuses_a_note_over_the_editable_size_limit() {
+        // A note the reader REFUSES to load must reach the model as a read
+        // failure. `read_note` hands back a flagged, content-free doc for it, and
+        // slicing that empty `raw` yields a successful 1..1 span quoting nothing —
+        // telling the model "this note is empty" about a note the user can see has
+        // content, and booking it as covered in the honesty footer (AGENTS.md
+        // invariant 3, PA-005).
+        //
+        // The fixture is sparse on purpose: `set_len` makes a genuinely over-cap
+        // file without writing 8 MiB, and `read_note`'s metadata preflight decides
+        // from that length alone — the same production branch a migrated vault's
+        // dumped log takes.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("big.md");
+        let file = fs::File::create(&f).unwrap();
+        file.set_len(crate::note::MAX_EDITABLE_NOTE_BYTES as u64 + 1)
+            .unwrap();
+        drop(file);
+        let r = KeywordRetriever::new(dir.path());
+
+        let err = r.read_note_span("big.md", 1, 3, 2000).unwrap_err();
+
+        // The variant is what `settle_vault_error` buckets on: `InvalidContent` is
+        // a rejection the model can recover from by looking elsewhere, not a
+        // failure that reads to the user as something broken.
+        let CoreError::InvalidContent(message) = &err else {
+            panic!("an unreadable note is a refusal, not {err:?}");
+        };
+        assert!(message.contains("big.md"), "{message}");
+        // Name the real reason — the size limit — rather than the empty note.
+        assert!(
+            message.contains(&crate::note::MAX_EDITABLE_NOTE_BYTES.to_string()),
+            "the message must state the limit it broke: {message}"
+        );
+    }
+
+    #[test]
+    fn read_note_span_refuses_a_non_utf8_attachment() {
+        // The other content-free state: an attachment whose extension is not a
+        // text note and whose bytes are not UTF-8 comes back as a `binary` doc with
+        // empty `raw`. Quoting nothing from it is the same false premise.
+        let dir = tempfile::tempdir().unwrap();
+        // 0xFF is invalid UTF-8 in any position, and `.png` is not a text-note
+        // extension — so `read_note` takes its binary branch rather than decoding
+        // lossily.
+        fs::write(dir.path().join("diagram.png"), [0xFFu8, 0xD8, 0xFF, 0x00]).unwrap();
+        let r = KeywordRetriever::new(dir.path());
+
+        let err = r.read_note_span("diagram.png", 1, 5, 2000).unwrap_err();
+
+        let CoreError::InvalidContent(message) = &err else {
+            panic!("an unreadable attachment is a refusal, not {err:?}");
+        };
+        assert!(message.contains("diagram.png"), "{message}");
+        assert!(
+            message.contains("not a text note"),
+            "the message must say the file is not text: {message}"
+        );
+    }
+
+    #[test]
+    fn read_note_span_still_reads_a_genuinely_empty_note() {
+        // The guard keys on the reader's refusal flags, never on emptiness — a
+        // note that really is empty was read successfully and still has an honest
+        // empty span. Widening the refusal to "raw is empty" would refuse it too.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("blank.md"), "").unwrap();
+        let r = KeywordRetriever::new(dir.path());
+
+        let span = r.read_note_span("blank.md", 1, 3, 2000).unwrap();
+
+        assert!(span.text.is_empty());
+        assert_eq!((span.start_line, span.end_line), (1, 1));
     }
 
     #[test]
