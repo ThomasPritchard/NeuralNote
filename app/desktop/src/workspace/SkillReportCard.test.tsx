@@ -1,7 +1,12 @@
 // SkillReportCard: the run's written-notes ledger and its Undo. Undo reports
-// per-file outcomes (removed / kept-edited / already gone / failed) — never a
+// per-file outcomes (deleted / kept-edited / already gone / failed) — never a
 // bare "done" — and a failure keeps a "Retry undo" affordance, because the
 // backend restores its authority over failed runs.
+//
+// Undo is the app's ONE unconfirmed destructive verb, and unlike the file-tree
+// delete it does not route through the Trash (#208). So the card owes the user
+// the permanence in words, tied to the button, every time the button is
+// offered — and the per-file outcome must not read as recoverable.
 
 import { render, screen, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
@@ -124,6 +129,7 @@ describe("SkillReportCard", () => {
     // Nothing landed on disk, so there is nothing of this run's to remove —
     // an Undo here would delete the user's own note.
     expect(screen.queryByRole("button", { name: "Undo" })).not.toBeInTheDocument();
+    expect(screen.queryByText(/permanently deletes/i)).not.toBeInTheDocument();
     expect(screen.queryByText(/notes? written/)).not.toBeInTheDocument();
     expect(screen.queryByRole("list", { name: "Written notes" })).not.toBeInTheDocument();
     expect(screen.getByText("1 note already in your vault")).toBeInTheDocument();
@@ -168,16 +174,50 @@ describe("SkillReportCard", () => {
     expect(screen.getByRole("button", { name: "Undo" })).toBeEnabled();
   });
 
+  it("warns that Undo permanently deletes, wherever the button is offered", () => {
+    render(<SkillReportCard files={FILES} runId="run-1" done={true} />);
+
+    // Everywhere else the app teaches that deleting means the Trash — the
+    // file-tree delete literally confirms with "Move to Trash". This path
+    // unlinks instead, so the card has to say so BEFORE the click.
+    const caveat = screen.getByText(/permanently deletes/i);
+    expect(caveat).toHaveTextContent(/don't go to the Trash/i);
+    // True of the backend, not decoration: an edited note fails the hash check
+    // and is kept (undo.rs `CheckedUnlink::Edited` -> SkippedEdited).
+    expect(caveat).toHaveTextContent(/edited since are kept/i);
+
+    // Tied to the control, so a screen-reader user meets the warning when they
+    // reach the button rather than only if they read past it.
+    expect(screen.getByRole("button", { name: "Undo" })).toHaveAccessibleDescription(
+      /permanently deletes/i,
+    );
+
+    // Supporting copy, not an announcement: the always-mounted <output> below
+    // owns the polite summary, and a second live region would fight it.
+    expect(
+      caveat.closest("[aria-live], output, [role='status'], [role='alert']"),
+    ).toBeNull();
+  });
+
   it("undoes the run and reports each file's outcome plus a polite summary", async () => {
     const user = userEvent.setup();
     render(<SkillReportCard files={FILES} runId="run-1" done={true} />);
     await user.click(screen.getByRole("button", { name: "Undo" }));
 
     expect(mockUndo).toHaveBeenCalledExactlyOnceWith("run-1");
-    expect(await screen.findAllByText("Removed")).toHaveLength(2);
-    expect(screen.getByText(/Undo finished — 2 notes removed\./)).toBeInTheDocument();
+    const outcomes = await screen.findAllByText(/Deleted permanently/i);
+    expect(outcomes).toHaveLength(2);
+    for (const outcome of outcomes) {
+      expect(outcome).toHaveTextContent(/not in the Trash/i);
+    }
+    // The soft word is gone: "Removed" is what the recoverable file-tree delete
+    // earns, and this deletion is not recoverable.
+    expect(screen.queryByText("Removed")).not.toBeInTheDocument();
+    expect(screen.getByText(/Undo finished — 2 notes deleted\./)).toBeInTheDocument();
     // Everything reached a terminal, non-failed outcome: nothing left to undo.
     expect(screen.queryByRole("button", { name: /Undo/ })).not.toBeInTheDocument();
+    // ...so the warning goes with it — it belongs to the offer, not the card.
+    expect(screen.queryByText(/permanently deletes/i)).not.toBeInTheDocument();
     expect(
       screen.getByRole("button", { name: "Open Literature/Zettelkasten talk.md" }),
     ).toBeDisabled();
@@ -204,8 +244,10 @@ describe("SkillReportCard", () => {
       await screen.findByText("You edited this note after the run wrote it."),
     ).toBeInTheDocument();
     expect(screen.getByText("Couldn't be removed")).toBeInTheDocument();
-    expect(screen.getByText(/0 notes removed, 2 notes kept\./)).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Retry undo" })).toBeEnabled();
+    expect(screen.getByText(/0 notes deleted, 2 notes kept\./)).toBeInTheDocument();
+    const retry = screen.getByRole("button", { name: "Retry undo" });
+    expect(retry).toBeEnabled();
+    expect(retry).toHaveAccessibleDescription(/permanently deletes/i);
     expect(
       screen.getByRole("button", { name: "Open Literature/Zettelkasten talk.md" }),
     ).toBeEnabled();
@@ -227,7 +269,7 @@ describe("SkillReportCard", () => {
     mockUndo.mockResolvedValue(ALL_DELETED);
     await user.click(screen.getByRole("button", { name: "Retry undo" }));
     expect(mockUndo).toHaveBeenCalledTimes(2);
-    expect(await screen.findAllByText("Removed")).toHaveLength(2);
+    expect(await screen.findAllByText(/Deleted permanently/i)).toHaveLength(2);
   });
 
   it("blocks double-fire while an undo is in flight", async () => {

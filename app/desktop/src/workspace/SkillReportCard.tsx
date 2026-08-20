@@ -4,8 +4,15 @@
 // because the user edited it is surfaced, never folded into a bare "done" —
 // and a failed removal keeps the button as "Retry undo" (the backend restores
 // its authority over failed runs).
+//
+// Undo is the app's one UNCONFIRMED destructive verb, and it is the only one
+// that does not route through the Trash: it unlinks (#208). Everywhere else the
+// product teaches the opposite rule — the file-tree delete confirms with "Move
+// to Trash" and the release notes promise Trash recovery — so this card carries
+// the correction in words, next to the button and tied to it, every time the
+// button is offered.
 
-import { useState } from "react";
+import { useId, useState } from "react";
 import { AlertTriangle, Check, FileCheck2, FilePlus2, Info, Loader2, Undo2 } from "lucide-react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
@@ -19,6 +26,17 @@ type UndoState =
   | { status: "done"; report: UndoReport }
   | { status: "error"; message: string };
 
+/** The permanence Undo owes the user before they press it. Both facts are
+ *  load-bearing and both were checked against the backend rather than assumed:
+ *  the unlink is `libc::unlinkat` with no Trash involved (`note_writer.rs`), and
+ *  an edited note fails the hash check and survives — `undo.rs` maps
+ *  `CheckedUnlink::Edited` to `SkippedEdited`, a non-deletion outcome. Stated
+ *  plainly rather than loudly: this is the fast correction of an AI action, and
+ *  an alarm here would train the user to click past it. */
+const UNDO_PERMANENCE_CAVEAT =
+  "Undo permanently deletes the notes this run wrote — they don't go to the " +
+  "Trash. Notes you've edited since are kept.";
+
 /** Pluralise a count with its noun. */
 function count(n: number, one: string, many: string): string {
   return `${n} ${n === 1 ? one : many}`;
@@ -30,7 +48,9 @@ function outcomeCopy(result: UndoFileResult): string {
   if (result.message !== null && result.message !== "") return result.message;
   switch (result.status) {
     case "deleted":
-      return "Removed";
+      // Not "Removed": that is the word the RECOVERABLE file-tree delete earns,
+      // and this file is gone for good.
+      return "Deleted permanently — not in the Trash";
     case "skippedEdited":
       return "Kept — it changed since it was written";
     case "skippedMissing":
@@ -131,6 +151,7 @@ export function SkillReportCard({
   onOpen?: (relPath: string) => void;
 }>) {
   const [undo, setUndo] = useState<UndoState>({ status: "idle" });
+  const caveatId = useId();
 
   const runUndo = async () => {
     if (runId === null || undo.status === "running") return;
@@ -147,7 +168,7 @@ export function SkillReportCard({
     report?.files.find((f) => f.relPath === relPath);
   const failedCount =
     report?.files.filter((f) => f.status === "failed").length ?? 0;
-  const removedCount =
+  const deletedCount =
     report?.files.filter((f) => f.status === "deleted").length ?? 0;
 
   // The button's four lives: absent when nothing was written (an already-present
@@ -265,22 +286,40 @@ export function SkillReportCard({
       )}
 
       {showUndo && (
-        <button
-          type="button"
-          onClick={() => void runUndo()}
-          disabled={undo.status === "running"}
-          className={cn(buttonVariants({ tone: "quiet", size: "sm" }), "self-start px-2.5 py-1")}
-        >
-          {undo.status === "running" ? (
-            <Loader2
-              className="size-3 animate-spin motion-reduce:animate-none"
-              aria-hidden
-            />
-          ) : (
-            <Undo2 className="size-3" aria-hidden />
-          )}
-          {failedCount > 0 || undo.status === "error" ? "Retry undo" : "Undo"}
-        </button>
+        // The warning and the button ship as one unit, so the button can never
+        // be offered without it. Static copy, not a live region: the <output>
+        // below owns announcements and a second one would talk over it —
+        // `aria-describedby` is what carries the caveat to a screen reader, at
+        // the moment focus reaches the control. The tone rides on the glyph and
+        // the body stays `text-foreground/90` (9.7:1 on the dark theme, 12.0:1
+        // on the light ones), because `text-warning` as body copy measures 3.4:1
+        // at this size — the same split `KeyChangeCaveat` already makes.
+        <div className="flex min-w-0 flex-col gap-1.5">
+          <p
+            id={caveatId}
+            className="flex items-start gap-1.5 text-[0.625rem] leading-snug text-foreground/90"
+          >
+            <AlertTriangle className="mt-px size-3 shrink-0 text-warning" aria-hidden />
+            <span className="min-w-0 flex-1 break-words">{UNDO_PERMANENCE_CAVEAT}</span>
+          </p>
+          <button
+            type="button"
+            onClick={() => void runUndo()}
+            disabled={undo.status === "running"}
+            aria-describedby={caveatId}
+            className={cn(buttonVariants({ tone: "quiet", size: "sm" }), "self-start px-2.5 py-1")}
+          >
+            {undo.status === "running" ? (
+              <Loader2
+                className="size-3 animate-spin motion-reduce:animate-none"
+                aria-hidden
+              />
+            ) : (
+              <Undo2 className="size-3" aria-hidden />
+            )}
+            {failedCount > 0 || undo.status === "error" ? "Retry undo" : "Undo"}
+          </button>
+        </div>
       )}
 
       {/* Always-mounted status slot: empty it reads as padding; on undo it
@@ -288,9 +327,9 @@ export function SkillReportCard({
           alert — the per-file rows above carry the detail). */}
       <output className="min-h-4 text-[0.625rem] leading-snug text-muted-foreground/70">
         {report &&
-          `Undo finished — ${count(removedCount, "note removed", "notes removed")}` +
-            (report.files.length - removedCount > 0
-              ? `, ${count(report.files.length - removedCount, "note kept", "notes kept")}.`
+          `Undo finished — ${count(deletedCount, "note deleted", "notes deleted")}` +
+            (report.files.length - deletedCount > 0
+              ? `, ${count(report.files.length - deletedCount, "note kept", "notes kept")}.`
               : ".")}
       </output>
 
