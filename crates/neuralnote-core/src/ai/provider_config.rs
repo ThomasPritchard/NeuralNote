@@ -7,13 +7,18 @@
 use crate::ai::approval::{retain_known_tool_overrides, ApprovalMode, ApprovalPolicy, GatedTool};
 use crate::ai::{capabilities::ReasoningSupport, DEFAULT_MODEL};
 use crate::error::{CoreError, CoreResult};
+use crate::temp_sibling::create_temp_sibling;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
+use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 use ts_rs::TS;
 
 const AI_CONFIG_FILE: &str = "ai-config.json";
+
+/// This site's own temp-name counter, so a busy AI-config write never advances the
+/// counter another write path is walking.
 static AI_CONFIG_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
@@ -408,13 +413,19 @@ pub fn write_provider_config(config_dir: &Path, config: &ProviderConfig) -> Core
     let parent = path.parent().ok_or_else(|| {
         CoreError::Io(format!("AI config path has no parent: {}", path.display()))
     })?;
-    let seq = AI_CONFIG_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-    let tmp = parent.join(format!(".{file_name}.{}.{seq}.nn-tmp", std::process::id()));
+    let (tmp, mut file) = create_temp_sibling(
+        parent,
+        &file_name,
+        &AI_CONFIG_TMP_SEQ,
+        "could not write AI config",
+    )?;
 
-    if let Err(e) = std::fs::write(&tmp, bytes) {
+    if let Err(e) = file.write_all(&bytes) {
+        drop(file);
         let _ = std::fs::remove_file(&tmp);
         return Err(CoreError::Io(format!("could not write AI config: {e}")));
     }
+    drop(file);
     if let Err(e) = std::fs::rename(&tmp, &path) {
         let _ = std::fs::remove_file(&tmp);
         return Err(CoreError::Io(format!("could not replace AI config: {e}")));
@@ -426,8 +437,10 @@ pub fn write_provider_config(config_dir: &Path, config: &ProviderConfig) -> Core
 mod tests {
     use super::*;
     use crate::ai::{ReasoningSupport, DEFAULT_MODEL, FIXTURE_SKILL_ID};
+    use crate::temp_sibling::MAX_TEMP_ATTEMPTS;
     use crate::CoreError;
     use std::fs;
+    use std::sync::atomic::Ordering;
 
     fn default_config() -> ProviderConfig {
         ProviderConfig::default()
@@ -1256,5 +1269,76 @@ mod tests {
         cfg.reasoning = false;
         write_provider_config(dir.path(), &cfg).unwrap();
         assert!(!read_provider_config(dir.path()).unwrap().reasoning);
+    }
+
+    /// How many consecutive temp names the guard below occupies, starting at
+    /// whatever the live counter reads.
+    ///
+    /// A write walks [`MAX_TEMP_ATTEMPTS`] names from wherever `AI_CONFIG_TMP_SEQ`
+    /// stands when it runs, and other tests in this binary move that counter while
+    /// the band is being planted. Eight windows wide, the band absorbs seven windows of that
+    /// interference and the write's whole window still falls on squatted names.
+    /// Exceeding even that is not a false pass: the write would find a free name
+    /// and SUCCEED, which is what the guard asserts against.
+    const SQUATTED_BAND: u64 = MAX_TEMP_ATTEMPTS as u64 * 8;
+
+    /// Every temp name one `write_provider_config` call can reach, lowest first.
+    fn temp_name_band(parent: &Path) -> Vec<PathBuf> {
+        let first = AI_CONFIG_TMP_SEQ.load(Ordering::Relaxed);
+        (first..first + SQUATTED_BAND)
+            .map(|sequence| {
+                parent.join(format!(
+                    ".{AI_CONFIG_FILE}.{}.{sequence}.nn-tmp",
+                    std::process::id()
+                ))
+            })
+            .collect()
+    }
+
+    /// A symlink squatting the temp sibling an AI-config write renames into place
+    /// must never be opened *through*. The plain `std::fs::write` this path used
+    /// followed such a link and truncated whatever it pointed at, outside the
+    /// config dir entirely (issue #213).
+    ///
+    /// Exhaustion is the WITNESS, not merely the outcome: a write gives up only
+    /// once every name it can reach is taken, and every name it can reach here is
+    /// one of these symlinks — so arriving at that error proves that many links
+    /// were offered to `create_new` and refused. Follow one instead and the write
+    /// succeeds, having clobbered `outside`.
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_squatting_the_temp_sibling_is_never_written_through() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        fs::write(outside.path(), "outside stays intact").unwrap();
+        let band = temp_name_band(dir.path());
+        for name in &band {
+            symlink(outside.path(), name).unwrap();
+        }
+
+        let result = write_provider_config(dir.path(), &default_config());
+
+        assert_eq!(
+            fs::read_to_string(outside.path()).unwrap(),
+            "outside stays intact",
+            "the AI-config write was made THROUGH a symlink squatting its temp sibling"
+        );
+        let error = result.expect_err(
+            "the write found a free temp name, so it was never offered a squatting \
+             symlink and this guard proved nothing",
+        );
+        assert!(
+            error
+                .to_string()
+                .contains("no unique temporary file was available"),
+            "unexpected error: {error}"
+        );
+        assert!(
+            std::fs::symlink_metadata(&band[0]).is_ok_and(|meta| meta.file_type().is_symlink()),
+            "the squatting symlink was consumed rather than skipped"
+        );
+        assert!(!config_file(dir.path()).exists());
     }
 }
