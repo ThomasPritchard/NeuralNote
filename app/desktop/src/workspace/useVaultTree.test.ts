@@ -168,4 +168,136 @@ describe("useVaultTree", () => {
     });
     expect(unlisten).toHaveBeenCalled();
   });
+
+  // Issue #209: the hook's `tree` alone cannot say whether an empty array means
+  // "this vault is empty" or "the read failed", so a failed read rendered as a
+  // confident "0 notes · 0 folders". `status` is the signal that separates them.
+  describe("load status", () => {
+    it("reports `ready` from the first render when no vault is open", () => {
+      const { result } = renderHook(() => useVaultTree(undefined));
+
+      // Nothing is pending and nothing failed: an unopened vault genuinely has
+      // no notes, so this `[]` is the one empty array that is safe to count.
+      expect(result.current.status).toBe("ready");
+      expect(result.current.tree).toEqual([]);
+    });
+
+    it("reports `loading` until the first read lands", async () => {
+      let resolveRead!: (tree: TreeNode[]) => void;
+      mockInvoke.mockReturnValue(
+        new Promise<TreeNode[]>((resolve) => {
+          resolveRead = resolve;
+        }),
+      );
+
+      const { result } = renderHook(() => useVaultTree("/v"));
+
+      // The tree is still [] here, but nothing has been read yet — a consumer
+      // must not render that as a count.
+      expect(result.current.status).toBe("loading");
+
+      await act(async () => {
+        resolveRead(treeA);
+      });
+
+      expect(result.current.status).toBe("ready");
+      expect(result.current.tree).toEqual(treeA);
+    });
+
+    it("reports `ready` for a genuinely empty vault", async () => {
+      mockInvoke.mockResolvedValue([]);
+
+      const { result } = renderHook(() => useVaultTree("/v"));
+
+      await waitFor(() => expect(result.current.status).toBe("ready"));
+      expect(result.current.tree).toEqual([]);
+    });
+
+    it("reports `failed` when the read rejects, never `ready` with an empty tree", async () => {
+      mockInvoke.mockRejectedValue({ message: "read failed" });
+      const onError = vi.fn();
+
+      const { result } = renderHook(() => useVaultTree("/v", onError));
+
+      await waitFor(() => expect(result.current.status).toBe("failed"));
+      // The error channel still fires — the status is an addition, not a swap.
+      expect(onError).toHaveBeenCalledWith("read failed");
+      expect(result.current.status).not.toBe("ready");
+    });
+
+    it("clears `failed` when a later refresh succeeds", async () => {
+      mockInvoke.mockRejectedValue({ message: "read failed" });
+      const { result } = renderHook(() => useVaultTree("/v"));
+      await waitFor(() => expect(result.current.status).toBe("failed"));
+
+      mockInvoke.mockResolvedValue(treeA);
+      await act(async () => {
+        result.current.refresh();
+      });
+
+      await waitFor(() => expect(result.current.status).toBe("ready"));
+      expect(result.current.tree).toEqual(treeA);
+    });
+
+    it("flips a ready tree to `failed` when a watcher-driven re-read rejects, keeping the last good tree", async () => {
+      vi.useFakeTimers();
+      mockInvoke.mockResolvedValue(treeA);
+      const onError = vi.fn();
+
+      const { result } = renderHook(() => useVaultTree("/v", onError));
+      await act(async () => {});
+      expect(result.current.status).toBe("ready");
+
+      const handler = treeChangedHandler();
+      mockInvoke.mockRejectedValue({ message: "index gone" });
+      await act(async () => {
+        handler();
+        await vi.advanceTimersByTimeAsync(300);
+      });
+
+      // The counts on screen are now unverified, not zero: keep the last good
+      // tree and mark it failed rather than wiping it back to the bug's [].
+      expect(result.current.status).toBe("failed");
+      expect(result.current.tree).toEqual(treeA);
+      expect(onError).toHaveBeenCalledWith("index gone");
+    });
+
+    it("resets to `loading` for a new vault instead of carrying the old vault's failure", async () => {
+      mockInvoke.mockRejectedValue({ message: "read failed" });
+      const { result, rerender } = renderHook(({ path }) => useVaultTree(path), {
+        initialProps: { path: "/v" as string | undefined },
+      });
+      await waitFor(() => expect(result.current.status).toBe("failed"));
+
+      let resolveRead!: (tree: TreeNode[]) => void;
+      mockInvoke.mockReturnValue(
+        new Promise<TreeNode[]>((resolve) => {
+          resolveRead = resolve;
+        }),
+      );
+      rerender({ path: "/w" });
+
+      expect(result.current.status).toBe("loading");
+
+      await act(async () => {
+        resolveRead(treeB);
+      });
+      expect(result.current.status).toBe("ready");
+      expect(result.current.tree).toEqual(treeB);
+    });
+
+    it("reports `ready` with an empty tree once the vault is closed", async () => {
+      mockInvoke.mockResolvedValue(treeA);
+      const { result, rerender } = renderHook(({ path }) => useVaultTree(path), {
+        initialProps: { path: "/v" as string | undefined },
+      });
+      await waitFor(() => expect(result.current.tree).toEqual(treeA));
+
+      // No vault open is a complete answer, not a pending or failed read.
+      rerender({ path: undefined });
+
+      expect(result.current.tree).toEqual([]);
+      expect(result.current.status).toBe("ready");
+    });
+  });
 });

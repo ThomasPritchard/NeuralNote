@@ -19,6 +19,19 @@ function complete(doc: string) {
   return createWikilinkCompletionSource(INDEX)(new CompletionContext(state, doc.length, false));
 }
 
+/** Complete against an index that never finished reading — the shape the failed
+ *  initial `read_tree` leaves behind (issue #209). */
+function completeWithoutIndex(doc: string, status: "loading" | "failed") {
+  const state = EditorState.create({ doc, selection: { anchor: doc.length } });
+  return createWikilinkCompletionSource([], status)(
+    new CompletionContext(state, doc.length, false),
+  );
+}
+
+function optionsOf(result: ReturnType<typeof complete>) {
+  return result && !(result instanceof Promise) ? result.options : [];
+}
+
 describe("wikilinkCompletion", () => {
   it("opens after [[ and inserts an exact closed wikilink", () => {
     const result = complete("see [[Da");
@@ -66,5 +79,37 @@ describe("wikilinkCompletion", () => {
       new CompletionContext(editor, doc.length, false),
     );
     expect(result && !(result instanceof Promise) ? result.options[0]?.label : null).toBe("Daily");
+  });
+
+  it("says the index is unavailable rather than silently offering nothing", () => {
+    // A vault with no notes and a vault whose index failed to read both filter
+    // to zero suggestions. Only the second one is a failure, and offering
+    // nothing there reads as broken links rather than an unread index.
+    expect(optionsOf(completeWithoutIndex("[[Da", "failed"))).toEqual([
+      {
+        label: "Vault index unavailable",
+        detail: "Refresh the vault to retry",
+        apply: expect.any(Function),
+      },
+    ]);
+    expect(optionsOf(completeWithoutIndex("[[Da", "loading"))).toEqual([
+      { label: "Reading the vault…", apply: expect.any(Function) },
+    ]);
+  });
+
+  it("leaves the document untouched when a notice is picked", () => {
+    const [notice] = optionsOf(completeWithoutIndex("[[", "failed"));
+    const dispatch = vi.fn();
+    (notice.apply as (view: unknown, c: unknown, f: number, t: number) => void)(
+      { dispatch } as never,
+      notice,
+      2,
+      2,
+    );
+    expect(dispatch).not.toHaveBeenCalled();
+  });
+
+  it("stays silent for a read vault that genuinely has no match", () => {
+    expect(optionsOf(complete("[[zzzz"))).toEqual([]);
   });
 });

@@ -20,7 +20,10 @@ const tree: TreeNode[] = [
   },
 ];
 
-function setup(availableTemplates = templates) {
+function setup(
+  availableTemplates = templates,
+  treeStatus: "loading" | "ready" | "failed" = "ready",
+) {
   const onCreate = vi.fn();
   const onClose = vi.fn();
   const user = userEvent.setup();
@@ -30,6 +33,7 @@ function setup(availableTemplates = templates) {
       templates={availableTemplates}
       vaultPath="/v"
       tree={tree}
+      treeStatus={treeStatus}
       onCreate={onCreate}
       onClose={onClose}
     />,
@@ -107,5 +111,29 @@ describe("TemplateInsertDialog", () => {
     expect(
       screen.getByRole("searchbox", { name: "Search templates" }),
     ).toHaveFocus();
+  });
+
+  it("says the folder list may be incomplete when the vault index failed to read", async () => {
+    // A flat vault legitimately offers only "Vault root". A failed index read
+    // looks identical, so the destination select has to say which one it is.
+    const { user } = setup(templates, "failed");
+    await user.click(screen.getByRole("button", { name: /Daily, Templates\/Daily\.md/ }));
+
+    const select = screen.getByRole("combobox", { name: "Destination folder" });
+    const notice = screen.getByRole("status");
+    expect(notice).toHaveTextContent(
+      "Vault index unavailable — this folder list may be incomplete.",
+    );
+    expect(select).toHaveAttribute("aria-describedby", notice.id);
+  });
+
+  it("says nothing about the folder list once the vault read has landed", async () => {
+    const { user } = setup(templates, "ready");
+    await user.click(screen.getByRole("button", { name: /Daily, Templates\/Daily\.md/ }));
+
+    expect(screen.queryByRole("status")).not.toBeInTheDocument();
+    expect(
+      screen.getByRole("combobox", { name: "Destination folder" }),
+    ).not.toHaveAttribute("aria-describedby");
   });
 });

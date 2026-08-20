@@ -9,6 +9,7 @@ import { MENU_ACTION } from "../lib/bindings/events";
 import type { TreeNode } from "../lib/types";
 import type { OpenNote } from "./useOpenNote";
 import type { NoteTab, NoteTabsController } from "./useNoteTabs";
+import type { VaultTreeStatus } from "./useVaultTree";
 
 // Controllable store + open-note state, captured child props, and a fake Tauri
 // window so the close-guard and navigation guards can be driven directly.
@@ -17,8 +18,12 @@ const { mockUseVault } = vi.hoisted(() => ({ mockUseVault: vi.fn() }));
 // it here so Workspace's note index / status counts / template picker read a
 // controllable tree and the hook's own read_tree + tree-changed subscription
 // don't run inside these Workspace unit tests.
-const { fullTreeRef, refreshFullTreeMock } = vi.hoisted(() => ({
+// `fullTreeStatusRef` defaults to "ready" — the status the stub must report for
+// the footer to render counts at all. It is a handle rather than a constant so a
+// test can drive the failed/loading branches (issue #209).
+const { fullTreeRef, fullTreeStatusRef, refreshFullTreeMock } = vi.hoisted(() => ({
   fullTreeRef: { current: [] as TreeNode[] },
+  fullTreeStatusRef: { current: "ready" as VaultTreeStatus },
   refreshFullTreeMock: vi.fn(),
 }));
 const notification = vi.hoisted(() => ({
@@ -112,7 +117,11 @@ const win = vi.hoisted(() => {
 
 vi.mock("../lib/store", () => ({ useVault: mockUseVault }));
 vi.mock("./useVaultTree", () => ({
-  useVaultTree: () => ({ tree: fullTreeRef.current, refresh: refreshFullTreeMock }),
+  useVaultTree: () => ({
+    tree: fullTreeRef.current,
+    status: fullTreeStatusRef.current,
+    refresh: refreshFullTreeMock,
+  }),
 }));
 vi.mock("../notifications", () => ({ useToast: () => notification }));
 vi.mock("./useNoteTabs", () => ({ useNoteTabs: () => tabsState.current }));
@@ -396,6 +405,7 @@ function vaultCtx(over: Record<string, unknown> = {}) {
 beforeEach(() => {
   mockUseVault.mockReset();
   fullTreeRef.current = [];
+  fullTreeStatusRef.current = "ready";
   refreshFullTreeMock.mockReset();
   Object.values(notification).forEach((mock) => mock.mockReset());
   mockInvoke.mockReset();

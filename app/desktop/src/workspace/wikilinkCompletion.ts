@@ -2,6 +2,7 @@ import type { Completion, CompletionSource } from "@codemirror/autocomplete";
 import type { EditorView } from "@codemirror/view";
 
 import type { NoteIndexEntry } from "./linkResolve";
+import type { VaultTreeStatus } from "./useVaultTree";
 import {
   filterWikilinkSuggestions,
   findWikilinkTrigger,
@@ -10,6 +11,22 @@ import {
 } from "./wikilinkAutocomplete";
 
 const MAX_TRIGGER_SCAN = 2_048;
+
+/** Picking a notice must not edit the document: it closes the popup and leaves
+ *  the `[[` the user typed exactly as they typed it. */
+const NO_INSERT = () => {};
+
+/** What the popup says when the index cannot answer. An index that failed (or
+ *  has not finished) reading is NOT a vault with no notes, and offering nothing
+ *  reads as broken links rather than a failed read (issue #209). */
+const INDEX_NOTICE: Record<Exclude<VaultTreeStatus, "ready">, Completion> = {
+  loading: { label: "Reading the vault…", apply: NO_INSERT },
+  failed: {
+    label: "Vault index unavailable",
+    detail: "Refresh the vault to retry",
+    apply: NO_INSERT,
+  },
+};
 
 export function wikilinkCompletionEdit(
   value: string,
@@ -45,7 +62,10 @@ function targetForSuggestion(
     : suggestion.name;
 }
 
-export function createWikilinkCompletionSource(index: readonly NoteIndexEntry[]): CompletionSource {
+export function createWikilinkCompletionSource(
+  index: readonly NoteIndexEntry[],
+  indexStatus: VaultTreeStatus = "ready",
+): CompletionSource {
   return (context) => {
     const line = context.state.doc.lineAt(context.pos);
     const scanFrom = Math.max(line.from, context.pos - MAX_TRIGGER_SCAN);
@@ -54,6 +74,14 @@ export function createWikilinkCompletionSource(index: readonly NoteIndexEntry[])
     if (!trigger || /[#|]/.test(trigger.prefix)) return null;
 
     const suggestions = filterWikilinkSuggestions([...index], trigger.prefix);
+    if (suggestions.length === 0 && indexStatus !== "ready") {
+      return {
+        from: scanFrom + trigger.start + 2,
+        to: context.pos,
+        filter: false,
+        options: [INDEX_NOTICE[indexStatus]],
+      };
+    }
     return {
       from: scanFrom + trigger.start + 2,
       to: context.pos,

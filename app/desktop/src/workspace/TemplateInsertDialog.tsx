@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { ArrowLeft, FileText, Search, X } from "lucide-react";
+import { AlertTriangle, ArrowLeft, FileText, Search, X } from "lucide-react";
 import {
   Dialog,
   DialogContent,
@@ -9,11 +9,22 @@ import {
 import { buttonVariants } from "@/components/ui/button";
 import { IconButton } from "@/components/ui/icon-button";
 import type { TemplateInfo, TreeNode } from "../lib/types";
+import type { VaultTreeStatus } from "./useVaultTree";
 
 interface Destination {
   path: string;
   label: string;
 }
+
+const FOLDER_NOTICE_ID = "template-destination-notice";
+
+/** The folder list is walked out of the vault tree, so an incomplete read shows
+ *  up here as folders that simply aren't offered. "Vault root only" is a
+ *  legitimate answer for a flat vault, so say which one this is (issue #209). */
+const FOLDER_NOTICE: Record<Exclude<VaultTreeStatus, "ready">, string> = {
+  loading: "Still reading the vault — this folder list may be incomplete.",
+  failed: "Vault index unavailable — this folder list may be incomplete.",
+};
 
 function destinations(vaultPath: string, tree: TreeNode[]): Destination[] {
   const result: Destination[] = [{ path: vaultPath, label: "Vault root" }];
@@ -33,6 +44,7 @@ export function TemplateInsertDialog({
   templates,
   vaultPath,
   tree,
+  treeStatus = "ready",
   onCreate,
   onClose,
 }: Readonly<{
@@ -40,6 +52,8 @@ export function TemplateInsertDialog({
   templates: TemplateInfo[];
   vaultPath: string;
   tree: TreeNode[];
+  /** Whether `tree` is a completed vault read — see `VaultTreeStatus`. */
+  treeStatus?: VaultTreeStatus;
   onCreate: (template: string, name: string, parentPath: string) => void;
   onClose: () => void;
 }>) {
@@ -171,21 +185,34 @@ export function TemplateInsertDialog({
                 className="rounded-lg border border-input bg-background px-3 py-2 text-sm font-normal outline-none focus-visible:ring-2 focus-visible:ring-ring"
               />
             </label>
-            <label className="flex flex-col gap-1.5 text-[0.75rem] font-medium text-foreground">
-              <span>Destination folder</span>
-              <select
-                aria-label="Destination folder"
-                value={parentPath}
-                onChange={(event) => setParentPath(event.target.value)}
-                className="rounded-lg border border-input bg-background px-3 py-2 text-sm font-normal outline-none focus-visible:ring-2 focus-visible:ring-ring"
-              >
-                {folders.map((folder) => (
-                  <option key={folder.path} value={folder.path}>
-                    {folder.label}
-                  </option>
-                ))}
-              </select>
-            </label>
+            <div className="flex flex-col gap-1.5">
+              <label className="flex flex-col gap-1.5 text-[0.75rem] font-medium text-foreground">
+                <span>Destination folder</span>
+                <select
+                  aria-label="Destination folder"
+                  aria-describedby={treeStatus === "ready" ? undefined : FOLDER_NOTICE_ID}
+                  value={parentPath}
+                  onChange={(event) => setParentPath(event.target.value)}
+                  className="rounded-lg border border-input bg-background px-3 py-2 text-sm font-normal outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                >
+                  {folders.map((folder) => (
+                    <option key={folder.path} value={folder.path}>
+                      {folder.label}
+                    </option>
+                  ))}
+                </select>
+              </label>
+              {treeStatus !== "ready" && (
+                <p
+                  id={FOLDER_NOTICE_ID}
+                  role="status"
+                  className="flex items-start gap-1.5 text-[0.6875rem] leading-4 text-muted-foreground"
+                >
+                  <AlertTriangle className="mt-px size-3 shrink-0 text-warning" aria-hidden />
+                  {FOLDER_NOTICE[treeStatus]}
+                </p>
+              )}
+            </div>
             <div className="flex items-center justify-between gap-3 border-t border-border pt-4">
               <button
                 type="button"
