@@ -67,10 +67,14 @@ export function Workspace() {
   // moat-adjacent). This keeps a full read_tree for those consumers only, while
   // the sidebar tree stays lazy. `reportError` is a stable useCallback, so this
   // doesn't re-read every render.
-  const { tree: fullTree, refresh: refreshFullTree } = useVaultTree(
-    vault?.path,
-    reportError,
-  );
+  // `fullTreeStatus` travels with the tree everywhere it goes. The array alone
+  // cannot say WHY it is empty, and every consumer below renders "there is
+  // nothing here" from an empty one (issue #209).
+  const {
+    tree: fullTree,
+    status: fullTreeStatus,
+    refresh: refreshFullTree,
+  } = useVaultTree(vault?.path, reportError);
   const toast = useToast();
   const noteTabs = useNoteTabs();
   const open = noteTabs.active;
@@ -392,9 +396,16 @@ export function Workspace() {
         aiStatusVersion={aiStatusVersion}
         onOpenChatSettings={() => handleOpenSettings("ai")}
         openNoteAt={openNoteAt}
+        noteIndexStatus={fullTreeStatus}
       />
 
-      <StatusBar vaultName={vault.name} tree={fullTree} note={open.note} />
+      <StatusBar
+        vaultName={vault.name}
+        tree={fullTree}
+        status={fullTreeStatus}
+        onRetry={refreshFullTree}
+        note={open.note}
+      />
 
       <SettingsModal
         open={settingsOpen}
@@ -406,6 +417,7 @@ export function Workspace() {
         templates={templates}
         vaultPath={vault.path}
         tree={fullTree}
+        treeStatus={fullTreeStatus}
         onCreate={handleCreateFromTemplate}
         onClose={() => setTemplateInsertOpen(false)}
       />

@@ -17,6 +17,7 @@ pub mod paths;
 pub mod preferences;
 pub mod recents;
 pub mod search;
+mod temp_sibling;
 pub mod templates;
 pub mod tree;
 pub mod vault;

@@ -18,6 +18,7 @@ import { NoteDocumentFrame, Reader } from "./Reader";
 import { sourceTitleMode } from "./sourceDocumentTitle";
 import type { OpenNote } from "./useOpenNote";
 import type { NoteDoc } from "../lib/types";
+import type { VaultTreeStatus } from "./useVaultTree";
 
 const SourceNoteEditor = lazy(() =>
   import("./SourceNoteEditor").then((module) => ({
@@ -29,6 +30,12 @@ interface NotePaneProps {
   open: OpenNote;
   /** Vault note index — wikilink resolution (reader) + `[[` autocomplete (editor). */
   noteIndex?: NoteIndexEntry[];
+  /** Whether `noteIndex` is a completed vault read, so the `[[` popup can say
+   *  "index unavailable" rather than silently offering nothing (issue #209).
+   *  Required all the way down the chain: an omitted status used to fall back to
+   *  `"ready"`, which turned a severed prop into a confident lie instead of a
+   *  compile error. */
+  noteIndexStatus: VaultTreeStatus;
   /** Open another vault note by relPath (the workspace's guarded open). */
   onOpenLink?: (relPath: string) => void;
   /** Open Search for an Obsidian-compatible inline tag. */
@@ -182,6 +189,7 @@ function OversizedNoteNotice({
 function TextNoteBody({
   open,
   noteIndex,
+  noteIndexStatus,
   onOpenLink,
   onSearchTag,
   reportError,
@@ -239,6 +247,7 @@ function TextNoteBody({
             onPreviewError={setPreviewError}
             reportError={reportError}
             noteIndex={noteIndex}
+            noteIndexStatus={noteIndexStatus}
             onOpenLink={onOpenLink}
             onSearchTag={onSearchTag}
             sourceRelPath={note.relPath}
@@ -256,6 +265,7 @@ function TextNoteBody({
 export function NotePane({
   open,
   noteIndex,
+  noteIndexStatus,
   onOpenLink,
   onSearchTag,
   reportError,
@@ -325,6 +335,7 @@ export function NotePane({
       <TextNoteBody
         open={open}
         noteIndex={noteIndex}
+        noteIndexStatus={noteIndexStatus}
         onOpenLink={onOpenLink}
         onSearchTag={onSearchTag}
         reportError={reportError}

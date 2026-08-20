@@ -1,13 +1,15 @@
 use std::io::Write;
 use std::path::Path;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::AtomicU64;
 
 use serde::Serialize;
 
 use crate::error::{CoreError, CoreResult};
+use crate::temp_sibling::create_temp_sibling;
 
+/// This site's own temp-name counter, so a busy config write never advances the
+/// counter another write path is walking.
 static CONFIG_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-const MAX_TEMP_ATTEMPTS: usize = 32;
 
 pub(crate) fn write_json_atomic<T: Serialize>(
     path: &Path,
@@ -31,30 +33,12 @@ pub(crate) fn write_json_atomic<T: Serialize>(
         .file_name()
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_else(|| "config.json".into());
-    let (temp, mut file) = (0..MAX_TEMP_ATTEMPTS)
-        .find_map(|_| {
-            let sequence = CONFIG_TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-            let temp = parent.join(format!(
-                ".{file_name}.{}.{sequence}.nn-tmp",
-                std::process::id()
-            ));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)
-            {
-                Ok(file) => Some(Ok((temp, file))),
-                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
-                Err(error) => Some(Err(CoreError::Io(format!(
-                    "could not write {label}: {error}"
-                )))),
-            }
-        })
-        .unwrap_or_else(|| {
-            Err(CoreError::Io(format!(
-                "could not write {label}: no unique temporary file was available"
-            )))
-        })?;
+    let (temp, mut file) = create_temp_sibling(
+        parent,
+        &file_name,
+        &CONFIG_TMP_SEQ,
+        &format!("could not write {label}"),
+    )?;
     if let Err(error) = file.write_all(&bytes).and_then(|()| file.sync_all()) {
         drop(file);
         let _ = std::fs::remove_file(&temp);
@@ -70,11 +54,13 @@ pub(crate) fn write_json_atomic<T: Serialize>(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::sync::Mutex;
 
     use serde::ser::Error as _;
 
     use super::*;
+    use crate::temp_sibling::MAX_TEMP_ATTEMPTS;
 
     struct SerializationFailure;
     static TEST_LOCK: Mutex<()> = Mutex::new(());

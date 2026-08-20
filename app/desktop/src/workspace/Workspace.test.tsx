@@ -9,6 +9,7 @@ import { MENU_ACTION } from "../lib/bindings/events";
 import type { TreeNode } from "../lib/types";
 import type { OpenNote } from "./useOpenNote";
 import type { NoteTab, NoteTabsController } from "./useNoteTabs";
+import type { VaultTreeStatus } from "./useVaultTree";
 
 // Controllable store + open-note state, captured child props, and a fake Tauri
 // window so the close-guard and navigation guards can be driven directly.
@@ -17,8 +18,17 @@ const { mockUseVault } = vi.hoisted(() => ({ mockUseVault: vi.fn() }));
 // it here so Workspace's note index / status counts / template picker read a
 // controllable tree and the hook's own read_tree + tree-changed subscription
 // don't run inside these Workspace unit tests.
-const { fullTreeRef, refreshFullTreeMock } = vi.hoisted(() => ({
+// `fullTreeStatusRef` defaults to "ready" — the status the stub must report for
+// the footer to render counts at all. It is a handle rather than a constant so a
+// test can drive the failed/loading branches, which the failed-index case in
+// "note index + rel-path opener threading" does (issue #209). Every consumer of
+// that status is mocked in this file, so what these tests own is the WIRING: the
+// value reaching each child. What each child then renders is proved where it
+// lives — StatusBar.vaultRead.test.tsx, TemplateInsertDialog.test.tsx,
+// SourceNoteEditor.test.tsx, and the failed-read e2e journey.
+const { fullTreeRef, fullTreeStatusRef, refreshFullTreeMock } = vi.hoisted(() => ({
   fullTreeRef: { current: [] as TreeNode[] },
+  fullTreeStatusRef: { current: "ready" as VaultTreeStatus },
   refreshFullTreeMock: vi.fn(),
 }));
 const notification = vi.hoisted(() => ({
@@ -51,6 +61,7 @@ const captured = vi.hoisted(() => ({
   fileTree: {} as Record<string, (...a: never[]) => void>,
   notePane: {} as {
     onSearchTag: (tag: string) => void;
+    noteIndexStatus: VaultTreeStatus;
   },
   ribbon: {} as {
     navigationExpanded: boolean;
@@ -94,6 +105,7 @@ const captured = vi.hoisted(() => ({
   templateDialog: {} as {
     open: boolean;
     templates: Array<{ relPath: string; name: string }>;
+    treeStatus: VaultTreeStatus;
     onCreate: (template: string, name: string, parentPath: string) => void;
     onClose: () => void;
   },
@@ -112,7 +124,11 @@ const win = vi.hoisted(() => {
 
 vi.mock("../lib/store", () => ({ useVault: mockUseVault }));
 vi.mock("./useVaultTree", () => ({
-  useVaultTree: () => ({ tree: fullTreeRef.current, refresh: refreshFullTreeMock }),
+  useVaultTree: () => ({
+    tree: fullTreeRef.current,
+    status: fullTreeStatusRef.current,
+    refresh: refreshFullTreeMock,
+  }),
 }));
 vi.mock("../notifications", () => ({ useToast: () => notification }));
 vi.mock("./useNoteTabs", () => ({ useNoteTabs: () => tabsState.current }));
@@ -154,7 +170,10 @@ vi.mock("./FileTree", () => ({
   },
 }));
 vi.mock("./NotePane", () => ({
-  NotePane: (props: { onSearchTag: (tag: string) => void }) => {
+  NotePane: (props: {
+    onSearchTag: (tag: string) => void;
+    noteIndexStatus: VaultTreeStatus;
+  }) => {
     captured.notePane = props;
     return <div data-testid="notepane" />;
   },
@@ -185,6 +204,7 @@ vi.mock("./TemplateInsertDialog", () => ({
   TemplateInsertDialog: (props: {
     open: boolean;
     templates: Array<{ relPath: string; name: string }>;
+    treeStatus: VaultTreeStatus;
     onCreate: (template: string, name: string, parentPath: string) => void;
     onClose: () => void;
   }) => {
@@ -232,8 +252,16 @@ vi.mock("./GraphView", () => ({
   },
 }));
 vi.mock("./StatusBar", () => ({
-  StatusBar: ({ vaultName }: { vaultName: string }) => (
-    <div data-testid="statusbar">{vaultName}</div>
+  StatusBar: ({
+    vaultName,
+    status,
+  }: {
+    vaultName: string;
+    status: VaultTreeStatus;
+  }) => (
+    <div data-testid="statusbar" data-status={status}>
+      {vaultName}
+    </div>
   ),
 }));
 
@@ -396,6 +424,7 @@ function vaultCtx(over: Record<string, unknown> = {}) {
 beforeEach(() => {
   mockUseVault.mockReset();
   fullTreeRef.current = [];
+  fullTreeStatusRef.current = "ready";
   refreshFullTreeMock.mockReset();
   Object.values(notification).forEach((mock) => mock.mockReset());
   mockInvoke.mockReset();
@@ -501,6 +530,48 @@ describe("Workspace — note index + rel-path opener threading", () => {
     expect((captured.notePane as { noteIndex?: unknown }).noteIndex).toEqual([
       { relPath: "Target.md", stem: "target" },
     ]);
+  });
+
+  it("hands a failed vault read to every surface that would otherwise claim a complete index", async () => {
+    // The reviewer's demonstration for issue #209: delete one of these prop
+    // pass-throughs in Workspace.tsx and, before the props became required,
+    // every consumer quietly defaulted to "ready" — the incomplete-folder notice
+    // and the "[[ index unavailable" notice stopped rendering and the whole
+    // suite stayed green. Each hop is asserted here so a severed chain fails
+    // loudly at the level that severs it.
+    fullTreeStatusRef.current = "failed";
+    fullTreeRef.current = [];
+    mockInvoke.mockImplementation((command) => {
+      if (command === "list_templates") {
+        return Promise.resolve([{ relPath: "Templates/Daily.md", name: "Daily" }]);
+      }
+      return defaultInvoke(String(command));
+    });
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    // The footer withholds its counts (StatusBar renders the notice + retry).
+    expect(screen.getByTestId("statusbar")).toHaveAttribute("data-status", "failed");
+    // The editor's `[[` popup says the index is unavailable instead of offering
+    // an empty list that reads as "this vault has no notes".
+    expect(captured.notePane.noteIndexStatus).toBe("failed");
+
+    // The template picker's folder list is walked from the same tree, so it
+    // carries the same caveat.
+    await act(async () => captured.ribbon.onInsertTemplate());
+    expect(screen.getByTestId("template-insert-dialog")).toBeInTheDocument();
+    expect(captured.templateDialog.treeStatus).toBe("failed");
+  });
+
+  it("keeps a completed vault read out of the incomplete-index surfaces", () => {
+    // The other half of the same wiring: "ready" must arrive as "ready", or the
+    // app cries wolf on every healthy vault.
+    fullTreeRef.current = [node("/v/Target.md")];
+    mockUseVault.mockReturnValue(vaultCtx());
+    render(<Workspace />);
+
+    expect(captured.notePane.noteIndexStatus).toBe("ready");
+    expect(screen.getByTestId("statusbar")).toHaveAttribute("data-status", "ready");
   });
 
   it("opens wikilink/backlink targets through the tab controller", async () => {

@@ -33,6 +33,7 @@ describe("SourceNoteEditor", () => {
   it("mounts one directly editable, accessible multiline CodeMirror surface", () => {
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-1"
         loadedHash="hash-1"
         value="# Exact source"
@@ -53,6 +54,7 @@ describe("SourceNoteEditor", () => {
     const onChange = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-derived-title"
         loadedHash="hash-title"
         value="The hierarchy follows a basic model."
@@ -79,6 +81,7 @@ describe("SourceNoteEditor", () => {
     const onChange = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-derived-title-crlf"
         loadedHash="hash-title-crlf"
         value={"---\r\ntags: [azure]\r\n---\r\nBody"}
@@ -102,6 +105,7 @@ describe("SourceNoteEditor", () => {
     const onChange = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-derived-title-frontmatter-eof"
         loadedHash="hash-title-frontmatter-eof"
         value={"---\ntitle: Azure\n---"}
@@ -122,6 +126,7 @@ describe("SourceNoteEditor", () => {
     const onChange = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-1"
         loadedHash="hash-1"
         value={"one\r\ntwo"}
@@ -149,14 +154,14 @@ describe("SourceNoteEditor", () => {
       onChange,
       onPreservationError: vi.fn(),
     };
-    const first = render(<SourceNoteEditor {...props} />);
+    const first = render(<SourceNoteEditor noteIndexStatus="ready" {...props} />);
     const editor = screen.getByRole("textbox", { name: "Note content" });
     await userEvent.click(editor);
     await userEvent.keyboard("{End}X");
     await waitFor(() => expect(onChange).toHaveBeenLastCalledWith("seedX"));
     first.unmount();
 
-    render(<SourceNoteEditor {...props} />);
+    render(<SourceNoteEditor noteIndexStatus="ready" {...props} />);
     expect(screen.getByRole("textbox", { name: "Note content" })).toHaveTextContent("seedX");
   });
 
@@ -164,6 +169,7 @@ describe("SourceNoteEditor", () => {
     const onChange = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-task"
         loadedHash="hash-task"
         value="- [ ] open"
@@ -186,6 +192,7 @@ describe("SourceNoteEditor", () => {
     ].join("\n");
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-table"
         loadedHash="hash-table"
         value={source}
@@ -231,6 +238,7 @@ describe("SourceNoteEditor", () => {
     ].join("\n");
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-table-caret"
         loadedHash="hash-table-caret"
         value={source}
@@ -259,6 +267,7 @@ describe("SourceNoteEditor", () => {
     const onChange = vi.fn();
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-table-align"
         loadedHash="hash-table-align"
         value={source}
@@ -295,6 +304,7 @@ describe("SourceNoteEditor", () => {
     ].join("\n");
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-table-huge"
         loadedHash="hash-table-huge"
         value={source}
@@ -325,6 +335,7 @@ describe("SourceNoteEditor", () => {
     ].join("\n");
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-table-bound"
         loadedHash="hash-table-bound"
         value={source}
@@ -349,6 +360,7 @@ describe("SourceNoteEditor", () => {
     ].join("\n");
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-table-nav"
         loadedHash="hash-table-nav"
         value={source}
@@ -378,6 +390,7 @@ describe("SourceNoteEditor", () => {
     const source = "# Commitments\n\nplain paragraph";
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-table-escape"
         loadedHash="hash-table-escape"
         value={source}
@@ -404,6 +417,7 @@ describe("SourceNoteEditor", () => {
     ].join("\n");
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-table-inline"
         loadedHash="hash-table-inline"
         value={source}
@@ -428,6 +442,7 @@ describe("SourceNoteEditor", () => {
     ].join("\n");
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-table-urls"
         loadedHash="hash-table-urls"
         value={source}
@@ -446,6 +461,7 @@ describe("SourceNoteEditor", () => {
     const source = "---\ntags: [old]\n---\n# My Note\n\nBody";
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-frontmatter-round-trip"
         loadedHash="hash-frontmatter-round-trip"
         value={source}
@@ -474,6 +490,7 @@ describe("SourceNoteEditor", () => {
     const source = "---\ntags: [old]\n---\n# My Note\n\nBody";
     const { rerender } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-frontmatter-edit"
         loadedHash="hash-before-save"
         value={source}
@@ -508,6 +525,7 @@ describe("SourceNoteEditor", () => {
     const saved = source.replace("old", "new");
     rerender(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-frontmatter-edit"
         loadedHash="hash-before-save"
         value={saved}
@@ -530,6 +548,7 @@ describe("SourceNoteEditor", () => {
     const onSearchTag = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-frontmatter-tags"
         loadedHash="hash-frontmatter-tags"
         value={"---\ntags: [reference, '#ops/nested', 7]\naliases: [reference]\n---\nBody"}
@@ -559,6 +578,7 @@ describe("SourceNoteEditor", () => {
     const source = "---\ntags: [old]\n---\nBody";
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-frontmatter-invalid-edit"
         loadedHash="hash-frontmatter-invalid-edit"
         value={source}
@@ -591,6 +611,7 @@ describe("SourceNoteEditor", () => {
     const source = "---\ntags: [old]\n---\nBody";
     const { rerender } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-frontmatter-save-race"
         loadedHash="hash-frontmatter-save-race"
         value={source}
@@ -615,6 +636,7 @@ describe("SourceNoteEditor", () => {
 
     rerender(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-frontmatter-save-race"
         loadedHash="hash-frontmatter-save-race"
         value={source.replace("old", "latest")}
@@ -640,6 +662,7 @@ describe("SourceNoteEditor", () => {
     const source = "---\ntags: [old]\n---\nBody";
     const { rerender } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-frontmatter-save-while-open"
         loadedHash="hash-frontmatter-save-while-open"
         value={source}
@@ -661,6 +684,7 @@ describe("SourceNoteEditor", () => {
 
     rerender(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-frontmatter-save-while-open"
         loadedHash="hash-frontmatter-save-while-open"
         value={source.replace("old", "saved")}
@@ -692,6 +716,7 @@ describe("SourceNoteEditor", () => {
     const source = "---\ntags: [old]\n---\nBody";
     const { rerender } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-frontmatter-hidden-undo"
         loadedHash="hash-frontmatter-hidden-undo"
         value={source}
@@ -713,6 +738,7 @@ describe("SourceNoteEditor", () => {
 
     rerender(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-frontmatter-hidden-undo"
         loadedHash="hash-frontmatter-hidden-undo"
         value={source.replace("old", "new")}
@@ -747,6 +773,7 @@ describe("SourceNoteEditor", () => {
   it("keeps YAML tag values inert when no search callback is available", () => {
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-frontmatter-tags-inert"
         loadedHash="hash-frontmatter-tags-inert"
         value={"---\ntags: [reference]\n---\nBody"}
@@ -765,6 +792,7 @@ describe("SourceNoteEditor", () => {
     const onChange = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-task-keyboard"
         loadedHash="hash-task"
         value="- [ ] open"
@@ -790,6 +818,7 @@ describe("SourceNoteEditor", () => {
     const onChange = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-format"
         loadedHash="hash-format"
         value="word"
@@ -809,6 +838,7 @@ describe("SourceNoteEditor", () => {
     const onChange = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-multicaret"
         loadedHash="hash-format"
         value="one two"
@@ -840,6 +870,7 @@ describe("SourceNoteEditor", () => {
     const onPreservationError = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-ambiguous"
         loadedHash="hash-ambiguous"
         value="one\r\ntwo"
@@ -863,12 +894,12 @@ describe("SourceNoteEditor", () => {
       onChange: vi.fn(),
       onPreservationError: vi.fn(),
     };
-    const first = render(<SourceNoteEditor {...props} />);
+    const first = render(<SourceNoteEditor noteIndexStatus="ready" {...props} />);
     const scroller = first.container.querySelector<HTMLElement>(".cm-scroller")!;
     scroller.scrollTop = 420;
     first.unmount();
 
-    const second = render(<SourceNoteEditor {...props} />);
+    const second = render(<SourceNoteEditor noteIndexStatus="ready" {...props} />);
     expect(second.container.querySelector<HTMLElement>(".cm-scroller")?.scrollTop).toBe(420);
   });
 
@@ -876,6 +907,7 @@ describe("SourceNoteEditor", () => {
     const onOpenLink = vi.fn();
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-links"
         loadedHash="hash-links"
         value="x [[Daily]] [[https://evil.example/x]]"
@@ -904,6 +936,7 @@ describe("SourceNoteEditor", () => {
   it("keeps a boundary-selected wikilink clickable while the editor is unfocused", () => {
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-unfocused-boundary-link"
         loadedHash="hash-unfocused-boundary-link"
         value="[[Daily]]"
@@ -921,6 +954,7 @@ describe("SourceNoteEditor", () => {
     const onOpenLink = vi.fn();
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-markdown-links"
         loadedHash="hash-markdown-links"
         value="[Azure Account](Azure%20Account.md) [unsafe](../Outside.md)"
@@ -950,6 +984,7 @@ describe("SourceNoteEditor", () => {
     const onOpenLink = vi.fn();
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-active-markdown-link"
         loadedHash="hash-active-markdown-link"
         value="before [Daily](Daily.md) after"
@@ -984,11 +1019,12 @@ describe("SourceNoteEditor", () => {
       onChange: vi.fn(),
       onPreservationError: vi.fn(),
     };
-    const rendered = render(<SourceNoteEditor {...props} noteIndex={[]} />);
+    const rendered = render(<SourceNoteEditor noteIndexStatus="ready" {...props} noteIndex={[]} />);
     expect(rendered.container.querySelector(".nn-lp-wikilink-unresolved")).not.toBeNull();
 
     rendered.rerender(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         {...props}
         noteIndex={[{ relPath: "Daily.md", stem: "daily" }]}
       />,
@@ -1009,7 +1045,7 @@ describe("SourceNoteEditor", () => {
       onPreservationError: vi.fn(),
       onOpenLink,
     };
-    const rendered = render(<SourceNoteEditor {...props} noteIndex={[]} />);
+    const rendered = render(<SourceNoteEditor noteIndexStatus="ready" {...props} noteIndex={[]} />);
     expect(
       rendered.container.querySelector(".nn-lp-link[data-nn-markdown-target]"),
     ).toBeNull();
@@ -1017,6 +1053,7 @@ describe("SourceNoteEditor", () => {
 
     rendered.rerender(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         {...props}
         noteIndex={[{ relPath: "Daily.md", stem: "daily" }]}
       />,
@@ -1028,10 +1065,36 @@ describe("SourceNoteEditor", () => {
     });
   });
 
+  it("tells the [[ popup the index is unavailable when the vault read failed", async () => {
+    // The wiring, not the pure function: `noteIndexStatus` has to survive the
+    // trip through the editor's ref and into the completion source, or a failed
+    // read renders as a vault with no notes to link to (issue #209).
+    render(
+      <SourceNoteEditor
+        noteIndexStatus="failed"
+        sessionKey="tab-index-failed"
+        loadedHash="hash-index-failed"
+        value=""
+        noteIndex={[]}
+        onChange={vi.fn()}
+        onPreservationError={vi.fn()}
+      />,
+    );
+
+    const editor = screen.getByRole("textbox", { name: "Note content" });
+    await userEvent.click(editor);
+    // userEvent.keyboard reads "[[" as its own escape for a single "[".
+    await userEvent.keyboard("[[[[");
+
+    expect(await screen.findByText("Vault index unavailable")).toBeInTheDocument();
+    expect(screen.getByText("Refresh the vault to retry")).toBeInTheDocument();
+  });
+
   it("opens the resolved wikilink at the caret with Mod-Enter", async () => {
     const onOpenLink = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-keyboard-link"
         loadedHash="hash-links"
         value="[[Daily]]"
@@ -1052,6 +1115,7 @@ describe("SourceNoteEditor", () => {
     const onOpenLink = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-markdown-link-keyboard"
         loadedHash="hash-markdown-link-keyboard"
         value="[Daily](Daily.md)"
@@ -1076,6 +1140,7 @@ describe("SourceNoteEditor", () => {
     const onSearchTag = vi.fn();
     const { container } = render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-inline-tag"
         loadedHash="hash-inline-tag"
         value="#SaaS Software As A Service:"
@@ -1104,6 +1169,7 @@ describe("SourceNoteEditor", () => {
     const onSearchTag = vi.fn();
     render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey="tab-inline-tag-keyboard"
         loadedHash="hash-inline-tag-keyboard"
         value="before #SaaS after"

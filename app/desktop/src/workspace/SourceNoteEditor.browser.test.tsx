@@ -59,6 +59,7 @@ async function mountEditor(
   await act(async () => {
     root!.render(
       <SourceNoteEditor
+        noteIndexStatus="ready"
         sessionKey={sessionKey}
         loadedHash={sessionKey}
         value={value}

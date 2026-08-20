@@ -28,6 +28,7 @@ describe("editor typography", () => {
     await act(async () => {
       root!.render(
         <SourceNoteEditor
+          noteIndexStatus="ready"
           sessionKey="typography"
           loadedHash="typography"
           value={NOTE}

@@ -9,7 +9,11 @@
 //! share the lib test binary with its other `write_note` call sites, one of which
 //! saves from eight threads at once.
 
+use std::path::PathBuf;
+use std::sync::atomic::Ordering;
+
 use super::*;
+use crate::temp_sibling::MAX_TEMP_ATTEMPTS;
 
 /// The temp sibling [`create_temp_sibling`] builds for `file_name` at `sequence`.
 /// Mirrors its format string — the single thing these tests know about the name,
