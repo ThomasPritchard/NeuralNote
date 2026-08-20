@@ -1,5 +1,12 @@
-import { CompletionContext } from "@codemirror/autocomplete";
-import { EditorState } from "@codemirror/state";
+import {
+  autocompletion,
+  CompletionContext,
+  completionStatus,
+  startCompletion,
+  type Completion,
+} from "@codemirror/autocomplete";
+import { EditorState, type TransactionSpec } from "@codemirror/state";
+import type { EditorView } from "@codemirror/view";
 import { describe, expect, it, vi } from "vitest";
 
 import type { NoteIndexEntry } from "./linkResolve";
@@ -16,7 +23,9 @@ const INDEX: NoteIndexEntry[] = [
 
 function complete(doc: string) {
   const state = EditorState.create({ doc, selection: { anchor: doc.length } });
-  return createWikilinkCompletionSource(INDEX)(new CompletionContext(state, doc.length, false));
+  return createWikilinkCompletionSource(INDEX, "ready")(
+    new CompletionContext(state, doc.length, false),
+  );
 }
 
 /** Complete against an index that never finished reading — the shape the failed
@@ -30,6 +39,54 @@ function completeWithoutIndex(doc: string, status: "loading" | "failed") {
 
 function optionsOf(result: ReturnType<typeof complete>) {
   return result && !(result instanceof Promise) ? result.options : [];
+}
+
+/** The single notice the source offers for `status`, or a failure if it offered
+ *  none — so a test that means to pick a notice can never pass having picked
+ *  nothing. */
+function noticeFor(status: "loading" | "failed"): Completion {
+  const [notice] = optionsOf(completeWithoutIndex("[[", status));
+  if (!notice) throw new Error(`no notice was offered for a ${status} index`);
+  return notice;
+}
+
+/** A view stand-in real enough for the close command: `closeCompletion` reads the
+ *  completion state field and dispatches an effect into it. The state carries the
+ *  real `autocompletion()` extension and applies whatever is dispatched, so
+ *  whether the popup is open is read from CodeMirror rather than inferred from the
+ *  shape of a spy call. */
+function noticeHarness(doc: string) {
+  let state = EditorState.create({
+    doc,
+    selection: { anchor: doc.length },
+    extensions: [
+      // The override is what gives `completionState` a source to mark active;
+      // the notice under test is taken from its own source, via `noticeFor`.
+      autocompletion({
+        override: [createWikilinkCompletionSource([], "failed")],
+      }),
+    ],
+  });
+  const dispatch = vi.fn((spec: TransactionSpec) => {
+    state = state.update(spec).state;
+  });
+  const view = {
+    get state() {
+      return state;
+    },
+    dispatch,
+  } as unknown as EditorView;
+  return { view, dispatch };
+}
+
+/** Pick `option` the way the popup does: through its own `apply`, over the range
+ *  the completion source reported. */
+function pick(option: Completion, view: EditorView, from: number, to: number) {
+  const { apply } = option;
+  if (typeof apply !== "function") {
+    throw new Error(`a notice must apply a function, got ${typeof apply}`);
+  }
+  apply(view, option, from, to);
 }
 
 describe("wikilinkCompletion", () => {
@@ -75,7 +132,7 @@ describe("wikilinkCompletion", () => {
       throw new Error("complete document copied");
     });
 
-    const result = createWikilinkCompletionSource(INDEX)(
+    const result = createWikilinkCompletionSource(INDEX, "ready")(
       new CompletionContext(editor, doc.length, false),
     );
     expect(result && !(result instanceof Promise) ? result.options[0]?.label : null).toBe("Daily");
@@ -97,16 +154,23 @@ describe("wikilinkCompletion", () => {
     ]);
   });
 
-  it("leaves the document untouched when a notice is picked", () => {
-    const [notice] = optionsOf(completeWithoutIndex("[[", "failed"));
-    const dispatch = vi.fn();
-    (notice.apply as (view: unknown, c: unknown, f: number, t: number) => void)(
-      { dispatch } as never,
-      notice,
-      2,
-      2,
-    );
-    expect(dispatch).not.toHaveBeenCalled();
+  it("closes the popup without editing the document when a notice is picked", () => {
+    // Enter reaches a notice through `acceptCompletion`, which consumes the key
+    // whatever `apply` does and dispatches nothing of its own for a function
+    // `apply`. So an apply that dispatches nothing leaves the popup open,
+    // swallowing that Enter and every one after it: picking a notice has to close
+    // the completion itself, while still leaving the typed `[[` alone.
+    const doc = "[[";
+    const { view, dispatch } = noticeHarness(doc);
+    startCompletion(view);
+    expect(completionStatus(view.state)).toBe("pending");
+
+    dispatch.mockClear();
+    pick(noticeFor("failed"), view, doc.length, doc.length);
+
+    expect(dispatch).toHaveBeenCalledTimes(1);
+    expect(completionStatus(view.state)).toBeNull();
+    expect(view.state.doc.toString()).toBe(doc);
   });
 
   it("stays silent for a read vault that genuinely has no match", () => {

@@ -92,7 +92,7 @@ describe("NotePane — live region semantics", () => {
   // payload on the module-level lazy component, so the fallback is only
   // reachable on the very first mount. A reorder turns this red, not silent.
   it("announces the lazy editor's loading fallback as a status region", async () => {
-    render(<NotePane open={openNote()} />);
+    render(<NotePane noteIndexStatus="ready" open={openNote()} />);
 
     expect(screen.getByText("Loading source editor…")).toHaveRole("status");
     // Let the lazy chunk settle so the suspense resolution stays inside the test.
@@ -101,7 +101,7 @@ describe("NotePane — live region semantics", () => {
 
   it("announces a live-preview failure as a status region, not silence", async () => {
     stub.previewFailure = "the renderer stopped responding";
-    render(<NotePane open={openNote()} />);
+    render(<NotePane noteIndexStatus="ready" open={openNote()} />);
 
     const notice = await screen.findByText(/Live preview is temporarily unavailable/);
     expect(notice).toHaveRole("status");
@@ -109,7 +109,7 @@ describe("NotePane — live region semantics", () => {
   });
 
   it("shows no preview notice while the live preview is healthy", async () => {
-    render(<NotePane open={openNote()} />);
+    render(<NotePane noteIndexStatus="ready" open={openNote()} />);
 
     await waitFor(() => expect(screen.queryByText("Loading source editor…")).toBeNull());
     expect(screen.queryByText(/Live preview is temporarily unavailable/)).toBeNull();

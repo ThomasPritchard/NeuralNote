@@ -64,8 +64,10 @@ export interface SourceNoteEditorProps {
   reportError?: (message: string) => void;
   noteIndex?: readonly NoteIndexEntry[];
   /** Whether `noteIndex` is a completed vault read. An empty index that failed
-   *  to read must say so in the `[[` popup rather than offer nothing (#209). */
-  noteIndexStatus?: VaultTreeStatus;
+   *  to read must say so in the `[[` popup rather than offer nothing (#209).
+   *  Required, and deliberately without a default: defaulting to `"ready"` is
+   *  the claim this prop exists to stop anyone making by accident. */
+  noteIndexStatus: VaultTreeStatus;
   onOpenLink?: (relPath: string) => void;
   onSearchTag?: (tag: string) => void;
   sourceRelPath?: string;
@@ -129,7 +131,7 @@ export function SourceNoteEditor({
   onPreviewError,
   reportError,
   noteIndex = EMPTY_NOTE_INDEX,
-  noteIndexStatus = "ready",
+  noteIndexStatus,
   onOpenLink,
   onSearchTag,
   sourceRelPath = "",

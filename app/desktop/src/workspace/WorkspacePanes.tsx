@@ -74,8 +74,9 @@ export interface WorkspacePanesProps {
   noteIndex: NoteIndexEntry[];
   /** Whether `noteIndex` is a completed vault read. An empty index that failed
    *  to read must not present itself as "this vault has no notes" in the `[[`
-   *  autocomplete (issue #209). */
-  noteIndexStatus?: VaultTreeStatus;
+   *  autocomplete (issue #209). Required, like `noteIndex` itself — the status
+   *  travels with the data it describes. */
+  noteIndexStatus: VaultTreeStatus;
   onSearchTag: (tag: string) => void;
   reportError: (message: string) => void;
   // Chat

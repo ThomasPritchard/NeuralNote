@@ -142,4 +142,27 @@ describe("Journey 9: error surfacing", () => {
     );
     expect(screen.getByTestId("vault-health")).toHaveAttribute("data-health", "healthy");
   });
+
+  it("says the [[ index is unavailable rather than offering an empty list", async () => {
+    // The same failed read, followed all the way down the other branch of the
+    // chain: Workspace -> WorkspacePanes -> NotePane -> SourceNoteEditor -> the
+    // completion source. Nothing is stubbed between them here, so a severed
+    // status prop at any hop shows up as an empty popup — which reads as "this
+    // vault has no notes to link to" rather than "the index could not be read"
+    // (issue #209).
+    const { user, backend } = renderApp({ seed: TWO_NOTES, recents });
+    backend.setFailure("read_tree", { kind: "io", message: "vault root unreadable" });
+    await user.click(await screen.findByRole("button", { name: "Open My Brain" }));
+
+    await user.click(await screen.findByRole("button", { name: "A.md" }));
+    const editor = await screen.findByRole("textbox", { name: "Note content" });
+    await user.click(editor);
+    await user.keyboard("{Control>}{End}{/Control}");
+    // userEvent reads "[[" as its own escape for a single "[".
+    await user.type(editor, " [[[[");
+
+    const listbox = await screen.findByRole("listbox");
+    expect(within(listbox).getByText("Vault index unavailable")).toBeInTheDocument();
+    expect(within(listbox).getByText("Refresh the vault to retry")).toBeInTheDocument();
+  });
 });

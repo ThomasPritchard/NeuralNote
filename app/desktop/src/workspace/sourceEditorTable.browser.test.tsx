@@ -120,6 +120,7 @@ describe("a drawn table as a grid", () => {
     await act(async () => {
       root!.render(
         <SourceNoteEditor
+          noteIndexStatus="ready"
           sessionKey="browser-table"
           loadedHash="browser-table-hash"
           value={SOURCE}

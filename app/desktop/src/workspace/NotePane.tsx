@@ -31,8 +31,11 @@ interface NotePaneProps {
   /** Vault note index — wikilink resolution (reader) + `[[` autocomplete (editor). */
   noteIndex?: NoteIndexEntry[];
   /** Whether `noteIndex` is a completed vault read, so the `[[` popup can say
-   *  "index unavailable" rather than silently offering nothing (issue #209). */
-  noteIndexStatus?: VaultTreeStatus;
+   *  "index unavailable" rather than silently offering nothing (issue #209).
+   *  Required all the way down the chain: an omitted status used to fall back to
+   *  `"ready"`, which turned a severed prop into a confident lie instead of a
+   *  compile error. */
+  noteIndexStatus: VaultTreeStatus;
   /** Open another vault note by relPath (the workspace's guarded open). */
   onOpenLink?: (relPath: string) => void;
   /** Open Search for an Obsidian-compatible inline tag. */

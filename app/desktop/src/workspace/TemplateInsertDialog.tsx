@@ -44,7 +44,7 @@ export function TemplateInsertDialog({
   templates,
   vaultPath,
   tree,
-  treeStatus = "ready",
+  treeStatus,
   onCreate,
   onClose,
 }: Readonly<{
@@ -52,8 +52,10 @@ export function TemplateInsertDialog({
   templates: TemplateInfo[];
   vaultPath: string;
   tree: TreeNode[];
-  /** Whether `tree` is a completed vault read — see `VaultTreeStatus`. */
-  treeStatus?: VaultTreeStatus;
+  /** Whether `tree` is a completed vault read — see `VaultTreeStatus`.
+   *  Required, and with no default: a defaulted `"ready"` would let this dialog
+   *  present a truncated folder list as the whole vault. */
+  treeStatus: VaultTreeStatus;
   onCreate: (template: string, name: string, parentPath: string) => void;
   onClose: () => void;
 }>) {
