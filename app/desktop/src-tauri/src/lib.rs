@@ -28,6 +28,14 @@ mod commands;
 mod event_names;
 mod key_revision;
 mod local;
+#[cfg(all(test, target_os = "macos"))]
+mod macho_fixtures;
+// Mach-O is a macOS format, and the requirement it guards is compiled locally
+// only on macOS (the source build shells out to `xcrun`). On any other target
+// there is no linkage question to ask, so the module is not compiled at all
+// rather than condemning every ELF executable as unreadable.
+#[cfg(target_os = "macos")]
+mod macho_linkage;
 mod menu;
 mod openrouter_catalogue;
 #[cfg(test)]

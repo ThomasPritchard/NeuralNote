@@ -865,6 +865,7 @@ mod tests {
             },
             app_data_bin_dir: PathBuf::from("/app-data/bin"),
             available_binaries: BTreeSet::new(),
+            unusable_binaries: Default::default(),
         };
         let mut active = ActiveSkills::new(8);
         let mut writes = WriteSession::new(1).unwrap();

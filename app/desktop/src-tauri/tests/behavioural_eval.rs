@@ -108,6 +108,7 @@ async fn run_case(
         },
         app_data_bin_dir: std::path::PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     let skill_services = SkillServices::new(
         &registry,

@@ -1039,9 +1039,9 @@ fn skill_registry_error(error: neuralnote_core::ai::SkillLookupError) -> CoreErr
 
 fn build_skill_environment(app: &AppHandle) -> neuralnote_core::ai::SkillEnvironment {
     let app_data_dir = app_data_dir_or_warn(app, "prepare the skill environment");
-    let available_binaries = app_data_dir
+    let inventory = app_data_dir
         .as_deref()
-        .map(requirement_detection::detect_requirement_files)
+        .map(requirement_detection::take_requirement_inventory)
         .unwrap_or_default();
     neuralnote_core::ai::SkillEnvironment {
         hardware: local::detect_hardware(app_data_dir.as_deref()),
@@ -1049,7 +1049,8 @@ fn build_skill_environment(app: &AppHandle) -> neuralnote_core::ai::SkillEnviron
             .as_ref()
             .map(|dir| dir.join("bin"))
             .unwrap_or_default(),
-        available_binaries,
+        available_binaries: inventory.available,
+        unusable_binaries: inventory.unusable,
     }
 }
 
@@ -3307,6 +3308,7 @@ mod tests {
             },
             app_data_bin_dir: vault.path().join("bin"),
             available_binaries: BTreeSet::new(),
+            unusable_binaries: Default::default(),
         };
         let note_writer = skills::RunNoteWriteBackend::new(std::sync::Arc::clone(&close_signal));
         let (policy, approval_prompt, approval_classifier) =

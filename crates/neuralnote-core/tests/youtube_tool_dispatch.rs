@@ -241,6 +241,7 @@ fn environment(whisper_installed: bool) -> SkillEnvironment {
         },
         app_data_bin_dir: bin,
         available_binaries: files,
+        unusable_binaries: Default::default(),
     }
 }
 

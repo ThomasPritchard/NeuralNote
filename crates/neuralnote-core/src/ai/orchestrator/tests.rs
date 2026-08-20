@@ -631,6 +631,7 @@ fn youtube_test_environment() -> SkillEnvironment {
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
+        unusable_binaries: Default::default(),
     }
 }
 
@@ -694,6 +695,7 @@ fn playlist_orchestrator_processes_21_transcripts_with_bounded_context_and_full_
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
+        unusable_binaries: Default::default(),
     };
     let pricing = PricingInput::Local;
     let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
@@ -1175,6 +1177,7 @@ fn playlist_cancellation_inside_a_batched_turn_skips_later_calls_and_keeps_parti
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
+        unusable_binaries: Default::default(),
     };
     let cancellation = CaptureCancellation::default();
     let writer = CancellingWriter(cancellation.clone());
@@ -1304,6 +1307,7 @@ fn rejected_playlist_batch_cannot_cascade_into_the_next_work_item() {
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::from([PathBuf::from("/app-data/bin/yt-dlp")]),
+        unusable_binaries: Default::default(),
     };
     let services = SkillServices::new(&skills, &environment, &prompt, &FsWriter, 1)
         .with_approval(
@@ -1870,6 +1874,7 @@ fn run_with_provider_and_cancellation(
         },
         app_data_bin_dir: std::path::PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     let services = SkillServices::new(
         &skills,
@@ -1971,6 +1976,7 @@ fn run_metered(root: &Path, llm: &MeteredLlm) -> Vec<ChatEvent> {
         },
         app_data_bin_dir: std::path::PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     let services = SkillServices::new(
         &skills,
@@ -2572,6 +2578,7 @@ fn terminal_skill_recovery_finishes_every_parallel_tool_result_before_stopping()
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     let calls = vec![
         ToolCall {
@@ -3665,6 +3672,7 @@ fn local_run_reports_budget_loss_and_never_front_truncates_grounding() {
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     let services = SkillServices::new(
         &skills,
@@ -3744,6 +3752,7 @@ fn run_budgeted_turn(model: &str, llm: &MockLlmClient) -> (Vec<Vec<LlmMessage>>,
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     let services = SkillServices::new(
         &skills,
@@ -3862,6 +3871,7 @@ fn retry_env() -> RetryEnv {
         },
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     };
     RetryEnv {
         _vault: vault,

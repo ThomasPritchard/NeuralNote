@@ -40,6 +40,7 @@ fn environment_with_available(
     SkillEnvironment {
         hardware: hardware(os, arch, free_disk_bytes),
         available_binaries,
+        unusable_binaries: Default::default(),
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
     }
 }
@@ -419,6 +420,35 @@ fn missing_asset_requirement_is_named_as_a_non_executable_asset() {
     ));
 }
 
+/// A requirement can be sitting exactly where the user put it and still be
+/// unusable — a locally compiled `whisper-cli` that cannot start is the case
+/// this exists for. Calling that "missing" sends them looking for a file that is
+/// right there, so the host's reason is shown instead.
+#[test]
+fn a_requirement_that_is_present_but_unusable_is_not_reported_as_missing() {
+    let mut env = environment("macos", "aarch64", 1, &[]);
+    let installed = env.app_data_bin_dir.join("whisper-cli");
+    env.unusable_binaries.insert(
+        installed,
+        "it needs libraries that are not on this machine: @rpath/libwhisper.1.dylib".into(),
+    );
+
+    let result = Eligibility::evaluate(
+        &[Requirement::Binary {
+            name: "whisper-cli".into(),
+        }],
+        &env,
+    );
+
+    let Eligibility::Unmet { reasons } = result else {
+        panic!("a present-but-unusable requirement is unmet");
+    };
+    assert_eq!(
+        reasons,
+        ["required binary 'whisper-cli' cannot be used: it needs libraries that are not on this machine: @rpath/libwhisper.1.dylib"]
+    );
+}
+
 #[test]
 fn asset_requirement_serializes_additively() {
     assert_eq!(
@@ -796,6 +826,7 @@ fn an_undetectable_binary_offers_no_install_remedy() {
     let unprobed = SkillEnvironment {
         hardware: hardware("macos", "aarch64", 99),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
         app_data_bin_dir: PathBuf::new(),
     };
     assert!(matches!(

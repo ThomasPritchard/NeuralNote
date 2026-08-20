@@ -1,4 +1,5 @@
 use super::detect_requirement_files;
+use crate::macho_fixtures::{executable, SYSTEM_DYLIBS, WHISPER_DYLIBS};
 
 #[cfg(unix)]
 fn write_file(path: &std::path::Path, executable: bool) {
@@ -38,15 +39,27 @@ fn detects_only_registered_regular_executables_and_regular_assets() {
     );
 }
 
+/// `whisper-cli` is the one requirement compiled here rather than downloaded, so
+/// it is the one whose libraries are checked. A placeholder byte string is now
+/// rejected, correctly, because it could never run — so the hand-installed shape
+/// this test speaks for is a real executable, the same one the fixed build
+/// produces.
 #[cfg(unix)]
 #[test]
 fn pending_whisper_files_are_detected_when_manually_installed() {
+    use std::os::unix::fs::PermissionsExt;
+
     let app_data = tempfile::tempdir().unwrap();
     let bin = app_data.path().join("bin");
     let assets = app_data.path().join("assets");
     std::fs::create_dir_all(&bin).unwrap();
     std::fs::create_dir_all(&assets).unwrap();
-    write_file(&bin.join("whisper-cli"), true);
+    std::fs::write(bin.join("whisper-cli"), executable(SYSTEM_DYLIBS, &[], &[])).unwrap();
+    std::fs::set_permissions(
+        bin.join("whisper-cli"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
     write_file(&assets.join("ggml-small.en.bin"), false);
 
     let available = detect_requirement_files(app_data.path());
@@ -77,6 +90,48 @@ fn directories_symlinks_and_non_executable_binaries_are_rejected() {
     .unwrap();
 
     assert!(detect_requirement_files(app_data.path()).is_empty());
+}
+
+/// The failure this inventory used to hide. A `whisper-cli` published by the
+/// shipped installer is a regular file with the execute bit set and cannot start:
+/// the libraries it loads went with the staging tree. Reporting it as available
+/// activates the transcription skill and moves the failure to dispatch, where it
+/// reads as "transcription is broken" rather than "the install is broken".
+#[cfg(unix)]
+#[test]
+fn a_whisper_binary_that_lost_its_libraries_is_not_reported_as_installed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let app_data = tempfile::tempdir().unwrap();
+    let bin = app_data.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let deleted_staging = app_data.path().join("build/whisper.cpp-1.9.1/build/bin");
+    let whisper = bin.join("whisper-cli");
+    std::fs::write(
+        &whisper,
+        executable(WHISPER_DYLIBS, &[], &[&deleted_staging.to_string_lossy()]),
+    )
+    .unwrap();
+    std::fs::set_permissions(&whisper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(!detect_requirement_files(app_data.path()).contains(&whisper));
+}
+
+/// The same inventory must still report the binary the fixed installer publishes,
+/// which needs nothing but the libraries macOS itself ships.
+#[cfg(unix)]
+#[test]
+fn a_self_contained_whisper_binary_is_reported_as_installed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let app_data = tempfile::tempdir().unwrap();
+    let bin = app_data.path().join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let whisper = bin.join("whisper-cli");
+    std::fs::write(&whisper, executable(SYSTEM_DYLIBS, &[], &[])).unwrap();
+    std::fs::set_permissions(&whisper, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(detect_requirement_files(app_data.path()).contains(&whisper));
 }
 
 #[test]

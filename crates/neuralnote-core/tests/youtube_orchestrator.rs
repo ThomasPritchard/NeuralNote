@@ -156,6 +156,7 @@ fn environment() -> SkillEnvironment {
             bin.join("bgutil-pot"),
             assets.join("bgutil-plugin.zip"),
         ]),
+        unusable_binaries: Default::default(),
     }
 }
 

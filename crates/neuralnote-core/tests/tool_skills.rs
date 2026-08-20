@@ -67,6 +67,7 @@ fn environment(free_disk_bytes: u64) -> SkillEnvironment {
         hardware: hardware(free_disk_bytes),
         app_data_bin_dir: PathBuf::from("/app-data/bin"),
         available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
     }
 }
 
