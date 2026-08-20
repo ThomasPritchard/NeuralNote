@@ -41,7 +41,14 @@ const REASONING_CHIP =
   "flex shrink-0 items-center gap-1 rounded-full px-2 py-0.5 text-[0.625rem] font-medium";
 
 /** The on colours. `text-primary` in both shapes: "reasoning is on" must not
- *  look like two different facts depending on who decided it. */
+ *  look like two different facts depending on who decided it.
+ *
+ *  No fill goes with it. A `bg-primary/10` tint under this same accent measured
+ *  **4.18:1** against the pane the composer actually sits on (`bg-sidebar`, not
+ *  `--background`) — under AA's 4.5 for 10px text, and under it in two of the
+ *  six themes. The accent on the bare pane is 4.82:1 and clears AA in all six.
+ *  The tint was buying a tenth of a shade of "on" and costing the contrast of
+ *  the word that says it. */
 const REASONING_ON = "text-primary";
 
 /** Reasoning on a model that cannot be told not to — a state, not an affordance.
@@ -49,10 +56,10 @@ const REASONING_ON = "text-primary";
  *  A `<span>`, so nothing announces a pressed state that cannot change and
  *  nothing takes a tab stop that leads nowhere. What tells it from the control
  *  is the app's own state idiom, the one Settings already uses for this exact
- *  fact: the accent lives in the word and the glyph, and the pill's fill and
- *  ring — the two things that read as a button's boundary — are gone. Under a
- *  pointer it says the same thing again, with no hover response and no hand
- *  cursor before the click rather than after it.
+ *  fact: the accent lives in the word and the glyph, and the ring — the mark
+ *  that reads as a button's boundary — is gone. Under a pointer it says the
+ *  same thing again, with no hover response and no hand cursor before the
+ *  click rather than after it.
  *
  *  The sentence itself has nowhere visible to go on a strip with no spare
  *  pixels, so it is carried where it costs none: in the accessible name, and in
@@ -289,14 +296,37 @@ export function ChatComposer({
             aria-describedby={capability.reason ? reasoningReasonId : undefined}
             className={cn(
               REASONING_CHIP,
+              // The ring is now the ONE mark that says "control": both control
+              // states wear it, the readout does not, so a boundary means
+              // exactly one thing on this strip.
               "ring-1 ring-inset transition-colors motion-reduce:transition-none",
               "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-primary",
               reasoningIndicatorOn
-                ? cn(REASONING_ON, "bg-primary/10 ring-primary/30")
+                // Full opacity, not the old `/30`. A boundary is non-text
+                // information (WCAG 1.4.11, 3:1) and against this pane `/30`
+                // measures 1.63:1 and `/60` 2.66:1; full primary is the first
+                // value that clears 3:1 in every theme, at 4.82:1 — the same
+                // ratio as the word it encloses, because it is the same colour.
+                ? cn(REASONING_ON, "ring-primary")
                 : "text-muted-foreground ring-border",
               savingReasoning || capability.disabled
                 ? "cursor-not-allowed opacity-50"
-                : !reasoningIndicatorOn && "hover:bg-muted hover:text-foreground",
+                : cn(
+                    // Tailwind v4 stopped giving buttons a hand cursor, which
+                    // had quietly made the readout's `cursor-default` a
+                    // distinction it did not actually draw. Asking for it back
+                    // is what makes that comment true.
+                    "cursor-pointer",
+                    // The strip's hover idiom is "fill on hover", and the two
+                    // states take it in opposite directions: the off chip may
+                    // lighten because its text lightens with it, while the on
+                    // chip must not — `hover:bg-muted` under this accent
+                    // measures 4.36:1. Sunken darkens instead and reads 5.55:1,
+                    // a bigger lightness step than the off chip's own hover.
+                    reasoningIndicatorOn
+                      ? "hover:bg-surface-sunken"
+                      : "hover:bg-muted hover:text-foreground",
+                  ),
             )}
             >
               <Brain className="size-3 shrink-0" aria-hidden />
