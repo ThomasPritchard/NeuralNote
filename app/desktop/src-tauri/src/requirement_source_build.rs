@@ -587,6 +587,9 @@ async fn verify_installed_binary(
 #[path = "requirement_source_build_tests.rs"]
 mod tests;
 
-#[cfg(test)]
+// The harness compiles the real whisper.cpp with `xcrun` and then reads the
+// installed binary's Mach-O linkage, so it is macOS-only twice over. It is
+// `#[ignore]`d opt-in besides, so no default run loses anything elsewhere.
+#[cfg(all(test, target_os = "macos"))]
 #[path = "requirement_source_build_live.rs"]
 mod live;

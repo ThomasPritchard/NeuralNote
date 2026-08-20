@@ -28,7 +28,13 @@ mod commands;
 mod event_names;
 mod key_revision;
 mod local;
-#[cfg(all(test, target_os = "macos"))]
+// Synthetic Mach-O bytes, not a reader of them: the fixtures are built by hand
+// out of integers and have no platform dependency, so they compile wherever the
+// installer and detection tests that use them do. Off macOS the adversarial
+// subset only `macho_linkage`'s own tests read goes unused, because that module
+// is not compiled there.
+#[cfg(test)]
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
 mod macho_fixtures;
 // Mach-O is a macOS format, and the requirement it guards is compiled locally
 // only on macOS (the source build shells out to `xcrun`). On any other target

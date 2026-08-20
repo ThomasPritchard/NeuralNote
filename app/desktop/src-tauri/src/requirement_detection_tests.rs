@@ -1,5 +1,5 @@
 use super::detect_requirement_files;
-use crate::macho_fixtures::{executable, SYSTEM_DYLIBS, WHISPER_DYLIBS};
+use crate::macho_fixtures::{executable, SYSTEM_DYLIBS};
 
 #[cfg(unix)]
 fn write_file(path: &std::path::Path, executable: bool) {
@@ -97,9 +97,14 @@ fn directories_symlinks_and_non_executable_binaries_are_rejected() {
 /// the libraries it loads went with the staging tree. Reporting it as available
 /// activates the transcription skill and moves the failure to dispatch, where it
 /// reads as "transcription is broken" rather than "the install is broken".
-#[cfg(unix)]
+///
+/// macOS only: dyld linkage is what makes this binary unrunnable, and only macOS
+/// asks the question. Elsewhere `unlaunchable_reason` is a deliberate no-op, so
+/// the same file is correctly reported as installed.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_whisper_binary_that_lost_its_libraries_is_not_reported_as_installed() {
+    use crate::macho_fixtures::WHISPER_DYLIBS;
     use std::os::unix::fs::PermissionsExt;
 
     let app_data = tempfile::tempdir().unwrap();

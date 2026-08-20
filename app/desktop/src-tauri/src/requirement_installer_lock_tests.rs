@@ -89,7 +89,12 @@ fn hold_the_lock_elsewhere(dir: &Path, name: &str, release: &Path) -> ChildGuard
 /// fsync run in between. This is what goes red if the decision ever escapes the
 /// lock: with another process holding it, a publish must refuse outright rather
 /// than inspect the installed binary and overwrite it.
-#[cfg(unix)]
+///
+/// macOS only, and not merely to compile: the test discriminates because the
+/// installed binary is one a publish *would* replace if it reached the decision.
+/// Only macOS judges it broken, so anywhere else both outcomes are `Conflict`
+/// and the test can no longer go red for its own reason.
+#[cfg(target_os = "macos")]
 #[test]
 fn a_repair_refuses_while_another_process_holds_the_install_lock() {
     use std::os::unix::fs::PermissionsExt as _;

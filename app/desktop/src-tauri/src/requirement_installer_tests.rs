@@ -51,7 +51,11 @@ fn install_whisper(app_data: &std::path::Path, image: &[u8]) -> std::path::PathB
 /// The replacement here is a real self-contained image rather than a byte string,
 /// so the test proves the repair leaves behind something the inventory will
 /// actually offer, not merely that the bytes moved.
-#[cfg(unix)]
+///
+/// macOS only: "cannot run" here means unresolved dyld linkage, which only macOS
+/// judges. Elsewhere the same image is a healthy executable and repair correctly
+/// refuses to touch it.
+#[cfg(target_os = "macos")]
 #[test]
 fn an_installed_executable_that_cannot_run_is_replaced() {
     let dir = tempfile::tempdir().unwrap();
