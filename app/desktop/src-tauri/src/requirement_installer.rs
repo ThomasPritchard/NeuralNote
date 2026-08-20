@@ -295,6 +295,23 @@ fn requirement_size_limit_error(install_kind: RequirementInstallKind) -> CoreErr
 /// Publish a locally compiled executable through the same locked `.part` and
 /// quarantine-removal discipline as downloaded executables. The caller must
 /// validate that `source` is the expected output beneath its private build root.
+///
+/// A *usable* executable already installed under that name is left alone and the
+/// publish refused: that refusal is what stops two concurrent installs clobbering
+/// each other. It is lifted for one case — the installed copy is unusable by the
+/// same verdict the inventory reads — because otherwise a user whose install
+/// predates the source-build fix has a dead `whisper-cli` no path through the app
+/// can replace.
+///
+/// What makes that safe against a concurrent install is the advisory lock, which
+/// is held across the decision and the rename alike; it is *not* the proximity of
+/// the two, since a full file copy and an fsync run between them. Two callers
+/// therefore serialise, and the second sees whatever the first published. Note
+/// the lock is a no-op off Unix, where the two would not serialise; the only
+/// supported platform for a locally built requirement is macOS.
+///
+/// A process that does not take the lock at all — someone copying a binary in
+/// from a terminal mid-copy — is not covered, and was not covered before.
 pub(crate) fn publish_built_executable(
     app_data_dir: &Path,
     name: &str,
@@ -317,10 +334,35 @@ pub(crate) fn publish_built_executable(
     })?;
     let _lock = AdvisoryInstallLock::acquire(&install_dir, name)?;
     let final_path = install_dir.join(name);
-    if final_path.symlink_metadata().is_ok() {
-        return Err(CoreError::Conflict(format!(
-            "requirement executable '{name}' is already installed"
-        )));
+    match final_path.symlink_metadata() {
+        // Nothing installed under that name: an ordinary first install.
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        // Anything else — a permission or symlink-loop error — means the path is
+        // occupied by something this cannot judge, and renaming over it blind is
+        // how a working install gets destroyed.
+        Err(error) => {
+            return Err(CoreError::Io(format!(
+                "could not inspect the '{name}' install path: {error}"
+            )))
+        }
+        // A rename cannot replace a directory, and removing whatever else is
+        // sitting there is not this function's call to make.
+        Ok(metadata) if !metadata.file_type().is_file() => {
+            return Err(CoreError::Conflict(format!(
+                "something other than a file already occupies the '{name}' install path"
+            )))
+        }
+        Ok(_) => match crate::requirement_detection::installed_executable_defect(&final_path, name)
+        {
+            None => {
+                return Err(CoreError::Conflict(format!(
+                    "requirement executable '{name}' is already installed"
+                )))
+            }
+            Some(defect) => {
+                log::warn!("replacing the installed '{name}', which is not usable: {defect}")
+            }
+        },
     }
     let part_path = install_dir.join(format!("{name}.part"));
     remove_if_exists(&part_path).map_err(|error| {

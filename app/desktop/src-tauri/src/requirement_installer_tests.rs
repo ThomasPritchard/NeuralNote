@@ -29,6 +29,119 @@ fn locally_built_executable_publishes_atomically_with_executable_permissions() {
     assert!(!dir.path().join("bin/whisper-cli.part").exists());
 }
 
+/// Install a `whisper-cli` at the path the app publishes to, with the execute
+/// bit an install would leave, so a repair has something real to replace.
+#[cfg(unix)]
+fn install_whisper(app_data: &std::path::Path, image: &[u8]) -> std::path::PathBuf {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let bin = app_data.join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let installed = bin.join("whisper-cli");
+    std::fs::write(&installed, image).unwrap();
+    std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o755)).unwrap();
+    installed
+}
+
+/// Everyone who accepted the Whisper prompt before the source build was fixed
+/// has a `whisper-cli` that dies in dyld. The app refused to overwrite anything
+/// already installed, so that copy could not be replaced from inside the app at
+/// all — the fix had to reach existing installs, not only new ones.
+///
+/// The replacement here is a real self-contained image rather than a byte string,
+/// so the test proves the repair leaves behind something the inventory will
+/// actually offer, not merely that the bytes moved.
+#[cfg(unix)]
+#[test]
+fn an_installed_executable_that_cannot_run_is_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let installed = install_whisper(
+        dir.path(),
+        &crate::macho_fixtures::executable(
+            crate::macho_fixtures::WHISPER_DYLIBS,
+            &[],
+            &[&dir.path().join("build/gone").to_string_lossy()],
+        ),
+    );
+    assert!(
+        !crate::requirement_detection::detect_requirement_files(dir.path()).contains(&installed)
+    );
+    let repaired =
+        crate::macho_fixtures::executable(crate::macho_fixtures::SYSTEM_DYLIBS, &[], &[]);
+    let source = dir.path().join("rebuilt-whisper");
+    std::fs::write(&source, &repaired).unwrap();
+
+    publish_built_executable(dir.path(), "whisper-cli", &source).unwrap();
+
+    assert_eq!(std::fs::read(&installed).unwrap(), repaired);
+    assert!(!dir.path().join("bin/whisper-cli.part").exists());
+    assert!(
+        crate::requirement_detection::detect_requirement_files(dir.path()).contains(&installed),
+        "a repaired install must be reported as available"
+    );
+}
+
+/// The refusal is what stops two installs racing each other, so it survives for
+/// the case it was written for: a working install is never overwritten.
+#[cfg(unix)]
+#[test]
+fn an_installed_executable_that_runs_is_never_clobbered() {
+    let dir = tempfile::tempdir().unwrap();
+    let healthy = crate::macho_fixtures::executable(crate::macho_fixtures::SYSTEM_DYLIBS, &[], &[]);
+    let installed = install_whisper(dir.path(), &healthy);
+    let source = dir.path().join("rebuilt-whisper");
+    std::fs::write(&source, b"second build").unwrap();
+
+    let result = publish_built_executable(dir.path(), "whisper-cli", &source);
+
+    assert!(matches!(result, Err(CoreError::Conflict(_))));
+    assert_eq!(std::fs::read(&installed).unwrap(), healthy);
+    assert!(!dir.path().join("bin/whisper-cli.part").exists());
+}
+
+/// Every reason a file is kept out of the inventory has to be a reason a fresh
+/// install may replace it, or the two disagree and the user is stuck: hidden
+/// because it cannot be run, and unrepairable because the installer thinks it is
+/// fine. A well-linked binary with its execute bit cleared is that case.
+#[cfg(unix)]
+#[test]
+fn a_healthy_binary_that_is_not_executable_is_hidden_and_therefore_replaceable() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let installed = install_whisper(
+        dir.path(),
+        &crate::macho_fixtures::executable(crate::macho_fixtures::SYSTEM_DYLIBS, &[], &[]),
+    );
+    std::fs::set_permissions(&installed, std::fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(
+        !crate::requirement_detection::detect_requirement_files(dir.path()).contains(&installed)
+    );
+    let source = dir.path().join("rebuilt-whisper");
+    std::fs::write(&source, b"repaired build").unwrap();
+
+    publish_built_executable(dir.path(), "whisper-cli", &source).unwrap();
+
+    assert_eq!(std::fs::read(&installed).unwrap(), b"repaired build");
+}
+
+/// Repair replaces a broken *executable*, not whatever happens to sit on the
+/// path. Anything else there is reported rather than renamed over.
+#[cfg(unix)]
+#[test]
+fn something_that_is_not_a_file_on_the_install_path_is_reported_not_replaced() {
+    let dir = tempfile::tempdir().unwrap();
+    let occupied = dir.path().join("bin/whisper-cli");
+    std::fs::create_dir_all(&occupied).unwrap();
+    let source = dir.path().join("rebuilt-whisper");
+    std::fs::write(&source, b"repaired build").unwrap();
+
+    let result = publish_built_executable(dir.path(), "whisper-cli", &source);
+
+    assert!(matches!(result, Err(CoreError::Conflict(_))));
+    assert!(occupied.symlink_metadata().unwrap().file_type().is_dir());
+}
+
 impl neuralnote_core::ai::PullSink for RecordingSink {
     fn send(&mut self, event: PullEvent) {
         self.events.push(event);

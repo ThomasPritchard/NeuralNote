@@ -512,9 +512,81 @@ pub(crate) async fn install_whisper_from_source(
         app_data_dir,
         recipe.name,
         &canonical_output,
-    )
+    )?;
+    // Everything above happens while the staging tree still exists, which is
+    // exactly the condition under which the original defect was invisible: the
+    // build succeeded, the file was published, and it could not start once the
+    // tree went away. Drop the staging tree first, then prove the installed
+    // binary launches from app-data alone.
+    drop(staging);
+    sink.send(PullEvent::Progress {
+        status: "Checking the installed whisper-cli runs".into(),
+        digest: None,
+        completed: None,
+        total: None,
+        percent: None,
+    });
+    verify_installed_binary(app_data_dir, recipe.name, cancellation).await
+}
+
+/// Launch the freshly installed executable once, with the build tree gone.
+///
+/// This is the only check that speaks for dyld itself — architecture, code
+/// signature, the shared cache, and the whole transitive dependency graph — and
+/// the recurring polls are a cheap screen next to it. It is affordable here
+/// because it happens once per install, and it is not the ambient risk that
+/// running a user-supplied file would be: this is the artefact just compiled
+/// from a checksum-pinned source in a private directory.
+///
+/// A failure removes the published file. Leaving an executable that cannot start
+/// is what sent the original failure downstream to look like broken
+/// transcription, and "not installed" is the honest state to leave behind.
+async fn verify_installed_binary(
+    app_data_dir: &Path,
+    name: &str,
+    cancellation: &CaptureCancellation,
+) -> CoreResult<()> {
+    let installed = app_data_dir.join("bin").join(name);
+    let spec = ProcessSpec {
+        program: installed.clone(),
+        args: vec![OsString::from("--version")],
+        cwd: Some(app_data_dir.to_path_buf()),
+        environment: EnvironmentPolicy::ClearAndSet(BTreeMap::from([
+            (OsString::from("PATH"), OsString::from("/usr/bin:/bin")),
+            (OsString::from("HOME"), app_data_dir.as_os_str().to_owned()),
+            (
+                OsString::from("TMPDIR"),
+                app_data_dir.as_os_str().to_owned(),
+            ),
+        ])),
+        timeout: Duration::from_secs(60),
+        stdout_limit: 64 * 1024,
+        stderr_limit: 64 * 1024,
+    };
+    let failure = match TokioProcessRunner.run(&spec, cancellation).await {
+        Ok(output) if output.status.success() => return Ok(()),
+        Ok(output) => format!(
+            "it exited with {}; {}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+                .chars()
+                .take(512)
+                .collect::<String>()
+        ),
+        Err(error) => format!("it could not be started: {error}"),
+    };
+    if let Err(error) = std::fs::remove_file(&installed) {
+        log::warn!("could not remove the unusable '{name}' that was just built: {error}");
+    }
+    Err(source_error(format!(
+        "the compiled {name} does not run on this machine, so it was not kept: {failure}"
+    )))
 }
 
 #[cfg(test)]
 #[path = "requirement_source_build_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "requirement_source_build_live.rs"]
+mod live;
