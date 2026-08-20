@@ -159,6 +159,14 @@ pub(super) fn whisper_build_specs(
             "-B".into(),
             build.as_os_str().to_owned(),
             "-DCMAKE_BUILD_TYPE=Release".into(),
+            // whisper.cpp defaults BUILD_SHARED_LIBS to ON everywhere except
+            // Emscripten and MinGW, so a default configure emits a `whisper-cli`
+            // that loads six `@rpath` dylibs through an `LC_RPATH` pointing at
+            // this staging build directory. Only the executable is published and
+            // the staging tree is deleted immediately afterwards, so that binary
+            // dies in dyld the first time the user transcribes anything. Linking
+            // the libraries in keeps the one-regular-file publish contract honest.
+            "-DBUILD_SHARED_LIBS=OFF".into(),
         ]),
         common(vec![
             "--build".into(),

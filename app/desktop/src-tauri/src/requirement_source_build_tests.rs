@@ -169,6 +169,30 @@ fn whisper_build_processes_use_static_argv_cleared_env_and_private_paths() {
     assert!(format!("{:?}", configure.environment).contains("ClearAndSet"));
 }
 
+/// The published artefact is a single file and the staging tree that produced it
+/// is deleted straight afterwards, so anything whisper.cpp links dynamically is
+/// gone by the time the user runs it. A default (shared) configure emits a
+/// `whisper-cli` carrying six `@rpath` dylib references and an `LC_RPATH` naming
+/// the deleted staging `build/bin`, which dyld cannot satisfy. Building the
+/// libraries into the executable is what keeps the one-file publish honest.
+#[test]
+fn the_configure_step_links_whisper_statically_so_one_published_file_is_self_contained() {
+    let staging = Path::new("/private/tmp/neuralnote-whisper");
+    let source = staging.join("whisper.cpp-1.9.1");
+
+    let [configure, _build] =
+        whisper_build_specs(Path::new("/opt/homebrew/bin/cmake"), staging, &source).unwrap();
+
+    assert!(
+        configure
+            .args
+            .iter()
+            .any(|arg| arg == "-DBUILD_SHARED_LIBS=OFF"),
+        "configure args must disable shared libraries, got {:?}",
+        configure.args
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn source_build_rejects_an_app_data_build_symlink() {
