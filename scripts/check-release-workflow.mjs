@@ -119,7 +119,7 @@ const build = jobBody("build");
 const publish = jobBody("publish");
 
 test("all production manifests use the release version", async () => {
-  const releaseVersion = "0.4.2";
+  const releaseVersion = "0.4.3";
   const [desktopPackage, nativeE2ePackage, tauriConfig] = await Promise.all([
     readRepositoryFile("app/desktop/package.json"),
     readRepositoryFile("app/desktop/e2e-native/package.json"),
@@ -157,7 +157,7 @@ test("all production manifests use the release version", async () => {
 test("release publication is manual-only and requires an explicit signing choice", () => {
   assert.match(trigger, /\n  workflow_dispatch:\s*$/m);
   assert.doesNotMatch(trigger, /^  (?:push|pull_request|schedule|release|workflow_run|workflow_call):/m);
-  assert.match(trigger, /release_tag:[\s\S]*?required:\s*true[\s\S]*?default:\s*v0\.4\.2/);
+  assert.match(trigger, /release_tag:[\s\S]*?required:\s*true[\s\S]*?default:\s*v0\.4\.3/);
   assert.match(
     trigger,
     /signing_mode:[\s\S]*?type:\s*choice[\s\S]*?required:\s*true[\s\S]*?default:\s*ad-hoc[\s\S]*?options:[\s\S]*?- ad-hoc[\s\S]*?- developer-id/,
@@ -304,13 +304,13 @@ test("the publisher stages a draft prerelease and exposes the manifest last", ()
   );
 });
 
-test("the immutable GitHub release description includes the complete v0.4.2 changelog", async () => {
-  const releaseNotes = await readRepositoryFile("docs/releases/v0.4.2.md");
+test("the immutable GitHub release description includes the complete v0.4.3 changelog", async () => {
+  const releaseNotes = await readRepositoryFile("docs/releases/v0.4.3.md");
   const bundledReleaseNotes = await readRepositoryFile("app/desktop/src/whats-new/releaseNotes.ts");
   const validate = stepBody(publish, "Validate downloaded release artifacts");
   const draft = stepBody(publish, "Create draft GitHub prerelease");
 
-  assert.match(releaseNotes, /^# NeuralNote 0\.4\.2 ALPHA$/m);
+  assert.match(releaseNotes, /^# NeuralNote 0\.4\.3 ALPHA$/m);
   // Headings and phrases below are THIS release's, and must be re-pointed at each
   // bump along with the version literals — they are not version strings, so the
   // runbook's `grep -c 'X\.Y\.Z'` count cannot catch them going stale. Their job is
@@ -318,21 +318,23 @@ test("the immutable GitHub release description includes the complete v0.4.2 chan
   // file, so one distinctive phrase per section is the point; a generic phrase that
   // would match any release would retire the check while appearing to keep it.
   for (const heading of [
-    "Capturing from YouTube",
-    "Writing",
-    "The window",
-    "Settings",
+    "Following an assistant run",
+    "Reasoning controls",
+    "Protecting your vault and settings",
+    "Citations and vault reads",
+    "YouTube and local transcription",
     "For anyone running NeuralNote from source",
     "Upgrading",
   ]) {
     assert.match(releaseNotes, new RegExp(`^## ${heading}$`, "m"));
   }
-  assert.match(releaseNotes, /signed caption links are no longer carried any further/);
-  assert.match(releaseNotes, /opening tag search and discarding the keystroke/);
-  assert.match(releaseNotes, /shown beneath an error rather than above it/);
-  assert.match(releaseNotes, /can no longer appear as a raw internal identifier/);
-  assert.match(releaseNotes, /keeps its own API key rather than sharing the installed app's/);
-  assert.match(releaseNotes, /aligned on version 0\.4\.2/);
+  assert.match(releaseNotes, /shows the time passing and the current planning round/);
+  assert.match(releaseNotes, /the effort names published by that model, in the order it publishes them/);
+  assert.match(releaseNotes, /vault itself is no longer accepted as something to delete, rename or move/);
+  assert.match(releaseNotes, /Counts unavailable and offers Retry/);
+  assert.match(releaseNotes, /repairs an older local Whisper install that cannot launch/);
+  assert.match(releaseNotes, /code cannot merge unchecked/);
+  assert.match(releaseNotes, /aligned on version 0\.4\.3/);
   const bundledItems = [...bundledReleaseNotes.matchAll(/items:\s*\[([\s\S]*?)\]/g)].flatMap(
     ([, items]) => [...items.matchAll(/"(?:[^"\\]|\\.)*"/g)].map(([item]) => JSON.parse(item)),
   );
@@ -341,7 +343,7 @@ test("the immutable GitHub release description includes the complete v0.4.2 chan
     .filter((line) => line.startsWith("- "))
     .map((line) => line.slice(2).replaceAll("`", ""));
   assert.deepEqual(publishedItems, bundledItems);
-  assert.match(build, /docs\/releases\/v0\.4\.2\.md/);
+  assert.match(build, /docs\/releases\/v0\.4\.3\.md/);
   assert.match(build, /ad-hoc signed and unnotarized/);
   assert.match(build, /Developer ID signed and notarized/);
   assert.match(validate, /RELEASE_NOTES/);

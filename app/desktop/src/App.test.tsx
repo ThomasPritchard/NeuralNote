@@ -34,7 +34,7 @@ const SEEN_CURRENT: PreferencesBootstrap = {
     theme: "neuralVioletDark",
     fontScale: "default",
     fontFamily: "inter",
-    lastSeenWhatsNewVersion: "0.4.2",
+    lastSeenWhatsNewVersion: "0.4.3",
   },
   recoveredFromCorrupt: false,
   readFailed: false,
@@ -81,7 +81,7 @@ describe("App router", () => {
     );
 
     const dialog = screen.getByRole("dialog", {
-      name: "What's new in NeuralNote 0.4.2",
+      name: "What's new in NeuralNote 0.4.3",
     });
     expect(dialog).toBeInTheDocument();
     expect(dialog).toHaveFocus();
@@ -118,7 +118,7 @@ describe("App router", () => {
     await waitFor(() =>
       expect(api.saveAppPreferences).toHaveBeenCalledWith({
         ...SEEN_CURRENT.preferences,
-        lastSeenWhatsNewVersion: "0.4.2",
+        lastSeenWhatsNewVersion: "0.4.3",
       }),
     );
   });

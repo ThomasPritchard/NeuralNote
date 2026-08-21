@@ -13,7 +13,7 @@ export interface ReleaseNotes {
 }
 
 // GENERATED FILE — do not edit by hand.
-// Source: docs/releases/v0.4.2.md. Regenerate with `npm run gen:release-notes`.
+// Source: docs/releases/v0.4.3.md. Regenerate with `npm run gen:release-notes`.
 //
 // One release only. The workflow contract greps this WHOLE file for `items:` and
 // compares the result with the single-version `.md`, so a superseded entry left
@@ -25,56 +25,76 @@ export interface ReleaseNotes {
 // CURRENT_RELEASE_NOTES, so a stale entry is never rendered and the query passes
 // whether or not the entry is there.
 export const RELEASE_NOTES: Readonly<Record<string, ReleaseNotes>> = {
-  "0.4.2": {
-    version: "0.4.2",
-    title: "What's new in NeuralNote 0.4.2",
+  "0.4.3": {
+    version: "0.4.3",
+    title: "What's new in NeuralNote 0.4.3",
     introduction:
-      "NeuralNote 0.4.2 is a corrections release. A YouTube video with a very large caption list now gets through metadata inspection instead of stalling, and the choice you make about where its notes are filed is remembered in your vault. Pressing Enter inside a code fence types a newline again, the welcome screen stops growing as you collect vaults, and a notification can no longer hide part of the note you are editing. Your vault format and saved settings are unchanged.",
+      "NeuralNote 0.4.3 makes longer assistant runs easier to follow. The conversation now reports the work actually in progress, shows elapsed time and honest round or playlist progress, and exposes each OpenRouter model's own reasoning controls. This release also fixes several cases where notes, settings, vault counts or citations could be reported incorrectly or put at risk. Your vault format and saved settings are unchanged.",
     groups: [
       {
-        title: "Capturing from YouTube",
+        title: "Following an assistant run",
         items: [
-          "A video whose automatic captions run to thousands of entries now completes metadata inspection instead of stopping at an output limit.",
-          "Only the handful of details NeuralNote actually uses are read from a video, so signed caption links are no longer carried any further.",
-          "The choice you make about where a video's notes are filed is now remembered in your vault, so capture continues on to fetching captions and writing the note.",
-          "Stopping a YouTube capture now reads as the run ending before the step, rather than as NeuralNote refusing to do it.",
-          "A playlist whose entries have no title is handled by falling back to the video id instead of failing outright.",
-          "Work that arrives just after you press Stop is still recorded, so the timeline does not lose the last thing that happened.",
+          "The live heading now says whether NeuralNote is sending your message, planning, searching your vault, reading notes or verifying citations.",
+          "Thinking appears only while reasoning is actually arriving, rather than standing in for every part of a run.",
+          "A running turn now shows the time passing and the current planning round.",
+          "A playlist reports which video is in progress, shows that video's title, channel, duration and thumbnail when available, and does not pretend its round limit predicts when the playlist will finish.",
+          "Reasoning from separate planning rounds and the final answer is kept in separate disclosures instead of being joined into one block.",
+          "Tool rows now show what they are acting on, their latest progress and how long they took, including search queries, note ranges and result counts.",
+          "A slow run distinguishes a provider that has gone quiet from one that is still connected but has produced nothing new.",
+          "YouTube lookup, caption fetching, local transcription, extractor updates and retries now report what they are doing while they run.",
         ],
       },
       {
-        title: "Writing",
+        title: "Reasoning controls",
         items: [
-          "Pressing Enter on a tag inside a fenced code block now types a new line instead of opening tag search and discarding the keystroke.",
-          "Pressing Enter on an ordinary tag still opens tag search, as before.",
+          "The selected OpenRouter model now offers the effort names published by that model, in the order it publishes them, rather than a fixed list chosen by NeuralNote.",
+          "A model that always reasons is shown as always on, one that cannot return reasoning is shown as unavailable, and a capability check that has not finished can be run again.",
+          "A chosen effort applies to every planning round as well as the final answer, and Settings explains that the extra reasoning tokens are billed on every step.",
+          "Changing model or provider clears an effort that belonged to the previous model, while turning reasoning off and back on for the same model restores the effort you chose.",
+          "If a model stops offering a stored effort, the run falls back to the model's current default instead of failing, and keeps your original choice in case it returns.",
         ],
       },
       {
-        title: "The window",
+        title: "Protecting your vault and settings",
         items: [
-          "A notification can no longer clip the note editor: at small window sizes the note stays reachable by scrolling instead of being cut off with no way to see the rest.",
-          "The welcome screen's list of recent vaults now scrolls inside its own panel, so the card keeps a steady size and the Open vault and New vault buttons stop moving as vaults accumulate.",
-          "A part-visible row at the bottom of that list shows there are more vaults below it.",
-          "The running cost of a turn is now shown beneath an error rather than above it.",
+          "The vault itself is no longer accepted as something to delete, rename or move, while ordinary notes and folders continue to work as before.",
+          "Creating or saving a note now refuses a planted or dangling symlink instead of following it to a file outside the vault.",
+          "Temporary writes for notes, recent vaults, preferences and provider settings now reserve a new file rather than writing through a path another process has occupied.",
+          "If saved preferences cannot be read, NeuralNote uses defaults for that launch but refuses to overwrite the intact settings file and explains why the change was not saved.",
+          "Installing an update now passes through the unsaved-note confirmation before NeuralNote relaunches.",
+          "Undo now warns before the click that notes written by the run are deleted permanently and do not go to the Trash, and reports failed, kept and deleted files separately.",
         ],
       },
       {
-        title: "Settings",
+        title: "Citations and vault reads",
         items: [
-          "Every action listed under what the assistant may do is named in plain English, so a newly added one can no longer appear as a raw internal identifier.",
+          "Backlinks now use file line numbers, including YAML frontmatter, so they agree with Search for the same passage.",
+          "A citation shortened to fit its byte limit now ends on the last line it actually quotes, and any future mismatch is dropped with a reason rather than shown as valid.",
+          "A note over the readable size limit, or one whose bytes are not valid UTF-8, is refused with the real reason instead of being described as an empty note that was read.",
+          "If the vault index cannot be read, the footer now says Counts unavailable and offers Retry instead of showing zero notes and zero folders beside a healthy indicator.",
+          "Wikilink completion and the template destination picker now say when their vault information may be incomplete rather than presenting a failed read as the whole vault.",
+        ],
+      },
+      {
+        title: "YouTube and local transcription",
+        items: [
+          "A video being processed can now appear beside the live progress with its metadata and a bounded, host-fetched thumbnail; a failed thumbnail fetch leaves a useful text-only card and does not fail the run.",
+          "The macOS source installer now produces a self-contained Whisper executable, verifies that it launches, and repairs an older local Whisper install that cannot launch.",
+          "A single-video run can write its note without an unnecessary second approval caused by treating its work item as playlist-only.",
         ],
       },
       {
         title: "For anyone running NeuralNote from source",
         items: [
-          "A development build now keeps its own API key rather than sharing the installed app's, so clearing the key while developing no longer deletes the real one.",
+          "Pull requests now compile and test the Rust workspace on macOS so cfg(macos) code cannot merge unchecked.",
+          "Chromium and Ubuntu native journeys remain required; hosted WebKit and native macOS and Windows journeys run weekly or manually while their runners remain informational.",
         ],
       },
       {
         title: "Upgrading",
         items: [
           "Your vault, its notes and your saved settings are carried over unchanged.",
-          "Application packages, updater checks, and the upgrade journey are aligned on version 0.4.2.",
+          "Application packages, updater checks, and the upgrade journey are aligned on version 0.4.3.",
         ],
       },
     ],
