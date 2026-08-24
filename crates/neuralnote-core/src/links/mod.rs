@@ -10,7 +10,7 @@
 
 use crate::error::CoreResult;
 use crate::model::{GraphLink, GraphNode, LinkGraph, TreeNode};
-use crate::note::title_and_body;
+use crate::note::{self, title_and_body};
 use crate::search;
 use crate::tree::{markdown_files, read_tree};
 use std::collections::{HashMap, HashSet};
@@ -114,14 +114,16 @@ fn collect_notes(files: &[&TreeNode]) -> NoteIndex {
     let mut skipped_files: u32 = 0;
 
     for node in files {
-        // Lossy read (a Latin-1 note must not error the graph); an unreadable
-        // note keeps its node — orphan-style, links skipped — and the failure
-        // is logged AND counted, never silent.
-        let raw = match std::fs::read(&node.path) {
-            Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-            Err(e) => {
+        // Bounded, lossy read via the ONE shared policy (`note::scan_note_text`):
+        // a Latin-1 note must not error the graph, and a note past the readable
+        // limit must not be pulled into memory whole just to harvest its links
+        // (issue #210). Either way the note keeps its node — orphan-style, links
+        // skipped — and the reason is logged AND counted, never silent.
+        let raw = match note::scan_note_text(Path::new(&node.path)) {
+            Ok(text) => text,
+            Err(skip) => {
                 log::warn!(
-                    "link graph: could not read {} ({e}); node kept, its links skipped",
+                    "link graph: could not read {} — {skip}; node kept, its links skipped",
                     node.path
                 );
                 skipped_files = skipped_files.saturating_add(1);

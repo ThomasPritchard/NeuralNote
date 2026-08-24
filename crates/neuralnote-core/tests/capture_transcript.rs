@@ -1,5 +1,5 @@
 use neuralnote_core::capture::{
-    render_transcript, render_youtube_transcript, CaptureError, Cue, RenderedTranscript,
+    render_transcript, render_youtube_transcript, CaptureError, Cue, ParsedVtt, RenderedTranscript,
     TranscriptProvenance, VideoId,
 };
 
@@ -11,11 +11,19 @@ fn cue(start_ms: u64, end_ms: u64, text: &str) -> Cue {
     }
 }
 
+/// Cues that reached the renderer without anything being folded away.
+fn parsed(cues: impl IntoIterator<Item = Cue>) -> ParsedVtt {
+    ParsedVtt {
+        cues: cues.into_iter().collect(),
+        merged_cue_count: 0,
+    }
+}
+
 #[test]
 fn youtube_renderer_emits_a_binding_markdown_link_with_floor_seconds() {
     let video_id = VideoId::new("iG9CE55wbtY").unwrap();
     let rendered = render_youtube_transcript(
-        &[cue(5_999, 8_000, "Ground truth.")],
+        &parsed([cue(5_999, 8_000, "Ground truth.")]),
         &TranscriptProvenance::Captions {
             language: "en".into(),
             automatic: false,
@@ -39,7 +47,7 @@ fn invalid_vtt(result: Result<RenderedTranscript, CaptureError>) -> String {
 
 #[test]
 fn caption_provenance_distinguishes_human_and_automatic_tracks() {
-    let cues = [cue(0, 1_000, "hello")];
+    let cues = parsed([cue(0, 1_000, "hello")]);
 
     let human = render_transcript(
         &cues,
@@ -70,7 +78,7 @@ fn caption_provenance_distinguishes_human_and_automatic_tracks() {
 fn caption_provenance_accepts_every_safe_language_key_allowed_by_metadata() {
     for language in ["en_US", "en.orig"] {
         let rendered = render_transcript(
-            &[cue(0, 1_000, "hello")],
+            &parsed([cue(0, 1_000, "hello")]),
             &TranscriptProvenance::Captions {
                 language: language.into(),
                 automatic: false,
@@ -85,7 +93,7 @@ fn caption_provenance_accepts_every_safe_language_key_allowed_by_metadata() {
 #[test]
 fn whisper_provenance_names_the_model() {
     let rendered = render_transcript(
-        &[cue(0, 1_000, "hello")],
+        &parsed([cue(0, 1_000, "hello")]),
         &TranscriptProvenance::Whisper {
             model: "small.en".into(),
         },
@@ -98,11 +106,11 @@ fn whisper_provenance_names_the_model() {
 
 #[test]
 fn paragraphs_use_the_group_start_anchor_at_about_thirty_seconds() {
-    let cues = [
+    let cues = parsed([
         cue(5_000, 8_000, "First cue."),
         cue(34_999, 35_000, "Still first paragraph."),
         cue(35_000, 36_000, "Second paragraph."),
-    ];
+    ]);
 
     let rendered = render_transcript(
         &cues,
@@ -122,7 +130,7 @@ fn paragraphs_use_the_group_start_anchor_at_about_thirty_seconds() {
 #[test]
 fn anchor_format_supports_transcripts_longer_than_an_hour() {
     let rendered = render_transcript(
-        &[cue(3_661_234, 3_662_000, "Long recording.")],
+        &parsed([cue(3_661_234, 3_662_000, "Long recording.")]),
         &TranscriptProvenance::Whisper {
             model: "small".into(),
         },
@@ -135,10 +143,10 @@ fn anchor_format_supports_transcripts_longer_than_an_hour() {
 #[test]
 fn renderer_preserves_cleaned_cue_words_casing_and_punctuation() {
     let rendered = render_transcript(
-        &[
+        &parsed([
             cue(0, 1_000, "NeuralNote keeps ALL source text."),
             cue(1_000, 2_000, "Don't rewrite it!"),
-        ],
+        ]),
         &TranscriptProvenance::Captions {
             language: "en".into(),
             automatic: false,
@@ -154,10 +162,10 @@ fn renderer_preserves_cleaned_cue_words_casing_and_punctuation() {
 #[test]
 fn word_count_counts_transcript_words_not_provenance_or_anchors() {
     let rendered = render_transcript(
-        &[
+        &parsed([
             cue(0, 1_000, "one two three"),
             cue(31_000, 32_000, "four five"),
-        ],
+        ]),
         &TranscriptProvenance::Whisper {
             model: "small".into(),
         },
@@ -170,7 +178,7 @@ fn word_count_counts_transcript_words_not_provenance_or_anchors() {
 #[test]
 fn overlapping_cues_render_in_source_order() {
     let rendered = render_transcript(
-        &[cue(0, 5_000, "First."), cue(4_000, 6_000, "Second.")],
+        &parsed([cue(0, 5_000, "First."), cue(4_000, 6_000, "Second.")]),
         &TranscriptProvenance::Captions {
             language: "en".into(),
             automatic: false,
@@ -183,10 +191,10 @@ fn overlapping_cues_render_in_source_order() {
 
 #[test]
 fn out_of_order_cues_are_rejected_before_they_can_forge_a_group_anchor() {
-    let cues = vec![
+    let cues = parsed([
         cue(10_000, 12_000, "First in source"),
         cue(5_000, 8_000, "Second in source"),
-    ];
+    ]);
 
     let error = render_transcript(
         &cues,
@@ -206,7 +214,7 @@ fn out_of_order_cues_are_rejected_before_they_can_forge_a_group_anchor() {
 #[test]
 fn empty_cue_list_is_rejected_instead_of_rendering_blank_source() {
     let detail = invalid_vtt(render_transcript(
-        &[],
+        &parsed([]),
         &TranscriptProvenance::Captions {
             language: "en".into(),
             automatic: false,
@@ -219,7 +227,7 @@ fn empty_cue_list_is_rejected_instead_of_rendering_blank_source() {
 #[test]
 fn blank_cue_text_is_rejected() {
     let detail = invalid_vtt(render_transcript(
-        &[cue(0, 1_000, " \t")],
+        &parsed([cue(0, 1_000, " \t")]),
         &TranscriptProvenance::Captions {
             language: "en".into(),
             automatic: false,
@@ -232,7 +240,7 @@ fn blank_cue_text_is_rejected() {
 #[test]
 fn reversed_cue_span_is_rejected_by_public_renderer() {
     let detail = invalid_vtt(render_transcript(
-        &[cue(2_000, 1_000, "backwards")],
+        &parsed([cue(2_000, 1_000, "backwards")]),
         &TranscriptProvenance::Whisper {
             model: "small".into(),
         },
@@ -244,7 +252,7 @@ fn reversed_cue_span_is_rejected_by_public_renderer() {
 #[test]
 fn provenance_rejects_line_break_injection() {
     let result = render_transcript(
-        &[cue(0, 1_000, "hello")],
+        &parsed([cue(0, 1_000, "hello")]),
         &TranscriptProvenance::Whisper {
             model: "small\nforged: value".into(),
         },
@@ -262,10 +270,67 @@ fn provenance_rejects_line_break_injection() {
 fn provenance_rejects_empty_and_oversized_components() {
     for model in [String::new(), "x".repeat(129)] {
         let result = render_transcript(
-            &[cue(0, 1_000, "hello")],
+            &parsed([cue(0, 1_000, "hello")]),
             &TranscriptProvenance::Whisper { model },
         );
 
         assert!(matches!(result, Err(CaptureError::InvalidMetadata(_))));
     }
+}
+
+#[test]
+fn merged_cues_are_announced_in_the_transcript_instead_of_disappearing() {
+    let provenance = TranscriptProvenance::Captions {
+        language: "en".into(),
+        automatic: true,
+    };
+    let source = ParsedVtt {
+        cues: vec![cue(0, 1_000, "hello")],
+        merged_cue_count: 3,
+    };
+
+    let rendered = render_transcript(&source, &provenance).unwrap();
+
+    assert!(
+        rendered
+            .text
+            .starts_with("source: captions:en-auto\nnote: 3 duplicate cues merged\n\n"),
+        "{}",
+        rendered.text
+    );
+}
+
+#[test]
+fn a_single_merged_cue_is_announced_in_the_singular() {
+    let source = ParsedVtt {
+        cues: vec![cue(0, 1_000, "hello")],
+        merged_cue_count: 1,
+    };
+
+    let rendered = render_transcript(
+        &source,
+        &TranscriptProvenance::Whisper {
+            model: "small".into(),
+        },
+    )
+    .unwrap();
+
+    assert!(
+        rendered.text.contains("note: 1 duplicate cue merged\n"),
+        "{}",
+        rendered.text
+    );
+}
+
+#[test]
+fn a_transcript_that_merged_nothing_carries_no_merge_note() {
+    let rendered = render_transcript(
+        &parsed([cue(0, 1_000, "hello")]),
+        &TranscriptProvenance::Whisper {
+            model: "small".into(),
+        },
+    )
+    .unwrap();
+
+    assert_eq!(rendered.text, "source: whisper:small\n\n[00:00:00] hello\n");
 }

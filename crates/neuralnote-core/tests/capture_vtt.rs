@@ -1,6 +1,7 @@
 use neuralnote_core::capture::{
-    parse_vtt, CaptureError, Cue, MAX_VTT_BYTES, MAX_VTT_CUES, MAX_VTT_CUE_TEXT_BYTES,
-    MAX_VTT_LINES, MAX_VTT_LINE_BYTES,
+    parse_vtt, render_transcript, CaptionSource, CaptureError, Cue, CueCleanup,
+    TranscriptProvenance, MAX_VTT_BYTES, MAX_VTT_CUES, MAX_VTT_CUE_TEXT_BYTES, MAX_VTT_LINES,
+    MAX_VTT_LINE_BYTES, ROLLING_GAP_MS,
 };
 
 fn fixture(name: &str) -> &'static [u8] {
@@ -20,8 +21,23 @@ fn fixture(name: &str) -> &'static [u8] {
     }
 }
 
+/// Parsed the way YouTube's automatic captions are: cleaning passes on.
+fn auto_cues(input: &[u8]) -> Vec<Cue> {
+    parse_vtt(input, CueCleanup::RollingCaptions)
+        .expect("fixture parses")
+        .cues
+}
+
+/// Parsed the way a human caption track or a Whisper transcript is: no cue is
+/// ever folded into a neighbour.
+fn verbatim_cues(input: &[u8]) -> Vec<Cue> {
+    parse_vtt(input, CueCleanup::Verbatim)
+        .expect("fixture parses")
+        .cues
+}
+
 fn invalid_vtt(input: &[u8]) -> String {
-    match parse_vtt(input).unwrap_err() {
+    match parse_vtt(input, CueCleanup::RollingCaptions).unwrap_err() {
         CaptureError::InvalidVtt(detail) => detail,
         other => panic!("expected invalid_vtt, got {other}"),
     }
@@ -29,7 +45,7 @@ fn invalid_vtt(input: &[u8]) -> String {
 
 #[test]
 fn human_captions_parse_identifiers_timings_settings_and_multiline_text() {
-    let cues = parse_vtt(fixture("human")).unwrap();
+    let cues = verbatim_cues(fixture("human"));
 
     assert_eq!(
         cues,
@@ -50,7 +66,7 @@ fn human_captions_parse_identifiers_timings_settings_and_multiline_text() {
 
 #[test]
 fn auto_captions_strip_word_timing_and_style_tags_then_unescape_entities() {
-    let cues = parse_vtt(fixture("auto_word_tags")).unwrap();
+    let cues = auto_cues(fixture("auto_word_tags"));
 
     assert_eq!(cues[0].text, "NeuralNote keeps source & timing");
     assert_eq!(cues[1].text, "Use <literal> text #1.");
@@ -58,7 +74,7 @@ fn auto_captions_strip_word_timing_and_style_tags_then_unescape_entities() {
 
 #[test]
 fn rolling_prefixes_keep_the_last_text_and_widen_the_group_span() {
-    let cues = parse_vtt(fixture("rolling")).unwrap();
+    let cues = auto_cues(fixture("rolling"));
 
     assert_eq!(
         cues,
@@ -84,7 +100,7 @@ a b
 a b c
 "#;
 
-    let cues = parse_vtt(input).unwrap();
+    let cues = auto_cues(input);
 
     assert_eq!(
         cues,
@@ -98,7 +114,7 @@ a b c
 
 #[test]
 fn styled_and_plain_adjacent_duplicates_become_one_widened_cue() {
-    let cues = parse_vtt(fixture("styled_plain_duplicates")).unwrap();
+    let cues = auto_cues(fixture("styled_plain_duplicates"));
 
     assert_eq!(
         cues,
@@ -127,7 +143,7 @@ a
 a b
 "#;
 
-    let cues = parse_vtt(input).unwrap();
+    let cues = auto_cues(input);
 
     assert_eq!(
         cues,
@@ -169,7 +185,7 @@ fn non_utf8_vtt_is_rejected_without_lossy_silent_conversion() {
 
 #[test]
 fn whisper_vtt_leading_space_quirk_is_trimmed_without_rewriting_words() {
-    let cues = parse_vtt(fixture("whisper_1_9_1")).unwrap();
+    let cues = verbatim_cues(fixture("whisper_1_9_1"));
 
     assert_eq!(
         cues.iter().map(|cue| cue.text.as_str()).collect::<Vec<_>>(),
@@ -182,7 +198,7 @@ fn whisper_vtt_leading_space_quirk_is_trimmed_without_rewriting_words() {
 
 #[test]
 fn overlapping_cues_are_kept_in_source_order() {
-    let cues = parse_vtt(fixture("overlapping")).unwrap();
+    let cues = auto_cues(fixture("overlapping"));
 
     assert_eq!(cues.len(), 2);
     assert_eq!((cues[0].start_ms, cues[0].end_ms), (0, 5_000));
@@ -287,7 +303,7 @@ id:fred
 Only this is a cue.
 "#;
 
-    let cues = parse_vtt(input).unwrap();
+    let cues = auto_cues(input);
 
     assert_eq!(cues, [cue(1_000, 2_000, "Only this is a cue.")]);
 }
@@ -308,7 +324,7 @@ fn cue_identifier_followed_by_non_timing_text_is_rejected() {
 
 #[test]
 fn minute_second_timestamp_form_is_supported() {
-    let cues = parse_vtt(b"WEBVTT\n\n01:02.345 --> 01:03.456\nshort timestamp\n").unwrap();
+    let cues = auto_cues(b"WEBVTT\n\n01:02.345 --> 01:03.456\nshort timestamp\n");
 
     assert_eq!((cues[0].start_ms, cues[0].end_ms), (62_345, 63_456));
 }
@@ -345,7 +361,7 @@ fn timestamp_numeric_overflow_is_rejected() {
 fn named_hex_unknown_and_unterminated_entities_are_handled_without_data_loss() {
     let input = b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\n&quot;x&apos; &nbsp; &lrm;&rlm; &#x41; &unknown; bare&amp\n";
 
-    let cues = parse_vtt(input).unwrap();
+    let cues = auto_cues(input);
 
     assert_eq!(
         cues[0].text,
@@ -357,7 +373,7 @@ fn named_hex_unknown_and_unterminated_entities_are_handled_without_data_loss() {
 fn html_unescape_covers_standard_named_entities_beyond_the_xml_subset() {
     let input = b"WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nWait&hellip; now\n";
 
-    let cues = parse_vtt(input).unwrap();
+    let cues = auto_cues(input);
 
     assert_eq!(cues[0].text, "Wait… now");
 }
@@ -386,4 +402,150 @@ fn cue(start_ms: u64, end_ms: u64, text: &str) -> Cue {
         end_ms,
         text: text.into(),
     }
+}
+
+// --- Issue #202: distant cues must never be folded into one anchor ---------
+
+#[test]
+fn prefix_related_cues_minutes_apart_keep_their_own_text_and_timestamps() {
+    let input = br#"WEBVTT
+
+00:00:05.000 --> 00:00:06.000
+Yes
+
+00:20:00.000 --> 00:20:02.000
+Yes I agree
+"#;
+
+    let cues = auto_cues(input);
+
+    assert_eq!(
+        cues,
+        [
+            cue(5_000, 6_000, "Yes"),
+            cue(1_200_000, 1_202_000, "Yes I agree"),
+        ]
+    );
+}
+
+#[test]
+fn identical_cues_minutes_apart_stay_two_cues() {
+    let input = br#"WEBVTT
+
+00:00:05.000 --> 00:00:06.000
+Yes
+
+00:20:00.000 --> 00:20:01.000
+Yes
+"#;
+
+    let cues = auto_cues(input);
+
+    assert_eq!(
+        cues,
+        [cue(5_000, 6_000, "Yes"), cue(1_200_000, 1_201_000, "Yes")]
+    );
+}
+
+#[test]
+fn rolling_collapse_stops_at_the_adjacency_bound() {
+    let at_bound = 1_000 + ROLLING_GAP_MS;
+    let within = auto_cues(rolling_pair_at(at_bound).as_bytes());
+    let beyond = auto_cues(rolling_pair_at(at_bound + 1).as_bytes());
+
+    assert_eq!(within, [cue(0, 4_000, "we build")], "{within:?}");
+    assert_eq!(
+        beyond,
+        [cue(0, 1_000, "we"), cue(at_bound + 1, 4_000, "we build")],
+        "{beyond:?}"
+    );
+}
+
+#[test]
+fn no_rendered_anchor_precedes_the_moment_its_words_were_spoken() {
+    let input = br#"WEBVTT
+
+00:00:05.000 --> 00:00:06.000
+Yes
+
+00:20:00.000 --> 00:20:02.000
+Yes I agree
+"#;
+    let captions = parse_vtt(input, CueCleanup::RollingCaptions).unwrap();
+
+    let rendered = render_transcript(
+        &captions,
+        &TranscriptProvenance::Captions {
+            language: "en".into(),
+            automatic: true,
+        },
+    )
+    .unwrap();
+
+    assert!(
+        rendered.text.contains("[00:20:00] Yes I agree"),
+        "{}",
+        rendered.text
+    );
+    assert!(
+        rendered.text.contains("[00:00:05] Yes"),
+        "{}",
+        rendered.text
+    );
+}
+
+/// A first cue ending at one second, then its prefix extension starting at
+/// `second_start_ms` — the only variable the adjacency bound turns on.
+fn rolling_pair_at(second_start_ms: u64) -> String {
+    let second = format_timestamp(second_start_ms);
+    format!("WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nwe\n\n{second} --> 00:00:04.000\nwe build\n")
+}
+
+fn format_timestamp(total_ms: u64) -> String {
+    let (seconds, millis) = (total_ms / 1_000, total_ms % 1_000);
+    format!(
+        "{:02}:{:02}:{:02}.{millis:03}",
+        seconds / 3_600,
+        (seconds % 3_600) / 60,
+        seconds % 60
+    )
+}
+
+#[test]
+fn a_human_caption_track_is_never_put_through_the_rolling_collapse() {
+    // The rolling fixture is the worst case: every cue extends its predecessor.
+    // A human track that genuinely reads this way keeps all four cues.
+    let cues = verbatim_cues(fixture("rolling"));
+
+    assert_eq!(
+        cues,
+        [
+            cue(0, 1_000, "we"),
+            cue(1_000, 2_000, "we build"),
+            cue(2_000, 3_000, "we build notes"),
+            cue(3_000, 4_000, "we build notes carefully"),
+        ]
+    );
+}
+
+#[test]
+fn a_verbatim_parse_reports_no_merges_while_a_collapse_counts_every_folded_cue() {
+    let verbatim = parse_vtt(fixture("rolling"), CueCleanup::Verbatim).unwrap();
+    let collapsed = parse_vtt(fixture("rolling"), CueCleanup::RollingCaptions).unwrap();
+
+    assert_eq!(verbatim.merged_cue_count, 0);
+    assert_eq!(collapsed.cues.len(), 1);
+    assert_eq!(collapsed.merged_cue_count, 3);
+}
+
+#[test]
+fn a_caption_track_derives_its_cleanup_policy_from_its_own_source() {
+    // The policy lives in one conversion so every caller agrees on it, and so a
+    // new `CaptionSource` variant has to be classified rather than falling into
+    // whichever branch an `if` happened to leave open.
+    assert_eq!(
+        CueCleanup::from(CaptionSource::Automatic),
+        CueCleanup::RollingCaptions
+    );
+    assert_eq!(CueCleanup::from(CaptionSource::Human), CueCleanup::Verbatim);
 }

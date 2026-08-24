@@ -148,9 +148,16 @@ export function ChatPane({
             <ExpandToggle expanded={expanded} onToggle={onToggleExpanded} />
           </div>
         </div>
+        {/* The promise sits above every view, so it may only claim what the
+            code enforces. Nothing counts or verifies *claims* — the verifier
+            sees only the `[eN]` markers the model chose to emit, and CONVERSE
+            answers with no retrieval at all. What IS enforced is the citation
+            re-check: a rendered citation was re-matched against the note on
+            disk (byte-exact quote + content hash) or dropped with its reason
+            surfaced. Pinned by ChatPane.test.tsx's "header promise" suite. */}
         <p className="mt-2 text-[0.6875rem] leading-snug text-muted-foreground">
-          Ask questions across everything in your vault. Every claim is
-          citation-checked against its source.
+          Ask questions across your notes. Every citation is re-checked against
+          the note on disk before it&apos;s shown.
         </p>
       </header>
 

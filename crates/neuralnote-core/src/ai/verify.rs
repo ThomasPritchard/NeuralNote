@@ -8,7 +8,7 @@
 //! [`crate::model::NoteDoc::content_hash`] the vault already computes is reused.
 
 use crate::ai::evidence::EvidenceSpan;
-use crate::note::read_note;
+use crate::note::{read_note, MAX_EDITABLE_NOTE_BYTES};
 use std::path::PathBuf;
 
 /// Re-verifies cited spans against the live vault.
@@ -53,6 +53,25 @@ impl CitationVerifier {
         }
         let doc = read_note(&self.root, &self.root.join(&span.rel_path))
             .map_err(|e| format!("the cited note could not be re-read: {e}"))?;
+        // A document the reader answers CONTENT-FREE — past the readable byte limit,
+        // or a non-UTF-8 attachment — carries an empty `content_hash`, which the
+        // comparison below would report as "changed on disk": false, and for such a
+        // note deterministically false forever. Name the real cause first (issues
+        // #210/#218), in the reader's own precedence: the resource limit is decided
+        // before binary-vs-text classification, so an oversized attachment reports
+        // its size rather than its encoding.
+        if doc.exceeds_editable_size {
+            return Err(format!(
+                "the cited note is {} bytes, past the {MAX_EDITABLE_NOTE_BYTES}-byte readable note limit, so its text cannot be re-read to verify the quote",
+                doc.size_bytes
+            ));
+        }
+        if doc.binary {
+            return Err(
+                "the cited note is not a text note (its bytes are not valid UTF-8), so its text cannot be re-read to verify the quote"
+                    .to_string(),
+            );
+        }
         if doc.content_hash != span.content_hash {
             return Err("the note changed on disk since it was read".to_string());
         }
@@ -111,6 +130,54 @@ mod tests {
         fs::write(v.path().join("n.md"), "totally different content\n").unwrap();
         let err = CitationVerifier::new(v.path()).verify(&span).unwrap_err();
         assert!(err.contains("changed on disk"));
+    }
+
+    #[test]
+    fn drops_an_over_cap_note_naming_the_size_not_a_disk_change() {
+        // Issues #210/#218: `read_note` answers a content-free doc for a note past
+        // the editable cap — `content_hash` empty. Compared hash-first, that reads
+        // as "changed on disk": false, and deterministic forever for that note. The
+        // reason must name the real cause.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("big.md");
+        let file = fs::File::create(&f).unwrap();
+        file.set_len(MAX_EDITABLE_NOTE_BYTES as u64 + 1).unwrap();
+        drop(file);
+        let span = EvidenceSpan {
+            id: "e1".into(),
+            rel_path: "big.md".into(),
+            content_hash: "1234567890".into(),
+            start_line: 1,
+            end_line: 1,
+            text: "a line the note may well contain".into(),
+        };
+
+        let err = CitationVerifier::new(dir.path()).verify(&span).unwrap_err();
+
+        assert!(err.contains("readable note limit"), "{err}");
+        assert!(!err.contains("changed on disk"), "{err}");
+    }
+
+    #[test]
+    fn drops_a_binary_note_naming_the_encoding_not_a_disk_change() {
+        // The other content-free state the reader can answer with: a non-UTF-8
+        // attachment. Same empty hash, so the same false disk-change verdict if the
+        // content-free states are not checked first.
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("scan.png"), [0xFF, 0xFE, 0x00, 0x01]).unwrap();
+        let span = EvidenceSpan {
+            id: "e1".into(),
+            rel_path: "scan.png".into(),
+            content_hash: "1234567890".into(),
+            start_line: 1,
+            end_line: 1,
+            text: "a line the attachment cannot carry".into(),
+        };
+
+        let err = CitationVerifier::new(dir.path()).verify(&span).unwrap_err();
+
+        assert!(err.contains("not a text note"), "{err}");
+        assert!(!err.contains("changed on disk"), "{err}");
     }
 
     #[test]

@@ -106,11 +106,16 @@ fn add_unlinked_mention(
     }
 }
 
+/// One source note's text, read under the ONE shared bounded policy
+/// (`note::scan_note_text`) — the same ceiling the reader applies, so a note past
+/// the readable limit is never pulled into memory whole to be mined for mentions
+/// (issue #210). A note whose text cannot be taken is skipped with its reason
+/// logged and counted, never silently.
 fn read_note_text(node: &TreeNode, skipped_files: &mut u32) -> Option<NoteText> {
-    let raw = match std::fs::read(&node.path) {
-        Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
-        Err(e) => {
-            log::warn!("backlinks: skipping unreadable file {}: {e}", node.path);
+    let raw = match note::scan_note_text(Path::new(&node.path)) {
+        Ok(text) => text,
+        Err(skip) => {
+            log::warn!("backlinks: skipping file {} — {skip}", node.path);
             *skipped_files = skipped_files.saturating_add(1);
             return None;
         }

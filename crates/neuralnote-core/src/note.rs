@@ -135,63 +135,144 @@ pub(crate) fn decode_note_text(bytes: Vec<u8>) -> (String, bool) {
     }
 }
 
+/// What a bounded read of a vault file yielded — the three outcomes
+/// [`read_note_bounded`] can decide between.
+pub(crate) enum BoundedRead {
+    /// Decoded text within the cap. `lossy` is true when invalid byte sequences
+    /// were rendered as U+FFFD.
+    Text { raw: String, lossy: bool },
+    /// A non-UTF-8 attachment (image/PDF/…): there is no text to present.
+    Binary,
+    /// Past [`MAX_EDITABLE_NOTE_BYTES`]. `size_bytes` is the ON-DISK size.
+    TooLarge { size_bytes: u64 },
+}
+
+/// The ONE bounded-read policy for a vault file, shared by the reader
+/// ([`read_note`]) and by every whole-vault scan ([`scan_note_text`], used by
+/// search, the link graph and backlinks).
+///
+/// Issue #210: the reader treated the size cap as a hard resource limit while the
+/// scans read the same files with `std::fs::read` and no bound at all. That
+/// asymmetry was both a memory hazard and a citation-fidelity hole — a scan of an
+/// over-cap note minted an evidence span hashing content the reader will never
+/// return, so the verifier could only drop the citation, blaming a disk change that
+/// never happened. One policy, one call site, so the two sides cannot drift again.
+///
+/// The order of the decisions is load-bearing:
+/// 1. Any file whose METADATA already reports more than the cap is refused without
+///    its bytes ever being read into memory. Resource safety takes precedence over
+///    binary/text classification: a multi-GiB attachment must not be loaded whole
+///    merely to choose between two content-free notices. `std::fs::metadata`
+///    follows symlinks, so an oversized target is caught through a link too.
+///    Metadata can lie about a shrink/grow race, so the byte-exact checks below
+///    stay authoritative for anything that gets this far.
+/// 2. The read itself is bounded too — the file can grow after metadata is
+///    sampled, and metadata may be unavailable. One byte past the cap is enough to
+///    make the authoritative size decision without letting a path race allocate the
+///    whole file. Bytes, not a UTF-8 string, so small images/PDFs still reach the
+///    graceful binary path.
+/// 3. A non-UTF-8 attachment is [`BoundedRead::Binary`] — never lossy-decoded,
+///    which would bloat a multi-MB image into megabytes of U+FFFD. `is_text_note`
+///    short-circuits, so a text note (the hot path) skips this validation scan and
+///    decodes exactly once.
+/// 4. The cap is re-checked on the DECODED string, because lossy decode AMPLIFIES:
+///    every invalid byte becomes the 3-byte U+FFFD, so a note at the on-disk cap
+///    (e.g. Latin-1 text) decodes to ~3× the limit — a document that would both
+///    freeze the webview (#82) and be unsavable (`write_note` rejects > MAX bytes).
+///    `size_bytes` still quotes the ON-DISK size, which is what the UI states.
+pub(crate) fn read_note_bounded(path: &Path) -> std::io::Result<BoundedRead> {
+    let claimed_len = std::fs::metadata(path).ok().map(|meta| meta.len());
+    if let Some(len) = claimed_len {
+        if len > MAX_EDITABLE_NOTE_BYTES as u64 {
+            return Ok(BoundedRead::TooLarge { size_bytes: len });
+        }
+    }
+    // The metadata length — proven at or under the cap just above, so never an
+    // untrusted allocation — is the read's capacity hint, exactly as `std::fs::read`
+    // sizes its own buffer. The vault-wide scans read every note on every query, so
+    // one allocation per note rather than geometric growth is worth the two lines.
+    let mut bytes = Vec::with_capacity(claimed_len.unwrap_or(0) as usize);
+    std::fs::File::open(path)?
+        .take(MAX_EDITABLE_NOTE_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_EDITABLE_NOTE_BYTES {
+        return Ok(BoundedRead::TooLarge {
+            size_bytes: bytes.len() as u64,
+        });
+    }
+    if !is_text_note(path) && std::str::from_utf8(&bytes).is_err() {
+        return Ok(BoundedRead::Binary);
+    }
+    let on_disk_len = bytes.len() as u64;
+    let (raw, lossy) = decode_note_text(bytes);
+    if raw.len() > MAX_EDITABLE_NOTE_BYTES {
+        return Ok(BoundedRead::TooLarge {
+            size_bytes: on_disk_len,
+        });
+    }
+    Ok(BoundedRead::Text { raw, lossy })
+}
+
+/// Why a whole-vault scan could not take a file's text. Every variant is a file
+/// the scan must count into its `skipped_files` and log — an omission the user is
+/// told about, never a silent gap.
+pub(crate) enum ScanSkip {
+    /// The file could not be opened or read (deleted, permissions, I/O).
+    Unreadable(std::io::Error),
+    /// Past [`MAX_EDITABLE_NOTE_BYTES`], so the reader refuses it too. Scanning it
+    /// would produce evidence no citation could ever be verified against.
+    TooLarge { size_bytes: u64 },
+    /// Not decodable as text — a non-UTF-8 attachment reached by a scan.
+    NotText,
+}
+
+impl std::fmt::Display for ScanSkip {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unreadable(e) => write!(f, "{e}"),
+            Self::TooLarge { size_bytes } => write!(
+                f,
+                "it is {size_bytes} bytes, past the {MAX_EDITABLE_NOTE_BYTES}-byte readable note limit"
+            ),
+            Self::NotText => write!(f, "its bytes are not valid UTF-8"),
+        }
+    }
+}
+
+/// The text of one note for a whole-vault SCAN, under exactly the ceiling the
+/// reader applies (see [`read_note_bounded`]) and decoded by exactly the reader's
+/// policy ([`decode_note_text`]) — so what search indexes is byte-identical to what
+/// the reader presents (issue #33), and a note the reader refuses is a note the
+/// scan refuses too (issue #210).
+///
+/// `Err` names the reason for the caller's log; either way the caller counts the
+/// file as skipped.
+pub(crate) fn scan_note_text(path: &Path) -> Result<String, ScanSkip> {
+    match read_note_bounded(path) {
+        Ok(BoundedRead::Text { raw, .. }) => Ok(raw),
+        Ok(BoundedRead::Binary) => Err(ScanSkip::NotText),
+        Ok(BoundedRead::TooLarge { size_bytes }) => Err(ScanSkip::TooLarge { size_bytes }),
+        Err(e) => Err(ScanSkip::Unreadable(e)),
+    }
+}
+
 /// Read a note: split frontmatter from body, parse the YAML leniently, and keep
-/// the full raw file regardless. The path is vault-scoped first.
+/// the full raw file regardless. The path is vault-scoped first, then read under
+/// the shared bounded-read policy ([`read_note_bounded`]) — a file past the cap or
+/// a non-UTF-8 attachment comes back as a flagged, content-free doc rather than
+/// being marshalled to the webview.
 pub fn read_note(root: &Path, target: &Path) -> CoreResult<NoteDoc> {
     let path = ensure_within(root, target)?;
     if !path.is_file() {
         return Err(CoreError::NotFound(path.display().to_string()));
     }
-    // Any vault file whose METADATA already reports more than the editable byte
-    // limit is flagged without its bytes ever being read into memory. Resource
-    // safety takes precedence over binary/text classification: a multi-GiB
-    // attachment must not be loaded whole merely to choose between two
-    // content-free notices. `std::fs::metadata` follows symlinks, so an
-    // oversized target is caught through a link too. Metadata can lie about a
-    // shrink/grow race, so the byte-exact checks below remain authoritative for
-    // anything that gets this far.
-    if let Ok(meta) = std::fs::metadata(&path) {
-        if meta.len() > MAX_EDITABLE_NOTE_BYTES as u64 {
-            return Ok(build_oversized_doc(root, &path, meta.len()));
+    let (raw, lossy) = match read_note_bounded(&path)? {
+        BoundedRead::TooLarge { size_bytes } => {
+            return Ok(build_oversized_doc(root, &path, size_bytes))
         }
-    }
-    // Bound the read as well as the metadata preflight: the file can grow after
-    // metadata is sampled, and metadata itself may be unavailable. Reading one
-    // byte past the cap is enough to make the authoritative size decision
-    // without allowing a path race to allocate the whole file. Read bytes, not
-    // a UTF-8 string, so small images/PDFs still reach the graceful binary path.
-    let mut bytes = Vec::new();
-    std::fs::File::open(&path)?
-        .take(MAX_EDITABLE_NOTE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    // The opened file may have grown after metadata was sampled. Decide the
-    // bounded byte result before binary classification so a MAX+1 invalid-UTF-8
-    // attachment cannot hide the resource-limit state behind `binary`.
-    if bytes.len() > MAX_EDITABLE_NOTE_BYTES {
-        return Ok(build_oversized_doc(root, &path, bytes.len() as u64));
-    }
-    // An attachment (image/PDF/…) that isn't valid UTF-8 stays a no-preview
-    // binary doc — never lossy-decoded, which would bloat a multi-MB image into
-    // megabytes of U+FFFD. `is_text_note` short-circuits, so a text note (the hot
-    // path) skips this validation scan and decodes exactly once below.
-    if !is_text_note(&path) && std::str::from_utf8(&bytes).is_err() {
-        return Ok(build_binary_doc(root, &path));
-    }
-    // A text note (`.md`/`.txt`) in some other encoding (Windows-1252/Latin-1 from
-    // a migrated vault) is decoded lossily so its content is SHOWN, never hidden,
-    // and flagged so the reader can warn. Same policy search uses, by construction.
-    let on_disk_len = bytes.len() as u64;
-    let (raw, lossy) = decode_note_text(bytes);
-    // The cap must also hold for the DECODED string — the thing actually
-    // marshalled to the webview and the thing the write side measures. Lossy
-    // decode AMPLIFIES: every invalid byte becomes the 3-byte U+FFFD, so a note
-    // at the on-disk cap (e.g. Latin-1 text) decodes to ~3× the limit — a doc
-    // that would both freeze the webview (#82) and be unsavable (write_note
-    // rejects > MAX bytes). It takes the same flagged, content-free path;
-    // size_bytes still quotes the ON-DISK size, which is what the UI states.
-    if raw.len() > MAX_EDITABLE_NOTE_BYTES {
-        return Ok(build_oversized_doc(root, &path, on_disk_len));
-    }
+        BoundedRead::Binary => return Ok(build_binary_doc(root, &path)),
+        BoundedRead::Text { raw, lossy } => (raw, lossy),
+    };
     Ok(build_doc(root, &path, raw, lossy))
 }
 

@@ -45,9 +45,10 @@ const PER_MESSAGE_OVERHEAD_TOKENS: usize = 8;
 /// Chars of ASCII alphanumeric/whitespace text per token — the easy ~4:1 case.
 const ASCII_CHARS_PER_TOKEN: usize = 4;
 
-/// Appended to any single message head-truncated to fit the window, so the loss is
+/// Appended to each message head-truncated to fit the window, so the loss is
 /// visible in-band as well as in the Coverage footer.
-const TRUNCATION_MARKER: &str = "\n\n[older content trimmed to fit the model's context window]";
+pub(super) const TRUNCATION_MARKER: &str =
+    "\n\n[older content trimmed to fit the model's context window]";
 
 /// A conservative, script-aware UPPER-BOUND estimate of the BPE token count of `text`.
 /// ASCII letters/digits/whitespace tokenise at ~4 chars/token; ASCII punctuation/symbols
@@ -127,10 +128,10 @@ pub(super) struct BudgetOutcome {
 /// or a cloud model's catalogue `context_length`), falling back to the curated-local
 /// default when the client reports none. Grounding (the leading system prefix) and
 /// the newest evidence are always preserved; the oldest history/evidence is dropped
-/// deterministically as whole protocol units; a lone evidence span larger than the
-/// whole window is head-truncated with an explicit marker rather than allowed to push
-/// grounding out. A prompt whose window is unknown (a cloud model absent from the
-/// catalogue cache) is returned unchanged — inert-with-reason, left to the char
+/// deterministically as whole protocol units; any force-kept span still larger than the
+/// remaining budget is head-truncated with an explicit marker — as many of them as it
+/// takes to fit — rather than allowed to push grounding out. A prompt whose window is
+/// unknown (a cloud model absent from the catalogue cache) is returned unchanged — inert-with-reason, left to the char
 /// guards that bound cloud cost. Trimming only ever REMOVES content, so budgeting
 /// can never increase what a call would have sent. The persistent `messages`
 /// accumulator is never mutated — this returns the trimmed copy for one request.
@@ -176,8 +177,10 @@ fn trim_to_budget(messages: &[LlmMessage], budget: usize) -> BudgetOutcome {
     let mut used: usize = prefix.iter().map(message_tokens).sum();
 
     // The newest unit (freshest evidence, or the question itself on a conversational
-    // turn) and the question are force-kept even if they alone overflow — a single
-    // oversized span is head-truncated below, never dropped in favour of older evidence.
+    // turn) and the question are force-kept even if they alone overflow — an oversized
+    // span is head-truncated below, never dropped in favour of older evidence. Both can
+    // be oversized at once, which is why that truncation iterates rather than trimming
+    // one message and hoping.
     for forced in [units.len().checked_sub(1), pinned_question]
         .into_iter()
         .flatten()
@@ -204,11 +207,19 @@ fn trim_to_budget(messages: &[LlmMessage], budget: usize) -> BudgetOutcome {
             lost = true;
         }
     }
-    // A single message larger than the whole window still overflows after unit
-    // selection. Grounding is the hard invariant, so head-truncate the largest
-    // non-system message instead of letting it push grounding out of the window.
+    // The force-kept units can still overflow after unit selection — one span larger
+    // than the whole window, or both force-kept units oversized at once. Grounding is
+    // the hard invariant, so head-truncate the largest non-system messages, repeatedly,
+    // instead of letting them push grounding out of the window.
     if total_tokens(&out) > budget {
-        lost |= truncate_largest_to_fit(&mut out, budget);
+        // Two independent losses, and neither implies the other: content trimmed away
+        // (the trim may still have closed the gap), and a prompt that STILL does not fit
+        // — the floor, where the provider front-truncates or rejects what we send. The
+        // floor can be reached without trimming a single byte, when the largest droppable
+        // message is already shorter than the marker, so `lost` asserts the post-condition
+        // instead of inferring it from whether the trim changed anything.
+        lost |= truncate_largest_first_to_fit(&mut out, budget);
+        lost |= total_tokens(&out) > budget;
     }
     BudgetOutcome {
         messages: out,
@@ -233,26 +244,55 @@ fn group_units(messages: &[LlmMessage]) -> Vec<std::ops::Range<usize>> {
     units
 }
 
-/// Head-truncate the largest non-system message until the whole prompt fits `budget`,
-/// appending [`TRUNCATION_MARKER`]. Returns whether it truncated anything. Never touches
-/// a system (grounding) message — grounding is the invariant the whole pass protects.
-fn truncate_largest_to_fit(messages: &mut [LlmMessage], budget: usize) -> bool {
-    let total = total_tokens(messages);
-    if total <= budget {
-        return false;
-    }
-    let Some(idx) = largest_droppable(messages) else {
-        return false;
-    };
-    let content = messages[idx].content.as_deref().unwrap_or_default();
-    let current = estimate_tokens(content);
-    let overflow = total - budget;
+/// Head-truncate non-system messages, largest first, until the whole prompt fits
+/// `budget`, appending [`TRUNCATION_MARKER`] to each one trimmed. Returns whether it
+/// truncated anything. Never touches a system (grounding) message — grounding is the
+/// invariant the whole pass protects.
+///
+/// One pass is not enough, because the force-keep step can pin TWO oversized messages
+/// (the newest unit AND the pinned question): trimming the larger of them to the bare
+/// marker leaves the other's overflow in place, and the prompt goes out over-window
+/// with only `lost` recorded — the silent front-truncation this pass exists to prevent.
+/// So the trim iterates until its own post-condition holds.
+///
+/// When the budget cannot be met at all — grounding alone exceeds it, or what remains
+/// is untrimmable (tool-call arguments, per-message framing) — the deliberate end state
+/// is this pass's FLOOR: every droppable message down to the bare marker, grounding
+/// byte-for-byte intact. Giving up grounding to close the gap would break cited recall,
+/// which is the one thing budgeting protects, so it is never traded away. Each iteration
+/// must strictly shrink the prompt or the loop stops, so the floor is always reached in
+/// finite steps — including on the first iteration, when the largest droppable message
+/// is already shorter than the marker and nothing can shrink at all. That last case is
+/// why the return value alone cannot stand in for the coverage loss: the caller checks
+/// this function's post-condition (`total_tokens <= budget`) as well.
+fn truncate_largest_first_to_fit(messages: &mut [LlmMessage], budget: usize) -> bool {
     let marker_tokens = estimate_tokens(TRUNCATION_MARKER);
-    let keep_tokens = current
-        .saturating_sub(overflow)
-        .saturating_sub(marker_tokens);
-    messages[idx].content = Some(truncate_content_to_tokens(content, keep_tokens));
-    true
+    let mut total = total_tokens(messages);
+    let mut truncated = false;
+    while total > budget {
+        let Some(idx) = largest_droppable(messages) else {
+            break;
+        };
+        let content = messages[idx].content.as_deref().unwrap_or_default();
+        let current = estimate_tokens(content);
+        let keep_tokens = current
+            .saturating_sub(total - budget)
+            .saturating_sub(marker_tokens);
+        let trimmed = truncate_content_to_tokens(content, keep_tokens);
+        // Only `content` changes, so the prompt's total moves by exactly this much.
+        // No saving means the largest droppable message is already at the marker, so
+        // no smaller one can shrink either: we are at the floor. Stop rather than
+        // spin — and rather than rewrite a message with something no smaller, which
+        // would let budgeting GROW what the call sends.
+        let saved = current.saturating_sub(estimate_tokens(&trimmed));
+        if saved == 0 {
+            break;
+        }
+        messages[idx].content = Some(trimmed);
+        total -= saved;
+        truncated = true;
+    }
+    truncated
 }
 
 fn largest_droppable(messages: &[LlmMessage]) -> Option<usize> {

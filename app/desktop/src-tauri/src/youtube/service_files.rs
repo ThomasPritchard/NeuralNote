@@ -1,4 +1,4 @@
-use neuralnote_core::capture::{parse_vtt, CaptureError};
+use neuralnote_core::capture::{parse_vtt, CaptureError, CueCleanup};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
@@ -37,7 +37,7 @@ pub(super) async fn read_valid_vtt(
     kind: ArtifactKind,
 ) -> Result<Vec<u8>, CaptureError> {
     let (_, bytes) = read_single_artifact(directory, extension, max_bytes, kind).await?;
-    parse_vtt(&bytes)?;
+    parse_vtt(&bytes, CueCleanup::Verbatim)?;
     Ok(bytes)
 }
 

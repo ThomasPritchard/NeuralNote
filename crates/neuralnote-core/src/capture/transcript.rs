@@ -1,6 +1,6 @@
 //! Timestamped transcript rendering from cleaned source cues.
 
-use super::{CaptureError, Cue, VideoId};
+use super::{CaptureError, ParsedVtt, VideoId};
 
 const PARAGRAPH_SPAN_MS: u64 = 30_000;
 const MAX_PROVENANCE_COMPONENT_BYTES: usize = 128;
@@ -25,28 +25,28 @@ pub struct RenderedTranscript {
 /// Each paragraph carries the first cue's start timestamp, so line-based citation
 /// evidence includes the exact anchor without adding a second citation contract.
 pub fn render_transcript(
-    cues: &[Cue],
+    source: &ParsedVtt,
     provenance: &TranscriptProvenance,
 ) -> Result<RenderedTranscript, CaptureError> {
-    render_transcript_inner(cues, provenance, None)
+    render_transcript_inner(source, provenance, None)
 }
 
 /// Render a YouTube transcript whose timestamp anchors carry their validated
 /// source jump target inside the byte-exact text later used for citations.
 pub fn render_youtube_transcript(
-    cues: &[Cue],
+    source: &ParsedVtt,
     provenance: &TranscriptProvenance,
     video_id: &VideoId,
 ) -> Result<RenderedTranscript, CaptureError> {
-    render_transcript_inner(cues, provenance, Some(video_id))
+    render_transcript_inner(source, provenance, Some(video_id))
 }
 
 fn render_transcript_inner(
-    cues: &[Cue],
+    source: &ParsedVtt,
     provenance: &TranscriptProvenance,
     video_id: Option<&VideoId>,
 ) -> Result<RenderedTranscript, CaptureError> {
-    if cues.is_empty() {
+    if source.cues.is_empty() {
         return invalid_vtt("transcript contains no usable cues");
     }
     let provenance = provenance_label(provenance)?;
@@ -56,7 +56,7 @@ fn render_transcript_inner(
     let mut word_count = 0u64;
     let mut previous_start = None;
 
-    for (index, cue) in cues.iter().enumerate() {
+    for (index, cue) in source.cues.iter().enumerate() {
         if cue.end_ms < cue.start_ms {
             return invalid_vtt(format!(
                 "transcript cue {index} ends before it starts: {}..{}",
@@ -92,7 +92,7 @@ fn render_transcript_inner(
     }
     paragraphs.push(render_paragraph(group_start, &group_text, video_id));
 
-    let mut text = format!("source: {provenance}\n\n");
+    let mut text = transcript_header(&provenance, source.merged_cue_count);
     text.push_str(&paragraphs.join("\n\n"));
     text.push('\n');
     Ok(RenderedTranscript {
@@ -100,6 +100,20 @@ fn render_transcript_inner(
         word_count,
         provenance,
     })
+}
+
+/// Cues the caption cleanup folded into a neighbour are named in the transcript
+/// rather than vanishing, so a reader can see the source repeated itself there.
+fn transcript_header(provenance: &str, merged_cue_count: usize) -> String {
+    let mut header = format!("source: {provenance}\n");
+    if merged_cue_count > 0 {
+        let noun = if merged_cue_count == 1 { "cue" } else { "cues" };
+        header.push_str(&format!(
+            "note: {merged_cue_count} duplicate {noun} merged\n"
+        ));
+    }
+    header.push('\n');
+    header
 }
 
 fn invalid_vtt<T>(detail: impl Into<String>) -> Result<T, CaptureError> {

@@ -417,3 +417,35 @@ describe("ChatPane — key setup", () => {
     expect(screen.getByLabelText("OpenRouter API key")).toBeInTheDocument();
   });
 });
+
+// The header's one-line promise sits above EVERY view — the first-run picker,
+// the disabled state and the live transcript alike — so it may only claim what
+// the code actually enforces. What is enforced is the citation re-check: every
+// citation the pane renders was re-matched against the note on disk (byte-exact
+// quote plus a content-hash check) and dropped, with its reason surfaced, if it
+// failed. Nothing anywhere counts or verifies *claims* — the verifier only ever
+// sees the `[eN]` markers the model chose to emit, and the CONVERSE route
+// answers with no retrieval and no verification at all. "Every claim is
+// citation-checked" was therefore a promise no code path keeps (issue #206),
+// and it was unpinned by any test until this one.
+describe("ChatPane — header promise", () => {
+  const HONEST_PROMISE =
+    "Ask questions across your notes. Every citation is re-checked against the note on disk before it's shown.";
+  const CLAIM_OVERCLAIM = /every claim is citation-checked/i;
+
+  it("promises the citation re-check, not a claim check, before a provider is configured", async () => {
+    mockAiStatus.mockResolvedValue(unconfigured());
+    setup();
+
+    expect(await screen.findByText(HONEST_PROMISE)).toBeInTheDocument();
+    expect(screen.queryByText(CLAIM_OVERCLAIM)).not.toBeInTheDocument();
+  });
+
+  it("keeps the same promise in the live chat view, where unverified answers land", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    setup();
+
+    expect(await screen.findByText(HONEST_PROMISE)).toBeInTheDocument();
+    expect(screen.queryByText(CLAIM_OVERCLAIM)).not.toBeInTheDocument();
+  });
+});
