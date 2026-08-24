@@ -39,8 +39,8 @@ pub use transcript::{
 };
 pub use vault::{detect_vault_scheme, VaultFolder, VaultInventory, VaultNote, VaultScheme};
 pub use vtt::{
-    parse_vtt, Cue, MAX_VTT_BYTES, MAX_VTT_CUES, MAX_VTT_CUE_TEXT_BYTES, MAX_VTT_LINES,
-    MAX_VTT_LINE_BYTES,
+    parse_vtt, Cue, CueCleanup, ParsedVtt, MAX_VTT_BYTES, MAX_VTT_CUES, MAX_VTT_CUE_TEXT_BYTES,
+    MAX_VTT_LINES, MAX_VTT_LINE_BYTES, ROLLING_GAP_MS,
 };
 /// Crate-internal: both callers are core modules, and the shell has no reason to
 /// build a data URI — it hands core the bytes and lets core decide.

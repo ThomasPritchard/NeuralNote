@@ -14,8 +14,8 @@ use crate::ai::youtube_preview;
 use crate::ai::youtube_tool_errors::{settle_capture_error, settle_session_capture_error};
 use crate::capture::{
     estimate_transcript_cost, parse_video_metadata, parse_vtt, render_youtube_transcript,
-    CaptionSource, CaptureAction, CaptureError, CostEstimate, PricingInput, RenderedTranscript,
-    TranscriptProvenance, VideoMetadata,
+    CaptionSource, CaptureAction, CaptureError, CostEstimate, CueCleanup, PricingInput,
+    RenderedTranscript, TranscriptProvenance, VideoMetadata,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -285,12 +285,12 @@ pub(super) async fn dispatch_transcribe_audio(
             "transcription was cancelled".into(),
         ));
     }
-    let cues = match parse_vtt(&payload.vtt) {
-        Ok(cues) => cues,
+    let transcribed = match parse_vtt(&payload.vtt, CueCleanup::Verbatim) {
+        Ok(transcribed) => transcribed,
         Err(error) => return settle_session_capture_error(work.session, error),
     };
     let rendered = match render_youtube_transcript(
-        &cues,
+        &transcribed,
         &TranscriptProvenance::Whisper {
             model: model.to_string(),
         },
@@ -571,12 +571,17 @@ fn render_caption_payload(
     language: &str,
     video_id: &crate::capture::VideoId,
 ) -> Result<RenderedTranscript, CaptureError> {
-    let cues = parse_vtt(&payload.vtt)?;
+    // The track's own source decides which cleaning policy it gets, and that
+    // decision lives in one conversion rather than here — see the `From` impl on
+    // `CueCleanup`. Running the rolling passes over a human track deletes words
+    // and re-anchors what survives.
+    let automatic = source == CaptionSource::Automatic;
+    let captions = parse_vtt(&payload.vtt, CueCleanup::from(source))?;
     render_youtube_transcript(
-        &cues,
+        &captions,
         &TranscriptProvenance::Captions {
             language: language.to_string(),
-            automatic: source == CaptionSource::Automatic,
+            automatic,
         },
         video_id,
     )

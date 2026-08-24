@@ -1,6 +1,6 @@
 //! Bounded WebVTT parsing and caption-cleaning policy.
 
-use super::CaptureError;
+use super::{CaptionSource, CaptureError};
 
 /// Maximum accepted VTT payload. A 24-hour caption file remains comfortably below
 /// this while an untrusted extractor result cannot grow memory without bound.
@@ -13,6 +13,48 @@ pub const MAX_VTT_LINES: usize = 500_000;
 pub const MAX_VTT_CUE_TEXT_BYTES: usize = 256 * 1024;
 /// Maximum raw cues accepted before cleaning or deduplication.
 pub const MAX_VTT_CUES: usize = 100_000;
+/// Longest gap tolerated between two cues before either may be folded into the
+/// other. The rolling auto-caption encoder re-sends the previous cue's words
+/// about a second later; anything further apart is separate speech, and merging
+/// it would delete words and re-anchor a citation to a moment they were not
+/// spoken.
+pub const ROLLING_GAP_MS: u64 = 2_000;
+
+/// Whether a VTT payload came from the rolling auto-caption encoder, and so
+/// needs the cue-cleaning passes at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CueCleanup {
+    /// YouTube automatic captions: each cue re-sends the previous cue's words
+    /// plus a few more, so adjacent duplicates and rolling prefixes collapse.
+    RollingCaptions,
+    /// Human caption tracks and Whisper transcripts: every cue already holds
+    /// only the words spoken in its own span, so none is ever folded away.
+    Verbatim,
+}
+
+/// A caption track's own source decides which cleaning policy it gets, and it
+/// decides here — once, for every caller. Only YouTube's automatic captions come
+/// from the rolling encoder the cleaning passes exist for; running them over a
+/// human track deletes words and re-anchors what survives. Matching exhaustively
+/// means a new [`CaptionSource`] has to be classified rather than inheriting
+/// whichever branch an `if` happened to leave open.
+impl From<CaptionSource> for CueCleanup {
+    fn from(source: CaptionSource) -> Self {
+        match source {
+            CaptionSource::Automatic => Self::RollingCaptions,
+            CaptionSource::Human => Self::Verbatim,
+        }
+    }
+}
+
+/// Cleaned cues plus what the cleaning cost, so a merge is never silent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedVtt {
+    pub cues: Vec<Cue>,
+    /// Source cues folded into a neighbour. Always zero under
+    /// [`CueCleanup::Verbatim`], which merges nothing.
+    pub merged_cue_count: usize,
+}
 
 /// One timed source cue. Times are milliseconds from the start of the video.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -22,12 +64,13 @@ pub struct Cue {
     pub text: String,
 }
 
-/// Parse caption or whisper WebVTT bytes into cleaned timed cues.
+/// Parse caption or Whisper WebVTT bytes into timed cues.
 ///
-/// The four cleaning passes are deliberate and ordered: parse/tag cleanup,
-/// adjacent duplicate removal, rolling-prefix collapse, then a final duplicate
-/// sweep for equal cues exposed by the collapse.
-pub fn parse_vtt(input: &[u8]) -> Result<Vec<Cue>, CaptureError> {
+/// `cleanup` decides whether the auto-caption cleaning passes run at all. They
+/// exist for the rolling encoder behind YouTube's automatic captions and would
+/// delete words from any track whose cues are already distinct, so a human
+/// caption track and a Whisper transcript are parsed verbatim.
+pub fn parse_vtt(input: &[u8], cleanup: CueCleanup) -> Result<ParsedVtt, CaptureError> {
     if input.len() > MAX_VTT_BYTES {
         return invalid(format!("VTT exceeds the {MAX_VTT_BYTES}-byte limit"));
     }
@@ -35,14 +78,29 @@ pub fn parse_vtt(input: &[u8]) -> Result<Vec<Cue>, CaptureError> {
         .map_err(|error| CaptureError::InvalidVtt(format!("VTT is not valid UTF-8: {error}")))?;
     let lines = bounded_lines(text)?;
     let index = cue_data_start(&lines)?;
-    let cues = parse_raw_cues(&lines, index)?;
-    let cues = merge_adjacent_duplicates(cues);
-    let cues = collapse_rolling_prefixes(cues);
-    let cues = merge_adjacent_duplicates(cues);
+    let raw_cues = parse_raw_cues(&lines, index)?;
+    let raw_cue_count = raw_cues.len();
+    let cues = match cleanup {
+        CueCleanup::RollingCaptions => clean_rolling_captions(raw_cues),
+        CueCleanup::Verbatim => raw_cues,
+    };
     if cues.is_empty() {
         return invalid("VTT contains no usable cues");
     }
-    Ok(cues)
+    Ok(ParsedVtt {
+        merged_cue_count: raw_cue_count.saturating_sub(cues.len()),
+        cues,
+    })
+}
+
+/// The three cleaning passes are deliberate and ordered: adjacent duplicate
+/// removal, rolling-prefix collapse, then a final duplicate sweep for equal
+/// cues the collapse exposed. Every pass folds a cue only into a neighbour it
+/// is within [`ROLLING_GAP_MS`] of, so no cue can absorb distant speech.
+fn clean_rolling_captions(cues: Vec<Cue>) -> Vec<Cue> {
+    let cues = merge_adjacent_duplicates(cues);
+    let cues = collapse_rolling_prefixes(cues);
+    merge_adjacent_duplicates(cues)
 }
 
 fn cue_data_start(lines: &[&str]) -> Result<usize, CaptureError> {
@@ -292,13 +350,18 @@ fn strip_inline_tags(line: &str) -> Result<String, CaptureError> {
     Ok(output)
 }
 
+/// Two cues may only be folded together when the later one starts while the
+/// earlier is still on screen, or just after it. A wider gap is separate speech.
+fn within_rolling_gap(previous_end_ms: u64, next_start_ms: u64) -> bool {
+    next_start_ms <= previous_end_ms.saturating_add(ROLLING_GAP_MS)
+}
+
 fn merge_adjacent_duplicates(cues: Vec<Cue>) -> Vec<Cue> {
     let mut merged: Vec<Cue> = Vec::with_capacity(cues.len());
     for cue in cues {
-        if let Some(previous) = merged
-            .last_mut()
-            .filter(|previous| previous.text == cue.text)
-        {
+        if let Some(previous) = merged.last_mut().filter(|previous| {
+            previous.text == cue.text && within_rolling_gap(previous.end_ms, cue.start_ms)
+        }) {
             previous.start_ms = previous.start_ms.min(cue.start_ms);
             previous.end_ms = previous.end_ms.max(cue.end_ms);
         } else {
@@ -316,7 +379,9 @@ fn collapse_rolling_prefixes(cues: Vec<Cue>) -> Vec<Cue> {
         let mut group_end = first.end_ms;
         let mut last = first;
         while cues.peek().is_some_and(|next| {
-            next.text.len() > last.text.len() && next.text.starts_with(&last.text)
+            next.text.len() > last.text.len()
+                && next.text.starts_with(&last.text)
+                && within_rolling_gap(last.end_ms, next.start_ms)
         }) {
             let next = cues.next().expect("peeked rolling cue exists");
             group_start = group_start.min(next.start_ms);

@@ -1,6 +1,6 @@
 use super::process::{EnvironmentPolicy, ProcessSpec};
 use super::SANITIZED_PATH;
-use neuralnote_core::capture::{parse_vtt, CaptureError, MAX_VTT_BYTES};
+use neuralnote_core::capture::{parse_vtt, CaptureError, CueCleanup, MAX_VTT_BYTES};
 use std::collections::BTreeMap;
 use std::ffi::OsString;
 use std::io::Read;
@@ -105,7 +105,7 @@ pub(super) async fn read_output_vtt(output_prefix: &Path) -> Result<Vec<u8>, Cap
     }
 
     let bytes = read_bounded_regular_file(found).await?;
-    parse_vtt(&bytes)?;
+    parse_vtt(&bytes, CueCleanup::Verbatim)?;
     Ok(bytes)
 }
 

@@ -371,6 +371,56 @@ fn transcript_sources(events: &[ChatEvent]) -> Vec<(String, Option<String>)> {
         .collect()
 }
 
+/// The nine words a rolling caption chain reveals one at a time.
+const ROLLING_WORDS: [&str; 9] = [
+    "we", "build", "notes", "from", "the", "sources", "you", "actually", "read",
+];
+
+/// A rolling caption payload: nine cues four seconds apart, each re-sending the
+/// previous cue's words and adding one more. That shape is the only one the
+/// rolling collapse can touch, so it is the only one that can tell the two
+/// cleanup policies apart. The chain deliberately outruns the renderer's
+/// thirty-second paragraph span, so a wrongly applied collapse shows up as a lost
+/// timestamp anchor and not merely as lost words.
+fn rolling_caption_vtt() -> Vec<u8> {
+    let mut vtt = String::from("WEBVTT\n");
+    let mut spoken_so_far = String::new();
+    for (index, word) in ROLLING_WORDS.iter().enumerate() {
+        if !spoken_so_far.is_empty() {
+            spoken_so_far.push(' ');
+        }
+        spoken_so_far.push_str(word);
+        let start_seconds = index as u64 * 4;
+        vtt.push_str(&format!(
+            "\n{} --> {}\n{spoken_so_far}\n",
+            vtt_timestamp(start_seconds),
+            vtt_timestamp(start_seconds + 4)
+        ));
+    }
+    vtt.into_bytes()
+}
+
+fn vtt_timestamp(seconds: u64) -> String {
+    format!(
+        "{:02}:{:02}:{:02}.000",
+        seconds / 3_600,
+        (seconds % 3_600) / 60,
+        seconds % 60
+    )
+}
+
+/// Every cue of a verbatim parse keeps its own words, and cue `n` carries the
+/// first `n` words of the sentence — so the transcript counts every prefix.
+fn every_rolling_prefix_word_count() -> u64 {
+    (1..=ROLLING_WORDS.len() as u64).sum()
+}
+
+/// How many timestamped source jump targets the transcript carries. Every one is
+/// a citation anchor, so losing one loses the moment a quote can be traced to.
+fn source_anchor_count(transcript: &str) -> usize {
+    transcript.matches("](https://youtu.be/").count()
+}
+
 #[test]
 fn fetched_captions_report_their_provenance_on_the_wire() {
     // Provenance used to reach the UI only by regexing `captions:` out of the
@@ -397,6 +447,100 @@ fn fetched_captions_report_their_provenance_on_the_wire() {
         "the label on the wire must be the one the tool reported to the model"
     );
     assert_eq!(transcript_sources(&events)[0].0, "captions:en");
+}
+
+#[test]
+fn a_human_caption_track_reaches_the_parser_verbatim() {
+    // Proving the parser honours a `Verbatim` argument proves nothing about what
+    // a human track is actually handed — that decision belongs to the caller, so
+    // it has to be driven through the caller. Under the rolling collapse eight of
+    // these nine cues would be deleted and the survivor re-anchored to the start,
+    // which is precisely what must never happen to a track the rolling encoder
+    // never produced.
+    let io = ScriptedYoutubeIo::new(metadata(r#"{"en":[{"ext":"vtt"}]}"#, "{}"));
+    io.push_caption(Ok(CaptionPayload {
+        vtt: rolling_caption_vtt(),
+        annotations: Vec::new(),
+    }));
+
+    let result = call(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_CAPTIONS,
+        &format!(r#"{{"url":"{URL}","lang":"en"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(
+        value["provenance"].as_str().unwrap(),
+        "captions:en",
+        "the human track is the one under test"
+    );
+    let transcript = value["transcript"].as_str().unwrap();
+    assert_eq!(
+        value["word_count"].as_u64().unwrap(),
+        every_rolling_prefix_word_count(),
+        "every cue keeps its own words: {transcript}"
+    );
+    assert!(
+        !transcript.contains("merged"),
+        "a human track has no rolling duplicates to merge: {transcript}"
+    );
+    assert!(
+        transcript.contains(
+            "[00:00:32](https://youtu.be/iG9CE55wbtY?t=32) we build notes from the sources you actually read"
+        ),
+        "the last cue keeps its own anchor rather than the first cue's: {transcript}"
+    );
+    assert_eq!(
+        source_anchor_count(transcript),
+        2,
+        "collapsing the track would leave a single anchor: {transcript}"
+    );
+}
+
+#[test]
+fn an_automatic_caption_track_is_collapsed_and_names_the_folded_cues() {
+    // The other half of the same decision: the rolling encoder's own output must
+    // still be cleaned, and the folded cues must be named rather than vanish.
+    let io = ScriptedYoutubeIo::new(metadata("{}", r#"{"en":[{"ext":"vtt"}]}"#));
+    io.push_caption(Ok(CaptionPayload {
+        vtt: rolling_caption_vtt(),
+        annotations: Vec::new(),
+    }));
+
+    let result = call(
+        &io,
+        &mut YoutubeToolSession::default(),
+        &environment(false),
+        TOOL_FETCH_CAPTIONS,
+        &format!(r#"{{"url":"{URL}","lang":"en"}}"#),
+    );
+
+    assert_eq!(result.outcome, ToolOutcome::Action);
+    let value: serde_json::Value = serde_json::from_str(&result.content).unwrap();
+    assert_eq!(
+        value["provenance"].as_str().unwrap(),
+        "captions:en-auto",
+        "the automatic track is the one under test"
+    );
+    let transcript = value["transcript"].as_str().unwrap();
+    assert_eq!(
+        value["word_count"].as_u64().unwrap(),
+        ROLLING_WORDS.len() as u64,
+        "the rolling chain collapses to the words actually spoken: {transcript}"
+    );
+    assert!(
+        transcript.contains("note: 8 duplicate cues merged"),
+        "a collapse is never silent: {transcript}"
+    );
+    assert_eq!(
+        source_anchor_count(transcript),
+        1,
+        "the collapsed chain is one span with one anchor: {transcript}"
+    );
 }
 
 #[test]

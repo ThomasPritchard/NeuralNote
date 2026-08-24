@@ -2,7 +2,7 @@ use super::live_eval::{configured_ytdlp, prepare_app_data, prove_runnable, skip_
 use super::process::TokioProcessRunner;
 use super::service::ShellYoutubeIo;
 use neuralnote_core::ai::{CaptionRequest, CaptureCancellation, PotMode, YoutubeIo, YoutubeUrl};
-use neuralnote_core::capture::{parse_vtt, CaptionSource, CaptureError};
+use neuralnote_core::capture::{parse_vtt, CaptionSource, CaptureError, CueCleanup};
 use std::sync::Arc;
 
 fn external_live_failure(error: &CaptureError) -> bool {
@@ -68,9 +68,15 @@ async fn run_caption_case(case: &str, video_id: &str, source: CaptionSource) {
         }
         Err(error) => panic!("{case} failed inside the shell YouTube boundary: {error}"),
     };
-    let cues = parse_vtt(&payload.vtt)
+    // The same conversion production uses, not a copy of it: a second mapping
+    // here could drift from `render_caption_payload` and this test would still
+    // pass while shipping the wrong policy.
+    let parsed = parse_vtt(&payload.vtt, CueCleanup::from(source))
         .unwrap_or_else(|error| panic!("{case} returned VTT that core rejected: {error}"));
-    assert!(!cues.is_empty(), "{case} returned no parsed caption cues");
+    assert!(
+        !parsed.cues.is_empty(),
+        "{case} returned no parsed caption cues"
+    );
 }
 
 #[tokio::test]
