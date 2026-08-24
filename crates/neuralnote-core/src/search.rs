@@ -15,7 +15,7 @@ use caseless::Caseless;
 use crate::error::CoreResult;
 use crate::links::mask_code;
 use crate::model::{FileHit, SearchMatch, SearchResponse, TreeNode};
-use crate::note::{self, decode_note_text, parse_frontmatter, title_and_body, title_from, Parsed};
+use crate::note::{self, parse_frontmatter, title_and_body, title_from, Parsed};
 use crate::tree::{read_tree, text_note_files};
 use icu_properties::{props::GeneralCategory, CodePointMapData, CodePointMapDataBorrowed};
 use std::borrow::Cow;
@@ -57,7 +57,7 @@ pub fn search_vault(root: &Path, query: &str) -> CoreResult<SearchResponse> {
 /// `injected` lets a caller feed in content an EARLIER search in the same chat run
 /// already loaded (retrieval's run-scoped pool, issue #67): keyed by the same
 /// absolute path, a hit is scanned in place instead of re-reading that file from
-/// disk. A pooled entry was itself produced by this function's `decode_note_text`,
+/// disk. A pooled entry was itself produced by this function's bounded read,
 /// so — for identical file bytes — it is byte-identical to a fresh read via the ONE
 /// shared decode policy (issue #33); an exact-path miss falls back to a disk read.
 /// The only residual doubt is within-run staleness (the file changed after it was
@@ -109,8 +109,9 @@ fn search_vault_inner(
     let mut skipped_files: u32 = 0;
 
     for node in text_note_files(&tree) {
-        // An unreadable file is skipped loudly — logged by the loader, counted here
-        // — never fatal.
+        // A file whose text cannot be taken — unreadable, or past the readable-note
+        // limit (issue #210) — is skipped loudly: the loader logs the reason, it is
+        // counted here, and it is never fatal.
         let Some(raw) = note_scan_text(node, injected) else {
             skipped_files = skipped_files.saturating_add(1);
             continue;
@@ -155,16 +156,19 @@ fn search_vault_inner(
 ///
 /// A pooled value is reused only on an EXACT absolute-path key — the same string
 /// as [`FileHit::path`] — so a mismatched path can never inject the wrong file
-/// (issue #67); and that value is itself this scan's own `decode_note_text`
-/// output, so for identical file bytes it equals a fresh read by construction. A
-/// path the pool does not cover falls back to a disk read, decoded via the ONE
-/// shared policy [`decode_note_text`] so the text search indexes is byte-identical
-/// to what the reader ([`crate::note::read_note`]) presents — a Latin-1 note is
-/// searchable exactly as shown, and the citation moat (retrieval reusing this
-/// content, then hashing it to match the reader's) holds by construction, not
-/// coincidence (issue #33).
+/// (issue #67); and that value is itself this scan's own bounded read, so for
+/// identical file bytes it equals a fresh read by construction. A path the pool
+/// does not cover falls back to a disk read through the ONE shared policy
+/// [`crate::note::scan_note_text`] — the reader's own ceiling and the reader's own
+/// decode — so the text search indexes is byte-identical to what the reader
+/// ([`crate::note::read_note`]) presents (a Latin-1 note is searchable exactly as
+/// shown, issue #33) and a note the reader refuses as over-cap is never scanned
+/// whole (issue #210). Both halves of the citation moat hold by construction:
+/// retrieval reuses this content and hashes it expecting the reader's hash, which
+/// an over-cap note has no way to produce.
 ///
-/// `None` means the file could not be read: logged here, counted as skipped by the
+/// `None` means the file's text could not be taken — unreadable, or past the
+/// readable-note limit: logged here with the reason, counted as skipped by the
 /// caller.
 fn note_scan_text<'a>(
     node: &TreeNode,
@@ -176,10 +180,10 @@ fn note_scan_text<'a>(
     if let Some(content) = pooled {
         return Some(Cow::Borrowed(content));
     }
-    match std::fs::read(&node.path) {
-        Ok(bytes) => Some(Cow::Owned(decode_note_text(bytes).0)),
-        Err(e) => {
-            log::warn!("search: skipping unreadable file {}: {e}", node.path);
+    match note::scan_note_text(Path::new(&node.path)) {
+        Ok(raw) => Some(Cow::Owned(raw)),
+        Err(skip) => {
+            log::warn!("search: skipping file {} — {skip}", node.path);
             None
         }
     }
