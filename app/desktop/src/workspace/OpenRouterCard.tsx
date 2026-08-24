@@ -8,6 +8,7 @@ import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
 import type { AiStatus } from "../lib/types";
 import { buttonVariants } from "@/components/ui/button";
+import { API_KEY_HANDLING_MESSAGE } from "./credentialCopy";
 import { KeyChangeCaveat } from "./KeyChangeCaveat";
 import { FIELD, LABEL } from "./KeySetupPanel";
 import { InlineError, ProviderCard } from "./ProviderCard";
@@ -164,8 +165,7 @@ export function OpenRouterCard({
           </>
         ) : (
           <span className="text-muted-foreground">
-            No key connected yet. Your key is stored in the OS keychain and
-            never leaves this machine.
+            No key connected yet. {API_KEY_HANDLING_MESSAGE}
           </span>
         )}
       </p>

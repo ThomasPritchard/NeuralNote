@@ -5,6 +5,7 @@
 import { useState } from "react";
 import { KeyRound, Sparkles } from "lucide-react";
 import { buttonVariants } from "@/components/ui/button";
+import { API_KEY_HANDLING_MESSAGE } from "./credentialCopy";
 
 // Exported so the settings page's key form (AiSettingsPage) shares the exact
 // field idiom — two key UIs that can't drift apart.
@@ -40,8 +41,7 @@ export function KeySetupPanel({
         </span>
         <p className="text-[0.875rem] font-medium text-foreground/90">Connect an AI key</p>
         <p className="mx-auto max-w-[17rem] text-[0.75rem] leading-relaxed text-muted-foreground">
-          Add an OpenRouter key to chat with your vault. Your key is stored in the
-          OS keychain, so it never leaves this machine.
+          Add an OpenRouter key to chat with your vault. {API_KEY_HANDLING_MESSAGE}
         </p>
       </div>
 
