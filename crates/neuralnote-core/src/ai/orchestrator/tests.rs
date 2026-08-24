@@ -2,7 +2,7 @@ use super::citations::{extract_cited_ids, strip_cited_markers};
 use super::collect::{round_beacon, EvidenceCollection, RETRY_BACKOFF};
 use super::context_budget::{
     context_window_tokens, estimate_tokens, fit_prompt_to_window, total_tokens,
-    ANSWER_RESERVE_TOKENS, LOCAL_CONTEXT_WINDOW_TOKENS, PROMPT_OVERHEAD_TOKENS,
+    ANSWER_RESERVE_TOKENS, LOCAL_CONTEXT_WINDOW_TOKENS, PROMPT_OVERHEAD_TOKENS, TRUNCATION_MARKER,
 };
 use super::coverage::{emit_coverage, CoverageAcc};
 use super::history::{prepare_history, MAX_HISTORY_CHARS};
@@ -3599,6 +3599,28 @@ fn fit_prompt_to_window_leaves_a_large_cloud_window_untouched() {
 }
 
 #[test]
+fn fit_prompt_to_window_leaves_a_prompt_that_already_fits_byte_for_byte() {
+    // The other side of the small LOCAL window, where trimming actually bites: a prompt
+    // comfortably inside the budget comes back identical, reporting no loss. Every other
+    // test here drives the pass OVER the window, so without this a slip that trimmed
+    // every droppable message — the user's own question included — would still pass.
+    let mut messages = vec![
+        LlmMessage::system(SYSTEM_PROMPT),
+        LlmMessage::user("what did I write about rust?"),
+    ];
+    messages.extend(evidence_round(0, "a short note about rust".into()));
+    assert!(
+        total_tokens(&messages) <= local_input_budget(),
+        "setup: this prompt must already fit the local budget"
+    );
+
+    let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL, None);
+
+    assert!(!out.lost, "a prompt that fits must report no coverage loss");
+    assert_eq!(out.messages, messages);
+}
+
+#[test]
 fn fit_prompt_to_window_prefers_the_reported_window_over_the_curated_default() {
     // The client-reported window is authoritative: it is the window the provider
     // will actually enforce (the local client reports the `num_ctx` it sends).
@@ -3686,6 +3708,102 @@ fn fit_prompt_to_window_head_truncates_a_single_oversized_evidence() {
         .unwrap()
         .contains("trimmed to fit"));
     assert!(total_tokens(&out.messages) <= local_input_budget());
+}
+
+#[test]
+fn fit_prompt_to_window_truncates_every_oversized_force_kept_message() {
+    // TWO oversized messages are force-kept together — the pinned user question and
+    // the newest evidence unit — so a single truncation pass cannot recover: it trims
+    // the larger one to the bare marker and the other's overflow survives untouched.
+    // The prompt then shipped OVER the window with only `lost` recorded, which is the
+    // silent front-truncation this whole pass exists to prevent. The trim must keep
+    // going until its own post-condition (`total <= budget`) actually holds.
+    let mut messages = vec![
+        LlmMessage::system(SYSTEM_PROMPT),
+        LlmMessage::user("配".repeat(20_000)),
+    ];
+    messages.extend(evidence_round(0, "配".repeat(20_000)));
+
+    let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL, None);
+
+    assert!(out.lost);
+    assert_eq!(out.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
+    assert!(
+        total_tokens(&out.messages) <= local_input_budget(),
+        "trimmed prompt still exceeds the window: {} > {}",
+        total_tokens(&out.messages),
+        local_input_budget()
+    );
+    // Both force-kept messages had to give — neither escapes the trim.
+    for message in out.messages.iter().filter(|m| m.role != Role::System) {
+        if let Some(content) = message.content.as_deref() {
+            assert!(
+                content.contains("trimmed to fit"),
+                "an oversized force-kept message escaped truncation: {content:.80}"
+            );
+        }
+    }
+}
+
+#[test]
+fn fit_prompt_to_window_stops_at_its_floor_when_the_budget_cannot_be_met() {
+    // A window so small the input budget is ZERO — smaller than the truncation marker
+    // itself. Grounding is never truncated, so no amount of trimming can make this
+    // fit. The deliberate end state is the floor: every droppable message down to the
+    // bare marker, grounding byte-for-byte intact, `lost` set so the caller surfaces
+    // the coverage loss. The pass must reach that floor and STOP, not spin.
+    let mut messages = vec![
+        LlmMessage::system(SYSTEM_PROMPT),
+        LlmMessage::user("配".repeat(2_000)),
+    ];
+    messages.extend(evidence_round(0, "配".repeat(2_000)));
+
+    let out = fit_prompt_to_window(&messages, crate::ai::DEFAULT_LOCAL_MODEL, Some(1));
+
+    assert!(out.lost);
+    assert_eq!(out.messages[0].content.as_deref(), Some(SYSTEM_PROMPT));
+    for message in out.messages.iter().filter(|m| m.role != Role::System) {
+        if let Some(content) = message.content.as_deref() {
+            assert_eq!(
+                content, TRUNCATION_MARKER,
+                "every droppable message must be trimmed to the floor"
+            );
+        }
+    }
+}
+
+#[test]
+fn fit_prompt_to_window_reports_loss_when_nothing_can_be_trimmed_to_fit() {
+    // The floor's OTHER shape. A window at the reserve+overhead line drives the input
+    // budget to ZERO, and the only droppable message — the pinned question — is already
+    // SHORTER than TRUNCATION_MARKER, so trimming it would GROW the prompt and the trim
+    // correctly declines to touch it. Nothing is truncated, yet the prompt still goes
+    // out over the window for the provider to front-truncate or reject. That is a
+    // coverage loss, and `lost` is the only channel that surfaces it — inferring `lost`
+    // from "did the trim change anything?" leaves the footer silent here.
+    let messages = vec![
+        LlmMessage::system(SYSTEM_PROMPT),
+        LlmMessage::user("summarise my notes on rust"),
+    ];
+    assert!(
+        estimate_tokens("summarise my notes on rust") < estimate_tokens(TRUNCATION_MARKER),
+        "setup: the question must be shorter than the marker, or the trim could shrink it"
+    );
+
+    let out = fit_prompt_to_window(
+        &messages,
+        crate::ai::DEFAULT_LOCAL_MODEL,
+        Some(ANSWER_RESERVE_TOKENS + PROMPT_OVERHEAD_TOKENS),
+    );
+
+    assert!(
+        out.lost,
+        "a prompt still over the window must report coverage loss even when nothing \
+         could be trimmed"
+    );
+    // The floor itself is unchanged: grounding intact, and an untrimmable message is
+    // left alone rather than rewritten with something no smaller.
+    assert_eq!(out.messages, messages);
 }
 
 #[test]
