@@ -35,6 +35,7 @@ export function ToolApprovalSheet({
   approval,
   turnId,
   dormant,
+  announceStatus = true,
 }: Readonly<{
   approval: ToolApprovalView;
   /** The owning run's id, sent with the answer so the Rust shell resolves this
@@ -44,6 +45,8 @@ export function ToolApprovalSheet({
    *  approval down, so the controls go — an answerable-looking security sheet
    *  that silently no-ops is worse than an honest dead one. */
   dormant: boolean;
+  /** v1 routes all polite announcements through its single action line. */
+  announceStatus?: boolean;
 }>) {
   const [submitting, setSubmitting] = useState(false);
   /** Flipped when `answer_tool_approval` reports "not live": the request expired
@@ -103,6 +106,11 @@ export function ToolApprovalSheet({
   };
 
   const expiry = expiryLine(approval.expiresInSecs);
+  const statusMessage = expired
+    ? "This request expired — nothing ran."
+    : dormant
+      ? "The run ended before this was answered — nothing ran."
+      : "";
   return (
     <section
       ref={containerRef}
@@ -186,10 +194,15 @@ export function ToolApprovalSheet({
 
       {/* Always-mounted status slot: reads as padding while empty, announces the
           expired/ended transitions politely and without a layout jump. */}
-      <output className="min-h-4 text-[0.625rem] leading-snug text-muted-foreground/70">
-        {expired && "This request expired — nothing ran."}
-        {!expired && dormant && "The run ended before this was answered — nothing ran."}
-      </output>
+      {announceStatus ? (
+        <output className="min-h-4 text-[0.625rem] leading-snug text-muted-foreground/70">
+          {statusMessage}
+        </output>
+      ) : (
+        <p className="min-h-4 text-[0.625rem] leading-snug text-muted-foreground/70">
+          {statusMessage}
+        </p>
+      )}
 
       {error && (
         <p

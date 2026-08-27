@@ -45,7 +45,12 @@ export type { CoreError } from "./bindings/CoreError";
 
 // ── Generated: AI cited chat (events.rs + desktop ai.rs) ──────────────────────
 export type { ApiKeyStatus } from "./bindings/ApiKeyStatus";
+export type { AgentActivityEnvelope } from "./bindings/AgentActivityEnvelope";
+export type { AgentActivityPayload } from "./bindings/AgentActivityPayload";
+export type { ActivityAbandonReason } from "./bindings/ActivityAbandonReason";
 export type { ChatEvent } from "./bindings/ChatEvent";
+export type { CycleSummarySource } from "./bindings/CycleSummarySource";
+export type { CycleSummaryProtocolIssue } from "./bindings/CycleSummaryProtocolIssue";
 export type { CancelChatRunOutcome } from "./bindings/CancelChatRunOutcome";
 export type { CancelChatRunStatus } from "./bindings/CancelChatRunStatus";
 export type { Elicitation } from "./bindings/Elicitation";
@@ -62,6 +67,7 @@ export type { ApprovalStatus } from "./bindings/ApprovalStatus";
 export type { PlanStep } from "./bindings/PlanStep";
 export type { PlaylistPosition } from "./bindings/PlaylistPosition";
 export type { StepStatus } from "./bindings/StepStatus";
+export type { ThinkingSource } from "./bindings/ThinkingSource";
 export type { UndoReport } from "./bindings/UndoReport";
 export type { UndoFileResult } from "./bindings/UndoFileResult";
 export type { UndoFileStatus } from "./bindings/UndoFileStatus";

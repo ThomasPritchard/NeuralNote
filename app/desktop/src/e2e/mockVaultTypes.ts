@@ -4,6 +4,7 @@
 // re-exports everything a test imports, so the public surface is unchanged.
 
 import type {
+  AgentActivityEnvelope,
   CandidateModel,
   ChatEvent,
   CoreError,
@@ -58,6 +59,8 @@ export type Entry =
 export type SeedEntry =
   | { kind: "folder"; relPath: string }
   | { kind: "file"; relPath: string; content?: string; unreadable?: boolean };
+
+export type MockChatFrame = ChatEvent | AgentActivityEnvelope;
 
 export interface CreateMockVaultOptions {
   /** Initial tree contents. Ancestor folders are auto-created. */
@@ -125,16 +128,23 @@ export interface CreateMockVaultOptions {
    *  once the script is drained. A `toolApprovalRequested` event pauses the same
    *  way — the gate blocks the dispatch until `answer_tool_approval` lands. */
   chatScript?: ChatEvent[];
+  /** Explicit envelope-v1 counterpart to `chatScript`. Keep `chatScript` for
+   *  deliberate legacy-adapter journeys; setting both is a fixture error. */
+  activityScript?: AgentActivityEnvelope[];
+  /** Build an envelope-v1 script after the real composer-generated turn id is
+   *  known. The factory's envelopes are replayed verbatim: unlike a fixture
+   *  convenience rewriter, this keeps deliberate wrong-turn tests meaningful. */
+  activityScriptFactory?: (turnId: string) => AgentActivityEnvelope[];
   /** How a scripted run continues once a parked `toolApprovalRequested` is
    *  answered. The branch IS the journey: an approved call goes on to dispatch
    *  and write, a denied one must not — and "no write happened" only means
    *  something if the approved arm proves the same script would have written.
    *  Absent, both answers replay the script's own remainder. */
-  approvalTails?: { approved: ChatEvent[]; denied: ChatEvent[] };
+  approvalTails?: { approved: MockChatFrame[]; denied: MockChatFrame[] };
   /** Pause a scripted chat after this many frames until `cancel_chat_run`.
    *  The optional tail is then streamed as the backend's honest wind-down. */
   cancelChatAfterEvents?: number;
-  cancelChatTail?: ChatEvent[];
+  cancelChatTail?: MockChatFrame[];
   /** Test-only mirror of the implementation-authored folder picker that writes
    *  the selected route to `.neuralnote/profile.json`. */
   profileFolderElicitationId?: string;

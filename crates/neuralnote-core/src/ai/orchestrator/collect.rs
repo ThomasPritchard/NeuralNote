@@ -25,6 +25,7 @@ use crate::ai::evidence::EvidenceRegistry;
 use crate::ai::llm::{Completion, LlmMessage, LlmRequest};
 use crate::ai::plan::RunPlan;
 use crate::ai::skills::ActiveSkills;
+use crate::ai::tool_turn_presentation::ToolTurnPresentation;
 use crate::ai::tools;
 use crate::ai::write_policy::WriteSession;
 use crate::ai::youtube::YoutubeToolSession;
@@ -94,9 +95,13 @@ impl ChatSession<'_> {
             ));
             // This tool-DECIDING turn is idempotent (no tool has run yet), so a single
             // transient transport failure is retried once rather than aborting the run.
-            let completion = self
-                .complete_tool_turn(&self.request(&budgeted.messages, &tools), sink)
+            let completed = self
+                .complete_tool_turn_with_presentation(
+                    &self.request(&budgeted.messages, &tools),
+                    sink,
+                )
                 .await?;
+            let completion = completed.completion;
             consumed += 1;
             if completion.tool_calls.is_empty() {
                 match handle_empty_tool_turn(messages, youtube_session, sink, &mut playlist) {
@@ -116,6 +121,7 @@ impl ChatSession<'_> {
             let control = self
                 .handle_tool_calls(
                     &completion.tool_calls,
+                    completed.presentation,
                     messages,
                     active_skills,
                     writes,
@@ -144,39 +150,59 @@ impl ChatSession<'_> {
     /// dispatch happens after this returns — so a retry can never double-execute a
     /// tool. And, historically, the turn emitted nothing, so a retry was invisible.
     ///
-    /// That second half no longer holds by construction: this turn is now streamed
-    /// ([`LlmClient::complete_tool_streaming`]), and a client that streams it emits
-    /// live note previews as it goes. **So the turn is never retried once anything
-    /// has been emitted** — a replay would stream a second copy of a half-composed
-    /// note over the first, and the user would watch their note rewind. The guard
-    /// spans the whole loop, not one attempt: an attempt that emitted and then
-    /// failed bars every later attempt too. A client on the default (non-streaming)
-    /// implementation emits nothing, so its retry behaviour is unchanged.
+    /// This turn is now streamed ([`LlmClient::complete_tool_streaming`]), but note
+    /// previews remain private until the complete tool batch can be pre-scanned.
+    /// A failed attempt discards those buffered previews, so it can still be retried
+    /// safely. Any event that is forwarded immediately (for example, Thinking) is
+    /// guarded across the whole loop and bars every later attempt because replaying
+    /// it would expose duplicate user-visible output.
     ///
     /// A non-transient failure or a user-stopped run is never retried either.
     ///
-    /// **The caller announces the round before calling this** (#126). Nothing else
-    /// can reach the user during this turn — only a `write_note` preview can, and
-    /// only on a provider that streams tool calls — so an answered question was
-    /// followed by a whole round-trip of silence, and by TWO on a provider that
-    /// does not stream tool turns and re-runs the turn buffered. The pane went on
-    /// showing whichever phase word it last had ("searching", while the model was
-    /// composing). [`ChatEvent::PlanningRound`], emitted by `collect_evidence`
-    /// outside the guard below, is the honest correction.
+    /// **The caller announces the round before calling this** (#126). Thinking and
+    /// other provider status may also reach the user during the turn; note previews
+    /// do not become visible until the completed batch is handed to the presentation
+    /// layer. [`ChatEvent::PlanningRound`], emitted by `collect_evidence` outside the
+    /// guard below, still prevents a silent tool-decision round.
+    #[cfg(test)]
     pub(super) async fn complete_tool_turn(
         &self,
         request: &LlmRequest,
         sink: &mut dyn EventSink,
     ) -> CoreResult<Completion> {
+        Ok(self
+            .complete_tool_turn_with_presentation(request, sink)
+            .await?
+            .completion)
+    }
+
+    async fn complete_tool_turn_with_presentation(
+        &self,
+        request: &LlmRequest,
+        sink: &mut dyn EventSink,
+    ) -> CoreResult<CompletedToolTurn> {
         let mut retries = MAX_COMPLETE_RETRIES;
         let mut sink = EmissionGuard {
             inner: sink,
             emitted: false,
         };
         loop {
-            match self.llm.complete_tool_streaming(request, &mut sink).await {
-                Ok(completion) => return Ok(completion),
+            let mut presentation = ToolTurnPresentation::default();
+            let result = {
+                let mut presentation_sink = presentation.sink(&mut sink);
+                self.llm
+                    .complete_tool_streaming(request, &mut presentation_sink)
+                    .await
+            };
+            match result {
+                Ok(completion) => {
+                    return Ok(CompletedToolTurn {
+                        completion,
+                        presentation,
+                    });
+                }
                 Err(error) => {
+                    presentation.discard();
                     let retryable = retries > 0
                         && error.is_retryable()
                         && !self.run_cancelled()
@@ -202,6 +228,11 @@ impl ChatSession<'_> {
     fn run_cancelled(&self) -> bool {
         self.skill_services.capture_cancellation.is_cancelled()
     }
+}
+
+struct CompletedToolTurn {
+    completion: Completion,
+    presentation: ToolTurnPresentation,
 }
 
 /// The beacon for the round about to run: its 1-based number, and the ceiling to

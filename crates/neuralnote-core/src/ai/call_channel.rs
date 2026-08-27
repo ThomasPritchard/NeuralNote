@@ -49,8 +49,8 @@ impl<'a> CallChannel<'a> {
     /// item. See [`ChatEvent::VideoPreview`].
     pub(super) fn video_preview(&mut self, preview: ChatEvent) {
         debug_assert!(
-            matches!(preview, ChatEvent::VideoPreview { .. }),
-            "video_preview carries only a VideoPreview"
+            matches!(&preview, ChatEvent::VideoPreview { id, .. } if id == self.call_id),
+            "video_preview carries only this call's VideoPreview"
         );
         self.sink.send(preview);
     }
@@ -59,6 +59,7 @@ impl<'a> CallChannel<'a> {
     /// No note exists at this point, hence no `rel_path`.
     pub(super) fn transcript_source(&mut self, label: impl Into<String>) {
         self.sink.send(ChatEvent::TranscriptSource {
+            id: self.call_id.to_string(),
             label: label.into(),
             rel_path: None,
         });

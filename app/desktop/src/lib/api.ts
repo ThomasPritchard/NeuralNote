@@ -24,11 +24,11 @@ import type {
   ApprovalMode,
   AppPreferences,
   AppPreferencesLoad,
+  AgentActivityEnvelope,
   ApiKeyStatus,
   Backlinks,
   CandidateModel,
   CancelChatRunOutcome,
-  ChatEvent,
   ChatTurn,
   CoreError,
   DirListing,
@@ -294,20 +294,18 @@ export const saveApiKey = (key: string, model: string) =>
 export const clearApiKey = () =>
   sequenceAiConfigMutation(() => invoke<KeyChangeOutcome>("clear_api_key"));
 
-/** Run one cited-chat turn. `onEvent` fires for each streamed `ChatEvent`
- *  (searching / reading / verifying / answer / citation / coverage) as it
- *  happens; the returned promise resolves when the run ends (after its `done` or
- *  `error` event) with the run id used by Undo. The API key stays Rust-side —
- *  only the prompt, prior turns, and explicitly selected skills cross the
- *  boundary. */
+/** Run one cited-chat turn. `onEvent` receives the backend-sequenced activity
+ *  envelopes in causal order; the returned promise resolves when the run ends
+ *  with the run id used by Undo. The API key stays Rust-side — only the prompt,
+ *  prior turns, and explicitly selected skills cross the boundary. */
 export const chat = (
   turnId: string,
   prompt: string,
   history: ChatTurn[],
-  onEvent: (event: ChatEvent) => void,
+  onEvent: (event: AgentActivityEnvelope) => void,
   activeSkills: string[] = [],
 ): Promise<string> => {
-  const channel = new Channel<ChatEvent>();
+  const channel = new Channel<AgentActivityEnvelope>();
   // eslint-disable-next-line unicorn/prefer-add-event-listener -- Tauri Channel exposes only `onmessage`; it has no addEventListener.
   channel.onmessage = onEvent;
   return invoke<string>("chat", {

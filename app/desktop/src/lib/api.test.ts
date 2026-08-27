@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, expectTypeOf, it, vi } from "vitest";
 
 // Mock the Tauri boundary so the typed wrappers can be driven in jsdom (which has
 // no Tauri runtime). Every wrapper funnels through `invoke`; `onTreeChanged` uses
@@ -61,7 +61,7 @@ import {
   undoSkillRun,
   writeNote,
 } from "./api";
-import type { AiStatus, ChatEvent, PullEvent } from "./types";
+import type { AgentActivityEnvelope, AiStatus, PullEvent } from "./types";
 import { ALWAYS_ASK_APPROVAL_STATUS } from "./approvalStatusFixture";
 
 const mockInvoke = vi.mocked(invoke);
@@ -290,15 +290,23 @@ describe("skills-bank wrappers", () => {
     const onEvent = vi.fn();
     await chat(TURN_ID, "hello", [], onEvent);
     const args = mockInvoke.mock.calls.at(-1)?.[1] as {
-      onEvent: { onmessage?: (event: ChatEvent) => void };
+      onEvent: { onmessage?: (event: AgentActivityEnvelope) => void };
     };
 
-    args.onEvent.onmessage?.({ type: "skillStep", message: "Writing note" });
+    const envelope = {
+      schemaVersion: 1,
+      turnId: TURN_ID,
+      sequence: 1,
+      cycleId: null,
+      activityId: null,
+      payload: { type: "hostStatus", message: "Writing note" },
+    } satisfies AgentActivityEnvelope;
+    args.onEvent.onmessage?.(envelope);
 
-    expect(onEvent).toHaveBeenCalledWith({
-      type: "skillStep",
-      message: "Writing note",
-    });
+    expect(onEvent).toHaveBeenCalledWith(envelope);
+    expectTypeOf<Parameters<typeof chat>[3]>().toEqualTypeOf<
+      (event: AgentActivityEnvelope) => void
+    >();
   });
 
   it("answers a live elicitation with the selected option ids scoped to its run", async () => {

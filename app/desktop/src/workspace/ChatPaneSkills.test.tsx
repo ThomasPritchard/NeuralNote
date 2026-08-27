@@ -281,11 +281,12 @@ describe("ChatPane — skills on send", () => {
   it("lands the resolved run id on the turn's report card (Undo becomes available)", async () => {
     const events: ChatEvent[] = [
       { type: "skillActivated", id: "fixture-note-workflow", name: "Fixture note workflow" },
-      { type: "noteWritten", relPath: "Literature/Talk.md", kind: "literature" },
+      { type: "noteWritten", id: "distil-1", relPath: "Literature/Talk.md", kind: "literature" },
       { type: "done" },
     ];
     mockChat.mockImplementation(async (turnId, _prompt, _history, onEvent) => {
-      for (const ev of events) onEvent(ev);
+      const emitLegacy = onEvent as unknown as (event: ChatEvent) => void;
+      for (const ev of events) emitLegacy(ev);
       return turnId;
     });
     const { user } = setup();
@@ -304,11 +305,12 @@ describe("ChatPane — skills on send", () => {
     const MISMATCHED_RUN_ID = "018f5f6c-8d5f-7c64-b8e7-ffffffffffff";
     const events: ChatEvent[] = [
       { type: "skillActivated", id: "fixture-note-workflow", name: "Fixture note workflow" },
-      { type: "noteWritten", relPath: "Literature/Talk.md", kind: "literature" },
+      { type: "noteWritten", id: "distil-1", relPath: "Literature/Talk.md", kind: "literature" },
       { type: "done" },
     ];
     mockChat.mockImplementation(async (_turnId, _prompt, _history, onEvent) => {
-      for (const ev of events) onEvent(ev);
+      const emitLegacy = onEvent as unknown as (event: ChatEvent) => void;
+      for (const ev of events) emitLegacy(ev);
       return MISMATCHED_RUN_ID;
     });
     const { user } = setup();

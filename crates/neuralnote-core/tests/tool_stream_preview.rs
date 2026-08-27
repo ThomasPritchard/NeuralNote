@@ -329,6 +329,27 @@ fn the_previewed_body_is_exactly_what_lands_in_the_vault() {
         _ => None,
     });
     assert_eq!(call_id, Some(preview_id));
+    let preview_at = events
+        .iter()
+        .position(
+            |event| matches!(event, ChatEvent::NoteEditPreview { id, .. } if id == preview_id),
+        )
+        .expect("the preview is announced");
+    let call_at = events
+        .iter()
+        .position(|event| {
+            matches!(event, ChatEvent::ToolCall { id, name, .. }
+                if id == preview_id && name == "write_note")
+        })
+        .expect("the matching write call is announced");
+    let result_at = events
+        .iter()
+        .position(|event| matches!(event, ChatEvent::ToolResult { id, .. } if id == preview_id))
+        .expect("the matching write call settles");
+    assert!(
+        preview_at < call_at && call_at < result_at,
+        "the streamed preview precedes the same-id call, which precedes its settlement"
+    );
     assert!(
         !events
             .iter()
@@ -339,9 +360,9 @@ fn the_previewed_body_is_exactly_what_lands_in_the_vault() {
 
 #[test]
 fn no_preview_ever_shows_text_the_written_note_does_not_contain() {
-    // Stronger than comparing the last frame: the body is shown hundreds of times
-    // on the way, and any one of those could have leaked a mangled escape or a
-    // half-decoded character that the finished body no longer shows.
+    // Tool-turn previews stay private until the completed batch can be inspected,
+    // then only the latest semantic frame is published. This prevents a partial
+    // or malformed provider attempt from ever entering the journal.
     let vault = vault();
     let llm = FixtureStreamingLlm::new(COMPLETED_CALL, true);
 
@@ -350,16 +371,15 @@ fn no_preview_ever_shows_text_the_written_note_does_not_contain() {
     let rel_path = written_note(&events).expect("the write landed");
     let on_disk = std::fs::read_to_string(vault.path().join(rel_path)).unwrap();
     let previews = previews(&events);
-    assert!(previews.len() > 100, "the body previewed as it arrived");
-    let mut last_len = 0;
-    for (_, body, _) in &previews {
-        assert!(
-            on_disk.starts_with(body),
-            "a preview showed text the written note does not begin with"
-        );
-        assert!(body.len() >= last_len, "a preview must never rewind");
-        last_len = body.len();
-    }
+    assert_eq!(
+        previews.len(),
+        1,
+        "stream fragments coalesce before display"
+    );
+    assert_eq!(
+        previews[0].1, on_disk,
+        "the published preview must be exactly the note that landed"
+    );
 }
 
 #[test]
@@ -413,32 +433,57 @@ fn a_call_arriving_whole_in_one_frame_previews_once_and_lands_the_same_note() {
 }
 
 #[test]
+fn a_rejected_preview_is_abandoned_before_its_activity_settles() {
+    // The captured call is syntactically complete but omits the required
+    // `kind`, so its semantic preview is visible and dispatch then rejects it.
+    let vault = vault();
+    let events = run(
+        vault.path(),
+        &FixtureStreamingLlm::new(COMPLETED_CALL, false),
+    );
+    let preview_id = previews(&events)
+        .last()
+        .expect("the completed arguments publish a preview")
+        .0;
+    let abandoned_at = events
+        .iter()
+        .position(
+            |event| matches!(event, ChatEvent::NoteEditAbandoned { id, .. } if id == preview_id),
+        )
+        .expect("the rejected preview is explicitly abandoned");
+    let settled_at = events
+        .iter()
+        .position(|event| {
+            matches!(event, ChatEvent::ToolResult { id, status: ToolStatus::Rejected, .. } if id == preview_id)
+        })
+        .expect("the rejected write settles exactly once");
+
+    assert!(
+        abandoned_at < settled_at,
+        "the preview account must be recorded while the activity is still live"
+    );
+}
+
+#[test]
 fn a_call_the_stream_cut_off_is_abandoned_and_writes_nothing() {
-    // The capture's own ending: the model stopped mid-note. The card must be
-    // cleared and the call must still settle on the timeline — a half-composed
-    // diff left sitting there would read as a note that landed.
+    // The capture's own ending: the model stopped mid-note. Because previews are
+    // private until the completed batch is inspected, no card is published and
+    // therefore no synthetic abandonment is needed. The call itself must still
+    // settle on the timeline — it is real work that the orchestrator rejected.
     let vault = vault();
     let llm = FixtureStreamingLlm::new(TRUNCATED_CALL, false);
 
     let events = run(vault.path(), &llm);
 
-    let previews = previews(&events);
-    assert!(!previews.is_empty(), "it previewed while it composed");
     assert!(
-        previews.iter().all(|(_, _, complete)| !complete),
-        "the arguments never closed"
+        previews(&events).is_empty(),
+        "an incomplete private preview must never be published"
     );
-    let abandoned: Vec<&str> = events
-        .iter()
-        .filter_map(|event| match event {
-            ChatEvent::NoteEditAbandoned { id, .. } => Some(id.as_str()),
-            _ => None,
-        })
-        .collect();
-    assert_eq!(
-        abandoned,
-        vec![previews[0].0],
-        "exactly one abandonment, keyed to the card on screen"
+    assert!(
+        !events
+            .iter()
+            .any(|event| matches!(event, ChatEvent::NoteEditAbandoned { .. })),
+        "there is no visible card to abandon"
     );
     assert_eq!(written_note(&events), None, "nothing was written");
     assert!(

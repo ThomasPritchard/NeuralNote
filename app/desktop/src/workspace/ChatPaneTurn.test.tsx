@@ -11,7 +11,7 @@
 
 import { act, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ChatEvent } from "../lib/types";
+import type { AgentActivityEnvelope, ChatEvent } from "../lib/types";
 
 const { reportError } = vi.hoisted(() => ({ reportError: vi.fn() }));
 
@@ -55,6 +55,7 @@ import {
   scriptChat,
   sendButton,
   setup,
+  type ChatPaneTestEvent,
 } from "./chatPaneTestHarness";
 
 /** One zero-hit search, in the frame order the orchestrator emits it. */
@@ -88,6 +89,19 @@ const hitSearch = (id: string, query: string, hits: number): ChatEvent[] => [
   { type: "retrieved", query, hitCount: hits, callId: null },
   { type: "toolResult", id, status: "ok", summary: `${hits} spans`, detail: null, durationMs: 0 },
 ];
+
+const v1Envelope = (
+  sequence: number,
+  turnId: string,
+  payload: AgentActivityEnvelope["payload"],
+): AgentActivityEnvelope => ({
+  schemaVersion: 1,
+  turnId,
+  sequence,
+  cycleId: null,
+  activityId: null,
+  payload,
+});
 
 beforeEach(() => {
   resetChatPaneMocks(reportError);
@@ -205,7 +219,7 @@ describe("ChatPane — chat view", () => {
     mockAiStatus.mockResolvedValue(openRouterActive());
     const run = deferred<string>();
     const stop = deferred<{ turnId: string; status: "cancelled" }>();
-    let emit!: (event: ChatEvent) => void;
+    let emit!: (event: ChatPaneTestEvent) => void;
     mockChat.mockImplementation((_turnId, _prompt, _history, onEvent) => {
       emit = onEvent;
       onEvent({ type: "answer", delta: "The whole answer landed." });
@@ -238,7 +252,7 @@ describe("ChatPane — chat view", () => {
   it("settles an in-flight playlist call after stop instead of leaving it spinning", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive());
     const run = deferred<string>();
-    let emit!: (event: ChatEvent) => void;
+    let emit!: (event: ChatPaneTestEvent) => void;
     mockChat.mockImplementation((_turnId, _prompt, _history, onEvent) => {
       emit = onEvent;
       onEvent({
@@ -291,7 +305,7 @@ describe("ChatPane — chat view", () => {
   it("keeps a queued committed-note ledger after stop without reviving terminal chat events", async () => {
     mockAiStatus.mockResolvedValue(openRouterActive());
     const run = deferred<string>();
-    let emit!: (event: ChatEvent) => void;
+    let emit!: (event: ChatPaneTestEvent) => void;
     mockChat.mockImplementation((_turnId, _prompt, _history, onEvent) => {
       emit = onEvent;
       onEvent({ type: "skillActivated", id: "youtube-distil", name: "YouTube distil" });
@@ -306,7 +320,7 @@ describe("ChatPane — chat view", () => {
     expect(await screen.findByText("Stopped")).toBeInTheDocument();
 
     act(() => {
-      emit({ type: "noteWritten", relPath: "Literature/Committed.md", kind: "literature" });
+      emit({ type: "noteWritten", id: "write-1", relPath: "Literature/Committed.md", kind: "literature" });
       emit({ type: "answer", delta: "late answer must stay hidden" });
       emit({ type: "error", message: "late cancellation error must stay hidden" });
       emit({ type: "done" });
@@ -371,7 +385,7 @@ describe("ChatPane — chat view", () => {
     const firstRun = deferred<string>();
     const secondRun = deferred<string>();
     const oldStop = deferred<{ turnId: string; status: "cancelled" }>();
-    let finishFirst!: (event: ChatEvent) => void;
+    let finishFirst!: (event: ChatPaneTestEvent) => void;
     mockChat
       .mockImplementationOnce((_turnId, _prompt, _history, onEvent) => {
         finishFirst = onEvent;
@@ -648,7 +662,10 @@ describe("ChatPane — chat view", () => {
     // `hitCount` is undefined between `searching` and `retrieved`. That is
     // "hasn't said yet", not zero — and the answer streaming has already folded
     // the rail down to this one line, so the summary renders mid-flight.
-    await askInChat("what did I write about focus?", [
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const ctx = setup();
+    await screen.findByLabelText("Ask across your vault");
+    const inFlight: ChatEvent[] = [
       {
         type: "toolCall",
         id: "c1",
@@ -659,7 +676,15 @@ describe("ChatPane — chat view", () => {
       },
       { type: "searching", query: "focus", callId: "c1" },
       { type: "answer", delta: "Let me pull that together." },
-    ]);
+    ];
+    mockChat.mockImplementation((_turnId, _prompt, _history, onEvent) => {
+      for (const event of inFlight) onEvent(event);
+      // This fixture is deliberately mid-flight. Resolving here would now be a
+      // truthful transport-close failure because no terminal frame arrived.
+      return new Promise<string>(() => {});
+    });
+    await ctx.user.type(composer(), "what did I write about focus?");
+    await ctx.user.click(sendButton());
 
     const rail = screen.getByRole("region", { name: "What the assistant did" });
     expect(within(rail).getByText("1 tool · 1 search")).toBeInTheDocument();
@@ -730,6 +755,7 @@ describe("ChatPane — chat view", () => {
     const { openNoteAt, user } = await askInChat("make a note", [
       {
         type: "noteWritten",
+        id: "write-1",
         relPath: "Atomic/Generated insight.md",
         kind: "atomic",
       },
@@ -825,6 +851,71 @@ describe("ChatPane — chat view", () => {
 
     expect(await screen.findByText("network down")).toBeInTheDocument();
     expect(composer()).toBeEnabled();
+  });
+
+  it("accepts the real envelope-v1 callback and does not invent a close warning after its terminal frame", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const { user } = setup();
+    await screen.findByLabelText("Ask across your vault");
+    mockChat.mockImplementation(async (turnId, _prompt, _history, onEvent) => {
+      onEvent(v1Envelope(1, turnId, { type: "runStarted" }));
+      onEvent(v1Envelope(2, turnId, { type: "answer", delta: "Envelope answer" }));
+      onEvent(v1Envelope(3, turnId, { type: "runCompleted" }));
+      return turnId;
+    });
+
+    await user.type(composer(), "v1 please");
+    await user.click(sendButton());
+
+    expect(await screen.findByText("Envelope answer")).toBeInTheDocument();
+    expect(screen.queryByText("Activity history is incomplete.")).not.toBeInTheDocument();
+    await waitFor(() => expect(composer()).toBeEnabled());
+  });
+
+  it("uses only the v1 action line as the pane's polite live region", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const run = deferred<string>();
+    mockChat.mockImplementation((turnId, _prompt, _history, onEvent) => {
+      onEvent(v1Envelope(1, turnId, { type: "runStarted" }));
+      onEvent(v1Envelope(2, turnId, {
+        type: "hostStatus",
+        message: "Preparing the next action",
+      }));
+      return run.promise;
+    });
+    const { user } = setup();
+    await screen.findByLabelText("Ask across your vault");
+
+    await user.type(composer(), "v1 status");
+    await user.click(sendButton());
+
+    expect(await screen.findByRole("status")).toHaveTextContent(
+      "Preparing the next action",
+    );
+    expect(document.querySelectorAll('[aria-live="polite"]')).toHaveLength(1);
+
+    await act(async () => {
+      run.resolve(TURN_ID);
+      await run.promise;
+    });
+  });
+
+  it("preserves v1 answer content and reports a resolved stream with no terminal envelope", async () => {
+    mockAiStatus.mockResolvedValue(openRouterActive());
+    const { user } = setup();
+    await screen.findByLabelText("Ask across your vault");
+    mockChat.mockImplementation(async (turnId, _prompt, _history, onEvent) => {
+      onEvent(v1Envelope(1, turnId, { type: "runStarted" }));
+      onEvent(v1Envelope(2, turnId, { type: "answer", delta: "Safe partial answer" }));
+      return turnId;
+    });
+
+    await user.type(composer(), "close early");
+    await user.click(sendButton());
+
+    expect(await screen.findByText("Safe partial answer")).toBeInTheDocument();
+    expect(screen.getByText("Activity history is incomplete.")).toBeInTheDocument();
+    await waitFor(() => expect(composer()).toBeEnabled());
   });
 
   it("sends on Enter, but Shift+Enter inserts a newline instead", async () => {

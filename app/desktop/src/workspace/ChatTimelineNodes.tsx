@@ -17,22 +17,17 @@
 import type { ReactNode } from "react";
 import {
   AlertTriangle,
-  Ban,
   Brain,
-  Check,
   ChevronRight,
   Download,
   Loader2,
   ShieldCheck,
-  Square,
-  TimerOff,
-  UserX,
 } from "lucide-react";
-import type { LucideIcon } from "lucide-react";
 import { cn } from "../lib/cn";
-import type { ToolStatus } from "../lib/types";
 import { Markdown } from "./Markdown";
 import { YoutubeRequirementCard } from "./ChatSkillChrome";
+import { ChatToolDetails } from "./ChatToolDetails";
+import { argumentHint, TOOL_SETTLEMENT } from "./chatToolPresentation";
 import type {
   ReasoningSource,
   SkillActivationFailure,
@@ -174,56 +169,7 @@ export function ThinkingNode({
  *  `ChatNoteEditCard`, which then owes the user the same account in the same
  *  words. Two hand-written copies of this vocabulary would eventually disagree
  *  about what "rejected" means. */
-export const TOOL_SETTLEMENT: Record<
-  ToolStatus,
-  { icon: LucideIcon; tone: string; label: string; filled?: true }
-> = {
-  // The common case is calm: a call that did what it said is not news.
-  ok: { icon: Check, tone: "text-muted-foreground/70", label: "" },
-  error: { icon: AlertTriangle, tone: "text-destructive", label: "failed" },
-  rejected: { icon: Ban, tone: "text-warning", label: "refused by NeuralNote" },
-  denied: { icon: UserX, tone: "text-warning", label: "denied by you" },
-  timedOut: { icon: TimerOff, tone: "text-warning", label: "expired unanswered" },
-  cancelled: {
-    icon: Square,
-    tone: "text-muted-foreground/70",
-    label: "run ended first",
-    filled: true,
-  },
-};
-
-/** The argument fields the tool schemas actually declare, in the order that
- *  makes the best one-line hint. Bulk fields (`content`, `options`) and numeric
- *  bounds are deliberately absent: a note body is not a label.
- *
- *  This reads the model's raw output, so it is parsed defensively and treated as
- *  untrusted — an unparseable or unrecognised payload yields no hint at all
- *  rather than a JSON blob on the rail. */
-const HINT_FIELDS = [
-  "query",
-  "rel_path",
-  "url",
-  "playlist_url",
-  "topic",
-  "folder",
-  "id",
-  "message",
-  "question",
-] as const;
-
-/** How much of the argument the rail will show.
- *
- *  This is the rail's only restraint now that every dispatched node stays on it,
- *  so it has to do real work. The hint is mono at 11px in a ~320px column — call
- *  it 45 characters a line at the shipped pane width, fewer in a narrow window —
- *  and a model that writes its own search queries will happily write two hundred
- *  characters of them. At the old 120 one query wrapped over seven lines and
- *  became the tallest thing in the timeline; at 64 it costs a line or two, which
- *  is what a hint is worth beside the title it qualifies. Nothing is lost by
- *  cutting it: the hint only says what a call is DOING, and the moment it
- *  settles the Rust-composed summary beside it becomes the authoritative
- *  account. */
-const MAX_HINT_CHARS = 64;
+export { formatArguments, TOOL_SETTLEMENT } from "./chatToolPresentation";
 
 /** A ` · x` qualifier on a node's title line, kept whole.
  *
@@ -258,29 +204,6 @@ const MAX_HINT_CHARS = 64;
  *  the space before it is a plain text node outside, where it stays a break
  *  opportunity instead of being trimmed at the start of a line. */
 export const QUALIFIER = "inline-block align-top wrap-anywhere";
-
-/** The widened disclosure's column heading. Quiet enough to be furniture. */
-const COLUMN_LABEL =
-  "text-[0.5625rem] font-semibold uppercase tracking-[0.08em] text-muted-foreground/60";
-
-/** A block of preformatted, untrusted-but-escaped text inside a disclosure —
- *  bounded in height, because a model can put a whole document in one argument
- *  and a fold that grows without limit is the rail's old wrapping bug again. */
-const DETAIL_BODY =
-  "nn-mono max-h-64 min-w-0 overflow-y-auto whitespace-pre-wrap break-words rounded-md bg-surface-sunken px-2 py-1.5 text-[0.625rem] leading-relaxed text-muted-foreground";
-
-/** The raw argument payload, indented if it happens to parse.
- *
- *  Best-effort by design: this is raw model output, so anything that is not
- *  valid JSON is shown exactly as it arrived rather than being repaired into
- *  something the model did not send. */
-export function formatArguments(argumentsJson: string): string {
-  try {
-    return JSON.stringify(JSON.parse(argumentsJson), null, 2);
-  } catch {
-    return argumentsJson;
-  }
-}
 
 /** The node's second row, in both of the states a node has.
  *
@@ -318,29 +241,6 @@ function ProgressLine({ text }: Readonly<{ text: string | undefined }>) {
       {text}
     </p>
   );
-}
-
-export function argumentHint(argumentsJson: string): string | null {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(argumentsJson);
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return null;
-  }
-  const record = parsed as Record<string, unknown>;
-  for (const field of HINT_FIELDS) {
-    const value = record[field];
-    if (typeof value === "string" && value.trim() !== "") {
-      const trimmed = value.trim();
-      return trimmed.length > MAX_HINT_CHARS
-        ? `${trimmed.slice(0, MAX_HINT_CHARS)}…`
-        : trimmed;
-    }
-  }
-  return null;
 }
 
 /** One dispatched tool call. The title comes from the Rust-side registry and the
@@ -421,54 +321,15 @@ export function ToolNode({
         )}
       </p>
       {settled === null && <ProgressLine text={call.progress} />}
-      {call.detail !== null && call.detail !== "" && (
-        // A call that did not simply succeed opens itself: the reason has to be
-        // on screen the moment it happens, not one click away. Passing a derived
-        // (not state-mirrored) `open` keeps that automatic while still letting
-        // the user collapse it — React only writes the prop when it changes.
-        <details
-          open={call.status !== null && call.status !== "ok"}
-          className="group/detail mt-1"
-        >
-          <summary className={`${FOLD_SUMMARY} text-[0.625rem]`}>
-            <ChevronRight
-              className="size-3 shrink-0 text-muted-foreground/60 transition-transform group-open/detail:rotate-90 motion-reduce:transition-none"
-              aria-hidden
-            />
-            Details
-          </summary>
-          {/* What was asked, then what came back. The container query decides
-              only whether the two sit SIDE BY SIDE, never whether the first one
-              exists: it used to hide the arguments outright below 30rem, and
-              since the turn is ~388px at the shipped pane width, the raw
-              payload was unreachable at the width almost everyone runs — not
-              deprioritised, gone. Stacked below the threshold, two columns
-              above; both headed either way, because two unlabelled blobs in a
-              column are worse than none. */}
-          <div className="mt-1 grid gap-1.5 @[30rem]:grid-cols-2">
-            <div className="flex min-w-0 flex-col gap-1">
-              <p className={COLUMN_LABEL}>
-                Arguments
-                {/* The wire name of the call the model actually made, kept in
-                    the machine register beside the machine payload rather than
-                    on the rail — `Search notes` and `search_notes` on one glance
-                    line is the same fact twice. It earns its place here because
-                    of the one node where the title cannot identify the call: an
-                    unregistered name renders under a Rust-authored "Unrecognised
-                    tool", and this fold — which opens itself for a rejected
-                    call — is then the only place the invented name appears. */}
-                <span className="nn-mono ml-1.5 font-normal normal-case tracking-normal text-muted-foreground/50">
-                  {call.name}
-                </span>
-              </p>
-              <p className={DETAIL_BODY}>{formatArguments(call.arguments)}</p>
-            </div>
-            <div className="flex min-w-0 flex-col gap-1">
-              <p className={COLUMN_LABEL}>Result</p>
-              <p className={DETAIL_BODY}>{call.detail}</p>
-            </div>
-          </div>
-        </details>
+      {call.detail !== null &&
+        call.detail !== "" &&
+        call.status !== null && (
+          <ChatToolDetails
+            name={call.name}
+            argumentsJson={call.arguments}
+            detail={call.detail}
+            status={call.status}
+          />
       )}
     </TimelineNode>
   );

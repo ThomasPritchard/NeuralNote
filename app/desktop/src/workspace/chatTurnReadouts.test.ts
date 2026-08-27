@@ -34,9 +34,9 @@ function run(events: ChatEvent[]): AssistantMessage {
 describe("skill report context", () => {
   it("reports the transcript sources the backend named, in first-seen order", () => {
     const turn = run([
-      { type: "transcriptSource", label: "captions:en-auto", relPath: null },
-      { type: "transcriptSource", label: "whisper:small.en", relPath: null },
-      { type: "transcriptSource", label: "captions:en-auto", relPath: null },
+      { type: "transcriptSource", id: "distil-1", label: "captions:en-auto", relPath: null },
+      { type: "transcriptSource", id: "distil-2", label: "whisper:small.en", relPath: null },
+      { type: "transcriptSource", id: "distil-3", label: "captions:en-auto", relPath: null },
     ]);
 
     expect(modelReportedProvenance(turn)).toEqual([

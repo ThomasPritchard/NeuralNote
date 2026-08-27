@@ -94,7 +94,7 @@ const gatedWrite: ChatEvent[] = [
 
 const approvedTail: ChatEvent[] = [
   { type: "toolResult", id: WRITE_ID, status: "ok", summary: NOTE_REL, detail: null, durationMs: 0 },
-  { type: "noteWritten", relPath: NOTE_REL, kind: "atomic" },
+  { type: "noteWritten", id: "write-1", relPath: NOTE_REL, kind: "atomic" },
   { type: "answer", delta: "Saved that as a note." },
   { type: "done" },
 ];

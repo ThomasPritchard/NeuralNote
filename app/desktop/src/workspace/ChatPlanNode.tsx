@@ -10,12 +10,10 @@
 // matched on; every other string here is ours.
 
 import type { ReactNode } from "react";
-import { AlertTriangle, Check, Circle, CircleMinus, Loader2 } from "lucide-react";
-import type { LucideIcon } from "lucide-react";
 import { cn } from "../lib/cn";
-import type { StepStatus } from "../lib/types";
 import type { PlanStepView } from "./chatMessage";
 import { QUALIFIER, TimelineNode } from "./ChatTimelineNodes";
+import { PLAN_STATUS_CHROME } from "./ChatPlanStatus";
 
 /** How each declared status reads.
  *
@@ -40,57 +38,6 @@ import { QUALIFIER, TimelineNode } from "./ChatTimelineNodes";
  *  the other three are fully carried by the glyph, and a rail that affixed
  *  "done" to every finished step would be six words of furniture per run. They
  *  still say it to a screen reader, which cannot see the glyph column at all. */
-const PLAN_STEP_CHROME: Record<
-  StepStatus,
-  {
-    icon: LucideIcon;
-    /** The glyph, and the visible account when there is one. */
-    tone: string;
-    labelTone: string;
-    account: string;
-    /** Whether `account` is shown on screen or only announced. */
-    visible: boolean;
-    spin?: true;
-  }
-> = {
-  pending: {
-    icon: Circle,
-    tone: "text-muted-foreground/35",
-    labelTone: "text-muted-foreground/60",
-    account: "Not started",
-    visible: false,
-  },
-  running: {
-    icon: Loader2,
-    tone: "text-primary",
-    labelTone: "text-foreground/80",
-    account: "In progress",
-    visible: false,
-    spin: true,
-  },
-  done: {
-    icon: Check,
-    tone: "text-muted-foreground/70",
-    labelTone: "text-muted-foreground",
-    account: "Done",
-    visible: false,
-  },
-  skipped: {
-    icon: CircleMinus,
-    tone: "text-muted-foreground/60",
-    labelTone: "text-muted-foreground/70",
-    account: "skipped as unnecessary",
-    visible: true,
-  },
-  failed: {
-    icon: AlertTriangle,
-    tone: "text-warning",
-    labelTone: "text-muted-foreground",
-    account: "did not work",
-    visible: true,
-  },
-};
-
 export function PlanStepNode({
   step,
   last,
@@ -103,7 +50,7 @@ export function PlanStepNode({
    *  dispatching anything. */
   nodes: ReactNode[];
 }>) {
-  const chrome = PLAN_STEP_CHROME[step.status];
+  const chrome = PLAN_STATUS_CHROME[step.status];
   return (
     <TimelineNode
       glyph={
@@ -121,13 +68,13 @@ export function PlanStepNode({
       <p className="min-w-0 break-words font-medium">
         {/* Ahead of the label, so the status is heard before the step it
             describes — the reading order the glyph column has visually. */}
-        {!chrome.visible && <span className="sr-only">{`${chrome.account}: `}</span>}
+        {!chrome.accountVisible && <span className="sr-only">{`${chrome.account}: `}</span>}
         <span className={chrome.labelTone}>{step.label}</span>
         {/* Kept whole for the same reason a tool node's summary is (`QUALIFIER`
             carries the whole argument): both visible accounts are more than one
             word, and left to ordinary inline layout the step's own verdict
             breaks across two lines of a model-written label. */}
-        {chrome.visible && (
+        {chrome.accountVisible && (
           <>
             {" "}
             <span className={cn(QUALIFIER, chrome.tone)}>· {chrome.account}</span>

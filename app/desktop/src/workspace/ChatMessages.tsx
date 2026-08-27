@@ -23,6 +23,7 @@ import type {
   CitationView,
 } from "./chatMessage";
 import { ChatNoteEdits } from "./ChatNoteEditCard";
+import { ChatActivityJournal } from "./ChatActivityJournal";
 import { ChatTimeline } from "./ChatTimeline";
 import { ToolApprovalSheet } from "./ToolApprovalSheet";
 import { SkillActivations, SkillSteps } from "./ChatSkillChrome";
@@ -91,6 +92,64 @@ function AssistantTurn({
     turn.skillActivationFailures.map((failure) => failure.message),
   );
   const narratedSteps = turn.skillSteps.filter((step) => !failureMessages.has(step));
+  const journalOwnsError =
+    turn.activityProtocol === "v1" &&
+    turn.error !== null &&
+    (turn.error === turn.activityJournal.warning ||
+      turn.error === turn.activityJournal.terminal.message);
+  const journalReturnedThinking =
+    (turn.activityJournal.finalThinking?.text.trim() ?? "") !== "" ||
+    turn.activityJournal.cycles.some((cycle) => cycle.thinking.text.trim() !== "");
+  const interactions = (
+    <>
+      {turn.pendingApproval !== null && turn.turnId !== null && (
+        <ToolApprovalSheet
+          key={turn.pendingApproval.id}
+          approval={turn.pendingApproval}
+          turnId={turn.turnId}
+          dormant={turn.done}
+          announceStatus={turn.activityProtocol !== "v1"}
+        />
+      )}
+      {turn.stopped && (
+        <p className="flex items-center gap-1.5 text-[0.6875rem] font-medium text-muted-foreground">
+          <Square className="size-3 fill-current" aria-hidden />
+          Stopped
+        </p>
+      )}
+      {turn.activityProtocol === "v1" ? (
+        !journalReturnedThinking &&
+        turn.reasoningRequested &&
+        turn.done &&
+        turn.error === null &&
+        !turn.stopped &&
+        answering && (
+          <p className="rounded-md border border-border bg-muted/40 px-2.5 py-1.5 text-[0.6875rem] leading-snug text-muted-foreground">
+            Thinking was on, but the model didn&apos;t return any.
+          </p>
+        )
+      ) : (
+        <MissingReasoningNotice
+          text={turn.thinking}
+          requested={turn.reasoningRequested}
+          show={turn.done && turn.error === null && !turn.stopped && answering}
+        />
+      )}
+      {turn.pendingElicitation !== null && turn.turnId !== null && (
+        <ElicitCard
+          key={turn.pendingElicitation.id}
+          elicitation={turn.pendingElicitation}
+          turnId={turn.turnId}
+          dormant={turn.done && elicitAnswer === undefined}
+          busy={busy}
+          answer={elicitAnswer}
+          onAnswered={onElicitAnswered}
+          onSendFollowUp={onSendFollowUp}
+          announceStatus={turn.activityProtocol !== "v1"}
+        />
+      )}
+    </>
+  );
   return (
     // No turn-wide aria-live: the per-row activity churn (15–20 mutations a run)
     // must stay silent. Liveness is scoped instead to the phase line (role=status),
@@ -108,62 +167,30 @@ function AssistantTurn({
     // rendered inside it; on one turn of a transcript there is nothing to catch.
     <div className="@container flex flex-col gap-3 rounded-xl border border-border bg-background/30 px-3 py-3">
       <SkillActivations activations={turn.skillActivations} />
-      <SkillSteps
-        steps={narratedSteps}
-        working={!turn.done && !answering && !awaitingUser && turn.error === null}
-      />
-      <ChatTimeline
-        turn={turn}
-        answering={answering}
-        suppressLive={hasSkillNarrative}
-      />
-      {/* Directly under the rail, above the answer: a write composing is the
-          thing to watch while it happens, and each card folds itself away the
-          moment its write settles, so a finished turn does not pay for it. */}
-      <ChatNoteEdits turn={turn} />
-      {turn.pendingApproval !== null && turn.turnId !== null && (
-        // Under the composing-write card on purpose: for a `write_note` the
-        // card IS what the user is being asked to allow, so the ask reads best
-        // directly beneath the thing it is about. Keyed by the call id, so a
-        // second gated call in one turn is a fresh mount (fresh focus, no
-        // half-answered reuse of the previous request's state).
-        <ToolApprovalSheet
-          key={turn.pendingApproval.id}
-          approval={turn.pendingApproval}
-          turnId={turn.turnId}
-          dormant={turn.done}
-        />
-      )}
-      {turn.stopped && (
-        <p className="flex items-center gap-1.5 text-[0.6875rem] font-medium text-muted-foreground">
-          <Square className="size-3 fill-current" aria-hidden />
-          Stopped
-        </p>
-      )}
-      <MissingReasoningNotice
-        text={turn.thinking}
-        requested={turn.reasoningRequested}
-        show={turn.done && turn.error === null && !turn.stopped && answering}
-      />
-      {turn.pendingElicitation !== null && turn.turnId !== null && (
-        // Keyed by elicitation id: a follow-up question in the same turn is a
-        // fresh card (fresh focus, fresh state), never a half-answered reuse.
-        <ElicitCard
-          key={turn.pendingElicitation.id}
-          elicitation={turn.pendingElicitation}
-          turnId={turn.turnId}
-          dormant={turn.done && elicitAnswer === undefined}
-          busy={busy}
-          answer={elicitAnswer}
-          onAnswered={onElicitAnswered}
-          onSendFollowUp={onSendFollowUp}
-        />
+      {turn.activityProtocol === "v1" ? (
+        <ChatActivityJournal turn={turn} onOpenNote={onOpenNote}>
+          {interactions}
+        </ChatActivityJournal>
+      ) : (
+        <>
+          <SkillSteps
+            steps={narratedSteps}
+            working={!turn.done && !answering && !awaitingUser && turn.error === null}
+          />
+          <ChatTimeline
+            turn={turn}
+            answering={answering}
+            suppressLive={hasSkillNarrative}
+          />
+          <ChatNoteEdits turn={turn} />
+          {interactions}
+        </>
       )}
       {answer.trim() !== "" && (
         // The answer is the payload — full-contrast, tightened to the pane's
         // narrow measure, with outer block margins collapsed so it sits flush.
         <div
-          aria-live="polite"
+          aria-live={turn.activityProtocol === "v1" ? undefined : "polite"}
           className="text-[0.8125rem] leading-6 text-foreground/90 [&_.nn-markdown>:first-child]:mt-0 [&_.nn-markdown>:last-child]:mb-0 [&_.nn-markdown_h1]:mt-4 [&_.nn-markdown_h1]:text-base [&_.nn-markdown_h2]:mt-3.5 [&_.nn-markdown_h2]:text-[0.9375rem] [&_.nn-markdown_h3]:mt-3 [&_.nn-markdown_h3]:text-[0.8125rem] [&_.nn-markdown_li]:leading-6 [&_.nn-markdown_ol]:my-2 [&_.nn-markdown_ol]:text-[0.8125rem] [&_.nn-markdown_p]:my-2 [&_.nn-markdown_p]:text-[0.8125rem] [&_.nn-markdown_p]:leading-6 [&_.nn-markdown_pre]:my-2 [&_.nn-markdown_pre]:text-[0.75rem] [&_.nn-markdown_ul]:my-2 [&_.nn-markdown_ul]:text-[0.8125rem]"
         >
           <Markdown body={answer} />
@@ -197,7 +224,7 @@ function AssistantTurn({
       )}
       <Sources citations={turn.citations} onOpen={onOpenCitation} />
       {turn.coverage && <CoverageFooter coverage={turn.coverage} />}
-      {turn.error && (
+      {turn.error && !journalOwnsError && (
         <div
           role="alert"
           className="flex items-start gap-2 rounded-lg border border-destructive/40 bg-destructive/10 px-2.5 py-2 text-[0.75rem] text-destructive"

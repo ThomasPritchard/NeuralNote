@@ -46,7 +46,7 @@ const gatedWrite: ChatEvent[] = [
 /** The gate said yes: the call dispatches, the note lands, the run ends. */
 const approvedTail: ChatEvent[] = [
   { type: "toolResult", id: CALL_ID, status: "ok", summary: NOTE_REL, detail: null, durationMs: 0 },
-  { type: "noteWritten", relPath: NOTE_REL, kind: "atomic" },
+  { type: "noteWritten", id: "write-1", relPath: NOTE_REL, kind: "atomic" },
   { type: "answer", delta: "Saved that as a note." },
   { type: "done" },
 ];

@@ -1,17 +1,21 @@
 // The chat pane's turn lifecycle: the transcript, the busy/stop/announce state,
 // and the send / stream-fold / cancel handlers. Orchestration stays in Rust —
 // this hook only drives the streamed `ChatEvent` loop via `chat` and folds it
-// with `reduceAssistantForTurn`. The reasoning opt-in and the active skills are
+// with the whole-turn activity ingestion boundary. The reasoning opt-in and the active skills are
 // inputs (owned by the provider hook and the pane, respectively), pinned onto
 // each turn at creation.
 
 import { useCallback, useRef, useState, type RefObject } from "react";
 import * as api from "../lib/api";
 import { errorMessage } from "../lib/api";
-import type { ChatEvent } from "../lib/types";
+import type { AgentActivityEnvelope } from "../lib/types";
 import { toHistory } from "./chatHistory";
 import { emptyAssistant, userMessage, type ChatMessage } from "./chatMessage";
-import { markAssistantStopped, reduceAssistantForTurn } from "./chatTurnStream";
+import {
+  markAssistantActivityStreamClosed,
+  markAssistantStopped,
+  reduceAssistantForTurn,
+} from "./chatTurnStream";
 import type { SkillPickerEntry } from "./skillAutocomplete";
 
 export interface ChatPaneChat {
@@ -71,7 +75,7 @@ export function useChatPaneChat({
         userMessage(prompt),
         emptyAssistant(effectiveReasoning, turnId),
       ]);
-      const applyTurnEvent = (event: ChatEvent) => {
+      const applyTurnEvent = (event: AgentActivityEnvelope) => {
         setMessages((prev) => reduceAssistantForTurn(prev, turnId, event));
       };
       // A transport-level rejection is surfaced as an inline error event, so a
@@ -79,13 +83,21 @@ export function useChatPaneChat({
       void api
         .chat(turnId, prompt, history, applyTurnEvent, activeSkills.map((s) => s.id))
         .then((runId) => {
+          // A successfully resolved command must already have delivered its
+          // terminal envelope. If it did not, preserve what arrived and close
+          // the live projection as an explicit incomplete stream.
+          setMessages((prev) => markAssistantActivityStreamClosed(prev, turnId));
           // The caller UUID is the sole run identity. A mismatched native echo
           // never receives an Undo handle.
           if (runId === turnId) {
             setRunIds((prev) => ({ ...prev, [assistantIndex]: runId }));
           }
         })
-        .catch((e) => applyTurnEvent({ type: "error", message: errorMessage(e) }))
+        .catch((e) => {
+          setMessages((prev) =>
+            markAssistantActivityStreamClosed(prev, turnId, errorMessage(e)),
+          );
+        })
         .finally(() => {
           if (activeTurnIdRef.current === turnId) {
             activeTurnIdRef.current = null;

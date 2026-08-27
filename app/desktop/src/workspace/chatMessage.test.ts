@@ -166,8 +166,8 @@ describe("reduceAssistant — skills bank", () => {
 
   it("accumulates written notes with their actual paths and kinds", () => {
     const turn = run([
-      { type: "noteWritten", relPath: "Literature/Name.md", kind: "literature" },
-      { type: "noteWritten", relPath: "Atomic/Idea.md", kind: "atomic" },
+      { type: "noteWritten", id: "write-1", relPath: "Literature/Name.md", kind: "literature" },
+      { type: "noteWritten", id: "write-2", relPath: "Atomic/Idea.md", kind: "atomic" },
     ]);
 
     expect(turn.writtenNotes).toEqual([
@@ -180,8 +180,8 @@ describe("reduceAssistant — skills bank", () => {
     // #108: a create-only write that hit an existing note wrote nothing, so it
     // must not be reported as written — and must not vanish either.
     const turn = run([
-      { type: "noteWritten", relPath: "Atomic/Idea.md", kind: "atomic" },
-      { type: "noteExists", relPath: "Atomic/Idea.md", kind: "atomic" },
+      { type: "noteWritten", id: "write-1", relPath: "Atomic/Idea.md", kind: "atomic" },
+      { type: "noteExists", id: "write-2", relPath: "Atomic/Idea.md", kind: "atomic" },
     ]);
 
     expect(turn.writtenNotes).toEqual([

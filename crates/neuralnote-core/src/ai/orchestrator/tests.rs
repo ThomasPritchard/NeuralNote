@@ -19,6 +19,7 @@ use crate::ai::local::HardwareSpec;
 use crate::ai::plan::{PlanStep, RunPlan, StepStatus};
 use crate::ai::retrieval::{FolderMeta, KeywordRetriever, ListOutcome, SearchOutcome};
 use crate::ai::skills::{ActiveSkills, SkillEnvironment, SkillRegistry};
+use crate::ai::tool_turn_presentation::ToolTurnPresentation;
 use crate::ai::tool_turn_reader::{StreamedToolTurn, ToolTurnReader};
 use crate::ai::tools;
 use crate::ai::write_policy::UnavailableNoteWriter;
@@ -1560,7 +1561,7 @@ fn nested_playlist_batch_is_stale_without_replacing_or_advancing_the_original_ru
     assert!(final_context.contains("V0000000001: succeeded"));
 }
 
-fn run(root: &Path, mock: &MockLlmClient, guards: &Guards) -> Vec<ChatEvent> {
+fn run(root: &Path, mock: &dyn LlmClient, guards: &Guards) -> Vec<ChatEvent> {
     run_with_provider(root, &KeywordRetriever::new(root), mock, guards)
 }
 
@@ -1846,7 +1847,7 @@ fn a_malformed_argument_call_is_refused_and_never_collapses_into_a_failure() {
 fn run_with_provider(
     root: &Path,
     provider: &dyn RetrievalProvider,
-    mock: &MockLlmClient,
+    mock: &dyn LlmClient,
     guards: &Guards,
 ) -> Vec<ChatEvent> {
     run_with_provider_and_cancellation(root, provider, mock, guards, CaptureCancellation::default())
@@ -1857,7 +1858,7 @@ fn run_with_provider(
 fn run_with_provider_and_cancellation(
     root: &Path,
     provider: &dyn RetrievalProvider,
-    mock: &MockLlmClient,
+    mock: &dyn LlmClient,
     guards: &Guards,
     cancellation: CaptureCancellation,
 ) -> Vec<ChatEvent> {
@@ -3220,6 +3221,167 @@ fn final_answer_prompt_removes_tool_protocol_but_preserves_tool_results() {
         .is_some_and(|content| content.contains("Tool execution is complete")));
 }
 
+struct PerTurnThinkingLlm {
+    completions: Mutex<VecDeque<(String, Completion)>>,
+}
+
+#[derive(Default)]
+struct EnvelopeCollector(Vec<crate::ai::AgentActivityEnvelope>);
+
+impl crate::ai::ActivityEnvelopeSink for EnvelopeCollector {
+    fn send(&mut self, envelope: crate::ai::AgentActivityEnvelope) {
+        self.0.push(envelope);
+    }
+}
+
+#[async_trait]
+impl LlmClient for PerTurnThinkingLlm {
+    async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+        unreachable!("this client streams every tool-deciding turn")
+    }
+
+    async fn complete_tool_streaming(
+        &self,
+        _req: &LlmRequest,
+        sink: &mut dyn EventSink,
+    ) -> CoreResult<Completion> {
+        let (delta, completion) = self
+            .completions
+            .lock()
+            .unwrap()
+            .pop_front()
+            .expect("the run makes exactly two tool-deciding requests");
+        sink.send(ChatEvent::Thinking { delta });
+        Ok(completion)
+    }
+
+    async fn complete_streaming(
+        &self,
+        _req: &LlmRequest,
+        sink: &mut dyn EventSink,
+    ) -> CoreResult<String> {
+        sink.send(ChatEvent::Answer {
+            delta: "Widgets snap together [e1].".into(),
+        });
+        Ok("Widgets snap together [e1].".into())
+    }
+}
+
+#[test]
+fn tool_deciding_thinking_is_opened_by_the_current_planning_round() {
+    let v = vault();
+    let llm = PerTurnThinkingLlm {
+        completions: Mutex::new(
+            vec![
+                (
+                    "first".into(),
+                    tool_call("c1", "search_notes", r#"{"query":"components"}"#),
+                ),
+                ("second".into(), final_turn()),
+            ]
+            .into(),
+        ),
+    };
+    let events = run(v.path(), &llm, &Guards::default());
+
+    let pos = |predicate: fn(&ChatEvent) -> bool| {
+        events
+            .iter()
+            .position(predicate)
+            .expect("the characterized event is present")
+    };
+    assert!(
+        pos(|event| matches!(event, ChatEvent::PlanningRound { round: 1, .. }))
+            < pos(|event| matches!(event, ChatEvent::Thinking { delta } if delta == "first"))
+    );
+    assert!(
+        pos(|event| matches!(event, ChatEvent::Thinking { delta } if delta == "first"))
+            < pos(|event| matches!(event, ChatEvent::ToolCall { id, .. } if id == "c1"))
+    );
+    assert!(
+        pos(|event| matches!(event, ChatEvent::ToolCall { id, .. } if id == "c1"))
+            < pos(|event| matches!(event, ChatEvent::ToolResult { id, .. } if id == "c1"))
+    );
+    assert!(
+        pos(|event| matches!(event, ChatEvent::ToolResult { id, .. } if id == "c1"))
+            < pos(|event| matches!(event, ChatEvent::PlanningRound { round: 2, .. }))
+    );
+    assert!(
+        pos(|event| matches!(event, ChatEvent::PlanningRound { round: 2, .. }))
+            < pos(|event| matches!(event, ChatEvent::Thinking { delta } if delta == "second"))
+    );
+    assert!(
+        pos(|event| matches!(event, ChatEvent::Thinking { delta } if delta == "second"))
+            < pos(|event| matches!(event, ChatEvent::Verifying))
+    );
+}
+
+#[test]
+fn final_answer_thinking_reaches_the_journal_without_a_tool_cycle() {
+    let v = vault();
+    let llm = MockLlmClient::new(vec![final_turn()], "Hello.").with_reasoning(&["compose"]);
+    let retriever = KeywordRetriever::new(v.path());
+    let skills = SkillRegistry::built_in(&[]).unwrap();
+    let environment = SkillEnvironment {
+        hardware: HardwareSpec {
+            total_ram_bytes: 1,
+            cpu_cores: 1,
+            cpu_brand: "test".into(),
+            gpu_label: None,
+            arch: "aarch64".into(),
+            os: "macos".into(),
+            free_disk_bytes: 1,
+        },
+        app_data_bin_dir: PathBuf::from("/app-data/bin"),
+        available_binaries: BTreeSet::new(),
+        unusable_binaries: Default::default(),
+    };
+    let services = SkillServices::new(
+        &skills,
+        &environment,
+        &NoUserPrompt,
+        &UnavailableNoteWriter,
+        1,
+    );
+    let mut sink =
+        crate::ai::SequencedActivitySink::new("turn-final-answer", EnvelopeCollector::default());
+
+    block_on(run_chat(
+        "hello",
+        &[],
+        Vec::new(),
+        v.path(),
+        "test-model",
+        &retriever,
+        &llm,
+        &services,
+        &mut sink,
+        &Guards::default(),
+    ))
+    .unwrap();
+
+    let envelope = sink
+        .into_inner()
+        .0
+        .into_iter()
+        .find(|envelope| {
+            matches!(
+                envelope.payload,
+                crate::ai::AgentActivityPayload::Thinking { .. }
+            )
+        })
+        .expect("the provider's final-answer reasoning reaches the journal");
+    assert_eq!(envelope.cycle_id, None);
+    assert_eq!(envelope.activity_id, None);
+    assert!(matches!(
+        envelope.payload,
+        crate::ai::AgentActivityPayload::Thinking {
+            source: crate::ai::ThinkingSource::FinalAnswer,
+            ..
+        }
+    ));
+}
+
 #[test]
 fn reasoning_deltas_reach_the_sink_as_thinking_events() {
     let v = vault();
@@ -4398,6 +4560,200 @@ fn run_streamed_tool_turn(llm: &dyn LlmClient) -> (CoreResult<Completion>, VecSi
 }
 
 #[test]
+fn tool_turn_presentation_forwards_thinking_but_coalesces_previews_until_flush() {
+    let mut presentation = ToolTurnPresentation::default();
+    let mut visible = VecSink::default();
+    {
+        let mut sink = presentation.sink(&mut visible);
+        sink.send(ChatEvent::Thinking {
+            delta: "Inspecting the request".into(),
+        });
+        for body in ["first", "latest"] {
+            sink.send(ChatEvent::NoteEditPreview {
+                id: "write-a".into(),
+                rel_path: Some("A.md".into()),
+                kind: None,
+                body: body.into(),
+                complete: body == "latest",
+            });
+        }
+        sink.send(ChatEvent::NoteEditPreview {
+            id: "write-b".into(),
+            rel_path: Some("B.md".into()),
+            kind: None,
+            body: "other".into(),
+            complete: true,
+        });
+    }
+
+    assert_eq!(
+        visible.events,
+        [ChatEvent::Thinking {
+            delta: "Inspecting the request".into()
+        }],
+        "Thinking is live while note composition remains unexposed"
+    );
+
+    let calls = [
+        ToolCall {
+            id: "write-b".into(),
+            name: tools::TOOL_WRITE_NOTE.into(),
+            arguments: "{}".into(),
+        },
+        ToolCall {
+            id: "write-a".into(),
+            name: tools::TOOL_WRITE_NOTE.into(),
+            arguments: "{}".into(),
+        },
+    ];
+    let flushed = presentation.flush(&calls, &mut visible);
+    let previews: Vec<(&str, &str)> = visible
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            ChatEvent::NoteEditPreview { id, body, .. } => Some((id.as_str(), body.as_str())),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(previews, [("write-b", "other"), ("write-a", "latest")]);
+    assert_eq!(
+        flushed,
+        BTreeSet::from(["write-a".into(), "write-b".into()])
+    );
+}
+
+#[test]
+fn discarding_an_unexposed_preview_emits_no_false_abandonment() {
+    let mut presentation = ToolTurnPresentation::default();
+    let mut visible = VecSink::default();
+    {
+        let mut sink = presentation.sink(&mut visible);
+        sink.send(ChatEvent::NoteEditPreview {
+            id: "write".into(),
+            rel_path: None,
+            kind: None,
+            body: "partial".into(),
+            complete: false,
+        });
+        sink.send(ChatEvent::NoteEditAbandoned {
+            id: "write".into(),
+            reason: "stream failed".into(),
+        });
+    }
+    presentation.discard();
+
+    assert!(
+        visible.events.is_empty(),
+        "a preview the user never saw needs no abandonment card"
+    );
+}
+
+struct PreviewedRejectedWriteLlm {
+    turns: std::sync::atomic::AtomicUsize,
+}
+
+#[async_trait]
+impl LlmClient for PreviewedRejectedWriteLlm {
+    async fn complete(&self, _req: &LlmRequest) -> CoreResult<Completion> {
+        panic!("this fixture streams its tool turns")
+    }
+
+    async fn complete_tool_streaming(
+        &self,
+        _req: &LlmRequest,
+        sink: &mut dyn EventSink,
+    ) -> CoreResult<Completion> {
+        let turn = self.turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if turn > 0 {
+            return Ok(final_turn());
+        }
+        sink.send(ChatEvent::Thinking {
+            delta: "The note shape is clear.".into(),
+        });
+        for body in ["# Draft", "# Draft\n\nBody"] {
+            sink.send(ChatEvent::NoteEditPreview {
+                id: "write".into(),
+                rel_path: Some("Draft.md".into()),
+                kind: Some(crate::ai::write_policy::NoteKind::Literature),
+                body: body.into(),
+                complete: body.ends_with("Body"),
+            });
+        }
+        Ok(Completion {
+            content: None,
+            tool_calls: vec![
+                ToolCall {
+                    id: "summary".into(),
+                    name: tools::TOOL_SKILL_STEP.into(),
+                    arguments: r#"{"message":"I have the note structure. Next I will save it."}"#
+                        .into(),
+                },
+                ToolCall {
+                    id: "write".into(),
+                    name: tools::TOOL_WRITE_NOTE.into(),
+                    arguments: r##"{"rel_path":"Draft.md","content":"# Draft\n\nBody","kind":"literature","work_item":0}"##.into(),
+                },
+            ],
+        })
+    }
+
+    async fn complete_streaming(
+        &self,
+        _req: &LlmRequest,
+        sink: &mut dyn EventSink,
+    ) -> CoreResult<String> {
+        sink.send(ChatEvent::Answer {
+            delta: "Finished.".into(),
+        });
+        Ok("Finished.".into())
+    }
+}
+
+#[test]
+fn summary_precedes_flushed_preview_and_rejected_write_abandons_it_explicitly() {
+    let vault = vault();
+    let llm = PreviewedRejectedWriteLlm {
+        turns: std::sync::atomic::AtomicUsize::new(0),
+    };
+
+    let events = run(vault.path(), &llm, &Guards::default());
+    let position = |predicate: fn(&ChatEvent) -> bool| events.iter().position(predicate).unwrap();
+
+    assert!(
+        position(|event| matches!(event, ChatEvent::Thinking { .. }))
+            < position(|event| matches!(event, ChatEvent::CycleSummary { .. }))
+    );
+    assert!(
+        position(|event| matches!(event, ChatEvent::CycleSummary { .. }))
+            < position(
+                |event| matches!(event, ChatEvent::NoteEditPreview { id, body, .. }
+                if id == "write" && body == "# Draft\n\nBody")
+            )
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, ChatEvent::NoteEditPreview { id, .. } if id == "write"))
+            .count(),
+        1,
+        "stream fragments coalesce into the last semantic preview"
+    );
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ChatEvent::ToolResult {
+            id,
+            status,
+            ..
+        } if id == "write" && *status != ToolStatus::Ok
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        ChatEvent::NoteEditAbandoned { id, .. } if id == "write"
+    )));
+}
+
+#[test]
 fn a_run_past_its_ceiling_still_never_announces_a_round_above_it() {
     // The invariant measured at the configuration that can actually break it.
     // The happy-path assertion runs a script with no playlist and no skill
@@ -4442,24 +4798,23 @@ fn a_run_past_its_ceiling_still_never_announces_a_round_above_it() {
 }
 
 #[test]
-fn a_streamed_tool_turn_is_never_retried_once_it_has_emitted() {
-    // The retry was only ever safe because the turn published nothing. Now
-    // that it streams live previews, replaying it would stream a second copy
-    // of a half-composed note over the first — the user would watch their
-    // note rewind. So a transient, retryable failure is NOT retried here.
+fn a_streamed_tool_turn_retries_when_its_only_preview_was_never_exposed() {
+    // Presentation buffering keeps this half-note private until the completed
+    // batch can be summarised. A failed attempt has published nothing, so it is
+    // safe to discard and spend the existing one retry.
     let llm = StreamingToolLlm::new(true);
 
     let (result, sink) = run_streamed_tool_turn(&llm);
 
     assert!(result.is_err(), "the failure is surfaced, not swallowed");
-    assert_eq!(llm.attempts(), 1, "emitted, so no replay");
+    assert_eq!(llm.attempts(), 2, "the unexposed attempt is retried once");
     assert_eq!(
         sink.events
             .iter()
             .filter(|event| matches!(event, ChatEvent::NoteEditPreview { .. }))
             .count(),
-        1,
-        "exactly one preview reached the user"
+        0,
+        "neither failed attempt exposed a preview"
     );
 }
 

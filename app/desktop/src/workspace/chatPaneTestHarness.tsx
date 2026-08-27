@@ -10,11 +10,13 @@
 
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { vi } from "vitest";
+import { vi, type MockedFunction } from "vitest";
 import * as api from "../lib/api";
 import type {
   AiStatus,
+  AgentActivityEnvelope,
   ChatEvent,
+  ChatTurn,
   ReasoningControl,
   ReasoningSupport,
 } from "../lib/types";
@@ -23,7 +25,19 @@ import { ALWAYS_ASK_APPROVAL_STATUS } from "../lib/approvalStatusFixture";
 
 export const mockAiStatus = vi.mocked(api.aiStatus);
 export const mockSave = vi.mocked(api.saveApiKey);
-export const mockChat = vi.mocked(api.chat);
+/** Chat-pane component suites deliberately exercise both sides of the whole-turn
+ * migration adapter. The production command callback is envelope-only; this
+ * widened mock seam is test-only and lets established legacy journeys stay
+ * explicit until their v1 counterparts replace them. */
+export type ChatPaneTestEvent = AgentActivityEnvelope | ChatEvent;
+type ChatPaneTestCommand = (
+  turnId: string,
+  prompt: string,
+  history: ChatTurn[],
+  onEvent: (event: ChatPaneTestEvent) => void,
+  activeSkills?: string[],
+) => Promise<string>;
+export const mockChat = vi.mocked(api.chat) as unknown as MockedFunction<ChatPaneTestCommand>;
 export const mockCancelChat = vi.mocked(api.cancelChatRun);
 export const mockSetReasoning = vi.mocked(api.setReasoning);
 export const mockRefreshSupport = vi.mocked(api.refreshReasoningSupport);
@@ -126,7 +140,7 @@ export async function openKeySetup(user: ReturnType<typeof userEvent.setup>) {
   );
 }
 
-/** Script `chat` to replay `events` through the passed onEvent, then resolve. */
+/** Script one explicit legacy turn through the migration adapter, then resolve. */
 export function scriptChat(events: ChatEvent[]) {
   mockChat.mockImplementation(async (_turnId, _prompt, _history, onEvent) => {
     for (const ev of events) onEvent(ev);

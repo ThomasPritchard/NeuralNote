@@ -55,6 +55,7 @@ fn option(id: &str, label: &str) -> ElicitOption {
 
 fn elicitation(multi_select: bool) -> Elicitation {
     Elicitation {
+        activity_id: "call-1".into(),
         id: "prompt-1".into(),
         question: "Choose".into(),
         options: vec![option("a", "Alpha"), option("b", "Beta")],
@@ -154,6 +155,7 @@ fn blank_and_duplicate_offered_ids_are_rejected_before_emitting_or_prompting() {
             &UnexpectedPrompt,
             &mut sink,
             Elicitation {
+                activity_id: "call-invalid".into(),
                 id: "invalid".into(),
                 question: "Choose".into(),
                 options,

@@ -533,7 +533,7 @@ fn fixture_manifest() -> SkillManifest {
         description: "Demonstrate progress, elicitation, and a guarded note write.".into(),
         icon: "flask".into(),
         instructions: include_str!("fixtures/fixture_skill/SKILL.md").into(),
-        tools: vec!["skill_step".into(), "ask_user".into(), "write_note".into()],
+        tools: vec!["ask_user".into(), "write_note".into()],
         requirements: Vec::new(),
         optional_requirements: Vec::new(),
         max_iterations: Some(12),
@@ -550,7 +550,6 @@ fn youtube_distil_manifest() -> SkillManifest {
         icon: "youtube".into(),
         instructions: include_str!("fixtures/youtube_distil/SKILL.md").into(),
         tools: vec![
-            "skill_step".into(),
             "ask_user".into(),
             "write_note".into(),
             "fetch_video_info".into(),

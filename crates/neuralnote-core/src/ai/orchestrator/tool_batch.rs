@@ -18,11 +18,14 @@ use super::settlement::{
 };
 use super::PARTIAL_RUN_CANCELLED;
 use crate::ai::approval::{self, ApprovalContext, ApprovalDecision, ApprovalGate, ApprovedCall};
+use crate::ai::cycle_summary::select_cycle_summary;
 use crate::ai::events::{ChatEvent, EventSink};
 use crate::ai::evidence::EvidenceRegistry;
 use crate::ai::llm::{LlmMessage, ToolCall};
 use crate::ai::plan::RunPlan;
 use crate::ai::skills::ActiveSkills;
+use crate::ai::tool_stream::ABANDONED_CANCELLED;
+use crate::ai::tool_turn_presentation::{ToolTurnPresentation, ABANDONED_NOT_COMMITTED};
 use crate::ai::tools::{self, dispatch, ToolOutcome};
 use crate::ai::write_policy::WriteSession;
 use crate::ai::youtube::YoutubeToolSession;
@@ -40,6 +43,7 @@ impl ChatSession<'_> {
     pub(super) async fn handle_tool_calls(
         &self,
         calls: &[ToolCall],
+        mut presentation: ToolTurnPresentation,
         messages: &mut Vec<LlmMessage>,
         active_skills: &mut ActiveSkills,
         writes: &mut WriteSession,
@@ -53,12 +57,37 @@ impl ChatSession<'_> {
         context_chars: &mut usize,
     ) -> ToolBatchControl {
         let mut control = ToolBatchControl::default();
+        // The completed provider batch is frozen before dispatch. Select the
+        // administrative summary now so it is sequenced after streamed Thinking
+        // and before any real call is announced. This inspection never grants a
+        // capability and does not make another model request.
+        let summary_decision = select_cycle_summary(calls);
+        if let Some(summary) = summary_decision.summary {
+            sink.send(ChatEvent::CycleSummary {
+                source: summary.source,
+                message: summary.message,
+                protocol_issues: summary.protocol_issues,
+            });
+        }
+        let flushed_previews = presentation.flush(calls, sink);
         let mut playlist_cancelled = false;
         let batch_playlist_item = youtube_session
             .playlist_current()
             .map(|(index, _, _)| index);
         let mut playlist_batch_closed = false;
-        for call in calls {
+        for (index, call) in calls.iter().enumerate() {
+            if let Some(disposition) = summary_decision.dispositions[index] {
+                // Preserve the provider protocol exactly: the assistant message
+                // still declares this call and history still receives one keyed
+                // role:tool result. It is deliberately absent from ToolCall /
+                // ToolResult because administrative narration is not an action.
+                messages.push(LlmMessage::tool_result(
+                    &call.id,
+                    &call.name,
+                    disposition.tool_result(),
+                ));
+                continue;
+            }
             // Announce the call BEFORE anything can go wrong with it, so one that
             // is skipped, cancelled, rejected or fails still reaches the timeline
             // instead of vanishing. Every branch below settles it exactly once.
@@ -66,6 +95,12 @@ impl ChatSession<'_> {
             // stands at THIS call's dispatch, not as it ends up.
             let dispatched = emit_tool_call(sink, call, plan);
             if playlist_batch_closed {
+                abandon_failed_preview(
+                    sink,
+                    &flushed_previews,
+                    &call.id,
+                    crate::ai::events::ToolStatus::Rejected,
+                );
                 settle_skipped(messages, sink, &dispatched, SkippedCall::StalePlaylistBatch);
                 continue;
             }
@@ -83,10 +118,22 @@ impl ChatSession<'_> {
                 }
             }
             if playlist_cancelled {
+                abandon_failed_preview(
+                    sink,
+                    &flushed_previews,
+                    &call.id,
+                    crate::ai::events::ToolStatus::Cancelled,
+                );
                 settle_skipped(messages, sink, &dispatched, SkippedCall::PlaylistCancelled);
                 continue;
             }
             if control.budget_hit {
+                abandon_failed_preview(
+                    sink,
+                    &flushed_previews,
+                    &call.id,
+                    crate::ai::events::ToolStatus::Rejected,
+                );
                 settle_skipped(
                     messages,
                     sink,
@@ -112,13 +159,14 @@ impl ChatSession<'_> {
                 )
                 .await;
             control.complete_turn |= tool_control == tools::ToolControl::CompleteTurn;
-            if settlement.status() == crate::ai::events::ToolStatus::Cancelled && !control.cancelled
-            {
+            let settlement_status = settlement.status();
+            if settlement_status == crate::ai::events::ToolStatus::Cancelled && !control.cancelled {
                 control.cancelled = true;
                 sink.send(ChatEvent::PartialRun {
                     reason: PARTIAL_RUN_CANCELLED.to_string(),
                 });
             }
+            abandon_failed_preview(sink, &flushed_previews, &call.id, settlement_status);
             emit_tool_result(sink, &dispatched, settlement);
             let current_playlist_item = youtube_session
                 .playlist_current()
@@ -289,6 +337,7 @@ impl ChatSession<'_> {
                 active_skills,
                 self.skill_services.note_writer,
                 writes,
+                call.call_id(),
                 sink,
                 authorized_tools,
             )
@@ -357,6 +406,26 @@ impl ChatSession<'_> {
         }
         result
     }
+}
+
+fn abandon_failed_preview(
+    sink: &mut dyn EventSink,
+    flushed_previews: &std::collections::BTreeSet<String>,
+    call_id: &str,
+    status: crate::ai::events::ToolStatus,
+) {
+    if status == crate::ai::events::ToolStatus::Ok || !flushed_previews.contains(call_id) {
+        return;
+    }
+    let reason = if status == crate::ai::events::ToolStatus::Cancelled {
+        ABANDONED_CANCELLED
+    } else {
+        ABANDONED_NOT_COMMITTED
+    };
+    sink.send(ChatEvent::NoteEditAbandoned {
+        id: call_id.to_string(),
+        reason: reason.to_string(),
+    });
 }
 
 /// Extract the `query` field from a search tool call's raw JSON arguments, if present.

@@ -24,6 +24,10 @@ RESEARCH — you MUST search before answering:
 - If the work genuinely needs three or more distinct steps, call `update_plan` once
   before you start, then keep it current as you go. Skip it for a direct answer or a
   single search — a plan for one step is noise.
+- Include exactly one `skill_step` alongside every batch of real work.
+- Write one or two ordinary-language sentences describing what you learned from
+  Thinking and what comes next. Do not name tools or include JSON.
+- Do not expose hidden chain-of-thought.
 
 These hold in both modes:
 - Never answer a factual question from your own knowledge. Your knowledge is for
@@ -41,4 +45,17 @@ pub(super) fn system_prompt(registry: &SkillRegistry) -> String {
         &catalogue
     };
     format!("{SYSTEM_PROMPT}\n\nAVAILABLE SKILLS\n{catalogue}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prompt_requests_one_plain_language_summary_with_each_work_batch() {
+        assert!(SYSTEM_PROMPT.contains("exactly one `skill_step`"));
+        assert!(SYSTEM_PROMPT.contains("one or two ordinary-language sentences"));
+        assert!(SYSTEM_PROMPT.contains("alongside every batch of real work"));
+        assert!(SYSTEM_PROMPT.contains("Do not expose hidden chain-of-thought"));
+    }
 }

@@ -428,8 +428,8 @@ describe("Journey 7: cited chat — the timeline rail", () => {
   it("reports a note the run left alone, and offers no Undo for it", async () => {
     const { user, advanceAllFrames } = await openWorkspace({
       chatScript: [
-        { type: "noteWritten", relPath: "Atomic/Fresh insight.md", kind: "atomic" },
-        { type: "noteExists", relPath: "Literature/Already here.md", kind: "literature" },
+        { type: "noteWritten", id: "write-1", relPath: "Atomic/Fresh insight.md", kind: "atomic" },
+        { type: "noteExists", id: "write-2", relPath: "Literature/Already here.md", kind: "literature" },
         { type: "answer", delta: "One was already there." },
         { type: "done" },
       ],
@@ -486,7 +486,7 @@ describe("Journey 7: cited chat — a note write, previewed as it composes", () 
         stepId: null,
       },
       { type: "toolResult", id: "call-write", status: "ok", summary: null, detail: null, durationMs: 0 },
-      { type: "noteWritten", relPath: WRITE_REL, kind: "atomic" },
+      { type: "noteWritten", id: "write-1", relPath: WRITE_REL, kind: "atomic" },
       { type: "answer", delta: "Captured it." },
       { type: "done" },
     ];

@@ -125,12 +125,17 @@ export function ChatPane({
   const stopping =
     chat.activeTurnIdRef.current !== null &&
     chat.stoppingTurnId === chat.activeTurnIdRef.current;
+  const latestMessage = chat.messages.at(-1);
+  const v1OwnsAnnouncement =
+    latestMessage?.role === "assistant" && latestMessage.activityProtocol === "v1";
 
   return (
     <aside className="nn-chat-pane relative flex shrink-0 flex-col border-l border-border bg-sidebar">
-      <p aria-live="polite" aria-atomic="true" className="sr-only">
-        {chat.liveAnnouncement}
-      </p>
+      {!v1OwnsAnnouncement && (
+        <p aria-live="polite" aria-atomic="true" className="sr-only">
+          {chat.liveAnnouncement}
+        </p>
+      )}
       <header className="shrink-0 border-b border-border px-5 py-3.5">
         <div className="flex min-w-0 items-center gap-2.5">
           <span className="grid size-7 place-items-center rounded-lg border border-primary/25 bg-primary/12 text-primary">

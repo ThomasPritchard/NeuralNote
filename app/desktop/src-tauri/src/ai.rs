@@ -5,8 +5,9 @@
 //! of: the **OS keychain** for the BYO API key (the key is read in Rust at call
 //! time and NEVER returned to the webview), the **OpenRouter HTTP client**
 //! (`reqwest`, OpenAI-compatible) implementing [`LlmClient`], and a
-//! [`TauriChannelSink`] that forwards [`ChatEvent`]s to the frontend over a Tauri
-//! channel. The `#[tauri::command]`s that expose this are in `commands/ai.rs`.
+//! [`TauriChannelSink`] that forwards ordered [`AgentActivityEnvelope`]s to the
+//! frontend over a Tauri channel. The `#[tauri::command]`s that expose this are in
+//! `commands/ai.rs`.
 
 use crate::key_revision::{self, KeyRevision};
 
@@ -14,11 +15,14 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use neuralnote_core::ai::approval::{self, ToolApprovalSubject};
 use neuralnote_core::ai::tool_turn_reader::{StreamedToolTurn, ToolTurnReader};
+#[cfg(test)]
+use neuralnote_core::ai::ChatEvent;
 use neuralnote_core::ai::{openai, provider_config, tool_stream};
 use neuralnote_core::ai::{
     openrouter_reasoning_support, parse_openrouter_context_windows, parse_openrouter_input_pricing,
-    parse_openrouter_reasoning_controls, ChatEvent, Completion, EventSink, LlmClient, LlmMessage,
-    LlmRequest, ReasoningControl, ReasoningSupport, RetryDelay, Role, TokenUsage,
+    parse_openrouter_reasoning_controls, ActivityEnvelopeSink, AgentActivityEnvelope, Completion,
+    EventSink, LlmClient, LlmMessage, LlmRequest, ReasoningControl, ReasoningSupport, RetryDelay,
+    Role, TokenUsage,
 };
 use neuralnote_core::capture::ModelPricing;
 use neuralnote_core::CoreError;
@@ -594,12 +598,13 @@ impl From<ChatTurn> for LlmMessage {
 
 /* ──────────────────────────────  Event sink  ───────────────────────────── */
 
-/// Forwards [`ChatEvent`]s to the frontend over a Tauri channel. `EventSink::send`
-/// is infallible by contract, so a closed channel (webview navigated away / closed)
-/// can't propagate an error — instead we log it once and stop emitting, rather than
-/// silently retrying against a dead UI for the rest of the run.
+/// Forwards [`AgentActivityEnvelope`]s to the frontend over a Tauri channel.
+/// [`ActivityEnvelopeSink::send`] is infallible by contract, so a closed channel
+/// (webview navigated away / closed) can't propagate an error — instead we log it
+/// once and stop emitting, rather than silently retrying against a dead UI for the
+/// rest of the run.
 pub struct TauriChannelSink {
-    channel: tauri::ipc::Channel<ChatEvent>,
+    channel: tauri::ipc::Channel<AgentActivityEnvelope>,
     closed: bool,
     close_signal: std::sync::Arc<ChatRunCloseSignal>,
 }
@@ -609,7 +614,7 @@ impl TauriChannelSink {
     /// and note writer. A failed delivery then cancels every layer instead of
     /// letting a dead webview retain work or write into an unmounted vault.
     pub(crate) fn with_close_signal(
-        channel: tauri::ipc::Channel<ChatEvent>,
+        channel: tauri::ipc::Channel<AgentActivityEnvelope>,
         close_signal: std::sync::Arc<ChatRunCloseSignal>,
     ) -> Self {
         Self {
@@ -620,21 +625,61 @@ impl TauriChannelSink {
     }
 }
 
-impl EventSink for TauriChannelSink {
-    fn send(&mut self, event: ChatEvent) {
+impl ActivityEnvelopeSink for TauriChannelSink {
+    fn send(&mut self, envelope: AgentActivityEnvelope) {
         if self.closed {
             return;
         }
-        if let Err(e) = self.channel.send(event) {
-            // EventSink cannot return this failure to core, so close the retained
-            // run signal instead. RunLlmClient races each transport await against
-            // it; prompt waits observe it separately, and the note backend checks it
-            // around synchronous writes. Core is left to unwind and return its Undo
-            // ledger rather than having the whole run future dropped.
-            log::warn!("chat event channel closed; dropping further events: {e}");
-            self.closed = true;
-            self.close_signal.close();
-        }
+        let delivery = self.channel.send(envelope);
+        settle_activity_delivery(&mut self.closed, &self.close_signal, delivery);
+    }
+}
+
+fn settle_activity_delivery<E: std::fmt::Display>(
+    closed: &mut bool,
+    close_signal: &std::sync::Arc<ChatRunCloseSignal>,
+    delivery: Result<(), E>,
+) {
+    if let Err(error) = delivery {
+        // ActivityEnvelopeSink cannot return this failure to core, so close the
+        // retained run signal instead. RunLlmClient races each transport await
+        // against it; prompt waits observe it separately, and the note backend
+        // checks it around synchronous writes. Core is left to unwind and return
+        // its Undo ledger rather than having the whole run future dropped.
+        log::warn!("chat activity channel closed; dropping further events: {error}");
+        *closed = true;
+        close_signal.close();
+    }
+}
+
+#[cfg(test)]
+mod activity_channel_delivery_tests {
+    use super::*;
+
+    #[test]
+    fn a_delivery_failure_closes_the_matching_run_and_latches_the_sink() {
+        let close_signal = std::sync::Arc::new(ChatRunCloseSignal::default());
+        let mut closed = false;
+
+        settle_activity_delivery(
+            &mut closed,
+            &close_signal,
+            Result::<(), &str>::Err("webview closed"),
+        );
+
+        assert!(closed);
+        assert_eq!(close_signal.reason(), Some(ChatRunCloseReason::Lifecycle));
+    }
+
+    #[test]
+    fn a_successful_delivery_leaves_the_run_open() {
+        let close_signal = std::sync::Arc::new(ChatRunCloseSignal::default());
+        let mut closed = false;
+
+        settle_activity_delivery(&mut closed, &close_signal, Result::<(), &str>::Ok(()));
+
+        assert!(!closed);
+        assert!(!close_signal.is_closed());
     }
 }
 
@@ -3070,7 +3115,10 @@ mod tests {
         keychain.fail_reads();
 
         match crate::commands::ai::resolve_key_presence(read_api_key(&config_dir)) {
-            Err(ChatEvent::Error { message }) => {
+            Err(event) if matches!(*event, ChatEvent::Error { .. }) => {
+                let ChatEvent::Error { message } = *event else {
+                    unreachable!("the match guard requires an error event")
+                };
                 assert!(
                     message.contains("Couldn't read the API key"),
                     "unexpected message: {message}"

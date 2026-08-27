@@ -338,6 +338,10 @@ function foldEvent(turn: AssistantMessage, event: ChatEvent): AssistantMessage {
       };
     case "skillStep":
       return { ...turn, skillSteps: [...turn.skillSteps, event.message] };
+    case "cycleSummary":
+      // Bare typed summaries exist only on the whole-turn legacy adapter. The
+      // v1 path stores them in the causal journal before compatibility folding.
+      return { ...turn, skillSteps: [...turn.skillSteps, event.message] };
     case "toolCall":
       // A tool node is not a progress phase — `phase` stays where the
       // searching/reading/verifying events put it.

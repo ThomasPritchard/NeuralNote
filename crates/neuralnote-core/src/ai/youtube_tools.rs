@@ -76,7 +76,8 @@ pub(super) async fn dispatch_fetch_video_info(
     // Only once every check has passed, so a video the run is about to refuse
     // never gets a card. The round beacon has already gone out, which is the
     // ordering `ChatEvent::VideoPreview` requires of its emitter.
-    let preview = youtube_preview::video_preview(work.io, &metadata, &metadata_video_id).await;
+    let preview =
+        youtube_preview::video_preview(call_id, work.io, &metadata, &metadata_video_id).await;
     work.channel.video_preview(preview);
     let genuinely_absent = metadata.captions.is_genuinely_absent()
         && !payload
@@ -408,6 +409,7 @@ fn validate_whisper_disk(
 
 fn whisper_install_question(call_id: &str, eligibility: &Eligibility) -> Elicitation {
     Elicitation {
+        activity_id: call_id.to_string(),
         id: format!("{call_id}:install-whisper"),
         question: format!(
             "Local transcription needs Whisper. NeuralNote will download the pinned v1.9.1 source, compile whisper-cli locally (this can take several minutes and requires Xcode Command Line Tools plus CMake 3.28+), then download the pinned small.en model. Install it now? Missing: {eligibility}"

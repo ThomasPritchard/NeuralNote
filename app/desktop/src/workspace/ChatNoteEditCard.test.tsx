@@ -128,6 +128,16 @@ afterEach(() => {
 });
 
 describe("note-write card — composing, then settling in place", () => {
+  it("keeps streamed note content out of live regions", () => {
+    renderTurn(turnFrom(preview("Quiet streamed content\n", false)));
+
+    const content = within(card()).getByText("Quiet streamed content");
+    const cursor = card().querySelector("span[aria-hidden]");
+    expect(content.closest('[aria-live], [role="status"], output')).toBeNull();
+    expect(cursor).not.toBeNull();
+    expect(cursor?.closest('[aria-live], [role="status"], output')).toBeNull();
+  });
+
   it("upgrades the same card from writing to written without ever making a second one", async () => {
     // Fragment by fragment, as OpenRouter delivers it.
     const composing = turnFrom(
@@ -153,7 +163,7 @@ describe("note-write card — composing, then settling in place", () => {
       preview("# Spaced recall\n\nRetrieval beats rereading, reliably.\n", true),
       writeCall(),
       settle("ok"),
-      { type: "noteWritten", relPath: REL_PATH, kind: "atomic" },
+      { type: "noteWritten", id: CALL_ID, relPath: REL_PATH, kind: "atomic" },
       { type: "done" },
     );
     view.update(settled);
@@ -197,7 +207,7 @@ describe("note-write card — composing, then settling in place", () => {
         preview("# One shot\n\nThe whole body, at once.\n", true),
         writeCall(),
         settle("ok"),
-        { type: "noteWritten", relPath: REL_PATH, kind: "atomic" },
+        { type: "noteWritten", id: CALL_ID, relPath: REL_PATH, kind: "atomic" },
         { type: "done" },
       ),
     );

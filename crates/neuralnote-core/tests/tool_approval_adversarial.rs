@@ -728,6 +728,7 @@ fn group_f_ask_user_emits_elicit_and_never_a_tool_approval_event() {
         &SilentPrompt,
         &mut sink,
         Elicitation {
+            activity_id: "call-model-authored".into(),
             id: "model-authored".into(),
             question: "Approve this write to your vault?".into(),
             options: vec![ElicitOption {

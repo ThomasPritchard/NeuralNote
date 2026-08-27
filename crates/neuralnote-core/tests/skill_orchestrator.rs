@@ -3,9 +3,10 @@ mod support;
 use async_trait::async_trait;
 use futures::executor::block_on;
 use neuralnote_core::ai::{
-    run_chat, ChatEvent, Completion, Elicitation, EventSink, Guards, HardwareSpec,
-    KeywordRetriever, LlmClient, LlmRequest, SkillEnvironment, SkillRegistry, SkillServices,
-    ToolCall, ToolStatus, UndoLedger, UserPrompt, FIXTURE_SKILL_ID, YOUTUBE_DISTIL_SKILL_ID,
+    run_chat, ChatEvent, Completion, CycleSummaryProtocolIssue, CycleSummarySource, Elicitation,
+    EventSink, Guards, HardwareSpec, KeywordRetriever, LlmClient, LlmRequest, SkillEnvironment,
+    SkillRegistry, SkillServices, ToolCall, ToolStatus, UndoLedger, UserPrompt, FIXTURE_SKILL_ID,
+    YOUTUBE_DISTIL_SKILL_ID,
 };
 use neuralnote_core::CoreResult;
 use std::collections::{BTreeSet, VecDeque};
@@ -126,6 +127,14 @@ fn names(request: &LlmRequest) -> BTreeSet<String> {
         .collect()
 }
 
+fn tool_name_list(request: &LlmRequest) -> Vec<&str> {
+    request
+        .tools
+        .iter()
+        .filter_map(|schema| schema["function"]["name"].as_str())
+        .collect()
+}
+
 fn run(
     root: &Path,
     llm: &RecordingLlm,
@@ -177,6 +186,180 @@ fn settlements(events: &[ChatEvent]) -> Vec<(String, ToolStatus)> {
             _ => None,
         })
         .collect()
+}
+
+#[test]
+fn every_tool_decision_request_advertises_one_non_authorizing_skill_step() {
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![final_turn()]);
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &Guards::default());
+    let requests = llm.requests();
+    let first = &requests[0];
+    let advertised = tool_name_list(first);
+
+    assert_eq!(
+        advertised
+            .iter()
+            .filter(|name| **name == "skill_step")
+            .count(),
+        1
+    );
+    for unauthorized in [
+        "ask_user",
+        "write_note",
+        "fetch_video_info",
+        "fetch_captions",
+    ] {
+        assert!(!advertised.contains(&unauthorized));
+    }
+    assert!(events.iter().any(|event| matches!(event, ChatEvent::Done)));
+}
+
+#[test]
+fn preloading_a_skill_does_not_duplicate_the_global_summary_schema() {
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![final_turn()]);
+
+    run(
+        vault.path(),
+        &llm,
+        vec![FIXTURE_SKILL_ID.into()],
+        &[],
+        &Guards::default(),
+    );
+    let requests = llm.requests();
+    let advertised = tool_name_list(&requests[0]);
+
+    assert_eq!(
+        advertised
+            .iter()
+            .filter(|name| **name == "skill_step")
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn accepted_summary_precedes_real_work_and_the_admin_call_is_not_an_activity() {
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![
+        parallel(vec![
+            ToolCall {
+                id: "summary".into(),
+                name: "skill_step".into(),
+                arguments:
+                    r#"{"message":"I found the available notes. Next I will inspect them."}"#.into(),
+            },
+            ToolCall {
+                id: "list".into(),
+                name: "list_notes".into(),
+                arguments: "{}".into(),
+            },
+        ]),
+        final_turn(),
+    ]);
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &Guards::default());
+    let summary_at = events
+        .iter()
+        .position(|event| matches!(event, ChatEvent::CycleSummary { .. }))
+        .unwrap();
+    let work_at = events
+        .iter()
+        .position(|event| matches!(event, ChatEvent::ToolCall { id, .. } if id == "list"))
+        .unwrap();
+
+    assert!(summary_at < work_at);
+    assert!(matches!(
+        &events[summary_at],
+        ChatEvent::CycleSummary {
+            source: CycleSummarySource::Model,
+            message,
+            protocol_issues,
+        } if message == "I found the available notes. Next I will inspect them."
+            && protocol_issues.is_empty()
+    ));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        ChatEvent::ToolCall { id, .. } | ChatEvent::ToolResult { id, .. } if id == "summary"
+    )));
+
+    let requests = llm.requests();
+    assert_eq!(requests.len(), 3, "summary adds no model request");
+    let history = &requests[1].messages;
+    assert_eq!(
+        history
+            .iter()
+            .filter(|message| message.tool_call_id.as_deref() == Some("summary"))
+            .count(),
+        1,
+        "provider history keeps exactly one result for the admin call"
+    );
+    assert_eq!(
+        history
+            .iter()
+            .filter(|message| message.tool_call_id.as_deref() == Some("list"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn missing_summary_uses_fallback_before_work_and_records_the_protocol_detail() {
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![tool_call("list", "list_notes", "{}"), final_turn()]);
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &Guards::default());
+    let summary_at = events
+        .iter()
+        .position(|event| matches!(event, ChatEvent::CycleSummary { .. }))
+        .unwrap();
+    let work_at = events
+        .iter()
+        .position(|event| matches!(event, ChatEvent::ToolCall { .. }))
+        .unwrap();
+
+    assert!(summary_at < work_at);
+    assert!(matches!(
+        &events[summary_at],
+        ChatEvent::CycleSummary {
+            source: CycleSummarySource::Fallback,
+            protocol_issues,
+            ..
+        } if protocol_issues == &[CycleSummaryProtocolIssue::Missing]
+    ));
+}
+
+#[test]
+fn summary_only_batch_returns_protocol_result_without_publishing_a_summary() {
+    let vault = tempfile::tempdir().unwrap();
+    let llm = RecordingLlm::new(vec![
+        tool_call(
+            "summary",
+            "skill_step",
+            r#"{"message":"I am ready to continue."}"#,
+        ),
+        final_turn(),
+    ]);
+
+    let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &Guards::default());
+
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, ChatEvent::CycleSummary { .. })));
+    assert!(!events.iter().any(|event| matches!(
+        event,
+        ChatEvent::ToolCall { id, .. } | ChatEvent::ToolResult { id, .. } if id == "summary"
+    )));
+    assert_eq!(
+        llm.requests()[1]
+            .messages
+            .iter()
+            .filter(|message| message.tool_call_id.as_deref() == Some("summary"))
+            .count(),
+        1
+    );
 }
 
 /// The invariant the timeline depends on: every declared call is announced once
@@ -660,7 +843,7 @@ fn preloaded_skill_uses_the_same_activation_and_is_ready_on_turn_one() {
 }
 
 #[test]
-fn fixture_flow_emits_progress_elicitation_and_written_note_with_undo_entry() {
+fn fixture_flow_emits_cycle_summaries_elicitation_and_written_note_with_undo_entry() {
     let vault = tempfile::tempdir().unwrap();
     let llm = RecordingLlm::new(vec![
         tool_call(
@@ -685,11 +868,12 @@ fn fixture_flow_emits_progress_elicitation_and_written_note_with_undo_entry() {
 
     let positions = |predicate: fn(&ChatEvent) -> bool| events.iter().position(predicate).unwrap();
     assert!(
-        positions(|event| matches!(event, ChatEvent::SkillActivated { .. }))
-            < positions(|event| matches!(event, ChatEvent::SkillStep { .. }))
+        positions(|event| matches!(event, ChatEvent::CycleSummary { .. }))
+            < positions(|event| matches!(event, ChatEvent::SkillActivated { .. })),
+        "the activation batch is summarised before its real action"
     );
     assert!(
-        positions(|event| matches!(event, ChatEvent::SkillStep { .. }))
+        positions(|event| matches!(event, ChatEvent::SkillActivated { .. }))
             < positions(|event| matches!(event, ChatEvent::Elicit { .. }))
     );
     assert!(
@@ -720,13 +904,18 @@ fn skill_override_raises_the_absolute_iteration_ceiling() {
     };
     let (events, _) = run(vault.path(), &llm, Vec::new(), &[], &guards);
 
-    assert_eq!(
+    assert!(
         events
             .iter()
-            .filter(|event| matches!(event, ChatEvent::SkillStep { .. }))
-            .count(),
-        3
+            .filter(|event| matches!(event, ChatEvent::PlanningRound { .. }))
+            .count()
+            >= 5,
+        "the activated skill permits all scripted tool-decision turns"
     );
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, ChatEvent::PartialRun { .. })));
+    assert!(events.iter().any(|event| matches!(event, ChatEvent::Done)));
 }
 
 #[test]

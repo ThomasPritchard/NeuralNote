@@ -118,7 +118,7 @@ fn built_in_fixture_manifest_is_complete_and_instruction_backed() {
     assert!(!skill.description.is_empty());
     assert!(!skill.icon.is_empty());
     assert!(skill.instructions.contains("# Fixture skill"));
-    assert_eq!(skill.tools, ["skill_step", "ask_user", "write_note"]);
+    assert_eq!(skill.tools, ["ask_user", "write_note"]);
     assert!(skill.requirements.is_empty());
     assert_eq!(skill.max_iterations, Some(12));
     assert_eq!(skill.max_context_chars, None);
@@ -135,7 +135,6 @@ fn youtube_manifest_freezes_tools_requirement_tiers_and_iteration_ceiling() {
     assert_eq!(
         skill.tools,
         [
-            "skill_step",
             "ask_user",
             "write_note",
             "fetch_video_info",

@@ -38,6 +38,7 @@ const transcribe: ChatEvent = {
 
 const preview: ChatEvent = {
   type: "videoPreview",
+  id: "c1",
   videoId: "V1",
   title: "Spaced repetition, explained",
   durationSecs: 742,

@@ -2,6 +2,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { clearMocks } from "@tauri-apps/api/mocks";
 
 import {
+  answerElicitation,
+  answerToolApproval,
   cancelChatRun,
   cancelPull,
   chat,
@@ -14,6 +16,7 @@ import {
   readNote,
   searchVault,
 } from "../lib/api";
+import type { AgentActivityEnvelope, ChatEvent } from "../lib/types";
 import { createMockVault, VAULT_ROOT } from "./mockVault";
 import { MockScheduler } from "./mockScheduler";
 
@@ -59,7 +62,9 @@ describe("mockVault contract infrastructure", () => {
     const turnId = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e31";
     const events: string[] = [];
 
-    const run = chat(turnId, "hello", [], (event) => events.push(event.type));
+    const run = chat(turnId, "hello", [], (event) =>
+      events.push((event as unknown as ChatEvent).type),
+    );
     expect(events).toEqual([]);
     scheduler.runAll();
     expect(events).toEqual(["processing"]);
@@ -86,7 +91,7 @@ describe("mockVault contract infrastructure", () => {
     let settled = false;
 
     const run = chat("018f5f6c-8d5f-7c64-b8e7-8f9f238d9e32", "hello", [], (event) =>
-      events.push(event.type),
+      events.push((event as unknown as ChatEvent).type),
     );
     void run.then(() => {
       settled = true;
@@ -103,6 +108,180 @@ describe("mockVault contract infrastructure", () => {
     expect(scheduler.runNext()).toBe(true);
     await expect(run).resolves.toMatch(/.+/u);
     expect(settled).toBe(true);
+  });
+
+  it("streams explicit envelope-v1 fixtures through the real chat Channel", async () => {
+    const scheduler = new MockScheduler();
+    const turnId = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e39";
+    const activityScript: AgentActivityEnvelope[] = [
+      {
+        schemaVersion: 1,
+        turnId,
+        sequence: 1,
+        cycleId: null,
+        activityId: null,
+        payload: { type: "runStarted" },
+      },
+      {
+        schemaVersion: 1,
+        turnId,
+        sequence: 2,
+        cycleId: null,
+        activityId: null,
+        payload: { type: "runCompleted" },
+      },
+    ];
+    const backend = createMockVault({ scheduler, activityScript });
+    backend.install();
+    const delivered: string[] = [];
+
+    const run = chat(turnId, "hello", [], (event) => {
+      delivered.push(event.payload.type);
+    });
+    scheduler.runAll();
+
+    await expect(run).resolves.toBe(turnId);
+    expect(delivered).toEqual(["runStarted", "runCompleted"]);
+  });
+
+  it("builds an envelope-v1 fixture from the chat turn id without rewriting it", async () => {
+    const scheduler = new MockScheduler();
+    const actualTurnId = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e40";
+    const builtFor: string[] = [];
+    const backend = createMockVault({
+      scheduler,
+      activityScriptFactory: (turnId) => {
+        builtFor.push(turnId);
+        return [
+          {
+            schemaVersion: 1,
+            turnId,
+            sequence: 1,
+            cycleId: null,
+            activityId: null,
+            payload: { type: "runStarted" },
+          },
+          {
+            schemaVersion: 1,
+            turnId: "deliberately-not-the-chat-turn",
+            sequence: 2,
+            cycleId: null,
+            activityId: null,
+            payload: { type: "runCompleted" },
+          },
+        ];
+      },
+    });
+    backend.install();
+    const deliveredTurnIds: string[] = [];
+
+    const run = chat(actualTurnId, "hello", [], (event) => {
+      deliveredTurnIds.push(event.turnId);
+    });
+    scheduler.runAll();
+
+    await expect(run).resolves.toBe(actualTurnId);
+    expect(builtFor).toEqual([actualTurnId]);
+    expect(deliveredTurnIds).toEqual([
+      actualTurnId,
+      "deliberately-not-the-chat-turn",
+    ]);
+  });
+
+  it("keeps an explicit envelope fixture's wrong turn id untouched", async () => {
+    const scheduler = new MockScheduler();
+    const actualTurnId = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e41";
+    const fixtureTurnId = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e42";
+    const backend = createMockVault({
+      scheduler,
+      activityScript: [
+        {
+          schemaVersion: 1,
+          turnId: fixtureTurnId,
+          sequence: 1,
+          cycleId: null,
+          activityId: null,
+          payload: { type: "runStarted" },
+        },
+      ],
+    });
+    backend.install();
+    const deliveredTurnIds: string[] = [];
+
+    const run = chat(actualTurnId, "hello", [], (event) => {
+      deliveredTurnIds.push(event.turnId);
+    });
+    scheduler.runAll();
+
+    await expect(run).resolves.toBe(actualTurnId);
+    expect(deliveredTurnIds).toEqual([fixtureTurnId]);
+  });
+
+  it("resumes a parked v1 approval with the next envelope, never a legacy frame", async () => {
+    const scheduler = new MockScheduler();
+    const turnId = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e43";
+    const scope = { cycleId: "cycle-a", activityId: "write-1" };
+    const backend = createMockVault({
+      scheduler,
+      activityScriptFactory: (actualTurnId) => [
+        { schemaVersion: 1, turnId: actualTurnId, sequence: 1, cycleId: null, activityId: null, payload: { type: "runStarted" } },
+        { schemaVersion: 1, turnId: actualTurnId, sequence: 2, cycleId: "cycle-a", activityId: null, payload: { type: "cycleStarted", round: 1, maxRounds: 8, playlist: null } },
+        { schemaVersion: 1, turnId: actualTurnId, sequence: 3, ...scope, payload: { type: "activityStarted", name: "write_note", title: "Write note", arguments: "{}", stepId: null } },
+        { schemaVersion: 1, turnId: actualTurnId, sequence: 4, ...scope, payload: { type: "approvalRequested", tool: "writeNote", relPath: "Notes/Test.md", reason: "modeAlwaysAsk", expiresInSecs: 120 } },
+        { schemaVersion: 1, turnId: actualTurnId, sequence: 6, ...scope, payload: { type: "activitySettled", status: "ok", summary: "Created note", detail: null, durationMs: 2 } },
+        { schemaVersion: 1, turnId: actualTurnId, sequence: 7, cycleId: null, activityId: null, payload: { type: "runCompleted" } },
+      ],
+    });
+    backend.install();
+    const delivered: unknown[] = [];
+
+    const run = chat(turnId, "write it", [], (event) => delivered.push(event));
+    scheduler.runAll();
+    await answerToolApproval(turnId, "write-1", true);
+    scheduler.runAll();
+    await expect(run).resolves.toBe(turnId);
+
+    expect(delivered).toHaveLength(7);
+    expect(delivered.every((frame) =>
+      typeof frame === "object" && frame !== null && "payload" in frame,
+    )).toBe(true);
+    expect((delivered[4] as AgentActivityEnvelope)).toMatchObject({
+      schemaVersion: 1,
+      turnId,
+      sequence: 5,
+      cycleId: "cycle-a",
+      activityId: "write-1",
+      payload: { type: "approvalResolved", decision: "approved" },
+    });
+  });
+
+  it("refuses an elicitation answer from a sibling turn with the same prompt id", async () => {
+    const scheduler = new MockScheduler();
+    const owner = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e44";
+    const sibling = "018f5f6c-8d5f-7c64-b8e7-8f9f238d9e45";
+    const backend = createMockVault({
+      scheduler,
+      chatScript: [
+        {
+          type: "elicit",
+          id: "prompt-1",
+          question: "Continue?",
+          options: [{ id: "yes", label: "Yes", description: null, imageDataUri: null }],
+          multiSelect: false,
+        },
+        { type: "done" },
+      ],
+    });
+    backend.install();
+    const run = chat(owner, "continue", [], () => undefined);
+    scheduler.runAll();
+
+    await expect(
+      answerElicitation(sibling, "prompt-1", ["yes"]),
+    ).rejects.toMatchObject({ kind: "notFound" });
+    await answerElicitation(owner, "prompt-1", ["yes"]);
+    scheduler.runAll();
+    await expect(run).resolves.toBe(owner);
   });
 
   it("resolves a requirement download only after its terminal frame is delivered", async () => {

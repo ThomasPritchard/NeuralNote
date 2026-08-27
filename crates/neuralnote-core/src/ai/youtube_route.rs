@@ -250,6 +250,7 @@ async fn elicit_scheme(
     })
     .collect();
     let elicitation = Elicitation {
+        activity_id: call_id.to_string(),
         id: format!("{call_id}:scheme"),
         question: "I could not confidently infer this vault's organisation. Which scheme should this skill remember?".into(),
         options,
@@ -302,6 +303,7 @@ async fn elicit_route(
             });
         }
         let elicitation = Elicitation {
+            activity_id: call_id.to_string(),
             id: format!("{call_id}:route:{}", page_index + 1),
             question: format!(
                 "I could not confidently infer this vault's route. Choose an existing destination (page {} of {page_count}); I will remember it for this vault.",

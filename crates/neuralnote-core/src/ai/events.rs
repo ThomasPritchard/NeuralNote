@@ -12,9 +12,11 @@
 use serde::{Deserialize, Serialize};
 use ts_rs::TS;
 
+use crate::ai::activity_journal::CycleSummarySource;
 use crate::ai::approval::{
     ApprovalDegradedReason, ApprovalReason, ApprovalResolution, ApprovalRule, GatedTool,
 };
+use crate::ai::cycle_summary::CycleSummaryProtocolIssue;
 use crate::ai::plan::{PlanStep, StepStatus};
 use crate::ai::write_policy::NoteKind;
 
@@ -36,6 +38,12 @@ pub struct ElicitOption {
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub struct Elicitation {
+    /// The dispatched tool activity that owns this prompt. Kept off the prompt
+    /// wire: the host resolves questions by `id`, while the activity journal
+    /// needs this separate correlation when one tool asks more than once.
+    #[serde(skip)]
+    #[ts(skip)]
+    pub activity_id: String,
     pub id: String,
     pub question: String,
     pub options: Vec<ElicitOption>,
@@ -202,6 +210,8 @@ pub enum ChatEvent {
     ///
     /// Everything here is host-read metadata, never model prose.
     VideoPreview {
+        // The provider call that obtained the preview metadata.
+        id: String,
         /// The YouTube video id, so a card can be told apart from its successor
         /// even when two videos share a title.
         video_id: String,
@@ -224,9 +234,22 @@ pub enum ChatEvent {
     SkillActivated { id: String, name: String },
     /// A user-facing progress update emitted by an active skill.
     SkillStep { message: String },
+    /// The one accepted or host-fallback summary for a work-producing model
+    /// batch. Unlike `SkillStep`, provenance is structural and the bounded
+    /// protocol details contain no raw model arguments.
+    CycleSummary {
+        source: CycleSummarySource,
+        message: String,
+        protocol_issues: Vec<CycleSummaryProtocolIssue>,
+    },
     /// A structured question is ready for the host to present. Answered or dormant
     /// presentation state is tracked client-side; no follow-up wire event is emitted.
     Elicit {
+        /// Internal activity correlation; legacy ChatEvent consumers never
+        /// received it, while the v1 sequencer projects it into the envelope.
+        #[serde(skip)]
+        #[ts(skip)]
+        activity_id: String,
         id: String,
         question: String,
         options: Vec<ElicitOption>,
@@ -302,6 +325,8 @@ pub enum ChatEvent {
     /// How a transcript was actually obtained, reported by the tool that obtained
     /// it — so provenance is read off the wire, never scraped out of model prose.
     TranscriptSource {
+        // The provider call that obtained the transcript.
+        id: String,
         label: String,
         rel_path: Option<String>,
     },
@@ -310,10 +335,20 @@ pub enum ChatEvent {
     /// never has to infer it from an answer that merely mentions "cancelled".
     PartialRun { reason: String },
     /// A create-only skill write succeeded at the actual collision-safe path.
-    NoteWritten { rel_path: String, kind: NoteKind },
+    NoteWritten {
+        // The provider write call that committed this note.
+        id: String,
+        rel_path: String,
+        kind: NoteKind,
+    },
     /// A create-only write hit an existing note and wrote nothing (#108). Without
     /// it the no-op is invisible, which the "failures are never silent" rule forbids.
-    NoteExists { rel_path: String, kind: NoteKind },
+    NoteExists {
+        // The provider write call that discovered the existing note.
+        id: String,
+        rel_path: String,
+        kind: NoteKind,
+    },
     /// A best-effort, partially-parsed view of a note the model is still
     /// composing. Rust owns the partial-JSON parse and emits a SEMANTIC preview,
     /// so the UI never sees half a JSON blob and never has to know the body
@@ -501,6 +536,16 @@ pub struct TokenUsage {
 pub trait EventSink: Send {
     fn send(&mut self, event: ChatEvent);
 
+    /// Move subsequent [`ChatEvent::Thinking`] deltas into the final-answer
+    /// phase. The legacy event stream needs no new visible event for this
+    /// lifecycle boundary, while the ordered journal uses it to prevent final
+    /// reasoning from inheriting the last tool cycle.
+    ///
+    /// Wrappers on the production sink path must forward this method, just as
+    /// they forward [`EventSink::record_usage`]. The default keeps legacy and
+    /// test sinks source-compatible while they have no phase state to update.
+    fn begin_final_answer(&mut self) {}
+
     /// Report what one model call cost — `None` when the provider said nothing.
     ///
     /// This is the transport's only channel back to the orchestrator besides its
@@ -614,6 +659,7 @@ mod tests {
         // Same transport as `ElicitOption::image_data_uri`: the image crosses as
         // a bounded data URI, so the webview never talks to a third party.
         let event = ChatEvent::VideoPreview {
+            id: "call-video".into(),
             video_id: "iG9CE55wbtY".into(),
             title: "Spaced repetition, explained".into(),
             duration_secs: Some(742),
@@ -624,6 +670,7 @@ mod tests {
             json(&event),
             serde_json::json!({
                 "type": "videoPreview",
+                "id": "call-video",
                 "videoId": "iG9CE55wbtY",
                 "title": "Spaced repetition, explained",
                 "durationSecs": 742,
@@ -644,6 +691,7 @@ mod tests {
         // empty string would render as a broken image; `null` says there is no
         // image and the card draws its text-only self.
         let event = ChatEvent::VideoPreview {
+            id: "call-video".into(),
             video_id: "iG9CE55wbtY".into(),
             title: "Spaced repetition, explained".into(),
             duration_secs: None,
@@ -804,6 +852,19 @@ mod tests {
                 "message": "Preparing note",
             })
         );
+        assert_eq!(
+            json(&ChatEvent::CycleSummary {
+                source: crate::ai::CycleSummarySource::Model,
+                message: "I found the notes. Next I’ll compare them.".into(),
+                protocol_issues: vec![crate::ai::CycleSummaryProtocolIssue::Late],
+            }),
+            serde_json::json!({
+                "type": "cycleSummary",
+                "source": "model",
+                "message": "I found the notes. Next I’ll compare them.",
+                "protocolIssues": [{ "kind": "late" }],
+            })
+        );
     }
 
     #[test]
@@ -815,6 +876,7 @@ mod tests {
             image_data_uri: Some("data:image/png;base64,abc".into()),
         };
         let elicitation = Elicitation {
+            activity_id: "call-1".into(),
             id: "prompt-1".into(),
             question: "Continue?".into(),
             options: vec![option.clone()],
@@ -831,6 +893,7 @@ mod tests {
 
         assert_eq!(
             json(&ChatEvent::Elicit {
+                activity_id: elicitation.activity_id,
                 id: elicitation.id,
                 question: elicitation.question,
                 options: elicitation.options,
@@ -955,11 +1018,13 @@ mod tests {
     fn transcript_source_carries_the_label_and_an_optional_note_path() {
         assert_eq!(
             json(&ChatEvent::TranscriptSource {
+                id: "call-captions".into(),
                 label: "captions:en".into(),
                 rel_path: None,
             }),
             serde_json::json!({
                 "type": "transcriptSource",
+                "id": "call-captions",
                 "label": "captions:en",
                 "relPath": null,
             })
@@ -981,6 +1046,7 @@ mod tests {
         // #108: a create-only write that hits an existing note used to emit nothing.
         // Its wire shape mirrors `noteWritten` so the UI can pair them.
         let event = ChatEvent::NoteExists {
+            id: "call-write".into(),
             rel_path: "Notes/Name.md".into(),
             kind: NoteKind::Atomic,
         };
@@ -988,6 +1054,7 @@ mod tests {
             json(&event),
             serde_json::json!({
                 "type": "noteExists",
+                "id": "call-write",
                 "relPath": "Notes/Name.md",
                 "kind": "atomic",
             })
@@ -1268,10 +1335,12 @@ mod tests {
             (NoteKind::Transcript, "transcript"),
         ] {
             let value = json(&ChatEvent::NoteWritten {
+                id: "call-write".into(),
                 rel_path: "Notes/Name.md".into(),
                 kind,
             });
             assert_eq!(value["type"], "noteWritten");
+            assert_eq!(value["id"], "call-write");
             assert_eq!(value["relPath"], "Notes/Name.md");
             assert_eq!(value["kind"], expected);
         }

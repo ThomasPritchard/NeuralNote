@@ -558,6 +558,7 @@ mod tests {
 
     fn elicitation(id: &str, multi_select: bool) -> Elicitation {
         Elicitation {
+            activity_id: id.into(),
             id: id.into(),
             question: "Continue?".into(),
             options: vec![

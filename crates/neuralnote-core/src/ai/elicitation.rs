@@ -50,6 +50,7 @@ pub async fn elicit_user(
     }
 
     sink.send(ChatEvent::Elicit {
+        activity_id: elicitation.activity_id.clone(),
         id: elicitation.id.clone(),
         question: elicitation.question.clone(),
         options: elicitation.options.clone(),

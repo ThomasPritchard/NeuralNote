@@ -135,8 +135,8 @@ describe("Journey 9: YouTube distil failures and fallbacks", () => {
       { type: "skillStep", message: "Transcribing locally with whisper:small.en…" },
       // The transcribing tool reports its own provenance, before any note exists
       // to attach it to — mirroring `dispatch_transcribe_audio`.
-      { type: "transcriptSource", label: "whisper:small.en", relPath: null },
-      { type: "noteWritten", relPath: "Transcripts/Quiet talk transcript.md", kind: "transcript" },
+      { type: "transcriptSource", id: "distil-1", label: "whisper:small.en", relPath: null },
+      { type: "noteWritten", id: "distil-1", relPath: "Transcripts/Quiet talk transcript.md", kind: "transcript" },
       { type: "answer", delta: "Transcript provenance: whisper:small.en." },
       {
         type: "citation",
@@ -201,9 +201,9 @@ describe("Journey 10: YouTube playlist selection", () => {
         multiSelect: false,
       },
       { type: "skillStep", message: "Video 1 of 21: Agent talk 1 — captions:en-auto" },
-      { type: "transcriptSource", label: "captions:en-auto", relPath: null },
-      { type: "noteWritten", relPath: "Literature/Agent talk 1.md", kind: "literature" },
-      { type: "noteWritten", relPath: "Transcripts/Agent talk 1 transcript.md", kind: "transcript" },
+      { type: "transcriptSource", id: "distil-1", label: "captions:en-auto", relPath: null },
+      { type: "noteWritten", id: "distil-1", relPath: "Literature/Agent talk 1.md", kind: "literature" },
+      { type: "noteWritten", id: "distil-1", relPath: "Transcripts/Agent talk 1 transcript.md", kind: "transcript" },
     ];
     const { user, backend, advanceAllFrames } = await openWorkspace({
       chatScript: script,

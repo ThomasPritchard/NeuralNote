@@ -24,11 +24,13 @@ use crate::capture::{thumbnail_data_uri, CaptureError, VideoId, VideoMetadata};
 /// another video's card — the two agree at today's only call site, and nothing
 /// about the signature required them to.
 pub(super) async fn video_preview(
+    call_id: &str,
     io: &dyn YoutubeIo,
     metadata: &VideoMetadata,
     video_id: &VideoId,
 ) -> ChatEvent {
     ChatEvent::VideoPreview {
+        id: call_id.to_string(),
         video_id: video_id.as_ref().to_string(),
         title: metadata.title.clone(),
         duration_secs: metadata.duration_seconds,

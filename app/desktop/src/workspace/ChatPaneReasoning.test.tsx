@@ -9,7 +9,7 @@
 
 import { act, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { AiStatus, ChatEvent } from "../lib/types";
+import type { AiStatus } from "../lib/types";
 
 const { reportError } = vi.hoisted(() => ({ reportError: vi.fn() }));
 
@@ -54,6 +54,7 @@ import {
   resetChatPaneMocks,
   sendButton,
   setup,
+  type ChatPaneTestEvent,
 } from "./chatPaneTestHarness";
 
 beforeEach(() => {
@@ -583,7 +584,7 @@ describe("ChatPane — reasoning backstop notice", () => {
     await screen.findByLabelText("Ask across your vault");
 
     const gate = deferred<string>();
-    let emit!: (ev: ChatEvent) => void;
+    let emit!: (ev: ChatPaneTestEvent) => void;
     mockChat.mockImplementation((_turnId, _p, _h, onEvent) => {
       emit = onEvent;
       return gate.promise; // stays in-flight while the user flips the toggle

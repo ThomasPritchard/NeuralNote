@@ -38,8 +38,8 @@ const happyScript: ChatEvent[] = [
   { type: "skillStep", message: "Preparing the fixture note…" },
   CONSENT,
   { type: "skillStep", message: "Writing the notes…" },
-  { type: "noteWritten", relPath: "Literature/Fixture talk.md", kind: "literature" },
-  { type: "noteWritten", relPath: "Atomic/Fixture idea.md", kind: "atomic" },
+  { type: "noteWritten", id: "distil-1", relPath: "Literature/Fixture talk.md", kind: "literature" },
+  { type: "noteWritten", id: "distil-1", relPath: "Atomic/Fixture idea.md", kind: "atomic" },
   {
     type: "answer",
     delta:

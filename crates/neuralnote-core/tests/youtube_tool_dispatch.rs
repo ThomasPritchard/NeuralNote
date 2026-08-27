@@ -285,6 +285,7 @@ fn call_with_pricing(
         &mut active,
         &FsBackend,
         &mut writes,
+        "youtube-call",
         &mut sink,
         &allowed,
     )
@@ -342,6 +343,7 @@ fn call_collecting_events(
             &mut active,
             &FsBackend,
             &mut writes,
+            "youtube-call",
             &mut sink,
             &allowed,
         )
@@ -363,9 +365,9 @@ fn transcript_sources(events: &[ChatEvent]) -> Vec<(String, Option<String>)> {
     events
         .iter()
         .filter_map(|event| match event {
-            ChatEvent::TranscriptSource { label, rel_path } => {
-                Some((label.clone(), rel_path.clone()))
-            }
+            ChatEvent::TranscriptSource {
+                label, rel_path, ..
+            } => Some((label.clone(), rel_path.clone())),
             _ => None,
         })
         .collect()
@@ -627,6 +629,7 @@ fn call_with_installer(
         &mut active,
         &FsBackend,
         &mut writes,
+        "install-call",
         &mut sink,
         &allowed,
     )
@@ -1404,6 +1407,7 @@ fn only_preview(events: &[ChatEvent]) -> PreviewFields {
     );
     match previews[0] {
         ChatEvent::VideoPreview {
+            id: _,
             video_id,
             title,
             duration_secs,

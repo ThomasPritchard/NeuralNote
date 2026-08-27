@@ -130,6 +130,7 @@ async fn elicit_playlist_selection(
     for (page_index, entries) in playlist.entries.chunks(PLAYLIST_PAGE_SIZE).enumerate() {
         let options = build_page_options(entries, io, session).await?;
         let elicitation = Elicitation {
+            activity_id: call_id.to_string(),
             id: format!("{call_id}:playlist:{}", page_index + 1),
             question: format!(
                 "Choose videos from '{}' (page {} of {page_count}; {} videos total).",
@@ -232,6 +233,7 @@ fn high_usage_confirmation(
 ) -> Elicitation {
     let unknown_duration_note = unknown_duration_note(estimated.unknown_duration_count);
     Elicitation {
+        activity_id: call_id.to_string(),
         id: format!("{call_id}:high-usage"),
         question: format!(
             "You selected {selected_count} videos. Are you sure? This can incur high usage. Rough estimate: {} input tokens, {}. Method: selected duration × 150 spoken words/minute; {}{}",

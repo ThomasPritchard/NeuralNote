@@ -139,6 +139,10 @@ impl EventSink for UsageMeter<'_> {
         self.inner.send(event);
     }
 
+    fn begin_final_answer(&mut self) {
+        self.inner.begin_final_answer();
+    }
+
     fn record_usage(&mut self, usage: Option<TokenUsage>) {
         match usage {
             Some(usage) => {

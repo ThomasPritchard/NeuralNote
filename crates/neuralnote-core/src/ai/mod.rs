@@ -14,9 +14,11 @@
 //! slots in as just another [`RetrievalProvider`] returning the same
 //! [`EvidenceSpan`] shape, with no change to the chat layer.
 
+pub mod activity_journal;
 pub mod approval;
 mod call_channel;
 pub mod capabilities;
+mod cycle_summary;
 pub mod elicitation;
 pub mod events;
 pub mod evidence;
@@ -35,6 +37,7 @@ mod skill_tools;
 pub mod skills;
 pub mod tool_registry;
 pub mod tool_stream;
+mod tool_turn_presentation;
 pub mod tool_turn_reader;
 pub mod tools;
 pub mod verify;
@@ -47,6 +50,10 @@ mod youtube_tool_errors;
 mod youtube_tool_schemas;
 mod youtube_tools;
 
+pub use activity_journal::{
+    ActivityAbandonReason, ActivityEnvelopeSink, AgentActivityEnvelope, AgentActivityPayload,
+    CycleSummarySource, SequencedActivitySink, ThinkingSource, ACTIVITY_JOURNAL_SCHEMA_VERSION,
+};
 pub use capabilities::{
     effective_reasoning, effective_reasoning_ask, ollama_reasoning_support,
     openrouter_reasoning_support, parse_ollama_capabilities, parse_openrouter_context_windows,
@@ -54,6 +61,7 @@ pub use capabilities::{
     reasoning_ask, reasoning_effort_override, supports_reasoning, supports_thinking,
     ModelCapabilities, ReasoningControl, ReasoningEffortOverride, ReasoningSupport,
 };
+pub use cycle_summary::CycleSummaryProtocolIssue;
 pub use elicitation::{elicit_user, ElicitationOutcome};
 pub use events::{ChatEvent, ElicitOption, Elicitation, EventSink, TokenUsage, ToolStatus};
 pub use evidence::{EvidenceRegistry, EvidenceSpan};

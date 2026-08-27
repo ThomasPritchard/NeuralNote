@@ -55,6 +55,7 @@ export function ElicitCard({
   answer,
   onAnswered,
   onSendFollowUp,
+  announceStatus = true,
 }: Readonly<{
   elicitation: PendingElicitation;
   /** The owning run's id, sent with the answer so the Rust shell resolves this
@@ -73,6 +74,8 @@ export function ElicitCard({
   onAnswered: (id: string, choices: string[]) => void;
   /** Issues an ordinary chat turn — the dormant card's whole affordance. */
   onSendFollowUp: (text: string) => void;
+  /** v1 routes all polite announcements through its single action line. */
+  announceStatus?: boolean;
 }>) {
   const { id, question, options, multiSelect } = elicitation;
   const [submitting, setSubmitting] = useState(false);
@@ -152,6 +155,11 @@ export function ElicitCard({
   // live question carries the primary tint — it's the one thing being waited
   // on, and the accent should mean exactly that.
   const quiet = answered || fallback;
+  const statusMessage = answered
+    ? "Answered."
+    : expired
+      ? "This question expired — picking an answer continues the chat."
+      : "";
 
   return (
     <section
@@ -287,12 +295,15 @@ export function ElicitCard({
 
       {/* Always-mounted status slot: reads as padding while empty, announces
           the answered/expired transitions politely without layout jump. */}
-      <output className="min-h-4 text-[0.625rem] leading-snug text-muted-foreground/70">
-        {answered && "Answered."}
-        {!answered &&
-          expired &&
-          "This question expired — picking an answer continues the chat."}
-      </output>
+      {announceStatus ? (
+        <output className="min-h-4 text-[0.625rem] leading-snug text-muted-foreground/70">
+          {statusMessage}
+        </output>
+      ) : (
+        <p className="min-h-4 text-[0.625rem] leading-snug text-muted-foreground/70">
+          {statusMessage}
+        </p>
+      )}
 
       {error && (
         <p

@@ -1,6 +1,7 @@
 //! The tools exposed to the model, and the dispatcher that runs them.
 //!
-//! Four read-only vault tools plus `use_skill` are always available. Active skills
+//! Four read-only vault tools, `use_skill`, and the administrative `skill_step`
+//! summary tool are always available. Active skills
 //! progressively grant their declared action tools. Schemas are OpenAI-compatible
 //! `serde_json::Value`s; tool argument property names are `snake_case` because this
 //! is the model-facing contract, not the frontend camelCase contract.
@@ -134,6 +135,7 @@ pub struct ToolContext<'a> {
     pub(super) active_skills: &'a mut ActiveSkills,
     pub(super) note_writer: &'a dyn NoteWriteBackend,
     pub(super) writes: &'a mut WriteSession,
+    pub(super) call_id: &'a str,
     pub(super) sink: &'a mut dyn EventSink,
     pub(super) youtube_io: &'a dyn YoutubeIo,
     pub(super) youtube_requirements: &'a dyn crate::ai::youtube::YoutubeRequirementInstaller,
@@ -162,6 +164,7 @@ impl<'a> ToolContext<'a> {
         active_skills: &'a mut ActiveSkills,
         note_writer: &'a dyn NoteWriteBackend,
         writes: &'a mut WriteSession,
+        call_id: &'a str,
         sink: &'a mut dyn EventSink,
         authorized_tools: &'a BTreeSet<String>,
     ) -> Self {
@@ -172,6 +175,7 @@ impl<'a> ToolContext<'a> {
             active_skills,
             note_writer,
             writes,
+            call_id,
             sink,
             youtube_io: &UNAVAILABLE_YOUTUBE_IO,
             youtube_requirements: &crate::ai::youtube::UNAVAILABLE_YOUTUBE_REQUIREMENT_INSTALLER,
@@ -236,6 +240,10 @@ pub fn tool_schemas(active_skill_tools: &BTreeSet<String>) -> Vec<Value> {
         search_notes_schema(),
         read_note_span_schema(),
         skill_tools::use_skill_schema(),
+        // Always advertised, but never authorizing: this administrative call
+        // can narrate a batch only. It grants no action tool and bypasses the
+        // visible tool lifecycle in the orchestrator.
+        skill_tools::skill_step_schema(),
         // Always advertised. A plan is a general agent affordance, not something
         // a skill grants — and a model that never calls it simply produces a
         // timeline with no step grouping, which is the pre-plan behaviour.
@@ -728,6 +736,9 @@ fn span_json(id: &str, span: &crate::ai::evidence::EvidenceSpan) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::cycle_summary::{
+        select_cycle_summary, CycleSummaryProtocolIssue, SkillStepDisposition,
+    };
     use crate::ai::events::VecSink;
     use crate::ai::evidence::EvidenceSpan;
     use crate::ai::llm::{NoUserPrompt, ToolCall};
@@ -879,6 +890,7 @@ mod tests {
             &mut active,
             &UnavailableNoteWriter,
             &mut writes,
+            "test-call",
             &mut sink,
             &allowed,
         );
@@ -979,11 +991,184 @@ mod tests {
                 TOOL_SEARCH_NOTES,
                 TOOL_READ_NOTE_SPAN,
                 TOOL_USE_SKILL,
+                // Administrative presentation infrastructure, not a grant for
+                // any action tool.
+                TOOL_SKILL_STEP,
                 // Always advertised: a plan is a general agent affordance, not
                 // something a skill grants.
                 TOOL_UPDATE_PLAN,
             ]
         );
+    }
+
+    #[test]
+    fn global_skill_step_is_advertised_once_without_granting_skill_actions() {
+        let schemas = tool_schemas(&BTreeSet::from([TOOL_SKILL_STEP.to_string()]));
+        let names: Vec<&str> = schemas
+            .iter()
+            .filter_map(|schema| schema["function"]["name"].as_str())
+            .collect();
+
+        assert_eq!(
+            names
+                .iter()
+                .filter(|name| **name == TOOL_SKILL_STEP)
+                .count(),
+            1,
+            "an active skill must not duplicate the global administrative schema"
+        );
+        for action in [
+            TOOL_ASK_USER,
+            TOOL_WRITE_NOTE,
+            TOOL_FETCH_VIDEO_INFO,
+            TOOL_FETCH_CAPTIONS,
+        ] {
+            assert!(
+                !names.contains(&action),
+                "advertising skill_step must not grant '{action}'"
+            );
+        }
+    }
+
+    fn summary_call(id: &str, arguments: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: TOOL_SKILL_STEP.into(),
+            arguments: arguments.into(),
+        }
+    }
+
+    fn real_call(id: &str, name: &str) -> ToolCall {
+        ToolCall {
+            id: id.into(),
+            name: name.into(),
+            arguments: "{}".into(),
+        }
+    }
+
+    #[test]
+    fn cycle_summary_normalises_whitespace_and_selects_the_first_valid_call() {
+        let calls = vec![
+            summary_call("bad", r#"{"message":"\n\n"}"#),
+            summary_call(
+                "accepted",
+                r#"{"message":"  I found the relevant notes.\r\nNext I will compare them.  "}"#,
+            ),
+            summary_call("duplicate", r#"{"message":"This must not win."}"#),
+            real_call("search", TOOL_SEARCH_NOTES),
+        ];
+
+        let decision = select_cycle_summary(&calls);
+        let summary = decision.summary.expect("a work batch gets a summary");
+        assert_eq!(
+            summary.message,
+            "I found the relevant notes. Next I will compare them."
+        );
+        assert_eq!(summary.source, crate::ai::CycleSummarySource::Model);
+        assert!(summary
+            .protocol_issues
+            .contains(&CycleSummaryProtocolIssue::EmptyMessage));
+        assert!(summary
+            .protocol_issues
+            .contains(&CycleSummaryProtocolIssue::Duplicate));
+        assert_eq!(
+            decision.dispositions,
+            [
+                Some(SkillStepDisposition::Invalid),
+                Some(SkillStepDisposition::Accepted),
+                Some(SkillStepDisposition::Duplicate),
+                None,
+            ]
+        );
+    }
+
+    #[test]
+    fn cycle_summary_rejects_paragraphs_controls_and_over_320_unicode_scalars() {
+        let valid_320 = "🧠".repeat(320);
+        let too_long = "é".repeat(161);
+        assert_eq!(too_long.chars().count(), 322, "combining marks are scalars");
+        let calls = vec![
+            summary_call("paragraphs", r#"{"message":"One\n\nTwo"}"#),
+            summary_call("control", r#"{"message":"One\u0000Two"}"#),
+            summary_call(
+                "long",
+                &serde_json::json!({ "message": too_long }).to_string(),
+            ),
+            summary_call(
+                "valid",
+                &serde_json::json!({ "message": valid_320.clone() }).to_string(),
+            ),
+            real_call("list", TOOL_LIST_NOTES),
+        ];
+
+        let summary = select_cycle_summary(&calls).summary.unwrap();
+        assert_eq!(summary.message, valid_320);
+        assert!(summary
+            .protocol_issues
+            .contains(&CycleSummaryProtocolIssue::MultipleParagraphs));
+        assert!(summary
+            .protocol_issues
+            .contains(&CycleSummaryProtocolIssue::ControlCharacter));
+        assert!(summary
+            .protocol_issues
+            .contains(&CycleSummaryProtocolIssue::TooLong));
+    }
+
+    #[test]
+    fn missing_summary_uses_the_first_real_tools_host_copy_and_unknown_is_generic() {
+        let known = select_cycle_summary(&[real_call("read", TOOL_READ_NOTE_SPAN)])
+            .summary
+            .unwrap();
+        assert_eq!(known.source, crate::ai::CycleSummarySource::Fallback);
+        assert_eq!(known.message, "Next, I’ll read the relevant note section.");
+        assert_eq!(known.protocol_issues, [CycleSummaryProtocolIssue::Missing]);
+
+        let unknown = select_cycle_summary(&[real_call("made-up", "not_a_tool")])
+            .summary
+            .unwrap();
+        assert_eq!(unknown.message, "Continuing with the next step.");
+    }
+
+    #[test]
+    fn summary_only_batches_publish_nothing_and_protocol_details_stay_bounded() {
+        let only_summary =
+            select_cycle_summary(&[summary_call("summary", r#"{"message":"I am ready."}"#)]);
+        assert!(only_summary.summary.is_none());
+        assert_eq!(
+            only_summary.dispositions,
+            [Some(SkillStepDisposition::IgnoredNoWork)]
+        );
+
+        let mut calls = vec![summary_call(
+            "accepted",
+            r#"{"message":"I found the notes. Next I will read them."}"#,
+        )];
+        calls.extend((0..100).map(|index| {
+            summary_call(&format!("duplicate-{index}"), r#"{"message":"Duplicate."}"#)
+        }));
+        calls.push(real_call("list", TOOL_LIST_NOTES));
+        let summary = select_cycle_summary(&calls).summary.unwrap();
+        assert!(summary.protocol_issues.len() <= 9);
+        assert!(matches!(
+            summary.protocol_issues.last(),
+            Some(CycleSummaryProtocolIssue::Additional { count }) if *count > 0
+        ));
+    }
+
+    #[test]
+    fn a_valid_summary_after_real_work_is_accepted_but_recorded_as_late() {
+        let calls = [
+            real_call("list", TOOL_LIST_NOTES),
+            summary_call(
+                "summary",
+                r#"{"message":"I found the list. Next I will read it."}"#,
+            ),
+        ];
+        let summary = select_cycle_summary(&calls).summary.unwrap();
+        assert_eq!(summary.source, crate::ai::CycleSummarySource::Model);
+        assert!(summary
+            .protocol_issues
+            .contains(&CycleSummaryProtocolIssue::Late));
     }
 
     #[test]

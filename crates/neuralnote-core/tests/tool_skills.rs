@@ -132,6 +132,7 @@ impl Harness {
             &mut self.active,
             &FsBackend,
             &mut self.writes,
+            call_id,
             &mut self.sink,
             allowed,
         );
@@ -180,11 +181,7 @@ fn use_skill_returns_full_instructions_emits_once_and_grants_declared_tools() {
     assert!(harness.active.contains(FIXTURE_SKILL_ID));
     assert_eq!(
         harness.active.authorized_tools(),
-        BTreeSet::from([
-            TOOL_ASK_USER.into(),
-            TOOL_SKILL_STEP.into(),
-            TOOL_WRITE_NOTE.into(),
-        ])
+        BTreeSet::from([TOOL_ASK_USER.into(), TOOL_WRITE_NOTE.into(),])
     );
     assert_eq!(harness.active.max_iterations(1), 12);
     assert_eq!(
@@ -275,23 +272,14 @@ fn skill_dispatchers_reject_malformed_json_with_tool_specific_errors() {
 }
 
 #[test]
-fn skill_step_requires_a_grant_then_emits_progress() {
+fn skill_step_is_global_and_never_emits_legacy_host_progress() {
     let mut harness = Harness::built_in();
     let result = harness.call("c1", TOOL_SKILL_STEP, r#"{"message":"Working"}"#);
-    assert_eq!(result.outcome, ToolOutcome::Rejected);
-    assert!(result.content.contains("not active"));
-
-    harness.call(
-        "c2",
-        TOOL_USE_SKILL,
-        &format!(r#"{{"id":"{FIXTURE_SKILL_ID}"}}"#),
-    );
-    let result = harness.call("c3", TOOL_SKILL_STEP, r#"{"message":"Working"}"#);
     assert_eq!(result.outcome, ToolOutcome::Action);
-    assert!(harness
+    assert!(!harness
         .events()
         .iter()
-        .any(|event| matches!(event, ChatEvent::SkillStep { message } if message == "Working")));
+        .any(|event| matches!(event, ChatEvent::SkillStep { .. })));
 }
 
 #[test]
@@ -568,11 +556,17 @@ fn a_create_only_write_that_hits_an_existing_note_says_so_instead_of_going_silen
             .events()
             .iter()
             .filter_map(|event| match event {
-                ChatEvent::NoteExists { rel_path, kind } => Some((rel_path.clone(), *kind)),
+                ChatEvent::NoteExists { id, rel_path, kind } => {
+                    Some((id.clone(), rel_path.clone(), *kind))
+                }
                 _ => None,
             })
             .collect::<Vec<_>>(),
-        [("Atomic.md".to_string(), NoteKind::Atomic)],
+        [(
+            "write-2".to_string(),
+            "Atomic.md".to_string(),
+            NoteKind::Atomic,
+        )],
         "the no-op write must reach the user, and say which note it collided with"
     );
 }

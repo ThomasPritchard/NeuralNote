@@ -32,22 +32,27 @@ pub(super) fn use_skill_schema() -> Value {
     )
 }
 
-pub(super) fn active_schemas() -> [(&'static str, Value); 3] {
+pub(super) fn active_schemas() -> [(&'static str, Value); 2] {
     [
-        (TOOL_SKILL_STEP, skill_step_schema()),
         (TOOL_ASK_USER, ask_user_schema()),
         (TOOL_WRITE_NOTE, write_note_schema()),
     ]
 }
 
-fn skill_step_schema() -> Value {
+pub(super) fn skill_step_schema() -> Value {
     function_tool(
         TOOL_SKILL_STEP,
-        "Emit a short user-facing progress update for the active skill.",
+        "Summarise the current Thinking and what comes next. Include exactly one \
+         skill_step alongside each batch of real work. Use one or two short, \
+         ordinary-language sentences; do not name tools or reveal hidden chain-of-thought.",
         json!({
             "type": "object",
             "properties": {
-                "message": { "type": "string", "description": "Short present-tense progress message." }
+                "message": {
+                    "type": "string",
+                    "description": "One or two ordinary-language sentences explaining what was learned and what happens next.",
+                    "maxLength": 320
+                }
             },
             "required": ["message"],
             "additionalProperties": false
@@ -159,7 +164,7 @@ struct SkillStepArgs {
     message: String,
 }
 
-pub(super) fn dispatch_skill_step(args_json: &str, context: &mut ToolContext<'_>) -> ToolResult {
+pub(super) fn dispatch_skill_step(args_json: &str, _context: &mut ToolContext<'_>) -> ToolResult {
     let args: SkillStepArgs = match serde_json::from_str(args_json) {
         Ok(args) => args,
         Err(error) => return reject(format!("invalid skill_step arguments: {error}")),
@@ -167,9 +172,10 @@ pub(super) fn dispatch_skill_step(args_json: &str, context: &mut ToolContext<'_>
     if args.message.trim().is_empty() {
         return reject("skill_step message cannot be empty".into());
     }
-    context.sink.send(ChatEvent::SkillStep {
-        message: args.message,
-    });
+    // The orchestrator pre-scans completed batches and publishes the accepted
+    // typed CycleSummary before any real activity. Direct dispatch remains total
+    // for tests and defensive callers, but model prose never becomes a legacy
+    // host-authored SkillStep event here.
     action(json!({ "ok": true }).to_string())
 }
 
@@ -203,6 +209,7 @@ pub(super) async fn dispatch_ask_user(
         }
     }
     let elicitation = Elicitation {
+        activity_id: call_id.to_string(),
         id: call_id.to_string(),
         question: args.question,
         options: args.options,
@@ -272,6 +279,7 @@ pub(super) fn dispatch_write_note(args_json: &str, context: &mut ToolContext<'_>
                 session.record_playlist_write(args.work_item, args.kind);
             }
             context.sink.send(ChatEvent::NoteWritten {
+                id: context.call_id.to_string(),
                 rel_path: rel_path.clone(),
                 kind: written_kind,
             });
@@ -286,6 +294,7 @@ pub(super) fn dispatch_write_note(args_json: &str, context: &mut ToolContext<'_>
             // was invisible. `kind` is the kind that was REQUESTED — nothing was
             // written, so there is no written kind to report.
             context.sink.send(ChatEvent::NoteExists {
+                id: context.call_id.to_string(),
                 rel_path: rel_path.clone(),
                 kind: args.kind,
             });

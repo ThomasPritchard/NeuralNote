@@ -110,6 +110,27 @@ impl RegisteredTool {
         }
     }
 
+    /// Neutral application copy used when a work batch did not provide a valid
+    /// model summary. Administrative `skill_step` has no action to describe.
+    pub const fn fallback_summary(self) -> Option<&'static str> {
+        Some(match self {
+            Self::ListNotes => "Next, I’ll see which notes are available.",
+            Self::ListFolders => "Next, I’ll inspect how the vault is organised.",
+            Self::SearchNotes => "Next, I’ll search the vault for relevant evidence.",
+            Self::ReadNoteSpan => "Next, I’ll read the relevant note section.",
+            Self::UseSkill => "Next, I’ll prepare the right workflow for this task.",
+            Self::SkillStep => return None,
+            Self::AskUser => "Next, I’ll ask for the choice needed to continue.",
+            Self::WriteNote => "Next, I’ll create the note in the vault.",
+            Self::FetchVideoInfo => "Next, I’ll fetch the video details.",
+            Self::FetchCaptions => "Next, I’ll fetch the available captions.",
+            Self::TranscribeAudio => "Next, I’ll transcribe the audio.",
+            Self::SelectPlaylistVideos => "Next, I’ll confirm which videos to process.",
+            Self::ResolveDistilRoute => "Next, I’ll choose the best transcript source.",
+            Self::UpdatePlan => "Next, I’ll set out the work and keep it up to date.",
+        })
+    }
+
     /// Resolve a wire name the model sent. `None` for anything unregistered —
     /// the dispatcher rejects it, and [`title_for`] still labels it.
     pub fn from_name(name: &str) -> Option<Self> {

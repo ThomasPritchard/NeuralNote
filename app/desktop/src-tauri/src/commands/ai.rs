@@ -509,9 +509,9 @@ fn keychain_read_error_event(error: &CoreError) -> neuralnote_core::ai::ChatEven
 /// [`ChatEvent`]: neuralnote_core::ai::ChatEvent
 pub(crate) fn resolve_key_presence(
     read: Result<Option<String>, CoreError>,
-) -> Result<bool, neuralnote_core::ai::ChatEvent> {
+) -> Result<bool, Box<neuralnote_core::ai::ChatEvent>> {
     read.map(|key| key.is_some())
-        .map_err(|error| keychain_read_error_event(&error))
+        .map_err(|error| Box::new(keychain_read_error_event(&error)))
 }
 
 fn app_data_dir_or_warn(app: &AppHandle, purpose: &str) -> Option<PathBuf> {
@@ -1117,7 +1117,7 @@ fn set_skill_enabled_in(
         .any(|skill_id| skill_id == id))
 }
 
-/// Run one cited-chat turn. Streams `ChatEvent`s to the frontend via `on_event`;
+/// Run one cited-chat turn. Streams ordered activity envelopes to the frontend via `on_event`;
 /// the API key is read here (Rust-side) and never crosses to the webview. Every
 /// failure (no vault, no key, transport) is surfaced as a `ChatEvent::Error` —
 /// never a panic, never silent. `async` so it runs on the worker pool, like the
@@ -1131,16 +1131,19 @@ pub(crate) async fn chat(
     prompt: String,
     history: Vec<ai::ChatTurn>,
     active_skills: Vec<String>,
-    on_event: tauri::ipc::Channel<neuralnote_core::ai::ChatEvent>,
+    on_event: tauri::ipc::Channel<neuralnote_core::ai::AgentActivityEnvelope>,
 ) -> Result<String, ()> {
     use neuralnote_core::ai::{
         read_provider_config, ChatEvent, EventSink, Guards, KeywordRetriever, LlmMessage,
-        ProviderKind,
+        ProviderKind, SequencedActivitySink,
     };
 
     let close_signal = std::sync::Arc::new(ai::ChatRunCloseSignal::default());
-    let mut sink =
+    let transport =
         ai::TauriChannelSink::with_close_signal(on_event, std::sync::Arc::clone(&close_signal));
+    // Sequence from the caller's exact turn id before any validation so even an
+    // early typed error belongs to the turn that initiated the command.
+    let mut sink = SequencedActivitySink::new(turn_id.clone(), transport);
     let turn_id = match parse_chat_turn_id(&turn_id) {
         Ok(turn_id) => turn_id,
         Err(error) => {
@@ -1249,7 +1252,7 @@ pub(crate) async fn chat(
     let key_present = match resolve_key_presence(ai::read_api_key(&ai_config_dir)) {
         Ok(present) => present,
         Err(event) => {
-            sink.send(event);
+            sink.send(*event);
             return Ok(run_id);
         }
     };
@@ -1473,6 +1476,10 @@ impl neuralnote_core::ai::EventSink for CausalRunEventSink<'_> {
         if !is_causal_user_stop {
             self.inner.send(event);
         }
+    }
+
+    fn begin_final_answer(&mut self) {
+        self.inner.begin_final_answer();
     }
 }
 
@@ -1863,11 +1870,12 @@ mod tests {
     use super::*;
     use crate::provider_config_mutation::ProviderConfigMutationGate;
     use neuralnote_core::ai::{
-        read_provider_config, run_chat, write_provider_config, ChatEvent, Completion, EventSink,
-        Guards, HardwareSpec, KeywordRetriever, LlmClient, LlmRequest, NoUserPrompt,
-        ProbedReasoning, ProviderConfig, ProviderKind, ReasoningControl, ReasoningProbeTarget,
-        ReasoningSupport, SkillEnvironment, SkillLookupError, SkillRegistry, SkillServices,
-        ToolCall, FIXTURE_SKILL_ID, YOUTUBE_DISTIL_SKILL_ID,
+        read_provider_config, run_chat, write_provider_config, ActivityEnvelopeSink,
+        AgentActivityEnvelope, AgentActivityPayload, ChatEvent, Completion, EventSink, Guards,
+        HardwareSpec, KeywordRetriever, LlmClient, LlmRequest, NoUserPrompt, ProbedReasoning,
+        ProviderConfig, ProviderKind, ReasoningControl, ReasoningProbeTarget, ReasoningSupport,
+        SequencedActivitySink, SkillEnvironment, SkillLookupError, SkillRegistry, SkillServices,
+        ThinkingSource, ToolCall, FIXTURE_SKILL_ID, YOUTUBE_DISTIL_SKILL_ID,
     };
     use neuralnote_core::CoreResult;
     use std::collections::BTreeSet;
@@ -2001,12 +2009,17 @@ mod tests {
         // return `Ok(false)` here and fail this test.
         let failed = resolve_key_presence(Err(CoreError::Io("keychain read failed: boom".into())));
         match failed {
-            Err(ChatEvent::Error { message }) => {
-                assert!(
-                    message.contains("Couldn't read the API key"),
-                    "unexpected message: {message}"
-                );
-            }
+            Err(event) => match *event {
+                ChatEvent::Error { message } => {
+                    assert!(
+                        message.contains("Couldn't read the API key"),
+                        "unexpected message: {message}"
+                    );
+                }
+                other => {
+                    panic!("a keychain read failure must surface as an error event, got {other:?}")
+                }
+            },
             other => {
                 panic!("a keychain read failure must surface as an error event, got {other:?}")
             }
@@ -2906,6 +2919,79 @@ mod tests {
         fn send(&mut self, event: ChatEvent) {
             self.0.push(event);
         }
+    }
+
+    #[derive(Default)]
+    struct RecordedEnvelopes(Vec<AgentActivityEnvelope>);
+
+    impl ActivityEnvelopeSink for RecordedEnvelopes {
+        fn send(&mut self, envelope: AgentActivityEnvelope) {
+            self.0.push(envelope);
+        }
+    }
+
+    #[test]
+    fn causal_filtering_precedes_sequence_assignment_without_leaving_a_gap() {
+        let signal = std::sync::Arc::new(ai::ChatRunCloseSignal::default());
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let mut sequenced =
+            SequencedActivitySink::new("turn-filtered", RecordedEnvelopes::default());
+        {
+            let mut causal =
+                CausalRunEventSink::new(&mut sequenced, std::sync::Arc::clone(&signal), observed);
+            signal.stop_by_user();
+            causal.send(ChatEvent::Processing);
+            causal.send(ChatEvent::Error {
+                message: "typed cancellation reached core".into(),
+            });
+            causal.send(ChatEvent::Done);
+        }
+
+        let envelopes = sequenced.into_inner().0;
+        assert_eq!(
+            envelopes
+                .iter()
+                .map(|envelope| envelope.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert!(matches!(
+            envelopes[0].payload,
+            AgentActivityPayload::RunStarted
+        ));
+        assert!(matches!(
+            envelopes[1].payload,
+            AgentActivityPayload::RunCompleted
+        ));
+    }
+
+    #[test]
+    fn causal_sink_forwards_the_final_answer_lifecycle_to_the_sequencer() {
+        let signal = std::sync::Arc::new(ai::ChatRunCloseSignal::default());
+        let observed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut sequenced = SequencedActivitySink::new("turn-final", RecordedEnvelopes::default());
+        {
+            let mut causal = CausalRunEventSink::new(&mut sequenced, signal, observed);
+            causal.send(ChatEvent::PlanningRound {
+                round: 1,
+                max_rounds: 8,
+                playlist: None,
+            });
+            causal.begin_final_answer();
+            causal.send(ChatEvent::Thinking {
+                delta: "compose".into(),
+            });
+        }
+
+        let thinking = sequenced.into_inner().0.pop().unwrap();
+        assert_eq!(thinking.cycle_id, None);
+        assert!(matches!(
+            thinking.payload,
+            AgentActivityPayload::Thinking {
+                source: ThinkingSource::FinalAnswer,
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -27,6 +27,11 @@ import type {
   StepStatus,
   ToolStatus,
 } from "../lib/types";
+import {
+  emptyActivityJournal,
+  type ActivityJournalState,
+  type ActivityProtocol,
+} from "./activityJournal";
 
 /** One row in the live activity log — the visible trace of the agent working. */
 export type ActivityStep =
@@ -244,6 +249,10 @@ export interface AssistantMessage {
   role: "assistant";
   /** Caller-generated identity used to route events and cancellation outcomes. */
   turnId: string | null;
+  /** The first transport event locks the whole turn to one ordering protocol. */
+  activityProtocol: ActivityProtocol;
+  /** Compact causal state for the v1 activity surface and protocol diagnostics. */
+  activityJournal: ActivityJournalState;
   /** The last progress phase backed by an actual transport/backend event.
    *
    *  There is deliberately no `"thinking"` member. "Thinking" is a claim that
@@ -358,6 +367,8 @@ export function emptyAssistant(
   return {
     role: "assistant",
     turnId,
+    activityProtocol: null,
+    activityJournal: emptyActivityJournal(),
     phase: "sending",
     reasoningStreaming: false,
     round: null,

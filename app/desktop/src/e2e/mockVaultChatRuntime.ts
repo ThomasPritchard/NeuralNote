@@ -15,18 +15,26 @@
 // satisfy a security prompt. Answering emits the settlement itself, as Rust
 // does, so the sheet is cleared by the EVENT and never by the click.
 
-import type { ChatEvent, PullEvent, UndoReport } from "../lib/types";
+import type {
+  AgentActivityEnvelope,
+  PullEvent,
+  UndoReport,
+} from "../lib/types";
 import {
   fail,
   type ApprovalAnswerRecord,
   type ChatCallRecord,
   type CreateMockVaultOptions,
+  type MockChatFrame,
 } from "./mockVaultTypes";
 import { channelSender } from "./mockVaultChannel";
 import { DEFAULT_REQUIREMENT_DOWNLOAD_SCRIPT } from "./mockVaultDefaults";
 import type { MockScheduledTask, MockScheduler } from "./mockScheduler";
 
 type CommandHandler = (a: Record<string, unknown>) => unknown;
+const isActivityEnvelope = (
+  frame: MockChatFrame,
+): frame is AgentActivityEnvelope => "payload" in frame;
 
 export interface ChatRuntime {
   handlers: Record<string, CommandHandler>;
@@ -40,7 +48,18 @@ export const createChatRuntime = (
   opts: CreateMockVaultOptions,
   scheduler: MockScheduler,
 ): ChatRuntime => {
-  const chatScript = opts.chatScript ?? [];
+  const configuredScripts = [
+    opts.chatScript,
+    opts.activityScript,
+    opts.activityScriptFactory,
+  ].filter((script) => script !== undefined).length;
+  if (configuredScripts > 1) {
+    throw new Error(
+      "mock chat fixtures must choose legacy, explicit envelope v1, or an envelope factory",
+    );
+  }
+  const chatScript: readonly MockChatFrame[] =
+    opts.activityScript ?? opts.chatScript ?? [];
 
   const chatCalls: ChatCallRecord[] = [];
   const approvalAnswers: ApprovalAnswerRecord[] = [];
@@ -50,8 +69,9 @@ export const createChatRuntime = (
 
   interface ParkedApproval {
     id: string;
+    request: AgentActivityEnvelope | null;
     send: (message: unknown) => void;
-    remainder: ChatEvent[];
+    remainder: MockChatFrame[];
     runId: string;
     finish: () => void;
   }
@@ -62,7 +82,7 @@ export const createChatRuntime = (
     offeredIds: ReadonlySet<string>;
     multiSelect: boolean;
     send: (message: unknown) => void;
-    remainder: ChatEvent[];
+    remainder: MockChatFrame[];
     runId: string;
     /** Resolves the still-pending `chat` invoke with its run id. */
     finish: () => void;
@@ -86,7 +106,7 @@ export const createChatRuntime = (
    *  a parked run keeps its `chat` invoke pending, exactly like the shell. */
   const advanceChatScript = (
     send: (message: unknown) => void,
-    events: ChatEvent[],
+    events: readonly MockChatFrame[],
     runId: string,
     finish: () => void,
   ): void => {
@@ -95,23 +115,36 @@ export const createChatRuntime = (
       const event = events[i];
       send(event);
       queuedFrame = true;
-      if (event.type === "noteWritten") {
+      const payload = isActivityEnvelope(event) ? event.payload : event;
+      if (payload.type === "noteWritten") {
         const written = writtenByRun.get(runId) ?? [];
-        written.push(event.relPath);
+        written.push(payload.relPath);
         writtenByRun.set(runId, written);
       }
-      if (event.type === "toolApprovalRequested") {
+      if (
+        (!isActivityEnvelope(event) && event.type === "toolApprovalRequested") ||
+        (isActivityEnvelope(event) && event.payload.type === "approvalRequested")
+      ) {
         // The gate blocks the dispatch here. The `chat` invoke stays pending,
         // exactly as it does for an elicitation — a run waiting on a security
         // answer has not finished.
-        parkedApproval = { id: event.id, send, remainder: events.slice(i + 1), runId, finish };
+        const id = isActivityEnvelope(event) ? event.activityId : event.id;
+        if (id === null) throw new Error("approval activity fixture has no activity id");
+        parkedApproval = {
+          id,
+          request: isActivityEnvelope(event) ? event : null,
+          send,
+          remainder: events.slice(i + 1),
+          runId,
+          finish,
+        };
         return;
       }
-      if (event.type === "elicit") {
+      if (payload.type === "elicit") {
         parkedElicitation = {
-          id: event.id,
-          offeredIds: new Set(event.options.map((o) => o.id)),
-          multiSelect: event.multiSelect,
+          id: payload.id,
+          offeredIds: new Set(payload.options.map((o) => o.id)),
+          multiSelect: payload.multiSelect,
           send,
           remainder: events.slice(i + 1),
           runId,
@@ -134,6 +167,7 @@ export const createChatRuntime = (
       // `done`/`error`, and returns the id `undo_skill_run` takes. A script
       // holding an `elicit` parks there; `answer_elicitation` resumes it.
       const runId = a.turnId as string;
+      const runScript = opts.activityScriptFactory?.(runId) ?? chatScript;
       chatCalls.push({
         prompt: a.prompt as string,
         activeSkills: [...((a.activeSkills as string[] | undefined) ?? [])],
@@ -146,11 +180,11 @@ export const createChatRuntime = (
         };
         const pauseAfter = opts.cancelChatAfterEvents;
         if (pauseAfter !== undefined) {
-          advanceChatScript(send, chatScript.slice(0, pauseAfter), runId, () => {
+          advanceChatScript(send, runScript.slice(0, pauseAfter), runId, () => {
             pausedChat = { send, runId, finish };
           });
         } else {
-          advanceChatScript(send, [...chatScript], runId, finish);
+          advanceChatScript(send, [...runScript], runId, finish);
         }
       });
     },
@@ -205,14 +239,28 @@ export const createChatRuntime = (
       const tail = branch === undefined
         ? parked.remainder
         : (approved ? branch.approved : branch.denied);
+      const resolution: MockChatFrame = parked.request === null
+        ? {
+            type: "toolApprovalResolved",
+            id,
+            decision: approved ? "approved" : "denied",
+          }
+        : {
+            schemaVersion: parked.request.schemaVersion,
+            turnId: parked.request.turnId,
+            sequence: parked.request.sequence + 1,
+            cycleId: parked.request.cycleId,
+            activityId: parked.request.activityId,
+            payload: {
+              type: "approvalResolved",
+              decision: approved ? "approved" : "denied",
+            },
+          };
       advanceChatScript(
         parked.send,
         // The settlement is the BACKEND's, exactly as in the shell: the UI's
         // sheet is cleared by this event, never by its own click.
-        [
-          { type: "toolApprovalResolved", id, decision: approved ? "approved" : "denied" },
-          ...tail,
-        ],
+        [resolution, ...tail],
         parked.runId,
         parked.finish,
       );
@@ -223,9 +271,10 @@ export const createChatRuntime = (
       // invalid choices reject and LEAVE the question parked for a retry;
       // only a valid answer consumes it and resumes the run.
       const id = a.id as string;
+      const turnId = a.turnId as string;
       const choices = a.choices as string[];
       const parked = parkedElicitation;
-      if (parked === null || parked.id !== id) {
+      if (parked === null || parked.id !== id || parked.runId !== turnId) {
         return fail(
           "notFound",
           `elicitation '${id}' is not live (it may have timed out or ended)`,

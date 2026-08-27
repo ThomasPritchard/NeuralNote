@@ -1,0 +1,22 @@
+.nn-agent-status-swap {
+  animation: nn-agent-status-swap 140ms ease-out;
+}
+
+@keyframes nn-agent-status-swap {
+  from {
+    opacity: 0;
+    transform: translateY(0.2rem);
+  }
+
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .nn-agent-status-swap {
+    animation: none;
+    transform: none;
+  }
+}

@@ -3,6 +3,8 @@ import type { ApprovalDegradedReason } from "./ApprovalDegradedReason";
 import type { ApprovalReason } from "./ApprovalReason";
 import type { ApprovalResolution } from "./ApprovalResolution";
 import type { ApprovalRule } from "./ApprovalRule";
+import type { CycleSummaryProtocolIssue } from "./CycleSummaryProtocolIssue";
+import type { CycleSummarySource } from "./CycleSummarySource";
 import type { ElicitOption } from "./ElicitOption";
 import type { GatedTool } from "./GatedTool";
 import type { NoteKind } from "./NoteKind";
@@ -45,7 +47,7 @@ playlist: PlaylistPosition | null, } | { "type": "keepalive" } | { "type": "tool
 /**
  * The [`ChatEvent::ToolCall`] id.
  */
-id: string, message: string, } | { "type": "videoPreview", 
+id: string, message: string, } | { "type": "videoPreview", id: string, 
 /**
  * The YouTube video id, so a card can be told apart from its successor
  * even when two videos share a title.
@@ -66,7 +68,7 @@ durationSecs: number | null, channel: string | null,
  * `None` rather than delaying or failing the run. `None` is the
  * degraded path the card must render usefully, not an error.
  */
-thumbnailDataUri: string | null, } | { "type": "skillActivated", id: string, name: string, } | { "type": "skillStep", message: string, } | { "type": "elicit", id: string, question: string, options: Array<ElicitOption>, multiSelect: boolean, } | { "type": "skillActivationFailed", id: string, name: string, 
+thumbnailDataUri: string | null, } | { "type": "skillActivated", id: string, name: string, } | { "type": "skillStep", message: string, } | { "type": "cycleSummary", source: CycleSummarySource, message: string, protocolIssues: Array<CycleSummaryProtocolIssue>, } | { "type": "elicit", id: string, question: string, options: Array<ElicitOption>, multiSelect: boolean, } | { "type": "skillActivationFailed", id: string, name: string, 
 /**
  * The human sentence, for display only — no longer load-bearing.
  */
@@ -131,7 +133,7 @@ detail: string | null,
  * 120-second budget. Anything rendering this beside a tool name has to
  * say "took", never "spent working".
  */
-durationMs: number, } | { "type": "transcriptSource", label: string, relPath: string | null, } | { "type": "partialRun", reason: string, } | { "type": "noteWritten", relPath: string, kind: NoteKind, } | { "type": "noteExists", relPath: string, kind: NoteKind, } | { "type": "noteEditPreview", 
+durationMs: number, } | { "type": "transcriptSource", id: string, label: string, relPath: string | null, } | { "type": "partialRun", reason: string, } | { "type": "noteWritten", id: string, relPath: string, kind: NoteKind, } | { "type": "noteExists", id: string, relPath: string, kind: NoteKind, } | { "type": "noteEditPreview", 
 /**
  * The [`ChatEvent::ToolCall`] id, so the card upgrades in place into
  * [`ChatEvent::NoteWritten`] rather than becoming a second node.

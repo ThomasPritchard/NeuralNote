@@ -134,8 +134,12 @@ impl ChatSession<'_> {
             });
         }
 
-        // Verify + answer phase. Verifying is the UI cue that the answer is being
-        // grounded; the actual citation checks run once we have the streamed text.
+        // Verify + answer phase. The lifecycle marker is not a visible event; it
+        // tells the ordered journal that any reasoning streamed by the following
+        // generation belongs to the final answer, never the last tool cycle.
+        sink.begin_final_answer();
+        // Verifying is the UI cue that the answer is being grounded; the actual
+        // citation checks run once we have the streamed text.
         sink.send(ChatEvent::Verifying);
         // A fresh streaming generation produces the final answer. It re-generates
         // rather than reusing the loop's last (non-streamed) turn — the deliberate
