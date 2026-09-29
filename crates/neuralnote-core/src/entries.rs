@@ -5,7 +5,13 @@ use crate::error::{CoreError, CoreResult};
 use crate::model::TreeNode;
 use crate::paths::{ensure_descendant, ensure_within, validate_name};
 use crate::tree::node_for;
+#[cfg(unix)]
+use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static CASE_RENAME_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+const MAX_CASE_RENAME_ATTEMPTS: usize = 32;
 
 /// Canonical vault root (used as the base for `rel_path` in returned nodes).
 fn canon_root(root: &Path) -> CoreResult<PathBuf> {
@@ -19,6 +25,98 @@ fn canon_root(root: &Path) -> CoreResult<PathBuf> {
 /// collision (PA-017).
 fn is_same_entry(a: &Path, b: &Path) -> bool {
     matches!((a.canonicalize(), b.canonicalize()), (Ok(ca), Ok(cb)) if ca == cb)
+}
+
+/// Reserve a private hidden directory for the two-step case-only rename. Creation
+/// is exclusive, so a stale path or concurrent rename is never reused as staging.
+fn reserve_case_rename_stage(parent: &Path, final_name: &str) -> CoreResult<(PathBuf, PathBuf)> {
+    for attempt in 0..MAX_CASE_RENAME_ATTEMPTS {
+        let stage_name = if attempt == 0 {
+            format!(".{final_name}.{}.nn-caserename", std::process::id())
+        } else {
+            let sequence = CASE_RENAME_SEQUENCE.fetch_add(1, Ordering::Relaxed);
+            format!(
+                ".{final_name}.{}.{sequence}.nn-caserename",
+                std::process::id()
+            )
+        };
+        let stage_dir = parent.join(stage_name);
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        builder.mode(0o700);
+        match builder.create(&stage_dir) {
+            Ok(()) => {
+                #[cfg(unix)]
+                if let Err(error) =
+                    std::fs::set_permissions(&stage_dir, std::fs::Permissions::from_mode(0o700))
+                {
+                    remove_case_rename_stage(&stage_dir);
+                    return Err(error.into());
+                }
+                return Ok((stage_dir.clone(), stage_dir.join("entry")));
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Err(CoreError::Io(
+        "could not rename entry: no unique staging directory was available".into(),
+    ))
+}
+
+/// Remove an empty staging directory without making a committed rename look like
+/// a failure. Cleanup problems remain visible in the native log.
+fn remove_case_rename_stage(stage_dir: &Path) {
+    if let Err(error) = std::fs::remove_dir(stage_dir) {
+        log::warn!(
+            "entries: could not remove case-rename staging directory {}: {error}",
+            stage_dir.display()
+        );
+    }
+}
+
+/// Move the source into its reserved staging directory, then to its final case.
+/// On the second failure, restore the original path and report any stranded copy.
+fn commit_case_only_rename(
+    source: &Path,
+    stage_dir: &Path,
+    staged_entry: &Path,
+    final_target: &Path,
+) -> CoreResult<()> {
+    if let Err(error) = std::fs::rename(source, staged_entry) {
+        remove_case_rename_stage(stage_dir);
+        return Err(error.into());
+    }
+    if let Err(error) = std::fs::rename(staged_entry, final_target) {
+        return Err(restore_case_only_rename(
+            staged_entry,
+            source,
+            stage_dir,
+            error,
+        ));
+    }
+    remove_case_rename_stage(stage_dir);
+    Ok(())
+}
+
+/// Restore a staged entry after the final case-only rename failed.
+fn restore_case_only_rename(
+    staged_entry: &Path,
+    source: &Path,
+    stage_dir: &Path,
+    rename_error: std::io::Error,
+) -> CoreError {
+    match std::fs::rename(staged_entry, source) {
+        Ok(()) => {
+            remove_case_rename_stage(stage_dir);
+            rename_error.into()
+        }
+        Err(restore_error) => CoreError::Io(format!(
+            "rename failed ({rename_error}) and the original name could not be restored \
+             ({restore_error}); the entry is intact at {}",
+            staged_entry.display()
+        )),
+    }
 }
 
 /// Create an empty folder `name` inside `parent`.
@@ -108,8 +206,9 @@ pub fn rename_entry(root: &Path, path: &Path, new_name: &str) -> CoreResult<Tree
     if target.exists() {
         return Err(CoreError::AlreadyExists(final_name));
     }
+    let response = crate::tree::node_for_destination(&canon_root(root)?, &path, &target)?;
     std::fs::rename(&path, &target)?;
-    node_for(&canon_root(root)?, &target)
+    Ok(response)
 }
 
 /// Apply a case-only rename (`Todo.md` → `todo.md`) via a two-step rename through
@@ -139,25 +238,11 @@ fn apply_case_only_rename(
         // A genuinely different file already holds that name (case-sensitive FS).
         return Err(CoreError::AlreadyExists(final_name.to_string()));
     }
-    let tmp = parent.join(format!(
-        ".{final_name}.{}.nn-caserename",
-        std::process::id()
-    ));
-    std::fs::rename(path, &tmp)?;
-    if let Err(e) = std::fs::rename(&tmp, &final_target) {
-        // Restore the original name. If that ALSO fails the entry is stranded
-        // under a hidden temp — never leave that silent: name its location so
-        // the user/logs can recover it rather than seeing it vanish.
-        return match std::fs::rename(&tmp, path) {
-            Ok(()) => Err(e.into()),
-            Err(restore_err) => Err(CoreError::Io(format!(
-                "rename failed ({e}) and the original name could not be restored \
-                 ({restore_err}); the file is intact at {}",
-                tmp.display()
-            ))),
-        };
-    }
-    node_for(&canon_root(root)?, &final_target)
+    let canonical_root = canon_root(root)?;
+    let response = crate::tree::node_for_destination(&canonical_root, path, &final_target)?;
+    let (stage_dir, staged_entry) = reserve_case_rename_stage(&parent, final_name)?;
+    commit_case_only_rename(path, &stage_dir, &staged_entry, &final_target)?;
+    Ok(response)
 }
 
 /// Move a file or folder to `new_parent`, keeping its name. Refuses to move a
@@ -196,8 +281,9 @@ pub fn move_entry(root: &Path, path: &Path, new_parent: &Path) -> CoreResult<Tre
             name.to_string_lossy().into_owned(),
         ));
     }
+    let response = crate::tree::node_for_destination(&canon_root(root)?, &path, &target)?;
     std::fs::rename(&path, &target)?;
-    node_for(&canon_root(root)?, &target)
+    Ok(response)
 }
 
 /// Delete a file or folder by moving it to the OS trash — recoverable, never a
@@ -255,5 +341,100 @@ fn ensure_md_extension(name: &str) -> String {
         name.to_string()
     } else {
         format!("{name}.md")
+    }
+}
+
+#[cfg(test)]
+mod case_rename_tests {
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn reserved_case_rename_stage_has_mode_0700() {
+        let parent = tempfile::tempdir().unwrap();
+        let (stage_dir, staged_entry) =
+            reserve_case_rename_stage(parent.path(), "renamed.md").unwrap();
+
+        assert_eq!(
+            std::fs::metadata(&stage_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(!staged_entry.exists());
+        std::fs::remove_dir(stage_dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_move_into_the_stage_keeps_the_original_and_cleans_the_directory() {
+        let probe = tempfile::NamedTempFile::new().unwrap();
+        std::fs::set_permissions(probe.path(), std::fs::Permissions::from_mode(0o000)).unwrap();
+        if std::fs::read(probe.path()).is_ok() {
+            return;
+        }
+
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("original.md");
+        let final_target = parent.path().join("renamed.md");
+        let stage_dir = parent.path().join(".stage");
+        let staged_entry = stage_dir.join("entry");
+        std::fs::write(&source, "source contents").unwrap();
+        std::fs::create_dir(&stage_dir).unwrap();
+        std::fs::set_permissions(&stage_dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let error = commit_case_only_rename(&source, &stage_dir, &staged_entry, &final_target)
+            .expect_err("the read-only staging directory must reject the first rename");
+
+        assert!(matches!(error, CoreError::Io(_) | CoreError::NotFound(_)));
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "source contents");
+        assert!(!stage_dir.exists());
+        assert!(!final_target.exists());
+    }
+
+    #[test]
+    fn a_failed_final_rename_restores_the_original_and_cleans_the_stage() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("original.md");
+        let final_target = parent.path().join("missing-parent").join("blocked");
+        let stage_dir = parent.path().join(".stage");
+        let staged_entry = stage_dir.join("entry");
+        std::fs::create_dir(&stage_dir).unwrap();
+        std::fs::write(&source, "source contents").unwrap();
+
+        let error = commit_case_only_rename(&source, &stage_dir, &staged_entry, &final_target)
+            .expect_err("the final rename has no destination parent");
+
+        assert!(matches!(error, CoreError::NotFound(_)));
+        assert_eq!(std::fs::read_to_string(&source).unwrap(), "source contents");
+        assert!(!stage_dir.exists());
+        assert!(!final_target.exists());
+    }
+
+    #[test]
+    fn a_failed_restore_reports_where_the_staged_entry_remains() {
+        let parent = tempfile::tempdir().unwrap();
+        let source = parent.path().join("original");
+        let stage_dir = parent.path().join(".stage");
+        let staged_entry = stage_dir.join("entry");
+        std::fs::create_dir(&source).unwrap();
+        std::fs::create_dir(&stage_dir).unwrap();
+        std::fs::write(&staged_entry, "recoverable source").unwrap();
+
+        let error = restore_case_only_rename(
+            &staged_entry,
+            &source,
+            &stage_dir,
+            std::io::Error::other("simulated final rename failure"),
+        );
+
+        assert!(
+            error
+                .to_string()
+                .contains(&staged_entry.to_string_lossy().to_string()),
+            "the recovery path was omitted: {error}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&staged_entry).unwrap(),
+            "recoverable source"
+        );
     }
 }

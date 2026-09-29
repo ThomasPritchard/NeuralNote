@@ -1,104 +1,90 @@
-//! Driving one streamed tool-deciding turn from raw response bytes.
-//!
-//! Three layers stack up to a streamed tool turn, and this is the top one:
-//!
-//! 1. [`ToolTurnAccumulator`] reassembles fragments into calls and previews the
-//!    note being composed. It knows nothing about SSE.
-//! 2. [`consume_tool_sse_line`] turns one SSE *line* into accumulator input.
-//! 3. This module turns a sequence of arbitrary *byte chunks* into those lines,
-//!    and settles the turn into a [`Completion`].
-//!
-//! It lives in core rather than the Tauri shell for the same reason the SSE
-//! parsing does: the behaviour is owned here, so coverage is measured here, and
-//! both providers drive it through the one client. The shell keeps only the part
-//! that genuinely needs the network — pulling chunks off the socket.
-//!
-//! **Not every provider streams a tool turn.** The one that cannot sends no
-//! tool-call fragments and no prose, which arrives here as a turn that carried
-//! nothing at all. That is reported as [`StreamedToolTurn::NotStreamed`] so the
-//! caller re-runs the turn buffered, rather than handing the orchestrator an
-//! empty turn — which reads as "the model chose to answer" and would silently
-//! skip retrieval for the whole run.
+//! Reassembles provider bytes into bounded SSE lines and settles tool turns.
 
 use crate::ai::events::EventSink;
 use crate::ai::llm::Completion;
 use crate::ai::openai::consume_tool_sse_line;
-use crate::ai::tool_stream::ToolTurnAccumulator;
+use crate::ai::tool_stream::{ToolTurnAccumulator, ABANDONED_TURN_FAILED};
+use crate::ai::transport_limits::{
+    SseLimits, SseLineReader, ToolStreamLimits, MAX_SSE_FRAME_BYTES, MAX_TOOL_RESPONSE_BYTES,
+};
 use crate::error::CoreResult;
 
 /// How a streamed tool turn settled.
 #[derive(Debug)]
 pub enum StreamedToolTurn {
-    /// The provider streamed the turn. This is what a buffered `complete` would
-    /// have returned for it.
     Completed(Completion),
-    /// The provider streamed no tool-call fragments and no prose — it does not
-    /// stream this turn. The caller must fall back to a buffered `complete`.
-    ///
-    /// Nothing was emitted when this is reported: a preview can only come from a
-    /// tool call, and there were none. So the fallback is invisible to the user
-    /// and cannot replay a note over one already on screen.
     NotStreamed,
 }
 
-/// Reassembles one streamed tool-deciding turn from the bytes of the response.
-#[derive(Debug, Default)]
+/// Reassembles one streamed tool-deciding turn from response bytes.
+#[derive(Debug)]
 pub struct ToolTurnReader {
-    /// Bytes not yet resolved into a complete line. Buffered as BYTES, not
-    /// `str`: a chunk can split a multibyte character, but never the `\n`
-    /// delimiter (one byte, never part of a UTF-8 sequence), so every complete
-    /// line decodes cleanly.
-    buf: Vec<u8>,
+    reader: SseLineReader,
     accumulator: ToolTurnAccumulator,
     terminated: bool,
 }
 
+impl Default for ToolTurnReader {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ToolTurnReader {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limits(
+            SseLimits::new(MAX_SSE_FRAME_BYTES, MAX_TOOL_RESPONSE_BYTES),
+            ToolStreamLimits::default(),
+        )
     }
 
-    /// Fold in one chunk of the response body. `Ok(true)` means the terminator
-    /// was seen (stop reading); `Ok(false)` means keep reading; `Err` surfaces a
-    /// failure with every live preview already cleared.
+    pub fn with_limits(sse_limits: SseLimits, tool_limits: ToolStreamLimits) -> Self {
+        Self {
+            reader: SseLineReader::with_limits(sse_limits),
+            accumulator: ToolTurnAccumulator::with_limits(tool_limits),
+            terminated: false,
+        }
+    }
+
+    /// Fold in one response chunk. A failure clears every live note preview.
     pub fn push_bytes(&mut self, chunk: &[u8], sink: &mut dyn EventSink) -> CoreResult<bool> {
-        self.buf.extend_from_slice(chunk);
-        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            if consume_tool_sse_line(&line, &mut self.accumulator, sink)? {
-                self.terminated = true;
-                return Ok(true);
+        if self.terminated {
+            return Ok(true);
+        }
+        let Self {
+            reader,
+            accumulator,
+            terminated,
+        } = self;
+        match reader.push_bytes(chunk, |line| consume_tool_sse_line(line, accumulator, sink)) {
+            Ok(done) => {
+                *terminated = done;
+                Ok(done)
+            }
+            Err(error) => {
+                accumulator.abandon(ABANDONED_TURN_FAILED, sink);
+                Err(error)
             }
         }
-        Ok(false)
     }
 
-    /// Settle the turn at end of stream.
-    ///
-    /// A final line the stream left without a trailing newline is read first —
-    /// otherwise a last fragment, or a terminal error frame, sitting in the tail
-    /// would be silently lost.
+    /// Settle the turn, processing a final line without a newline first.
     pub fn finish(mut self, sink: &mut dyn EventSink) -> CoreResult<StreamedToolTurn> {
-        if !self.terminated && !self.buf.is_empty() {
-            let tail = std::mem::take(&mut self.buf);
-            consume_tool_sse_line(&tail, &mut self.accumulator, sink)?;
+        if !self.terminated {
+            let result = self
+                .reader
+                .finish(|line| consume_tool_sse_line(line, &mut self.accumulator, sink));
+            if let Err(error) = result {
+                self.accumulator.abandon(ABANDONED_TURN_FAILED, sink);
+                return Err(error);
+            }
         }
         let metered = self.accumulator.usage_reported();
         let completion = self.accumulator.finish(sink)?;
-        // Prose alone is a real answer — the model declining to call a tool — and
-        // must NOT trigger a fallback that would bill a second turn and could
-        // answer differently. Only a turn that carried nothing at all is one the
-        // provider failed to stream.
         if completion.content.is_none() && completion.tool_calls.is_empty() {
-            // Deliberately silent on usage: this turn did not happen as far as the
-            // run is concerned, and the buffered call that replaces it reports its
-            // own. Saying "unmetered" here would write off a total the fallback is
-            // about to supply.
             return Ok(StreamedToolTurn::NotStreamed);
         }
         if !metered {
-            // The turn completed and the provider never priced it. Say so, so the
-            // run's total comes out absent rather than quietly missing this turn.
             sink.record_usage(None);
         }
         Ok(StreamedToolTurn::Completed(completion))
@@ -197,6 +183,102 @@ mod tests {
                 _ => None,
             })
             .collect()
+    }
+
+    #[test]
+    fn an_eight_mib_control_character_note_fits_through_nested_json_escaping() {
+        use crate::ai::transport_limits::{MAX_SSE_FRAME_BYTES, MAX_TOOL_ARGUMENT_BYTES};
+
+        let note_bytes = 8 * 1024 * 1024;
+        let note = "\u{0001}".repeat(note_bytes);
+        let arguments = serde_json::json!({
+            "rel_path": "large.md",
+            "content": note,
+        })
+        .to_string();
+        let frame = serde_json::json!({
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call_large",
+                    "type": "function",
+                    "function": {"name": "write_note", "arguments": arguments},
+                }]}
+            }]
+        });
+        let frame = format!("data: {frame}\n");
+
+        assert!(arguments.len() < MAX_TOOL_ARGUMENT_BYTES);
+        assert!(frame.len() < MAX_SSE_FRAME_BYTES);
+        assert!(
+            frame.len() > 55 * 1024 * 1024,
+            "the outer escaping is exercised"
+        );
+
+        let mut reader = ToolTurnReader::new();
+        let mut sink = VecSink::default();
+        reader.push_bytes(frame.as_bytes(), &mut sink).unwrap();
+        reader.push_bytes(b"data: [DONE]\n", &mut sink).unwrap();
+        let completion = completed(reader.finish(&mut sink).unwrap());
+
+        assert_eq!(previews(&sink).last().unwrap().1.len(), note_bytes);
+        assert_eq!(completion.tool_calls[0].arguments.len(), arguments.len());
+    }
+
+    #[test]
+    fn excess_tool_calls_fail_and_clear_an_open_note_preview() {
+        let mut reader = ToolTurnReader::new();
+        let mut sink = VecSink::default();
+
+        for index in 0..33 {
+            let call = if index == 0 {
+                serde_json::json!({
+                    "index": index,
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {
+                        "name": "write_note",
+                        "arguments": r#"{"rel_path":"draft.md","content":"working""#,
+                    }
+                })
+            } else {
+                serde_json::json!({
+                    "index": index,
+                    "id": format!("call_{index}"),
+                    "type": "function",
+                    "function": { "name": "search_notes", "arguments": "" }
+                })
+            };
+            let line = format!(
+                "data: {}\n",
+                serde_json::json!({"choices": [{"delta": {"tool_calls": [call]}}]})
+            );
+            let result = reader.push_bytes(line.as_bytes(), &mut sink);
+            if index < 32 {
+                assert!(result.is_ok(), "call {index} should be within the limit");
+            } else {
+                assert!(result.is_err(), "the 33rd distinct call must be rejected");
+            }
+        }
+
+        assert!(
+            previews(&sink).iter().any(|(id, _, _)| *id == "call_0"),
+            "the first call must have emitted a live preview before the limit hit"
+        );
+        let abandonments = sink
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ChatEvent::NoteEditAbandoned { id, .. } if id == "call_0"
+                )
+            })
+            .count();
+        assert_eq!(
+            abandonments, 1,
+            "the rejected turn clears the preview exactly once"
+        );
     }
 
     /// Feed whole lines, as a well-behaved provider would chunk them.

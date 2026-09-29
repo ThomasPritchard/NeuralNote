@@ -67,13 +67,6 @@ interface ChangedRange {
   readonly newTo: number;
 }
 
-/** An old newline competing to donate its separator to a rewritten one. */
-interface SeparatorCandidate {
-  readonly distance: number;
-  readonly position: number;
-  readonly separator: LineSeparator;
-}
-
 /** Where a position in the rewritten span falls back in the span it replaced,
  *  interpolated by length. A pure insertion or a pure deletion has no span to
  *  interpolate across, so it projects onto the start of the change. */
@@ -84,25 +77,19 @@ function projectedOldPosition(range: ChangedRange, position: number): number {
   return range.oldFrom + ((position - range.newFrom) / newSpan) * oldSpan;
 }
 
-/** Did this change consume the newline that sat at `oldPosition`? An insertion
- *  consumes nothing, so it can only draw on a newline sitting exactly at the
- *  point of insertion. */
-function isReplacedBy(range: ChangedRange, oldPosition: number): boolean {
-  const isInsideReplacement = oldPosition >= range.oldFrom && oldPosition < range.oldTo;
-  const isInsertionAtBoundary = range.oldTo === range.oldFrom
-    && oldPosition === range.oldFrom;
-  return isInsideReplacement || isInsertionAtBoundary;
-}
-
-function isNearer(
-  candidate: SeparatorCandidate,
-  incumbent: SeparatorCandidate | undefined,
-): boolean {
-  if (incumbent === undefined) return true;
-  if (candidate.distance === incumbent.distance) {
-    return candidate.position < incumbent.position;
+/** First index at or after `position` in a sorted slice. */
+function lowerBound(
+  positions: readonly number[],
+  position: number,
+  from = 0,
+  to = positions.length,
+): number {
+  while (from < to) {
+    const middle = Math.floor((from + to) / 2);
+    if (positions[middle] < position) from = middle + 1;
+    else to = middle;
   }
-  return candidate.distance < incumbent.distance;
+  return from;
 }
 
 /** The separator a newline written by `range` inherits: the one carried by the
@@ -114,18 +101,20 @@ function inheritedSeparator(
   range: ChangedRange,
   position: number,
 ): LineSeparator | undefined {
+  const from = lowerBound(oldPositions, range.oldFrom);
+  // An insertion consumes only a boundary exactly at its insertion point.
+  const to = lowerBound(oldPositions, Math.max(range.oldTo, range.oldFrom + 1), from);
+  if (from === to) return undefined;
+
   const target = projectedOldPosition(range, position);
-  let nearest: SeparatorCandidate | undefined;
-  for (const [index, oldPosition] of oldPositions.entries()) {
-    if (!isReplacedBy(range, oldPosition)) continue;
-    const candidate: SeparatorCandidate = {
-      distance: Math.abs(oldPosition - target),
-      position: oldPosition,
-      separator: source.separators[index] ?? source.defaultSeparator,
-    };
-    if (isNearer(candidate, nearest)) nearest = candidate;
-  }
-  return nearest?.separator;
+  const after = lowerBound(oldPositions, target, from, to);
+  const before = after - 1;
+  // Only the neighbours of the projected position can be nearest. Ties go left.
+  const nearest = after === to || (before >= from
+    && target - oldPositions[before] <= oldPositions[after] - target)
+    ? before
+    : after;
+  return source.separators[nearest] ?? source.defaultSeparator;
 }
 
 export function applySourceChanges(source: SourceText, changes: ChangeSet): SourceText {

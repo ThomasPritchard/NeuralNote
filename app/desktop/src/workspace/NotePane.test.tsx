@@ -274,9 +274,12 @@ describe("NotePane", () => {
     expect(open.reload).toHaveBeenCalled();
   });
 
-  it("surfaces a deletion notice when the open note was deleted on disk", () => {
+  it("describes copying a deleted note into a new note before closing the tab", () => {
     render(<NotePane noteIndexStatus="ready" open={openNote({ externalDeleted: true })} />);
-    expect(screen.getByText(/was deleted on disk/i)).toBeInTheDocument();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "This note was deleted on disk. Your copy is kept here. Copy its contents into a new note before closing this tab.",
+    );
+    expect(screen.queryByText(/save to restore/i)).not.toBeInTheDocument();
   });
 
   it("shows no deletion notice when the note is still present on disk", () => {

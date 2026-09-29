@@ -1037,10 +1037,36 @@ fn snippet_window(n_chars: usize, first: (usize, usize)) -> (usize, usize) {
     (start, start + SNIPPET_MAX_CHARS)
 }
 
-pub(crate) fn clip_line_around(line: &str, first: (usize, usize)) -> String {
-    let starts = char_starts(line);
-    let (start, end) = snippet_window(starts.len() - 1, first);
-    line[starts[start]..starts[end]].to_string()
+/// Reuse one line's UTF-8 offsets across occurrence snippets. ASCII needs no index.
+pub(crate) struct SnippetLine<'a> {
+    text: &'a str,
+    starts: Option<Vec<usize>>,
+}
+
+impl<'a> SnippetLine<'a> {
+    pub(crate) fn new(text: &'a str) -> Self {
+        Self {
+            text,
+            starts: (!text.is_ascii()).then(|| char_starts(text)),
+        }
+    }
+
+    pub(crate) fn char_offset(&self, byte_offset: usize) -> usize {
+        let offset = byte_offset.min(self.text.len());
+        self.starts.as_ref().map_or(offset, |starts| {
+            starts.binary_search(&offset).unwrap_or_else(|index| index)
+        })
+    }
+
+    pub(crate) fn clip_around(&self, first: (usize, usize)) -> String {
+        let length = self
+            .starts
+            .as_ref()
+            .map_or(self.text.len(), |starts| starts.len() - 1);
+        let (start, end) = snippet_window(length, first);
+        let byte = |index| self.starts.as_ref().map_or(index, |starts| starts[index]);
+        self.text[byte(start)..byte(end)].to_string()
+    }
 }
 
 /// Non-overlapping occurrences of `query` in `folded`, as folded-index ranges.

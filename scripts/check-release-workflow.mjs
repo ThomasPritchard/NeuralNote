@@ -13,6 +13,7 @@ import { fileURLToPath } from "node:url";
 // probe-failed cases run on every pull request instead of only when a release is
 // cut - which is the entire reason the publisher was extracted (#104).
 import "./publish-release-manifest.test.mjs";
+import "./check-citation-evaluation.test.mjs";
 
 const workflowUrl = new URL("../.github/workflows/release-alpha.yml", import.meta.url);
 const workflow = await readFile(fileURLToPath(workflowUrl), "utf8");
@@ -534,4 +535,15 @@ test("the manifest publisher the release runs is the file the tests cover", asyn
     /^\s*(?:git|cp) /m,
     "manifest publication must delegate, not re-inline the git plumbing",
   );
+});
+
+
+test("release requires reviewed citation evidence before dependencies or signing", () => {
+  assert.match(trigger, /citation_evaluation:/);
+  const gate = stepBody(build, "Validate reviewed citation evaluation");
+  assert.match(gate, /CITATION_EVALUATION_JSON: \$\{\{ inputs\.citation_evaluation \}\}/);
+  assert.match(gate, /RELEASE_SHA: \$\{\{ steps\.release_source\.outputs\.RELEASE_SHA \}\}/);
+  assert.match(gate, /node scripts\/check-citation-evaluation\.mjs/);
+  assert.ok(build.indexOf("Validate reviewed citation evaluation") < build.indexOf("Install locked frontend dependencies"));
+  assert.match(build, /citation-evaluation-record/);
 });

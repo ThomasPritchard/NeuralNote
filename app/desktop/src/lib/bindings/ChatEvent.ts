@@ -22,24 +22,14 @@ export type ChatEvent = { "type": "processing" } | { "type": "planningRound",
  */
 round: number, 
 /**
- * The ceiling as computed for THIS round.
- *
- * Re-read every emission and it CAN GROW mid-run: activating a skill
- * raises the ceiling ([`ActiveSkills::max_iterations`](crate::ai::skills::ActiveSkills::max_iterations)
- * folds each active skill's declared cap over the base). The UI must
- * render the latest pair and never cache the denominator.
+ * Current ceiling; skill activation can raise it. Render the latest
+ * value rather than caching the initial denominator.
  */
 maxRounds: number, 
 /**
- * Which video of a selected playlist this round is working on, or
- * `None` when no playlist is in flight.
- *
- * Re-stated on every beacon rather than announced once, so the pair the
- * head renders is always this round's pair and the end of a playlist
- * clears itself. During a playlist this is the honest progress reading:
- * `max_rounds` above is a ceiling the iteration guard deliberately does
- * not enforce while a playlist runs (each item may spend its own
- * bounded allowance), whereas the playlist length cannot move.
+ * Current playlist item, or `None` outside a playlist. Repeated each
+ * round to clear stale progress. Playlist length is fixed; each item
+ * has its own iteration allowance.
  */
 playlist: PlaylistPosition | null, } | { "type": "keepalive" } | { "type": "toolProgress", 
 /**
@@ -57,14 +47,9 @@ videoId: string, title: string,
  */
 durationSecs: number | null, channel: string | null, 
 /**
- * The thumbnail, bounded and validated host-side and carried as a data
- * URI exactly as [`ElicitOption::image_data_uri`] already is, so the
- * webview needs no third-party network allowlist.
- *
- * A **nice-to-have**: the fetch is capped and timed out, and a
- * thumbnail that fails, exceeds its cap, or is rejected arrives as
- * `None` rather than delaying or failing the run. `None` is the
- * degraded path the card must render usefully, not an error.
+ * Host-validated, bounded data URI; no third-party webview allowlist.
+ * Fetch failure, rejection, or timeout produces `None` without failing
+ * the run. The card must remain useful without a thumbnail.
  */
 thumbnailDataUri: string | null, } | { "type": "skillActivated", id: string, name: string, } | { "type": "skillStep", message: string, } | { "type": "elicit", id: string, question: string, options: Array<ElicitOption>, multiSelect: boolean, } | { "type": "skillActivationFailed", id: string, name: string, 
 /**
@@ -90,24 +75,9 @@ title: string,
  */
 arguments: string, 
 /**
- * The [`ChatEvent::Plan`] step that was [`StepStatus::Running`] at the
- * moment this call was DISPATCHED — the key the timeline nests tool
- * nodes under their step by.
- *
- * Stamped at dispatch, never resolved at render: the affiliation is a
- * fact about when the call happened, so a later
- * [`ChatEvent::PlanStepStatus`] must not re-parent a node that already
- * went out. That is also why the `update_plan` call which declares the
- * plan is itself unaffiliated — it was dispatched before the plan
- * existed.
- *
- * `None` is ordinary, not a failure: no plan was declared (the common
- * case), or no step is running right now. It is never a synthetic step,
- * and never an empty string — an unaffiliated node renders on the rail
- * exactly as it did before plans existed.
- *
- * It plays **no part in settlement**: a [`ChatEvent::ToolResult`]
- * correlates on `id` alone, and carries no step of its own.
+ * The step running at dispatch. Later plan changes must not re-parent
+ * this call. `None` means no active step, including the call that creates
+ * the plan. Settlement correlates on `id`, independently of this field.
  */
 stepId: string | null, } | { "type": "toolResult", id: string, status: ToolStatus, 
 /**
@@ -119,17 +89,8 @@ summary: string | null,
  */
 detail: string | null, 
 /**
- * Wall-clock time from dispatch to settlement. Measured with `Instant`,
- * which the core already treats as a measurement rather than a timer.
- * Never optional: the orchestrator always knows how long it waited, and
- * a call that never ran waited approximately nothing rather than an
- * unknown amount.
- *
- * **It is time-to-settle, not time-in-the-tool.** The approval gate sits
- * between dispatch and settlement, so a gated call the user leaves
- * sitting reports the human's thinking time too — up to the gate's
- * 120-second budget. Anything rendering this beside a tool name has to
- * say "took", never "spent working".
+ * Elapsed time measured with `Instant` from dispatch to settlement,
+ * including any approval wait. This is not tool execution time.
  */
 durationMs: number, } | { "type": "transcriptSource", label: string, relPath: string | null, } | { "type": "partialRun", reason: string, } | { "type": "noteWritten", relPath: string, kind: NoteKind, } | { "type": "noteExists", relPath: string, kind: NoteKind, } | { "type": "noteEditPreview", 
 /**

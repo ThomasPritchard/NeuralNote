@@ -111,7 +111,7 @@ function SaveNotices({ open }: Readonly<{ open: OpenNote }>) {
         >
           <AlertTriangle className="mt-px size-3.5 shrink-0" aria-hidden />
           <span className="leading-snug">
-            This note was deleted on disk. Your copy is kept here — save to restore it.
+            This note was deleted on disk. Your copy is kept here. Copy its contents into a new note before closing this tab.
           </span>
         </div>
       )}

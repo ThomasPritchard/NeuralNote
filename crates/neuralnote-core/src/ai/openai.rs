@@ -8,6 +8,10 @@
 
 use crate::ai::events::{ChatEvent, EventSink, TokenUsage};
 use crate::ai::tool_stream::{self, ToolCallDelta, ToolTurnAccumulator};
+use crate::ai::transport_limits::{
+    checked_len, reserve_string_bounded, MAX_ANSWER_BYTES, MAX_TOOL_ARGUMENT_BYTES, MAX_TOOL_CALLS,
+    MAX_TOOL_CONTENT_BYTES, MAX_TOOL_RETAINED_BYTES,
+};
 use crate::ai::{Completion, LlmMessage, LlmRequest, Role, ToolCall};
 use crate::error::{CoreError, CoreResult};
 use serde::{Deserialize, Serialize};
@@ -31,15 +35,30 @@ pub fn redact(text: &str, key: &str) -> String {
 /// report `None` exactly once for a turn the provider never metered — without it
 /// an unmetered turn would be indistinguishable from one whose report is still
 /// coming, and the run's total would silently omit it.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct AnswerStream {
     text: String,
     usage_reported: bool,
+    max_bytes: usize,
+}
+
+impl Default for AnswerStream {
+    fn default() -> Self {
+        Self::with_max_bytes(MAX_ANSWER_BYTES)
+    }
 }
 
 impl AnswerStream {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn with_max_bytes(max_bytes: usize) -> Self {
+        Self {
+            text: String::new(),
+            usage_reported: false,
+            max_bytes,
+        }
     }
 
     /// Whether the provider reported this turn's token usage.
@@ -96,13 +115,10 @@ pub fn consume_sse_line(
     if let SseLine::Chunk(chunk) = &classified {
         stream.report(chunk.usage.as_ref(), sink);
     }
-    let full = &mut stream.text;
     match sse_event(classified) {
         SseEvent::Delta(delta) => {
-            sink.send(ChatEvent::Answer {
-                delta: delta.clone(),
-            });
-            full.push_str(&delta);
+            push_answer_delta(stream, &delta)?;
+            sink.send(ChatEvent::Answer { delta });
             Ok(None)
         }
         SseEvent::Reasoning(delta) => {
@@ -119,10 +135,8 @@ pub fn consume_sse_line(
             // answer content reaches `full`, keeping the returned string byte-equal to
             // the Answer deltas the orchestrator verifies citations against.
             sink.send(ChatEvent::Thinking { delta: reasoning });
-            sink.send(ChatEvent::Answer {
-                delta: delta.clone(),
-            });
-            full.push_str(&delta);
+            push_answer_delta(stream, &delta)?;
+            sink.send(ChatEvent::Answer { delta });
             Ok(None)
         }
         SseEvent::Truncated { delta } => {
@@ -132,10 +146,8 @@ pub fn consume_sse_line(
             // later by the citation parser, never emitted as a citation. Then surface the
             // truncation. Non-terminal: `[DONE]`/EOF still ends the stream.
             if let Some(delta) = delta {
-                sink.send(ChatEvent::Answer {
-                    delta: delta.clone(),
-                });
-                full.push_str(&delta);
+                push_answer_delta(stream, &delta)?;
+                sink.send(ChatEvent::Answer { delta });
             }
             sink.send(ChatEvent::AnswerTruncated);
             Ok(None)
@@ -148,10 +160,22 @@ pub fn consume_sse_line(
             sink.send(ChatEvent::Keepalive);
             Ok(None)
         }
-        SseEvent::Done => Ok(Some(full.clone())),
+        SseEvent::Done => Ok(Some(stream.text.clone())),
         SseEvent::Error(msg) => Err(CoreError::Llm(msg)),
         SseEvent::Other => Ok(None),
     }
+}
+
+fn push_answer_delta(stream: &mut AnswerStream, delta: &str) -> CoreResult<()> {
+    let next_len = reserve_string_bounded(
+        &mut stream.text,
+        delta.len(),
+        stream.max_bytes,
+        "answer text",
+    )?;
+    stream.text.push_str(delta);
+    debug_assert_eq!(stream.text.len(), next_len);
+    Ok(())
 }
 
 /// Final guard on a streamed answer: an empty answer on the (no-tools) answer turn
@@ -229,6 +253,7 @@ pub fn parse_completion(value: serde_json::Value) -> CoreResult<Completion> {
         .next()
         .map(|c| c.message)
         .ok_or_else(|| CoreError::Llm("OpenRouter returned no choices".into()))?;
+    validate_completion_limits(&msg)?;
     Ok(Completion {
         content: msg.content,
         tool_calls: msg
@@ -241,6 +266,48 @@ pub fn parse_completion(value: serde_json::Value) -> CoreResult<Completion> {
             })
             .collect(),
     })
+}
+
+fn validate_completion_limits(message: &WireRespMessage) -> CoreResult<()> {
+    if message.tool_calls.len() > MAX_TOOL_CALLS {
+        return Err(CoreError::Llm(format!(
+            "buffered completion exceeded {MAX_TOOL_CALLS} tool calls"
+        )));
+    }
+    if let Some(content) = &message.content {
+        if content.len() > MAX_TOOL_CONTENT_BYTES {
+            return Err(CoreError::Llm(format!(
+                "buffered completion prose exceeded its {MAX_TOOL_CONTENT_BYTES}-byte limit"
+            )));
+        }
+    }
+    let mut retained = message.content.as_ref().map_or(0, String::len);
+    for call in &message.tool_calls {
+        if call.function.arguments.len() > MAX_TOOL_ARGUMENT_BYTES {
+            return Err(CoreError::Llm(format!(
+                "buffered tool-call arguments exceeded their {MAX_TOOL_ARGUMENT_BYTES}-byte limit"
+            )));
+        }
+        retained = checked_len(
+            retained,
+            call.id.len(),
+            MAX_TOOL_RETAINED_BYTES,
+            "buffered tool-call data",
+        )?;
+        retained = checked_len(
+            retained,
+            call.function.name.len(),
+            MAX_TOOL_RETAINED_BYTES,
+            "buffered tool-call data",
+        )?;
+        retained = checked_len(
+            retained,
+            call.function.arguments.len(),
+            MAX_TOOL_RETAINED_BYTES,
+            "buffered tool-call data",
+        )?;
+    }
+    Ok(())
 }
 
 /// One parsed SSE line's meaning.
@@ -550,10 +617,10 @@ pub fn consume_tool_sse_line(
                 sink.send(ChatEvent::Thinking { delta: reasoning });
             }
             if let Some(content) = content {
-                accumulator.push_content(&content);
+                accumulator.push_content(&content, sink)?;
             }
             for fragment in fragments {
-                accumulator.push_fragment(fragment, sink);
+                accumulator.push_fragment(fragment, sink)?;
             }
             Ok(false)
         }
@@ -1166,6 +1233,56 @@ mod tests {
             }
             _ => panic!("expected SseEvent::Error for a mid-stream error frame"),
         }
+    }
+
+    #[test]
+    fn answer_stream_limit_fails_before_emitting_or_retaining_the_overflowing_delta() {
+        let mut sink = VecSink::default();
+        let mut stream = AnswerStream::with_max_bytes(4);
+        consume_sse_line(
+            br#"data: {"choices":[{"delta":{"content":"1234"}}]}"#,
+            &mut sink,
+            &mut stream,
+        )
+        .unwrap();
+        let error = consume_sse_line(
+            br#"data: {"choices":[{"delta":{"content":"5"}}]}"#,
+            &mut sink,
+            &mut stream,
+        )
+        .expect_err("the answer ceiling must be enforced");
+
+        assert!(error.to_string().contains("4-byte"), "{error}");
+        assert_eq!(stream.text(), "1234");
+        assert_eq!(
+            sink.0
+                .iter()
+                .filter(|event| matches!(event, ChatEvent::Answer { .. }))
+                .count(),
+            1,
+            "the rejected delta must not be emitted"
+        );
+    }
+
+    #[test]
+    fn buffered_completion_rejects_excess_tool_calls() {
+        let calls = (0..33)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("call_{index}"),
+                    "type": "function",
+                    "function": { "name": "search_notes", "arguments": "{}" }
+                })
+            })
+            .collect::<Vec<_>>();
+        let response = serde_json::json!({
+            "choices": [{"message": {"content": null, "tool_calls": calls}}]
+        });
+
+        let error = parse_completion(response)
+            .expect_err("buffered completions must share the streamed call-count limit");
+
+        assert!(error.to_string().contains("32 tool calls"), "{error}");
     }
 
     #[test]
@@ -2031,15 +2148,17 @@ mod tests {
         // landed, which is the exact failure NoteEditAbandoned exists to prevent.
         let mut sink = crate::ai::events::VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
-        accumulator.push_fragment(
-            ToolCallDelta {
-                index: 0,
-                id: Some("call-1".into()),
-                name: Some(crate::ai::tool_registry::TOOL_WRITE_NOTE.into()),
-                arguments: Some(r#"{"content": "half"#.into()),
-            },
-            &mut sink,
-        );
+        accumulator
+            .push_fragment(
+                ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some(crate::ai::tool_registry::TOOL_WRITE_NOTE.into()),
+                    arguments: Some(r#"{"content": "half"#.into()),
+                },
+                &mut sink,
+            )
+            .unwrap();
         let frame = captured_frame(|line| line.contains(r#""finish_reason":"error""#));
 
         let error = consume_tool_sse_line(frame.as_bytes(), &mut accumulator, &mut sink)

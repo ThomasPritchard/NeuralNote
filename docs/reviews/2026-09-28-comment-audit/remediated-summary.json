@@ -1,0 +1,50 @@
+{
+  "cloc_version": "2.10",
+  "source_files": 723,
+  "inline_modules_removed": 65,
+  "groups": {
+    "dedicated-tests": {
+      "files": 301,
+      "code": 69127,
+      "comment": 9170,
+      "blank": 10062,
+      "comment_share": 11.71
+    },
+    "tooling-other": {
+      "files": 15,
+      "code": 2206,
+      "comment": 290,
+      "blank": 208,
+      "comment_share": 11.62
+    },
+    "frontend-production": {
+      "files": 187,
+      "code": 23874,
+      "comment": 6697,
+      "blank": 2113,
+      "comment_share": 21.91
+    },
+    "generated": {
+      "files": 74,
+      "code": 198,
+      "comment": 629,
+      "blank": 74,
+      "comment_share": 76.06
+    },
+    "rust-inline-tests": {
+      "files": 62,
+      "code": 18449,
+      "comment": 1968,
+      "blank": 2071,
+      "comment_share": 9.64
+    },
+    "rust-production": {
+      "files": 146,
+      "code": 31946,
+      "comment": 7393,
+      "blank": 25441,
+      "comment_share": 18.79
+    }
+  },
+  "source": "uncommitted fix/main-review-2026-09-28 worktree, final remediation source"
+}

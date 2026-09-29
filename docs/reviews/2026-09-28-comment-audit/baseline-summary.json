@@ -1,0 +1,50 @@
+{
+  "cloc_version": "2.10",
+  "source_commit": "b4fe8315d787bbe5226828557f7f4204d435731b",
+  "source_files": 719,
+  "inline_modules_removed": 61,
+  "groups": {
+    "dedicated-tests": {
+      "files": 299,
+      "code": 68740,
+      "comment": 9167,
+      "blank": 10019,
+      "comment_share": 11.77
+    },
+    "tooling-other": {
+      "files": 14,
+      "code": 2123,
+      "comment": 289,
+      "blank": 201,
+      "comment_share": 11.98
+    },
+    "frontend-production": {
+      "files": 187,
+      "code": 23880,
+      "comment": 7034,
+      "blank": 2115,
+      "comment_share": 22.75
+    },
+    "generated": {
+      "files": 74,
+      "code": 198,
+      "comment": 713,
+      "blank": 74,
+      "comment_share": 78.27
+    },
+    "rust-inline-tests": {
+      "files": 58,
+      "code": 17880,
+      "comment": 1968,
+      "blank": 2010,
+      "comment_share": 9.92
+    },
+    "rust-production": {
+      "files": 145,
+      "code": 31105,
+      "comment": 7611,
+      "blank": 24755,
+      "comment_share": 19.66
+    }
+  }
+}

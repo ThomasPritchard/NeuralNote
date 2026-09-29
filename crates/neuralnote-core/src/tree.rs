@@ -161,6 +161,40 @@ fn is_hidden(name: &str) -> bool {
     name.starts_with('.')
 }
 
+/// Build the mutation response from the source entry before a rename or move
+/// commits. Folder children remain unloaded so a committed operation never
+/// depends on a recursive refresh succeeding.
+pub(crate) fn node_for_destination(
+    root: &Path,
+    source: &Path,
+    destination: &Path,
+) -> CoreResult<TreeNode> {
+    let metadata = std::fs::symlink_metadata(source)?;
+    let is_folder = metadata.is_dir();
+    let name = destination
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    Ok(TreeNode {
+        kind: if is_folder {
+            EntryKind::Folder
+        } else {
+            EntryKind::File
+        },
+        name,
+        path: destination.to_string_lossy().into_owned(),
+        rel_path: rel_path(root, destination),
+        ext: if is_folder {
+            None
+        } else {
+            destination
+                .extension()
+                .map(|e| e.to_string_lossy().to_lowercase())
+        },
+        children: None,
+    })
+}
+
 /// Build a single [`TreeNode`] for `path` (folders include their scanned
 /// children). Used by entry operations to return the node they just produced.
 /// `root` must be the canonical vault root; `path` an absolute path within it.

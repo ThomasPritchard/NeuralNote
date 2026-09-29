@@ -1,35 +1,11 @@
-//! Assembling one STREAMED tool-deciding turn, and previewing the note the model
-//! is composing while it composes it.
-//!
-//! The non-streamed turn ([`LlmClient::complete`]) hands back finished tool calls.
-//! The streamed one hands back hundreds of fragments instead, and this module puts
-//! them back together — while the turn is still running, so a note the model is
-//! writing can be shown as it appears rather than materialising all at once when
-//! the write lands.
-//!
-//! **The accumulation contract comes from a captured transcript, not a document.**
-//! `fixtures/openrouter_tool_stream.sse` is a real OpenRouter tool-call turn, and
-//! every rule below was measured on it:
-//!
-//! - `index` is the accumulation key. It was present on all 3425 entries.
-//! - `id` and `function.name` arrive EXACTLY ONCE per call, on first sight.
-//! - `arguments` arrive as many tiny fragments — 386 of them for 4840 characters
-//!   on one call, mean 12.5 characters, and **32 of them empty**. An accumulator
-//!   that reads an empty fragment as a terminator breaks on real traffic.
-//! - A call can simply stop mid-arguments. In the capture the stream ended
-//!   `finish_reason: "error"` with the last call truncated mid-sentence, 1367
-//!   characters that never became valid JSON. Abandonment is the common path.
-//!
-//! Only tools on [`PREVIEWABLE_TOOLS`] are previewed. Arbitrary tool arguments are
-//! model-authored text with no agreed shape, and rendering them as if they were a
-//! note is not something the UI can be asked to do safely.
-//!
-//! [`LlmClient::complete`]: crate::ai::llm::LlmClient::complete
+//! Reassembles streamed tool calls and previews only note-writing calls.
+//! The captured fixture pins fragment ordering and incomplete-call settlement.
 
 use crate::ai::events::{ChatEvent, EventSink, TokenUsage};
 use crate::ai::llm::{Completion, ToolCall};
 use crate::ai::partial_json::PartialObject;
 use crate::ai::tool_registry::TOOL_WRITE_NOTE;
+use crate::ai::transport_limits::{checked_len, reserve_string_bounded, ToolStreamLimits};
 use crate::ai::write_policy::NoteKind;
 use crate::error::{CoreError, CoreResult};
 use std::collections::BTreeMap;
@@ -71,6 +47,8 @@ pub struct ToolCallDelta {
 pub struct ToolTurnAccumulator {
     content: String,
     calls: BTreeMap<u32, PendingCall>,
+    retained_bytes: usize,
+    limits: ToolStreamLimits,
     /// Whether this turn's token usage has already gone to the sink. The run's
     /// total needs exactly one report per model call, so a repeated frame must
     /// not double-count — and a turn the provider never metered must still be
@@ -121,13 +99,54 @@ struct PreviewSnapshot {
 
 impl ToolTurnAccumulator {
     pub fn new() -> Self {
-        Self::default()
+        Self::with_limits(ToolStreamLimits::default())
     }
 
-    /// Fold in a chunk of the assistant prose that came alongside the tool calls,
-    /// so a streamed turn returns the same [`Completion`] shape as a buffered one.
-    pub fn push_content(&mut self, delta: &str) {
+    pub fn with_limits(limits: ToolStreamLimits) -> Self {
+        Self {
+            content: String::new(),
+            calls: BTreeMap::new(),
+            retained_bytes: 0,
+            limits,
+            usage_reported: false,
+        }
+    }
+
+    /// Fold in assistant prose under the per-turn retention ceilings.
+    pub fn push_content(&mut self, delta: &str, sink: &mut dyn EventSink) -> CoreResult<()> {
+        let next_content = checked_len(
+            self.content.len(),
+            delta.len(),
+            self.limits.max_content_bytes,
+            "tool-turn prose",
+        );
+        let next_retained = next_content.and_then(|_| {
+            checked_len(
+                self.retained_bytes,
+                delta.len(),
+                self.limits.max_total_retained_bytes,
+                "tool-turn retained data",
+            )
+        });
+        let next_retained = match next_retained {
+            Ok(len) => len,
+            Err(error) => {
+                self.abandon(ABANDONED_TURN_FAILED, sink);
+                return Err(error);
+            }
+        };
+        if let Err(error) = reserve_string_bounded(
+            &mut self.content,
+            delta.len(),
+            self.limits.max_content_bytes,
+            "tool-turn prose",
+        ) {
+            self.abandon(ABANDONED_TURN_FAILED, sink);
+            return Err(error);
+        }
         self.content.push_str(delta);
+        self.retained_bytes = next_retained;
+        Ok(())
     }
 
     /// Pass this turn's token report to the sink, at most once.
@@ -153,28 +172,101 @@ impl ToolTurnAccumulator {
 
     /// Fold in one tool-call fragment, emitting a live preview when the call is
     /// previewable and the fragment moved it on.
-    pub fn push_fragment(&mut self, fragment: ToolCallDelta, sink: &mut dyn EventSink) {
-        let call = self.calls.entry(fragment.index).or_default();
-        // First sight wins for both. The wire sends them once, and a later,
-        // different id would orphan every event already emitted under the first.
-        if call.id.is_none() {
-            call.id = fragment.id;
+    pub fn push_fragment(
+        &mut self,
+        fragment: ToolCallDelta,
+        sink: &mut dyn EventSink,
+    ) -> CoreResult<()> {
+        let current = self.calls.get(&fragment.index);
+        let is_new = current.is_none();
+        if is_new && self.calls.len() >= self.limits.max_calls {
+            self.abandon(ABANDONED_TURN_FAILED, sink);
+            return Err(CoreError::Llm(format!(
+                "provider tool turn exceeded its {}-call limit",
+                self.limits.max_calls
+            )));
         }
-        if call.name.is_none() {
-            call.name = fragment.name;
-        }
-        let Some(text) = fragment.arguments else {
-            return;
+
+        let previous_argument_bytes = current.map_or(0, |call| call.arguments.len());
+        let added_argument_bytes = fragment.arguments.as_ref().map_or(0, String::len);
+        let next_argument_bytes = match checked_len(
+            previous_argument_bytes,
+            added_argument_bytes,
+            self.limits.max_call_argument_bytes,
+            "tool-call arguments",
+        ) {
+            Ok(len) => len,
+            Err(error) => {
+                self.abandon(ABANDONED_TURN_FAILED, sink);
+                return Err(error);
+            }
         };
-        if text.is_empty() {
-            // 32 of these in the capture. They carry no news, but they are NOT a
-            // terminator — the call goes on arriving after them.
-            return;
+        let added_metadata_bytes = (if current.is_none_or(|call| call.id.is_none()) {
+            fragment.id.as_ref().map_or(0, String::len)
+        } else {
+            0
+        }) + (if current.is_none_or(|call| call.name.is_none()) {
+            fragment.name.as_ref().map_or(0, String::len)
+        } else {
+            0
+        });
+        let added_retained_bytes = match added_argument_bytes.checked_add(added_metadata_bytes) {
+            Some(bytes) => bytes,
+            None => {
+                self.abandon(ABANDONED_TURN_FAILED, sink);
+                return Err(CoreError::Llm("tool-call size overflow".into()));
+            }
+        };
+        let next_retained = match checked_len(
+            self.retained_bytes,
+            added_retained_bytes,
+            self.limits.max_total_retained_bytes,
+            "tool-turn retained data",
+        ) {
+            Ok(len) => len,
+            Err(error) => {
+                self.abandon(ABANDONED_TURN_FAILED, sink);
+                return Err(error);
+            }
+        };
+
+        let reserve_error = reserve_string_bounded(
+            &mut self.calls.entry(fragment.index).or_default().arguments,
+            added_argument_bytes,
+            self.limits.max_call_argument_bytes,
+            "tool-call arguments",
+        );
+        if let Err(error) = reserve_error {
+            self.abandon(ABANDONED_TURN_FAILED, sink);
+            return Err(error);
         }
-        call.arguments.push_str(&text);
-        if is_previewable(call.name.as_deref()) {
+
+        {
+            let call = self
+                .calls
+                .get_mut(&fragment.index)
+                .expect("call was inserted");
+            if call.id.is_none() {
+                call.id = fragment.id;
+            }
+            if call.name.is_none() {
+                call.name = fragment.name;
+            }
+            if let Some(text) = fragment.arguments {
+                call.arguments.push_str(&text);
+            }
+            debug_assert_eq!(call.arguments.len(), next_argument_bytes);
+        }
+        self.retained_bytes = next_retained;
+
+        let call = self
+            .calls
+            .get_mut(&fragment.index)
+            .expect("call was inserted");
+        if !call.arguments.is_empty() && is_previewable(call.name.as_deref()) {
             emit_preview(call, sink);
         }
+        Ok(())
     }
 
     /// Clear every preview still on screen, because the turn will not produce the
@@ -201,8 +293,15 @@ impl ToolTurnAccumulator {
     /// The unclosed call is still returned, raw, so the dispatcher rejects it in
     /// full view rather than the call vanishing off the timeline.
     pub fn finish(mut self, sink: &mut dyn EventSink) -> CoreResult<Completion> {
+        if let Some((index, _)) = self.calls.iter().find(|(_, call)| call.id.is_none()) {
+            let index = *index;
+            self.abandon(ABANDONED_TURN_FAILED, sink);
+            return Err(CoreError::Llm(format!(
+                "the provider streamed tool-call fragments at index {index} without an id, so the tool turn cannot be reassembled"
+            )));
+        }
         let mut tool_calls = Vec::with_capacity(self.calls.len());
-        for (index, call) in &mut self.calls {
+        for call in self.calls.values_mut() {
             if call.previewed_but_unfinished() {
                 if let Some(id) = call.take_previewed_id() {
                     sink.send(ChatEvent::NoteEditAbandoned {
@@ -211,14 +310,7 @@ impl ToolTurnAccumulator {
                     });
                 }
             }
-            let Some(id) = call.id.clone() else {
-                // The protocol keys a tool result on the call id, so a call whose
-                // first-sight frame never arrived cannot be answered. Surfacing
-                // the broken stream beats dispatching a plan with a hole in it.
-                return Err(CoreError::Llm(format!(
-                    "the provider streamed tool-call fragments at index {index} without an id, so the tool turn cannot be reassembled"
-                )));
-            };
+            let id = call.id.clone().expect("ids were checked before settlement");
             tool_calls.push(ToolCall {
                 // A nameless call is left nameless on purpose: the dispatcher
                 // rejects it and it still gets a timeline node, which is the
@@ -298,15 +390,7 @@ fn is_previewable(name: Option<&str>) -> bool {
     name.is_some_and(|name| PREVIEWABLE_TOOLS.contains(&name))
 }
 
-/// Re-read the arguments so far and send a preview if anything changed.
-///
-/// The whole buffer is re-parsed on every fragment rather than scanned onward
-/// from the last one. That is what keeps un-escaping a whole-document job for
-/// `serde_json`, and it is affordable at the sizes this sees: replaying the
-/// capture's completed call — 386 fragments over a 4840-character argument blob,
-/// so quadratic in the note's length — measured 1.5 ms in release, spread across
-/// the seconds the model spends composing it. A note an order of magnitude larger
-/// would want an incremental scan; nothing in this app produces one.
+/// Re-read the bounded argument prefix and send a preview when it changes.
 fn emit_preview(call: &mut PendingCall, sink: &mut dyn EventSink) {
     let Some(id) = call.id.clone() else {
         // No correlation key, so no card could be upgraded or cleared later.
@@ -403,6 +487,61 @@ mod tests {
             .collect()
     }
 
+    #[test]
+    fn argument_limit_failure_abandons_previews_and_does_not_retain_overflow() {
+        let limits = ToolStreamLimits::new(2, 40, 64, 8);
+        let mut accumulator = ToolTurnAccumulator::with_limits(limits);
+        let mut sink = VecSink::default();
+        let preview_fragment = ToolCallDelta {
+            index: 0,
+            id: Some("call_0".into()),
+            name: Some(TOOL_WRITE_NOTE.into()),
+            arguments: Some(r#"{"rel_path":"d.md","content":"hi""#.into()),
+        };
+        let retained_len = preview_fragment.arguments.as_ref().unwrap().len();
+        accumulator
+            .push_fragment(preview_fragment, &mut sink)
+            .unwrap();
+        let error = accumulator
+            .push_fragment(
+                ToolCallDelta {
+                    index: 0,
+                    id: None,
+                    name: None,
+                    arguments: Some("x".repeat(40)),
+                },
+                &mut sink,
+            )
+            .expect_err("an argument past its per-call byte cap must fail");
+
+        assert!(error.to_string().contains("40-byte"), "{error}");
+        let abandonments = sink
+            .events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ChatEvent::NoteEditAbandoned { id, .. } if id == "call_0"
+                )
+            })
+            .count();
+        assert_eq!(
+            abandonments, 1,
+            "limit failure clears the preview exactly once"
+        );
+        assert_eq!(accumulator.calls[&0].arguments.len(), retained_len);
+    }
+
+    #[test]
+    fn tool_prose_limit_is_enforced_before_retaining_the_delta() {
+        let mut accumulator = ToolTurnAccumulator::with_limits(ToolStreamLimits::new(1, 8, 8, 4));
+        let error = accumulator
+            .push_content("12345", &mut VecSink::default())
+            .expect_err("tool-turn prose must remain bounded");
+        assert!(error.to_string().contains("4-byte"), "{error}");
+        assert!(accumulator.content.is_empty());
+    }
+
     fn abandoned(sink: &VecSink) -> Vec<&str> {
         sink.events
             .iter()
@@ -497,7 +636,7 @@ mod tests {
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
         for fragment in fragments_for(1) {
-            accumulator.push_fragment(fragment, &mut sink);
+            accumulator.push_fragment(fragment, &mut sink).unwrap();
         }
         let previews = previews(&sink);
         assert!(
@@ -526,7 +665,7 @@ mod tests {
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
         for fragment in fragments_for(15) {
-            accumulator.push_fragment(fragment, &mut sink);
+            accumulator.push_fragment(fragment, &mut sink).unwrap();
         }
         let (id, _, complete) = *previews(&sink).last().unwrap();
         let id = id.to_string();
@@ -562,7 +701,7 @@ mod tests {
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
         for fragment in fragments {
-            accumulator.push_fragment(fragment, &mut sink);
+            accumulator.push_fragment(fragment, &mut sink).unwrap();
         }
         assert_eq!(previews(&sink).last().unwrap().1, captured_content(1));
     }
@@ -579,10 +718,10 @@ mod tests {
         second.reverse();
         while !first.is_empty() || !second.is_empty() {
             if let Some(fragment) = first.pop() {
-                accumulator.push_fragment(fragment, &mut sink);
+                accumulator.push_fragment(fragment, &mut sink).unwrap();
             }
             if let Some(fragment) = second.pop() {
-                accumulator.push_fragment(fragment, &mut sink);
+                accumulator.push_fragment(fragment, &mut sink).unwrap();
             }
         }
         let completion = accumulator.finish(&mut sink).unwrap();
@@ -608,15 +747,17 @@ mod tests {
             .collect();
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
-        accumulator.push_fragment(
-            ToolCallDelta {
-                index: 1,
-                id: Some("call-1".into()),
-                name: Some(TOOL_WRITE_NOTE.into()),
-                arguments: Some(whole),
-            },
-            &mut sink,
-        );
+        accumulator
+            .push_fragment(
+                ToolCallDelta {
+                    index: 1,
+                    id: Some("call-1".into()),
+                    name: Some(TOOL_WRITE_NOTE.into()),
+                    arguments: Some(whole),
+                },
+                &mut sink,
+            )
+            .unwrap();
         assert_eq!(previews(&sink).len(), 1);
         let (_, body, complete) = previews(&sink)[0];
         assert!(complete);
@@ -629,15 +770,17 @@ mod tests {
     fn arguments_that_never_become_valid_json_are_abandoned() {
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
-        accumulator.push_fragment(
-            ToolCallDelta {
-                index: 0,
-                id: Some("call-1".into()),
-                name: Some(TOOL_WRITE_NOTE.into()),
-                arguments: Some(r#"{"rel_path": "a.md", "content": "body"#.into()),
-            },
-            &mut sink,
-        );
+        accumulator
+            .push_fragment(
+                ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some(TOOL_WRITE_NOTE.into()),
+                    arguments: Some(r#"{"rel_path": "a.md", "content": "body"#.into()),
+                },
+                &mut sink,
+            )
+            .unwrap();
         accumulator.finish(&mut sink).unwrap();
         assert_eq!(abandoned(&sink), vec!["call-1"]);
         let (_, body, complete) = *previews(&sink).last().unwrap();
@@ -650,7 +793,7 @@ mod tests {
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
         for fragment in fragments_for(1).into_iter().take(40) {
-            accumulator.push_fragment(fragment, &mut sink);
+            accumulator.push_fragment(fragment, &mut sink).unwrap();
         }
         assert!(!previews(&sink).is_empty(), "a card is on screen");
         accumulator.abandon(ABANDONED_CANCELLED, &mut sink);
@@ -675,7 +818,7 @@ mod tests {
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
         for fragment in fragments_for(1) {
-            accumulator.push_fragment(fragment, &mut sink);
+            accumulator.push_fragment(fragment, &mut sink).unwrap();
         }
         assert!(previews(&sink).last().unwrap().2, "composed in full");
         accumulator.abandon(ABANDONED_CANCELLED, &mut sink);
@@ -687,7 +830,7 @@ mod tests {
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
         for fragment in fragments_for(0) {
-            accumulator.push_fragment(fragment, &mut sink);
+            accumulator.push_fragment(fragment, &mut sink).unwrap();
         }
         assert!(
             previews(&sink).is_empty(),
@@ -706,15 +849,17 @@ mod tests {
             r#"ced.md", "kind": "atom"#,
             r#"ic", "#,
         ] {
-            accumulator.push_fragment(
-                ToolCallDelta {
-                    index: 0,
-                    id: Some("call-1".into()),
-                    name: Some(TOOL_WRITE_NOTE.into()),
-                    arguments: Some(chunk.into()),
-                },
-                &mut sink,
-            );
+            accumulator
+                .push_fragment(
+                    ToolCallDelta {
+                        index: 0,
+                        id: Some("call-1".into()),
+                        name: Some(TOOL_WRITE_NOTE.into()),
+                        arguments: Some(chunk.into()),
+                    },
+                    &mut sink,
+                )
+                .unwrap();
         }
         let paths: Vec<(Option<String>, Option<NoteKind>)> = sink
             .events
@@ -741,15 +886,17 @@ mod tests {
     fn an_unrecognised_kind_reads_as_absent_rather_than_as_a_guess() {
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
-        accumulator.push_fragment(
-            ToolCallDelta {
-                index: 0,
-                id: Some("call-1".into()),
-                name: Some(TOOL_WRITE_NOTE.into()),
-                arguments: Some(r#"{"kind": "diary", "content": "x"}"#.into()),
-            },
-            &mut sink,
-        );
+        accumulator
+            .push_fragment(
+                ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some(TOOL_WRITE_NOTE.into()),
+                    arguments: Some(r#"{"kind": "diary", "content": "x"}"#.into()),
+                },
+                &mut sink,
+            )
+            .unwrap();
         let kinds: Vec<Option<NoteKind>> = sink
             .events
             .iter()
@@ -768,15 +915,17 @@ mod tests {
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
         for (id, name) in [("call-1", TOOL_WRITE_NOTE), ("call-2", "search_notes")] {
-            accumulator.push_fragment(
-                ToolCallDelta {
-                    index: 0,
-                    id: Some(id.into()),
-                    name: Some(name.into()),
-                    arguments: Some(r#"{"content": "x"#.into()),
-                },
-                &mut sink,
-            );
+            accumulator
+                .push_fragment(
+                    ToolCallDelta {
+                        index: 0,
+                        id: Some(id.into()),
+                        name: Some(name.into()),
+                        arguments: Some(r#"{"content": "x"#.into()),
+                    },
+                    &mut sink,
+                )
+                .unwrap();
         }
         let completion = accumulator.finish(&mut sink).unwrap();
         let call = completion.tool_calls.first().unwrap();
@@ -789,15 +938,17 @@ mod tests {
     fn fragments_with_no_id_surface_as_an_error_rather_than_a_hole_in_the_turn() {
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
-        accumulator.push_fragment(
-            ToolCallDelta {
-                index: 3,
-                id: None,
-                name: Some(TOOL_WRITE_NOTE.into()),
-                arguments: Some(r#"{"content": "orphan"}"#.into()),
-            },
-            &mut sink,
-        );
+        accumulator
+            .push_fragment(
+                ToolCallDelta {
+                    index: 3,
+                    id: None,
+                    name: Some(TOOL_WRITE_NOTE.into()),
+                    arguments: Some(r#"{"content": "orphan"}"#.into()),
+                },
+                &mut sink,
+            )
+            .unwrap();
         let error = accumulator.finish(&mut sink).unwrap_err();
         assert!(
             error.to_string().contains("index 3"),
@@ -815,15 +966,17 @@ mod tests {
         // That is identity, not content — nothing to preview yet.
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
-        accumulator.push_fragment(
-            ToolCallDelta {
-                index: 0,
-                id: Some("call-1".into()),
-                name: Some(TOOL_WRITE_NOTE.into()),
-                arguments: None,
-            },
-            &mut sink,
-        );
+        accumulator
+            .push_fragment(
+                ToolCallDelta {
+                    index: 0,
+                    id: Some("call-1".into()),
+                    name: Some(TOOL_WRITE_NOTE.into()),
+                    arguments: None,
+                },
+                &mut sink,
+            )
+            .unwrap();
         assert!(previews(&sink).is_empty());
         let completion = accumulator.finish(&mut sink).unwrap();
         assert_eq!(completion.tool_calls.first().unwrap().arguments, "");
@@ -852,7 +1005,7 @@ mod tests {
             let mut tracked = LivePreviews::new(&mut sink);
             let mut accumulator = ToolTurnAccumulator::new();
             for fragment in fragments {
-                accumulator.push_fragment(fragment, &mut tracked);
+                accumulator.push_fragment(fragment, &mut tracked).unwrap();
             }
             if settle {
                 accumulator.finish(&mut tracked).unwrap();
@@ -911,7 +1064,7 @@ mod tests {
             let mut tracked = LivePreviews::new(&mut sink);
             let mut accumulator = ToolTurnAccumulator::new();
             for fragment in fragments_for(1).into_iter().take(40) {
-                accumulator.push_fragment(fragment, &mut tracked);
+                accumulator.push_fragment(fragment, &mut tracked).unwrap();
             }
             tracked.abandon_live(ABANDONED_CANCELLED);
             tracked.abandon_live(ABANDONED_CANCELLED);
@@ -938,8 +1091,8 @@ mod tests {
     fn assistant_prose_alongside_the_tool_calls_is_kept() {
         let mut sink = VecSink::default();
         let mut accumulator = ToolTurnAccumulator::new();
-        accumulator.push_content("Let me ");
-        accumulator.push_content("check.");
+        accumulator.push_content("Let me ", &mut sink).unwrap();
+        accumulator.push_content("check.", &mut sink).unwrap();
         let completion = accumulator.finish(&mut sink).unwrap();
         assert_eq!(completion.content.as_deref(), Some("Let me check."));
         // A turn with no prose reports absent, never an empty string.

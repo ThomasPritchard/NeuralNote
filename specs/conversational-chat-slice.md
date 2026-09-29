@@ -266,16 +266,17 @@ the expensive one.
 - **Real-model tier (shell).** `crates/neuralnote-core` is deliberately **network-free**, so this
   cannot live there — it belongs in `app/desktop/src-tauri/tests/`, which owns the HTTP clients.
 
-  *(Correction: an earlier draft said this matched "the Slice-1 pattern." No such pattern exists —
-  the workspace has no `tests/` directory, no `#[ignore]`, and no env-gated test. It is designed
-  here, not copied.)*
+  These live, potentially billed probes are intentionally `#[ignore]` in routine tests. Run
+  them explicitly with `--ignored --nocapture` and `NEURALNOTE_REQUIRE_EVAL=1`; missing providers
+  then fail instead of looking like a pass. Routine green tests do not establish citation quality.
 
-  Gate it on provider availability and **skip loudly**: `#[ignore]` is the wrong tool, since an
-  ignored test does not skip, it silently never runs. The test must run, detect the missing
-  provider, print an unmissable notice, and — critically — a skipped run must never read as a pass.
-  Set `NEURALNOTE_REQUIRE_EVAL=1` (release/CI) to turn a skip into a hard failure.
-
-Any regression on the real-model tier blocks ship — this eval *is* the moat check for this slice.
+Release dispatch requires a reviewed evaluation record tied to the exact release commit and both
+shipped default models. Follow [the release evaluation procedure](../docs/release-citation-evaluation.md).
+The cloud tier must pass. The accepted local best-effort limitation permits missing citations only,
+with an actual run and explicit review; wrong citations, unsupported claims, or unavailable providers
+cannot be waived. Human review checks claim support and abstention because source provenance and
+citation counts alone do not establish them. The workflow validates and retains the record; it does
+not execute live providers or independently establish the truth of a maintainer's attestation.
 
 ## 8. Testing (Definition of Done)
 

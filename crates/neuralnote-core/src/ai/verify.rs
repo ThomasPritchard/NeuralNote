@@ -1,11 +1,7 @@
-//! Citation verification — the moat's discipline, held even in the keyword slice.
-//!
-//! Before any citation is surfaced, its span is re-read from disk and proven
-//! current: the note's content hash must be unchanged since the span was captured,
-//! the quoted text must still occur verbatim, AND the line range must describe
-//! exactly the text quoted. Any doubt drops the citation — *a wrong citation is
-//! worse than no answer* (spec §6). No crypto dependency: the same
-//! [`crate::model::NoteDoc::content_hash`] the vault already computes is reused.
+//! Citation verification against an unchanged note, verbatim quote presence,
+//! and quote/range line-count consistency. The producer supplies the start line;
+//! this verifier does not independently anchor the quote to that position or
+//! establish that the quote supports the model's claim.
 
 use crate::ai::evidence::EvidenceSpan;
 use crate::note::{read_note, MAX_EDITABLE_NOTE_BYTES};
@@ -21,27 +17,14 @@ impl CitationVerifier {
         Self { root: root.into() }
     }
 
-    /// Prove `span` is safe to surface. Returns `Ok(())` when the note is unchanged,
-    /// still contains the quoted text, and is claimed over exactly the lines that text
-    /// covers; otherwise `Err(reason)` — a human-readable reason to show in a
-    /// [`crate::ai::events::ChatEvent::CitationDropped`] event.
-    ///
-    /// A note that cannot be re-read (deleted, permissions) is a drop, not a hard
-    /// error: one bad citation must never sink the whole answer.
+    /// Check the note hash, quote presence, and range length. Returns a readable
+    /// drop reason on failure; one invalid citation does not sink the answer.
     pub fn verify(&self, span: &EvidenceSpan) -> Result<(), String> {
-        // An empty span is structurally uncitable — and `raw.contains("")` is always
-        // true, so the quote check below would pass it vacuously. Reject it up front.
-        // Empty text is reachable: a blank line, an empty note, or `max_bytes`
-        // truncating a multibyte first char to zero.
+        // `contains("")` is true; empty or zero-byte-truncated quotes are invalid.
         if span.text.is_empty() {
             return Err("the cited span has no quotable text".to_string());
         }
-        // The range must describe exactly the text carried. Neither check below can
-        // see an over-claim — a prefix of a substring is still a substring, and the
-        // hash covers the note, not the range — so a producer that shortened its quote
-        // (a byte budget, a trimmed blank tail) without shortening its range would
-        // otherwise attribute the answer to lines it never quoted. `text` is non-empty
-        // here, so it covers at least its own start line.
+        // Truncating a quote must also shorten its claimed line range.
         let expected_end = span
             .start_line
             .saturating_add(lines_carried(&span.text).saturating_sub(1));
@@ -53,13 +36,8 @@ impl CitationVerifier {
         }
         let doc = read_note(&self.root, &self.root.join(&span.rel_path))
             .map_err(|e| format!("the cited note could not be re-read: {e}"))?;
-        // A document the reader answers CONTENT-FREE — past the readable byte limit,
-        // or a non-UTF-8 attachment — carries an empty `content_hash`, which the
-        // comparison below would report as "changed on disk": false, and for such a
-        // note deterministically false forever. Name the real cause first (issues
-        // #210/#218), in the reader's own precedence: the resource limit is decided
-        // before binary-vs-text classification, so an oversized attachment reports
-        // its size rather than its encoding.
+        // Content-free size/binary responses have no hash. Report the reader's
+        // actual cause before comparing hashes, preserving size-before-encoding.
         if doc.exceeds_editable_size {
             return Err(format!(
                 "the cited note is {} bytes, past the {MAX_EDITABLE_NOTE_BYTES}-byte readable note limit, so its text cannot be re-read to verify the quote",

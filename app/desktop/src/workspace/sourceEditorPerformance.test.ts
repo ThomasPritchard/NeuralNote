@@ -97,6 +97,19 @@ function keystroke(subject: Typist): number {
   return performance.now() - started;
 }
 
+function multilineReplacement(lines: number): () => number {
+  const source = loadSourceText("old line\r\n".repeat(lines));
+  const insert = "new line\n".repeat(lines);
+  const changes = ChangeSet.of({ from: 0, to: source.text.length, insert }, source.text.length);
+  return () => {
+    const started = performance.now();
+    const result = applySourceChanges(source, changes);
+    const elapsed = performance.now() - started;
+    expect(serializeSourceText(result)).toBe("new line\r\n".repeat(lines));
+    return elapsed;
+  };
+}
+
 const SAMPLES = 21;
 
 /**
@@ -156,6 +169,13 @@ describe("source editor performance budgets", () => {
     }
     samples.sort((left, right) => left - right);
     expect(samples[2]).toBeLessThanOrEqual(1_500);
+  });
+
+  it.skipIf(UNDER_COVERAGE_INSTRUMENTATION)("avoids quadratic separator lookup during a full multiline replacement", () => {
+    const small = multilineReplacement(1_000);
+    const large = multilineReplacement(4_000);
+    for (let warmup = 0; warmup < 3; warmup += 1) { small(); large(); }
+    expect(costRatio(large, small)).toBeLessThanOrEqual(SUPERLINEAR_RATIO);
   });
 
   it.skipIf(UNDER_COVERAGE_INSTRUMENTATION)("keeps exact-source reconstruction linear in the size of the note", () => {
