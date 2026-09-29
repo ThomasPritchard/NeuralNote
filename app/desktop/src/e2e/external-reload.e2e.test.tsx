@@ -18,13 +18,18 @@
 // the real mockIPC event bridge, so the app's genuine onTreeChanged
 // subscriptions (store tree refresh + useNoteTabs reconcile) both run.
 
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 import { act, screen, waitFor } from "@testing-library/react";
 import { emit } from "@tauri-apps/api/event";
+import { EditorView } from "@codemirror/view";
+import { createNote, readNote } from "../lib/api";
+import { clearSourceEditorSessions } from "../workspace/sourceEditorSession";
 import { TREE_CHANGED } from "../lib/bindings/events";
 import { renderApp, type RenderAppResult } from "./renderApp";
 import { VAULT_ROOT, type SeedEntry } from "./mockVault";
 import { MAX_EDITABLE_NOTE_BYTES } from "./mockVaultNotes";
+
+beforeEach(clearSourceEditorSessions);
 
 const recents = [{ name: "My Brain", path: VAULT_ROOT, lastOpened: 1_700_000_000_000 }];
 
@@ -123,6 +128,52 @@ describe("Frontend reconciliation only: external deletion of an open note (issue
     expect(screen.getByRole("tab", { name: /^Alpha$/ })).toBeInTheDocument();
     expect(await noteEditor()).toHaveTextContent("Alpha body.");
     expect(screen.queryByText(/changed on disk/)).not.toBeInTheDocument();
+  });
+});
+
+describe("Journey: recover a deleted note by copying into a new note", () => {
+  it.each([false, true])("recovers the retained draft into a different note (original recreated: %s)", async (recreated) => {
+    const { user, backend } = await openVault();
+    await user.click(await screen.findByRole("button", { name: "Alpha.md" }));
+    const editor = await noteEditor();
+    const view = EditorView.findFromDOM(editor)!;
+    await act(async () => {
+      view.dispatch({ changes: { from: view.state.doc.length, insert: " Unsaved work." } });
+    });
+    backend.applyExternalDelete("Alpha.md");
+    await fireWatcherAfterDebounce();
+    expect(await screen.findByText(/Copy its contents into a new note before closing this tab/))
+      .toBeInTheDocument();
+
+    await user.click(editor);
+    await act(async () => {
+      view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } });
+    });
+    const copied = await user.copy();
+    expect(copied?.getData("text/plain")).toBe("Alpha body. Unsaved work.");
+
+    if (recreated) {
+      // Seed a recreated file through the existing mock backend command, then
+      // reconcile it as a watcher change. This is frontend reconciliation evidence.
+      await createNote(VAULT_ROOT, "Alpha");
+      backend.applyExternalEdit("Alpha.md", "Recreated content.");
+      await fireWatcherAfterDebounce();
+    }
+    expect(screen.queryByText(/changed on disk since you opened it/) !== null).toBe(recreated);
+    expect(getEditor()).toHaveTextContent("Alpha body. Unsaved work.");
+
+    await user.click(screen.getByRole("button", { name: "New note" }));
+    await user.type(await screen.findByLabelText("New note name"), "Recovered{Enter}");
+    await screen.findByRole("tab", { name: /^Recovered$/ });
+    await user.click(await noteEditor());
+    await user.paste(copied!);
+    await user.click(screen.getByRole("button", { name: "Save" }));
+    await waitFor(async () => {
+      expect((await readNote(`${VAULT_ROOT}/Recovered.md`)).raw).toBe("Alpha body. Unsaved work.");
+    });
+    expect(screen.getByRole("tab", { name: /Alpha.*unsaved changes/i })).toBeInTheDocument();
+    const originalOnDisk = recreated ? await readNote(`${VAULT_ROOT}/Alpha.md`) : null;
+    expect(originalOnDisk?.raw).toBe(recreated ? "Recreated content." : undefined);
   });
 });
 

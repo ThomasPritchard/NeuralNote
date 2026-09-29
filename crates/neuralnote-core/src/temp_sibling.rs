@@ -15,6 +15,8 @@
 //! renaming (`config_io` does, the note save path deliberately does not, to keep
 //! its performance profile); and what they do with a failed write or rename.
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -43,21 +45,21 @@ pub(crate) fn create_temp_sibling(
         .find_map(|_| {
             let seq = sequence.fetch_add(1, Ordering::Relaxed);
             let temp = parent.join(format!(".{file_name}.{}.{seq}.nn-tmp", std::process::id()));
-            match std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temp)
-            {
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(unix)]
+            options.mode(0o600);
+            match options.open(&temp) {
                 Ok(file) => Some(Ok((temp, file))),
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => None,
                 Err(error) => Some(Err(open_failure(action, &error))),
             }
         })
         .unwrap_or_else(|| {
-            // Every one of these names is one only this process could predict, and
-            // all of them were refused EEXIST — the signature of the squatting this
-            // module exists to refuse, not of ordinary contention. Leave a trace an
-            // operator can find; the caller still gets the same explicit error.
+            // Every candidate was refused by exclusive creation. The predictable
+            // name may be occupied by stale state, concurrent activity, or a
+            // squatted path; leave a trace an operator can find while returning the
+            // same explicit error to the caller.
             log::warn!(
                 "temp_sibling: all {MAX_TEMP_ATTEMPTS} temp names for {file_name} were taken in {}",
                 parent.display()
@@ -152,5 +154,23 @@ mod tests {
                 .contains("no unique temporary file was available"),
             "exhaustion must name itself, got {error}"
         );
+    }
+}
+
+#[cfg(all(test, unix))]
+mod private_mode_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn temporary_siblings_are_created_without_group_or_other_access() {
+        let parent = tempfile::tempdir().unwrap();
+        let sequence = AtomicU64::new(0);
+        let (path, file) = create_temp_sibling(parent.path(), "private.md", &sequence, "fixture")
+            .expect("create the temporary sibling");
+
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o077, 0);
+        drop(file);
+        std::fs::remove_file(path).unwrap();
     }
 }

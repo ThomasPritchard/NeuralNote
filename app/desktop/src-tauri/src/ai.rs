@@ -14,6 +14,10 @@ use async_trait::async_trait;
 use futures_util::StreamExt;
 use neuralnote_core::ai::approval::{self, ToolApprovalSubject};
 use neuralnote_core::ai::tool_turn_reader::{StreamedToolTurn, ToolTurnReader};
+use neuralnote_core::ai::transport_limits::{
+    BoundedBytes, SseLimits, SseLineReader, MAX_ANSWER_RESPONSE_BYTES,
+    MAX_BUFFERED_COMPLETION_BYTES, MAX_PROVIDER_ERROR_BYTES,
+};
 use neuralnote_core::ai::{openai, provider_config, tool_stream};
 use neuralnote_core::ai::{
     openrouter_reasoning_support, parse_openrouter_context_windows, parse_openrouter_input_pricing,
@@ -742,9 +746,16 @@ pub async fn probe_openrouter_reasoning(model: &str) -> ReasoningSupport {
     if !response.status().is_success() {
         return ReasoningSupport::Unknown;
     }
-    let Ok(body) = response.text().await else {
+    let Ok(body) = read_bounded_response(
+        response,
+        MAX_BUFFERED_COMPLETION_BYTES,
+        "OpenRouter model catalogue",
+    )
+    .await
+    else {
         return ReasoningSupport::Unknown;
     };
+    let body = String::from_utf8_lossy(&body);
 
     cache_openrouter_pricing(&body, model);
     cache_openrouter_model_windows(&body);
@@ -754,6 +765,73 @@ pub async fn probe_openrouter_reasoning(model: &str) -> ReasoningSupport {
 
 fn openrouter_models_request(client: &reqwest::Client) -> reqwest::RequestBuilder {
     client.get(OPENROUTER_MODELS_URL)
+}
+
+/// Read a successful provider body without allowing its declared or received size
+/// to exceed the caller's ceiling.
+async fn read_bounded_response(
+    response: reqwest::Response,
+    max_bytes: usize,
+    subject: &str,
+) -> Result<Vec<u8>, CoreError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64)
+    {
+        return Err(CoreError::Llm(format!(
+            "{subject} exceeded its {max_bytes}-byte limit"
+        )));
+    }
+    let mut bytes = BoundedBytes::with_limit(max_bytes);
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk =
+            chunk.map_err(|error| CoreError::Llm(format!("could not read {subject}: {error}")))?;
+        bytes
+            .push(&chunk)
+            .map_err(|error| CoreError::Llm(format!("could not buffer {subject}: {error}")))?;
+    }
+    Ok(bytes.into_bytes())
+}
+
+/// Retain only a bounded prefix of an error response. A broken body read keeps the
+/// status useful and marks the omitted detail instead of replacing the failure.
+async fn read_provider_error_prefix(
+    response: reqwest::Response,
+    max_bytes: usize,
+) -> (String, bool) {
+    let declared_too_large = response
+        .content_length()
+        .is_some_and(|length| length > max_bytes as u64);
+    let mut bytes = BoundedBytes::with_limit(max_bytes);
+    let mut truncated = declared_too_large;
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let Ok(chunk) = chunk else {
+            truncated = true;
+            break;
+        };
+        let remaining = max_bytes.saturating_sub(bytes.len());
+        if chunk.len() > remaining {
+            let _ = bytes.push(&chunk[..remaining]);
+            truncated = true;
+            break;
+        }
+        if bytes.push(&chunk).is_err() {
+            truncated = true;
+            break;
+        }
+    }
+    let mut body = String::from_utf8_lossy(bytes.as_slice()).into_owned();
+    if body.len() > max_bytes {
+        let mut boundary = max_bytes;
+        while !body.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        body.truncate(boundary);
+        truncated = true;
+    }
+    (body, truncated)
 }
 
 fn cache_openrouter_pricing(models_json: &str, model: &str) {
@@ -834,6 +912,85 @@ pub fn cached_openrouter_reasoning_control(model: &str) -> Option<ReasoningContr
 }
 
 /* ─────────────────────────────  LLM client  ────────────────────────────── */
+
+const PROVIDER_ERROR_TRUNCATION_MARKER: &str = " [truncated]";
+
+fn append_bounded(output: &mut String, text: &str, max_bytes: usize) -> bool {
+    let remaining = max_bytes.saturating_sub(output.len());
+    if text.len() <= remaining {
+        output.push_str(text);
+        return true;
+    }
+    let mut end = remaining.min(text.len());
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    output.push_str(&text[..end]);
+    false
+}
+
+/// Redact without first copying an unbounded provider error, then cap its
+/// diagnostic projection while preserving UTF-8 and an explicit truncation mark.
+fn provider_error_text(text: &str, bearer: &str, max_bytes: usize) -> String {
+    let mut output = String::with_capacity(max_bytes);
+    let mut truncated = false;
+    let mut remainder = text;
+    if bearer.is_empty() {
+        truncated = !append_bounded(&mut output, remainder, max_bytes);
+    } else {
+        while let Some((before, after)) = remainder.split_once(bearer) {
+            if !append_bounded(&mut output, before, max_bytes)
+                || !append_bounded(&mut output, "***", max_bytes)
+            {
+                truncated = true;
+                break;
+            }
+            remainder = after;
+        }
+        if !truncated && !append_bounded(&mut output, remainder, max_bytes) {
+            truncated = true;
+        }
+    }
+    if truncated {
+        let prefix_limit = max_bytes.saturating_sub(PROVIDER_ERROR_TRUNCATION_MARKER.len());
+        let mut boundary = prefix_limit.min(output.len());
+        while !output.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        output.truncate(boundary);
+        if max_bytes >= PROVIDER_ERROR_TRUNCATION_MARKER.len() {
+            output.push_str(PROVIDER_ERROR_TRUNCATION_MARKER);
+        }
+    }
+    output
+}
+
+/// Redact credentials from error-bearing events; normal answer and preview data
+/// remains byte-identical to the provider stream and its settled completion.
+struct ProviderRedactingSink<'a> {
+    inner: &'a mut dyn EventSink,
+    bearer: &'a str,
+}
+
+impl EventSink for ProviderRedactingSink<'_> {
+    fn send(&mut self, event: ChatEvent) {
+        let event = match event {
+            ChatEvent::NoteEditAbandoned { id, reason } => ChatEvent::NoteEditAbandoned {
+                id,
+                reason: provider_error_text(&reason, self.bearer, MAX_PROVIDER_ERROR_BYTES),
+            },
+            ChatEvent::Error { message } => ChatEvent::Error {
+                message: provider_error_text(&message, self.bearer, MAX_PROVIDER_ERROR_BYTES),
+            },
+            other => other,
+        };
+        self.inner.send(event);
+    }
+
+    fn record_usage(&mut self, usage: Option<TokenUsage>) {
+        self.inner.record_usage(usage);
+    }
+}
 
 /// OpenAI-compatible [`LlmClient`]. Holds one reusable HTTP client and endpoint
 /// config; the model id travels per-request in [`LlmRequest::model`].
@@ -986,19 +1143,22 @@ impl OpenAiChatClient {
             .post(&self.tool_wire_body(req, /* stream */ true))
             .await?;
 
-        // Same byte-buffered line loop as the answer turn, and for the same
-        // reason: a chunk can split a multibyte character but never the `\n`
-        // delimiter, so every complete line decodes cleanly. The reassembly
-        // itself lives in core, where it is tested against the captured turn.
         let mut stream = resp.bytes_stream();
         let mut reader = ToolTurnReader::new();
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
-            if reader.push_bytes(&chunk, sink)? {
+            let chunk = chunk.map_err(|error| {
+                self.sanitize_provider_error(CoreError::Llm(format!("stream read error: {error}")))
+            })?;
+            if reader
+                .push_bytes(&chunk, sink)
+                .map_err(|error| self.sanitize_provider_error(error))?
+            {
                 break;
             }
         }
-        reader.finish(sink)
+        reader
+            .finish(sink)
+            .map_err(|error| self.sanitize_provider_error(error))
     }
 
     /// One buffered turn: the completion the model returned, and what the
@@ -1010,12 +1170,22 @@ impl OpenAiChatClient {
         let body = self.tool_wire_body(req, /* stream */ false);
         let resp = self.post(&body).await?;
         let provider = self.provider_label();
-        let value: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| CoreError::Llm(format!("could not parse {provider} response: {e}")))?;
+        let bytes = read_bounded_response(
+            resp,
+            MAX_BUFFERED_COMPLETION_BYTES,
+            "buffered provider response",
+        )
+        .await
+        .map_err(|error| self.sanitize_provider_error(error))?;
+        let value: serde_json::Value = serde_json::from_slice(&bytes).map_err(|error| {
+            self.sanitize_provider_error(CoreError::Llm(format!(
+                "could not parse {provider} response: {error}"
+            )))
+        })?;
         let usage = openai::parse_usage(&value);
-        Ok((openai::parse_completion(value)?, usage))
+        let completion =
+            openai::parse_completion(value).map_err(|error| self.sanitize_provider_error(error))?;
+        Ok((completion, usage))
     }
 
     /// Read the streamed answer to its end, returning the text exactly as it was
@@ -1040,25 +1210,27 @@ impl OpenAiChatClient {
         let body = self.answer_wire_body(req);
         let resp = self.post(&body).await?;
         let mut stream = resp.bytes_stream();
-        let mut buf: Vec<u8> = Vec::new();
-
+        let mut reader = SseLineReader::with_limits(SseLimits::new(
+            neuralnote_core::ai::transport_limits::MAX_SSE_FRAME_BYTES,
+            MAX_ANSWER_RESPONSE_BYTES,
+        ));
         while let Some(chunk) = stream.next().await {
-            let chunk = chunk.map_err(|e| CoreError::Llm(format!("stream read error: {e}")))?;
-            buf.extend_from_slice(&chunk);
-
-            while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-                let line_bytes: Vec<u8> = buf.drain(..=pos).collect();
-                if let Some(done) = openai::consume_sse_line(&line_bytes, sink, answer)? {
-                    return Ok(done);
-                }
+            let chunk = chunk.map_err(|error| {
+                self.sanitize_provider_error(CoreError::Llm(format!("stream read error: {error}")))
+            })?;
+            let terminal = reader
+                .push_bytes(&chunk, |line| {
+                    Ok(openai::consume_sse_line(line, sink, answer)?.is_some())
+                })
+                .map_err(|error| self.sanitize_provider_error(error))?;
+            if terminal {
+                return Ok(answer.text().to_string());
             }
         }
-        // Flush a final line the stream left without a trailing newline — otherwise a
-        // last delta, or a terminal error frame, in the tail would be silently lost
-        // (and a cited id in that tail would go missing, corrupting verification).
-        if !buf.is_empty() {
-            openai::consume_sse_line(&buf, sink, answer)?;
-        }
+        // Process the final unterminated frame before settling an ordinary EOF.
+        reader
+            .finish(|line| Ok(openai::consume_sse_line(line, sink, answer)?.is_some()))
+            .map_err(|error| self.sanitize_provider_error(error))?;
         Ok(answer.text().to_string())
     }
 
@@ -1067,6 +1239,23 @@ impl OpenAiChatClient {
             "Local AI"
         } else {
             "OpenRouter"
+        }
+    }
+
+    fn sanitize_provider_error(&self, error: CoreError) -> CoreError {
+        let bearer = self.bearer.as_deref().unwrap_or("");
+        match error {
+            CoreError::Llm(message) => CoreError::Llm(provider_error_text(
+                &message,
+                bearer,
+                MAX_PROVIDER_ERROR_BYTES,
+            )),
+            CoreError::LocalAi(message) => CoreError::LocalAi(provider_error_text(
+                &message,
+                bearer,
+                MAX_PROVIDER_ERROR_BYTES,
+            )),
+            other => other,
         }
     }
 
@@ -1083,28 +1272,30 @@ impl OpenAiChatClient {
             // OpenRouter attribution (optional, but polite + helps rate limits).
             req = req.header("X-Title", title);
         }
-        let resp = req
-            .json(body)
-            .send()
-            .await
-            .map_err(|e| CoreError::Llm(format!("request to {provider} failed: {e}")))?;
+        let resp = req.json(body).send().await.map_err(|error| {
+            self.sanitize_provider_error(CoreError::Llm(format!(
+                "request to {provider} failed: {error}"
+            )))
+        })?;
 
         if !resp.status().is_success() {
             let status = resp.status();
-            // Prefer the provider's error body (it explains bad-key / rate-limit /
-            // bad-model); fall back to the status line so the error is never blank.
-            let body = resp.text().await.unwrap_or_default();
-            // Redact the key before it can reach a user-facing error or a log: a
-            // provider/proxy error body could echo the Authorization header, and a
-            // leaked key is catastrophic. Defence in depth on the secret boundary.
-            let key = self.bearer.as_deref().unwrap_or("");
-            let detail = openai::redact(body.trim(), key);
+            let (body, truncated) =
+                read_provider_error_prefix(resp, MAX_PROVIDER_ERROR_BYTES).await;
+            let detail = openai::redact(body.trim(), self.bearer.as_deref().unwrap_or(""));
             let detail = detail.trim();
-            return Err(CoreError::Llm(if detail.is_empty() {
-                format!("{provider} returned {status}")
+            let suffix = if truncated {
+                " [provider error body truncated]"
             } else {
-                format!("{provider} returned {status}: {detail}")
-            }));
+                ""
+            };
+            return Err(
+                self.sanitize_provider_error(CoreError::Llm(if detail.is_empty() {
+                    format!("{provider} returned {status}{suffix}")
+                } else {
+                    format!("{provider} returned {status}: {detail}{suffix}")
+                })),
+            );
         }
         Ok(resp)
     }
@@ -1117,11 +1308,19 @@ impl OpenAiChatClient {
     /// message list.
     async fn post_json(&self, body: &serde_json::Value) -> Result<serde_json::Value, CoreError> {
         let provider = self.provider_label();
-        self.post(body)
-            .await?
-            .json()
-            .await
-            .map_err(|e| CoreError::Llm(format!("could not parse {provider} response: {e}")))
+        let response = self.post(body).await?;
+        let bytes = read_bounded_response(
+            response,
+            MAX_BUFFERED_COMPLETION_BYTES,
+            "buffered provider response",
+        )
+        .await
+        .map_err(|error| self.sanitize_provider_error(error))?;
+        serde_json::from_slice(&bytes).map_err(|error| {
+            self.sanitize_provider_error(CoreError::Llm(format!(
+                "could not parse {provider} response: {error}"
+            )))
+        })
     }
 }
 
@@ -1220,7 +1419,11 @@ impl LlmClient for OpenAiChatClient {
         // can fail at the socket, at a frame, or as it settles, and a card left on
         // screen by ANY of them reads as a note that landed. One exit, one clear.
         // Cards the turn already retired are not re-reported.
-        let mut tracked = tool_stream::LivePreviews::new(sink);
+        let mut redacted = ProviderRedactingSink {
+            inner: sink,
+            bearer: self.bearer.as_deref().unwrap_or(""),
+        };
+        let mut tracked = tool_stream::LivePreviews::new(&mut redacted);
         match self.read_tool_stream(req, &mut tracked).await {
             Ok(StreamedToolTurn::Completed(completion)) => Ok(completion),
             // The provider sent no tool-call fragments and no prose, so it does
@@ -1255,12 +1458,18 @@ impl LlmClient for OpenAiChatClient {
         // this is the one turn whose reasoning tokens surface as live `Thinking`
         // events.
         let mut answer = openai::AnswerStream::new();
-        let text = self.read_answer_stream(req, sink, &mut answer).await?;
+        let mut redacted = ProviderRedactingSink {
+            inner: sink,
+            bearer: self.bearer.as_deref().unwrap_or(""),
+        };
+        let text = self
+            .read_answer_stream(req, &mut redacted, &mut answer)
+            .await?;
         if !answer.usage_reported() {
             // The provider never priced this turn. Saying so is what makes the
             // run's footer come out ABSENT rather than quietly reporting the
             // tool turns' tokens as the whole bill.
-            sink.record_usage(None);
+            redacted.record_usage(None);
         }
         openai::finish_answer(text)
     }
@@ -2473,6 +2682,18 @@ mod tests {
         )
     }
 
+    fn bearer_client_for(url: String, bearer: &str) -> OpenAiChatClient {
+        OpenAiChatClient::new_with(
+            url,
+            Some(bearer.to_string()),
+            None,
+            Duration::from_secs(5),
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+    }
+
     /// The same client as the local (Ollama) provider builds — the one that must
     /// size Ollama's context window on every turn.
     fn local_client_for(url: String, num_ctx: u32) -> OpenAiChatClient {
@@ -2571,6 +2792,150 @@ mod tests {
             .unwrap();
 
         assert_eq!(sink.1, vec![None]);
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn answer_stream_error_redacts_the_bearer_before_returning() {
+        let bearer = "synthetic-bearer-answer";
+        let body = format!(
+            "data: {{\"error\":{{\"code\":429,\"message\":\"gateway echoed {bearer}\"}},\"choices\":[{{\"delta\":{{\"content\":\"\"}},\"finish_reason\":\"error\"}}]}}\n"
+        );
+        let (url, server) = fake_provider(vec![sse_response(&body)]);
+        let client = bearer_client_for(url, bearer);
+        let mut sink = RecordingSink::default();
+
+        let error = client
+            .complete_streaming(&tool_request(), &mut sink)
+            .await
+            .expect_err("an in-band provider error must fail the turn");
+
+        assert!(!error.to_string().contains(bearer), "{error}");
+        assert!(error.to_string().contains("gateway echoed ***"), "{error}");
+        assert!(
+            format!("{:?}", sink.0).find(bearer).is_none(),
+            "provider secrets must not enter emitted events"
+        );
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn tool_stream_error_redacts_the_bearer_before_returning() {
+        let bearer = "synthetic-bearer-tool";
+        let preview = serde_json::json!({
+            "choices": [{
+                "delta": {"tool_calls": [{
+                    "index": 0,
+                    "id": "call-preview",
+                    "type": "function",
+                    "function": {
+                        "name": "write_note",
+                        "arguments": r#"{"rel_path":"draft.md","content":"partial""#,
+                    }
+                }]}
+            }]
+        });
+        let provider_message = format!("gateway echoed {bearer} {}", "x".repeat(20 * 1024));
+        let error = serde_json::json!({
+            "error": {"code": 500, "message": provider_message},
+            "choices": [{"delta": {"content": ""}, "finish_reason": "error"}]
+        });
+        let body = format!("data: {preview}\ndata: {error}\n");
+        let (url, server) = fake_provider(vec![sse_response(&body)]);
+        let client = bearer_client_for(url, bearer);
+        let mut sink = RecordingSink::default();
+
+        let error = client
+            .complete_tool_streaming(&tool_request(), &mut sink)
+            .await
+            .expect_err("an in-band provider error must fail the turn");
+
+        let CoreError::Llm(message) = &error else {
+            panic!("the HTTP error classification must remain Llm: {error}");
+        };
+        assert!(!message.contains(bearer), "{message}");
+        assert!(message.contains("gateway echoed ***"), "{message}");
+        assert!(message.contains("[truncated]"), "{message}");
+        assert!(
+            message.len() <= MAX_PROVIDER_ERROR_BYTES,
+            "{} bytes",
+            message.len()
+        );
+        assert!(
+            format!("{:?}", sink.0).find(bearer).is_none(),
+            "provider secrets must not enter emitted events"
+        );
+        let abandonments = sink
+            .0
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ChatEvent::NoteEditAbandoned { id, .. } if id == "call-preview"
+                )
+            })
+            .count();
+        assert_eq!(abandonments, 1, "the preview is abandoned exactly once");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn provider_error_projection_redacts_and_bounds_with_an_injected_limit() {
+        let bearer = "synthetic-error-token";
+        let message = format!("diagnostic {bearer} {}", "x".repeat(1024));
+        let bounded = provider_error_text(&message, bearer, 64);
+
+        assert!(!bounded.contains(bearer), "{bounded}");
+        assert!(bounded.contains("diagnostic ***"), "{bounded}");
+        assert!(bounded.contains("[truncated]"), "{bounded}");
+        assert!(bounded.len() <= 64, "{} bytes", bounded.len());
+    }
+
+    #[tokio::test]
+    async fn bounded_body_reader_rejects_declared_overflow_before_reading_json() {
+        let response_body = "12345";
+        let (url, server) = fake_provider(vec![json_response(response_body)]);
+        let client = client_for(url);
+        let response = client
+            .post(&serde_json::json!({"probe": true}))
+            .await
+            .unwrap();
+
+        let error = read_bounded_response(response, 4, "test provider body")
+            .await
+            .expect_err("declared provider body size above the cap must fail");
+
+        assert!(error.to_string().contains("4-byte"), "{error}");
+        server.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn buffered_http_error_redacts_and_bounds_the_provider_body() {
+        let bearer = "synthetic-bearer-buffered";
+        let body = format!("gateway echoed {bearer} {}", "x".repeat(20 * 1024));
+        let response = format!(
+            "HTTP/1.1 500 Internal Server Error\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let (url, server) = fake_provider(vec![response]);
+        let client = bearer_client_for(url, bearer);
+
+        let error = client
+            .complete(&tool_request())
+            .await
+            .expect_err("a provider 500 must fail the buffered turn");
+        let message = error.to_string();
+
+        assert!(!message.contains(bearer), "{message}");
+        assert!(message.contains("gateway echoed ***"), "{message}");
+        assert!(
+            message.contains("truncated"),
+            "oversized diagnostics must say they were truncated: {message}"
+        );
+        assert!(
+            message.len() < 17 * 1024,
+            "provider error body must stay bounded"
+        );
         server.join().unwrap();
     }
 

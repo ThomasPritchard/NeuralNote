@@ -150,8 +150,13 @@ fn find_title_mentions(note: &NoteText, title: &str) -> Vec<(u32, String)> {
         let line_no = u32::try_from(idx + 1)
             .unwrap_or(u32::MAX)
             .saturating_add(note.body_line_offset);
-        for (start, end) in title_matches_in_line(masked_line, &folded_title) {
-            mentions.push((line_no, search::clip_line_around(line, (start, end))));
+        let matches = title_matches_in_line(masked_line, &folded_title);
+        if matches.is_empty() {
+            continue;
+        }
+        let snippets = search::SnippetLine::new(line);
+        for (start, end) in matches {
+            mentions.push((line_no, snippets.clip_around((start, end))));
         }
     }
     mentions
@@ -201,4 +206,26 @@ fn sort_unlinked(unlinked: &mut [UnlinkedMention]) {
             .cmp(&b.source_rel)
             .then_with(|| a.line.cmp(&b.line))
     });
+}
+
+#[cfg(test)]
+mod mention_tests {
+    use super::*;
+
+    #[test]
+    fn repeated_mentions_keep_unicode_and_file_line_evidence() {
+        let note = NoteText {
+            title: "Source".into(),
+            body: "Target here\r\n`Target`\n`é🙂` Target Target".into(),
+            body_line_offset: 3,
+        };
+        assert_eq!(
+            find_title_mentions(&note, "Target"),
+            vec![
+                (4, "Target here".into()),
+                (6, "`é🙂` Target Target".into()),
+                (6, "`é🙂` Target Target".into()),
+            ]
+        );
+    }
 }

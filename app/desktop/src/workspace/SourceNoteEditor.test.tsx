@@ -1,6 +1,6 @@
 import { act, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
-import { undo } from "@codemirror/commands";
+import { redo, undo } from "@codemirror/commands";
 import { EditorSelection } from "@codemirror/state";
 import { EditorView } from "@codemirror/view";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -143,6 +143,74 @@ describe("SourceNoteEditor", () => {
     await userEvent.keyboard("{Control>}{End}{/Control}{Enter}three");
 
     await waitFor(() => expect(onChange).toHaveBeenLastCalledWith("one\r\ntwo\r\nthree"));
+  });
+
+  it("restores exact mixed endings through multiline replacement, undo, and redo", () => {
+    const original = "one\r\ntwo\nthree\rfour";
+    const onChange = vi.fn();
+    const onPreservationError = vi.fn();
+    render(<SourceNoteEditor
+      noteIndexStatus="ready" sessionKey="mixed-replacement" loadedHash="mixed-hash"
+      value={original} onChange={onChange} onPreservationError={onPreservationError}
+    />);
+    const view = EditorView.findFromDOM(screen.getByRole("textbox", { name: "Note content" }))!;
+    act(() => { view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "A\nB" } }); });
+    expect(onChange).toHaveBeenLastCalledWith("A\nB");
+    act(() => { expect(undo(view)).toBe(true); });
+    expect(onChange).toHaveBeenLastCalledWith(original);
+    act(() => { expect(redo(view)).toBe(true); });
+    expect(onChange).toHaveBeenLastCalledWith("A\nB");
+    expect(onPreservationError).not.toHaveBeenCalledWith(expect.any(String));
+  });
+
+  it("preserves separator metadata when character and multiline edits share one undo group", () => {
+    const original = "one\r\ntwo\nthree\rfour";
+    const onChange = vi.fn();
+    const onPreservationError = vi.fn();
+    render(<SourceNoteEditor
+      noteIndexStatus="ready" sessionKey="grouped-replacement" loadedHash="grouped-hash"
+      value={original} onChange={onChange} onPreservationError={onPreservationError}
+    />);
+    const view = EditorView.findFromDOM(screen.getByRole("textbox", { name: "Note content" }))!;
+    act(() => {
+      view.dispatch({ changes: { from: 0, insert: "!" } });
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "A\nB" } });
+      view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: "W\nX\nY\nZ" } });
+      view.dispatch({ changes: { from: view.state.doc.length, insert: "?" } });
+    });
+    expect(onChange).toHaveBeenLastCalledWith("W\nX\nY\nZ?");
+    act(() => { expect(undo(view)).toBe(true); });
+    expect(onChange).toHaveBeenLastCalledWith(original);
+    act(() => { expect(redo(view)).toBe(true); });
+    expect(onChange).toHaveBeenLastCalledWith("W\nX\nY\nZ?");
+    expect(onPreservationError).not.toHaveBeenCalledWith(expect.any(String));
+  });
+
+  it("preserves mixed endings across newline insertion, cut, undo, and redo", async () => {
+    const user = userEvent.setup();
+    const original = "a\r\nb\nc\rd";
+    const onChange = vi.fn();
+    render(<SourceNoteEditor
+      noteIndexStatus="ready" sessionKey="mixed-cut" loadedHash="cut-hash"
+      value={original} onChange={onChange} onPreservationError={vi.fn()}
+    />);
+    const editor = screen.getByRole("textbox", { name: "Note content" });
+    const view = EditorView.findFromDOM(editor)!;
+    act(() => { view.dispatch({ changes: { from: 3, insert: "X\nY\n" } }); });
+    expect(onChange).toHaveBeenLastCalledWith("a\r\nbX\nY\n\nc\rd");
+    act(() => { expect(undo(view)).toBe(true); });
+    expect(onChange).toHaveBeenLastCalledWith(original);
+    act(() => { expect(redo(view)).toBe(true); });
+    expect(onChange).toHaveBeenLastCalledWith("a\r\nbX\nY\n\nc\rd");
+    await user.click(editor);
+    act(() => { view.dispatch({ selection: { anchor: 0, head: view.state.doc.length } }); });
+    const cut = await user.cut();
+    expect(cut?.getData("text/plain")).toBe("a\r\nbX\nY\n\nc\rd");
+    expect(onChange).toHaveBeenLastCalledWith("");
+    act(() => { expect(undo(view)).toBe(true); });
+    expect(onChange).toHaveBeenLastCalledWith("a\r\nbX\nY\n\nc\rd");
+    act(() => { expect(redo(view)).toBe(true); });
+    expect(onChange).toHaveBeenLastCalledWith("");
   });
 
   it("keeps its source session when React unmounts and remounts the same tab revision", async () => {

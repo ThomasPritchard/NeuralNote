@@ -136,11 +136,17 @@ root, and uploads only the resulting artifact directory rather than seeded vault
 
 ### Denial of service
 
-Editable full-document writes are capped at 8 MiB before filesystem mutation. Editor decorations
+Editable full-document writes and existing-file conflict reads are capped at 8 MiB before filesystem mutation. Editor decorations
 iterate visible ranges and use CodeMirror's maintained incremental Markdown parser; retained tab
 sessions are bounded. Other parsers cap bytes, lines, entries, dimensions, aliases, and decoded media. Tool loops cap iterations,
 spans, write budgets, and playlist work. Network and process operations have deadlines, bounded pipes,
 and cancellation. The Sonar-reported backtracking expression was replaced by a linear scan.
+
+Provider transport limits are defined in `ai/transport_limits.rs`: bounded SSE lines and total
+responses, buffered JSON, answer/prose accumulation, tool count and argument storage, plus bounded
+error diagnostics. Overflow is an explicit provider error and settles outstanding edit previews.
+Error redaction runs at the authenticated native boundary before returning errors or forwarding
+error-bearing events to the webview.
 
 Vault profile reads take at most 64 KiB plus one detection byte and use non-blocking no-follow opens,
 so a FIFO, device, oversized file, or symlink is rejected rather than read or waited on. Profile saves
@@ -185,6 +191,10 @@ reversed.
   oversized drafts, malformed Markdown, raw HTML/MDX/JSX, unsafe links, remote image/embed targets,
   completion-label injection, unresolved wikilinks, and forged widget navigation targets.
 - Unknown citation IDs and notes modified between retrieval and answer emission.
+- Private note mode retention; oversized replacement files during save; unreadable descendants
+  after rename/move; occupied case-rename staging paths and failed rollback.
+- Fragmented or oversized provider frames/bodies, excessive tool calls/arguments, and synthetic
+  credential echoes in HTTP/SSE errors after an edit preview has opened.
 - Model-authored remote and data image URIs.
 - Unknown Hugging Face repositories and Ollama tags sent directly over IPC.
 - Oversized, malformed, duplicate, wrong-day, redirected, or unauthenticated OpenRouter ranking
@@ -206,6 +216,20 @@ reversed.
 - Release dispatch from a non-main ref, missing or moved tag, tag/main mismatch, missing mode-specific
   credentials, absent ad-hoc acknowledgement, duplicate release or manifest, unexpected transferred
   artifact, checksum mismatch, and an ad-hoc build labelled as notarized.
+
+## Release citation-evaluation record
+
+Release dispatch accepts a maintainer's reviewed JSON record as untrusted data. The validator caps
+its size, rejects unknown fields, binds it to the checked release SHA and source-defined model
+names, and requires retained HTTPS evidence references and SHA-256 digests. GitHub passes the
+input through an environment variable; it is never interpolated into shell source. The validator
+performs no URL fetch and emits no record contents to logs. The record is retained separately from
+the signed release artifact set and must contain no credentials or private vault content.
+
+This gate verifies an attestation, not the truth or accessibility of its evidence. The release
+maintainer remains responsible for reviewing real model output, claim support, and abstention.
+Only the documented local missing-citation limitation can be accepted; unavailable evaluation,
+wrong citations, and unsupported answers remain release blockers.
 
 ## Residual risk and review triggers
 

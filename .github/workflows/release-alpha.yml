@@ -7,6 +7,10 @@ on:
         description: Existing tag for the 0.4.3 alpha release
         required: true
         default: v0.4.3
+      citation_evaluation:
+        description: Reviewed citation evaluation JSON for this exact release commit (see release runbook)
+        type: string
+        required: true
       signing_mode:
         description: macOS signing and trust mode
         type: choice
@@ -177,6 +181,20 @@ jobs:
           node-version: 24
           cache: npm
           cache-dependency-path: app/desktop/package-lock.json
+
+      - name: Validate reviewed citation evaluation
+        env:
+          CITATION_EVALUATION_JSON: ${{ inputs.citation_evaluation }}
+          RELEASE_SHA: ${{ steps.release_source.outputs.RELEASE_SHA }}
+        run: node scripts/check-citation-evaluation.mjs "$RUNNER_TEMP/citation-evaluation.json"
+
+      - name: Retain reviewed citation evaluation
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: citation-evaluation-record
+          path: ${{ runner.temp }}/citation-evaluation.json
+          if-no-files-found: error
+          retention-days: 90
 
       - name: Validate application versions and workflow contract
         working-directory: app/desktop

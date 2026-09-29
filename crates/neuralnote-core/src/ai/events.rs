@@ -2,7 +2,7 @@
 //!
 //! A serde-tagged enum streamed over an [`EventSink`]. The tag is `type` and both
 //! the tag values and every field are `camelCase`, matching the repo's event/IPC
-//! convention (mirror the shape in `app/desktop/src/lib/types.ts`). The UI renders
+//! convention. TypeScript contracts are generated into `src/lib/bindings/`. The UI renders
 //! the sequence as live steps: search → read → verify → cited answer.
 //!
 //! Model-authored image payloads are rejected by the tool dispatcher. Trusted
@@ -42,14 +42,8 @@ pub struct Elicitation {
     pub multi_select: bool,
 }
 
-/// Which item of a selected playlist is in flight.
-///
-/// The denominator is the playlist's own length — fixed when the user picked the
-/// videos and unable to move afterwards, unlike
-/// [`ChatEvent::PlanningRound::max_rounds`], which a mid-run skill activation can
-/// raise. That is the whole reason this exists: during a playlist the run's
-/// progress is measured in videos, which is both the honest unit of work and the
-/// only one with a stable ceiling.
+/// Which selected video is in flight. The total is fixed for the run, unlike
+/// the planning-round ceiling, which can grow when skills activate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
@@ -61,53 +55,15 @@ pub struct PlaylistPosition {
     pub total: u32,
 }
 
-/// How a dispatched tool call settled. Mirrors [`crate::ai::tools::ToolOutcome`]'s
-/// discriminant but is the UI-facing vocabulary: `Rejected` (bad args/path — the
-/// orchestrator refused) and `Denied` (the user refused) are different stories and
-/// must render differently.
-///
-/// The three ways the approval gate can settle a call it ASKED about are three
-/// separate statuses — `Denied`, `TimedOut`, `Cancelled` — and the split is the
-/// point. All three mean "the call did not run", but they attribute it to three
-/// different parties: the user said no, nobody answered inside 120s, or the run
-/// went away underneath the question. Folding them into `Denied` tells a user who
-/// never saw the sheet that they refused something, which is the one account that
-/// is definitely false. `ApprovalResolution` already distinguishes them on the
-/// wire — §9.2 says it exists precisely so a timeout or a window close is visible
-/// — so collapsing here threw the distinction away at the last step.
-///
-/// A call the gate refuses WITHOUT asking (a vault escape, an invalid path)
-/// settles as `Rejected` instead: that is validation, not a decision anyone made.
-///
-/// `ApprovalResolution::Unavailable` has no counterpart here and needs none: it is
-/// emitted *before* a prompt, to explain the pause, and is always followed by one
-/// of the three above.
-///
-/// What goes red if these are re-collapsed:
-/// `a_timeout_is_not_reported_as_a_user_denial`, in `orchestrator.rs`'s
-/// `settlement_tests`, which is where the mapping from `ApprovalResolution` to
-/// this enum actually lives.
-///
-/// `Error` is produced by `ToolOutcome::Failed` — a call that reached the vault,
-/// the network, or the extractor and came apart there (#116). It used to have no
-/// producer, because `ToolOutcome` could not tell that apart from a call the
-/// dispatcher refused; both arrived as one `Rejected`, and the timeline told the
-/// user NeuralNote had declined work it had in fact attempted.
-///
-/// The dividing line is whether anything was tried. Malformed arguments, an
-/// unknown or unauthorised tool, a path outside the vault, a URL outside the
-/// playlist the user picked: all `Rejected`, because the system protected the
-/// user and nothing is broken. Everything past that point is `Error`.
-///
-/// What goes red if they are re-collapsed:
-/// `a_malformed_argument_call_is_refused_and_never_collapses_into_a_failure`,
-/// in `orchestrator.rs`'s `tests`, which asserts the two settle differently in
-/// one run rather than merely asserting each in isolation.
+/// How a dispatched tool call settled. Validation refusal (`Rejected`), execution
+/// failure (`Error`), user denial, prompt timeout, and run cancellation remain
+/// distinct so the UI accurately attributes the outcome.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, TS)]
 #[serde(rename_all = "camelCase")]
 #[ts(export)]
 pub enum ToolStatus {
     Ok,
+    /// Execution was attempted and failed.
     Error,
     /// The user was asked and said no.
     Denied,
@@ -116,6 +72,7 @@ pub enum ToolStatus {
     /// The user was asked and the run ended — window closed, or stopped — before
     /// an answer could be honoured.
     Cancelled,
+    /// Validation or authorization refused the call before execution.
     Rejected,
 }
 
@@ -130,52 +87,24 @@ pub enum ToolStatus {
 )]
 #[ts(export)]
 pub enum ChatEvent {
-    /// The run has been accepted and is preparing its first model request.
-    ///
-    /// Emitted AT MOST ONCE per run, at the top of the orchestrator — never
-    /// twice, and not at all when setting up the write session fails, which
-    /// surfaces [`ChatEvent::Error`] and returns before this point. The per-round
-    /// beacon is [`ChatEvent::PlanningRound`], which carries a round number and
-    /// therefore cannot reset the phase backwards the way a repeated `Processing`
-    /// did.
+    /// Emitted at most once after setup succeeds, before the first model request.
+    /// Setup failures emit `Error` without `Processing`.
     Processing,
-    /// A tool-deciding round-trip is starting. Emitted once per round, before the
-    /// model request goes out, through the raw sink and before the retry guard in
-    /// `orchestrator::collect` wraps it — counting it would disable the one
-    /// bounded retry that turn is allowed.
-    ///
-    /// It replaces the per-round `Processing` that used to keep the phase word
-    /// from going stale during a turn that can take fifteen seconds and emits
-    /// nothing else (#126); unlike `Processing` it says *which* round, so a
-    /// repeat cannot read as a fresh start.
+    /// A tool-deciding round begins. Emitted before the model request and outside
+    /// the retry guard, so this beacon does not consume the bounded retry.
     PlanningRound {
         /// 1-based. The first tool-deciding turn is round 1.
         round: u32,
-        /// The ceiling as computed for THIS round.
-        ///
-        /// Re-read every emission and it CAN GROW mid-run: activating a skill
-        /// raises the ceiling ([`ActiveSkills::max_iterations`](crate::ai::skills::ActiveSkills::max_iterations)
-        /// folds each active skill's declared cap over the base). The UI must
-        /// render the latest pair and never cache the denominator.
+        /// Current ceiling; skill activation can raise it. Render the latest
+        /// value rather than caching the initial denominator.
         max_rounds: u32,
-        /// Which video of a selected playlist this round is working on, or
-        /// `None` when no playlist is in flight.
-        ///
-        /// Re-stated on every beacon rather than announced once, so the pair the
-        /// head renders is always this round's pair and the end of a playlist
-        /// clears itself. During a playlist this is the honest progress reading:
-        /// `max_rounds` above is a ceiling the iteration guard deliberately does
-        /// not enforce while a playlist runs (each item may spend its own
-        /// bounded allowance), whereas the playlist length cannot move.
+        /// Current playlist item, or `None` outside a playlist. Repeated each
+        /// round to clear stale progress. Playlist length is fixed; each item
+        /// has its own iteration allowance.
         playlist: Option<PlaylistPosition>,
     },
-    /// The provider is alive and has sent nothing else. Forwarded from an SSE
-    /// comment line (OpenRouter sends `: OPENROUTER PROCESSING`), which the
-    /// stream classifier used to resolve to "ignorable" and drop.
-    ///
-    /// Carries no payload on purpose: it says "the socket is alive", not
-    /// "progress happened". It refreshes the transport-liveness signal and must
-    /// NOT reset a stall detector, which watches for progress.
+    /// Transport liveness from an SSE comment. It carries no progress and must
+    /// not reset the progress stall detector.
     Keepalive,
     /// A long-running tool reporting from inside itself, keyed to the
     /// [`ChatEvent::ToolCall`] it belongs to so it renders on that node rather
@@ -189,18 +118,8 @@ pub enum ChatEvent {
         id: String,
         message: String,
     },
-    /// The video the run is about to work on, for a preview card beside the
-    /// live head.
-    ///
-    /// **It carries no playlist position.** The position is owned by the
-    /// [`ChatEvent::PlanningRound`] beacon alone, so the card and the head read
-    /// one number from one emitter and can never disagree about which video is
-    /// in flight. That places an ordering requirement on whoever emits this:
-    /// **it follows the beacon that first announces its item**, so a preview
-    /// belonging to the previous video is cleared by the beacon rather than left
-    /// standing beside the new one.
-    ///
-    /// Everything here is host-read metadata, never model prose.
+    /// Host-read video metadata. Emitted after the `PlanningRound` beacon that
+    /// first announces its item; that beacon owns position and clears old previews.
     VideoPreview {
         /// The YouTube video id, so a card can be told apart from its successor
         /// even when two videos share a title.
@@ -210,14 +129,9 @@ pub enum ChatEvent {
         /// an absent duration must render as absent rather than as `0`.
         duration_secs: Option<u64>,
         channel: Option<String>,
-        /// The thumbnail, bounded and validated host-side and carried as a data
-        /// URI exactly as [`ElicitOption::image_data_uri`] already is, so the
-        /// webview needs no third-party network allowlist.
-        ///
-        /// A **nice-to-have**: the fetch is capped and timed out, and a
-        /// thumbnail that fails, exceeds its cap, or is rejected arrives as
-        /// `None` rather than delaying or failing the run. `None` is the
-        /// degraded path the card must render usefully, not an error.
+        /// Host-validated, bounded data URI; no third-party webview allowlist.
+        /// Fetch failure, rejection, or timeout produces `None` without failing
+        /// the run. The card must remain useful without a thumbnail.
         thumbnail_data_uri: Option<String>,
     },
     /// A skill became active and granted its declared tools.
@@ -257,24 +171,9 @@ pub enum ChatEvent {
         /// The raw arguments JSON exactly as the model emitted it. The UI parses it
         /// defensively for the detail line; it is never trusted to be valid JSON.
         arguments: String,
-        /// The [`ChatEvent::Plan`] step that was [`StepStatus::Running`] at the
-        /// moment this call was DISPATCHED — the key the timeline nests tool
-        /// nodes under their step by.
-        ///
-        /// Stamped at dispatch, never resolved at render: the affiliation is a
-        /// fact about when the call happened, so a later
-        /// [`ChatEvent::PlanStepStatus`] must not re-parent a node that already
-        /// went out. That is also why the `update_plan` call which declares the
-        /// plan is itself unaffiliated — it was dispatched before the plan
-        /// existed.
-        ///
-        /// `None` is ordinary, not a failure: no plan was declared (the common
-        /// case), or no step is running right now. It is never a synthetic step,
-        /// and never an empty string — an unaffiliated node renders on the rail
-        /// exactly as it did before plans existed.
-        ///
-        /// It plays **no part in settlement**: a [`ChatEvent::ToolResult`]
-        /// correlates on `id` alone, and carries no step of its own.
+        /// The step running at dispatch. Later plan changes must not re-parent
+        /// this call. `None` means no active step, including the call that creates
+        /// the plan. Settlement correlates on `id`, independently of this field.
         step_id: Option<String>,
     },
     /// The call settled. Exactly one per [`ChatEvent::ToolCall`], always emitted —
@@ -286,17 +185,8 @@ pub enum ChatEvent {
         summary: Option<String>,
         /// Bounded result or error text for the disclosure. Truncated Rust-side.
         detail: Option<String>,
-        /// Wall-clock time from dispatch to settlement. Measured with `Instant`,
-        /// which the core already treats as a measurement rather than a timer.
-        /// Never optional: the orchestrator always knows how long it waited, and
-        /// a call that never ran waited approximately nothing rather than an
-        /// unknown amount.
-        ///
-        /// **It is time-to-settle, not time-in-the-tool.** The approval gate sits
-        /// between dispatch and settlement, so a gated call the user leaves
-        /// sitting reports the human's thinking time too — up to the gate's
-        /// 120-second budget. Anything rendering this beside a tool name has to
-        /// say "took", never "spent working".
+        /// Elapsed time measured with `Instant` from dispatch to settlement,
+        /// including any approval wait. This is not tool execution time.
         duration_ms: u64,
     },
     /// How a transcript was actually obtained, reported by the tool that obtained
@@ -385,19 +275,9 @@ pub enum ChatEvent {
         /// The [`ChatEvent::ToolCall`] that ran it — see [`ChatEvent::Retrieved`].
         call_id: Option<String>,
     },
-    /// `query` finished, yielding `hit_count` evidence spans.
-    ///
-    /// `call_id` is the correlation key for all three retrieval cues. These cues
-    /// are emitted BY the tool calls above them on the rail, so the timeline can
-    /// enrich the tool node in place rather than render the same act twice. It
-    /// does not do so yet — today the rail drops these cues — and this key is
-    /// what makes that possible without guessing: tool calls run in parallel, so
-    /// arrival order is not a correlation key, and inferring one from it would
-    /// put the wrong query on the wrong node.
-    ///
-    /// `Option`, not `String`: the cues come from the retrieval layer and a path
-    /// may have no dispatched call behind it. `None` means "no node to attach
-    /// to" and renders exactly as it did before the key existed.
+    /// Search result count. `call_id` correlates retrieval cues with their tool
+    /// node; parallel calls cannot be matched by arrival order. `None` means no
+    /// dispatched call owns this cue.
     Retrieved {
         query: String,
         hit_count: u32,

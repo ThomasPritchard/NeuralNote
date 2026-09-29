@@ -6,6 +6,8 @@ use crate::paths::{ensure_within, rel_path};
 use crate::temp_sibling::create_temp_sibling;
 use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
 
@@ -288,15 +290,6 @@ fn is_text_note(path: &Path) -> bool {
     crate::tree::is_text_note_ext(ext.as_deref())
 }
 
-/// Read a file as a string the *same way the reader does* — lossily — so a note
-/// that was lossy-decoded on read (non-UTF-8, e.g. a Windows-1252 note from a
-/// migrated vault) yields the same string, and therefore the same content hash, on
-/// the write-path conflict check. Strict `read_to_string` here would error on such
-/// a file and make every save of an editable note fail.
-fn read_to_string_lossy(path: &Path) -> std::io::Result<String> {
-    Ok(decode_note_text(std::fs::read(path)?).0)
-}
-
 /// Overwrite a note's full content, atomically (write to a temp sibling, then
 /// rename) so a crash mid-write can never leave a half-written, corrupt note.
 /// Returns the fresh [`NoteDoc`] built from the content just written — the caller
@@ -324,13 +317,25 @@ pub fn write_note(
         return Err(CoreError::NotFound(path.display().to_string()));
     }
     if let Some(expected) = expected_hash {
-        // Read the current bytes (surfaces I/O errors — never a silent skip) and
-        // compare. Fail safe: any mismatch is a conflict, not an overwrite.
+        // The same bounded read and lossy decoding used by the reader keeps a
+        // replaced disk file from bypassing the editable-note resource limit.
         // (There is a microsecond check-then-rename TOCTOU window; accepted — the
         // threat model is a single cooperative user, not racing writers, and the
         // worst case is overwriting an edit that landed in that window, not corruption.)
-        // Lossy read so a non-UTF-8 (editable, lossy-decoded) note can still be saved.
-        let current = read_to_string_lossy(&path)?;
+        let current = match read_note_bounded(&path)? {
+            BoundedRead::Text { raw, .. } => raw,
+            BoundedRead::Binary => {
+                return Err(CoreError::Conflict(
+                    "this note changed on disk since you opened it and is no longer readable as editable text"
+                        .into(),
+                ));
+            }
+            BoundedRead::TooLarge { size_bytes } => {
+                return Err(CoreError::Conflict(format!(
+                    "this note changed on disk since you opened it; its current content exceeds the {MAX_EDITABLE_NOTE_BYTES}-byte editable note limit (on-disk size: {size_bytes} bytes)"
+                )));
+            }
+        };
         if content_hash(&current) != expected {
             return Err(CoreError::Conflict(
                 "this note changed on disk since you opened it".into(),
@@ -348,11 +353,21 @@ pub fn write_note(
     let parent = path
         .parent()
         .ok_or_else(|| CoreError::OutsideVault(path.display().to_string()))?;
+    // Standard Unix permission bits are copied; ACL and extended-attribute
+    // preservation is not established by this atomic replacement.
+    #[cfg(unix)]
+    let original_mode = std::fs::metadata(&path)?.permissions().mode() & 0o7777;
     let (tmp, mut file) =
         create_temp_sibling(parent, &file_name, &TMP_SEQ, "could not save the note")?;
     if let Err(e) = file.write_all(content.as_bytes()) {
         drop(file);
         let _ = std::fs::remove_file(&tmp); // don't leak a partially-written temp
+        return Err(e.into());
+    }
+    #[cfg(unix)]
+    if let Err(e) = file.set_permissions(std::fs::Permissions::from_mode(original_mode)) {
+        drop(file);
+        let _ = std::fs::remove_file(&tmp);
         return Err(e.into());
     }
     drop(file);

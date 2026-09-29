@@ -154,6 +154,28 @@ describe("sourceText", () => {
     );
   });
 
+  it("breaks equal-distance separator ties toward the earlier boundary", () => {
+    const source = loadSourceText("a\r\nb\nc");
+    const changes = ChangeSet.of(
+      { from: 0, to: source.text.length, insert: "AA\nBB" }, source.text.length,
+    );
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe("AA\r\nBB");
+  });
+
+  it("inherits multiline paste endings only from the insertion boundary", () => {
+    const source = loadSourceText("a\r\nb\nc\rd");
+    const changes = ChangeSet.of({ from: 3, insert: "X\nY\n" }, source.text.length);
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe(
+      "a\r\nbX\nY\n\nc\rd",
+    );
+  });
+
+  it("excludes the boundary at the end of a replacement from inheritance", () => {
+    const source = loadSourceText("a\r\nb\nc\rd");
+    const changes = ChangeSet.of({ from: 0, to: 3, insert: "A\nB\n" }, source.text.length);
+    expect(serializeSourceText(applySourceChanges(source, changes))).toBe("A\r\nB\r\n\nc\rd");
+  });
+
   it("uses the document default for a mid-line insertion, not a later stray ending", () => {
     const source = loadSourceText("a\nb\nc\r\nd\ne\n");
     const at = source.text.indexOf("c");

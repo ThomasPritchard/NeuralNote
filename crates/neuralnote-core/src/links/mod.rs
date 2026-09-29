@@ -220,7 +220,7 @@ fn extract_targets(source_rel: &str, body: &str) -> Vec<RawTarget> {
 /// [`LinkResolutionIndex`] so these occurrences use the graph's exact rules.
 pub(crate) fn extract_link_occurrences(source_rel: &str, body: &str) -> Vec<RawLinkOccurrence> {
     let masked = mask_code(body);
-    let context = LineContext::new(body, &masked);
+    let mut context = LineContext::new(body, &masked);
     let mut out = Vec::new();
     emit_raw_targets(source_rel, &masked, |target, offset| {
         out.push(context.occurrence(target, offset));
@@ -243,6 +243,7 @@ struct LineContext<'a> {
     starts: Vec<usize>,
     masked_lines: Vec<&'a str>,
     original_lines: Vec<&'a str>,
+    snippets: HashMap<usize, (search::SnippetLine<'a>, search::SnippetLine<'a>)>,
 }
 
 impl<'a> LineContext<'a> {
@@ -252,17 +253,27 @@ impl<'a> LineContext<'a> {
             starts,
             masked_lines,
             original_lines: original.lines().collect(),
+            snippets: HashMap::new(),
         }
     }
 
-    fn occurrence(&self, target: RawTarget, offset: usize) -> RawLinkOccurrence {
+    fn occurrence(&mut self, target: RawTarget, offset: usize) -> RawLinkOccurrence {
         let idx = self.line_index(offset);
-        let line = self.original_lines.get(idx).copied().unwrap_or("");
-        let col = self.char_offset(idx, offset);
+        let original = self.original_lines.get(idx).copied().unwrap_or("");
+        let masked = self.masked_lines.get(idx).copied().unwrap_or("");
+        let start = self.starts.get(idx).copied().unwrap_or(0);
+        // Masking preserves character counts, but can change UTF-8 byte offsets.
+        let (masked, original) = self.snippets.entry(idx).or_insert_with(|| {
+            (
+                search::SnippetLine::new(masked),
+                search::SnippetLine::new(original),
+            )
+        });
+        let col = masked.char_offset(offset.saturating_sub(start));
         RawLinkOccurrence {
             target,
             line: u32::try_from(idx + 1).unwrap_or(u32::MAX),
-            snippet: search::clip_line_around(line, (col, col.saturating_add(1))),
+            snippet: original.clip_around((col, col.saturating_add(1))),
         }
     }
 
@@ -272,13 +283,6 @@ impl<'a> LineContext<'a> {
             Err(0) => 0,
             Err(idx) => idx - 1,
         }
-    }
-
-    fn char_offset(&self, idx: usize, offset: usize) -> usize {
-        let start = self.starts.get(idx).copied().unwrap_or(0);
-        let line = self.masked_lines.get(idx).copied().unwrap_or("");
-        let byte_len = offset.saturating_sub(start).min(line.len());
-        line[..byte_len].chars().count()
     }
 }
 
@@ -438,4 +442,46 @@ pub(crate) fn resolve_rel(cand: &str, by_rel: &HashMap<String, Vec<String>>) -> 
 /// appended (Obsidian resolves extensionless links).
 fn resolve_md_rel(cand: &str, by_rel: &HashMap<String, Vec<String>>) -> Option<String> {
     resolve_rel(cand, by_rel).or_else(|| resolve_rel(&format!("{cand}.md"), by_rel))
+}
+
+#[cfg(test)]
+mod occurrence_performance_tests {
+    use super::*;
+    use std::hint::black_box;
+    use std::time::Instant;
+
+    fn dense_elapsed(count: usize) -> std::time::Duration {
+        let body = "[[target]] ".repeat(count);
+        (0..3)
+            .map(|_| {
+                let start = Instant::now();
+                let found = extract_link_occurrences("source.md", black_box(&body));
+                assert_eq!(found.len(), count);
+                black_box(found);
+                start.elapsed()
+            })
+            .min()
+            .unwrap()
+    }
+
+    #[test]
+    fn dense_link_occurrences_scale_below_quadratic() {
+        let small = dense_elapsed(500).as_secs_f64();
+        let large = dense_elapsed(2000).as_secs_f64();
+        assert!(
+            large / small < 8.0,
+            "4x links took {:.2}x time",
+            large / small
+        );
+    }
+
+    #[test]
+    fn snippets_keep_unicode_columns_after_masked_code() {
+        let body = format!("intro\r\n`é🙂` {}[[target]]", "🙂".repeat(220));
+        let found = extract_link_occurrences("source.md", &body);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].line, 2);
+        assert!(found[0].snippet.ends_with("[[target]]"));
+        assert_eq!(found[0].snippet.chars().count(), 200);
+    }
 }

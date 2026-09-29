@@ -472,3 +472,88 @@ fn deleting_an_entry_removes_it_from_the_vault() {
     // the vault's point of view the entry is gone.
     assert!(!Path::new(&note).exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn renaming_a_folder_with_an_unreadable_descendant_returns_an_unloaded_node() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !permission_restrictions_apply() {
+        return;
+    }
+    let vault = vault();
+    let source = vault.path().join("Before");
+    let unreadable = source.join("unreadable");
+    fs::create_dir_all(&unreadable).unwrap();
+    fs::write(unreadable.join("secret.md"), "present").unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = rename_entry(vault.path(), &source, "After");
+
+    let moved_unreadable = vault.path().join("After/unreadable");
+    fs::set_permissions(&moved_unreadable, fs::Permissions::from_mode(0o700)).unwrap();
+    let node = result.expect("rename committed but descendant scan made it look failed");
+    assert_eq!(node.name, "After");
+    assert!(
+        node.children.is_none(),
+        "folder children are returned unloaded"
+    );
+    assert!(!source.exists());
+    assert!(moved_unreadable.join("secret.md").is_file());
+}
+
+#[cfg(unix)]
+#[test]
+fn moving_a_folder_with_an_unreadable_descendant_returns_an_unloaded_node() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !permission_restrictions_apply() {
+        return;
+    }
+    let vault = vault();
+    let source = vault.path().join("Before");
+    let unreadable = source.join("unreadable");
+    let destination = vault.path().join("Destination");
+    fs::create_dir_all(&unreadable).unwrap();
+    fs::create_dir(&destination).unwrap();
+    fs::write(unreadable.join("secret.md"), "present").unwrap();
+    fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+    let result = move_entry(vault.path(), &source, &destination);
+
+    let moved = destination.join("Before");
+    fs::set_permissions(moved.join("unreadable"), fs::Permissions::from_mode(0o700)).unwrap();
+    let node = result.expect("move committed but descendant scan made it look failed");
+    assert_eq!(node.name, "Before");
+    assert!(
+        node.children.is_none(),
+        "folder children are returned unloaded"
+    );
+    assert!(!source.exists());
+    assert!(moved.join("unreadable/secret.md").is_file());
+}
+
+#[test]
+fn case_only_rename_preserves_an_occupied_legacy_staging_path() {
+    let vault = vault();
+    let source = vault.path().join("Todo.md");
+    let legacy_stage = vault
+        .path()
+        .join(format!(".todo.md.{}.nn-caserename", std::process::id()));
+    fs::write(&source, "note contents").unwrap();
+    fs::write(&legacy_stage, "pre-existing staging data").unwrap();
+
+    let node = rename_entry(vault.path(), &source, "todo.md")
+        .expect("a stale staging path should be skipped, not clobbered or fatal");
+
+    assert_eq!(node.name, "todo.md");
+    assert_eq!(
+        fs::read_to_string(vault.path().join("todo.md")).unwrap(),
+        "note contents"
+    );
+    assert_eq!(
+        fs::read_to_string(&legacy_stage).unwrap(),
+        "pre-existing staging data",
+        "case-only rename replaced data it did not own"
+    );
+}

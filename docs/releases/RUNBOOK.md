@@ -138,6 +138,9 @@ publish job fails closed.
 Run **Actions → release-macos-alpha → Run workflow** with **Use workflow from** set to `main`. Inputs:
 
 - `release_tag` — the existing tag, normally `vX.Y.Z`.
+- `citation_evaluation` — reviewed JSON for this exact commit and its default cloud/local models,
+  prepared using [the citation evaluation procedure](../release-citation-evaluation.md). Required
+  before dependencies or signing; a skipped or unavailable evaluation is not acceptable evidence.
 - `signing_mode` — `ad-hoc` (default; no Apple membership, unnotarized) or `developer-id` (Apple
   Developer ID signed and notarized).
 - `confirm_unnotarized` — required `true` for `ad-hoc`; ignored for `developer-id`.

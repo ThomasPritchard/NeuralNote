@@ -78,14 +78,21 @@ export interface SourceNoteEditorProps {
 }
 
 const EMPTY_NOTE_INDEX: readonly NoteIndexEntry[] = [];
-const preserveExactSourceHistory = StateEffect.define<null>();
-const restoreExactSourceHistory = StateEffect.define<SourceText>();
+const restoreExactSourceHistory = StateEffect.define<Omit<SourceText, "text">>();
 
 function exactSourceHistory(source: () => SourceText) {
   return invertedEffects.of((transaction) => {
-    const preservesSource = transaction.effects.some((effect) =>
-      effect.is(preserveExactSourceHistory) || effect.is(restoreExactSourceHistory));
-    return preservesSource ? [restoreExactSourceHistory.of(source())] : [];
+    let changesBoundaries = false;
+    transaction.changes.iterChanges((from, to, _newFrom, _newTo, inserted) => {
+      const doc = transaction.startState.doc;
+      changesBoundaries ||= inserted.lines > 1 || doc.lineAt(from).number !== doc.lineAt(to).number;
+    });
+    const restoresSource = transaction.effects.some((effect) => effect.is(restoreExactSourceHistory));
+    if (!changesBoundaries && !restoresSource) return [];
+    // Ordinary character edits need no metadata snapshot. Boundary changes can
+    // discard separator identity, so retain it for undo and the inverse redo.
+    const { separators, defaultSeparator } = source();
+    return [restoreExactSourceHistory.of({ separators, defaultSeparator })];
   });
 }
 
@@ -112,7 +119,6 @@ function exactSourceClipboard(source: () => SourceText) {
       view.dispatch(
         view.state.replaceSelection(""),
         {
-          effects: preserveExactSourceHistory.of(null),
           userEvent: "delete.cut",
           scrollIntoView: true,
         },
@@ -291,16 +297,15 @@ export function SourceNoteEditor({
         try {
           for (const transaction of transactions) {
             if (transaction.docChanged) source = applySourceChanges(source, transaction.changes);
-            const restoredSource = transaction.effects.find((effect) =>
-              effect.is(restoreExactSourceHistory));
-            if (restoredSource?.is(restoreExactSourceHistory)) {
-              serializeSourceText(restoredSource.value);
-              if (restoredSource.value.text !== transaction.newDoc.toString()) {
-                throw new SourcePreservationError(
-                  "Cannot restore exact source history: the snapshot does not match the editor document.",
-                );
-              }
-              source = restoredSource.value;
+            // Grouped undo effects run newest to oldest: the last metadata
+            // snapshot belongs to the text before the entire history group.
+            let restoredSource: Omit<SourceText, "text"> | undefined;
+            for (const effect of transaction.effects) {
+              if (effect.is(restoreExactSourceHistory)) restoredSource = effect.value;
+            }
+            if (restoredSource) {
+              source = { ...source, ...restoredSource };
+              serializeSourceText(source);
             }
           }
           editorView.update(transactions);

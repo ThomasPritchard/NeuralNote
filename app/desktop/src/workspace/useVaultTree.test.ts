@@ -136,6 +136,81 @@ describe("useVaultTree", () => {
     expect(mockInvoke.mock.calls.filter((c) => c[0] === "read_tree").length).toBe(2);
   });
 
+  it.each(["manual", "watcher"])("keeps the newest %s refresh when an older read succeeds last", async (trigger) => {
+    vi.useFakeTimers();
+    let finishOlder!: (tree: TreeNode[]) => void;
+    mockInvoke.mockReturnValueOnce(new Promise<TreeNode[]>((resolve) => { finishOlder = resolve; }));
+    mockInvoke.mockResolvedValueOnce(treeB);
+    const { result } = renderHook(() => useVaultTree("/v"));
+
+    await act(async () => {
+      if (trigger === "manual") result.current.refresh();
+      else {
+        treeChangedHandler()();
+        await vi.advanceTimersByTimeAsync(300);
+      }
+    });
+    expect(result.current.tree).toEqual(treeB);
+
+    await act(async () => { finishOlder(treeA); });
+    expect(result.current.tree).toEqual(treeB);
+    expect(result.current.status).toBe("ready");
+  });
+
+  it("ignores an older rejection after a newer refresh succeeds", async () => {
+    let rejectOlder!: (error: unknown) => void;
+    mockInvoke.mockReturnValueOnce(new Promise((_, reject) => { rejectOlder = reject; }));
+    mockInvoke.mockResolvedValueOnce(treeB);
+    const onError = vi.fn();
+    const { result } = renderHook(() => useVaultTree("/v", onError));
+
+    await act(async () => { result.current.refresh(); });
+    expect(result.current.tree).toEqual(treeB);
+    await act(async () => { rejectOlder({ message: "obsolete failure" }); });
+
+    expect(result.current.status).toBe("ready");
+    expect(result.current.tree).toEqual(treeB);
+    expect(onError).not.toHaveBeenCalled();
+  });
+
+  it("does not let an older success clear a newer read failure", async () => {
+    let finishOlder!: (tree: TreeNode[]) => void;
+    mockInvoke.mockReturnValueOnce(new Promise<TreeNode[]>((resolve) => { finishOlder = resolve; }));
+    mockInvoke.mockRejectedValueOnce({ message: "latest failure" });
+    const onError = vi.fn();
+    const { result } = renderHook(() => useVaultTree("/v", onError));
+
+    await act(async () => { result.current.refresh(); });
+    await act(async () => { finishOlder(treeA); });
+
+    expect(result.current.status).toBe("failed");
+    expect(result.current.tree).toEqual([]);
+    expect(onError).toHaveBeenCalledExactlyOnceWith("latest failure");
+  });
+
+  it.each(["success", "failure"])("ignores a late %s from the previous vault", async (outcome) => {
+    let finishOlder!: (tree: TreeNode[]) => void;
+    let rejectOlder!: (error: unknown) => void;
+    mockInvoke.mockReturnValueOnce(new Promise<TreeNode[]>((resolve, reject) => {
+      finishOlder = resolve;
+      rejectOlder = reject;
+    }));
+    mockInvoke.mockResolvedValueOnce(treeB);
+    const onError = vi.fn();
+    const { result, rerender } = renderHook(({ path }) => useVaultTree(path, onError), {
+      initialProps: { path: "/v" },
+    });
+    rerender({ path: "/w" });
+    await act(async () => {});
+    await act(async () => {
+      if (outcome === "success") finishOlder(treeA);
+      else rejectOlder({ message: "abandoned vault" });
+    });
+    expect(result.current.tree).toEqual(treeB);
+    expect(result.current.status).toBe("ready");
+    expect(onError).not.toHaveBeenCalled();
+  });
+
   it("tears down the tree-changed subscription on unmount", async () => {
     mockInvoke.mockResolvedValue(treeA);
     const unlisten = vi.fn();
